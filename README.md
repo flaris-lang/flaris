@@ -124,6 +124,11 @@ gcc -shared -fPIC -I ffi -o sqlite_ffi.so ffi/sqlite_ffi.c -lsqlite3
 Bug reports and library contributions are welcome. Good first contributions are
 new libraries, or tests and documentation for existing ones.
 
+Note that `doc/` is **published from the upstream repository**, not authored
+here - it is overwritten on each release, so documentation fixes are best raised
+as an issue or on Discord rather than as a pull request against those files.
+Everything else in this repo takes PRs normally.
+
 - Chat: [Discord](https://discord.gg/TxZK9eXn2c)
 - A bug report is most useful with the output of `flarisvm --version`, your OS,
   and a minimal `.fls` script that reproduces it
