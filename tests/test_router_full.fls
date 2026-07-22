@@ -1,0 +1,154 @@
+// test_router_full.fls
+// Run: flarisvm -u ./tests/test_router_full.fls --libs='./libs'
+
+import { Router, Response, JwtMiddleware, JwtSign, LoggerMiddleware, CorsMiddleware }
+    from library("Router", "1.0");
+
+global secret = "test-secret-key";
+global app    = nil;
+
+// ============================================================
+// Benchmarks - network-free: route registration + direct
+// dispatch of a mock request object (no sockets, no server).
+// ============================================================
+
+fn benchRouter() {
+    Console.WriteLine("=== Router benchmarks ===");
+
+    let nRoutes  = 50;
+    let regIters = 20;
+
+    // Route-table construction: register 50 routes on a fresh router.
+    let t0 = Time.Ticks();
+    iter (n from 0 to regIters - 1) {
+        let r = new Router();
+        iter (i from 0 to nRoutes - 1) {
+            r.Get("/bench/" + str(i) + "/:id", fn(_req) {
+                return Response.Json({ok: true}, nil);
+            });
+        }
+    }
+    Console.WriteLine("register ", nRoutes, " routes x", regIters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    // Matching + dispatch: mock request against the worst-case (last) route.
+    let r2 = new Router();
+    iter (i from 0 to nRoutes - 1) {
+        r2.Get("/bench/" + str(i) + "/:id", fn(_req) {
+            return Response.Json({ok: true}, nil);
+        });
+    }
+    let iters = 1000;
+    let t1 = Time.Ticks();
+    iter (i from 0 to iters - 1) {
+        let req = { method: "GET", path: "/bench/49/123",
+                    params: nil, query: {}, headers: {}, body: "" };
+        let _resp = r2._dispatch(req);
+    }
+    Console.WriteLine("dispatch last-of-", nRoutes, " x", iters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t1)]), " ms");
+
+    Console.WriteLine("=== benchmarks done ===");
+}
+
+fn Main() {
+    app = new Router();
+    global logMw  = new LoggerMiddleware();
+    global corsMw = new CorsMiddleware("*");
+    global jwtMw  = new JwtMiddleware(secret, ["/auth/login", "/health"]);
+
+    app.Use(fn(req, next) { return logMw.Handle(req, next); });
+    app.Use(fn(req, next) { return corsMw.Handle(req, next); });
+    app.Use(fn(req, next) { return jwtMw.Handle(req, next); });
+
+    // --- Public routes ---
+
+    app.Get("/health", fn(_req) {
+        return Response.Json({status: "ok"}, nil);
+    });
+
+    app.Post("/auth/login", fn(req) {
+        let body  = nil;
+        let error = false;
+        try {
+            body = Json.Parse(req.body);
+        } catch(e) {
+            error = true;
+        }
+
+        if (error)
+            return Response.Error(400, "Invalid JSON");
+
+        if (body == nil || body.username == nil)
+            return Response.Error(400, "Missing username");
+
+        let token = JwtSign({sub: body.username, role: "user"}, secret, 3600);
+        return Response.Json({token: token}, nil);
+    });
+
+    // --- Protected routes via route group ---
+
+    let api = app.Group("/api");
+
+    api.Get("/me", fn(req) {
+        return Response.Json({user: req.jwt.sub, role: req.jwt.role}, nil);
+    });
+
+    api.Get("/users", fn(req) {
+        return Response.Json([
+            {id: 1, name: "Alice"},
+            {id: 2, name: "Bob"}
+        ], nil);
+    });
+
+    api.Get("/users/:id", fn(req) {
+        return Response.Json({id: req.params.id, name: "Alice"}, nil);
+    });
+
+    api.Post("/users", fn(req) {
+        let body  = nil;
+        let error = false;
+        try {
+            body = Json.Parse(req.body);
+        } catch(e) {
+            error = true;
+        }
+        if (body == nil || body.name == nil)
+            return Response.Error(400, "Missing name field");
+        if (error)
+            return Response.Error(400, "Invalid JSON body");
+        return Response.Json({id: 3, name: body.name, created: true}, 201);
+    });
+
+    api.Put("/users/:id", fn(req) {
+        let body  = nil;
+        let error = false;
+        try {
+            body = Json.Parse(req.body);
+        } catch(e) {
+            error = true;
+        }
+        if (error)
+            return Response.Error(400, "Invalid JSON body");
+        return Response.Json({id: req.params.id, updated: true}, nil);
+    });
+
+    api.Delete("/users/:id", fn(req) {
+        return Response.Json({id: req.params.id, deleted: true}, nil);
+    });
+
+    app.NotFound(fn(req) {
+        return Response.Error(404, "Route not found: " + req.path);
+    });
+
+    benchRouter();
+
+    VM.OnSignal(2, fn(a) {
+        Console.WriteLine("Stopping server...");
+        app.Stop();
+        return 0;
+    });
+
+    Console.WriteLine("Server starting on http://localhost:8087");
+    app.Listen(8087);
+}

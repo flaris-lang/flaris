@@ -1,0 +1,589 @@
+// test_http.fls - Test suite for Http.fls stdlib
+//
+// Uses httpbin.org as the test server (plain HTTP on port 80).
+// Run: flarisvm test_http.fls
+
+import { Http, Status, ContentType } from library("Http", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + "  expected=" + Convert.ToString(expected) + "  got=" + Convert.ToString(actual));
+    }
+    return 0;
+}
+
+fn statusOf(res)  { if (res == nil) { return -1; } return res.status; }
+fn bodyOf(res)    { if (res == nil) { return ""; } return res.body;   }
+fn headersOf(res) { if (res == nil) { return {}; } return res.headers; }
+
+// --------------------------------------------------------
+//  Constants (no network)
+// --------------------------------------------------------
+
+fn test_constants() {
+    Console.WriteLine("== Constants ==");
+
+    checkEq(Status.OK,                 200, "Status.OK");
+    checkEq(Status.Created,            201, "Status.Created");
+    checkEq(Status.NoContent,          204, "Status.NoContent");
+    checkEq(Status.BadRequest,         400, "Status.BadRequest");
+    checkEq(Status.Unauthorized,       401, "Status.Unauthorized");
+    checkEq(Status.Forbidden,          403, "Status.Forbidden");
+    checkEq(Status.NotFound,           404, "Status.NotFound");
+    checkEq(Status.Conflict,           409, "Status.Conflict");
+    checkEq(Status.InternalError,      500, "Status.InternalError");
+    checkEq(Status.NotImplemented,     501, "Status.NotImplemented");
+    checkEq(Status.BadGateway,         502, "Status.BadGateway");
+    checkEq(Status.ServiceUnavailable, 503, "Status.ServiceUnavailable");
+
+    checkEq(ContentType.JSON,          "application/json",                  "ContentType.JSON");
+    checkEq(ContentType.HTML,          "text/html",                         "ContentType.HTML");
+    checkEq(ContentType.Text,          "text/plain",                        "ContentType.Text");
+    checkEq(ContentType.FormEncoded,   "application/x-www-form-urlencoded", "ContentType.FormEncoded");
+    checkEq(ContentType.MultipartForm, "multipart/form-data",               "ContentType.MultipartForm");
+    checkEq(ContentType.XML,           "application/xml",                   "ContentType.XML");
+    checkEq(ContentType.Binary,        "application/octet-stream",          "ContentType.Binary");
+    checkEq(ContentType.Javascript,    "application/javascript",            "ContentType.Javascript");
+    checkEq(ContentType.CSV,           "text/csv",                          "ContentType.CSV");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  ParseUrl (no network)
+// --------------------------------------------------------
+
+fn test_parse_url() {
+    Console.WriteLine("== ParseUrl ==");
+
+    let p1 = HttpUtil.ParseUrl("http://example.com/path?q=1");
+    checkEq(p1.scheme, "http",        "scheme basic");
+    checkEq(p1.host,   "example.com", "host basic");
+    checkEq(p1.port,   80,            "port default http");
+    checkEq(p1.path,   "/path",       "path basic");
+    checkEq(p1.query,  "q=1",         "query basic");
+
+    let p2 = HttpUtil.ParseUrl("http://example.com:8080/api");
+    checkEq(p2.port,  8080,   "explicit port");
+    checkEq(p2.path,  "/api", "path with port");
+
+    let p3 = HttpUtil.ParseUrl("http://example.com");
+    checkEq(p3.path,  "/", "path defaults to /");
+    checkEq(p3.query, "",  "query empty");
+
+    let p4 = HttpUtil.ParseUrl("http://[::1]:9000/v1");
+    checkEq(p4.host, "::1",  "IPv6 literal host");
+    checkEq(p4.port, 9000,   "IPv6 literal port");
+    checkEq(p4.path, "/v1",  "IPv6 literal path");
+
+    let p5 = HttpUtil.ParseUrl("https://secure.example.com/");
+    checkEq(p5.scheme, "https", "https scheme");
+    checkEq(p5.port,   443,     "port default https");
+
+    check(HttpUtil.ParseUrl("") == nil, "empty url returns nil");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  GET
+// --------------------------------------------------------
+
+fn test_get() {
+    Console.WriteLine("== GET ==");
+
+    let res = Http.Get("http://httpbin.org/get", nil);
+    check(res != nil,                 "get: response not nil");
+    checkEq(statusOf(res), Status.OK, "get: status 200");
+    check(headersOf(res) != nil,      "get: headers present");
+    check(bodyOf(res) != nil,         "get: body present");
+
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        check(json != nil,                        "get: body is valid JSON");
+        checkEq(json.url, "http://httpbin.org/get", "get: url echoed");
+    }
+
+    // Optional headers - omit second arg entirely
+    let res2 = Http.Get("http://httpbin.org/get");
+    check(res2 != nil,                  "get: omitted headers not nil");
+    checkEq(statusOf(res2), Status.OK,  "get: omitted headers status 200");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  GET with custom headers
+// --------------------------------------------------------
+
+fn test_get_headers() {
+    Console.WriteLine("== GET custom headers ==");
+
+    let hdrs = { "X-Test-Header": "flaris123", "Accept": "application/json" };
+    let res  = Http.Get("http://httpbin.org/headers", hdrs);
+    check(res != nil,                 "get headers: response not nil");
+    checkEq(statusOf(res), Status.OK, "get headers: status 200");
+
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        check(json != nil, "get headers: valid JSON");
+        if (json != nil) {
+            checkEq(json.headers["X-Test-Header"], "flaris123", "custom header echoed");
+        }
+    }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  POST
+// --------------------------------------------------------
+
+fn test_post() {
+    Console.WriteLine("== POST ==");
+
+    let payload = Json.Stringify({ name: "flaris", value: 42 });
+    let res     = Http.Post("http://httpbin.org/post", payload, nil);
+    check(res != nil,                 "post: response not nil");
+    checkEq(statusOf(res), Status.OK, "post: status 200");
+
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        check(json != nil, "post: valid JSON response");
+        if (json != nil) {
+            checkEq(json.json.name,  "flaris", "post: body.name echoed");
+            checkEq(json.json.value, 42,       "post: body.value echoed");
+        }
+    }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  PUT
+// --------------------------------------------------------
+
+fn test_put() {
+    Console.WriteLine("== PUT ==");
+
+    let payload = Json.Stringify({ id: 1, updated: true });
+    let res     = Http.Put("http://httpbin.org/put", payload, nil);
+    check(res != nil,                 "put: response not nil");
+    checkEq(statusOf(res), Status.OK, "put: status 200");
+
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        if (json != nil) {
+            check(json.json.updated == true, "put: body echoed");
+        }
+    }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  PATCH
+// --------------------------------------------------------
+
+fn test_patch() {
+    Console.WriteLine("== PATCH ==");
+
+    let payload = Json.Stringify({ field: "value", partial: true });
+    let res     = Http.Patch("http://httpbin.org/patch", payload, nil);
+    check(res != nil,                 "patch: response not nil");
+    checkEq(statusOf(res), Status.OK, "patch: status 200");
+
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        check(json != nil, "patch: valid JSON response");
+        if (json != nil) {
+            check(json.json.partial == true, "patch: body echoed");
+        }
+    }
+
+    // Omit headers
+    let res2 = Http.Patch("http://httpbin.org/patch", payload);
+    check(res2 != nil,                  "patch: omitted headers not nil");
+    checkEq(statusOf(res2), Status.OK,  "patch: omitted headers status 200");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  QUERY (HTTP QUERY method - safe/idempotent request with a body)
+// --------------------------------------------------------
+
+fn test_query_method() {
+    Console.WriteLine("== QUERY ==");
+
+    // QUERY is a new method; most servers (httpbin included) reject it with 405.
+    // The point of this test is that the client TRANSMITS a QUERY request with a
+    // body and gets a real HTTP response back. If a server ever echoes it (200),
+    // we additionally verify the method + body round-trip.
+    let payload = Json.Stringify({ filter: "status:open", limit: 10 });
+    let res     = Http.Query("http://httpbin.org/anything", payload, nil);
+    check(res != nil,          "query: response not nil");
+    check(statusOf(res) > 0,   "query: got a real HTTP status");
+
+    if (res != nil && statusOf(res) == Status.OK) {
+        let json = Json.Parse(res.body);
+        check(json != nil, "query: valid JSON response");
+        if (json != nil) {
+            checkEq(json.method, "QUERY", "query: method echoed as QUERY");
+            check(json.json.limit == 10, "query: body echoed");
+        }
+    }
+
+    // Omit headers - still completes end-to-end.
+    let res2 = Http.Query("http://httpbin.org/anything", payload);
+    check(res2 != nil,        "query: omitted headers not nil");
+    check(statusOf(res2) > 0, "query: omitted headers got a status");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  HEAD
+// --------------------------------------------------------
+
+fn test_head() {
+    Console.WriteLine("== HEAD ==");
+
+    let res = Http.Head("http://httpbin.org/get");
+    check(res != nil,                 "head: response not nil");
+    checkEq(statusOf(res), Status.OK, "head: status 200");
+
+    if (res != nil) {
+        // HEAD must return headers but no body
+        check(res.headers != nil, "head: headers present");
+        check(!("body" in res) || res.body == nil || len(res.body) == 0,
+              "head: body is empty");
+    }
+
+    // 404 via HEAD
+    let r404 = Http.Head("http://httpbin.org/status/404");
+    checkEq(statusOf(r404), Status.NotFound, "head: 404 status");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  DELETE
+// --------------------------------------------------------
+
+fn test_delete() {
+    Console.WriteLine("== DELETE ==");
+
+    let res = Http.Delete("http://httpbin.org/delete", nil);
+    check(res != nil,                 "delete: response not nil");
+    checkEq(statusOf(res), Status.OK, "delete: status 200");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Non-200 status codes
+// --------------------------------------------------------
+
+fn test_status_codes() {
+    Console.WriteLine("== Status codes ==");
+
+    let r404 = Http.Get("http://httpbin.org/status/404", nil);
+    check(r404 != nil,                            "404: response not nil");
+    checkEq(statusOf(r404), Status.NotFound,      "404: status returned");
+
+    let r500 = Http.Get("http://httpbin.org/status/500", nil);
+    check(r500 != nil,                            "500: response not nil");
+    checkEq(statusOf(r500), Status.InternalError, "500: status returned");
+
+    let r401 = Http.Get("http://httpbin.org/status/401", nil);
+    check(r401 != nil,                            "401: response not nil");
+    checkEq(statusOf(r401), Status.Unauthorized,  "401: status returned");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Redirect following
+// --------------------------------------------------------
+
+fn test_redirect() {
+    Console.WriteLine("== Redirect ==");
+
+    let res = Http.Get("http://httpbin.org/redirect/1", nil);
+    check(res != nil,                 "redirect: response not nil");
+    checkEq(statusOf(res), Status.OK, "redirect: followed to 200");
+
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        check(json != nil, "redirect: final response is JSON");
+    }
+
+    // Multi-hop: 3 hops, still within the 5-hop limit
+    let r3 = Http.Get("http://httpbin.org/redirect/3", nil);
+    check(r3 != nil,                   "redirect 3-hop: response not nil");
+    checkEq(statusOf(r3), Status.OK,   "redirect 3-hop: followed to 200");
+
+    // Exceeds limit (> 5 hops) - should return nil
+    let r6 = Http.Get("http://httpbin.org/redirect/6", nil);
+    check(r6 == nil, "redirect 6-hop: exceeds limit returns nil");
+
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Query string in URL
+// --------------------------------------------------------
+
+fn test_query_string() {
+    Console.WriteLine("== Query string ==");
+
+    let res = Http.Get("http://httpbin.org/get?foo=bar&n=42", nil);
+    check(res != nil,                 "query: response not nil");
+    checkEq(statusOf(res), Status.OK, "query: status 200");
+
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        if (json != nil) {
+            checkEq(json.args.foo, "bar", "query: foo=bar echoed");
+            checkEq(json.args.n,   "42",  "query: n=42 echoed");
+        }
+    }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Error paths
+// --------------------------------------------------------
+
+fn test_error_paths() {
+    Console.WriteLine("== Error paths ==");
+
+    let bad = Http.Get("http://this-host-does-not-exist.invalid/", nil);
+    check(bad == nil, "unreachable host returns nil");
+
+    let empty = Http.Get("", nil);
+    check(empty == nil, "empty url returns nil");
+
+    let httpsThrew = false;
+    try {
+        Http.Get("https://example.com/", nil);
+    } catch (e) {
+        httpsThrew = true;
+    }
+    check(httpsThrew, "https throws unsupported error");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Curl (requires curl in PATH)
+// --------------------------------------------------------
+
+fn test_curl() {
+    Console.WriteLine("== Curl ==");
+
+    let res = Http.Curl("http://httpbin.org/get", nil);
+    if (res == nil) {
+        Console.WriteLine("  SKIP: curl not available");
+        return 0;
+    }
+    checkEq(statusOf(res), Status.OK, "curl get: status 200");
+    check(len(res.body) > 0,          "curl get: body not empty");
+
+    let https = Http.Curl("https://httpbin.org/get", nil);
+    check(https != nil,               "curl https: response not nil");
+    checkEq(statusOf(https), Status.OK, "curl https: status 200");
+
+    let payload = Json.Stringify({ From: "flaris" });
+    let post = Http.Curl("http://httpbin.org/post", {
+        method:  "POST",
+        body:    payload,
+        headers: { "Content-Type": ContentType.JSON }
+    });
+    check(post != nil,                "curl post: not nil");
+    checkEq(statusOf(post), Status.OK, "curl post: status 200");
+
+    // PATCH via curl
+    let patchPayload = Json.Stringify({ x: 1 });
+    let patch = Http.Curl("http://httpbin.org/patch", {
+        method: "PATCH",
+        body:   patchPayload,
+        headers: { "Content-Type": ContentType.JSON }
+    });
+    check(patch != nil,               "curl patch: not nil");
+    checkEq(statusOf(patch), Status.OK, "curl patch: status 200");
+
+    let slow = Http.Curl("http://httpbin.org/delay/1", { timeout: 5 });
+    check(slow != nil,                "curl timeout: not nil");
+    checkEq(statusOf(slow), Status.OK, "curl timeout: completes");
+
+    let r404 = Http.Curl("http://httpbin.org/status/404", nil);
+    checkEq(statusOf(r404), Status.NotFound, "curl 404 returned");
+
+    // Omit options
+    let res2 = Http.Curl("http://httpbin.org/get");
+    check(res2 != nil,                "curl: omitted options not nil");
+    checkEq(statusOf(res2), Status.OK, "curl: omitted options status 200");
+
+    return 0;
+}
+
+// --------------------------------------------------------
+//  WGet (requires wget in PATH)
+// --------------------------------------------------------
+
+fn test_wget() {
+    Console.WriteLine("== WGet ==");
+
+    let res = Http.WGet("http://httpbin.org/get", "/tmp/flaris_wget_test.json");
+    if (res == nil) {
+        Console.WriteLine("  SKIP: wget not available");
+        return 0;
+    }
+    checkEq(res.path, "/tmp/flaris_wget_test.json", "wget: path matches dest");
+    checkEq(statusOf(res), Status.OK, "wget: status 200");
+
+    let https = Http.WGet("https://httpbin.org/get", "/tmp/flaris_wget_https.json");
+    check(https != nil,               "wget https: not nil");
+    checkEq(statusOf(https), Status.OK, "wget https: status 200");
+
+    let auto = Http.WGet("http://httpbin.org/json", nil);
+    check(auto != nil, "wget auto-name: not nil");
+
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Async - all six methods
+// --------------------------------------------------------
+
+fn async test_async() {
+    Console.WriteLine("== Async GET ==");
+    let res = await Http.GetAsync("http://httpbin.org/get", nil);
+    check(res != nil,                 "async get: not nil");
+    checkEq(statusOf(res), Status.OK, "async get: status 200");
+    if (res != nil) {
+        let json = Json.Parse(res.body);
+        check(json != nil, "async get: valid JSON");
+    }
+
+    Console.WriteLine("== Async POST ==");
+    let payload = Json.Stringify({ lang: "flaris", isAsync: true });
+    let res2 = await Http.PostAsync("http://httpbin.org/post", payload, nil);
+    check(res2 != nil,                 "async post: not nil");
+    checkEq(statusOf(res2), Status.OK, "async post: status 200");
+    if (res2 != nil) {
+        let json2 = Json.Parse(res2.body);
+        if (json2 != nil) { checkEq(json2.json.lang, "flaris", "async post: body echoed"); }
+    }
+
+    Console.WriteLine("== Async PUT ==");
+    let putPayload = Json.Stringify({ id: 99, isAsync: true });
+    let res3 = await Http.PutAsync("http://httpbin.org/put", putPayload, nil);
+    check(res3 != nil,                 "async put: not nil");
+    checkEq(statusOf(res3), Status.OK, "async put: status 200");
+    if (res3 != nil) {
+        let json3 = Json.Parse(res3.body);
+        if (json3 != nil) { checkEq(json3.json.id, 99, "async put: body echoed"); }
+    }
+
+    Console.WriteLine("== Async PATCH ==");
+    let patchPayload = Json.Stringify({ delta: 5, isAsync: true });
+    let res4 = await Http.PatchAsync("http://httpbin.org/patch", patchPayload, nil);
+    check(res4 != nil,                 "async patch: not nil");
+    checkEq(statusOf(res4), Status.OK, "async patch: status 200");
+    if (res4 != nil) {
+        let json4 = Json.Parse(res4.body);
+        if (json4 != nil) { checkEq(json4.json.delta, 5, "async patch: body echoed"); }
+    }
+
+    Console.WriteLine("== Async DELETE ==");
+    let res5 = await Http.DeleteAsync("http://httpbin.org/delete", nil);
+    check(res5 != nil,                 "async delete: not nil");
+    checkEq(statusOf(res5), Status.OK, "async delete: status 200");
+
+    Console.WriteLine("== Async HEAD ==");
+    let res6 = await Http.HeadAsync("http://httpbin.org/get");
+    check(res6 != nil,                 "async head: not nil");
+    checkEq(statusOf(res6), Status.OK, "async head: status 200");
+    if (res6 != nil) { check(res6.headers != nil, "async head: headers present"); }
+
+    Console.WriteLine("== Async status codes ==");
+    checkEq(statusOf(await Http.GetAsync("http://httpbin.org/status/404", nil)), Status.NotFound, "async 404");
+    checkEq(statusOf(await Http.PostAsync("http://httpbin.org/status/201", "", nil)), Status.Created, "async 201");
+
+    Console.WriteLine("== Async error path ==");
+    let bad = await Http.GetAsync("http://this-host-does-not-exist.invalid/", nil);
+    check(bad == nil, "async: unreachable host returns nil");
+
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Async concurrent
+// --------------------------------------------------------
+
+fn async test_async_concurrent() {
+    Console.WriteLine("== Async concurrent ==");
+
+    let f1 = Http.GetAsync("http://httpbin.org/get",     nil);
+    let f2 = Http.GetAsync("http://httpbin.org/get?n=2", nil);
+    let f3 = Http.GetAsync("http://httpbin.org/get?n=3", nil);
+
+    let r1 = await f1;
+    let r2 = await f2;
+    let r3 = await f3;
+
+    check(r1 != nil,                 "concurrent: r1 not nil");
+    check(r2 != nil,                 "concurrent: r2 not nil");
+    check(r3 != nil,                 "concurrent: r3 not nil");
+    checkEq(statusOf(r1), Status.OK, "concurrent: r1 200");
+    checkEq(statusOf(r2), Status.OK, "concurrent: r2 200");
+    checkEq(statusOf(r3), Status.OK, "concurrent: r3 200");
+
+    if (r2 != nil) {
+        let j2 = Json.Parse(r2.body);
+        if (j2 != nil) { checkEq(j2.args.n, "2", "concurrent: r2 args.n=2"); }
+    }
+    if (r3 != nil) {
+        let j3 = Json.Parse(r3.body);
+        if (j3 != nil) { checkEq(j3.args.n, "3", "concurrent: r3 args.n=3"); }
+    }
+
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Main
+// --------------------------------------------------------
+
+fn async Main() {
+    Console.WriteLine("=== Http.fls test suite ===");
+
+    test_constants();
+    test_parse_url();
+    test_get();
+    test_get_headers();
+    test_post();
+    test_put();
+    test_patch();
+    test_query_method();
+    test_head();
+    test_delete();
+    test_status_codes();
+    test_redirect();
+    test_query_string();
+    test_error_paths();
+    test_curl();
+    test_wget();
+    await test_async();
+    await test_async_concurrent();
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + Convert.ToString(testsRun) + " run, " + Convert.ToString(testsFailed) + " failed.");
+    if (testsFailed == 0) { Console.WriteLine("All tests passed."); }
+    return testsFailed;
+}

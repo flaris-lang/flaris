@@ -1,0 +1,97 @@
+// test_https_builtin.fls - Built-in TLS (no FFI, no -u) smoke test.
+//
+//   flarisvm tests/test_https_builtin.fls --libs='./libs'
+//
+// Verifies that HTTPS works through the built-in Tls module (OS-native TLS:
+// Secure Transport on macOS, dlopen'd OpenSSL on Linux) with no unsafe flag and
+// no compiled plugin. This is the test the Linux Docker image runs.
+//
+// Hard checks (gate the exit code): backend present, GET succeeds, body parses.
+// Cert-verification checks are printed but not gated (they need a reachable
+// badssl.com and are about behaviour, not the build).
+
+import { Https, Status } from library("Https", "1.0");
+
+global fails = 0;
+
+fn check(cond, msg) {
+    if (!cond) { fails += 1; Console.WriteLine("FAIL: ", msg); }
+    else       { Console.WriteLine("ok:   ", msg); }
+}
+
+fn note(cond, msg) {
+    Console.WriteLine(cond ? "ok:   " : "WARN: ", msg);
+}
+
+fn async Main() {
+    Console.WriteLine("=== built-in TLS smoke test (no -u) ===");
+
+    check(Tls.Available(), "built-in TLS backend available");
+
+    let r = Https.Get("https://api.github.com/", { "User-Agent": "flaris-builtin-test" });
+    check(r != nil, "GET https://api.github.com/ returns a response");
+    if (r != nil) {
+        check(r.status == Status.OK, "GET status == 200 (got " + Convert.ToString(r.status) + ")");
+        let j = Json.Parse(r.body);
+        check(j != nil && Object.HasKey(j, "current_user_url"), "response body parses as expected JSON");
+    }
+
+    // Object body must arrive as JSON over TLS.
+    let p = Https.Post("https://postman-echo.com/post", { name: "Linux", n: 3 });
+    if (p != nil) {
+        let pj = Json.Parse(p.body);
+        note(pj != nil && pj.json != nil && pj.json.name == "Linux", "POST object body round-trips as JSON");
+    } else {
+        note(false, "POST round-trip (no network?)");
+    }
+
+    // Certificate + hostname verification (informational; needs badssl.com).
+    let bad = Https.Get("https://wrong.host.badssl.com/");
+    note(bad == nil, "verified GET rejects wrong-hostname cert");
+    let ins = Https.GetInsecure("https://wrong.host.badssl.com/");
+    note(ins != nil, "insecure GET accepts wrong-hostname cert");
+
+    // Async transport round-trip (io-pool offload): ConnectAsync -> WriteAsync ->
+    // ReadLineAsync -> ReadAllAsync directly against a real server.
+    let ah = await Tls.ConnectAsync("api.github.com", 443);
+    check(ah != 0, "ConnectAsync opens a TLS connection");
+    if (ah != 0) {
+        let sent = await Tls.WriteAsync(ah,
+            "GET / HTTP/1.1\r\nHost: api.github.com\r\nUser-Agent: flaris\r\nConnection: close\r\n\r\n");
+        check(sent > 0, "WriteAsync sends the request");
+        let line = await Tls.ReadLineAsync(ah);
+        check(line != nil && String.Contains(line, "200"), "ReadLineAsync reads the 200 status line");
+        let body = await Tls.ReadAllAsync(ah);
+        check(body != nil, "ReadAllAsync reads the body to EOF");
+        Tls.Close(ah);
+    }
+
+    // PeerCert exposes a pinnable fingerprint + subject.
+    let ph = Tls.Connect("api.github.com", 443);
+    if (ph != 0) {
+        let cert = Tls.PeerCert(ph);
+        check(cert != nil && len(cert.sha256) == 64, "PeerCert returns a 64-hex sha256");
+        check(cert != nil && cert.subject != "",     "PeerCert returns a subject");
+        Tls.Close(ph);
+    }
+    // SNI override: a wrong SNI must fail hostname verification.
+    let wrong = Tls.Connect("api.github.com", 443, false, 15000, { sni: "wrong.host.example" });
+    check(wrong == 0, "wrong SNI override rejected by verification");
+
+    // Https.GetAsync drives the async HTTP engine over async TLS: resolves to a
+    // real response, and two started together run concurrently (overlapping I/O).
+    let ar = await Https.GetAsync("https://api.github.com/");
+    check(ar != nil && ar.status == Status.OK, "Https.GetAsync resolves to a 200 response");
+    let ca = Https.GetAsync("https://api.github.com/");
+    let cb = Https.GetAsync("https://api.github.com/");
+    Scheduler.Schedule(ca);
+    Scheduler.Schedule(cb);
+    let cra = await ca;
+    let crb = await cb;
+    check(cra != nil && crb != nil && cra.status == Status.OK && crb.status == Status.OK,
+          "two Https.GetAsync requests run concurrently");
+
+    Console.WriteLine(fails == 0 ? "=== ALL HARD CHECKS PASSED ===" :
+                                   ("=== FAILURES: " + Convert.ToString(fails) + " ==="));
+    return fails;
+}

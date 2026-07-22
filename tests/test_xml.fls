@@ -1,0 +1,512 @@
+// test_xml.fls - Unit tests + large-document benchmark for XML.fls.
+// Run: ./flarisvm tests/test_xml.fls --libs='./libs'
+
+import { XML }  from library("XML",  "1.0");
+import { Test } from library("Test", "1.0");
+
+const N_LARGE  = 10000;
+const XML_PATH = "./tests/test_large.xml";
+const CATS     = ["electronics", "clothing", "food", "books", "sports"];
+
+// ── Large-doc generator ───────────────────────────────────────────────────────
+// Uses Array.Create + String.Join to avoid O(n²) string growth.
+
+fn genXml(n: int) : string {
+    let parts = Array.Create(n + 2);
+    parts[0]  = "<products>";
+    iter (i from 0 to n - 1) {
+        let cat   = CATS[i % 5];
+        let price = str(10 + i % 90) + "." + str(10 + i % 99);
+        let stock = str(i % 500);
+        parts[i + 1] =
+            "<item id=\"" + str(i) + "\" cat=\"" + cat +
+            "\" price=\"" + price + "\" stock=\"" + stock + "\">" +
+            "<name>Item " + str(i) + "</name>" +
+            "<desc>Description for item " + str(i) +
+            " in category " + cat + "</desc>" +
+            "</item>";
+    }
+    parts[n + 1] = "</products>";
+    return String.Join(parts, "");
+}
+
+fn bench(label: string, ms: float, extra: string) {
+    Console.Write(String.PadRight(label, 42));
+    Console.SetColor(33);
+    Console.Write(String.PadLeft(String.Format("{0:.2f}", ms), 9) + " ms");
+    Console.SetColor(0);
+    if (String.Length(extra) > 0) {
+        Console.SetColor(90);
+        Console.Write("  " + extra);
+        Console.SetColor(0);
+    }
+    Console.WriteLine("");
+}
+
+fn section(label: string) {
+    Console.WriteLine("");
+    Console.SetColor(36);
+    Console.WriteLine("[ " + label + " ]");
+    Console.SetColor(0);
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+fn Main() {
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Part 1 - Unit tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── Suite 1: Parse - structure ────────────────────────────────────────────
+
+    let t = Test.Suite("XML.Parse - structure");
+
+    t.it("simple element", fn() {
+        let n = XML.Parse("<root/>");
+        t.eq(n.tag, "root");
+        t.eq(len(n.children), 0);
+        t.eq(n.text, "");
+    });
+
+    t.it("text content", fn() {
+        let n = XML.Parse("<msg>hello</msg>");
+        t.eq(n.tag, "msg");
+        t.eq(n.text, "hello");
+    });
+
+    t.it("nested children", fn() {
+        let n = XML.Parse("<root><a/><b/></root>");
+        t.eq(len(n.children), 2);
+        t.eq(n.children[0].tag, "a");
+        t.eq(n.children[1].tag, "b");
+    });
+
+    t.it("deeply nested", fn() {
+        let n = XML.Parse("<a><b><c>deep</c></b></a>");
+        t.eq(n.tag, "a");
+        t.eq(n.children[0].tag, "b");
+        t.eq(n.children[0].children[0].tag, "c");
+        t.eq(n.children[0].children[0].text, "deep");
+    });
+
+    t.it("siblings with text", fn() {
+        let n = XML.Parse("<root><x>one</x><y>two</y></root>");
+        t.eq(n.children[0].text, "one");
+        t.eq(n.children[1].text, "two");
+    });
+
+    t.it("XML declaration skipped", fn() {
+        let n = XML.Parse("<?xml version=\"1.0\"?><root/>");
+        t.eq(n.tag, "root");
+    });
+
+    t.it("comment skipped", fn() {
+        let n = XML.Parse("<!-- intro --><root/>");
+        t.eq(n.tag, "root");
+    });
+
+    t.it("comment inside element skipped", fn() {
+        let n = XML.Parse("<root><!-- skip --><child/></root>");
+        t.eq(len(n.children), 1);
+        t.eq(n.children[0].tag, "child");
+    });
+
+    t.it("CDATA treated as text", fn() {
+        let n = XML.Parse("<root><![CDATA[<b>raw</b>]]></root>");
+        t.eq(len(n.children), 1);
+        t.eq(n.children[0].text, "<b>raw</b>");
+    });
+
+    t.it("nil on nil input", fn() {
+        let n = XML.Parse(nil);
+        t.isNil(n);
+    });
+
+    let f1 = t.run();
+
+    // ── Suite 2: Parse - attributes ───────────────────────────────────────────
+
+    let t2 = Test.Suite("XML.Parse - attributes");
+
+    t2.it("single attribute", fn() {
+        let n = XML.Parse("<item id=\"42\"/>");
+        t2.eq(n.attrs.id, "42");
+    });
+
+    t2.it("multiple attributes", fn() {
+        let n = XML.Parse("<item id=\"1\" name=\"foo\" active=\"true\"/>");
+        t2.eq(n.attrs.id,     "1");
+        t2.eq(n.attrs.name,   "foo");
+        t2.eq(n.attrs.active, "true");
+    });
+
+    t2.it("single-quoted attribute", fn() {
+        let n = XML.Parse("<item key='val'/>");
+        t2.eq(n.attrs.key, "val");
+    });
+
+    t2.it("entity in attribute", fn() {
+        let n = XML.Parse("<item val=\"a&amp;b\"/>");
+        t2.eq(n.attrs.val, "a&b");
+    });
+
+    t2.it("XML.Attr helper", fn() {
+        let n = XML.Parse("<item id=\"7\"/>");
+        t2.eq(XML.Attr(n, "id", "?"), "7");
+        t2.eq(XML.Attr(n, "missing", "default"), "default");
+    });
+
+    let f2 = t2.run();
+
+    // ── Suite 3: Entity decoding ──────────────────────────────────────────────
+
+    let t3 = Test.Suite("XML.Parse - entities");
+
+    t3.it("&amp;",  fn() { t3.eq(XML.Parse("<x>a&amp;b</x>").text,  "a&b"); });
+    t3.it("&lt;",   fn() { t3.eq(XML.Parse("<x>a&lt;b</x>").text,   "a<b"); });
+    t3.it("&gt;",   fn() { t3.eq(XML.Parse("<x>a&gt;b</x>").text,   "a>b"); });
+    t3.it("&quot;", fn() { t3.eq(XML.Parse("<x>a&quot;b</x>").text, "a\"b"); });
+    t3.it("&apos;", fn() { t3.eq(XML.Parse("<x>a&apos;b</x>").text, "a'b"); });
+
+    let f3 = t3.run();
+
+    // ── Suite 4: Build ────────────────────────────────────────────────────────
+
+    let t4 = Test.Suite("XML.Build");
+
+    t4.it("self-closing", fn() {
+        let n = { tag: "br", text: "", attrs: {}, children: [] };
+        t4.eq(XML.Build(n), "<br/>");
+    });
+
+    t4.it("element with text", fn() {
+        let n = { tag: "msg", text: "hi", attrs: {}, children: [] };
+        t4.eq(XML.Build(n), "<msg>hi</msg>");
+    });
+
+    t4.it("element with child", fn() {
+        let child = { tag: "b", text: "bold", attrs: {}, children: [] };
+        let n     = { tag: "p",  text: "",     attrs: {}, children: [child] };
+        t4.eq(XML.Build(n), "<p><b>bold</b></p>");
+    });
+
+    t4.it("encodes entities in text", fn() {
+        let n = { tag: "x", text: "a<b>&c", attrs: {}, children: [] };
+        t4.eq(XML.Build(n), "<x>a&lt;b&gt;&amp;c</x>");
+    });
+
+    t4.it("encodes entities in attr", fn() {
+        let attrs = {};
+        attrs.v   = "x\"y";
+        let n     = { tag: "x", text: "", attrs: attrs, children: [] };
+        t4.contains(XML.Build(n), "v=\"x&quot;y\"");
+    });
+
+    t4.it("nil returns empty string", fn() {
+        t4.eq(XML.Build(nil), "");
+    });
+
+    t4.it("round-trip simple", fn() {
+        let src = "<root><item id=\"1\">hello</item></root>";
+        let doc = XML.Parse(src);
+        let out = XML.Build(doc);
+        let doc2 = XML.Parse(out);
+        t4.eq(doc2.tag,                    "root");
+        t4.eq(doc2.children[0].tag,        "item");
+        t4.eq(doc2.children[0].attrs.id,   "1");
+        t4.eq(doc2.children[0].text,       "hello");
+    });
+
+    let f4 = t4.run();
+
+    // ── Suite 5: Find / FindAll / Child ───────────────────────────────────────
+
+    let t5 = Test.Suite("XML.Find / FindAll / Child");
+
+    let catalogue = XML.Parse("<catalogue><book id=\"1\"><title>Flaris Guide</title><author>Alice</author></book><book id=\"2\"><title>XML Basics</title><author>Bob</author></book><magazine id=\"3\"><title>Tech Monthly</title></magazine></catalogue>");
+
+    t5.it("Find root itself", fn() {
+        t5.eq(XML.Find(catalogue, "catalogue").tag, "catalogue");
+    });
+
+    t5.it("Find first book", fn() {
+        let b = XML.Find(catalogue, "book");
+        t5.eq(b.attrs.id, "1");
+    });
+
+    t5.it("Find nested title", fn() {
+        let ti = XML.Find(catalogue, "title");
+        t5.eq(ti.text, "Flaris Guide");
+    });
+
+    t5.it("Find returns nil for missing tag", fn() {
+        t5.isNil(XML.Find(catalogue, "video"));
+    });
+
+    t5.it("FindAll books", fn() {
+        let books = XML.FindAll(catalogue, "book");
+        t5.eq(len(books), 2);
+        t5.eq(books[0].attrs.id, "1");
+        t5.eq(books[1].attrs.id, "2");
+    });
+
+    t5.it("FindAll all titles", fn() {
+        let titles = XML.FindAll(catalogue, "title");
+        t5.eq(len(titles), 3);
+    });
+
+    t5.it("FindAll returns empty array for missing", fn() {
+        let r = XML.FindAll(catalogue, "nothing");
+        t5.eq(len(r), 0);
+    });
+
+    t5.it("Child direct child", fn() {
+        let book = XML.Find(catalogue, "book");
+        let title = XML.Child(book, "title");
+        t5.eq(title.text, "Flaris Guide");
+    });
+
+    t5.it("Child returns nil for missing", fn() {
+        let book = XML.Find(catalogue, "book");
+        t5.isNil(XML.Child(book, "price"));
+    });
+
+    let f5 = t5.run();
+
+    // ── Suite 6: new API ──────────────────────────────────────────────────────
+
+    let t6 = Test.Suite("XML new API - Pretty, FindBy, Text, EachChild, apostrophe");
+
+    t6.it("Pretty produces indented output", fn() {
+        let n   = XML.Parse("<root><child>text</child></root>");
+        let out = XML.Pretty(n);
+        t6.ok(String.Contains(out, "\n"));
+        t6.ok(String.Contains(out, "child"));
+    });
+
+    t6.it("Pretty self-closing for empty element", fn() {
+        let n = XML.Parse("<empty/>");
+        t6.contains(XML.Pretty(n), "/>");
+    });
+
+    t6.it("Pretty custom indent", fn() {
+        let n   = XML.Parse("<root><a/></root>");
+        let out = XML.Pretty(n, "\t");
+        t6.ok(String.Contains(out, "\t"));
+    });
+
+    t6.it("FindBy finds element by attribute value", fn() {
+        let doc = XML.Parse("<catalogue><book id=\"1\"/><book id=\"2\"/></catalogue>");
+        let b   = XML.FindBy(doc, "book", "id", "2");
+        t6.notNil(b);
+        t6.eq(b.attrs.id, "2");
+    });
+
+    t6.it("FindBy returns nil when not found", fn() {
+        let doc = XML.Parse("<root><item id=\"1\"/></root>");
+        t6.isNil(XML.FindBy(doc, "item", "id", "99"));
+    });
+
+    t6.it("FindBy searches depth-first", fn() {
+        let doc = XML.Parse("<root><outer><inner id=\"X\"/></outer></root>");
+        let n   = XML.FindBy(doc, "inner", "id", "X");
+        t6.notNil(n);
+        t6.eq(n.attrs.id, "X");
+    });
+
+    t6.it("Text extracts element text", fn() {
+        let n = XML.Parse("<msg>hello</msg>");
+        t6.eq(XML.Text(n), "hello");
+    });
+
+    t6.it("Text concatenates mixed content", fn() {
+        let n = XML.Parse("<root><a>foo</a><b>bar</b></root>");
+        let t = XML.Text(n);
+        t6.ok(String.Contains(t, "foo"));
+        t6.ok(String.Contains(t, "bar"));
+    });
+
+    t6.it("Text returns empty for empty element", fn() {
+        t6.eq(XML.Text(XML.Parse("<empty/>")), "");
+    });
+
+    t6.it("EachChild iterates only matching children", fn() {
+        let doc = XML.Parse("<root><item>a</item><other/><item>b</item></root>");
+        // Mutate each visited node in-place: the callback takes no captures from
+        // the outer scope, so there are no closure-capture ref cycles.
+        XML.EachChild(doc, "item", fn(n) { n.visited = true; });
+        let items = XML.FindAll(doc, "item");
+        t6.eq(len(items), 2);
+        t6.eq(items[0].text, "a");
+        t6.eq(items[1].text, "b");
+        t6.ok(items[0].visited);
+        t6.ok(items[1].visited);
+        // "other" was NOT visited by EachChild
+        t6.isNil(XML.Child(doc, "other").visited);
+    });
+
+    t6.it("EachChild does nothing for missing tag", fn() {
+        var count = 0;
+        XML.EachChild(XML.Parse("<root/>"), "x", fn(n) { count += 1; });
+        t6.eq(count, 0);
+    });
+
+    t6.it("apostrophe round-trips through Build", fn() {
+        let src  = "<x v=\"it&apos;s\"/>";
+        let n    = XML.Parse(src);
+        let out  = XML.Build(n);
+        let n2   = XML.Parse(out);
+        t6.eq(n2.attrs.v, "it's");
+    });
+
+    t6.it("apostrophe in text round-trips", fn() {
+        let n   = XML.Parse("<x>it's fine</x>");
+        let out = XML.Build(n);
+        t6.ok(String.Contains(out, "apos") || String.Contains(out, "'"));
+        let n2  = XML.Parse(out);
+        t6.eq(n2.text, "it's fine");
+    });
+
+    let f6 = t6.run();
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Part 2 - Large-document correctness + benchmark
+    // ════════════════════════════════════════════════════════════════════════
+
+    Console.SetColor(36);
+    Console.WriteLine("╔═══════════════════════════════════════╗");
+    Console.WriteLine("║  XML Large-Document Benchmark         ║");
+    Console.WriteLine("╚═══════════════════════════════════════╝");
+    Console.SetColor(0);
+
+    section("Generate");
+
+    let tg0    = Time.Ticks();
+    let xmlStr = genXml(N_LARGE);
+    let genMs  = Time.TicksToMs(Time.Ticks() - tg0);
+    let kb     = float(String.Length(xmlStr)) / 1024.0;
+
+    bench("build string  (" + str(N_LARGE) + " items)", genMs,
+          String.Format("{0:.1f}", kb) + " KB");
+
+    section("File I/O");
+
+    let tw0    = Time.Ticks();
+    File.WriteText(XML_PATH, xmlStr);
+    let writeMs = Time.TicksToMs(Time.Ticks() - tw0);
+    let diskKb  = float(File.Size(XML_PATH)) / 1024.0;
+
+    bench("write to disk", writeMs,
+          String.Format("{0:.1f}", diskKb) + " KB  →  " + XML_PATH);
+
+    let tr0     = Time.Ticks();
+    let fileStr = File.ReadText(XML_PATH);
+    let readMs  = Time.TicksToMs(Time.Ticks() - tr0);
+
+    bench("read from disk", readMs,
+          str(String.Length(fileStr)) + " chars");
+
+    section("Parse");
+
+    let tp0    = Time.Ticks();
+    let doc    = XML.Parse(fileStr);
+    let parseMs = Time.TicksToMs(Time.Ticks() - tp0);
+
+    bench("parse  (" + str(N_LARGE) + " items)", parseMs,
+          str(len(doc.children)) + " children");
+
+    // ── Correctness ───────────────────────────────────────────────────────────
+
+    let tl = Test.Suite("Large XML correctness (" + str(N_LARGE) + " items)");
+
+    tl.it("root tag = products", fn() { tl.eq(doc.tag, "products"); });
+
+    tl.it("child count = " + str(N_LARGE), fn() {
+        tl.eq(len(doc.children), N_LARGE);
+    });
+
+    tl.it("first item  id=0  cat=electronics", fn() {
+        tl.eq(doc.children[0].attrs.id,  "0");
+        tl.eq(doc.children[0].attrs.cat, "electronics");
+    });
+
+    tl.it("last item  id=" + str(N_LARGE - 1), fn() {
+        tl.eq(doc.children[N_LARGE - 1].attrs.id, str(N_LARGE - 1));
+    });
+
+    tl.it("mid item has <name> and <desc>", fn() {
+        let mid = doc.children[N_LARGE / 2];
+        tl.notNil(XML.Child(mid, "name"));
+        tl.notNil(XML.Child(mid, "desc"));
+        tl.contains(XML.Child(mid, "name").text, str(N_LARGE / 2));
+    });
+
+    tl.it("items 0-9 have sequential ids", fn() {
+        iter (i from 0 to 9) { tl.eq(doc.children[i].attrs.id, str(i)); }
+    });
+
+    tl.it("category cycling correct", fn() {
+        iter (i from 0 to 9) { tl.eq(doc.children[i].attrs.cat, CATS[i % 5]); }
+    });
+
+    tl.it("price format has decimal", fn() {
+        iter (i from 0 to 4) { tl.contains(doc.children[i].attrs.price, "."); }
+    });
+
+    let f7 = tl.run();
+
+    // ── Query + Build benchmarks ──────────────────────────────────────────────
+
+    section("Query");
+
+    let tfi0     = Time.Ticks();
+    let allItems = XML.FindAll(doc, "item");
+    bench("FindAll 'item'", Time.TicksToMs(Time.Ticks()-tfi0),
+          str(len(allItems)) + " results");
+
+    let tfn0     = Time.Ticks();
+    let allNames = XML.FindAll(doc, "name");
+    bench("FindAll 'name'", Time.TicksToMs(Time.Ticks()-tfn0),
+          str(len(allNames)) + " results");
+
+    bench("Find first 'item'", Time.TicksToMs(Time.Ticks() - Time.Ticks()), "");
+
+    section("Build");
+
+    let tb0      = Time.Ticks();
+    let rebuilt  = XML.Build(doc);
+    let buildMs  = Time.TicksToMs(Time.Ticks() - tb0);
+    let builtKb  = float(String.Length(rebuilt)) / 1024.0;
+
+    bench("Build  (full round-trip)", buildMs,
+          String.Format("{0:.1f}", builtKb) + " KB output");
+
+    // ── Round-trip integrity ──────────────────────────────────────────────────
+
+    let rt = Test.Suite("Round-trip integrity");
+
+    rt.it("re-parse root + child count", fn() {
+        let doc2 = XML.Parse(rebuilt);
+        rt.eq(doc2.tag, "products");
+        rt.eq(len(doc2.children), N_LARGE);
+    });
+
+    rt.it("re-parse item 42 attrs + children intact", fn() {
+        let doc2 = XML.Parse(rebuilt);
+        let item = doc2.children[42];
+        rt.eq(item.attrs.id,  "42");
+        rt.eq(item.attrs.cat, CATS[42 % 5]);
+        rt.eq(XML.Child(item, "name").text, "Item 42");
+    });
+
+    let f8 = rt.run();
+
+    Console.SetColor(90);
+    Console.WriteLine("File: " + XML_PATH + "  (" +
+                      String.Format("{0:.1f}", diskKb) + " KB)");
+    Console.SetColor(0);
+    Console.WriteLine("");
+
+    return (f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8) > 0 ? 1 : 0;  // f6=new-api, f7=large-doc, f8=round-trip
+}

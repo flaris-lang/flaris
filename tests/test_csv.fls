@@ -1,0 +1,602 @@
+// test_csv.fls - Test suite for CSV.fls
+// Run: flarisvm tests/test_csv.fls --libs='./libs'
+
+import { CSV } from library("CSV", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn chk(label:string, cond:bool) {
+    if (cond) {
+        passed += 1;
+    } else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label);
+    }
+}
+
+fn chkEq(label:string, got, expected) {
+    if (got == expected) {
+        passed += 1;
+    } else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label + " - expected: " + str(expected) + "  got: " + str(got));
+    }
+}
+
+// ============================================================
+// ParseLine
+// ============================================================
+
+fn testParseLine() {
+    Console.WriteLine("--- ParseLine ---");
+
+    let r1 = CSV.ParseLine("a,b,c");
+    chkEq("ParseLine basic len",   len(r1), 3);
+    chkEq("ParseLine [0]",         r1[0], "a");
+    chkEq("ParseLine [2]",         r1[2], "c");
+
+    let r2 = CSV.ParseLine("1,,3");
+    chkEq("ParseLine empty field len", len(r2), 3);
+    chkEq("ParseLine empty field [1]", r2[1], "");
+
+    let r3 = CSV.ParseLine("\"hello, world\",ok");
+    chkEq("ParseLine quoted comma len",  len(r3), 2);
+    chkEq("ParseLine quoted comma [0]",  r3[0], "hello, world");
+    chkEq("ParseLine quoted comma [1]",  r3[1], "ok");
+
+    let r4 = CSV.ParseLine("\"say \"\"hi\"\"\",end");
+    chkEq("ParseLine escaped quote len", len(r4), 2);
+    chkEq("ParseLine escaped quote [0]", r4[0], "say \"hi\"");
+
+    let r5 = CSV.ParseLine("a\tb\tc", "\t");
+    chkEq("ParseLine TSV len", len(r5), 3);
+    chkEq("ParseLine TSV [1]", r5[1], "b");
+}
+
+// ============================================================
+// Parse - arrays
+// ============================================================
+
+fn testParseArrays() {
+    Console.WriteLine("--- Parse (arrays) ---");
+
+    let src = "1,2,3\n4,5,6\n";
+    let rows = CSV.Parse(src);
+    chkEq("Parse rows len", len(rows), 2);
+    chkEq("Parse [0][0]",   rows[0][0], "1");
+    chkEq("Parse [1][2]",   rows[1][2], "6");
+
+    // CRLF line endings
+    let crlf = "a,b\r\nc,d\r\n";
+    let cr = CSV.Parse(crlf);
+    chkEq("Parse CRLF rows", len(cr), 2);
+    chkEq("Parse CRLF [1][0]", cr[1][0], "c");
+
+    // Quoted newline inside field
+    let qnl = "\"line1\nline2\",end\n";
+    let qr = CSV.Parse(qnl);
+    chkEq("Parse quoted newline rows", len(qr), 1);
+    chkEq("Parse quoted newline [0][0]", qr[0][0], "line1\nline2");
+    chkEq("Parse quoted newline [0][1]", qr[0][1], "end");
+
+    // Blank lines are skipped
+    let blanks = "a,b\n\n\nc,d\n";
+    let br = CSV.Parse(blanks);
+    chkEq("Parse skip blank lines", len(br), 2);
+
+    // Trim option
+    let trimSrc = " hello , world \n";
+    let tr = CSV.Parse(trimSrc, { trim: true });
+    chkEq("Parse trim [0][0]", tr[0][0], "hello");
+    chkEq("Parse trim [0][1]", tr[0][1], "world");
+
+    // Custom delimiter
+    let pipe = "a|b|c\n1|2|3\n";
+    let pr = CSV.Parse(pipe, { delimiter: "|" });
+    chkEq("Parse pipe delim len",   len(pr), 2);
+    chkEq("Parse pipe delim [0][1]", pr[0][1], "b");
+}
+
+// ============================================================
+// Parse - with headers
+// ============================================================
+
+fn testParseHeaders() {
+    Console.WriteLine("--- Parse (headers) ---");
+
+    let src = "name,age,city\nAlice,30,Stockholm\nBob,25,Gothenburg\n";
+    let rows = CSV.Parse(src, { headers: true });
+
+    chkEq("Parse hdrs len",        len(rows), 2);
+    chkEq("Parse hdrs [0].name",   rows[0].name, "Alice");
+    chkEq("Parse hdrs [0].age",    rows[0].age, "30");
+    chkEq("Parse hdrs [1].city",   rows[1].city, "Gothenburg");
+
+    // Missing trailing fields become ""
+    let short = "a,b,c\n1,2\n";
+    let sr = CSV.Parse(short, { headers: true });
+    chkEq("Parse hdrs short row len", len(sr), 1);
+    chkEq("Parse hdrs short [0].c",   sr[0].c, "");
+}
+
+// ============================================================
+// Stringify - arrays
+// ============================================================
+
+fn testStringifyArrays() {
+    Console.WriteLine("--- Stringify (arrays) ---");
+
+    let rows = [["a", "b", "c"], ["1", "2", "3"]];
+    let out  = CSV.Stringify(rows);
+    chkEq("Stringify arrays basic", out, "a,b,c\n1,2,3\n");
+
+    // Minimal quoting: field with comma gets quoted
+    let r2 = [["hello, world", "ok"]];
+    let o2 = CSV.Stringify(r2);
+    chkEq("Stringify quote comma", o2, "\"hello, world\",ok\n");
+
+    // Embedded quote gets doubled
+    let r3 = [["say \"hi\""]];
+    let o3 = CSV.Stringify(r3);
+    chkEq("Stringify double quote", o3, "\"say \"\"hi\"\"\"\n");
+
+    // Plain values that don't need quoting are not quoted
+    let r4 = [["simple", "123", "ok"]];
+    let o4 = CSV.Stringify(r4);
+    chkEq("Stringify no unnecessary quotes", o4, "simple,123,ok\n");
+
+    // Empty string
+    chkEq("Stringify empty input", CSV.Stringify([]), "");
+
+    // Custom delimiter
+    let r5 = [["a", "b"], ["1", "2"]];
+    let o5 = CSV.Stringify(r5, { delimiter: "\t" });
+    chkEq("Stringify TSV", o5, "a\tb\n1\t2\n");
+}
+
+// ============================================================
+// Stringify - objects (with auto-detected headers)
+// ============================================================
+
+fn testStringifyObjects() {
+    Console.WriteLine("--- Stringify (objects) ---");
+
+    let rows = [
+        { name: "Alice", age: 30 },
+        { name: "Bob",   age: 25 }
+    ];
+    let out = CSV.Stringify(rows);
+
+    // Header line must be present, data rows must follow
+    let lines = String.SplitLines(String.Trim(out));
+    chkEq("Stringify objs line count", len(lines), 3);
+
+    // Explicit header order
+    let out2 = CSV.Stringify(rows, { headers: ["age", "name"] });
+    let lines2 = String.SplitLines(String.Trim(out2));
+    chkEq("Stringify objs explicit hdr line 0", lines2[0], "age,name");
+    chkEq("Stringify objs explicit hdr line 1", lines2[1], "30,Alice");
+
+    // nil field becomes empty string
+    let r3 = [{ a: "x", b: nil }];
+    let o3 = CSV.Stringify(r3, { headers: ["a", "b"] });
+    chkEq("Stringify nil field", o3, "a,b\nx,\n");
+}
+
+// ============================================================
+// Round-trip: Parse(Stringify(x)) == x
+// ============================================================
+
+fn testRoundTrip() {
+    Console.WriteLine("--- Round-trip ---");
+
+    // Arrays
+    let orig = [["Alice", "30", "Stockholm"], ["Bob", "25", "Gothenburg"]];
+    let rt   = CSV.Parse(CSV.Stringify(orig));
+    chkEq("Round-trip arrays rows", len(rt), 2);
+    chkEq("Round-trip arrays [0][0]", rt[0][0], "Alice");
+    chkEq("Round-trip arrays [1][1]", rt[1][1], "25");
+
+    // Objects
+    let objs = [{ name: "Alice", score: "100" }, { name: "Bob", score: "42" }];
+    let rt2  = CSV.Parse(CSV.Stringify(objs), { headers: true });
+    chkEq("Round-trip objs len",          len(rt2), 2);
+    chkEq("Round-trip objs [0].name",     rt2[0].name, "Alice");
+    chkEq("Round-trip objs [1].score",    rt2[1].score, "42");
+
+    // Field with embedded comma survives round-trip
+    let tricky = [["hello, world", "ok"]];
+    let rt3 = CSV.Parse(CSV.Stringify(tricky));
+    chkEq("Round-trip comma field", rt3[0][0], "hello, world");
+
+    // Field with embedded quote survives round-trip
+    let q = [["say \"hi\"", "done"]];
+    let rt4 = CSV.Parse(CSV.Stringify(q));
+    chkEq("Round-trip quote field", rt4[0][0], "say \"hi\"");
+}
+
+// ============================================================
+// File round-trip (write then read back)
+// ============================================================
+
+fn testFileRoundTrip() {
+    Console.WriteLine("--- File round-trip ---");
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_test.csv");
+    let rows = [
+        { city: "Stockholm", pop: "975000" },
+        { city: "Gothenburg", pop: "590000" }
+    ];
+
+    let ok = CSV.WriteFile(path, rows);
+    chk("WriteFile returns true", ok == true);
+
+    let back = CSV.ParseFile(path, { headers: true });
+    chkEq("ParseFile len",          len(back), 2);
+    chkEq("ParseFile [0].city",     back[0].city, "Stockholm");
+    chkEq("ParseFile [1].pop",      back[1].pop, "590000");
+}
+
+// ============================================================
+// Type coercion (opts.types)
+// ============================================================
+
+fn testTypes() {
+    Console.WriteLine("--- Type coercion ---");
+
+    let src = "name,age,score,active\nAlice,30,9.5,true\nBob,25,7.0,false\n";
+    let rows = CSV.Parse(src, { headers: true, types: true });
+
+    chkEq("types len",               len(rows), 2);
+    chkEq("types int age",           type(rows[0].age),    Type.Int);
+    chkEq("types int value",         rows[0].age,          30);
+    chkEq("types float score",       type(rows[0].score),  Type.Float);
+    chkEq("types float value",       rows[0].score,        9.5);
+    chkEq("types bool true",         rows[0].active,       true);
+    chkEq("types bool false",        rows[1].active,       false);
+    chkEq("types string name",       type(rows[0].name),   Type.String);
+
+    // Arrays mode with types
+    let grid = CSV.Parse("1,2.5,true\n3,4.0,false\n", { types: true });
+    chkEq("types array int",         type(grid[0][0]), Type.Int);
+    chkEq("types array float",       type(grid[0][1]), Type.Float);
+    chkEq("types array bool",        type(grid[0][2]), Type.Bool);
+    chkEq("types array int value",   grid[0][0],       1);
+    chkEq("types array float value", grid[0][1],       2.5);
+
+    // Empty field stays string even with types:true
+    let e = CSV.Parse(",1\n", { types: true });
+    chkEq("types empty field",       e[0][0], "");
+    chkEq("types non-empty coerced", e[0][1], 1);
+
+    // Negative numbers
+    let neg = CSV.Parse("-5,-1.5\n", { types: true });
+    chkEq("types neg int",   neg[0][0], -5);
+    chkEq("types neg float", neg[0][1], -1.5);
+}
+
+// ============================================================
+// Comment skipping (opts.comment)
+// ============================================================
+
+fn testComments() {
+    Console.WriteLine("--- Comment skipping ---");
+
+    let src = "# this is a comment\na,b\n# another comment\n1,2\n3,4\n";
+    let rows = CSV.Parse(src, { comment: "#" });
+    chkEq("comment rows len",  len(rows), 3);  // header row + 2 data rows, all as arrays
+    chkEq("comment row0 [0]",  rows[0][0], "a");
+    chkEq("comment row1 [0]",  rows[1][0], "1");
+
+    // With headers
+    let src2 = "# metadata\nname,age\n# separator\nAlice,30\n";
+    let rows2 = CSV.Parse(src2, { headers: true, comment: "#" });
+    chkEq("comment+headers len",        len(rows2), 1);
+    chkEq("comment+headers [0].name",   rows2[0].name, "Alice");
+    chkEq("comment+headers [0].age",    rows2[0].age, "30");
+
+    // Comment char only skips lines that START with it
+    let src3 = "ha#sh,ok\n";
+    let rows3 = CSV.Parse(src3, { comment: "#" });
+    chkEq("comment mid-field not skipped", len(rows3), 1);
+    chkEq("comment mid-field value",       rows3[0][0], "ha#sh");
+}
+
+// ============================================================
+// ForEach - streaming callback
+// ============================================================
+
+fn testForEach() {
+    Console.WriteLine("--- ForEach ---");
+
+    // Use array to accumulate - closures capture locals by value in Flaris
+    let src = "a,b\n1,2\n3,4\n5,6\n";
+    let acc = [0, 0];   // [count, sum_of_field_counts]
+    CSV.ForEach(src, fn(row) {
+        acc[0] += 1;
+        acc[1] += len(row);
+    });
+    chkEq("ForEach count",      acc[0], 4);   // "a,b" + "1,2" + "3,4" + "5,6"
+    chkEq("ForEach sum fields", acc[1], 8);   // 4 rows × 2 fields
+
+    // With headers - rows arrive as objects
+    let names = [];
+    CSV.ForEach("name,age\nAlice,30\nBob,25\n", fn(row) {
+        Array.Append(names, row.name);
+    }, { headers: true });
+    chkEq("ForEach with headers len",    len(names), 2);
+    chkEq("ForEach with headers [0]",    names[0],   "Alice");
+
+    // With types
+    let ints = [];
+    CSV.ForEach("1\n2\n3\n", fn(row) {
+        Array.Append(ints, row[0]);
+    }, { types: true });
+    chkEq("ForEach types len",   len(ints),    3);
+    chkEq("ForEach types value", ints[0],      1);
+    chkEq("ForEach types type",  type(ints[0]), Type.Int);
+}
+
+// ============================================================
+// Head - first N rows
+// ============================================================
+
+fn testHead() {
+    Console.WriteLine("--- Head ---");
+
+    let src = "a,b\n1,2\n3,4\n5,6\n7,8\n";
+
+    let h2 = CSV.Head(src, 2);
+    chkEq("Head(2) len",     len(h2), 2);
+    chkEq("Head(2) [0][0]",  h2[0][0], "a");
+    chkEq("Head(2) [1][0]",  h2[1][0], "1");
+
+    // Head with headers option - header row doesn't count against limit
+    let h1 = CSV.Head(src, 1, { headers: true });
+    chkEq("Head(1,headers) len",       len(h1), 1);
+    chkEq("Head(1,headers) [0].a",     h1[0].a, "1");
+
+    // Head larger than file returns everything (src has 5 rows: a,b / 1,2 / 3,4 / 5,6 / 7,8)
+    let hAll = CSV.Head(src, 100);
+    chkEq("Head(100) capped at file",  len(hAll), 5);
+
+    // Head(0) returns nothing
+    let h0 = CSV.Head(src, 0);
+    chkEq("Head(0) empty",   len(h0), 0);
+}
+
+// ============================================================
+// AppendFile
+// ============================================================
+
+fn testAppendFile() {
+    Console.WriteLine("--- AppendFile ---");
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_append_test.csv");
+
+    // Remove any leftover file from a previous run
+    try { File.Delete(path); } catch (e) {}
+
+    let rows1 = [{ city: "Stockholm", pop: "975000" }];
+    let rows2 = [{ city: "Gothenburg", pop: "590000" }];
+    let rows3 = [{ city: "Malmoe", pop: "350000" }];
+
+    // First write - creates file with header
+    CSV.WriteFile(path, rows1);
+    let after1 = CSV.ParseFile(path, { headers: true });
+    chkEq("AppendFile first write len",     len(after1), 1);
+    chkEq("AppendFile first write city",    after1[0].city, "Stockholm");
+
+    // AppendFile should add a row without duplicating the header
+    CSV.AppendFile(path, rows2);
+    let after2 = CSV.ParseFile(path, { headers: true });
+    chkEq("AppendFile after append len",    len(after2), 2);
+    chkEq("AppendFile appended row city",   after2[1].city, "Gothenburg");
+    chkEq("AppendFile first row unchanged", after2[0].city, "Stockholm");
+
+    // Second append
+    CSV.AppendFile(path, rows3);
+    let after3 = CSV.ParseFile(path, { headers: true });
+    chkEq("AppendFile two appends len",     len(after3), 3);
+    chkEq("AppendFile second append city",  after3[2].city, "Malmoe");
+
+    // AppendFile to non-existent file creates it (with header)
+    let path2 = Path.Combine(Os.TempDir(), "_flaris_csv_append_new.csv");
+    try { File.Delete(path2); } catch (e) {}
+    CSV.AppendFile(path2, [{ a: "1", b: "2" }]);
+    let newFile = CSV.ParseFile(path2, { headers: true });
+    chkEq("AppendFile creates new file len", len(newFile), 1);
+    chkEq("AppendFile creates new file [0].a", newFile[0].a, "1");
+}
+
+// ============================================================
+// ForEachFile
+// ============================================================
+
+fn testForEachFile() {
+    Console.WriteLine("--- ForEachFile ---");
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_foreach_test.csv");
+    let rows = [["name", "age"], ["Alice", "30"], ["Bob", "25"], ["Carol", "35"]];
+    CSV.WriteFile(path, rows);
+
+    // Basic row accumulation
+    let acc = [];
+    CSV.ForEachFile(path, fn(row) {
+        Array.Append(acc, row[0]);
+    });
+    chkEq("ForEachFile row count",  len(acc), 4);  // header row + 3 data rows (no headers opt)
+    chkEq("ForEachFile first cell", acc[0], "name");
+    chkEq("ForEachFile last cell",  acc[3], "Carol");
+
+    // With headers option - objects
+    let names = [];
+    CSV.ForEachFile(path, fn(row) {
+        Array.Append(names, row.name);
+    }, { headers: true });
+    chkEq("ForEachFile headers len",    len(names), 3);
+    chkEq("ForEachFile headers [0]",    names[0], "Alice");
+    chkEq("ForEachFile headers [2]",    names[2], "Carol");
+
+    // With types option
+    let ages = [];
+    CSV.ForEachFile(path, fn(row) {
+        Array.Append(ages, row.age);
+    }, { headers: true, types: true });
+    chkEq("ForEachFile types len",      len(ages), 3);
+    chkEq("ForEachFile types value",    ages[0], 30);
+    chkEq("ForEachFile types type",     type(ages[0]), Type.Int);
+}
+
+// ============================================================
+// ColumnIndex
+// ============================================================
+
+fn testColumnIndex() {
+    Console.WriteLine("--- ColumnIndex ---");
+
+    let hdrs = ["name", "age", "city", "score"];
+
+    chkEq("ColumnIndex first column",   CSV.ColumnIndex(hdrs, "name"),  0);
+    chkEq("ColumnIndex middle column",  CSV.ColumnIndex(hdrs, "city"),  2);
+    chkEq("ColumnIndex last column",    CSV.ColumnIndex(hdrs, "score"), 3);
+    chkEq("ColumnIndex missing returns -1", CSV.ColumnIndex(hdrs, "missing"), -1);
+    chkEq("ColumnIndex empty array",    CSV.ColumnIndex([], "name"), -1);
+
+    // Works with string representations of other types
+    let numHdrs = ["0", "1", "2"];
+    chkEq("ColumnIndex numeric header", CSV.ColumnIndex(numHdrs, "1"), 1);
+
+    // Case-sensitive
+    chkEq("ColumnIndex case sensitive", CSV.ColumnIndex(hdrs, "Name"), -1);
+}
+
+fn testInference() {
+    Console.WriteLine("--- Type inference (Infer / null tokens) ---");
+
+    // Public Infer: case-insensitive booleans, ints, floats, else string.
+    chkEq("Infer TRUE",  CSV.Infer("TRUE"),  true);
+    chkEq("Infer False", CSV.Infer("False"), false);
+    chkEq("Infer int",   CSV.Infer("42"),    42);
+    chkEq("Infer float", CSV.Infer("3.14"),  3.14);
+    chkEq("Infer string", CSV.Infer("hello"), "hello");
+    chkEq("Infer string type", type(CSV.Infer("hello")), Type.String);
+
+    // Case-insensitive booleans through the types path.
+    let r = CSV.Parse("flag\nTRUE\nFalse\n", { headers: true, types: true });
+    chkEq("types bool TRUE", r[0].flag, true);
+    chkEq("types bool False", r[1].flag, false);
+
+    // nullValues maps tokens (and "") to nil; default keeps "" as "".
+    let rn = CSV.Parse("a,b,c\n1,,NA\n", { headers: true, types: true, nullValues: ["", "NA"] });
+    chkEq("nullValues int kept", rn[0].a, 1);
+    chkEq("nullValues empty -> nil", rn[0].b, nil);
+    chkEq("nullValues token -> nil", rn[0].c, nil);
+
+    // Back-compat: without nullValues, empty stays "".
+    let re = CSV.Parse(",1\n", { types: true });
+    chkEq("default empty stays string", re[0][0], "");
+}
+
+fn testFormulaInjection() {
+    Console.WriteLine("--- Formula-injection escape (sanitize) ---");
+
+    let danger = [
+        ["name", "value"],
+        ["a", "=SUM(A1:A2)"],
+        ["b", "+1+1"],
+        ["c", "-2+3"],
+        ["d", "@cmd"],
+        ["e", "safe"]
+    ];
+
+    // Without sanitize, dangerous fields are written verbatim.
+    let plain = CSV.Stringify(danger);
+    chk("no-sanitize keeps =SUM", String.Contains(plain, "\n=SUM(A1:A2)") || String.Contains(plain, ",=SUM(A1:A2)") || String.Contains(plain, "a,=SUM(A1:A2)"));
+
+    // With sanitize, leading = + - @ get a single-quote prefix.
+    let safe = CSV.Stringify(danger, { sanitize: true });
+    chk("sanitize escapes =",  String.Contains(safe, "a,'=SUM(A1:A2)"));
+    chk("sanitize escapes +",  String.Contains(safe, "b,'+1+1"));
+    chk("sanitize escapes -",  String.Contains(safe, "c,'-2+3"));
+    chk("sanitize escapes @",  String.Contains(safe, "d,'@cmd"));
+    chk("sanitize leaves safe field", String.Contains(safe, "e,safe"));
+
+    // Critical: numeric values are NOT corrupted by sanitize.
+    let nums = [["n"], [-5], [3.5], [-1]];
+    let ns = CSV.Stringify(nums, { sanitize: true });
+    chk("sanitize keeps numeric -5", String.Contains(ns, "\n-5\n"));
+    chk("sanitize keeps numeric 3.5", String.Contains(ns, "\n3.5\n"));
+    chk("sanitize no quote on numbers", !String.Contains(ns, "'-5"));
+}
+
+// ============================================================
+// Benchmarks
+// ============================================================
+
+fn testBenchmarks() {
+    Console.WriteLine("=== CSV benchmarks ===");
+
+    // Build a ~1000-row source table.
+    let rows = [];
+    iter (i from 1 to 1000) {
+        Array.Append(rows, ["row" + str(i), str(i), "city" + str(i % 50), "note, with comma"]);
+    }
+
+    let iters = 10;
+
+    let t0 = Time.Ticks();
+    var out = "";
+    iter (i from 0 to iters - 1) {
+        out = CSV.Stringify(rows);
+    }
+    Console.WriteLine("Stringify 1000 rows x", iters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    let t1 = Time.Ticks();
+    var parsed = [];
+    iter (i from 0 to iters - 1) {
+        parsed = CSV.Parse(out);
+    }
+    Console.WriteLine("Parse 1000 rows x", iters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t1)]), " ms");
+
+    chkEq("bench round-trip rows", len(parsed), 1000);
+    chkEq("bench round-trip [0][0]", parsed[0][0], "row1");
+
+    Console.WriteLine("=== benchmarks done ===");
+}
+
+// ============================================================
+// Entry point
+// ============================================================
+
+fn Main() {
+    testParseLine();
+    testParseArrays();
+    testParseHeaders();
+    testStringifyArrays();
+    testStringifyObjects();
+    testRoundTrip();
+    testFileRoundTrip();
+    testTypes();
+    testComments();
+    testForEach();
+    testHead();
+    testAppendFile();
+    testForEachFile();
+    testColumnIndex();
+    testInference();
+    testFormulaInjection();
+    testBenchmarks();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: " + str(passed + failed) + "  failed: " + str(failed));
+    if (failed == 0) {
+        Console.Ok("All CSV tests passed!");
+    } else {
+        Console.WriteLine("❌ Some tests FAILED.");
+    }
+    return failed;
+}

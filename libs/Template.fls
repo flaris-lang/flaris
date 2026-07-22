@@ -1,0 +1,329 @@
+// Template.fls - Mustache-style string template engine for Flaris.
+// Version: 1.0
+//
+// Usage:
+//   import { Template } from library("Template", "1.0");
+//
+//   // Compile once, render many times (preferred for hot paths)
+//   let t = Template.Parse("Hello, {{name}}! You have {{count}} messages.");
+//   Console.WriteLine(t.Render({ name: "Alice", count: 3 }));
+//
+//   // One-shot render (parse + render in a single call)
+//   let html = Template.Apply("<ul>{{#each items}}<li>{{.}}</li>{{/each}}</ul>",
+//                             { items: ["a", "b", "c"] });
+//
+//   // Partials - register a named sub-template, then include it with {{> name}}
+//   Template.Register("nav", Template.Parse("<nav>{{title}}</nav>"));
+//   let page = Template.Apply("{{> nav}}<main>{{body}}</main>",
+//                             { title: "Home", body: "Welcome" });
+//
+// Template syntax:
+//   {{key}}                     Variable - HTML-escaped (&, <, >, ", ')
+//   {{{key}}}                   Raw variable - no escaping
+//   {{key.nested.path}}         Dot-path: walks object properties
+//   {{#if key}}…{{/if}}         Conditional (falsy: nil, false, 0, "", [])
+//   {{#if key}}…{{#else}}…{{/if}}  Conditional with else branch
+//   {{#unless key}}…{{/unless}} Inverse conditional (renders when key is falsy)
+//   {{#each items}}…{{/each}}   Iteration over an array
+//     Inside each:  {{.}}       current item value
+//                   {{_index}}  0-based position
+//                   {{_first}}  true on first iteration
+//                   {{_last}}   true on last iteration
+//                   {{_count}}  total number of items
+//   {{> name}}                  Partial - renders a registered template by name
+//   {{! comment }}              Comment - stripped from output
+//
+// API:
+//   Template.Parse(src)                →  Template instance
+//   Template.Apply(src, data)          →  string  (parse + render in one call)
+//   Template.Register(name, template)  - register a named partial globally
+//   Template.GetPartial(name)          →  Template instance or nil
+//   instance.Render(data)              →  string
+
+global _tpl_partials = {};
+
+class Template {
+    let _nodes = nil; 
+
+    fn Constructor(nodes) {
+        this._nodes = nodes;
+    }
+
+    // Compile a template source string into a reusable Template.
+    fn static Parse(src:string) {
+        let c = { s: src, p: 0, n: String.Length(src) };
+        let r = Template._parseBlock(c);
+        return new Template(r.nodes);
+    }
+
+    // Render this template with data as the root context.
+    fn Render(data) {
+        var parts = [];
+        Template._render(this._nodes, data, parts);
+        return String.Join(parts, "");
+    }
+
+    // One-shot: parse and render in a single call.
+    fn static Apply(src:string, data) {
+        return Template.Parse(src).Render(data);
+    }
+
+    // Register a named partial template for use with {{> name}}.
+    fn static Register(name:string, tpl:instance) {
+        _tpl_partials[name] = tpl;
+    }
+
+    // Look up a registered partial by name; returns nil if not found.
+    fn static GetPartial(name:string) {
+        return Object.TryGet(_tpl_partials, name, nil);
+    }
+
+    // =========================================================================
+    // Parser - produces an AST (array of node objects)
+    //
+    // Node shapes:
+    //   { t:"x",       v:"..." }                      literal text
+    //   { t:"var",     path:[...] }                   escaped variable
+    //   { t:"raw",     path:[...] }                   unescaped variable
+    //   { t:"if",      path:[...], thn:[...], els:[...] }
+    //   { t:"unless",  path:[...], body:[...] }
+    //   { t:"each",    path:[...], body:[...] }
+    //   { t:"partial", name:"..." }                   partial reference
+    //
+    // _parseBlock returns { nodes:[...], stop: nil | "else" | "end_if" | "end_each" | "end_unless" }
+    // =========================================================================
+
+    fn static _parseBlock(c) {
+        var nodes = [];
+        while (c.p < c.n) {
+            let tagPos = Template._find(c.s, "{{", c.p);
+            if (tagPos < 0) {
+                Array.Append(nodes, { t: "x", v: String.Substr(c.s, c.p) });
+                c.p = c.n;
+                break;
+            }
+            if (tagPos > c.p) {
+                Array.Append(nodes, { t: "x", v: String.Substr(c.s, c.p, tagPos - c.p) });
+            }
+            c.p = tagPos;
+
+            let tag = Template._readTag(c);
+
+            if (tag.t == "x" or tag.t == "var" or tag.t == "raw" or tag.t == "partial") {
+                Array.Append(nodes, tag);
+            } else if (tag.t == "if") {
+                let then_r = Template._parseBlock(c);
+                var els = [];
+                if (then_r.stop == "else") {
+                    let else_r = Template._parseBlock(c);
+                    els = else_r.nodes;
+                }
+                Array.Append(nodes, { t: "if", path: tag.path, thn: then_r.nodes, els: els });
+            } else if (tag.t == "unless") {
+                let body_r = Template._parseBlock(c);
+                Array.Append(nodes, { t: "unless", path: tag.path, body: body_r.nodes });
+            } else if (tag.t == "each") {
+                let body_r = Template._parseBlock(c);
+                Array.Append(nodes, { t: "each", path: tag.path, body: body_r.nodes });
+            } else if (tag.t == "else" or tag.t == "end_if" or tag.t == "end_each" or tag.t == "end_unless") {
+                return { nodes: nodes, stop: tag.t };
+            }
+            // tag.t == "comment" - stripped, no action
+        }
+        return { nodes: nodes, stop: nil };
+    }
+
+    // Read one tag starting at c.p (which must point at "{{").
+    // Advances c.p past the closing "}}".
+    fn static _readTag(c) {
+        c.p += 2;
+        let raw = c.p < c.n and String.Substr(c.s, c.p, 1) == "{";
+        if (raw) c.p += 1;
+
+        let closeStr = raw ? "}}}" : "}}";
+        let closePos = Template._find(c.s, closeStr, c.p);
+        if (closePos < 0) {
+            let v = String.Substr(c.s, c.p - (raw ? 3 : 2));
+            c.p = c.n;
+            return { t: "x", v: v };
+        }
+
+        let inner = String.Trim(String.Substr(c.s, c.p, closePos - c.p));
+        c.p = closePos + String.Length(closeStr);
+
+        if (raw)                                   return { t: "raw",     path: Template._splitPath(inner) };
+        if (String.StartsWith(inner, "!"))         return { t: "comment" };
+        if (inner == "#else")                      return { t: "else" };
+        if (inner == "/if")                        return { t: "end_if" };
+        if (inner == "/each")                      return { t: "end_each" };
+        if (inner == "/unless")                    return { t: "end_unless" };
+        if (String.StartsWith(inner, "#if "))      return { t: "if",     path: Template._splitPath(String.Trim(String.Substr(inner, 4))) };
+        if (String.StartsWith(inner, "#unless "))  return { t: "unless", path: Template._splitPath(String.Trim(String.Substr(inner, 8))) };
+        if (String.StartsWith(inner, "#each "))    return { t: "each",   path: Template._splitPath(String.Trim(String.Substr(inner, 6))) };
+        if (String.StartsWith(inner, "> "))        return { t: "partial", name: String.Trim(String.Substr(inner, 2)) };
+        return { t: "var", path: Template._splitPath(inner) };
+    }
+
+    // "user.name" - ["user", "name"],  "." - ["."],  "title" - ["title"]
+    fn static _splitPath(key:string) {
+        if (key == ".") return [key];
+        if (String.Contains(key, ".")) return String.Split(key, ".");
+        return [key];
+    }
+
+    // String.IndexOf with a start offset (the builtin takes only 2 args).
+    fn static _find(src:string, needle:string, pos:int) {
+        if (pos >= String.Length(src)) return -1;
+        let idx = String.IndexOf(String.Substr(src, pos), needle);
+        if (idx < 0) return -1;
+        return idx + pos;
+    }
+
+    // =========================================================================
+    // Renderer
+    // =========================================================================
+
+    fn static _render(nodes, ctx, parts) {
+        let i = 0;
+        while (i < len(nodes)) {
+            let node = nodes[i];
+
+            if (node.t == "x") {
+                Array.Append(parts, node.v);
+
+            } else if (node.t == "var") {
+                let val = Template._resolve(node.path, ctx);
+                if (val != nil) Array.Append(parts, Template._escape(str(val)));
+
+            } else if (node.t == "raw") {
+                let val = Template._resolve(node.path, ctx);
+                if (val != nil) Array.Append(parts, str(val));
+
+            } else if (node.t == "if") {
+                if (Template._truthy(Template._resolve(node.path, ctx))) {
+                    Template._render(node.thn, ctx, parts);
+                } else {
+                    Template._render(node.els, ctx, parts);
+                }
+
+            } else if (node.t == "unless") {
+                if (!Template._truthy(Template._resolve(node.path, ctx))) {
+                    Template._render(node.body, ctx, parts);
+                }
+
+            } else if (node.t == "partial") {
+                let partial = Template.GetPartial(node.name);
+                if (partial != nil) {
+                    Template._render(partial._nodes, ctx, parts);
+                }
+
+            } else if (node.t == "each") {
+                let items = Template._resolve(node.path, ctx);
+                if (items != nil and type(items) == Type.Array) {
+                    let count = len(items);
+                    let j = 0;
+                    while (j < count) {
+                        let frame = {
+                            _value:  items[j],
+                            _index:  j,
+                            _first:  j == 0,
+                            _last:   j == count - 1,
+                            _count:  count,
+                            _parent: ctx
+                        };
+                        Template._render(node.body, frame, parts);
+                        j += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Resolve a dot-path against a context.
+    //
+    // ctx is either the root data object or an each-frame:
+    //   { _value, _index, _first, _last, _count, _parent }
+    //
+    // Resolution order:
+    //   "."              - current item (_value, or ctx itself at root)
+    //   _index/_first/…  - loop meta-vars from the each-frame
+    //   key              - property on _value (if object), then ctx, then _parent
+    fn static _resolve(path, ctx) {
+        if (ctx == nil or path == nil or len(path) == 0) return nil;
+        if (type(ctx) != Type.Object) return nil;
+
+        let key  = path[0];
+        let rest = len(path) > 1 ? Array.Subset(path, 1, len(path) - 1) : nil;
+
+        // "." = the current iteration item
+        if (key == ".") {
+            let dotVal = Object.TryGet(ctx, "_value", nil);
+            if (dotVal != nil) {
+                if (rest != nil) return Template._resolve(rest, dotVal);
+                return dotVal;
+            }
+            if (rest != nil) return Template._resolve(rest, ctx);
+            return ctx;
+        }
+
+        // Loop meta-variables
+        if (key == "_index" or key == "_first" or key == "_last" or key == "_count") {
+            let mv = Object.TryGet(ctx, key, nil);
+            if (mv != nil) return mv;
+            let par0 = Object.TryGet(ctx, "_parent", nil);
+            if (par0 != nil) return Template._resolve(path, par0);
+            return nil;
+        }
+
+        // Inside an each-frame: try the item's properties first
+        var val = nil;
+        let item = Object.TryGet(ctx, "_value", nil);
+        if (item != nil and type(item) == Type.Object) {
+            val = Object.TryGet(item, key, nil);
+        }
+
+        // Fall back to the context frame / root data
+        if (val == nil) {
+            val = Object.TryGet(ctx, key, nil);
+        }
+
+        // Still nothing - walk up the parent chain
+        let par = Object.TryGet(ctx, "_parent", nil);
+        if (val == nil and par != nil) {
+            return Template._resolve(path, par);
+        }
+
+        // Traverse remaining path segments into the resolved value
+        if (val != nil and rest != nil) {
+            return Template._resolve(rest, val);
+        }
+
+        return val;
+    }
+
+    // Falsy: nil, false, 0, 0.0, "", [].  Everything else is truthy.
+    fn static _truthy(val) {
+        if (val == nil)   return false;
+        if (val == false) return false;
+        if (type(val) == Type.Int    and val == 0)   return false;
+        if (type(val) == Type.Float  and val == 0.0) return false;
+        if (type(val) == Type.String and val == "")  return false;
+        if (type(val) == Type.Array  and len(val) == 0) return false;
+        return true;
+    }
+
+    // HTML-escape: & < > " '
+    fn static _escape(s:string) {
+        if (!String.Contains(s, "&") and !String.Contains(s, "<") and
+            !String.Contains(s, ">") and !String.Contains(s, "\"") and
+            !String.Contains(s, "'")) return s;
+        s = String.Replace(s, "&",  "&amp;");
+        s = String.Replace(s, "<",  "&lt;");
+        s = String.Replace(s, ">",  "&gt;");
+        s = String.Replace(s, "\"", "&quot;");
+        s = String.Replace(s, "'",  "&#39;");
+        return s;
+    }
+}
+export { Template };

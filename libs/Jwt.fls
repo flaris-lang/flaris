@@ -1,0 +1,398 @@
+// Jwt.fls - JSON Web Token (JWT / JWS) library for Flaris.
+// Version: 1.0
+//
+// Algorithms:
+//   HS256 / HS512 - symmetric, HMAC-SHA256 / HMAC-SHA512 with a shared secret.
+//   EdDSA         - asymmetric, Ed25519: sign with a secret key, verify with the
+//                   public key (verifiers never hold the signing secret).
+// All methods are static - use Jwt directly, no instance needed.
+// Tokens follow the standard three-part base64url format: header.payload.signature
+//
+// Usage:
+//   import { Jwt } from library("Jwt", "1.0");
+//
+//   // Symmetric (HS256/HS512): issue + verify with one shared secret
+//   let payload = { sub: "user-42", role: "admin" };
+//   let token = Jwt.EncodeHS256(payload, "my-secret", { exp: Time.Now() + 3600 });
+//   let ok    = Jwt.VerifyHS256(token, "my-secret");
+//   let valid = Jwt.VerifyHS256WithClaims(token, "my-secret", { leeway: 5 });
+//   // (EncodeHS512 / VerifyHS512 / VerifyHS512WithClaims are identical with HS512.)
+//
+//   // Asymmetric (EdDSA): sign with the secret key, verify with the public key
+//   let kp = Crypto.Ed25519KeyPair();           // { PublicKey, SecretKey } (hex)
+//   let t2 = Jwt.EncodeEdDSA(payload, kp.SecretKey, { exp: Time.Now() + 3600 });
+//   let ok2 = Jwt.VerifyEdDSA(t2, kp.PublicKey); // verifier only needs PublicKey
+//
+//   // Decode without verification (inspect contents)
+//   let decoded = Jwt.Decode(token);
+//   Console.WriteLine(decoded.payload.sub);   // "user-42"
+//
+// API (all static):
+//   Encode<Alg>(payload, key, options?)   - Alg = HS256 | HS512 | EdDSA
+//       →  token string or nil on error. For EdDSA, key is the hex secret key.
+//       options: { iat:int, exp:int, nbf:int }  - Unix timestamps; omit to skip claim
+//
+//   Verify<Alg>(token, key)
+//       →  bool  - checks the signature only; does not check exp/nbf/iat.
+//       For EdDSA, key is the hex public key.
+//
+//   Verify<Alg>WithClaims(token, key, options?)
+//       →  bool  - Verify<Alg> + ValidateClaims in one call
+//
+//   Decode(token)
+//       →  { header:object, payload:object, signatureHex:string, signingInput:string }
+//       Splits and base64url-decodes the token without verifying the signature.
+//
+//   ValidateClaims(payload, options?)
+//       →  bool  - checks exp, nbf, iat against current time
+//       options: { now:int, leeway:int, requireExp:bool, requireNbf:bool,
+//                  requireIat:bool, maxIatSkew:int, allowNoTimeClaims:bool }
+//
+// NOTE: the alg is taken from the call you make, not from the token header, so a
+// token cannot downgrade its own algorithm. Pick the verifier that matches how
+// the token was issued.
+
+class Jwt {
+
+    // --------------------------------------------------------
+    //  Internal: hex helpers
+    // --------------------------------------------------------
+
+    fn _hexNibble(ch) {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+        if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+        return -1;
+    }
+
+    fn _hexToBytes(hex) {
+        let n = len(hex);
+        if (n % 2 != 0) return nil;
+        let out = [];
+        let i = 0;
+        while (i < n) {
+            let hi = _hexNibble(hex[i]);
+            let lo = _hexNibble(hex[i+1]);
+            if (hi < 0 || lo < 0) return nil;
+            Array.Append(out, hi * 16 + lo);
+            i += 2;
+        }
+        return out;
+    }
+
+    fn _bytesToHex(bytes) {
+        let H = "0123456789abcdef";
+        let s = "";
+        iter (i from 0 to len(bytes) - 1) {
+            let b = bytes[i];
+            s = s + H[(b >> 4) & 15] + H[b & 15];
+        }
+        return s;
+    }
+
+    fn _bytesToString(bytes:array): string {
+        let s = "";
+        iter (i from 0 to len(bytes) - 1) {
+            s = s + Convert.ToChar(bytes[i]);
+        }
+        return s;
+    }
+
+    fn _stringToBytes(s:string): array {
+        let out = [];
+        iter (i from 0 to len(s) - 1) {
+            Array.Append(out, int(s[i]));
+        }
+        return out;
+    }
+
+    // --------------------------------------------------------
+    //  Internal: canonical JSON (sorted keys, no whitespace)
+    // --------------------------------------------------------
+
+    fn _escapeJsonString(s:string): string {
+        let out = "";
+        iter (i from 0 to len(s) - 1) {
+            let c = s[i];
+            if      (c == "\"") out += "\\\"";
+            else if (c == "\\") out += "\\\\";
+            else if (c == "\n") out += "\\n";
+            else if (c == "\r") out += "\\r";
+            else if (c == "\t") out += "\\t";
+            else                out += c;
+        }
+        return out;
+    }
+
+    fn _sortStrings(a:array) {
+        iter (i from 1 to len(a) - 1) {
+            let key = a[i];
+            let j = i - 1;
+            while (j >= 0 && a[j] > key) {
+                a[j+1] = a[j];
+                j -= 1;
+            }
+            a[j+1] = key;
+        }
+    }
+
+    // --------------------------------------------------------
+    //  JWT core
+    // --------------------------------------------------------
+
+    fn Base64UrlEncodeString(s:string): string {
+        return Util.Base64UrlEncode(s);
+    }
+
+    fn Base64UrlDecodeToString(s:string): string {
+        return Util.Base64DecodeString(s);
+    }
+
+    fn EncodeHS256(payload:object, secret:string, options?) {
+        let header = { alg: "HS256", typ: "JWT" };
+        let opts = options ?? nil;
+
+        if (opts != nil) {
+            if (opts.iat != nil) payload.iat = opts.iat;
+            if (opts.exp != nil) payload.exp = opts.exp;
+            if (opts.nbf != nil) payload.nbf = opts.nbf;
+        }
+
+        let headerB64  = Util.Base64UrlEncode(Json.Stringify(header));
+        let payloadB64 = Util.Base64UrlEncode(Json.Stringify(payload));
+        let signingInput = headerB64 + "." + payloadB64;
+
+        let sigHex   = Crypto.HmacSha256(secret, signingInput);
+        let sigBlock = Util.HexToBin(sigHex);
+        if (sigBlock == nil) return nil;
+
+        return signingInput + "." + Util.Base64UrlEncode(sigBlock);
+    }
+
+    fn Decode(token:string) {
+        let parts = String.Split(token, ".");
+        if (len(parts) != 3) return nil;
+        let headerJson  = Util.Base64DecodeString(parts[0]);
+        let payloadJson = Util.Base64DecodeString(parts[1]);
+        if (headerJson == nil || payloadJson == nil) return nil;
+
+        let header  = Json.Parse(headerJson);
+        let payload = Json.Parse(payloadJson);
+        if (header == nil || payload == nil) return nil;
+
+        let sigBytes = Util.Base64DecodeBlock(parts[2]);
+        if (sigBytes == nil) return nil;
+
+        return {
+            header:       header,
+            payload:      payload,
+            signatureHex: Util.BinToHex(sigBytes),
+            signingInput: parts[0] + "." + parts[1]
+        };
+    }
+
+    fn VerifyHS256(token:string, secret:string): bool {
+        try {
+            let d = Jwt.Decode(token);
+            if (d == nil) return false;
+            let expected = Crypto.HmacSha256(secret, d.signingInput);
+            return String.ToLower(expected) == String.ToLower(d.signatureHex);
+        } catch (_e) {
+            return false;
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Claims validation
+    // --------------------------------------------------------
+
+    fn ValidateClaims(payload:object, options?): bool {
+        if (payload == nil) return false;
+        let opts = options ?? nil;
+
+        let now = nil;
+        if (opts != nil && opts.now != nil) now = opts.now;
+        if (now == nil) now = Time.Now();
+
+        let leeway            = (opts != nil && opts.leeway != nil)            ? opts.leeway            : 0;
+        let requireExp        = (opts != nil && opts.requireExp != nil)        ? opts.requireExp        : false;
+        let requireNbf        = (opts != nil && opts.requireNbf != nil)        ? opts.requireNbf        : false;
+        let requireIat        = (opts != nil && opts.requireIat != nil)        ? opts.requireIat        : false;
+        let maxIatSkew        = (opts != nil && opts.maxIatSkew != nil)        ? opts.maxIatSkew        : 0;
+        let allowNoTimeClaims = (opts != nil && opts.allowNoTimeClaims != nil) ? opts.allowNoTimeClaims : true;
+
+        if (payload.exp == nil) {
+            if (requireExp) return false;
+        } else {
+            if (now > payload.exp + leeway) return false;
+        }
+
+        if (payload.nbf == nil) {
+            if (requireNbf) return false;
+        } else {
+            if (now + leeway < payload.nbf) return false;
+        }
+
+        if (payload.iat == nil) {
+            if (requireIat) return false;
+        } else {
+            if (maxIatSkew > 0 && payload.iat > now + maxIatSkew) return false;
+        }
+
+        if (!allowNoTimeClaims) {
+            if (payload.exp == nil && payload.nbf == nil && payload.iat == nil) return false;
+        }
+
+        return true;
+    }
+
+    fn VerifyHS256WithClaims(token:string, secret:string, options?): bool {
+        let d = Jwt.Decode(token);
+        if (d == nil) return false;
+        let expected = Crypto.HmacSha256(secret, d.signingInput);
+        if (String.ToLower(expected) != String.ToLower(d.signatureHex)) return false;
+        return Jwt.ValidateClaims(d.payload, options ?? nil);
+    }
+
+    // --------------------------------------------------------
+    //  HS512 (HMAC-SHA512) - symmetric, like HS256 but stronger MAC
+    // --------------------------------------------------------
+
+    fn EncodeHS512(payload:object, secret:string, options?) {
+        let header = { alg: "HS512", typ: "JWT" };
+        let opts = options ?? nil;
+        if (opts != nil) {
+            if (opts.iat != nil) payload.iat = opts.iat;
+            if (opts.exp != nil) payload.exp = opts.exp;
+            if (opts.nbf != nil) payload.nbf = opts.nbf;
+        }
+
+        let headerB64  = Util.Base64UrlEncode(Json.Stringify(header));
+        let payloadB64 = Util.Base64UrlEncode(Json.Stringify(payload));
+        let signingInput = headerB64 + "." + payloadB64;
+
+        let sigHex   = Crypto.HmacSha512(secret, signingInput);
+        let sigBlock = Util.HexToBin(sigHex);
+        if (sigBlock == nil) return nil;
+
+        return signingInput + "." + Util.Base64UrlEncode(sigBlock);
+    }
+
+    fn VerifyHS512(token:string, secret:string): bool {
+        try {
+            let d = Jwt.Decode(token);
+            if (d == nil) return false;
+            let expected = Crypto.HmacSha512(secret, d.signingInput);
+            return String.ToLower(expected) == String.ToLower(d.signatureHex);
+        } catch (_e) {
+            return false;
+        }
+    }
+
+    fn VerifyHS512WithClaims(token:string, secret:string, options?): bool {
+        let d = Jwt.Decode(token);
+        if (d == nil) return false;
+        let expected = Crypto.HmacSha512(secret, d.signingInput);
+        if (String.ToLower(expected) != String.ToLower(d.signatureHex)) return false;
+        return Jwt.ValidateClaims(d.payload, options ?? nil);
+    }
+
+    // --------------------------------------------------------
+    //  EdDSA (Ed25519) - asymmetric: sign with the secret key, verify with
+    //  the public key. Generate a key pair with Crypto.Ed25519KeyPair()
+    //  (both keys are hex strings). Verifiers only need the public key.
+    // --------------------------------------------------------
+
+    fn EncodeEdDSA(payload:object, secretKeyHex:string, options?) {
+        let header = { alg: "EdDSA", typ: "JWT" };
+        let opts = options ?? nil;
+        if (opts != nil) {
+            if (opts.iat != nil) payload.iat = opts.iat;
+            if (opts.exp != nil) payload.exp = opts.exp;
+            if (opts.nbf != nil) payload.nbf = opts.nbf;
+        }
+
+        let headerB64  = Util.Base64UrlEncode(Json.Stringify(header));
+        let payloadB64 = Util.Base64UrlEncode(Json.Stringify(payload));
+        let signingInput = headerB64 + "." + payloadB64;
+
+        let sigHex   = Crypto.Ed25519Sign(secretKeyHex, signingInput);
+        let sigBlock = Util.HexToBin(sigHex);
+        if (sigBlock == nil) return nil;
+
+        return signingInput + "." + Util.Base64UrlEncode(sigBlock);
+    }
+
+    fn VerifyEdDSA(token:string, publicKeyHex:string): bool {
+        try {
+            let d = Jwt.Decode(token);
+            if (d == nil) return false;
+            return Crypto.Ed25519Verify(d.signatureHex, publicKeyHex, d.signingInput);
+        } catch (_e) {
+            return false;
+        }
+    }
+
+    fn VerifyEdDSAWithClaims(token:string, publicKeyHex:string, options?): bool {
+        let d = Jwt.Decode(token);
+        if (d == nil) return false;
+        if (!Crypto.Ed25519Verify(d.signatureHex, publicKeyHex, d.signingInput)) return false;
+        return Jwt.ValidateClaims(d.payload, options ?? nil);
+    }
+
+    // --------------------------------------------------------
+    //  Convenience helpers
+    // --------------------------------------------------------
+
+    // Returns true if the token has an exp claim that is in the past.
+    fn IsExpired(token:string): bool {
+        try {
+            let d = Jwt.Decode(token);
+            if (d == nil) return true;
+            if (d.payload.exp == nil) return false;
+            return Time.Now() > d.payload.exp;
+        } catch (_e) {
+            return true;
+        }
+    }
+
+    // Returns the exp claim as a Unix timestamp, or nil if absent / invalid.
+    fn ExpiresAt(token:string) {
+        let d = Jwt.Decode(token);
+        if (d == nil) return nil;
+        return d.payload.exp;
+    }
+
+    // Returns the value of a single named claim from a raw token string.
+    // Decodes the token on every call - use GetClaimFromDecoded when reading
+    // multiple claims from the same token.
+    fn GetClaim(token:string, claim:string) {
+        let d = Jwt.Decode(token);
+        if (d == nil) return nil;
+        return d.payload[claim];
+    }
+
+    // Returns the value of a named claim from an already-decoded token object
+    // (the result of Decode()). O(1) property lookup - no re-parsing.
+    // UNSAFE: this function does not verify the token signature. Always call
+    // VerifyHS256() (or VerifyHS256WithClaims()) before trusting the result.
+    fn GetClaimFromDecoded(decoded, claim:string) {
+        if (decoded == nil) return nil;
+        return decoded.payload[claim];
+    }
+
+    // Create a new token from an existing valid token with an extended expiry.
+    // Verifies the token first; returns nil if the token is invalid.
+    // The payload is re-encoded as-is except the exp claim is updated.
+    fn static Refresh(token:string, secret:string, newExpSeconds:int) : string|nil {
+        let verified = Jwt.VerifyHS256(token, secret);
+        if (!verified) return nil;
+        let decoded = Jwt.Decode(token);
+        if (decoded == nil) return nil;
+        let payload = decoded.payload;
+        payload.exp = Time.Now() + newExpSeconds;
+        return Jwt.EncodeHS256(payload, secret);
+    }
+}
+
+export { Jwt };

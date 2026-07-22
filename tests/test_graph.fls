@@ -1,0 +1,822 @@
+// test_graph.fls - Test suite + benchmarks for Graph.fls
+// Run: flarisvm test_graph.fls --libs='./libs'
+
+import { Graph }   from library("Graph",   "1.0");
+import { BigInt }  from library("BigInt",  "1.0");
+import { Decimal } from library("Decimal", "1.0");
+
+// ============================================================
+// Globals - lambdas can only reference globals, not locals
+// ============================================================
+
+global passed = 0;
+global failed = 0;
+
+global _sink      = 0;
+global _N_SMALL   = 50;
+global _N_MEDIUM  = 500;
+global _N_DIJKSTRA = 150;
+
+global _g_bench_undirected    = new Graph();
+global _g_bench_directed      = (new Graph()).AsDirected();
+global _g_bench_directed_sm   = (new Graph()).AsDirected();
+global _g_bench_sparse        = new Graph();
+global _g_bench_dijk          = new Graph();
+
+// ============================================================
+// Test helpers
+// ============================================================
+
+fn check(label:string, cond:bool) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + label);
+        failed += 1;
+    }
+}
+
+fn checkEq(label:string, actual, expected) {
+    if (actual == expected) {
+        Console.WriteLine("[PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + label + "  expected=" + str(expected) + "  got=" + str(actual));
+        failed += 1;
+    }
+}
+
+// ============================================================
+// Benchmark helpers
+// ============================================================
+
+fn bench(name:string, f:fn, n:int) {
+    f(); f(); f();   // warmup
+
+    let t0:int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt:int = Time.Ticks() - t0;
+
+    let ms:float = Time.TicksToMs(dt);
+    let us:float = Time.TicksToUs(dt) / float(n);
+
+    Console.WriteLine(
+        String.PadRight(name, 44),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn buildCycle(n:int) {
+    let g = new Graph();
+    iter (i from 0 to n - 1) {
+        g.AddEdge(i, (i + 1) % n);
+        g.AddEdge(i, (i + 3) % n);
+    }
+    return g;
+}
+
+fn buildDAG(n:int) {
+    let g = (new Graph()).AsDirected();
+    iter (i from 0 to n - 2) {
+        g.AddEdge(i, i + 1);
+        if (i + 3 < n) g.AddEdge(i, i + 3);
+    }
+    return g;
+}
+
+fn buildChain(n:int) {
+    let g = new Graph();
+    iter (i from 0 to n - 2) {
+        g.AddEdge(i, i + 1);
+    }
+    return g;
+}
+
+fn benchSep() {
+    Console.WriteLine("------------------------------------------------------------");
+}
+
+fn test_extra_graph() {
+// ============================================================
+// A. InDegree / OutDegree / Degree - directed graph
+
+Console.WriteLine("\n--- A. InDegree / OutDegree / Degree (directed) ---");
+
+let g_extra1 = (new Graph()).AsDirected();
+g_extra1.AddEdge("A", "B").AddEdge("A", "C").AddEdge("B", "C");
+
+checkEq("Directed OutDegree A", g_extra1.OutDegree("A"), 2);
+checkEq("Directed OutDegree B", g_extra1.OutDegree("B"), 1);
+checkEq("Directed OutDegree C", g_extra1.OutDegree("C"), 0);
+
+checkEq("Directed InDegree A", g_extra1.InDegree("A"), 0);
+checkEq("Directed InDegree B", g_extra1.InDegree("B"), 1);
+checkEq("Directed InDegree C", g_extra1.InDegree("C"), 2);
+
+checkEq("Directed Degree A = InDegree+OutDegree", g_extra1.Degree("A"), 2);
+checkEq("Directed Degree B = InDegree+OutDegree", g_extra1.Degree("B"), 2);
+checkEq("Directed Degree C = InDegree+OutDegree", g_extra1.Degree("C"), 2);
+
+// missing node returns 0
+checkEq("Directed InDegree missing node", g_extra1.InDegree("Z"), 0);
+checkEq("Directed OutDegree missing node", g_extra1.OutDegree("Z"), 0);
+checkEq("Directed Degree missing node", g_extra1.Degree("Z"), 0);
+
+// ============================================================
+// B. InDegree / OutDegree / Degree - undirected graph
+
+Console.WriteLine("\n--- B. Degree (undirected) ---");
+
+let g_extra2 = new Graph();
+g_extra2.AddEdge("P", "Q").AddEdge("P", "R").AddEdge("Q", "R");
+
+// Undirected: Degree == number of incident edges
+checkEq("Undirected Degree P", g_extra2.Degree("P"), 2);
+checkEq("Undirected Degree Q", g_extra2.Degree("Q"), 2);
+checkEq("Undirected Degree R", g_extra2.Degree("R"), 2);
+
+// For undirected, OutDegree equals degree (neighbours list)
+checkEq("Undirected OutDegree P", g_extra2.OutDegree("P"), 2);
+
+// ============================================================
+// C. Kruskal - 2-node graph (single edge)
+
+Console.WriteLine("\n--- C. Kruskal (2-node) ---");
+
+let g_extra3 = new Graph();
+g_extra3.AddEdge("X", "Y", 7);
+
+let mst1 = g_extra3.Kruskal();
+checkEq("Kruskal 2-node: MST has 1 edge", len(mst1), 1);
+check("Kruskal 2-node: edge weight = 7", mst1[0].weight == 7);
+
+// ============================================================
+// D. Kruskal - 3-node triangle (picks 2 cheapest edges)
+
+Console.WriteLine("\n--- D. Kruskal (triangle) ---");
+
+let g_extra4 = new Graph();
+g_extra4.AddEdge("A", "B", 1).AddEdge("B", "C", 2).AddEdge("A", "C", 10);
+
+let mst2 = g_extra4.Kruskal();
+checkEq("Kruskal triangle: MST has 2 edges", len(mst2), 2);
+
+let mst2TotalWeight = mst2[0].weight + mst2[1].weight;
+checkEq("Kruskal triangle: total MST weight = 3", mst2TotalWeight, 3);
+
+// Verify neither of the MST edges has the expensive weight 10
+check("Kruskal triangle: no edge with weight 10", mst2[0].weight != 10 && mst2[1].weight != 10);
+
+// ============================================================
+// E. AsUndirected - convert directed graph, verify properties
+
+Console.WriteLine("\n--- E. AsUndirected ---");
+
+let g_extra5 = (new Graph()).AsDirected();
+g_extra5.AddEdge("M", "N", 5).AddEdge("N", "O", 3);
+
+check("Before AsUndirected: IsDirected = true", g_extra5.IsDirected());
+
+g_extra5.AsUndirected();
+
+check("After AsUndirected: IsDirected = false", !g_extra5.IsDirected());
+
+// After calling AsUndirected on a previously directed graph the stored
+// adjacency list still contains only the originally-added directions, so
+// we only assert that the method returns false for IsDirected and that the
+// existing edges are still accessible.
+check("AsUndirected: HasEdge M->N still accessible", g_extra5.HasEdge("M", "N"));
+check("AsUndirected: HasEdge N->O still accessible", g_extra5.HasEdge("N", "O"));
+
+// A freshly-built undirected graph round-trips through AsUndirected cleanly
+let g_extra6 = new Graph();
+g_extra6.AddEdge("U", "V", 4);
+g_extra6.AsUndirected();
+check("AsUndirected on undirected: still undirected", !g_extra6.IsDirected());
+check("AsUndirected on undirected: HasEdge U->V", g_extra6.HasEdge("U", "V"));
+check("AsUndirected on undirected: HasEdge V->U", g_extra6.HasEdge("V", "U"));
+}
+
+// Shared admissible heuristic table for the A* tests (estimated cost to "D").
+global _astar_est = Collections.HashMap();
+
+fn _pathStr(p) {
+    if (p == nil) return "nil";
+    var s = ""; var i = 0;
+    while (i < len(p)) { if (i > 0) s = s + "-"; s = s + str(p[i]); i = i + 1; }
+    return s;
+}
+
+fn test_pathfinding_extra() {
+    Console.WriteLine("\n--- G. A* / Bellman-Ford / Floyd-Warshall / Prim / Components ---");
+
+    // Directed weighted: A-1->B-2->D, A-4->C-1->D, B-5->C  (best A->D = 3 via B)
+    let g = (new Graph()).AsDirected();
+    g.AddEdge("A", "B", 1).AddEdge("B", "D", 2);
+    g.AddEdge("A", "C", 4).AddEdge("C", "D", 1).AddEdge("B", "C", 5);
+
+    _astar_est.Set("A", 2); _astar_est.Set("B", 1);
+    _astar_est.Set("C", 1); _astar_est.Set("D", 0);
+
+    checkEq("A* zero heuristic A->D", _pathStr(g.AStar("A", "D", fn(_n) { return 0; })), "A-B-D");
+    checkEq("A* admissible heuristic A->D", _pathStr(g.AStar("A", "D", fn(n) { return _astar_est.Get(n); })), "A-B-D");
+    checkEq("A* start==end", _pathStr(g.AStar("A", "A", fn(_n) { return 0; })), "A");
+    checkEq("A* unreachable D->A", _pathStr(g.AStar("D", "A", fn(_n) { return 0; })), "nil");
+    checkEq("A* missing node", g.AStar("A", "Z", fn(_n) { return 0; }), nil);
+
+    // Bellman-Ford
+    let bf = g.BellmanFord("A");
+    checkEq("BF dist to D", bf.Distances.Get("D"), 3);
+    checkEq("BF dist to C", bf.Distances.Get("C"), 4);
+    checkEq("BF prev of D", bf.Prev.Get("D"), "B");
+    check("BF no negative cycle", !bf.HasNegativeCycle);
+    checkEq("BF missing start", g.BellmanFord("Z"), nil);
+
+    // Bellman-Ford negative-cycle detection: X-1->Y, Y- -1->Z, Z- -1->X (sum -1)
+    let gc = (new Graph()).AsDirected();
+    gc.AddEdge("X", "Y", 1).AddEdge("Y", "Z", 0 - 1).AddEdge("Z", "X", 0 - 1);
+    check("BF detects negative cycle", gc.BellmanFord("X").HasNegativeCycle);
+
+    // Bellman-Ford with a legitimate negative edge but no cycle
+    let gn = (new Graph()).AsDirected();
+    gn.AddEdge("S", "A", 4).AddEdge("S", "B", 5).AddEdge("A", "B", 0 - 3);
+    let bfn = gn.BellmanFord("S");
+    checkEq("BF negative edge dist to B", bfn.Distances.Get("B"), 1);
+    check("BF negative edge no cycle", !bfn.HasNegativeCycle);
+
+    // Floyd-Warshall
+    let fw = g.FloydWarshall();
+    checkEq("FW A->D distance", fw.Dist.Get("A").Get("D"), 3);
+    checkEq("FW B->D distance", fw.Dist.Get("B").Get("D"), 2);
+    checkEq("FW A->D path", _pathStr(Graph.FloydWarshallPath(fw, "A", "D")), "A-B-D");
+    checkEq("FW self path", _pathStr(Graph.FloydWarshallPath(fw, "A", "A")), "A");
+    checkEq("FW no path D->A", Graph.FloydWarshallPath(fw, "D", "A"), nil);
+    check("FW no negative cycle", !fw.HasNegativeCycle);
+    check("FW detects negative cycle", gc.FloydWarshall().HasNegativeCycle);
+
+    // Prim MST on undirected: A-B(1) B-C(2) A-C(3) + isolated component D-E(1)
+    let u = new Graph();
+    u.AddEdge("A", "B", 1).AddEdge("B", "C", 2).AddEdge("A", "C", 3).AddEdge("D", "E", 1);
+    let mst = u.Prim("A");
+    var primTotal = 0;
+    foreach (e in mst) { primTotal = primTotal + e.weight; }
+    checkEq("Prim spans start component edge count", len(mst), 2);
+    checkEq("Prim MST total weight", primTotal, 3);
+    checkEq("Prim empty graph", len((new Graph()).Prim(nil)), 0);
+
+    // ConnectedComponents (weakly connected): {A,B,C} and {D,E}
+    let cc = u.ConnectedComponents();
+    checkEq("Components count", len(cc), 2);
+    // components are returned in node-key order; both sizes present
+    var sizeSum = 0;
+    foreach (c in cc) { sizeSum = sizeSum + len(c); }
+    checkEq("Components cover all nodes", sizeSum, 5);
+    checkEq("Empty graph components", len((new Graph()).ConnectedComponents()), 0);
+
+    // Single fully-connected component
+    checkEq("One component for connected graph", len(g.ConnectedComponents()), 1);
+}
+
+fn Main()
+{
+// ============================================================
+// 1. Nodes and edges (undirected)
+
+Console.WriteLine("\n--- 1. Nodes / edges (undirected) ---");
+
+let g = new Graph();
+
+g.AddNode("A").AddNode("B").AddNode("C");
+checkEq("NodeCount after AddNode x3", g.NodeCount(), 3);
+check("HasNode A", g.HasNode("A"));
+check("HasNode B", g.HasNode("B"));
+check("!HasNode Z", !g.HasNode("Z"));
+
+g.AddEdge("A", "B").AddEdge("B", "C");
+checkEq("EdgeCount after 2 edges", g.EdgeCount(), 2);
+check("HasEdge A->B", g.HasEdge("A", "B"));
+check("HasEdge B->A (undirected)", g.HasEdge("B", "A"));
+check("HasEdge B->C", g.HasEdge("B", "C"));
+check("!HasEdge A->C", !g.HasEdge("A", "C"));
+
+g.RemoveEdge("A", "B");
+checkEq("EdgeCount after RemoveEdge", g.EdgeCount(), 1);
+check("!HasEdge A->B after remove", !g.HasEdge("A", "B"));
+check("!HasEdge B->A after remove", !g.HasEdge("B", "A"));
+
+let g2 = new Graph();
+g2.AddEdge("X", "Y");
+checkEq("NodeCount auto-created", g2.NodeCount(), 2);
+
+g2.AddEdge("X", "Y");
+checkEq("EdgeCount no duplicate", g2.EdgeCount(), 1);
+
+// ============================================================
+// 2. Directed graph
+
+Console.WriteLine("\n--- 2. Directed graph ---");
+
+let dg = (new Graph()).AsDirected();
+dg.AddEdge("A", "B").AddEdge("B", "C").AddEdge("C", "A");
+
+check("dg directed A->B", dg.HasEdge("A", "B"));
+check("dg !B->A (directed)", !dg.HasEdge("B", "A"));
+checkEq("dg EdgeCount", dg.EdgeCount(), 3);
+check("dg IsDirected", dg.IsDirected());
+
+// ============================================================
+// 3. Weighted edges
+
+Console.WriteLine("\n--- 3. Weighted edges ---");
+
+let wg = new Graph();
+wg.AddEdge("A", "B", 5).AddEdge("B", "C", 3);
+checkEq("Weight A->B", wg.GetEdgeWeight("A", "B"), 5);
+checkEq("Weight B->A (undirected)", wg.GetEdgeWeight("B", "A"), 5);
+checkEq("Weight B->C", wg.GetEdgeWeight("B", "C"), 3);
+
+// ============================================================
+// 4. RemoveNode
+
+Console.WriteLine("\n--- 4. RemoveNode ---");
+
+let rg = new Graph();
+rg.AddEdge("A", "B").AddEdge("A", "C").AddEdge("B", "C");
+rg.RemoveNode("A");
+checkEq("NodeCount after RemoveNode", rg.NodeCount(), 2);
+check("!HasNode A", !rg.HasNode("A"));
+checkEq("EdgeCount after RemoveNode A", rg.EdgeCount(), 1);
+check("B->C still exists", rg.HasEdge("B", "C"));
+
+// ============================================================
+// 5. BFS traversal
+
+Console.WriteLine("\n--- 5. BFS ---");
+
+let bg = new Graph();
+bg.AddEdge("A", "B").AddEdge("A", "C").AddEdge("B", "D").AddEdge("C", "D");
+
+let bfsOrder = bg.BFS("A");
+
+check("BFS visits A first", bfsOrder[0] == "A");
+check("BFS visits all 4 nodes", len(bfsOrder) == 4);
+
+// ============================================================
+// 6. DFS traversal
+
+Console.WriteLine("\n--- 6. DFS ---");
+
+let dfsOrder = bg.DFS("A");
+
+check("DFS visits A first", dfsOrder[0] == "A");
+check("DFS visits all 4 nodes", len(dfsOrder) == 4);
+
+// ============================================================
+// 7. BFSPath (unweighted shortest path)
+
+Console.WriteLine("\n--- 7. BFSPath ---");
+
+let pg = new Graph();
+pg.AddEdge("A", "B").AddEdge("B", "C").AddEdge("A", "C");
+
+let path = pg.BFSPath("A", "C");
+check("BFSPath A->C exists", path != nil);
+check("BFSPath A->C length <= 2", len(path) <= 2);
+checkEq("BFSPath first node A", path[0], "A");
+checkEq("BFSPath last node C", path[len(path) - 1], "C");
+
+let noPath = pg.BFSPath("A", "Z");
+check("BFSPath to unknown node is nil", noPath == nil);
+
+let samePath = pg.BFSPath("A", "A");
+checkEq("BFSPath same node length 1", len(samePath), 1);
+
+// ============================================================
+// 8. Dijkstra / ShortestPath
+
+Console.WriteLine("\n--- 8. Dijkstra / ShortestPath ---");
+
+let dijkg = (new Graph()).AsDirected();
+dijkg.AddEdge("A", "B", 1);
+dijkg.AddEdge("A", "C", 4);
+dijkg.AddEdge("B", "C", 2);
+dijkg.AddEdge("B", "D", 5);
+dijkg.AddEdge("C", "D", 1);
+
+let result = dijkg.Dijkstra("A");
+checkEq("Dijkstra dist A->A", result.Distances.Get("A"), 0);
+checkEq("Dijkstra dist A->B", result.Distances.Get("B"), 1);
+checkEq("Dijkstra dist A->C", result.Distances.Get("C"), 3);
+checkEq("Dijkstra dist A->D", result.Distances.Get("D"), 4);
+
+let sp = dijkg.ShortestPath("A", "D");
+check("ShortestPath A->D exists", sp != nil);
+checkEq("ShortestPath A->D first", sp[0], "A");
+checkEq("ShortestPath A->D last", sp[len(sp) - 1], "D");
+
+let spUnreachable = dijkg.ShortestPath("D", "A");
+check("ShortestPath D->A nil (directed)", spUnreachable == nil);
+
+// ============================================================
+// 9. IsConnected
+
+Console.WriteLine("\n--- 9. IsConnected ---");
+
+let cg = new Graph();
+cg.AddEdge("A", "B").AddEdge("B", "C");
+check("Connected graph", cg.IsConnected());
+
+let cg2 = new Graph();
+cg2.AddEdge("A", "B");
+cg2.AddNode("C");
+check("Disconnected graph", !cg2.IsConnected());
+
+let cg3 = new Graph();
+check("Empty graph is connected", cg3.IsConnected());
+
+// ============================================================
+// 10. HasCycle
+
+Console.WriteLine("\n--- 10. HasCycle ---");
+
+let cyc1 = (new Graph()).AsDirected();
+cyc1.AddEdge("A", "B").AddEdge("B", "C").AddEdge("C", "A");
+check("Directed cycle detected", cyc1.HasCycle());
+
+let cyc2 = (new Graph()).AsDirected();
+cyc2.AddEdge("A", "B").AddEdge("B", "C");
+check("DAG has no cycle", !cyc2.HasCycle());
+
+let cyc3 = new Graph();
+cyc3.AddEdge("A", "B").AddEdge("B", "C").AddEdge("C", "A");
+check("Undirected cycle detected", cyc3.HasCycle());
+
+let cyc4 = new Graph();
+cyc4.AddEdge("A", "B").AddEdge("B", "C");
+check("Undirected tree has no cycle", !cyc4.HasCycle());
+
+// ============================================================
+// 11. TopologicalSort
+
+Console.WriteLine("\n--- 11. TopologicalSort ---");
+
+let dag = (new Graph()).AsDirected();
+dag.AddEdge("A", "C").AddEdge("B", "C").AddEdge("C", "D");
+
+let topo = dag.TopologicalSort();
+check("Topo sort result not nil", topo != nil);
+checkEq("Topo sort length", len(topo), 4);
+
+let posA = 0; let posB = 0; let posC = 0; let posD = 0;
+iter (i from 0 to len(topo) - 1) {
+    if (topo[i] == "A") posA = i;
+    if (topo[i] == "B") posB = i;
+    if (topo[i] == "C") posC = i;
+    if (topo[i] == "D") posD = i;
+}
+check("Topo: A before C", posA < posC);
+check("Topo: B before C", posB < posC);
+check("Topo: C before D", posC < posD);
+
+let cycdag = (new Graph()).AsDirected();
+cycdag.AddEdge("A", "B").AddEdge("B", "A");
+let topoFail = cycdag.TopologicalSort();
+check("Topo sort on cyclic graph returns nil", topoFail == nil);
+
+// ============================================================
+// 12. Transpose
+
+Console.WriteLine("\n--- 12. Transpose ---");
+
+let tg = (new Graph()).AsDirected();
+tg.AddEdge("A", "B", 7).AddEdge("B", "C", 3);
+
+let tr = tg.Transpose();
+check("Transpose B->A", tr.HasEdge("B", "A"));
+check("Transpose C->B", tr.HasEdge("C", "B"));
+check("Transpose !A->B", !tr.HasEdge("A", "B"));
+checkEq("Transpose weight B->A", tr.GetEdgeWeight("B", "A"), 7);
+
+// ============================================================
+// 13. Clear / ToString
+
+Console.WriteLine("\n--- 13. Clear / ToString ---");
+
+let clrg = new Graph();
+clrg.AddEdge("A", "B").AddEdge("B", "C");
+clrg.Clear();
+checkEq("NodeCount after Clear", clrg.NodeCount(), 0);
+checkEq("EdgeCount after Clear", clrg.EdgeCount(), 0);
+
+let ts = (new Graph()).AsDirected();
+ts.AddEdge("A", "B");
+let s = ts.ToString();
+check("ToString contains 'directed=true'", String.Contains(s, "directed=true"));
+
+// ============================================================
+// 14. Int node IDs
+
+Console.WriteLine("\n--- 14. Int node IDs ---");
+
+let ig = new Graph();
+ig.AddEdge(1, 2).AddEdge(2, 3).AddEdge(3, 4);
+checkEq("Int nodes count", ig.NodeCount(), 4);
+check("Int HasEdge 1->2", ig.HasEdge(1, 2));
+let ipath = ig.BFSPath(1, 4);
+check("Int BFSPath 1->4", ipath != nil);
+checkEq("Int BFSPath first", ipath[0], 1);
+checkEq("Int BFSPath last", ipath[len(ipath) - 1], 4);
+
+// ============================================================
+// 15. WeightType / builder methods
+
+Console.WriteLine("\n--- 15. WeightType / builder methods ---");
+
+let wtg = (new Graph()).WithBigInt();
+check("WeightType bigint", wtg.WeightType() == "bigint");
+let wts = wtg.ToString();
+check("ToString contains weightType=bigint", String.Contains(wts, "weightType=bigint"));
+
+let wtg2 = new Graph();
+check("WeightType default native", wtg2.WeightType() == "native");
+
+// ============================================================
+// 16. BigInt weights
+
+Console.WriteLine("\n--- 16. BigInt weights ---");
+
+let bg_w = (new Graph()).AsDirected().WithBigInt();
+let bw1 = BigInt.From(100);
+let bw2 = BigInt.From(200);
+let bw3 = BigInt.From(50);
+
+bg_w.AddEdge("A", "B", bw1);
+bg_w.AddEdge("A", "C", bw2);
+bg_w.AddEdge("B", "C", bw3);
+
+let bres = bg_w.Dijkstra("A");
+check("BigInt Dijkstra dist A->A = 0",   BigInt.Eq(bres.Distances.Get("A"), BigInt.Zero()));
+check("BigInt Dijkstra dist A->B = 100", BigInt.Eq(bres.Distances.Get("B"), BigInt.From(100)));
+check("BigInt Dijkstra dist A->C = 150", BigInt.Eq(bres.Distances.Get("C"), BigInt.From(150)));
+
+let bsp = bg_w.ShortestPath("A", "C");
+check("BigInt ShortestPath A->C exists", bsp != nil);
+checkEq("BigInt ShortestPath first", bsp[0], "A");
+checkEq("BigInt ShortestPath last",  bsp[len(bsp) - 1], "C");
+
+let bgw_edge = bg_w.GetEdgeWeight("A", "B");
+check("BigInt GetEdgeWeight A->B = 100", BigInt.Eq(bgw_edge, BigInt.From(100)));
+
+// ============================================================
+// 17. Decimal weights
+
+Console.WriteLine("\n--- 17. Decimal weights ---");
+
+let dg_w = (new Graph()).AsDirected().WithDecimal();
+let dw1 = Decimal.From("1.5");
+let dw2 = Decimal.From("3.0");
+let dw3 = Decimal.From("0.75");
+
+dg_w.AddEdge("X", "Y", dw1);
+dg_w.AddEdge("X", "Z", dw2);
+dg_w.AddEdge("Y", "Z", dw3);
+
+let dres = dg_w.Dijkstra("X");
+check("Decimal Dijkstra dist X->X = 0",    Decimal.Eq(dres.Distances.Get("X"), Decimal.Zero()));
+check("Decimal Dijkstra dist X->Y = 1.5",  Decimal.Eq(dres.Distances.Get("Y"), Decimal.From("1.5")));
+check("Decimal Dijkstra dist X->Z = 2.25", Decimal.Eq(dres.Distances.Get("Z"), Decimal.From("2.25")));
+
+let dsp = dg_w.ShortestPath("X", "Z");
+check("Decimal ShortestPath X->Z exists", dsp != nil);
+checkEq("Decimal ShortestPath first", dsp[0], "X");
+checkEq("Decimal ShortestPath last",  dsp[len(dsp) - 1], "Z");
+
+// ============================================================
+// 18. Transpose preserves weightType
+
+Console.WriteLine("\n--- 18. Transpose preserves weightType ---");
+
+let btg = (new Graph()).AsDirected().WithBigInt();
+btg.AddEdge("A", "B", BigInt.From(7));
+let btr = btg.Transpose();
+check("Transposed graph weightType preserved", btr.WeightType() == "bigint");
+check("Transposed BigInt edge B->A", btr.HasEdge("B", "A"));
+check("Transposed BigInt weight B->A = 7", BigInt.Eq(btr.GetEdgeWeight("B", "A"), BigInt.From(7)));
+
+// ============================================================
+// 19. Bug-fix regression tests
+
+Console.WriteLine("\n--- 19. Regression: self-loops, Neighbors/EdgesFrom, IsConnected directed, negative weights ---");
+
+// Self-loop guard: AddEdge(A, A) must be a no-op
+let slg = new Graph();
+slg.AddEdge("A", "B");
+slg.AddEdge("A", "A");
+checkEq("Self-loop ignored: NodeCount unchanged", slg.NodeCount(), 2);
+checkEq("Self-loop ignored: EdgeCount unchanged", slg.EdgeCount(), 1);
+check("Self-loop ignored: !HasEdge(A,A)", !slg.HasEdge("A", "A"));
+
+let slg2 = (new Graph()).AsDirected();
+slg2.AddEdge("X", "X");
+checkEq("Directed self-loop ignored: EdgeCount=0", slg2.EdgeCount(), 0);
+
+// Neighbors() returns node IDs, EdgesFrom() returns edge objects
+let nng = new Graph();
+nng.AddEdge("A", "B", 5).AddEdge("A", "C", 9);
+let nb = nng.Neighbors("A");
+check("Neighbors returns array", len(nb) == 2);
+check("Neighbors contains B", nb[0] == "B" || nb[1] == "B");
+check("Neighbors contains C", nb[0] == "C" || nb[1] == "C");
+
+let ef = nng.EdgesFrom("A");
+check("EdgesFrom returns 2 edge objects", len(ef) == 2);
+check("EdgesFrom has Weight field", ef[0].Weight == 5 || ef[0].Weight == 9);
+check("EdgesFrom has To field", ef[0].To == "B" || ef[0].To == "C");
+
+// IsConnected throws for directed graphs
+let isConnThrew: bool = false;
+try {
+    let dcg = (new Graph()).AsDirected();
+    dcg.AddEdge("A", "B");
+    dcg.IsConnected();
+} catch (e) {
+    isConnThrew = true;
+}
+check("IsConnected throws for directed", isConnThrew);
+
+// IsWeaklyConnected: directed A->B, C->A is weakly connected
+let wcg = (new Graph()).AsDirected();
+wcg.AddEdge("A", "B").AddEdge("C", "A");
+check("IsWeaklyConnected: A->B, C->A = true", wcg.IsWeaklyConnected());
+
+let wcg2 = (new Graph()).AsDirected();
+wcg2.AddEdge("A", "B");
+wcg2.AddNode("C");
+check("IsWeaklyConnected: A->B + isolated C = false", !wcg2.IsWeaklyConnected());
+
+let wcg3 = (new Graph()).AsDirected();
+check("IsWeaklyConnected: empty = true", wcg3.IsWeaklyConnected());
+
+// IsWeaklyConnected also works for undirected
+let wcg4 = new Graph();
+wcg4.AddEdge("A", "B").AddEdge("B", "C");
+check("IsWeaklyConnected undirected connected", wcg4.IsWeaklyConnected());
+
+let wcg5 = new Graph();
+wcg5.AddEdge("A", "B");
+wcg5.AddNode("C");
+check("IsWeaklyConnected undirected disconnected", !wcg5.IsWeaklyConnected());
+
+// Dijkstra rejects negative weights
+let negThrew: bool = false;
+try {
+    let neg = (new Graph()).AsDirected();
+    neg.AddEdge("A", "B", -1);
+    neg.AddEdge("B", "C", 2);
+    neg.Dijkstra("A");
+} catch (e) {
+    negThrew = true;
+}
+check("Dijkstra throws on negative weight", negThrew);
+
+// Dijkstra with zero-weight edges is fine
+let negOk: bool = false;
+let zeroWg = (new Graph()).AsDirected();
+zeroWg.AddEdge("A", "B", 0).AddEdge("B", "C", 1);
+let zres = zeroWg.Dijkstra("A");
+check("Dijkstra accepts zero-weight edges", zres != nil && zres.Distances.Get("C") == 1);
+
+// ============================================================
+// Extra tests
+
+test_extra_graph();
+test_pathfinding_extra();
+
+// ============================================================
+// Test summary
+
+Console.WriteLine("\n============================================================");
+Console.WriteLine("Tests: " + str(passed) + " passed, " + str(failed) + " failed");
+
+// ============================================================
+// Benchmarks
+// ============================================================
+
+Console.WriteLine("\n\n=== Graph Benchmarks ===");
+Console.WriteLine(String.PadRight("benchmark", 44), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+benchSep();
+
+// -- Construction --
+
+Console.WriteLine("\n[ Construction - " + str(_N_SMALL) + " nodes ]");
+
+bench("AddEdge undirected (cycle)", fn() {
+    let g = new Graph();
+    iter (i from 0 to _N_SMALL - 1) {
+        g.AddEdge(i, (i + 1) % _N_SMALL);
+    }
+    _sink = g.EdgeCount();
+}, 1000);
+
+bench("AddEdge directed (DAG)", fn() {
+    let g = (new Graph()).AsDirected();
+    iter (i from 0 to _N_SMALL - 2) {
+        g.AddEdge(i, i + 1);
+    }
+    _sink = g.EdgeCount();
+}, 1000);
+
+_g_bench_undirected = buildCycle(_N_MEDIUM);
+
+bench("HasEdge (existing)", fn() {
+    if (_g_bench_undirected.HasEdge(0, 1)) { _sink = 1; } else { _sink = 0; }
+}, 20000);
+
+bench("HasEdge (missing)", fn() {
+    if (_g_bench_undirected.HasEdge(0, _N_MEDIUM - 1)) { _sink = 1; } else { _sink = 0; }
+}, 20000);
+
+// -- Traversal --
+
+_g_bench_directed    = buildDAG(_N_MEDIUM);
+_g_bench_directed_sm = buildDAG(100);
+_g_bench_sparse      = buildChain(_N_MEDIUM);
+_g_bench_dijk        = buildCycle(_N_DIJKSTRA);
+
+Console.WriteLine("\n[ Traversal - " + str(_N_MEDIUM) + " nodes ]");
+
+bench("BFS  dense (cycle graph)", fn() {
+    let o = _g_bench_undirected.BFS(0);
+    _sink = len(o);
+}, 300);
+
+bench("DFS  dense (cycle graph)", fn() {
+    let o = _g_bench_undirected.DFS(0);
+    _sink = len(o);
+}, 300);
+
+bench("BFS  sparse (chain graph)", fn() {
+    let o = _g_bench_sparse.BFS(0);
+    _sink = len(o);
+}, 300);
+
+bench("DFS  sparse (chain graph)", fn() {
+    let o = _g_bench_sparse.DFS(0);
+    _sink = len(o);
+}, 300);
+
+// -- Path finding --
+
+Console.WriteLine("\n[ Path finding ]");
+
+bench("BFSPath  dense  start-end", fn() {
+    let p = _g_bench_undirected.BFSPath(0, _N_MEDIUM - 1);
+    if (p != nil) { _sink = len(p); }
+}, 300);
+
+bench("BFSPath  sparse start-end", fn() {
+    let p = _g_bench_sparse.BFSPath(0, _N_MEDIUM - 1);
+    if (p != nil) { _sink = len(p); }
+}, 300);
+
+bench("Dijkstra (" + str(_N_DIJKSTRA) + " nodes, all dists)", fn() {
+    let r = _g_bench_dijk.Dijkstra(0);
+    _sink = r.Distances.Size();
+}, 300);
+
+bench("ShortestPath (" + str(_N_DIJKSTRA) + " nodes) start-end", fn() {
+    let p = _g_bench_dijk.ShortestPath(0, _N_DIJKSTRA - 1);
+    if (p != nil) { _sink = len(p); }
+}, 300);
+
+// -- Analysis --
+
+Console.WriteLine("\n[ Analysis - " + str(_N_MEDIUM) + " nodes ]");
+
+bench("IsConnected  dense", fn() {
+    if (_g_bench_undirected.IsConnected()) { _sink = 1; }
+}, 300);
+
+bench("IsConnected  sparse", fn() {
+    if (_g_bench_sparse.IsConnected()) { _sink = 1; }
+}, 300);
+
+bench("HasCycle  undirected (cycle)", fn() {
+    if (_g_bench_undirected.HasCycle()) { _sink = 1; }
+}, 300);
+
+bench("HasCycle  directed (DAG, no cycle)", fn() {
+    if (!_g_bench_directed_sm.HasCycle()) { _sink = 0; }
+}, 300);
+
+bench("TopologicalSort  DAG", fn() {
+    let t = _g_bench_directed_sm.TopologicalSort();
+    if (t != nil) { _sink = len(t); }
+}, 300);
+
+benchSep();
+Console.WriteLine("_sink=" + str(_sink) + "  (prevents dead-code elimination)");
+    return failed;
+}

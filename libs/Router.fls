@@ -1,0 +1,734 @@
+// =============================================================================
+// Router.fls - HTTP server router with middleware pipeline for Flaris.
+// Version: 1.0
+//
+// Requires -u (unsafe) flag.
+//
+// Exports:
+//   Router              - HTTP router (register routes, run server)
+//   Response            - static response builder helpers
+//   JwtMiddleware       - JWT Bearer token authentication
+//   JwtSign(payload, secret, expirySecs)  - issue a signed HS256 JWT
+//   LoggerMiddleware    - request/response logging
+//   CorsMiddleware      - CORS response headers
+//   RateLimitMiddleware - simple in-memory per-IP rate limiter
+//
+// Usage:
+//   import { Router, Response, LoggerMiddleware, CorsMiddleware, JwtMiddleware, JwtSign }
+//       from library("Router", "1.0");
+//
+//   let app = new Router();
+//   app.Use(fn(req, next) { return (new LoggerMiddleware()).Handle(req, next); });
+//   app.Use(fn(req, next) { return (new CorsMiddleware("*")).Handle(req, next); });
+//
+//   app.Get("/", fn(req) { return Response.Text("Hello"); });
+//   app.Post("/echo", fn(req) { return Response.Json(Json.Parse(req.body)); });
+//
+//   let api = app.Group("/api");
+//   api.Use(fn(req, next) {
+//       return (new JwtMiddleware("my-secret", ["/api/login"])).Handle(req, next);
+//   });
+//   api.Get("/users", fn(req) { return Response.Json([{ id: 1 }]); });
+//
+//   app.Listen(8080);
+//
+// Router:
+//   new Router()
+//   .Get(pattern, handler)      - register route; pattern can include :param segments
+//   .Post(pattern, handler)
+//   .Put(pattern, handler)
+//   .Delete(pattern, handler)
+//   .Patch(pattern, handler)
+//   .Head(pattern, handler)
+//   .Use(middleware)            - add global middleware (fn(req, next) → response)
+//   .Group(prefix)  →  RouteGroup  - prefix-scoped sub-router
+//   .Static(urlPrefix, rootDir, opts?) - serve files under rootDir (path-safe);
+//       opts: { index:"index.html", fallback:"<file>", cacheControl:"<value>" }
+//   .NotFound(handler)          - custom 404 handler
+//   .Listen(port)               - start blocking HTTP server
+//   .Stop()                     - shut down server
+//
+//   Note: global middleware also runs for unmatched routes, so CORS preflight
+//   (OPTIONS) and logging apply even without a registered handler.
+//
+//   handler signature:  fn(req) → response
+//   req object:  { method, path, params, query, headers, body }
+//   params:      path parameters from :name segments (req.params.name)
+//
+// RouteGroup (returned by Group):
+//   .Get / .Post / .Put / .Delete / .Patch(pattern, handler)
+//   .Use(middleware)    - group-scoped middleware
+//
+// Middleware:
+//   fn(req, next) → response
+//   Call next(req) to continue the chain; return early to short-circuit.
+//   Can modify req before and/or response after calling next(req).
+//
+// Response (static builders):
+//   Response.Json(data, status?)      - Content-Type: application/json
+//   Response.Text(text, status?)      - Content-Type: text/plain
+//   Response.Html(html, status?)      - Content-Type: text/html
+//   Response.Error(status, message)   - JSON error body
+//   Response.Redirect(url, status?)   - 302 by default
+//   Response.NoContent()              - 204
+//   Response.File(path, contentType?) - serve a file (raw bytes, MIME inferred)
+//
+// Bundled middleware classes:
+//   new LoggerMiddleware()
+//   new CorsMiddleware(origin, opts?)  - origin: "*" or specific domain
+//       - opts: { methods, headers, maxAge, credentials, exposeHeaders }
+//   new JwtMiddleware(secret, skipPaths?)
+//       - validates "Authorization: Bearer <token>"; adds req.jwtPayload
+//       - skipPaths: array of path prefixes that bypass auth
+//   new RateLimitMiddleware(limit, windowSeconds)
+//       - per-IP rate limiter; returns 429 when exceeded
+//   JwtSign(payload, secret, expirySecs)  →  token string
+// =============================================================================
+
+import { Jwt } from library("Jwt", "1.0");
+import { Logger } from library("Logger", "1.0");
+
+global _jwt = new Jwt();
+
+// =============================================================================
+// _Pipeline - executes a middleware chain + terminal handler for one request.
+//
+// Chain entries: { handler: fn }  (each is fn(req, next) -> response)
+// Terminal handler: fn(req) -> response
+//
+// A new _Pipeline instance is created per dispatch so _index is isolated.
+// =============================================================================
+
+class _Pipeline
+{
+    let _chain:array = [];
+    let _terminal    = nil;
+    let _index:int   = 0;
+
+    fn Constructor(chain:array, terminal) {
+        _chain    = chain;
+        _terminal = terminal;
+        _index    = 0;
+    }
+
+    fn Run(req) {
+        if (_index >= len(_chain)) {
+            return _terminal(req);
+        }
+        let entry = _chain[_index];
+        _index++;
+        return entry.handler(req, fn(r) {
+            return this.Run(r);
+        });
+    }
+}
+
+// =============================================================================
+// RouteGroup - prefix-scoped route registration with optional middleware
+// =============================================================================
+
+class RouteGroup
+{
+    let _router           = nil;
+    let _prefix:string    = "";
+    let _middleware:array = [];
+
+    fn Constructor(router, prefix:string) {
+        _router = router;
+        _prefix = prefix;
+    }
+
+    fn Get(pattern:string, handler:fn) {
+        _router._addGroupRoute("GET", _prefix + pattern, handler, _middleware);
+    }
+
+    fn Post(pattern:string, handler:fn) {
+        _router._addGroupRoute("POST", _prefix + pattern, handler, _middleware);
+    }
+
+    fn Put(pattern:string, handler:fn) {
+        _router._addGroupRoute("PUT", _prefix + pattern, handler, _middleware);
+    }
+
+    fn Delete(pattern:string, handler:fn) {
+        _router._addGroupRoute("DELETE", _prefix + pattern, handler, _middleware);
+    }
+
+    fn Patch(pattern:string, handler:fn) {
+        _router._addGroupRoute("PATCH", _prefix + pattern, handler, _middleware);
+    }
+
+    // Register middleware scoped to this group only: fn(req, next) -> response
+    fn Use(middleware:fn) {
+        Array.Append(_middleware, { handler: middleware });
+    }
+}
+
+// =============================================================================
+// Router
+// =============================================================================
+
+class Router
+{
+    let _routes:array     = [];
+    let _middleware:array = [];
+    let _server            = nil;
+    let _notFound          = nil;
+    let _running           = true;
+
+    // ---- route registration ----
+
+    fn Get(pattern:string, handler:fn) {
+        _addRoute("GET", pattern, handler, []);
+    }
+
+    fn Post(pattern:string, handler:fn) {
+        _addRoute("POST", pattern, handler, []);
+    }
+
+    fn Put(pattern:string, handler:fn) {
+        _addRoute("PUT", pattern, handler, []);
+    }
+
+    fn Delete(pattern:string, handler:fn) {
+        _addRoute("DELETE", pattern, handler, []);
+    }
+
+    fn Patch(pattern:string, handler:fn) {
+        _addRoute("PATCH", pattern, handler, []);
+    }
+
+    fn Head(pattern:string, handler:fn) {
+        _addRoute("HEAD", pattern, handler, []);
+    }
+
+    fn _addRoute(method:string, pattern:string, handler:fn, routeMiddleware:array) {
+        Array.Append(_routes, {
+            method:     method,
+            pattern:    pattern,
+            handler:    handler,
+            middleware: routeMiddleware
+        });
+    }
+
+    fn _addGroupRoute(method:string, pattern:string, handler:fn, routeMiddleware:array) {
+        _addRoute(method, pattern, handler, routeMiddleware);
+    }
+
+    // ---- route groups ----
+
+    fn Group(prefix:string) {
+        return new RouteGroup(this, prefix);
+    }
+
+    // ---- static file serving ----
+    // Mount a directory at urlPrefix and serve its files safely. Path traversal
+    // (".." segments, backslashes) is rejected with 403. Directory requests fall
+    // back to the index file. options (optional):
+    //   { index: "index.html", fallback: "<path>", cacheControl: "<value>" }
+    // `fallback` serves a single file for any unmatched path (SPA support).
+    // Example: app.Static("/assets", "./public", { cacheControl: "max-age=3600" });
+    fn Static(urlPrefix:string, rootDir:string, options) {
+        let handler = new _StaticHandler(rootDir, options);
+        let pattern = urlPrefix + "/*";
+        _addRoute("GET",  pattern, fn(req) { return handler.Serve(req); }, []);
+        _addRoute("HEAD", pattern, fn(req) { return handler.Serve(req); }, []);
+        return this;
+    }
+
+    // ---- middleware ----
+    // Signature: fn(req, next) -> response
+
+    fn Use(middleware:fn) {
+        Array.Append(_middleware, { handler: middleware });
+    }
+
+    // ---- custom 404 handler ----
+
+    fn NotFound(handler:fn) {
+        _notFound = handler;
+    }
+
+    // ---- combine global + route-scoped middleware into one chain ----
+
+    fn _buildChain(routeMiddleware:array) {
+        let combined:array = [];
+        let i:int = 0;
+        while (i < len(_middleware)) {
+            Array.Append(combined, _middleware[i]);
+            i += 1;
+        }
+        i = 0;
+        while (i < len(routeMiddleware)) {
+            Array.Append(combined, routeMiddleware[i]);
+            i += 1;
+        }
+        return combined;
+    }
+
+    // ---- dispatch ----
+
+    fn _dispatch(req) {
+        let i:int = 0;
+        while (i < len(_routes)) {
+            let route = _routes[i];
+            if (HttpUtil.RouteMatch(req, route.method, route.pattern)) {
+                let chain    = this._buildChain(route.middleware);
+                let pipeline = new _Pipeline(chain, route.handler);
+                return pipeline.Run(req);
+            }
+            i += 1;
+        }
+
+        // No route matched. Still run the global middleware chain so that
+        // cross-cutting concerns (CORS preflight, logging, ...) apply to
+        // unmatched requests too - in particular OPTIONS preflight requests
+        // never match a GET/POST route. The chain terminates in the custom 404
+        // handler when set, otherwise a default 404.
+        let terminal = (_notFound != nil)
+            ? _notFound
+            : fn(_r) { return Response.Error(404, "Not Found"); };
+        let pipeline = new _Pipeline(_middleware, terminal);
+        return pipeline.Run(req);
+    }
+
+    // ---- server loop ----
+
+    fn Listen(port:int) {
+        Console.WriteLine("Router listening on port ", port);
+        this._server = HttpUtil.StartServer(port, fn(req) {
+            return this._dispatch(req);
+        });
+
+        if (this._server == nil) {
+            Console.WriteLine("StartServer failed - port in use or bad handler type");
+            return;
+        }
+
+        this._running = true;
+        while (this._running) {
+            HttpUtil.WaitReadable(this._server, -1);
+            var more = true;
+            while (more) {
+                more = this._server != nil && HttpUtil.HandleRequests(this._server);
+            }
+        }
+    }
+
+    fn Stop() {
+        Console.WriteLine("Router stopping...");
+        this._running = false;
+        if (this._server != nil) {
+            HttpUtil.StopServer(this._server);
+            this._server = nil;
+        }
+    }
+}
+
+// =============================================================================
+// Response
+// =============================================================================
+
+class Response
+{
+    fn static Json(data, status) {
+        let s:int = (status == nil) ? 200 : status;
+        return {
+            status:  s,
+            body:    Json.Stringify(data),
+            headers: { "Content-Type": "application/json" }
+        };
+    }
+
+    fn static Text(text, status) {
+        let s:int = (status == nil) ? 200 : status;
+        return {
+            status:  s,
+            body:    text,
+            headers: { "Content-Type": "text/plain" }
+        };
+    }
+
+    fn static Html(html, status) {
+        let s:int = (status == nil) ? 200 : status;
+        return {
+            status:  s,
+            body:    html,
+            headers: { "Content-Type": "text/html" }
+        };
+    }
+
+    fn static Error(status, message) {
+        return {
+            status:  status,
+            body:    Json.Stringify({ error: message }),
+            headers: { "Content-Type": "application/json" }
+        };
+    }
+
+    fn static Redirect(url, status) {
+        let s:int = (status == nil) ? 302 : status;
+        return {
+            status:  s,
+            body:    "",
+            headers: { "Location": url }
+        };
+    }
+
+    fn static NoContent() {
+        return {
+            status:  204,
+            body:    "",
+            headers: {}
+        };
+    }
+
+    // Serve a single file. Content-Type is inferred from the extension unless
+    // `contentType` is given. The body is the raw bytes, so binary assets
+    // (images, fonts, ...) are transmitted intact. Returns 404 if missing.
+    fn static File(path:string, contentType) {
+        return _StaticHandler._serveFile(path, contentType);
+    }
+}
+
+// =============================================================================
+// _StaticHandler - path-safe static file server used by Router.Static().
+// =============================================================================
+
+class _StaticHandler
+{
+    let _root:string  = ".";
+    let _index:string = "index.html";
+    let _fallback     = nil;
+    let _cache        = nil;
+
+    fn Constructor(root:string, options) {
+        if (root != nil and len(root) > 0) _root = root;
+        if (options != nil) {
+            if (Object.HasKey(options, "index"))        _index    = options.index;
+            if (Object.HasKey(options, "fallback"))     _fallback = options.fallback;
+            if (Object.HasKey(options, "cacheControl")) _cache    = options.cacheControl;
+        }
+    }
+
+    fn Serve(req) {
+        var rel:string = "";
+        if (req.params != nil and Object.HasKey(req.params, "*")) {
+            rel = req.params["*"];
+        }
+
+        let safe = _StaticHandler._safeRel(rel);
+        if (safe == nil) {
+            return Response.Error(403, "Forbidden");
+        }
+
+        var path:string = _root;
+        if (len(safe) > 0) path = _root + "/" + safe;
+
+        // A directory request (including the mount root) serves the index file.
+        // Directory.Exists() uses stat()+S_ISDIR; File.Exists() (fopen) is true for
+        // directories too, so the regular-file check excludes them explicitly.
+        if (len(safe) == 0 or Directory.Exists(path)) {
+            path = path + "/" + _index;
+        }
+
+        if (File.Exists(path) and !Directory.Exists(path)) {
+            return this._fileResponse(path);
+        }
+
+        // SPA fallback: serve a single entry file for any unmatched path.
+        if (_fallback != nil and File.Exists(_fallback)) {
+            return this._fileResponse(_fallback);
+        }
+
+        return Response.Error(404, "Not Found");
+    }
+
+    fn _fileResponse(path:string) {
+        let bytes = File.ReadAllBytes(path);
+        if (bytes == nil) {
+            return Response.Error(404, "Not Found");
+        }
+        let headers = { "Content-Type": _StaticHandler._mimeFor(path) };
+        if (_cache != nil) headers["Cache-Control"] = _cache;
+        return { status: 200, body: bytes, headers: headers };
+    }
+
+    // Read a file and build a response with an inferred (or given) Content-Type.
+    // Backs Response.File(); kept here so the File builtin is referenced outside
+    // the Response class (which defines a static method also named File).
+    fn static _serveFile(path:string, contentType) {
+        if (!File.Exists(path) or Directory.Exists(path)) {
+            return Response.Error(404, "Not Found");
+        }
+        let bytes = File.ReadAllBytes(path);
+        if (bytes == nil) {
+            return Response.Error(404, "Not Found");
+        }
+        let ct = (contentType == nil) ? _StaticHandler._mimeFor(path) : contentType;
+        return { status: 200, body: bytes, headers: { "Content-Type": ct } };
+    }
+
+    // Validate a request-relative path. Returns the cleaned path, or nil if it
+    // is unsafe (contains a ".." traversal segment or a backslash). The router's
+    // matcher has already collapsed empty segments, so a non-nil result is safe
+    // to append under the root directory.
+    fn static _safeRel(rel) {
+        if (rel == nil or rel == "") return "";
+        if (String.Contains(rel, "\\")) return nil;   // no Windows separators
+        let parts = String.Split(rel, "/");
+        var i:int = 0;
+        while (i < len(parts)) {
+            if (parts[i] == "..") return nil;          // path-traversal attempt
+            i = i + 1;
+        }
+        return rel;
+    }
+
+    // Map a file extension to a MIME type (defaults to octet-stream).
+    fn static _mimeFor(path:string): string {
+        let parts = String.Split(path, ".");
+        let n:int = len(parts);
+        if (n < 2) return "application/octet-stream";
+        let ext = String.ToLower(parts[n - 1]);
+        if (String.Contains(ext, "/")) return "application/octet-stream";
+
+        let m = {
+            html: "text/html; charset=utf-8",
+            htm:  "text/html; charset=utf-8",
+            css:  "text/css; charset=utf-8",
+            js:   "text/javascript; charset=utf-8",
+            mjs:  "text/javascript; charset=utf-8",
+            json: "application/json; charset=utf-8",
+            xml:  "application/xml; charset=utf-8",
+            txt:  "text/plain; charset=utf-8",
+            md:   "text/markdown; charset=utf-8",
+            csv:  "text/csv; charset=utf-8",
+            svg:  "image/svg+xml",
+            png:  "image/png",
+            jpg:  "image/jpeg",
+            jpeg: "image/jpeg",
+            gif:  "image/gif",
+            webp: "image/webp",
+            ico:  "image/x-icon",
+            bmp:  "image/bmp",
+            woff: "font/woff",
+            woff2:"font/woff2",
+            ttf:  "font/ttf",
+            otf:  "font/otf",
+            eot:  "application/vnd.ms-fontobject",
+            pdf:  "application/pdf",
+            wasm: "application/wasm",
+            mp4:  "video/mp4",
+            webm: "video/webm",
+            mp3:  "audio/mpeg",
+            wav:  "audio/wav",
+            ogg:  "audio/ogg",
+            zip:  "application/zip",
+            gz:   "application/gzip"
+        };
+        if (Object.HasKey(m, ext)) return m[ext];
+        return "application/octet-stream";
+    }
+}
+
+// =============================================================================
+// LoggerMiddleware
+//
+// Usage:
+//   let logMw = new LoggerMiddleware();
+//   app.Use(fn(req, next) { return logMw.Handle(req, next); });
+// =============================================================================
+
+
+
+class LoggerMiddleware
+{
+    let  _log:instance = nil;
+
+    fn Constructor() {
+        _log = new Logger();
+    }
+
+    fn Handle(req, next) {
+        _log.Info("-->", { method: req.method, path: req.path });
+        let resp = next(req);
+        _log.Info("<--", { method: req.method, path: req.path, status: resp.status });
+        return resp;
+    }
+}
+
+// =============================================================================
+// CorsMiddleware
+//
+// Usage:
+//   let corsMw = new CorsMiddleware("*");
+//   app.Use(fn(req, next) { return corsMw.Handle(req, next); });
+//
+// Optional second argument tunes the policy:
+//   new CorsMiddleware("https://app.example.com", {
+//       methods: "GET, POST",
+//       headers: "Content-Type, Authorization, X-Token",
+//       maxAge: 3600,
+//       credentials: true,                 // Access-Control-Allow-Credentials
+//       exposeHeaders: "X-Total-Count"     // Access-Control-Expose-Headers
+//   });
+// =============================================================================
+
+class CorsMiddleware
+{
+    let _origin:string      = "*";
+    let _methods:string     = "GET, POST, PUT, DELETE, PATCH, OPTIONS";
+    let _headers:string     = "Content-Type, Authorization";
+    let _maxAge:string      = "86400";
+    let _credentials:bool   = false;
+    let _exposeHeaders      = nil;
+
+    fn Constructor(origin:string, options) {
+        if (origin != nil) _origin = origin;
+        if (options != nil) {
+            if (Object.HasKey(options, "methods"))       _methods       = options.methods;
+            if (Object.HasKey(options, "headers"))       _headers       = options.headers;
+            if (Object.HasKey(options, "maxAge"))        _maxAge        = str(options.maxAge);
+            if (Object.HasKey(options, "credentials"))   _credentials   = options.credentials;
+            if (Object.HasKey(options, "exposeHeaders")) _exposeHeaders = options.exposeHeaders;
+        }
+    }
+
+    fn Handle(req, next) {
+        if (req.method == "OPTIONS") {
+            let h = {
+                "Access-Control-Allow-Origin":  _origin,
+                "Access-Control-Allow-Methods": _methods,
+                "Access-Control-Allow-Headers": _headers,
+                "Access-Control-Max-Age":       _maxAge
+            };
+            if (_credentials) h["Access-Control-Allow-Credentials"] = "true";
+            return { status: 204, body: "", headers: h };
+        }
+
+        let resp = next(req);
+        if (resp.headers == nil) resp["headers"] = {};
+        resp.headers["Access-Control-Allow-Origin"] = _origin;
+        if (_credentials) resp.headers["Access-Control-Allow-Credentials"] = "true";
+        if (_exposeHeaders != nil) resp.headers["Access-Control-Expose-Headers"] = _exposeHeaders;
+        return resp;
+    }
+}
+
+// =============================================================================
+// JwtMiddleware
+//
+// Usage:
+//   let jwtMw = new JwtMiddleware(secret, ["/auth/login"]);
+//   app.Use(fn(req, next) { return jwtMw.Handle(req, next); });
+//
+// On success: populates req.jwt with decoded payload, calls next.
+// On failure: returns 401 without calling next.
+// =============================================================================
+
+class JwtMiddleware
+{
+    let _secret:string   = "";
+    let _skipPaths:array = [];
+
+    fn Constructor(secret:string, skipPaths) {
+        _secret    = secret;
+        _skipPaths = (skipPaths == nil) ? [] : skipPaths;
+    }
+
+    fn Handle(req, next) {
+        let si:int = 0;
+        while (si < len(_skipPaths)) {
+            if (req.path == _skipPaths[si]) { return next(req); }
+            si += 1;
+        }
+
+        let auth = req.headers["Authorization"];
+        if (auth == nil) {
+            return Response.Error(401, "Missing Authorization header");
+        }
+
+        let prefix = "Bearer ";
+        if (len(auth) <= len(prefix)) {
+            return Response.Error(401, "Invalid Authorization header");
+        }
+
+        let token = String.Substr(auth, len(prefix), len(auth) - len(prefix));
+
+        let verified = _jwt.VerifyHS256(token, _secret);
+        if (!verified) {
+            return Response.Error(401, "Invalid or expired token");
+        }
+
+        let decoded = _jwt.Decode(token);
+        if (decoded != nil) {
+            req.jwt = decoded.payload;
+        }
+        return next(req);
+    }
+}
+
+// =============================================================================
+// RateLimitMiddleware - simple in-memory rate limiter
+//
+// Usage:
+//   let rateMw = new RateLimitMiddleware(100, 60);  // 100 req / 60 seconds
+//   app.Use(fn(req, next) { return rateMw.Handle(req, next); });
+// =============================================================================
+
+class RateLimitMiddleware
+{
+    let _limit:int  = 100;
+    let _window:int = 60;
+    let _counts      = {};
+    let _windows     = {};
+
+    fn Constructor(limit:int, windowSeconds:int) {
+        _limit  = limit;
+        _window = windowSeconds;
+    }
+
+    fn Handle(req, next) {
+        let ip = req.headers["X-Forwarded-For"];
+        if (ip == nil) { ip = "unknown"; }
+
+        let now:int  = Time.Now();
+        let winStart = _windows[ip];
+
+        if (winStart == nil || (now - winStart) > _window) {
+            _windows[ip] = now;
+            _counts[ip]  = 1;
+        } else {
+            _counts[ip] = _counts[ip] + 1;
+        }
+
+        if (_counts[ip] > _limit) {
+            return {
+                status:  429,
+                body:    Json.Stringify({ error: "Too many requests" }),
+                headers: {
+                    "Content-Type": "application/json",
+                    "Retry-After":  "" + _window
+                }
+            };
+        }
+
+        return next(req);
+    }
+}
+
+// =============================================================================
+// JwtSign - issue a signed HS256 JWT
+// =============================================================================
+
+fn JwtSign(payload, secret, expirySeconds) {
+    let options = nil;
+    if (expirySeconds != nil) {
+        let now:int = Time.Now();
+        options = { iat: now, exp: now + expirySeconds };
+    }
+    return _jwt.EncodeHS256(payload, secret, options);
+}
+
+export { Router, Response, JwtMiddleware, JwtSign, LoggerMiddleware, CorsMiddleware, RateLimitMiddleware };

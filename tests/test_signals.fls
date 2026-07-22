@@ -1,0 +1,758 @@
+// test_signals.fls
+// Tests for libs/Signals.fls
+
+import { Signals } from library("Signals", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn assert(name:string, cond:bool) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name);
+        failed += 1;
+    }
+}
+
+fn assertClose(name:string, a:float, b:float, tol:float) {
+    assert(name, Math.AbsF(a - b) <= tol);
+}
+
+fn makeArray(n:int, val:float): array {
+    let a:array = Array.Create(n);
+    Array.Fill(a, val);
+    return a;
+}
+
+fn test_extra_signals(signals:Signals) {
+    // ============================================================
+    //  Static NextPow2
+    // ============================================================
+
+    // NextPow2 is declared `fn static` - verify the static call path.
+    assert("Signals.NextPow2(1)  = 1",  Signals.NextPow2(1)  == 1);
+    assert("Signals.NextPow2(2)  = 2",  Signals.NextPow2(2)  == 2);
+    assert("Signals.NextPow2(5)  = 8",  Signals.NextPow2(5)  == 8);
+    assert("Signals.NextPow2(8)  = 8",  Signals.NextPow2(8)  == 8);
+    assert("Signals.NextPow2(17) = 32", Signals.NextPow2(17) == 32);
+    assert("Signals.NextPow2(64) = 64", Signals.NextPow2(64) == 64);
+
+    // ============================================================
+    //  Additional PeakNormalize edge cases
+    // ============================================================
+
+    // PeakNormalize on a signal with a negative peak larger than the positive peak.
+    let pnNeg = signals.PeakNormalize([-3.0, 1.0, 0.0]);
+    assertClose("PeakNormalize neg peak: [-3,1,0][0] = -1", pnNeg[0], -1.0, 1e-9);
+    assertClose("PeakNormalize neg peak: [-3,1,0][1] = 1/3", pnNeg[1], 1.0/3.0, 1e-9);
+
+    // PeakNormalize on a single-element signal.
+    let pnOne = signals.PeakNormalize([0.5]);
+    assertClose("PeakNormalize single element", pnOne[0], 1.0, 1e-9);
+
+    // ============================================================
+    //  Additional FFTPad edge cases
+    // ============================================================
+
+    // Length already a power of 2 -> unchanged.
+    let pad16 = signals.FFTPad(signals.Rect(16));
+    assert("FFTPad 16 -> 16 (no-op)", len(pad16) == 16);
+
+    // Single element -> stays 1.
+    let pad1 = signals.FFTPad([1.0]);
+    assert("FFTPad 1 -> 1", len(pad1) == 1);
+
+    // 9 samples -> 16.
+    let pad9 = signals.FFTPad(signals.Rect(9));
+    assert("FFTPad 9 -> 16", len(pad9) == 16);
+
+    // ============================================================
+    //  Additional Convolve edge cases
+    // ============================================================
+
+    // Scale kernel: output = signal * scalar.
+    let convScale = signals.Convolve([1.0, 2.0, 3.0], [2.0]);
+    assert("Convolve scalar kernel length", len(convScale) == 3);
+    assertClose("Convolve scalar kernel[1]", convScale[1], 4.0, 1e-9);
+
+    // Full linear convolution of [1,1] with [1,1] = [1,2,1].
+    let conv11 = signals.Convolve([1.0, 1.0], [1.0, 1.0]);
+    assert("Convolve [1,1]*[1,1] length = 3", len(conv11) == 3);
+    assertClose("Convolve [1,1]*[1,1][0]", conv11[0], 1.0, 1e-9);
+    assertClose("Convolve [1,1]*[1,1][1]", conv11[1], 2.0, 1e-9);
+    assertClose("Convolve [1,1]*[1,1][2]", conv11[2], 1.0, 1e-9);
+
+    // ============================================================
+    //  Additional FIR edge cases
+    // ============================================================
+
+    // FIR length must equal input length.
+    let firIn = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let firOut = signals.FIR(firIn, [0.5, 0.5]);
+    assert("FIR length == input length", len(firOut) == len(firIn));
+
+    // FIR with an identity kernel [1.0] is a pass-through.
+    let firId = signals.FIR(firIn, [1.0]);
+    assertClose("FIR identity[0]", firId[0], firIn[0], 1e-9);
+    assertClose("FIR identity[4]", firId[4], firIn[4], 1e-9);
+
+    // ============================================================
+    //  Additional MedianFilter edge cases
+    // ============================================================
+
+    // Even-width window (w=2): should still run without crashing.
+    let medEven = signals.MedianFilter([3.0, 1.0, 4.0, 1.0, 5.0], 2);
+    assert("MedianFilter w=2 length", len(medEven) == 5);
+
+    // Constant signal: median filter is identity.
+    let constSig = makeArray(10, 7.0);
+    let medConst = signals.MedianFilter(constSig, 3);
+    assert("MedianFilter const length", len(medConst) == 10);
+    assertClose("MedianFilter const value", medConst[5], 7.0, 1e-9);
+
+    // ============================================================
+    //  Additional Chirp edge cases
+    // ============================================================
+
+    // A chirp sweeping from f to f (constant frequency) should behave like a sine.
+    let chirpFlat = signals.Chirp(1000, 440.0, 440.0, 44100.0, 1.0);
+    assert("Chirp flat length", len(chirpFlat) == 1000);
+    assertClose("Chirp flat peak = 1.0", signals.Peak(chirpFlat), 1.0, 0.01);
+
+    // Amplitude = 0 gives silence.
+    let chirpSil = signals.Chirp(64, 100.0, 500.0, 8000.0, 0.0);
+    assertClose("Chirp amplitude=0 is silence", signals.Peak(chirpSil), 0.0, 1e-9);
+
+    // ============================================================
+    //  Additional PowerSpectrum / ToDb / BinToHz edge cases
+    // ============================================================
+
+    // PowerSpectrum: power of a magnitude-2 bin should be 4.
+    let fakeSpec = { real: [2.0, 0.0], imag: [0.0, 0.0] };
+    let ps = signals.PowerSpectrum(fakeSpec);
+    assertClose("PowerSpectrum bin0=4", ps[0], 4.0, 1e-9);
+
+    // ToDb: 10.0 should give +20 dB.
+    assertClose("ToDb 10.0 = 20dB", signals.ToDb([10.0])[0], 20.0, 1e-6);
+    // ToDb: 0.1 should give -20 dB.
+    assertClose("ToDb 0.1 = -20dB", signals.ToDb([0.1])[0], -20.0, 1e-4);
+
+    // BinToHz: bin 0 always = 0 Hz.
+    assertClose("BinToHz bin0 = 0", signals.BinToHz(0, 1024, 44100.0), 0.0, 1e-9);
+    // BinToHz: bin = n/2 -> Nyquist.
+    assertClose("BinToHz Nyquist", signals.BinToHz(512, 1024, 44100.0), 22050.0, 1e-3);
+
+    // ============================================================
+    //  Additional CrossCorrelate edge cases
+    // ============================================================
+
+    // CrossCorrelate of two identical constant signals at lag 0 = Autocorrelate lag 0.
+    let ccDC = makeArray(8, 2.0);
+    let ccOut = signals.CrossCorrelate(ccDC, ccDC, 0);
+    assertClose("CrossCorrelate DC lag0 = 4", ccOut[0], 4.0, 1e-9);
+
+    // CrossCorrelate two orthogonal signals: lag-0 value near zero.
+    let ccSin = signals.Sine(128, 100.0, 1000.0, 1.0, 0.0);
+    let ccCos = signals.Cosine(128, 100.0, 1000.0, 1.0, 0.0);
+    let ccOrth = signals.CrossCorrelate(ccSin, ccCos, 0);
+    assert("CrossCorrelate sin/cos lag0 ≈ 0", Math.AbsF(ccOrth[0]) < 0.1);
+
+    // ============================================================
+    //  Additional Decimate / Interpolate edge cases
+    // ============================================================
+
+    // Decimate by 1 returns same length.
+    let decBy1 = signals.Decimate(signals.Rect(16), 1);
+    assert("Decimate factor=1 length", len(decBy1) == 16);
+
+    // Interpolate by 1 returns same length.
+    let interpBy1 = signals.Interpolate([1.0, 2.0, 3.0], 1);
+    assert("Interpolate factor=1 length", len(interpBy1) == 3);
+
+    // Decimate by 4 on a 100-sample signal -> 25 samples.
+    let decBy4 = signals.Decimate(makeArray(100, 1.0), 4);
+    assert("Decimate factor=4 length = 25", len(decBy4) == 25);
+
+    // Interpolate by 3 on a 4-sample signal -> 12 samples.
+    let interpBy3 = signals.Interpolate([1.0, 2.0, 3.0, 4.0], 3);
+    assert("Interpolate factor=3 length = 12", len(interpBy3) == 12);
+
+    // ============================================================
+    //  Additional DCRemove edge cases
+    // ============================================================
+
+    // DCRemove on a constant signal gives all zeros.
+    let dcConst = makeArray(16, 5.0);
+    let dcRem = signals.DCRemove(dcConst);
+    assertClose("DCRemove const -> 0", signals.Mean(dcRem), 0.0, 1e-9);
+    assertClose("DCRemove const[8] = 0", dcRem[8], 0.0, 1e-9);
+
+    // DCRemove on a zero-mean signal leaves it unchanged.
+    let dcZM = signals.Sine(64, 10.0, 64.0, 1.0, 0.0);
+    let dcZMrem = signals.DCRemove(dcZM);
+    assertClose("DCRemove zero-mean signal unchanged (sample 10)",
+                dcZMrem[10], dcZM[10], 1e-6);
+
+    // ============================================================
+    //  Additional Rescale edge cases
+    // ============================================================
+
+    // Rescale a constant signal: all values become newMin.
+    let rsConst = signals.Rescale(makeArray(8, 3.0), -1.0, 1.0);
+    assertClose("Rescale const -> newMin", rsConst[0], -1.0, 1e-9);
+
+    // Rescale [0..4] to [0..1]: step = 0.25.
+    let rsLinear = signals.Rescale([0.0, 1.0, 2.0, 3.0, 4.0], 0.0, 1.0);
+    assertClose("Rescale linear first", rsLinear[0], 0.0, 1e-9);
+    assertClose("Rescale linear mid",   rsLinear[2], 0.5, 1e-9);
+    assertClose("Rescale linear last",  rsLinear[4], 1.0, 1e-9);
+
+    // ============================================================
+    //  Additional Linspace edge cases
+    // ============================================================
+
+    // n=1 returns [start].
+    let ls1 = signals.Linspace(1, 3.0, 7.0);
+    assert("Linspace n=1 length", len(ls1) == 1);
+    assertClose("Linspace n=1 value", ls1[0], 3.0, 1e-9);
+
+    // Descending range.
+    let lsDesc = signals.Linspace(3, 1.0, 0.0);
+    assertClose("Linspace descending first", lsDesc[0], 1.0, 1e-9);
+    assertClose("Linspace descending last",  lsDesc[2], 0.0, 1e-9);
+
+    // ============================================================
+    //  Additional ArgMax edge cases
+    // ============================================================
+
+    // ArgMax on a single-element array -> index 0.
+    assert("ArgMax single element", signals.ArgMax([42.0]) == 0);
+
+    // ArgMax when max is at the last position.
+    assert("ArgMax last element", signals.ArgMax([1.0, 2.0, 3.0]) == 2);
+
+    // ArgMax when max is at the first position.
+    assert("ArgMax first element", signals.ArgMax([5.0, 2.0, 1.0]) == 0);
+
+    // ============================================================
+    //  Additional FindPeaks edge cases
+    // ============================================================
+
+    // No peaks when all values below minHeight.
+    let fpLow = signals.FindPeaks([0.1, 0.2, 0.1, 0.2, 0.1], 0.5, 1);
+    assert("FindPeaks none below minHeight", len(fpLow) == 0);
+
+    // Two peaks separated by exactly minDistance should both be found.
+    let fpClose = signals.FindPeaks([0.0, 1.0, 0.0, 1.0, 0.0], 0.5, 2);
+    assert("FindPeaks two peaks at distance 2", len(fpClose) == 2);
+
+    // Single peak at the centre of a signal.
+    let fpSingle = signals.FindPeaks([0.0, 0.0, 2.0, 0.0, 0.0], 0.5, 1);
+    assert("FindPeaks single centre peak count", len(fpSingle) == 1);
+    assert("FindPeaks single centre peak index", fpSingle[0] == 2);
+}
+
+fn test_benchmarks(signals:Signals) {
+    Console.WriteLine("");
+    Console.WriteLine("=== Benchmarks ===");
+
+    let N_bench = 4096;
+    let t0 = 0;
+    let t1 = 0;
+
+    t0 = Time.Millis();
+    let bench_sine = signals.Sine(N_bench, 440.0, 44100.0, 1.0, 0.0);
+    t1 = Time.Millis();
+    Console.WriteLine("Sine(" + str(N_bench) + ")              : " + str(t1 - t0) + " ms");
+
+    t0 = Time.Millis();
+    let bench_hann = signals.Hann(N_bench);
+    t1 = Time.Millis();
+    Console.WriteLine("Hann(" + str(N_bench) + ")              : " + str(t1 - t0) + " ms");
+
+    t0 = Time.Millis();
+    let bench_win = signals.ApplyWindow(bench_sine, bench_hann);
+    t1 = Time.Millis();
+    Console.WriteLine("ApplyWindow(" + str(N_bench) + ")       : " + str(t1 - t0) + " ms");
+
+    t0 = Time.Millis();
+    let bench_rms = signals.RMS(bench_sine);
+    t1 = Time.Millis();
+    Console.WriteLine("RMS(" + str(N_bench) + ")               : " + str(t1 - t0) + " ms");
+
+    t0 = Time.Millis();
+    let bench_peak = signals.Peak(bench_sine);
+    t1 = Time.Millis();
+    Console.WriteLine("Peak(" + str(N_bench) + ")              : " + str(t1 - t0) + " ms");
+
+    t0 = Time.Millis();
+    let bench_ma = signals.MovingAverage(bench_sine, 16);
+    t1 = Time.Millis();
+    Console.WriteLine("MovingAverage(" + str(N_bench) + ", 16) : " + str(t1 - t0) + " ms");
+
+    t0 = Time.Millis();
+    let bench_lp = signals.LowPass(bench_sine, 1000.0, 44100.0, 0.707);
+    t1 = Time.Millis();
+    Console.WriteLine("LowPass(" + str(N_bench) + ")           : " + str(t1 - t0) + " ms");
+
+    t0 = Time.Millis();
+    let bench_med = signals.MedianFilter(bench_sine, 5);
+    t1 = Time.Millis();
+    Console.WriteLine("MedianFilter(" + str(N_bench) + ", 5)   : " + str(t1 - t0) + " ms");
+
+    let bench_kernel = signals.Hann(32);
+    t0 = Time.Millis();
+    let bench_conv = signals.Convolve(bench_sine, bench_kernel);
+    t1 = Time.Millis();
+    Console.WriteLine("Convolve(" + str(N_bench) + ", 32)      : " + str(t1 - t0) + " ms");
+
+    let N_dft = 256;
+    let bench_dft_in = signals.Sine(N_dft, 440.0, 44100.0, 1.0, 0.0);
+    t0 = Time.Millis();
+    let bench_spec = signals.DFT(bench_dft_in);
+    t1 = Time.Millis();
+    Console.WriteLine("DFT(" + str(N_dft) + ")                 : " + str(t1 - t0) + " ms");
+
+    let N_ac = 512;
+    let bench_ac_in = signals.Sine(N_ac, 440.0, 44100.0, 1.0, 0.0);
+    t0 = Time.Millis();
+    let bench_ac = signals.Autocorrelate(bench_ac_in, 64);
+    t1 = Time.Millis();
+    Console.WriteLine("Autocorrelate(" + str(N_ac) + ", 64)    : " + str(t1 - t0) + " ms");
+
+    let N_fft = 1024;
+    let fftBenchIn = signals.Sine(N_fft, 440.0, 44100.0, 1.0, 0.0);
+    t0 = Time.Millis();
+    let fftBenchOut = signals.FFT(fftBenchIn);
+    t1 = Time.Millis();
+    Console.WriteLine("FFT(" + str(N_fft) + ")                 : " + str(t1 - t0) + " ms");
+
+    Console.WriteLine("==================");
+}
+
+fn test_windows(signals:Signals) {
+    // ============================================================
+    //  Windows
+    // ============================================================
+
+    let rect = signals.Rect(8);
+    assert("Rect length", len(rect) == 8);
+    assertClose("Rect values", rect[3], 1.0, 1e-9);
+
+    let hann = signals.Hann(8);
+    assert("Hann length", len(hann) == 8);
+    assertClose("Hann[0] = 0", hann[0], 0.0, 1e-9);
+    assertClose("Hann[7] = 0", hann[7], 0.0, 1e-9);
+    assertClose("Hann[4] peak", hann[4], 0.9505, 0.001);
+
+    let hamming = signals.Hamming(8);
+    assert("Hamming length", len(hamming) == 8);
+    assertClose("Hamming[0]", hamming[0], 0.08, 0.01);
+
+    let blackman = signals.Blackman(8);
+    assert("Blackman length", len(blackman) == 8);
+    assertClose("Blackman[0]", blackman[0], 0.0, 0.01);
+
+    let bartlett = signals.Bartlett(8);
+    assert("Bartlett length", len(bartlett) == 8);
+    assertClose("Bartlett[0]", bartlett[0], 0.0, 1e-9);
+
+    let ones = signals.Rect(8);
+    let windowed = signals.ApplyWindow(ones, hann);
+    assert("ApplyWindow length", len(windowed) == 8);
+    assertClose("ApplyWindow[0] = 0", windowed[0], 0.0, 1e-9);
+
+    let wfft = signals.WindowedFft(ones, hann);
+    assert("WindowedFft shape real", len(wfft.real) == 8);
+    assert("WindowedFft shape imag", len(wfft.imag) == 8);
+}
+
+fn test_statistics(signals:Signals) {
+    // ============================================================
+    //  Statistics
+    // ============================================================
+
+    let dc = makeArray(16, 3.0);
+    assertClose("RMS DC", signals.RMS(dc), 3.0, 1e-6);
+
+    let sr = 1000.0;
+    let sine = signals.Sine(1000, 100.0, sr, 1.0, 0.0);
+    assertClose("RMS sine ≈ 0.707", signals.RMS(sine), 0.7071, 0.005);
+    assertClose("Peak sine = 1.0", signals.Peak(sine), 1.0, 0.05);
+    assertClose("P2P sine ≈ 2.0", signals.PeakToPeak(sine), 2.0, 0.1);
+    assertClose("Energy DC", signals.Energy(dc), 16.0 * 9.0, 1e-6);
+    assertClose("Mean DC", signals.Mean(dc), 3.0, 1e-9);
+
+    let shifted = signals.Sine(100, 10.0, 1000.0, 1.0, 0.0);
+    let shiftedDC = Array.Select(shifted, fn(x) { return x + 5.0; });
+    let removed = signals.DCRemove(shiftedDC);
+    assertClose("DCRemove mean ≈ 0", signals.Mean(removed), 0.0, 1e-6);
+
+    let big = makeArray(8, 4.0);
+    let norm = signals.Normalize(big);
+    assertClose("Normalize peak=1", signals.Peak(norm), 1.0, 1e-9);
+
+    let vdc = makeArray(16, 3.0);
+    assertClose("Variance DC = 0", signals.Variance(vdc), 0.0, 1e-9);
+    let v2 = [-1.0, 1.0];
+    assertClose("Variance [-1,1] = 1", signals.Variance(v2), 1.0, 1e-9);
+    assertClose("StdDev DC = 0", signals.StdDev(vdc), 0.0, 1e-9);
+    assertClose("StdDev [-1,1] = 1", signals.StdDev(v2), 1.0, 1e-9);
+
+    let raw = signals.Sine(100, 10.0, 1000.0, 2.0, 0.0);
+    let zs = signals.ZScore(raw);
+    assertClose("ZScore mean ≈ 0", signals.Mean(zs), 0.0, 1e-6);
+    assertClose("ZScore stddev ≈ 1", signals.StdDev(zs), 1.0, 1e-6);
+    let zdc = signals.ZScore(vdc);
+    assertClose("ZScore DC = 0", zdc[0], 0.0, 1e-9);
+
+    let clipped = signals.Clip([-2.0, -0.5, 0.5, 3.0], -1.0, 1.0);
+    assertClose("Clip low", clipped[0], -1.0, 1e-9);
+    assertClose("Clip high", clipped[3], 1.0, 1e-9);
+
+    let resc = signals.Rescale([0.0, 5.0, 10.0], -1.0, 1.0);
+    assertClose("Rescale first", resc[0], -1.0, 1e-9);
+    assertClose("Rescale last", resc[2], 1.0, 1e-9);
+
+    let ls = signals.Linspace(5, 0.0, 1.0);
+    assert("Linspace length", len(ls) == 5);
+    assertClose("Linspace mid", ls[2], 0.5, 1e-9);
+
+    let argm = signals.ArgMax([1.0, 7.0, 3.0, 6.0]);
+    assert("ArgMax", argm == 1);
+
+    // ============================================================
+    //  Analysis
+    // ============================================================
+
+    let zcSine = signals.Sine(1000, 100.0, 1000.0, 1.0, 0.0);
+    let zc = signals.ZeroCrossings(zcSine);
+    assert("ZeroCrossings sine ≈ 200", Math.AbsF(zc - 200) <= 4);
+    assert("ZeroCrossings DC = 0", signals.ZeroCrossings(makeArray(16, 3.0)) == 0);
+
+    let pkSig = [0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 1.5, 0.0];
+    let peaks = signals.FindPeaks(pkSig, 0.5, 2);
+    assert("FindPeaks count", len(peaks) == 3);
+    assert("FindPeaks index 0", peaks[0] == 1);
+    assert("FindPeaks index 1", peaks[1] == 4);
+    assert("FindPeaks index 2", peaks[2] == 7);
+
+    let peaksHigh = signals.FindPeaks(pkSig, 1.2, 2);
+    assert("FindPeaks minHeight", len(peaksHigh) == 2);
+
+    let thr = signals.Threshold([0.5, 1.0, 1.5, 2.0, 0.5], 1.0);
+    assert("Threshold length", len(thr) == 5);
+    assert("Threshold[0] false", thr[0] == false);
+    assert("Threshold[1] true", thr[1] == true);
+    assert("Threshold[4] false", thr[4] == false);
+}
+
+fn test_filters(signals:Signals) {
+    // ============================================================
+    //  Filters
+    // ============================================================
+
+    let dc10 = makeArray(20, 5.0);
+    let ma = signals.MovingAverage(dc10, 4);
+    assertClose("MovingAvg DC", ma[10], 5.0, 1e-9);
+
+    let sig = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let delta = [1.0];
+    let conv = signals.Convolve(sig, delta);
+    assert("Convolve delta length", len(conv) == 5);
+    assertClose("Convolve delta[2]", conv[2], 3.0, 1e-9);
+
+    let twoTap = signals.Convolve([2.0, 4.0, 6.0], [0.5, 0.5]);
+    assertClose("Convolve 2-tap[1]", twoTap[1], 3.0, 1e-9);
+
+    let fir = signals.FIR(sig, [0.5, 0.5]);
+    assert("FIR output length", len(fir) == len(sig));
+
+    let iirCoeffs = [1.0, 0.0, 0.0, 0.0, 0.0];
+    let iirOut = signals.IIR([1.0, 2.0, 3.0], iirCoeffs);
+    assertClose("IIR identity[0]", iirOut[0], 1.0, 1e-9);
+    assertClose("IIR identity[2]", iirOut[2], 3.0, 1e-9);
+
+    let SR = 8000.0;
+    let N = 512;
+
+    let lpCoeffs = signals.LowPassCoeffs(500.0, SR, 0.707);
+    let lp_num = lpCoeffs[0] + lpCoeffs[1] + lpCoeffs[2];
+    let lp_den = 1.0 + lpCoeffs[3] + lpCoeffs[4];
+    assertClose("LowPass DC gain = 1", lp_num / lp_den, 1.0, 1e-6);
+
+    let hpCoeffs = signals.HighPassCoeffs(500.0, SR, 0.707);
+    let hp_num = hpCoeffs[0] - hpCoeffs[1] + hpCoeffs[2];
+    let hp_den = 1.0 - hpCoeffs[3] + hpCoeffs[4];
+    assertClose("HighPass Nyquist gain = 1", hp_num / hp_den, 1.0, 1e-6);
+
+    let bpCoeffs = signals.BandPassCoeffs(1000.0, SR, 1.0);
+    let bp_dc = bpCoeffs[0] + bpCoeffs[1] + bpCoeffs[2];
+    assert("BandPass DC gain ≈ 0", Math.AbsF(bp_dc) < 0.01);
+
+    let nCoeffs = signals.NotchCoeffs(1000.0, SR, 1.0);
+    let n_num = nCoeffs[0] + nCoeffs[1] + nCoeffs[2];
+    let n_den = 1.0 + nCoeffs[3] + nCoeffs[4];
+    assertClose("Notch DC gain = 1", n_num / n_den, 1.0, 1e-6);
+
+    let low = signals.Sine(N, 100.0, SR, 1.0, 0.0);
+    let high = signals.Sine(N, 3000.0, SR, 1.0, 0.0);
+    let mixed = signals.Mix(low, high, 1.0, 1.0);
+
+    let lpFiltered = signals.LowPass(mixed, 500.0, SR, 0.707);
+    let lpOutRMS = signals.RMS(lpFiltered);
+    assert("LowPass output has content", lpOutRMS > 0.1);
+
+    let lpHighOnly = signals.LowPass(high, 500.0, SR, 0.707);
+    let lpHighOnlyRMS = signals.RMS(lpHighOnly);
+    assert("LowPass attenuates 3kHz", lpHighOnlyRMS < 0.1);
+
+    let lpLowOnly = signals.LowPass(low, 500.0, SR, 0.707);
+    let lpLowOnlyRMS = signals.RMS(lpLowOnly);
+    assertClose("LowPass passes 100Hz", lpLowOnlyRMS, 0.707, 0.1);
+
+    let hpLowOnly = signals.HighPass(low, 500.0, SR, 0.707);
+    let hpHighOnly = signals.HighPass(high, 500.0, SR, 0.707);
+    assert("HighPass attenuates 100Hz", signals.RMS(hpLowOnly) < 0.1);
+    assertClose("HighPass passes 3kHz", signals.RMS(hpHighOnly), 0.707, 0.1);
+
+    let center = signals.Sine(N, 1000.0, SR, 1.0, 0.0);
+    let bpCenter = signals.BandPass(center, 1000.0, SR, 2.0);
+    let bpLow = signals.BandPass(low, 1000.0, SR, 2.0);
+    let bpHigh = signals.BandPass(high, 1000.0, SR, 2.0);
+    assert("BandPass passes center freq", signals.RMS(bpCenter) > 0.1);
+    assert("BandPass attenuates 100Hz", signals.RMS(bpLow) < 0.15);
+    assert("BandPass attenuates 3kHz", signals.RMS(bpHigh) < 0.15);
+
+    let notchCenter = signals.Notch(center, 1000.0, SR, 5.0);
+    let notchLow = signals.Notch(low, 1000.0, SR, 5.0);
+    assert("Notch attenuates center freq", signals.RMS(notchCenter) < 0.15);
+    assertClose("Notch passes 100Hz", signals.RMS(notchLow), 0.707, 0.15);
+
+    let dc5 = makeArray(40, 5.0);
+    dc5[10] = 100.0;
+    dc5[20] = -80.0;
+    dc5[30] = 50.0;
+    let medFiltered = signals.MedianFilter(dc5, 5);
+    assertClose("MedianFilter removes pos spike", medFiltered[12], 5.0, 1.0);
+    assertClose("MedianFilter removes neg spike", medFiltered[22], 5.0, 1.0);
+    assertClose("MedianFilter preserves DC", medFiltered[35], 5.0, 0.1);
+    assert("MedianFilter length", len(medFiltered) == len(dc5));
+    let identity = signals.MedianFilter(low, 1);
+    assertClose("MedianFilter w=1 is identity[5]", identity[5], low[5], 1e-9);
+}
+
+fn test_spectral(signals:Signals) {
+    // ============================================================
+    //  Frequency domain
+    // ============================================================
+
+    let dcShort = makeArray(8, 1.0);
+    let spec = signals.DFT(dcShort);
+    assertClose("DFT DC bin0 real", spec.real[0], 8.0, 1e-6);
+    assertClose("DFT DC bin0 imag", spec.imag[0], 0.0, 1e-6);
+    assertClose("DFT DC bin1 real", spec.real[1], 0.0, 1e-6);
+
+    let testSig = [1.0, 0.5, -0.5, -1.0, -0.5, 0.5, 1.0, 0.5];
+    let fwd = signals.DFT(testSig);
+    let inv = signals.IDFT(fwd);
+    assert("IDFT round-trip length", len(inv) == len(testSig));
+    assertClose("IDFT round-trip[0]", inv[0], testSig[0], 1e-6);
+    assertClose("IDFT round-trip[3]", inv[3], testSig[3], 1e-6);
+
+    let mag = signals.Magnitude(spec);
+    assertClose("Magnitude DC bin0", mag[0], 8.0, 1e-6);
+
+    let pw = signals.PowerSpectrum(spec);
+    assertClose("PowerSpectrum DC bin0", pw[0], 64.0, 1e-5);
+
+    assertClose("ToDb 1.0 = 0dB", signals.ToDb([1.0])[0], 0.0, 1e-6);
+    assertClose("ToDb 0.0 = -120dB", signals.ToDb([0.0])[0], -120.0, 1e-6);
+    assertClose("BinToHz", signals.BinToHz(1, 8, 8000.0), 1000.0, 1e-6);
+
+    let fftDC = makeArray(8, 1.0);
+    let fftSpec = signals.FFT(fftDC);
+    assertClose("FFT DC bin0 real", fftSpec.real[0], 8.0, 1e-6);
+    assertClose("FFT DC bin0 imag", fftSpec.imag[0], 0.0, 1e-6);
+    assertClose("FFT DC bin1 real", fftSpec.real[1], 0.0, 1e-4);
+    assertClose("FFT DC bin1 imag", fftSpec.imag[1], 0.0, 1e-4);
+
+    let fftIn = signals.Sine(64, 440.0, 44100.0, 1.0, 0.0);
+    let fftFwd = signals.FFT(fftIn);
+    let fftInv = signals.IFFT(fftFwd);
+    assert("IFFT round-trip length", len(fftInv) == len(fftIn));
+    assertClose("IFFT round-trip[0]", fftInv[0], fftIn[0], 1e-6);
+    assertClose("IFFT round-trip[32]", fftInv[32], fftIn[32], 1e-6);
+
+    let shortSig = signals.Sine(8, 1.0, 8.0, 1.0, 0.0);
+    let fftS = signals.FFT(shortSig);
+    let dftS = signals.DFT(shortSig);
+    let fftM = signals.Magnitude(fftS);
+    let dftM = signals.Magnitude(dftS);
+    assertClose("FFT mag[0] ≈ DFT mag[0]", fftM[0], dftM[0], 1e-4);
+    assertClose("FFT mag[1] ≈ DFT mag[1]", fftM[1], dftM[1], 1e-4);
+
+    let tone = signals.Sine(1024, 1.0, 1024.0, 1.0, 0.0);
+    let toneSpec = signals.FFT(tone);
+    let toneMag = signals.Magnitude(toneSpec);
+    assert("FFT tone energy at bin 1", toneMag[1] > toneMag[0]);
+    assert("FFT tone energy at bin 1>2", toneMag[1] > toneMag[2]);
+
+    // ============================================================
+    //  Correlation
+    // ============================================================
+
+    let acSig = [1.0, 2.0, 3.0];
+    let ac = signals.Autocorrelate(acSig, 2);
+    assert("Autocorrelate length", len(ac) == 3);
+    assertClose("Autocorrelate lag0", ac[0], (1.0 + 4.0 + 9.0) / 3.0, 1e-6);
+
+    let cc = signals.CrossCorrelate(acSig, acSig, 2);
+    assertClose("CrossCorrelate[0] = AutoCorrelate[0]", cc[0], ac[0], 1e-9);
+
+    // ============================================================
+    //  Phase
+    // ============================================================
+
+    // DC signal: all bins should have phase 0
+    let phaseSpec = signals.DFT(makeArray(8, 1.0));
+    let ph = signals.Phase(phaseSpec);
+    assert("Phase length", len(ph) == 8);
+    assertClose("Phase DC bin0 = 0", ph[0], 0.0, 1e-6);
+
+    // Pure cosine at bin 1 (n=8): bin 1 has real > 0, imag ≈ 0, so phase ≈ 0
+    let cosIn = signals.Cosine(8, 1.0, 8.0, 1.0, 0.0);
+    let cosDFT = signals.DFT(cosIn);
+    let cosPh  = signals.Phase(cosDFT);
+    assertClose("Phase cosine bin1 ≈ 0", cosPh[1], 0.0, 0.05);
+}
+
+fn test_generation(signals:Signals) {
+    // ============================================================
+    //  Generation
+    // ============================================================
+
+    let s0 = signals.Sine(10, 440.0, 44100.0, 1.0, 0.0);
+    assertClose("Sine[0] = 0", s0[0], 0.0, 1e-9);
+    assert("Sine length", len(s0) == 10);
+
+    let c0 = signals.Cosine(10, 440.0, 44100.0, 1.0, 0.0);
+    assertClose("Cosine[0] = 1", c0[0], 1.0, 1e-9);
+
+    let sq = signals.Square(16, 100.0, 1000.0, 1.0);
+    assert("Square amplitude", Math.AbsF(signals.Peak(sq) - 1.0) < 0.01);
+
+    let saw = signals.Sawtooth(100, 10.0, 1000.0, 1.0);
+    assertClose("Sawtooth P2P ≈ 2", signals.PeakToPeak(saw), 2.0, 0.1);
+
+    let tri = signals.Triangle(100, 10.0, 1000.0, 1.0);
+    assertClose("Triangle P2P ≈ 2", signals.PeakToPeak(tri), 2.0, 0.05);
+
+    let ns = signals.Noise(1000, 1.0);
+    assert("Noise length", len(ns) == 1000);
+    assert("Noise peak <= 1.0", signals.Peak(ns) <= 1.0);
+
+    let ch = signals.Chirp(100, 100.0, 500.0, 8000.0, 1.0);
+    assert("Chirp length", len(ch) == 100);
+
+    let mix = signals.Mix(makeArray(4, 2.0), makeArray(4, 4.0), 0.5, 0.5);
+    assertClose("Mix DC", mix[0], 3.0, 1e-9);
+
+    // ============================================================
+    //  Resampling
+    // ============================================================
+
+    let dSig = signals.Sine(100, 10.0, 1000.0, 1.0, 0.0);
+    let dec = signals.Decimate(dSig, 2);
+    assert("Decimate length", len(dec) == 50);
+
+    let intSig = [1.0, 2.0, 3.0, 4.0];
+    let interp = signals.Interpolate(intSig, 2);
+    assert("Interpolate length", len(interp) == 8);
+
+    // ============================================================
+    //  v2.1 additions
+    // ============================================================
+
+    assert("IsPowerOfTwo(8)", signals.IsPowerOfTwo(8) == true);
+    assert("IsPowerOfTwo(10) false", signals.IsPowerOfTwo(10) == false);
+    assert("NextPowerOfTwo(9)", signals.NextPowerOfTwo(9) == 16);
+    assert("NextPowerOfTwo(16)", signals.NextPowerOfTwo(16) == 16);
+
+    let df = signals.DominantFrequency(signals.Sine(1024, 128.0, 1024.0, 1.0, 0.0), 1024.0);
+    assert("DominantFrequency", int(df) == 128);
+
+    // ============================================================
+    //  Utility (Silence, Concat, Repeat)
+    // ============================================================
+
+    let sil = signals.Silence(16);
+    assert("Silence length", len(sil) == 16);
+    assertClose("Silence[0] = 0", sil[0], 0.0, 1e-9);
+    assertClose("Silence RMS = 0", signals.RMS(sil), 0.0, 1e-9);
+
+    let catA = signals.Sine(8, 440.0, 44100.0, 1.0, 0.0);
+    let catB = signals.Sine(12, 880.0, 44100.0, 0.5, 0.0);
+    let cat  = signals.Concat(catA, catB);
+    assert("Concat length", len(cat) == 20);
+    assertClose("Concat first sample = catA[0]", cat[0], catA[0], 1e-9);
+    assertClose("Concat seam sample = catB[0]", cat[8], catB[0], 1e-9);
+
+    let rep = signals.Repeat(catA, 3);
+    assert("Repeat length", len(rep) == 24);
+    assertClose("Repeat copy 1 at 8", rep[8], catA[0], 1e-9);
+    assertClose("Repeat copy 2 at 16", rep[16], catA[0], 1e-9);
+
+    // ============================================================
+    //  Normalization helpers (PeakNormalize, FFTPad, NextPow2)
+    // ============================================================
+
+    let pn = signals.PeakNormalize([0.0, 0.5, -2.0, 1.0]);
+    assertClose("PeakNormalize peak = 1", signals.Peak(pn), 1.0, 1e-9);
+    assertClose("PeakNormalize[2] = -1", pn[2], -1.0, 1e-9);
+
+    let pnZero = signals.PeakNormalize([0.0, 0.0, 0.0]);
+    assertClose("PeakNormalize silence unchanged", pnZero[0], 0.0, 1e-9);
+
+    let pad6  = signals.FFTPad([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert("FFTPad 6 -> 8", len(pad6) == 8);
+    assertClose("FFTPad preserves first sample", pad6[0], 1.0, 1e-9);
+    assertClose("FFTPad zero-pad", pad6[7], 0.0, 1e-9);
+
+    let pad8 = signals.FFTPad([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    assert("FFTPad power-of-2 unchanged", len(pad8) == 8);
+
+    assert("NextPow2(1)  = 1",  signals.NextPow2(1)  == 1);
+    assert("NextPow2(7)  = 8",  signals.NextPow2(7)  == 8);
+    assert("NextPow2(8)  = 8",  signals.NextPow2(8)  == 8);
+    assert("NextPow2(9)  = 16", signals.NextPow2(9)  == 16);
+    assert("NextPow2(33) = 64", signals.NextPow2(33) == 64);
+}
+
+fn Main() {
+    let signals = new Signals();
+
+    test_windows(signals);
+    test_statistics(signals);
+    test_filters(signals);
+    test_spectral(signals);
+    test_generation(signals);
+    test_extra_signals(signals);
+    test_benchmarks(signals);
+
+    // ============================================================
+    //  Summary
+    // ============================================================
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed.");
+    if (failed == 0) {
+        Console.Ok("All tests passed!");
+        return 0;
+    } else {
+        Console.Error("Some tests FAILED.");
+        return 1;
+    }
+}

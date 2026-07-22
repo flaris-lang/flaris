@@ -1,0 +1,410 @@
+// test_numerics.fls
+// Tests for libs/Numerics.fls  (run with -j to exercise the JIT kernels).
+
+import { Numerics, Stats, LinAlg, Chart } from library("Numerics", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn assert(name: string, cond: bool) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name);
+        failed += 1;
+    }
+}
+
+fn assertClose(name: string, a: float, b: float, tol: float) {
+    if (Math.AbsF(a - b) <= tol) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name + "  got=" + str(a) + "  want=" + str(b));
+        failed += 1;
+    }
+}
+
+// --- Callback targets for the user-function methods -----------------------
+fn f_cos_minus_x(x: float): float { return Math.Cos(x) - x; }        // root ~0.739085
+fn df_cos_minus_x(x: float): float { return -Math.Sin(x) - 1.0; }
+fn f_sin(x: float): float { return Math.Sin(x); }                     // roots at k*PI
+fn f_parab(x: float): float { return (x - 2.0) * (x - 2.0) + 1.0; }   // min at x=2
+
+// Sample f(x) = x^2 at x = 0, 1, ..., n-1 into a flat float array.
+fn sampleSquare(n: int): array {
+    let a: array = Array.Create(n, Type.Float);
+    iter(i from 0 to n - 1) {
+        let x: float = i + 0.0;
+        a[i] = x * x;
+    }
+    return a;
+}
+
+// ============================================================
+//  Correctness
+// ============================================================
+
+fn test_polynomials(nm: Numerics) {
+    Console.WriteLine("=== Polynomials ===");
+
+    // p(x) = 1 + 2x + 3x^2  ->  p(2) = 1 + 4 + 12 = 17,  p'(x) = 2 + 6x -> p'(2) = 14
+    let p = [1.0, 2.0, 3.0];
+    assertClose("EvalPoly(2)",  nm.EvalPoly(p, 2.0), 17.0, 1e-9);
+    assertClose("EvalPoly(0)",  nm.EvalPoly(p, 0.0), 1.0,  1e-9);
+    assertClose("EvalDeriv(2)", nm.EvalDeriv(p, 2.0), 14.0, 1e-9);
+
+    // x^2 - 2  ->  root sqrt(2)
+    let q = [-2.0, 0.0, 1.0];
+    let sqrt2 = 1.4142135623730951;
+    assertClose("NewtonRoot sqrt2", nm.NewtonRoot(q, 1.0, 1e-12, 100), sqrt2, 1e-9);
+    assertClose("Root sqrt2",       nm.Root(q, 1.0),                   sqrt2, 1e-6);
+    assertClose("Bisect sqrt2",     nm.Bisect(q, 0.0, 2.0, 1e-12, 200), sqrt2, 1e-6);
+    assertClose("Secant sqrt2",     nm.Secant(q, 1.0, 2.0, 1e-12, 100), sqrt2, 1e-9);
+
+    // x^3 - x  ->  root near 1.0 starting from 0.6
+    let cubic = [0.0, -1.0, 0.0, 1.0];
+    assertClose("NewtonRoot cubic", nm.NewtonRoot(cubic, 0.6, 1e-12, 100), 1.0, 1e-9);
+
+    // Quadratic roots: x^2 - 3x + 2 = (x-1)(x-2)
+    let roots = nm.SolveQuadratic(1.0, -3.0, 2.0);
+    assert("SolveQuadratic count", len(roots) == 2);
+    assertClose("SolveQuadratic r1", roots[0], 1.0, 1e-9);
+    assertClose("SolveQuadratic r2", roots[1], 2.0, 1e-9);
+
+    let none = nm.SolveQuadratic(1.0, 0.0, 1.0);   // x^2 + 1, no real roots
+    assert("SolveQuadratic none", len(none) == 0);
+}
+
+fn test_calculus(nm: Numerics) {
+    Console.WriteLine("=== Calculus ===");
+
+    let ys = sampleSquare(5);   // [0, 1, 4, 9, 16], h = 1
+
+    // Trapz of x^2 on [0,4]: (0+16)/2 + 1+4+9 = 22
+    assertClose("IntegrateTrapz", nm.IntegrateTrapz(ys, 1.0), 22.0, 1e-9);
+
+    // Simpson is exact for quadratics: integral 0..4 of x^2 = 64/3
+    assertClose("IntegrateSimpson", nm.IntegrateSimpson(ys, 1.0), 64.0 / 3.0, 1e-9);
+
+    // Even sample count still integrates (Simpson head + trapz tail).
+    let ys6 = sampleSquare(6);
+    assert("IntegrateSimpson even > 0", nm.IntegrateSimpson(ys6, 1.0) > 0.0);
+
+    // Cumulative trapezoid: last element equals the full trapezoid integral.
+    let cum = nm.CumTrapz(ys, 1.0);
+    assert("CumTrapz length", len(cum) == 5);
+    assertClose("CumTrapz[0]", cum[0], 0.0, 1e-9);
+    assertClose("CumTrapz last", cum[4], 22.0, 1e-9);
+
+    // Central difference of x^2 -> [1, 2, 4, 6, 7] with fwd/bwd ends.
+    let dy = nm.Derivative(ys, 1.0);
+    assertClose("Derivative[0]", dy[0], 1.0, 1e-9);
+    assertClose("Derivative[2]", dy[2], 4.0, 1e-9);
+    assertClose("Derivative[4]", dy[4], 7.0, 1e-9);
+}
+
+fn test_interpolation(nm: Numerics) {
+    Console.WriteLine("=== Interpolation ===");
+
+    let xs = [0.0, 1.0, 2.0, 3.0];
+    let ys = [0.0, 10.0, 20.0, 30.0];
+
+    assertClose("Interp mid",   nm.Interp(xs, ys, 1.5), 15.0, 1e-9);
+    assertClose("Interp mid2",  nm.Interp(xs, ys, 2.5), 25.0, 1e-9);
+    assertClose("Interp node",  nm.Interp(xs, ys, 2.0), 20.0, 1e-9);
+    assertClose("Interp clampL", nm.Interp(xs, ys, -1.0), 0.0, 1e-9);
+    assertClose("Interp clampR", nm.Interp(xs, ys, 9.0), 30.0, 1e-9);
+}
+
+fn test_functions(nm: Numerics) {
+    Console.WriteLine("=== User functions ===");
+
+    let dottie = 0.7390851332151607;
+    assertClose("NewtonFn", nm.NewtonFn(f_cos_minus_x, df_cos_minus_x, 0.7, 1e-12, 100), dottie, 1e-9);
+    assertClose("BisectFn", nm.BisectFn(f_cos_minus_x, 0.0, 1.0, 1e-12, 200), dottie, 1e-6);
+    assertClose("SecantFn", nm.SecantFn(f_cos_minus_x, 0.0, 1.0, 1e-12, 100), dottie, 1e-9);
+
+    // Integral of sin over [0, PI] = 2
+    assertClose("IntegrateFn sin", nm.IntegrateFn(f_sin, 0.0, Math.PI, 1000), 2.0, 1e-6);
+
+    // d/dx sin at 0 = cos(0) = 1
+    assertClose("DerivativeFn", nm.DerivativeFn(f_sin, 0.0, 0.00001), 1.0, 1e-6);
+
+    // Minimum of (x-2)^2 + 1 is at x = 2
+    assertClose("GoldenMin", nm.GoldenMin(f_parab, 0.0, 5.0, 1e-9, 200), 2.0, 1e-4);
+
+    // All roots of sin on [-0.5, 7]: 0, PI, 2*PI
+    let sinRoots = nm.FindRoots(f_sin, -0.5, 7.0, 400, 1e-10);
+    assert("FindRoots sin count", len(sinRoots) == 3);
+    assertClose("FindRoots sin r0", sinRoots[0], 0.0,          1e-6);
+    assertClose("FindRoots sin r1", sinRoots[1], Math.PI,      1e-6);
+    assertClose("FindRoots sin r2", sinRoots[2], 2.0 * Math.PI, 1e-6);
+
+    // Polynomial (x-1)(x-2)(x-3) = x^3 - 6x^2 + 11x - 6, ascending coeffs.
+    let cubic = [-6.0, 11.0, -6.0, 1.0];
+    let pr = nm.FindRootsPoly(cubic, 0.0, 4.0, 400, 1e-10);
+    assert("FindRootsPoly count", len(pr) == 3);
+    assertClose("FindRootsPoly r0", pr[0], 1.0, 1e-6);
+    assertClose("FindRootsPoly r1", pr[1], 2.0, 1e-6);
+    assertClose("FindRootsPoly r2", pr[2], 3.0, 1e-6);
+}
+
+fn test_special() {
+    Console.WriteLine("=== Special functions (Math.*) ===");
+    assertClose("Gamma(5)",   Math.Gamma(5.0),      24.0,       1e-9);
+    assertClose("LnGamma(10)", Math.LnGamma(10.0),  12.80182748, 1e-6);
+    assertClose("Erf(1)",     Math.Erf(1.0),        0.84270079, 1e-8);
+    assertClose("Erfc(1)",    Math.Erfc(1.0),       0.15729921, 1e-8);
+    assertClose("Beta(2,3)",  Math.Beta(2.0, 3.0),  0.08333333, 1e-8);
+    assertClose("Digamma(1)", Math.Digamma(1.0),   -0.57721566, 1e-6);
+    assertClose("GammaP(3,2)", Math.GammaP(3.0, 2.0), 0.32332358, 1e-7);
+    assertClose("GammaQ(3,2)", Math.GammaQ(3.0, 2.0), 0.67667642, 1e-7);
+    assertClose("BetaInc",    Math.BetaInc(2.0, 3.0, 0.5), 0.6875, 1e-7);
+}
+
+fn test_stats(st: Stats) {
+    Console.WriteLine("=== Stats ===");
+    let xs = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+    assertClose("Mean",   st.Mean(xs),   5.0,       1e-9);
+    assertClose("Stddev", st.Stddev(xs), 2.1380899, 1e-6);
+    assertClose("Median", st.Median(xs), 4.5,       1e-9);
+    assertClose("P25",    st.Percentile(xs, 25.0), 4.0, 1e-9);
+
+    assertClose("NormalCdf",      st.NormalCdf(1.96, 0.0, 1.0), 0.9750021, 1e-6);
+    assertClose("NormalQuantile", st.NormalQuantile(0.975, 0.0, 1.0), 1.9599640, 1e-5);
+    assertClose("NormalPdf(0)",   st.NormalPdf(0.0, 0.0, 1.0), 0.3989423, 1e-6);
+    assertClose("ChiSqCdf",       st.ChiSqCdf(3.841459, 1.0), 0.95, 1e-5);
+    assertClose("ChiSqQuantile",  st.ChiSqQuantile(0.95, 1.0), 3.841459, 1e-4);
+    assertClose("StudentTCdf",    st.StudentTCdf(2.0, 10.0), 0.9633060, 1e-6);
+    assertClose("StudentTQuant",  st.StudentTQuantile(0.975, 10.0), 2.2281389, 1e-4);
+    assertClose("FCdf",           st.FCdf(3.0, 5.0, 10.0), 0.9344418, 1e-6);
+    assertClose("PoissonPmf",     st.PoissonPmf(2, 3.0), 0.2240418, 1e-7);
+    assertClose("BinomialPmf",    st.BinomialPmf(2, 5, 0.5), 0.3125, 1e-9);
+    assertClose("ExponentialCdf", st.ExponentialCdf(1.0, 1.0), 0.6321206, 1e-6);
+
+    let lr = st.LinearRegression([1.0, 2.0, 3.0, 4.0, 5.0], [2.0, 4.0, 6.0, 8.0, 10.0]);
+    assertClose("LR slope",     lr.slope, 2.0, 1e-9);
+    assertClose("LR intercept", lr.intercept, 0.0, 1e-9);
+    assertClose("LR r2",        lr.r2, 1.0, 1e-9);
+
+    let tt = st.TTest1([5.1, 4.9, 5.2, 4.8, 5.0], 5.0);
+    assertClose("TTest1 df", tt.df, 4.0, 1e-9);
+    assert("TTest1 p in (0,1]", tt.p > 0.0 && tt.p <= 1.0);
+}
+
+fn test_linalg(la: LinAlg) {
+    Console.WriteLine("=== LinAlg ===");
+    let A = [4.0, 3.0, 6.0, 3.0];              // [[4,3],[6,3]]
+    let x = la.Solve(A, [10.0, 12.0], 2);      // -> [1, 2]
+    assertClose("Solve x0", x[0], 1.0, 1e-9);
+    assertClose("Solve x1", x[1], 2.0, 1e-9);
+    assertClose("Det", la.Det(A, 2), -6.0, 1e-9);
+
+    let inv = la.Inverse(A, 2);
+    let I = la.MatMul(A, inv, 2, 2, 2);        // A * inv = identity
+    assertClose("Inv->I[0]", I[0], 1.0, 1e-9);
+    assertClose("Inv->I[1]", I[1], 0.0, 1e-9);
+    assertClose("Inv->I[3]", I[3], 1.0, 1e-9);
+
+    let L = la.Cholesky([4.0, 2.0, 2.0, 3.0], 2);   // SPD
+    assertClose("Chol L00", L[0], 2.0, 1e-9);
+    assertClose("Chol L10", L[2], 1.0, 1e-9);
+    assertClose("Chol L11", L[3], 1.4142136, 1e-6);
+
+    assertClose("Norm", la.Norm([3.0, 4.0]), 5.0, 1e-9);
+    assertClose("Dot",  la.Dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]), 32.0, 1e-9);
+
+    let y = la.MatVec(A, [1.0, 1.0], 2, 2);    // [7, 9]
+    assertClose("MatVec y0", y[0], 7.0, 1e-9);
+    assertClose("MatVec y1", y[1], 9.0, 1e-9);
+
+    // 3x3 solve sanity: identity system
+    let Id = [1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0];
+    let z = la.Solve(Id, [3.0, 5.0, 7.0], 3);
+    assertClose("3x3 I solve", z[1], 5.0, 1e-9);
+
+    // Singular matrix -> empty result
+    let sing = la.Solve([1.0, 2.0, 2.0, 4.0], [1.0, 2.0], 2);
+    assert("Singular -> []", len(sing) == 0);
+}
+
+fn test_chart() {
+    Console.WriteLine("=== Chart ===");
+    let n = 80;
+    let xs: array = Array.Create(n, Type.Float);
+    let ys: array = Array.Create(n, Type.Float);
+    iter(i from 0 to n - 1) {
+        let x: float = (i + 0.0) * 0.1;
+        xs[i] = x;
+        ys[i] = Math.Sin(x);
+    }
+    let path = "/tmp/numerics_chart_test.png";
+    let ch = new Chart(480, 300);
+    let ok = ch.Title("test").XLabel("x").YLabel("y")
+               .AddLine(xs, ys, Gfx.RGB(30, 90, 200))
+               .AddScatter(xs, ys, Gfx.RGB(200, 40, 40))
+               .Save(path);
+    assert("Chart Save", ok);
+    assert("Chart file exists", File.Exists(path));
+}
+
+fn test_plotting(nm: Numerics) {
+    Console.WriteLine("=== Plotting ===");
+    let dataPath = "/tmp/numerics_plot_data.png";
+    let fnPath = "/tmp/numerics_plot_fn.png";
+
+    let ys = sampleSquare(64);
+    assert("Plot data -> png", nm.Plot(ys, dataPath, 320, 200));
+    assert("Plot data file exists", File.Exists(dataPath));
+
+    assert("PlotFunction -> png", nm.PlotFunction(f_sin, 0.0, 2.0 * Math.PI, fnPath, 400, 240));
+    assert("PlotFunction file exists", File.Exists(fnPath));
+}
+
+// ============================================================
+//  Benchmarks (exercise the JIT kernels under load)
+// ============================================================
+
+fn test_benchmarks(nm: Numerics) {
+    Console.WriteLine("");
+    Console.WriteLine("=== Benchmarks ===");
+
+    let t0 = 0;
+    let t1 = 0;
+
+    // --- Polynomial evaluation: degree-64 poly, 200k evaluations ---
+    let deg = 64;
+    let coeffs: array = Array.Create(deg + 1, Type.Float);
+    iter(i from 0 to deg) {
+        coeffs[i] = 0.001 * (i + 1);
+    }
+    let evals = 200000;
+    t0 = Time.Millis();
+    let acc = 0.0;
+    iter(k from 0 to evals - 1) {
+        acc += nm.EvalPoly(coeffs, 1.0001);
+    }
+    t1 = Time.Millis();
+    Console.WriteLine("EvalPoly deg=" + str(deg) + " x" + str(evals) + " : " + str(t1 - t0) + " ms  (acc=" + str(acc) + ")");
+
+    // --- Newton root: x^2 - 2, 200k solves ---
+    let q = [-2.0, 0.0, 1.0];
+    let solves = 200000;
+    t0 = Time.Millis();
+    let racc = 0.0;
+    iter(k from 0 to solves - 1) {
+        racc += nm.NewtonRoot(q, 1.0, 1e-12, 50);
+    }
+    t1 = Time.Millis();
+    Console.WriteLine("NewtonRoot x" + str(solves) + "       : " + str(t1 - t0) + " ms  (racc=" + str(racc) + ")");
+
+    // --- Integration over a large sampled array ---
+    let big = sampleSquare(200000);
+    t0 = Time.Millis();
+    let area = 0.0;
+    iter(k from 0 to 99) {
+        area += nm.IntegrateSimpson(big, 0.01);
+    }
+    t1 = Time.Millis();
+    Console.WriteLine("IntegrateSimpson n=200k x100 : " + str(t1 - t0) + " ms  (area=" + str(area) + ")");
+
+    // --- Cumulative integral + derivative on a large array ---
+    t0 = Time.Millis();
+    let cum = nm.CumTrapz(big, 0.01);
+    let _der = nm.Derivative(big, 0.01);
+    t1 = Time.Millis();
+    Console.WriteLine("CumTrapz+Derivative n=200k   : " + str(t1 - t0) + " ms  (cumEnd=" + str(cum[199999]) + ")");
+
+    // --- Find all roots of a high-degree polynomial (JIT scan + refine) ---
+    // p(x) = (x-1)(x-2)...(x-6) expanded, ascending coeffs.
+    let poly = [720.0, -1764.0, 1624.0, -735.0, 175.0, -21.0, 1.0];
+    let rootRuns = 20000;
+    t0 = Time.Millis();
+    let rootCount = 0;
+    iter(k from 0 to rootRuns - 1) {
+        let rs = nm.FindRootsPoly(poly, 0.0, 7.0, 700, 1e-10);
+        rootCount = len(rs);
+    }
+    t1 = Time.Millis();
+    Console.WriteLine("FindRootsPoly deg=6 x" + str(rootRuns) + " : " + str(t1 - t0) + " ms  (roots=" + str(rootCount) + ")");
+
+    // --- Interpolation lookups on a large table ---
+    let tn = 100000;
+    let xs: array = Array.Create(tn, Type.Float);
+    let ysL: array = Array.Create(tn, Type.Float);
+    iter(i from 0 to tn - 1) {
+        let x: float = i + 0.0;
+        xs[i] = x;
+        ysL[i] = x * x;
+    }
+    let lookups = 200000;
+    t0 = Time.Millis();
+    let iacc = 0.0;
+    iter(k from 0 to lookups - 1) {
+        iacc += nm.Interp(xs, ysL, 12345.6);
+    }
+    t1 = Time.Millis();
+    Console.WriteLine("Interp table x" + str(lookups) + "     : " + str(t1 - t0) + " ms  (iacc=" + str(iacc) + ")");
+}
+
+fn test_benchmarks_extra(st: Stats, la: LinAlg) {
+    let t0 = 0;
+    let t1 = 0;
+
+    // Descriptive stats over a large array (JIT sum/moment kernels).
+    let big = sampleSquare(1000000);
+    t0 = Time.Millis();
+    let acc = 0.0;
+    iter(k from 0 to 49) {
+        acc += st.Mean(big) + st.Variance(big) + st.Skewness(big);
+    }
+    t1 = Time.Millis();
+    Console.WriteLine("Stats mean/var/skew n=1M x50 : " + str(t1 - t0) + " ms  (acc=" + str(acc) + ")");
+
+    // Dense linear solve on a well-conditioned n x n system (JIT LU kernel).
+    let n = 120;
+    let A: array = Array.Create(n * n, Type.Float);
+    let b: array = Array.Create(n, Type.Float);
+    iter(i from 0 to n - 1) {
+        b[i] = (i + 1) + 0.0;
+        iter(j from 0 to n - 1) {
+            if (i == j) { A[i * n + j] = (n + 0.0); }
+            else { A[i * n + j] = 1.0 / ((i + j) + 1.0); }
+        }
+    }
+    t0 = Time.Millis();
+    let checksum = 0.0;
+    iter(k from 0 to 199) {
+        let x = la.Solve(A, b, n);
+        checksum = x[0];
+    }
+    t1 = Time.Millis();
+    Console.WriteLine("LinAlg Solve " + str(n) + "x" + str(n) + " x200      : " + str(t1 - t0) + " ms  (x0=" + str(checksum) + ")");
+}
+
+fn Main() {
+    let nm = new Numerics();
+    let st = new Stats();
+    let la = new LinAlg();
+
+    test_polynomials(nm);
+    test_calculus(nm);
+    test_interpolation(nm);
+    test_functions(nm);
+    test_special();
+    test_stats(st);
+    test_linalg(la);
+    test_chart();
+    test_plotting(nm);
+    test_benchmarks(nm);
+    test_benchmarks_extra(st, la);
+
+    Console.WriteLine("");
+    Console.WriteLine("Passed: " + str(passed) + "  Failed: " + str(failed));
+    if (failed > 0) {
+        return 1;
+    }
+    return 0;
+}

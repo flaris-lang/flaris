@@ -1,0 +1,896 @@
+// =============================================================================
+// HttpServer.fls - HTTP/1.1 server for Flaris, written in Flaris on Stream.
+// Version: 1.0
+//
+// Does NOT require -u. The whole server is built on the Stream socket API, so
+// it runs in the default sandbox. That is the main difference from Router.fls,
+// which wraps the built-in (unsafe-gated) C server: this one adds keep-alive,
+// chunked request bodies and streamed responses, and gives you the connection.
+//
+// Usage:
+//   import { HttpServer } from library("HttpServer", "1.0");
+//
+//   let srv = new HttpServer({ port: 8080 });
+//   srv.Get("/",           fn(req, res) { res.Text("Hello"); });
+//   srv.Get("/users/:id",  fn(req, res) { res.Json({ id: req.Param("id") }); });
+//   srv.Post("/echo",      fn(req, res) { res.Json(req.Json()); });
+//   srv.Listen();                      // blocks, serving until Stop()
+//
+//   // Or take every request yourself:
+//   srv.OnRequest(fn(req, res) { res.Text(req.method + " " + req.path); });
+//
+// Concurrency:
+//   Each accepted connection is served on its own fiber, so a slow client does
+//   not stall the others. Fibers are cooperative, so a handler that never yields
+//   holds the VM - keep handlers short, or yield inside long loops.
+//
+// HttpServer:
+//   new HttpServer(opts?)
+//       port                 listen port; 0 binds an ephemeral port (see Port())
+//       backlog              listen backlog                    (default 128)
+//       keepAlive            allow connection reuse            (default true)
+//       idleTimeoutMs        keep-alive idle wait              (default 5000)
+//       readTimeoutMs        socket read timeout               (default 10000)
+//       maxRequestsPerConn   requests before a forced close    (default 100)
+//       maxHeaders           header count cap                  (default 100)
+//       maxHeaderBytes       total header-block cap            (default 65536)
+//       maxBodyBytes         request-body cap                  (default 8388608)
+//       maxConnections       concurrent connections            (default 64)
+//       serverName           Server: header                    (default "Flaris")
+//   .Get / .Post / .Put / .Delete / .Patch / .Head(pattern, handler)
+//   .Route(method, pattern, handler)
+//   .OnRequest(handler)        - catch-all; runs when no route matches
+//   .NotFound(handler)         - custom 404
+//   .OnError(handler)          - fn(req, res, err); default sends a 500
+//   .Static(urlPrefix, rootDir, opts?)  - { index:"index.html", cacheControl }
+//   .Listen()                  - bind and serve; blocks the calling fiber
+//   .ListenAsync()             - bind, then serve on a fiber; returns at once
+//   .Stop()                    - stop accepting and close the listen socket
+//   .IsRunning()  .Port()      - Port() is the real port after binding with 0
+//
+//   Patterns: "/users/:id" captures a segment into req.Param("id");
+//             a trailing "*" matches the rest into req.Param("*").
+//
+// Handler signature: fn(req, res)
+//
+// HttpRequest:
+//   .method .path .rawPath .version .headers .body .peer
+//   .Header(name, default?)  - case-insensitive lookup
+//   .Query(name, default?)   - decoded query-string parameter
+//   .Param(name)             - captured path parameter
+//   .Text()                  - body as a string
+//   .Json()                  - body parsed as JSON (nil when malformed)
+//   .ContentLength()  .IsKeepAlive()
+//
+// HttpResponse:
+//   .Status(code)  .Header(name, value)  .ContentType(ct)   - chainable
+//   .Text(s, status?)   .Html(s, status?)   .Json(value, status?)
+//   .Bytes(block, contentType?, status?)    - binary body, exact length
+//   .File(path, contentType?)               - send a file (MIME by extension)
+//   .Redirect(url, status?)  .NoContent()   .Error(status, message)
+//   .StartChunked(contentType?)  .WriteChunk(data)  .EndChunked()
+//                            - stream a response of unknown length
+//   .Sent()                  - true once the response has been written
+//
+// Limits and safety:
+//   Request line, header count/size and body size are all capped; a request
+//   that exceeds them gets 431 or 413 instead of allocating. Header names and
+//   values are validated so a handler cannot inject CRLF into the response.
+//   Sockets carry an OS-level read timeout, so one stalled client cannot hold
+//   the VM: the accept loop and the keep-alive idle wait park the fiber via
+//   Stream.WaitReadable, and every blocking read is bounded by readTimeoutMs.
+//
+// Not implemented: TLS (put it behind a TLS-terminating proxy), HTTP/2, and
+// request pipelining (a second request is read only after the first replies).
+// =============================================================================
+
+// A method named Json or File shadows the namespace of the same name for the
+// whole class body, so `Json.Stringify` inside `fn Json()` would resolve to the
+// method. These module-level wrappers reach the real namespace from outside.
+fn _jsonEncode(value): string { return Json.Stringify(value); }
+fn _jsonDecode(text:string)   { return Json.Parse(text); }
+fn _fileExists(path:string): bool { return File.Exists(path); }
+fn _fileBytes(path:string)        { return File.ReadAllBytes(path); }
+
+// =============================================================================
+// HttpStatus - reason phrases and extension-to-MIME mapping.
+// =============================================================================
+
+class HttpStatus
+{
+    fn static Reason(code:int): string {
+        if (code == 200) return "OK";
+        if (code == 201) return "Created";
+        if (code == 202) return "Accepted";
+        if (code == 204) return "No Content";
+        if (code == 206) return "Partial Content";
+        if (code == 301) return "Moved Permanently";
+        if (code == 302) return "Found";
+        if (code == 303) return "See Other";
+        if (code == 304) return "Not Modified";
+        if (code == 307) return "Temporary Redirect";
+        if (code == 308) return "Permanent Redirect";
+        if (code == 400) return "Bad Request";
+        if (code == 401) return "Unauthorized";
+        if (code == 403) return "Forbidden";
+        if (code == 404) return "Not Found";
+        if (code == 405) return "Method Not Allowed";
+        if (code == 408) return "Request Timeout";
+        if (code == 409) return "Conflict";
+        if (code == 411) return "Length Required";
+        if (code == 413) return "Content Too Large";
+        if (code == 414) return "URI Too Long";
+        if (code == 415) return "Unsupported Media Type";
+        if (code == 429) return "Too Many Requests";
+        if (code == 431) return "Request Header Fields Too Large";
+        if (code == 500) return "Internal Server Error";
+        if (code == 501) return "Not Implemented";
+        if (code == 502) return "Bad Gateway";
+        if (code == 503) return "Service Unavailable";
+        if (code == 504) return "Gateway Timeout";
+        if (code == 505) return "HTTP Version Not Supported";
+
+        // Fall back to the class-generic phrase.
+        if (code >= 100 && code < 200) return "Informational";
+        if (code >= 200 && code < 300) return "Success";
+        if (code >= 300 && code < 400) return "Redirection";
+        if (code >= 400 && code < 500) return "Client Error";
+        return "Server Error";
+    }
+
+    // Content type guessed from a file extension.
+    fn static MimeFor(path:string): string {
+        let e = String.ToLower(Path.GetExtension(path));
+        if (e == ".html" || e == ".htm") return "text/html; charset=utf-8";
+        if (e == ".css")  return "text/css; charset=utf-8";
+        if (e == ".js" || e == ".mjs") return "text/javascript; charset=utf-8";
+        if (e == ".json") return "application/json";
+        if (e == ".txt" || e == ".md")  return "text/plain; charset=utf-8";
+        if (e == ".xml")  return "application/xml";
+        if (e == ".csv")  return "text/csv; charset=utf-8";
+        if (e == ".svg")  return "image/svg+xml";
+        if (e == ".png")  return "image/png";
+        if (e == ".jpg" || e == ".jpeg") return "image/jpeg";
+        if (e == ".gif")  return "image/gif";
+        if (e == ".webp") return "image/webp";
+        if (e == ".ico")  return "image/x-icon";
+        if (e == ".woff") return "font/woff";
+        if (e == ".woff2") return "font/woff2";
+        if (e == ".pdf")  return "application/pdf";
+        if (e == ".zip")  return "application/zip";
+        if (e == ".wasm") return "application/wasm";
+        return "application/octet-stream";
+    }
+}
+
+// =============================================================================
+// HttpRequest - one parsed request. Handlers receive it read-only.
+// =============================================================================
+
+class HttpRequest
+{
+    let method:string   = "GET";
+    let path:string     = "/";      // decoded path, no query string
+    let rawPath:string  = "/";      // path exactly as sent, query included
+    let version:string  = "HTTP/1.1";
+    let headers          = nil;     // lowercased name -> value
+    let query            = nil;     // decoded query parameters
+    let params           = nil;     // captured path parameters
+    let body             = nil;     // block, or nil when there is no body
+    let peer:string     = "";
+    let keepAlive:bool  = true;
+
+    fn Constructor() {
+        headers = {};
+        query   = {};
+        params  = {};
+    }
+
+    // Header lookup; names are matched case-insensitively.
+    fn Header(name:string, dflt?): string {
+        return Object.TryGet(headers, String.ToLower(name), dflt ?? nil);
+    }
+
+    fn Query(name:string, dflt?) { return Object.TryGet(query,  name, dflt ?? nil); }
+    fn Param(name:string)        { return Object.TryGet(params, name, nil); }
+
+    fn ContentLength(): int {
+        if (body == nil) return 0;
+        return len(body);
+    }
+
+    fn IsKeepAlive(): bool { return keepAlive; }
+
+    // Body decoded as UTF-8 text.
+    fn Text(): string {
+        if (body == nil) return "";
+        return Buffer.ToString(body);
+    }
+
+    // Body parsed as JSON; nil when the body is empty or malformed.
+    fn Json() {
+        let t = this.Text();
+        if (t == "") return nil;
+        return _jsonDecode(t);
+    }
+}
+
+// =============================================================================
+// HttpResponse - builds and writes the reply for one request.
+// =============================================================================
+
+class HttpResponse
+{
+    let _conn            = nil;
+    let _status:int     = 200;
+    let _headers         = nil;    // name -> value, in insertion order
+    let _order:array    = [];
+    let _sent:bool      = false;
+    let _headOnly:bool  = false;   // HEAD: send headers, suppress the body
+    let _keepAlive:bool = true;
+    let _chunked:bool   = false;
+    let _serverName:string = "Flaris";
+
+    fn Constructor(conn, headOnly:bool, keepAlive:bool, serverName:string) {
+        _conn       = conn;
+        _headOnly   = headOnly;
+        _keepAlive  = keepAlive;
+        _serverName = serverName;
+        _headers    = {};
+        _order      = [];
+        _status     = 200;
+        _sent       = false;
+        _chunked    = false;
+    }
+
+    fn Sent(): bool        { return _sent; }
+    fn IsKeepAlive(): bool { return _keepAlive; }
+
+    fn Status(code:int) { _status = code; return this; }
+
+    // Reject CRLF in either half so a header can never split the response.
+    fn Header(name:string, value) {
+        let v = str(value);
+        if (String.Contains(name, "\r") || String.Contains(name, "\n")
+            || String.Contains(name, ":") || name == "") {
+            throw(1, "HttpServer: invalid header name");
+        }
+        if (String.Contains(v, "\r") || String.Contains(v, "\n")) {
+            throw(1, "HttpServer: invalid header value for '" + name + "'");
+        }
+        if (!Object.HasKey(_headers, name)) { Array.Append(_order, name); }
+        _headers[name] = v;
+        return this;
+    }
+
+    fn ContentType(ct:string) { return this.Header("Content-Type", ct); }
+
+    // Serialize the status line plus headers. bodyLen < 0 means chunked.
+    fn _headBlock(bodyLen:int): string {
+        let sb = [];
+        Array.Append(sb, "HTTP/1.1 " + str(_status) + " " + HttpStatus.Reason(_status));
+
+        if (!Object.HasKey(_headers, "Server")) {
+            Array.Append(sb, "Server: " + _serverName);
+        }
+        foreach (k in _order) {
+            // Length and framing are decided here, never by the handler.
+            let lk = String.ToLower(k);
+            if (lk != "content-length" && lk != "connection" && lk != "transfer-encoding") {
+                Array.Append(sb, k + ": " + _headers[k]);
+            }
+        }
+        if (bodyLen >= 0) {
+            Array.Append(sb, "Content-Length: " + str(bodyLen));
+        } else {
+            Array.Append(sb, "Transfer-Encoding: chunked");
+        }
+        Array.Append(sb, "Connection: " + (_keepAlive ? "keep-alive" : "close"));
+        Array.Append(sb, "");
+        Array.Append(sb, "");
+        return String.Join(sb, "\r\n");
+    }
+
+    // Send a complete response. `body` is a string, a block, or nil.
+    fn _send(body, contentType?: string, status?) {
+        if (_sent) return false;
+        if (status != nil) { _status = int(status); }
+        if (contentType != nil && !Object.HasKey(_headers, "Content-Type")) {
+            this.ContentType(contentType);
+        }
+
+        let isBlock = (body != nil) && Type.Is(body, Type.Block);
+        let bodyLen = 0;
+        if (body != nil) { bodyLen = isBlock ? len(body) : String.Length(body); }
+
+        // 204 and 304 carry no body at all.
+        if (_status == 204 || _status == 304) { body = nil; bodyLen = 0; }
+
+        Stream.WriteString(_conn, this._headBlock(bodyLen));
+        if (body != nil && !_headOnly && bodyLen > 0) {
+            if (isBlock) { Stream.WriteBytes(_conn, body, bodyLen); }
+            else         { Stream.WriteString(_conn, body); }
+        }
+        _sent = true;
+        return true;
+    }
+
+    fn Text(s:string, status?: int)  { return this._send(s, "text/plain; charset=utf-8", status); }
+    fn Html(s:string, status?: int)  { return this._send(s, "text/html; charset=utf-8",  status); }
+    fn Json(value, status?: int)     { return this._send(_jsonEncode(value), "application/json", status); }
+
+    fn Bytes(data, contentType?: string, status?: int) {
+        return this._send(data, contentType ?? "application/octet-stream", status);
+    }
+
+    fn NoContent() { return this._send(nil, nil, 204); }
+
+    fn Redirect(url:string, status?: int) {
+        this.Header("Location", url);
+        return this._send("", "text/plain; charset=utf-8", status ?? 302);
+    }
+
+    // JSON error body, matching what the default 404/500 handlers send.
+    fn Error(status:int, message:string) {
+        return this._send(_jsonEncode({ error: message, status: status }),
+                          "application/json", status);
+    }
+
+    // Send a file's bytes. Returns false (and sends 404) when it is missing.
+    fn File(path:string, contentType?: string) {
+        if (!_fileExists(path)) { return this.Error(404, "not found"); }
+        let data = _fileBytes(path);
+        if (data == nil) { return this.Error(500, "could not read file"); }
+        return this._send(data, contentType ?? HttpStatus.MimeFor(path), nil);
+    }
+
+    // --- Chunked streaming --------------------------------------------------
+
+    // Begin a streamed response of unknown length.
+    fn StartChunked(contentType?: string) {
+        if (_sent) return false;
+        if (contentType != nil && !Object.HasKey(_headers, "Content-Type")) {
+            this.ContentType(contentType);
+        }
+        _chunked = true;
+        Stream.WriteString(_conn, this._headBlock(-1));
+        return true;
+    }
+
+    // Write one chunk. Empty writes are skipped (an empty chunk ends the body).
+    fn WriteChunk(data): bool {
+        if (!_chunked || _sent) return false;
+        let isBlock = Type.Is(data, Type.Block);
+        let n = isBlock ? len(data) : String.Length(data);
+        if (n == 0) return true;
+        if (_headOnly) return true;
+
+        Stream.WriteString(_conn, Convert.ToRadixString(n, 16) + "\r\n");
+        if (isBlock) { Stream.WriteBytes(_conn, data, n); }
+        else         { Stream.WriteString(_conn, data); }
+        Stream.WriteString(_conn, "\r\n");
+        return true;
+    }
+
+    fn EndChunked(): bool {
+        if (!_chunked || _sent) return false;
+        if (!_headOnly) { Stream.WriteString(_conn, "0\r\n\r\n"); }
+        _sent = true;
+        return true;
+    }
+}
+
+// =============================================================================
+// _Route - one method + pattern pair and its handler.
+// =============================================================================
+
+class _Route
+{
+    let method:string  = "GET";
+    let segs:array    = [];      // pattern split on "/"
+    let handler        = nil;
+    let catchAll:bool = false;   // pattern ends with "*"
+
+    fn Constructor(method:string, pattern:string, handler) {
+        this.method  = String.ToUpper(method);
+        this.handler = handler;
+        let p = pattern;
+        if (String.EndsWith(p, "*")) {
+            catchAll = true;
+            p = String.Substr(p, 0, String.Length(p) - 1);
+        }
+        segs = _splitPath(p);
+    }
+
+    // Match `parts` against this route, filling `params` on success.
+    fn Matches(parts:array, params): bool {
+        if (catchAll) {
+            if (len(parts) < len(segs)) return false;
+        } else if (len(parts) != len(segs)) {
+            return false;
+        }
+
+        iter (i from 0 to len(segs) - 1) {
+            let s = segs[i];
+            if (String.StartsWith(s, ":")) {
+                params[String.Substr(s, 1)] = parts[i];
+            } else if (s != parts[i]) {
+                return false;
+            }
+        }
+        if (catchAll) {
+            let tail = [];
+            iter (i from len(segs) to len(parts) - 1) { Array.Append(tail, parts[i]); }
+            params["*"] = String.Join(tail, "/");
+        }
+        return true;
+    }
+}
+
+// Split a URL path into its non-empty segments.
+fn _splitPath(path:string): array {
+    let out = [];
+    foreach (s in String.Split(path, "/")) {
+        if (s != "") { Array.Append(out, s); }
+    }
+    return out;
+}
+
+// =============================================================================
+// HttpServer - binds a socket and serves HTTP/1.1 over it.
+// =============================================================================
+
+class HttpServer
+{
+    let _port:int              = 8080;
+    let _backlog:int           = 128;
+    let _keepAlive:bool        = true;
+    let _idleTimeoutMs:int     = 5000;
+    let _readTimeoutMs:int     = 10000;
+    let _maxRequestsPerConn:int = 100;
+    let _maxHeaders:int        = 100;
+    let _maxHeaderBytes:int    = 65536;
+    let _maxBodyBytes:int      = 8388608;
+    let _maxConnections:int    = 64;
+    let _serverName:string     = "Flaris";
+
+    let _sock                   = nil;
+    let _running:bool          = false;
+    let _boundPort:int         = 0;
+    let _activeConns:int       = 0;
+
+    let _routes:array          = [];
+    let _onRequest              = nil;
+    let _notFound               = nil;
+    let _onError                = nil;
+    let _statics:array         = [];   // { prefix, root, index, cacheControl }
+
+    fn Constructor(opts?) {
+        _routes  = [];
+        _statics = [];
+        if (opts != nil) {
+            _port               = Object.TryGet(opts, "port",               8080);
+            _backlog            = Object.TryGet(opts, "backlog",            128);
+            _keepAlive          = Object.TryGet(opts, "keepAlive",          true);
+            _idleTimeoutMs      = Object.TryGet(opts, "idleTimeoutMs",      5000);
+            _readTimeoutMs      = Object.TryGet(opts, "readTimeoutMs",      10000);
+            _maxRequestsPerConn = Object.TryGet(opts, "maxRequestsPerConn", 100);
+            _maxHeaders         = Object.TryGet(opts, "maxHeaders",         100);
+            _maxHeaderBytes     = Object.TryGet(opts, "maxHeaderBytes",     65536);
+            _maxBodyBytes       = Object.TryGet(opts, "maxBodyBytes",       8388608);
+            _maxConnections     = Object.TryGet(opts, "maxConnections",     64);
+            _serverName         = Object.TryGet(opts, "serverName",         "Flaris");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Registration
+    // -------------------------------------------------------------------------
+
+    fn Route(method:string, pattern:string, handler) {
+        Array.Append(_routes, new _Route(method, pattern, handler));
+        return this;
+    }
+
+    fn Get(pattern:string, handler)    { return this.Route("GET",    pattern, handler); }
+    fn Post(pattern:string, handler)   { return this.Route("POST",   pattern, handler); }
+    fn Put(pattern:string, handler)    { return this.Route("PUT",    pattern, handler); }
+    fn Delete(pattern:string, handler) { return this.Route("DELETE", pattern, handler); }
+    fn Patch(pattern:string, handler)  { return this.Route("PATCH",  pattern, handler); }
+    fn Head(pattern:string, handler)   { return this.Route("HEAD",   pattern, handler); }
+
+    fn OnRequest(handler) { _onRequest = handler; return this; }
+    fn NotFound(handler)  { _notFound  = handler; return this; }
+    fn OnError(handler)   { _onError   = handler; return this; }
+
+    // Serve files under rootDir for URLs beginning with urlPrefix.
+    fn Static(urlPrefix:string, rootDir:string, opts?) {
+        let o = (opts != nil) ? opts : {};
+        Array.Append(_statics, {
+            prefix:       urlPrefix,
+            root:         rootDir,
+            index:        Object.TryGet(o, "index",        "index.html"),
+            cacheControl: Object.TryGet(o, "cacheControl", "")
+        });
+        return this;
+    }
+
+    fn IsRunning(): bool { return _running; }
+    fn Port(): int       { return _boundPort; }
+
+    // -------------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------------
+
+    // Bind the listen socket. Separated from the accept loop so ListenAsync can
+    // guarantee the port is open before it returns.
+    fn _bind() {
+        if (_sock != nil) return true;
+        let s = Stream.Listen("tcp", _port, _backlog);
+        if (s == nil) {
+            throw(1, "HttpServer: could not bind port " + str(_port));
+        }
+        _sock      = s;
+        _boundPort = _port;
+        // With port 0 the kernel picks one - read it back so callers can use it.
+        if (_port == 0) {
+            let addr = Stream.LocalAddr(s);
+            if (addr != nil) {
+                let c = String.LastIndexOf(addr, ":");
+                if (c >= 0) {
+                    let p = Convert.ParseInt(String.Substr(addr, c + 1));
+                    if (p != nil) { _boundPort = p; }
+                }
+            }
+        }
+        _running = true;
+        return true;
+    }
+
+    // Bind and serve until Stop(). Blocks the calling fiber.
+    fn Listen() {
+        this._bind();
+        this._acceptLoop();
+        return nil;
+    }
+
+    // Bind now, then serve on a background fiber.
+    fn ListenAsync() {
+        this._bind();
+        // `this` is not captured by a Fiber.Run closure - bind it to a local first.
+        let self = this;
+        Fiber.Run(fn() { self._acceptLoop(); });
+        return _boundPort;
+    }
+
+    // Ask the accept loop to stop. The loop owns the listen socket and closes it
+    // on its way out - closing it here could pull the socket out from under a
+    // fiber parked in WaitReadable. Shutdown therefore completes within one
+    // accept tick (500 ms), not instantly.
+    fn Stop() {
+        _running = false;
+        return nil;
+    }
+
+    // Accept connections, handing each to its own fiber.
+    fn _acceptLoop() {
+        // `this` is not captured by a Fiber.Run closure - bind it to a local first.
+        let self = this;
+        while (_running && _sock != nil) {
+            // Park until a connection arrives; the timeout re-checks _running.
+            let ready = Stream.WaitReadable(_sock, 500);
+            if (ready != nil && _running && _sock != nil) {
+                let conn = Stream.Accept(_sock);
+                if (conn != nil) {
+                    if (_activeConns >= _maxConnections) {
+                        // At capacity: answer 503 immediately rather than queueing.
+                        Stream.WriteString(conn,
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        Stream.Close(conn);
+                    } else {
+                        _activeConns = _activeConns + 1;
+                        Fiber.Run(fn() { self._serveConnection(conn); });
+                    }
+                }
+            }
+        }
+        // The loop owns the socket: release the port on the way out.
+        if (_sock != nil) {
+            Stream.Close(_sock);
+            _sock = nil;
+        }
+        _running = false;
+        return nil;
+    }
+
+    // -------------------------------------------------------------------------
+    // Connection handling
+    // -------------------------------------------------------------------------
+
+    // Serve requests on one connection until it closes or the limits run out.
+    fn _serveConnection(conn) {
+        Stream.SetNoDelay(conn, true);
+        // An OS-level read timeout bounds every blocking read below, so a client
+        // that stops mid-request cannot hold the single-threaded VM.
+        Stream.SetTimeout(conn, _readTimeoutMs);
+
+        let peer   = Stream.PeerAddr(conn) ?? "";
+        let served = 0;
+        let alive  = true;
+
+        while (alive && _running && served < _maxRequestsPerConn) {
+            // Park (not block) while the connection is idle between requests.
+            let ready = Stream.WaitReadable(conn, _idleTimeoutMs);
+            if (ready == nil) {
+                alive = false;
+            } else {
+                let handled = this._serveOne(conn, peer, served);
+                served = served + 1;
+                if (!handled) { alive = false; }
+            }
+        }
+
+        Stream.Close(conn);
+        _activeConns = _activeConns - 1;
+        return nil;
+    }
+
+    // Read one request and write its response. Returns false to close.
+    fn _serveOne(conn, peer:string, served:int): bool {
+        let parsed = this._readRequest(conn, peer);
+        let req    = parsed.req;
+
+        // A parse failure still gets a well-formed reply, then closes.
+        if (parsed.status != 0) {
+            let res = new HttpResponse(conn, false, false, _serverName);
+            if (parsed.status > 0) { res.Error(parsed.status, parsed.message); }
+            return false;
+        }
+
+        // Honour the client's wish to close, plus our own per-connection cap.
+        let keep = _keepAlive && req.keepAlive && (served + 1) < _maxRequestsPerConn;
+        let res  = new HttpResponse(conn, req.method == "HEAD", keep, _serverName);
+
+        this._dispatch(req, res);
+
+        // A handler that wrote nothing still owes the client a response.
+        if (!res.Sent()) { res.Error(500, "handler produced no response"); }
+        return keep;
+    }
+
+    // Route the request to a handler, converting a raised error into a 500.
+    fn _dispatch(req, res) {
+        try {
+            // 1. Explicit routes.
+            let parts   = _splitPath(req.path);
+            let matched = false;
+            let methodMismatch = false;
+
+            foreach (r in _routes) {
+                if (!matched) {
+                    let p = {};
+                    if (r.Matches(parts, p)) {
+                        // HEAD falls back to the GET handler.
+                        let m = r.method;
+                        if (m == req.method || (req.method == "HEAD" && m == "GET")) {
+                            req.params = p;
+                            matched = true;
+                            r.handler(req, res);
+                        } else {
+                            methodMismatch = true;
+                        }
+                    }
+                }
+            }
+
+            // 2. Static mounts.
+            if (!matched) {
+                matched = this._serveStatic(req, res);
+            }
+
+            // 3. Catch-all handler.
+            if (!matched && _onRequest != nil) {
+                matched = true;
+                _onRequest(req, res);
+            }
+
+            // 4. Nothing claimed it.
+            if (!matched && !res.Sent()) {
+                if (methodMismatch) {
+                    res.Error(405, "method not allowed");
+                } else if (_notFound != nil) {
+                    _notFound(req, res);
+                } else {
+                    res.Error(404, "not found");
+                }
+            }
+        } catch (e) {
+            if (_onError != nil) {
+                _onError(req, res, e);
+            }
+            if (!res.Sent()) { res.Error(500, "internal server error"); }
+        }
+        return nil;
+    }
+
+    // Serve req from a Static() mount. Returns true when it handled the request.
+    fn _serveStatic(req, res): bool {
+        if (req.method != "GET" && req.method != "HEAD") return false;
+
+        foreach (m in _statics) {
+            if (!res.Sent() && String.StartsWith(req.path, m.prefix)) {
+                let rel = String.Substr(req.path, String.Length(m.prefix));
+                if (String.StartsWith(rel, "/")) { rel = String.Substr(rel, 1); }
+                if (rel == "") { rel = m.index; }
+
+                // Reject traversal before touching the filesystem.
+                if (String.Contains(rel, "..") || String.StartsWith(rel, "/")
+                    || String.Contains(rel, "\\")) {
+                    res.Error(403, "forbidden");
+                    return true;
+                }
+
+                let full = Path.Combine(m.root, rel);
+                // Confirm the resolved path really is inside the mount root.
+                let rootFull = Path.GetFullPath(m.root);
+                let fileFull = Path.GetFullPath(full);
+                if (rootFull == nil || fileFull == nil
+                    || !String.StartsWith(fileFull, rootFull)) {
+                    res.Error(403, "forbidden");
+                    return true;
+                }
+                if (!File.Exists(fileFull)) { return false; }
+
+                if (m.cacheControl != "") { res.Header("Cache-Control", m.cacheControl); }
+                res.File(fileFull);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Request parsing
+    // -------------------------------------------------------------------------
+
+    // Read and parse one request.
+    // Returns { req, status, message }: status 0 is success, > 0 is the error
+    // code to report, -1 means the peer closed and nothing should be sent.
+    fn _readRequest(conn, peer:string) {
+        let line = Stream.ReadLine(conn);
+        if (line == nil || line == "") {
+            return { req: nil, status: -1, message: "closed" };
+        }
+        if (String.Length(line) > 8192) {
+            return { req: nil, status: 414, message: "request line too long" };
+        }
+
+        let parts = String.Split(line, " ");
+        if (len(parts) < 3) {
+            return { req: nil, status: 400, message: "malformed request line" };
+        }
+
+        let req = new HttpRequest();
+        req.method  = String.ToUpper(parts[0]);
+        req.rawPath = parts[1];
+        req.version = String.Trim(parts[2]);
+        req.peer    = peer;
+
+        // Split off the query string, then percent-decode the path.
+        let target = req.rawPath;
+        let q      = String.IndexOf(target, "?");
+        if (q >= 0) {
+            let qs = String.Substr(target, q + 1);
+            target = String.Substr(target, 0, q);
+            req.query = HttpUtil.ParseQuery(qs) ?? {};
+        }
+        req.path = HttpUtil.UrlDecode(target) ?? target;
+        if (!String.StartsWith(req.path, "/")) {
+            return { req: nil, status: 400, message: "path must be absolute" };
+        }
+
+        // Headers, bounded by both count and total size.
+        let raw   = [];
+        let total = 0;
+        let count = 0;
+        let h     = Stream.ReadLine(conn);
+        while (h != nil && h != "") {
+            total = total + String.Length(h) + 2;
+            count = count + 1;
+            if (count > _maxHeaders || total > _maxHeaderBytes) {
+                return { req: nil, status: 431, message: "header block too large" };
+            }
+            Array.Append(raw, h);
+            h = Stream.ReadLine(conn);
+        }
+        if (len(raw) > 0) {
+            req.headers = HttpUtil.ParseHeaders(String.Join(raw, "\r\n") + "\r\n") ?? {};
+        }
+
+        // HTTP/1.1 keeps the connection open unless asked otherwise; 1.0 is the
+        // reverse and needs an explicit keep-alive.
+        let connHdr = String.ToLower(req.Header("Connection", "") ?? "");
+        if (req.version == "HTTP/1.0") {
+            req.keepAlive = String.Contains(connHdr, "keep-alive");
+        } else {
+            req.keepAlive = !String.Contains(connHdr, "close");
+        }
+
+        // Body: chunked wins over Content-Length, per RFC 9112.
+        let te = String.ToLower(req.Header("Transfer-Encoding", "") ?? "");
+        if (String.Contains(te, "chunked")) {
+            let r = this._readChunkedBody(conn);
+            if (!r.ok) {
+                return { req: nil, status: 413, message: "body too large" };
+            }
+            req.body = r.body;
+        } else {
+            let clRaw = req.Header("Content-Length", nil);
+            if (clRaw != nil) {
+                let cl = Convert.ParseInt(String.Trim(clRaw));
+                if (cl == nil || cl < 0) {
+                    return { req: nil, status: 400, message: "bad Content-Length" };
+                }
+                if (cl > _maxBodyBytes) {
+                    return { req: nil, status: 413, message: "body too large" };
+                }
+                if (cl > 0) { req.body = Stream.ReadBytes(conn, cl); }
+            }
+        }
+
+        return { req: req, status: 0, message: "" };
+    }
+
+    // Decode a chunked body into one block.
+    // Returns { ok, body }: ok is false when the body exceeds maxBodyBytes, and
+    // body is nil for a chunked body that carried no bytes.
+    fn _readChunkedBody(conn) {
+        let parts = [];
+        let total = 0;
+        let more  = true;
+
+        while (more) {
+            let line = Stream.ReadLine(conn);
+            if (line == nil || line == "") {
+                more = false;
+            } else {
+                // Drop any chunk extension after ';'.
+                let semi = String.IndexOf(line, ";");
+                if (semi >= 0) { line = String.Substr(line, 0, semi); }
+                let n = Convert.ParseInt("0x" + String.Trim(line));
+
+                if (n == nil || n < 0) {
+                    more = false;
+                } else if (n == 0) {
+                    // Final chunk: consume the trailer section.
+                    let t = Stream.ReadLine(conn);
+                    while (t != nil && t != "") { t = Stream.ReadLine(conn); }
+                    more = false;
+                } else {
+                    total = total + n;
+                    if (total > _maxBodyBytes) { return { ok: false, body: nil }; }
+                    let part = Stream.ReadBytes(conn, n);
+                    if (part == nil) {
+                        more = false;
+                    } else {
+                        Array.Append(parts, part);
+                        Stream.ReadLine(conn);   // trailing CRLF after the chunk
+                    }
+                }
+            }
+        }
+
+        // Buffer.Create rejects a zero count, so an empty body stays nil.
+        if (total == 0) { return { ok: true, body: nil }; }
+
+        let out = Buffer.Create(total, 1);
+        let off = 0;
+        foreach (p in parts) {
+            Buffer.Copy(p, 0, out, off, len(p));
+            off = off + len(p);
+        }
+        return { ok: true, body: out };
+    }
+}
+
+export { HttpServer, HttpRequest, HttpResponse, HttpStatus };

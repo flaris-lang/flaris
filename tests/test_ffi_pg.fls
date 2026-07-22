@@ -1,0 +1,453 @@
+// test_ffi_pg.fls - Test suite for the Postgres FFI binding
+//
+// Run:
+//   flarisvm --unsafe test_ffi_pg.fls
+//
+// Prerequisites:
+//   - pg_ffi.so / .dylib / .dll compiled and in the same directory
+//   - Postgres.fls compiled:  flarisvm --compile Postgres.fls Postgres.flx
+//   - A running PostgreSQL instance with the connection string below
+//   - The test schema created by running the SQL block in the comments
+//
+// Test schema (run once in psql):
+//   CREATE TABLE ffi_test_users (
+//       id    SERIAL PRIMARY KEY,
+//       name  TEXT    NOT NULL,
+//       score FLOAT,
+//       active BOOLEAN DEFAULT true
+//   );
+//   INSERT INTO ffi_test_users (name, score, active) VALUES
+//       ('Alice', 9.5,  true),
+//       ('Bob',   7.0,  false),
+//       ('Carol', 8.25, true);
+//
+//   CREATE TABLE ffi_test_config (
+//       key   TEXT PRIMARY KEY,
+//       value TEXT
+//   );
+//   INSERT INTO ffi_test_config VALUES ('app_name', 'FlarisPG');
+
+import { Postgres } from library("Postgres", "1.0");
+
+// ── Connection string - adjust to your local setup ──────────────────────────
+const CONNSTR = "host=localhost port=5432 dbname=postgres user=postgres password=postgres";
+
+// ── Benchmark helpers ────────────────────────────────────────────────────────
+
+global _sink = 0;
+global _bpg  = nil;   // Postgres handle captured by bench lambdas
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 44),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine("------------------------------------------------------------"); }
+
+fn bench_pg(db) {
+    _bpg = db;
+
+    // Scratch table - separate from test data so we don't skew row counts
+    db.Exec("CREATE TABLE IF NOT EXISTS ffi_bench_data (id SERIAL PRIMARY KEY, val TEXT, n FLOAT)");
+    db.Exec("DELETE FROM ffi_bench_data");
+
+    Console.WriteLine("\n========================================");
+    Console.WriteLine(" Postgres Benchmarks");
+    Console.WriteLine("========================================");
+    Console.WriteLine(String.PadRight("benchmark", 44), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("[ Read - local Postgres, 3-row table ]");
+
+    bench("ScalarInt  COUNT(*)", fn() {
+        _sink = _bpg.ScalarInt("SELECT COUNT(*) FROM ffi_test_users");
+    }, 500);
+
+    bench("ScalarString  SELECT version()", fn() {
+        _sink = _bpg.ScalarString("SELECT version()");
+    }, 500);
+
+    bench("Query      SELECT 3 rows", fn() {
+        let r = _bpg.Query("SELECT id, name, score, active FROM ffi_test_users ORDER BY id");
+        _sink = len(r);
+    }, 500);
+
+    bench("QueryParams  WHERE active = $1", fn() {
+        let r = _bpg.QueryParams(
+            "SELECT id, name FROM ffi_test_users WHERE active = $1",
+            [true]);
+        _sink = len(r);
+    }, 500);
+
+    benchSep();
+    Console.WriteLine("[ Write - round-trip INSERT + DELETE ]");
+
+    bench("ExecParams  INSERT+DELETE  (autocommit)", fn() {
+        _bpg.ExecParams(
+            "INSERT INTO ffi_bench_data (val, n) VALUES ($1, $2)",
+            ["bench", 1.0]);
+        _bpg.Exec("DELETE FROM ffi_bench_data");
+    }, 200);
+
+    bench("Exec  BEGIN+100×INSERT+COMMIT", fn() {
+        _bpg.Exec("BEGIN");
+        iter (i from 0 to 99) {
+            _bpg.ExecParams(
+                "INSERT INTO ffi_bench_data (val, n) VALUES ($1, $2)",
+                ["t", float(i)]);
+        }
+        _bpg.Exec("COMMIT");
+        _bpg.Exec("DELETE FROM ffi_bench_data");
+    }, 10);
+
+    db.Exec("DROP TABLE ffi_bench_data");
+}
+
+// ── Test framework ───────────────────────────────────────────────────────────
+
+global passed = 0;
+global failed = 0;
+
+fn check(label:string, cond:bool) {
+    if (cond) {
+        Console.WriteLine("  [PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("  [FAIL] " + label);
+        failed += 1;
+    }
+}
+
+fn checkEq(label:string, actual, expected) {
+    if (actual == expected) {
+        Console.WriteLine("  [PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("  [FAIL] " + label
+            + "  expected=" + str(expected)
+            + "  got="      + str(actual));
+        failed += 1;
+    }
+}
+
+fn checkNotNil(label:string, val) {
+    check(label + " (not nil)", val != nil);
+}
+
+fn checkHasKey(label:string, obj, key:string) {
+    check(label + " has key '" + key + "'", key in obj);
+}
+
+// ── Test groups ──────────────────────────────────────────────────────────────
+
+fn test_connect(db) {
+    Console.WriteLine("\n[1] Connection");
+    checkNotNil("Postgres.Connect returned instance", db);
+}
+
+fn test_scalar_int(db) {
+    Console.WriteLine("\n[2] ScalarInt");
+
+    let count = db.ScalarInt("SELECT COUNT(*) FROM ffi_test_users");
+    checkEq("COUNT(*) = 3", count, 3);
+
+    let max_id = db.ScalarInt("SELECT MAX(id) FROM ffi_test_users");
+    check("MAX(id) >= 1", max_id >= 1);
+
+    let none = db.ScalarInt("SELECT COUNT(*) FROM ffi_test_users WHERE name = 'Nobody'");
+    checkEq("empty count = 0", none, 0);
+
+    let bad = db.ScalarInt("SELECT COUNT(*) FROM does_not_exist_xyz");
+    checkEq("bad table - nil", bad, nil);
+}
+
+fn test_scalar_string(db) {
+    Console.WriteLine("\n[3] ScalarString");
+
+    let app = db.ScalarString("SELECT value FROM ffi_test_config WHERE key = 'app_name'");
+    checkEq("config lookup = 'FlarisPG'", app, "FlarisPG");
+
+    let missing = db.ScalarString("SELECT value FROM ffi_test_config WHERE key = 'nope'");
+    checkEq("missing row - nil", missing, nil);
+
+    let ver = db.ScalarString("SELECT version()");
+    check("version() is non-empty string", ver != nil && len(ver) > 0);
+}
+
+fn test_query_rows(db) {
+    Console.WriteLine("\n[4] Query - row count and keys");
+
+    let rows = db.Query("SELECT id, name, score, active FROM ffi_test_users ORDER BY id");
+
+    checkEq("row count = 3", len(rows), 3);
+    checkHasKey("row[0] has 'id'",     rows[0], "id");
+    checkHasKey("row[0] has 'name'",   rows[0], "name");
+    checkHasKey("row[0] has 'score'",  rows[0], "score");
+    checkHasKey("row[0] has 'active'", rows[0], "active");
+}
+
+fn test_query_types(db) {
+    Console.WriteLine("\n[5] Query - native type mapping");
+
+    let rows = db.Query("SELECT id, name, score, active FROM ffi_test_users ORDER BY id");
+
+    // id: INTEGER - int
+    check("id is int",    type(rows[0].id)     == Type.Int);
+    checkEq("Alice id",   rows[0].id,           1);
+
+    // name: TEXT - string
+    check("name is string", type(rows[0].name) == Type.String);
+    checkEq("Alice name",   rows[0].name,        "Alice");
+
+    // score: FLOAT - float
+    check("score is float",  type(rows[0].score) == Type.Float);
+    checkEq("Alice score",   rows[0].score,        9.5);
+
+    // active: BOOLEAN - bool
+    check("active is bool",   type(rows[0].active) == Type.Bool);
+    checkEq("Alice active",   rows[0].active,        true);
+    checkEq("Bob active",     rows[1].active,        false);
+}
+
+fn test_query_values(db) {
+    Console.WriteLine("\n[6] Query - row values");
+
+    let rows = db.Query("SELECT id, name, score, active FROM ffi_test_users ORDER BY id");
+
+    checkEq("row[0] name",  rows[0].name,  "Alice");
+    checkEq("row[1] name",  rows[1].name,  "Bob");
+    checkEq("row[2] name",  rows[2].name,  "Carol");
+    checkEq("Bob score",    rows[1].score, 7.0);
+    checkEq("Carol score",  rows[2].score, 8.25);
+}
+
+fn test_query_empty(db) {
+    Console.WriteLine("\n[7] Query - empty result");
+
+    let rows = db.Query("SELECT * FROM ffi_test_users WHERE name = 'Nobody'");
+    checkEq("empty query returns array", type(rows), Type.Array);
+    checkEq("empty array length = 0",   len(rows),  0);
+}
+
+fn test_query_null(db) {
+    Console.WriteLine("\n[8] Query - NULL columns become nil");
+
+    // Insert a row with NULL score, then query it, then clean up
+    db.Query("INSERT INTO ffi_test_users (name, score) VALUES ('Null_Test', NULL)");
+    let rows = db.Query("SELECT score FROM ffi_test_users WHERE name = 'Null_Test'");
+    checkEq("NULL score - nil", rows[0].score, nil);
+    db.Query("DELETE FROM ffi_test_users WHERE name = 'Null_Test'");
+}
+
+fn test_query_error(db) {
+    Console.WriteLine("\n[9] Query - error object");
+
+    let result = db.Query("SELECT * FROM table_that_does_not_exist_xyz");
+    checkNotNil("error result is not nil", result);
+    check("error result has 'error' key", "error" in result);
+    check("error message non-empty", len(result.error) > 0);
+}
+
+fn test_multiple_queries(db) {
+    Console.WriteLine("\n[10] Multiple sequential queries");
+
+    let c1 = db.ScalarInt("SELECT COUNT(*) FROM ffi_test_users");
+    let c2 = db.ScalarInt("SELECT COUNT(*) FROM ffi_test_users");
+    let c3 = db.ScalarInt("SELECT COUNT(*) FROM ffi_test_users");
+    checkEq("repeated ScalarInt consistent", c1, c2);
+    checkEq("third query same result",       c1, c3);
+}
+
+fn test_query_params(db) {
+    Console.WriteLine("\n[11] QueryParams - parameterized SELECT");
+
+    let rows = db.QueryParams(
+        "SELECT name, score FROM ffi_test_users WHERE active = $1 ORDER BY name",
+        [true]);
+    checkEq("active=true count = 2", len(rows), 2);
+    checkEq("first name is Alice",   rows[0].name, "Alice");
+    checkEq("Alice score",           rows[0].score, 9.5);
+
+    let single = db.QueryParams(
+        "SELECT id FROM ffi_test_users WHERE name = $1",
+        ["Bob"]);
+    checkEq("Bob row count = 1", len(single), 1);
+    check("Bob id >= 1", single[0].id >= 1);
+
+    // nil param - SQL NULL in WHERE (should match nothing meaningful here)
+    let nil_rows = db.QueryParams(
+        "SELECT id FROM ffi_test_users WHERE score = $1",
+        [nil]);
+    checkEq("nil param - empty (NULLs never equal)", len(nil_rows), 0);
+}
+
+fn test_exec(db) {
+    Console.WriteLine("\n[12] Exec / ExecParams - DML with row counts");
+
+    // Insert via ExecParams, then verify, then clean up
+    let ins = db.ExecParams(
+        "INSERT INTO ffi_test_users (name, score, active) VALUES ($1, $2, $3)",
+        ["Exec_Test", 5.0, false]);
+    checkEq("ExecParams INSERT returns 1", ins, 1);
+
+    let row = db.QueryParams(
+        "SELECT score, active FROM ffi_test_users WHERE name = $1",
+        ["Exec_Test"]);
+    checkEq("inserted score", row[0].score, 5.0);
+    checkEq("inserted active", row[0].active, false);
+
+    let upd = db.ExecParams(
+        "UPDATE ffi_test_users SET score = $1 WHERE name = $2",
+        [6.5, "Exec_Test"]);
+    checkEq("ExecParams UPDATE returns 1", upd, 1);
+
+    let del = db.ExecParams(
+        "DELETE FROM ffi_test_users WHERE name = $1",
+        ["Exec_Test"]);
+    checkEq("ExecParams DELETE returns 1", del, 1);
+
+    // Exec (no params) error case returns -1
+    let bad = db.Exec("DELETE FROM table_that_does_not_exist_xyz");
+    checkEq("Exec error - -1", bad, -1);
+}
+
+fn test_query_one(db) {
+    Console.WriteLine("\n[13] QueryOne / QueryOneParams");
+
+    let row = db.QueryOne("SELECT name, score FROM ffi_test_users WHERE name = 'Alice'");
+    checkNotNil("QueryOne found Alice",         row);
+    checkEq("QueryOne name",                    row.name,  "Alice");
+    checkEq("QueryOne score",                   row.score, 9.5);
+
+    let none = db.QueryOne("SELECT name FROM ffi_test_users WHERE name = 'DoesNotExist'");
+    checkEq("QueryOne on empty result - nil",   none, nil);
+
+    let rowp = db.QueryOneParams(
+        "SELECT name FROM ffi_test_users WHERE score > $1",
+        [8.0]);
+    checkNotNil("QueryOneParams found row",     rowp);
+
+    let nonep = db.QueryOneParams(
+        "SELECT name FROM ffi_test_users WHERE score > $1",
+        [999.0]);
+    checkEq("QueryOneParams empty - nil",       nonep, nil);
+}
+
+fn test_scalar_params(db) {
+    Console.WriteLine("\n[14] ScalarIntParams / ScalarStringParams");
+
+    let cnt = db.ScalarIntParams(
+        "SELECT COUNT(*) FROM ffi_test_users WHERE score > $1",
+        [5.0]);
+    check("ScalarIntParams count > 0", cnt > 0);
+
+    let name = db.ScalarStringParams(
+        "SELECT name FROM ffi_test_users WHERE name = $1",
+        ["Alice"]);
+    checkEq("ScalarStringParams name = Alice", name, "Alice");
+
+    let miss = db.ScalarIntParams(
+        "SELECT COUNT(*) FROM ffi_test_users WHERE score > $1",
+        [999.0]);
+    checkEq("ScalarIntParams zero - 0", miss, 0);
+
+    let misss = db.ScalarStringParams(
+        "SELECT name FROM ffi_test_users WHERE name = $1",
+        ["Nobody"]);
+    checkEq("ScalarStringParams missing - nil", misss, nil);
+}
+
+fn test_transaction_helper(db) {
+    Console.WriteLine("\n[15] Transaction(fn) helper - commit + rollback");
+
+    // Commit path
+    let ok = db.Transaction(fn() {
+        let a = db.ExecParams(
+            "INSERT INTO ffi_test_users (name, score, active) VALUES ($1, $2, $3)",
+            ["TxH1", 1.0, false]);
+        let b = db.ExecParams(
+            "INSERT INTO ffi_test_users (name, score, active) VALUES ($1, $2, $3)",
+            ["TxH2", 2.0, false]);
+        return a == 1 && b == 1;
+    });
+    checkEq("Transaction commit returns true", ok, true);
+    let committed = db.ScalarIntParams(
+        "SELECT COUNT(*) FROM ffi_test_users WHERE name LIKE $1",
+        ["TxH%"]);
+    checkEq("both rows committed", committed, 2);
+
+    // Rollback path
+    let fail = db.Transaction(fn() {
+        db.ExecParams(
+            "INSERT INTO ffi_test_users (name, score, active) VALUES ($1, $2, $3)",
+            ["TxHRoll", 0.0, false]);
+        return false;
+    });
+    checkEq("Transaction rollback returns false", fail, false);
+    let rolled = db.ScalarIntParams(
+        "SELECT COUNT(*) FROM ffi_test_users WHERE name = $1",
+        ["TxHRoll"]);
+    checkEq("rolled-back row absent", rolled, 0);
+
+    // Clean up
+    db.Exec("DELETE FROM ffi_test_users WHERE name LIKE 'TxH%'");
+}
+
+fn test_close(db) {
+    Console.WriteLine("\n[16] Close");
+
+    let ok = db.Close();
+    checkEq("Close() returns true", ok, true);
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+fn Main() {
+    Console.WriteLine("========================================");
+    Console.WriteLine(" Postgres FFI Test Suite");
+    Console.WriteLine("========================================");
+
+    let db = Postgres.Connect(CONNSTR);
+    if (db == nil) {
+        Console.Error("Could not connect - check CONNSTR and that the server is running.");
+        Console.Error("CONNSTR: " + CONNSTR);
+        return 1;
+    }
+
+    test_connect(db);
+    test_scalar_int(db);
+    test_scalar_string(db);
+    test_query_rows(db);
+    test_query_types(db);
+    test_query_values(db);
+    test_query_empty(db);
+    test_query_null(db);
+    test_query_error(db);
+    test_multiple_queries(db);
+    test_query_params(db);
+    test_exec(db);
+    test_query_one(db);
+    test_scalar_params(db);
+    test_transaction_helper(db);
+    bench_pg(db);
+    test_close(db);
+
+    Console.WriteLine("\n========================================");
+    Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed");
+
+    if (failed == 0) {
+        Console.WriteLine("All tests passed.");
+        return 0;
+    }
+    Console.WriteLine("Some tests FAILED.");
+    return 1;
+}

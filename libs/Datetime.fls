@@ -1,0 +1,694 @@
+// Datetime.fls - DateTime and Duration library for Flaris.
+// Version: 1.0
+//
+// Two classes:
+//   DateTime - a point in time with timezone, backed by a Unix timestamp (seconds).
+//   Duration - a signed length of time in whole seconds.
+//
+// ⚠ DST transitions are NOT modelled - standard UTC offsets only.
+//
+// Usage:
+//   import { DateTime, Duration } from library("Datetime", "1.0");
+//
+//   // Current time and arithmetic
+//   let now  = DateTime.Now();                          // UTC
+//   let next = now.AddHours(2).AddMinutes(30);
+//   Console.WriteLine(next.Format("long"));
+//
+//   // Timezones
+//   let berlin = DateTime.NowIn("Europe/Berlin");
+//   Console.WriteLine(berlin.ToString());               // "2025-06-01 14:30:00 Europe/Berlin"
+//   Console.WriteLine(berlin.ToISO());                  // "2025-06-01T14:30:00+02:00"
+//
+//   // Construct an exact moment
+//   let d = DateTime.Of(2025, 12, 31, 23, 59, 59, "UTC");
+//   Console.WriteLine(d.Ago());                         // "6 months ago"
+//
+//   // Duration arithmetic
+//   let dur = Duration.FromHours(1).Add(Duration.FromMinutes(45));
+//   Console.WriteLine(dur.ToString());                  // "1h45m"
+//   Console.WriteLine(dur.TotalMinutes());              // 105.0
+//
+// ── Duration ─────────────────────────────────────────────────────────────────
+//
+// Constructors (static):
+//   Duration.FromMilliseconds(n)   Duration.FromSeconds(n)
+//   Duration.FromMinutes(n)        Duration.FromHours(n)
+//   Duration.FromDays(n)           Duration.FromWeeks(n)
+//   Duration.Parse(s)              - "1h30m", "02:30:00", "90s", etc.; nil on error
+//   Duration.Between(a, b)         - b - a as a Duration
+//
+// Arithmetic (return new Duration):
+//   .Add(other)    .Sub(other)    .Scale(factor)
+//   .Negate()      .Abs()
+//
+// Component access:
+//   .Days()  .Hours()  .Minutes()  .Seconds()   - component parts (not totals)
+//   .TotalSeconds()  .TotalMilliseconds()
+//   .TotalMinutes()  .TotalHours()  .TotalDays()  .TotalWeeks()
+//   .IsNegative()    .IsZero()
+//   .IsLongerThan(other)  .IsShorterThan(other)  .Equals(other)
+//
+// Formatting:
+//   .ToString()    - compact: "1h30m", "45s", "-2h"
+//
+// ── DateTime ─────────────────────────────────────────────────────────────────
+//
+// Constructors (static):
+//   DateTime.Now()                 - current UTC time
+//   DateTime.NowIn(tz)             - current time in named timezone
+//   DateTime.NowLocal()            - current local time
+//   DateTime.Today(tz?)            - midnight of today in tz (or UTC)
+//   DateTime.Of(year, month, day, hour, minute, second, tz?)
+//   DateTime.FromUnix(ts)          - from Unix timestamp (seconds, UTC)
+//   DateTime.FromUnixIn(ts, tz)    - from Unix timestamp with timezone
+//   DateTime.FromMillis(ms)        - from millisecond timestamp
+//   DateTime.Parse(s, tz?)         - ISO 8601 string
+//   DateTime.ParseFmt(s, fmt, tz?) - custom format string
+//   DateTime.Min(a, b)  DateTime.Max(a, b)
+//
+// Component accessors (in local timezone):
+//   .Year()  .Month()  .Day()  .Hour()  .Minute()  .Second()  .Weekday()
+//   .DayOfYear()  .WeekOfYear()  .Quarter()
+//   .DaysInMonth()  .IsLeapYear()
+//   .DayName()  .MonthName()
+//
+// UTC accessors (always UTC regardless of timezone):
+//   .YearUTC()  .MonthUTC()  .DayUTC()  .HourUTC()  .MinuteUTC()  .SecondUTC()
+//
+// Arithmetic (return new DateTime in same timezone):
+//   .AddSeconds(n)  .AddMinutes(n)  .AddHours(n)
+//   .AddDays(n)     .AddWeeks(n)    .AddMonths(n)  .AddYears(n)
+//
+// Comparison:
+//   .IsBefore(other)   .IsAfter(other)
+//   .IsSameDay(other)  .IsSameMonth(other)  .IsSameYear(other)
+//   .IsToday()  .IsWeekend()  .IsWeekday()
+//   .IsInRange(start, end)
+//   .Clamp(min, max)
+//
+// Difference:
+//   .DiffSeconds(other)  .DiffMinutes(other)  .DiffHours(other)
+//
+// Range boundaries:
+//   .StartOfDay()   .EndOfDay()
+//   .StartOfWeek()  .EndOfWeek()
+//   .StartOfMonth() .EndOfMonth()
+//   .StartOfYear()  .EndOfYear()
+//
+// Navigation:
+//   .NextWeekday(n)      - next occurrence of weekday 0-6 (0=Sun)
+//   .PreviousWeekday(n)
+//
+// Business days (holidays?: optional array of DateTime to exclude):
+//   .IsBusinessDay(holidays?)            - not a weekend or listed holiday
+//   .AddBusinessDays(n, holidays?)       - move n business days (n<0 = backward)
+//   .NextBusinessDay(holidays?)  .PreviousBusinessDay(holidays?)
+//   .BusinessDaysUntil(other, holidays?) - signed business-day count between dates
+//
+// Timezone:
+//   .InZone(tz)          - same instant, different timezone label
+//   .ToUTC()  .ToLocal()
+//   .Timezone()          →  string
+//   .UtcOffset()         →  int (seconds)
+//   .FormatOffset()      →  "+02:00" style string
+//
+// Formatting:
+//   .Format(fmt)         - fmt: "short", "long", "date", "time", or strftime pattern
+//   .FormatUTC(fmt)      - same but always in UTC
+//   .ToISO()             →  "YYYY-MM-DDTHH:MM:SS±HH:MM"
+//   .ToString()          →  "YYYY-MM-DD HH:MM:SS TZ"
+//   .Ago()               →  "3 hours ago", "2 days ago", etc.
+//
+// Unix timestamps:
+//   .Unix()              →  int (seconds since epoch)
+//   .UnixMillis()        →  int
+//
+// Timezone registry:
+//   DateTime.Timezones()                       →  array of known TZ names
+//   DateTime.HasTimezone(tz)                   →  bool
+//   DateTime.RegisterTimezone(name, offsetMins) - add a custom timezone
+
+// Custom-registered timezones (added via DateTime.RegisterTimezone).
+global _DT_TZ = {};
+
+// Built-in static timezone map: IANA name → UTC offset in minutes.
+global _DT_TZ_BUILTIN = {
+    "UTC": 0, "GMT": 0,
+    "Europe/London": 0, "Europe/Lisbon": 0, "Europe/Dublin": 0,
+    "Europe/Paris": 60, "Europe/Berlin": 60, "Europe/Rome": 60,
+    "Europe/Madrid": 60, "Europe/Amsterdam": 60, "Europe/Brussels": 60,
+    "Europe/Stockholm": 60, "Europe/Vienna": 60, "Europe/Warsaw": 60,
+    "Europe/Prague": 60, "Europe/Zurich": 60, "Europe/Copenhagen": 60,
+    "Europe/Helsinki": 120, "Europe/Athens": 120, "Europe/Bucharest": 120,
+    "Europe/Riga": 120, "Europe/Tallinn": 120, "Europe/Vilnius": 120,
+    "Europe/Moscow": 180, "Europe/Istanbul": 180, "Europe/Minsk": 180,
+    "Asia/Dubai": 240, "Asia/Muscat": 240,
+    "Asia/Karachi": 300, "Asia/Tashkent": 300,
+    "Asia/Colombo": 330,
+    "Asia/Dhaka": 360,
+    "Asia/Bangkok": 420, "Asia/Jakarta": 420, "Asia/Ho_Chi_Minh": 420,
+    "Asia/Singapore": 480, "Asia/Shanghai": 480, "Asia/Hong_Kong": 480,
+    "Asia/Taipei": 480, "Asia/Kuala_Lumpur": 480,
+    "Asia/Tokyo": 540, "Asia/Seoul": 540,
+    "Australia/Perth": 480,
+    "Australia/Darwin": 570, "Australia/Adelaide": 570,
+    "Australia/Sydney": 600, "Australia/Brisbane": 600, "Australia/Melbourne": 600,
+    "Pacific/Auckland": 720, "Pacific/Fiji": 720,
+    "Pacific/Honolulu": -600,
+    "America/Anchorage": -540,
+    "America/Los_Angeles": -480, "America/Vancouver": -480,
+    "America/Denver": -420, "America/Phoenix": -420,
+    "America/Chicago": -360, "America/Mexico_City": -360,
+    "America/New_York": -300, "America/Toronto": -300,
+    "America/Bogota": -300, "America/Lima": -300,
+    "America/Halifax": -240, "America/Caracas": -240,
+    "America/Sao_Paulo": -180, "America/Argentina/Buenos_Aires": -180,
+    "America/Montevideo": -180,
+    "Atlantic/Azores": -60,
+    "Africa/Casablanca": 0, "Africa/Lagos": 60,
+    "Africa/Johannesburg": 120,
+    "Africa/Nairobi": 180, "Africa/Addis_Ababa": 180
+};
+
+
+// ── Duration ─────────────────────────────────────────────────────────────────
+// Signed time interval stored as integer seconds.
+// Immutable - all arithmetic returns a new Duration.
+
+class Duration {
+    let _secs = 0;
+
+    fn Constructor(seconds:number) {
+        this._secs = int(seconds);
+    }
+
+    // ── Accessors ─────────────────────────────────────────────────────────────
+
+    fn TotalSeconds(): int      { return this._secs; }
+    fn TotalMilliseconds(): int { return this._secs * 1000; }
+    fn TotalMinutes(): float    { return this._secs / 60.0; }
+    fn TotalHours(): float      { return this._secs / 3600.0; }
+    fn TotalDays(): float       { return this._secs / 86400.0; }
+    fn TotalWeeks(): float      { return this._secs / 604800.0; }
+
+    // Integer component parts (always non-negative).
+    fn Days(): int    { return int(Math.Abs(float(this._secs)) / 86400); }
+    fn Hours(): int   { return int(Math.Abs(this._secs) / 3600); }
+    fn Minutes(): int { return int((Math.Abs(this._secs) % 3600) / 60); }
+    fn Seconds(): int { return Math.Abs(this._secs) % 60; }
+    fn IsNegative(): bool { return this._secs < 0; }
+    fn IsZero(): bool     { return this._secs == 0; }
+
+    // ── Arithmetic ────────────────────────────────────────────────────────────
+
+    fn Add(other:instance): instance    { return new Duration(this._secs + other._secs); }
+    fn Sub(other:instance): instance    { return new Duration(this._secs - other._secs); }
+    fn Scale(factor:number): instance   { return new Duration(int(this._secs * factor)); }
+    fn Negate(): instance               { return new Duration(-this._secs); }
+    fn Abs(): instance                  { return new Duration(Math.Abs(this._secs)); }
+
+    // ── Comparison ────────────────────────────────────────────────────────────
+
+    fn IsLongerThan(other:instance): bool  { return this._secs > other._secs; }
+    fn IsShorterThan(other:instance): bool { return this._secs < other._secs; }
+    fn Equals(other:instance): bool        { return this._secs == other._secs; }
+
+    // ── Formatting ────────────────────────────────────────────────────────────
+
+    // "HH:MM:SS", leading minus for negative durations.
+    fn ToString(): string {
+        let sign = (this._secs < 0 ? "-" : "");
+        let h = this.Hours();
+        let m = this.Minutes();
+        let s = this.Seconds();
+        return sign
+            + String.PadLeft(str(h), 2, "0") + ":"
+            + String.PadLeft(str(m), 2, "0") + ":"
+            + String.PadLeft(str(s), 2, "0");
+    }
+
+    // ── Static constructors ───────────────────────────────────────────────────
+
+    fn static FromMilliseconds(n:number): instance { return new Duration(int(n / 1000)); }
+    fn static FromSeconds(n:number): instance      { return new Duration(n); }
+    fn static FromMinutes(n:number): instance      { return new Duration(n * 60); }
+    fn static FromHours(n:number): instance        { return new Duration(n * 3600); }
+    fn static FromDays(n:number): instance         { return new Duration(n * 86400); }
+    fn static FromWeeks(n:number): instance        { return new Duration(n * 604800); }
+
+    // Parse "HH:MM:SS" or "HH:MM" (with optional leading minus). Returns nil on failure.
+    fn static Parse(s:string): instance|nil {
+        let src = String.Trim(s);
+        let neg = String.StartsWith(src, "-");
+        if (neg) { src = String.Substr(src, 1, len(src) - 1); }
+
+        let parts = String.Split(src, ":");
+        if (len(parts) < 2 || len(parts) > 3) { return nil; }
+
+        let h  = Convert.TryParseInt(parts[0]);
+        let m  = Convert.TryParseInt(parts[1]);
+        let sv = 0;
+        if (len(parts) == 3) { sv = Convert.TryParseInt(parts[2]); }
+
+        if (h == nil || m == nil || sv == nil) { return nil; }
+        if (m < 0 || m > 59 || sv < 0 || sv > 59) { return nil; }
+
+        let total = h * 3600 + m * 60 + sv;
+        return new Duration(neg ? -total : total);
+    }
+
+    // Duration between two DateTime values (b − a). May be negative.
+    fn static Between(a:instance, b:instance): instance {
+        return new Duration(b.Unix() - a.Unix());
+    }
+}
+
+
+// ── DateTime ──────────────────────────────────────────────────────────────────
+// Immutable wrapper around a UTC Unix timestamp (seconds since epoch).
+// _tz is for display/component access only - _ts is always UTC.
+
+class DateTime {
+    let _ts = 0;
+    let _tz: string = nil; 
+
+    fn Constructor(timestamp:number, tz:string|nil) {
+        this._ts = int(timestamp);
+        this._tz = (tz == nil ? "UTC" : tz);
+    }
+
+    // ── Private static helpers ────────────────────────────────────────────────
+    // These are class methods, so their closure is rebound on import and they
+    // can access the _DT_TZ global for custom zone registrations.
+
+    fn static _IsLeap(year:int): bool {
+        if (year % 400 == 0) { return true; }
+        if (year % 100 == 0) { return false; }
+        return year % 4 == 0;
+    }
+
+    fn static _DaysInMonth(year:int, month:int): int {
+        if (month == 2) { return (DateTime._IsLeap(year) ? 29 : 28); }
+        if (month == 4 || month == 6 || month == 9 || month == 11) { return 30; }
+        return 31;
+    }
+
+    // Resolve IANA timezone name to UTC offset in minutes.
+    fn static _TzOffset(tz): int {
+        if (tz == nil) { return 0; }
+        if (tz == "local") { return Time.TimeZoneOffsetMins(); }
+        let offset = _DT_TZ_BUILTIN[tz];
+        if (offset != nil) { return offset; }
+        let custom = _DT_TZ[tz];
+        if (custom != nil) { return custom; }
+        throw(1, "datetime: unknown timezone '" + tz + "'. Call DateTime.Timezones() for the list.");
+    }
+
+    // Format offset minutes as "+HH:MM" / "-HH:MM".
+    fn static _FormatOffset(offsetMins:int): string {
+        if (offsetMins == 0) { return "+00:00"; }
+        let sign = (offsetMins < 0 ? "-" : "+");
+        let abs  = Math.Abs(offsetMins);
+        let h    = int(abs / 60);
+        let m    = abs % 60;
+        return sign + String.PadLeft(str(h), 2, "0") + ":" + String.PadLeft(str(m), 2, "0");
+    }
+
+    // Day of year (1–366) from a raw UTC timestamp.
+    fn static _DayOfYearTs(ts:int): int {
+        let y   = Time.Year(ts);
+        let m   = Time.Month(ts);
+        let d   = Time.Day(ts);
+        let doy = 0;
+        iter (i from 1 to m - 1) {
+            doy = doy + DateTime._DaysInMonth(y, i);
+        }
+        return doy + d;
+    }
+
+    // ISO week number (1–53) from a raw UTC timestamp.
+    fn static _WeekOfYearTs(ts:int): int {
+        let dow    = Time.Weekday(ts);
+        let isoday = (dow == 0 ? 7 : dow);
+        let thu_ts = ts + ((4 - isoday) * 86400);
+        let doy    = DateTime._DayOfYearTs(thu_ts);
+        return int((doy - 1) / 7) + 1;
+    }
+
+    // Add n calendar months to (year, month, day). Clamps day to month end.
+    fn static _AddMonths(year:int, month:int, day:int, n:int) {
+        var m  = month - 1 + n;
+        var ny = year + Convert.ToInt(m / 12);
+        var nm = m % 12;
+        if (nm < 0) { nm = nm + 12; ny = ny - 1; }
+        nm = nm + 1;
+        let maxday = DateTime._DaysInMonth(ny, nm);
+        return { year: ny, month: nm, day: (day > maxday ? maxday : day) };
+    }
+
+    // Add n calendar years, clamping Feb 29 on non-leap targets.
+    fn static _AddYears(year:int, month:int, day:int, n:int) {
+        let ny     = year + n;
+        let maxday = DateTime._DaysInMonth(ny, month);
+        return { year: ny, month: month, day: (day > maxday ? maxday : day) };
+    }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    fn _LocalTs(): int {
+        return this._ts + (DateTime._TzOffset(this._tz) * 60);
+    }
+
+    // ── Component accessors (timezone-adjusted) ───────────────────────────────
+
+    fn Year(): int    { return Time.Year(this._LocalTs()); }
+    fn Month(): int   { return Time.Month(this._LocalTs()); }
+    fn Day(): int     { return Time.Day(this._LocalTs()); }
+    fn Hour(): int    { return Time.Hour(this._LocalTs()); }
+    fn Minute(): int  { return Time.Minute(this._LocalTs()); }
+    fn Second(): int  { return Time.Second(this._LocalTs()); }
+    fn Weekday(): int { return Time.Weekday(this._LocalTs()); }  // 0=Sun … 6=Sat
+
+    // ── UTC component accessors ────────────────────────────────────────────────
+
+    fn YearUTC(): int    { return Time.Year(this._ts); }
+    fn MonthUTC(): int   { return Time.Month(this._ts); }
+    fn DayUTC(): int     { return Time.Day(this._ts); }
+    fn HourUTC(): int    { return Time.Hour(this._ts); }
+    fn MinuteUTC(): int  { return Time.Minute(this._ts); }
+    fn SecondUTC(): int  { return Time.Second(this._ts); }
+    fn WeekdayUTC(): int { return Time.Weekday(this._ts); }
+
+    // ── Calendar accessors ────────────────────────────────────────────────────
+
+    fn DayOfYear(): int   { return DateTime._DayOfYearTs(this._LocalTs()); }
+    fn WeekOfYear(): int  { return DateTime._WeekOfYearTs(this._LocalTs()); }
+    fn Quarter(): int     { return int((this.Month() - 1) / 3) + 1; }
+    fn IsLeapYear(): bool { return DateTime._IsLeap(this.Year()); }
+    fn DaysInMonth(): int { return DateTime._DaysInMonth(this.Year(), this.Month()); }
+
+    // ── Predicates ────────────────────────────────────────────────────────────
+
+    fn IsWeekend(): bool  { let d = this.Weekday(); return d == 0 || d == 6; }
+    fn IsWeekday(): bool  { return !this.IsWeekend(); }
+    fn IsToday(): bool    { return this.IsSameDay(DateTime.NowIn(this._tz)); }
+
+    fn IsSameDay(other:instance): bool {
+        return this.Year() == other.Year() &&
+               this.Month() == other.Month() &&
+               this.Day() == other.Day();
+    }
+
+    fn IsSameMonth(other:instance): bool {
+        return this.Year() == other.Year() && this.Month() == other.Month();
+    }
+
+    fn IsSameYear(other:instance): bool {
+        return this.Year() == other.Year();
+    }
+
+    fn IsInRange(startDt:instance, endDt:instance): bool {
+        return this._ts >= startDt._ts && this._ts <= endDt._ts;
+    }
+
+    // ── Human-readable names ──────────────────────────────────────────────────
+
+    fn DayName(): string {
+        let names = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+        return names[this.Weekday()];
+    }
+
+    fn MonthName(): string {
+        let names = ["January","February","March","April","May","June",
+                     "July","August","September","October","November","December"];
+        return names[this.Month() - 1];
+    }
+
+    fn DayNameShort(): string {
+        let names = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+        return names[this.Weekday()];
+    }
+
+    fn MonthNameShort(): string {
+        let names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+        return names[this.Month() - 1];
+    }
+
+    fn Ago(): string {
+        let diffSecs = int(Math.Abs(float(DateTime.Now().Unix() - this.Unix())));
+        let future = this.Unix() > DateTime.Now().Unix();
+        let suffix = future ? " from now" : " ago";
+        if (diffSecs < 60)   return str(diffSecs) + " second" + (diffSecs == 1 ? "" : "s") + suffix;
+        if (diffSecs < 3600) {
+            let m = diffSecs / 60;
+            return str(m) + " minute" + (m == 1 ? "" : "s") + suffix;
+        }
+        if (diffSecs < 86400) {
+            let h = diffSecs / 3600;
+            return str(h) + " hour" + (h == 1 ? "" : "s") + suffix;
+        }
+        let d = diffSecs / 86400;
+        return str(d) + " day" + (d == 1 ? "" : "s") + suffix;
+    }
+
+    // ── Comparison ────────────────────────────────────────────────────────────
+
+    fn IsBefore(other:instance): bool { return this._ts < other._ts; }
+    fn IsAfter(other:instance): bool  { return this._ts > other._ts; }
+    fn Equals(other:instance): bool   { return this._ts == other._ts; }
+
+    // ── Simple arithmetic ─────────────────────────────────────────────────────
+
+    fn AddSeconds(n:number): instance { return new DateTime(Time.AddSeconds(this._ts, n), this._tz); }
+    fn AddMinutes(n:number): instance { return new DateTime(Time.AddMinutes(this._ts, n), this._tz); }
+    fn AddHours(n:number): instance   { return new DateTime(Time.AddHours(this._ts, n), this._tz); }
+    fn AddDays(n:number): instance    { return new DateTime(Time.AddDays(this._ts, n), this._tz); }
+    fn AddWeeks(n:number): instance   { return new DateTime(Time.AddWeeks(this._ts, n), this._tz); }
+
+    // ── Calendar arithmetic ───────────────────────────────────────────────────
+
+    fn AddMonths(n:int): instance {
+        let r = DateTime._AddMonths(this.Year(), this.Month(), this.Day(), n);
+        return DateTime.Of(r.year, r.month, r.day, this.Hour(), this.Minute(), this.Second(), this._tz);
+    }
+
+    fn AddYears(n:int): instance {
+        let r = DateTime._AddYears(this.Year(), this.Month(), this.Day(), n);
+        return DateTime.Of(r.year, r.month, r.day, this.Hour(), this.Minute(), this.Second(), this._tz);
+    }
+
+    // ── Duration arithmetic ───────────────────────────────────────────────────
+
+    fn Add(duration:instance): instance  { return new DateTime(this._ts + duration.TotalSeconds(), this._tz); }
+    fn Sub(duration:instance): instance  { return new DateTime(this._ts - duration.TotalSeconds(), this._tz); }
+    fn Diff(other:instance): instance    { return new Duration(this._ts - other._ts); }
+    fn DiffDays(other:instance): int     { return Time.DiffDays(this._ts, other._ts); }
+    fn DiffHours(other:instance): float  { return (this._ts - other._ts) / 3600.0; }
+    fn DiffMinutes(other:instance): float { return (this._ts - other._ts) / 60.0; }
+
+    // ── Next / Previous weekday ───────────────────────────────────────────────
+
+    // Returns the next future occurrence of weekday n (0=Sun…6=Sat). Never returns self.
+    fn NextWeekday(n:int): instance {
+        let d = this.AddDays(1);
+        while (d.Weekday() != n) { d = d.AddDays(1); }
+        return d;
+    }
+
+    // Returns the most recent past occurrence of weekday n. Never returns self.
+    fn PreviousWeekday(n:int): instance {
+        let d = this.AddDays(-1);
+        while (d.Weekday() != n) { d = d.AddDays(-1); }
+        return d;
+    }
+
+    // ── Business-day arithmetic ───────────────────────────────────────────────
+    // `holidays` (optional) is an array of DateTime instances. A day is a
+    // non-business day when it falls on a weekend or matches one of the holiday
+    // dates (compared by calendar date, time-of-day ignored).
+
+    fn _isHolidayDate(holidays): bool {
+        if (holidays == nil) { return false; }
+        iter (i from 0 to len(holidays) - 1) {
+            if (this.IsSameDay(holidays[i])) { return true; }
+        }
+        return false;
+    }
+
+    fn IsBusinessDay(holidays?): bool {
+        return !this.IsWeekend() && !this._isHolidayDate(holidays);
+    }
+
+    // Move forward (n > 0) or backward (n < 0) by n business days, skipping
+    // weekends and holidays. n == 0 returns self.
+    fn AddBusinessDays(n:int, holidays?): instance {
+        var d = this;
+        var remaining:int = (n < 0) ? -n : n;
+        let step:int = (n < 0) ? -1 : 1;
+        while (remaining > 0) {
+            d = d.AddDays(step);
+            if (!d.IsWeekend() && !d._isHolidayDate(holidays)) {
+                remaining = remaining - 1;
+            }
+        }
+        return d;
+    }
+
+    // The next / previous business day (never returns self).
+    fn NextBusinessDay(holidays?): instance     { return this.AddBusinessDays(1, holidays); }
+    fn PreviousBusinessDay(holidays?): instance { return this.AddBusinessDays(-1, holidays); }
+
+    // Count business days between this date and `other`, comparing by calendar
+    // day. The start day is exclusive and the end day inclusive (when it is a
+    // business day). Positive when other is later, negative when earlier, 0 for
+    // the same day.
+    fn BusinessDaysUntil(other:instance, holidays?): int {
+        var cur = this.StartOfDay();
+        let end = other.StartOfDay();
+        if (cur.IsSameDay(end)) { return 0; }
+
+        var count:int = 0;
+        if (end._ts > cur._ts) {
+            while (!cur.IsSameDay(end)) {
+                cur = cur.AddDays(1);
+                if (!cur.IsWeekend() && !cur._isHolidayDate(holidays)) { count = count + 1; }
+            }
+            return count;
+        }
+        while (!cur.IsSameDay(end)) {
+            cur = cur.AddDays(-1);
+            if (!cur.IsWeekend() && !cur._isHolidayDate(holidays)) { count = count + 1; }
+        }
+        return -count;
+    }
+
+    // ── Boundary helpers ──────────────────────────────────────────────────────
+
+    fn StartOfDay(): instance {
+        let local  = this._LocalTs();
+        let offset = Time.Hour(local) * 3600 + Time.Minute(local) * 60 + Time.Second(local);
+        return new DateTime(this._ts - offset, this._tz);
+    }
+
+    fn EndOfDay(): instance    { return this.StartOfDay().AddSeconds(86399); }
+
+    fn StartOfWeek(): instance {
+        let dow    = this.Weekday();
+        let isoday = (dow == 0 ? 7 : dow);
+        return this.StartOfDay().AddDays(-(isoday - 1));
+    }
+
+    fn EndOfWeek(): instance   { return this.StartOfWeek().AddDays(6).EndOfDay(); }
+
+    fn StartOfMonth(): instance  { return DateTime.Of(this.Year(), this.Month(), 1, 0, 0, 0, this._tz); }
+    fn EndOfMonth(): instance    { return DateTime.Of(this.Year(), this.Month(), this.DaysInMonth(), 23, 59, 59, this._tz); }
+    fn StartOfYear(): instance   { return DateTime.Of(this.Year(), 1, 1, 0, 0, 0, this._tz); }
+    fn EndOfYear(): instance     { return DateTime.Of(this.Year(), 12, 31, 23, 59, 59, this._tz); }
+
+    // ── Range utilities ───────────────────────────────────────────────────────
+
+    fn Clamp(minDt:instance, maxDt:instance): instance {
+        if (this._ts < minDt._ts) { return minDt.InZone(this._tz); }
+        if (this._ts > maxDt._ts) { return maxDt.InZone(this._tz); }
+        return this;
+    }
+
+    fn static Min(a:instance, b:instance): instance { return (a._ts <= b._ts ? a : b); }
+    fn static Max(a:instance, b:instance): instance { return (a._ts >= b._ts ? a : b); }
+
+    // ── Timezone ──────────────────────────────────────────────────────────────
+
+    fn InZone(tz:string): instance  { return new DateTime(this._ts, tz); }
+    fn ToUTC(): instance            { return new DateTime(this._ts, "UTC"); }
+    fn ToLocal(): instance          { return new DateTime(this._ts, "local"); }
+    fn Timezone(): string           { return this._tz; }
+    fn UtcOffset(): int             { return DateTime._TzOffset(this._tz); }
+    fn FormatOffset(): string       { return DateTime._FormatOffset(DateTime._TzOffset(this._tz)); }
+
+    // ── Raw values ────────────────────────────────────────────────────────────
+
+    fn Unix(): int       { return this._ts; }
+    fn UnixMillis(): int { return this._ts * 1000; }
+
+    // ── Formatting ────────────────────────────────────────────────────────────
+
+    fn Format(fmt:string): string    { return Time.Format(this._LocalTs(), fmt); }
+    fn FormatUTC(fmt:string): string { return Time.Format(this._ts, fmt); }
+
+    // ISO 8601 with timezone offset: "2025-06-15T09:30:00+02:00"
+    fn ToISO(): string {
+        return Time.Format(this._LocalTs(), "%Y-%m-%dT%H:%M:%S") + this.FormatOffset();
+    }
+
+    // "YYYY-MM-DD HH:MM:SS TZ"
+    fn ToString(): string {
+        return Time.Format(this._LocalTs(), "long") + " " + this._tz;
+    }
+
+    // ── Static constructors ───────────────────────────────────────────────────
+
+    fn static Now(): instance      { return new DateTime(Time.Now(), "UTC"); }
+    fn static NowIn(tz:string): instance  { return new DateTime(Time.Now(), tz); }
+    fn static NowLocal(): instance { return new DateTime(Time.Now(), "local"); }
+
+    fn static Today(tz:string|nil): instance {
+        let tzStr = (tz == nil ? "UTC" : tz);
+        return DateTime.NowIn(tzStr).StartOfDay();
+    }
+
+    fn static FromUnix(ts:int): instance         { return new DateTime(ts, "UTC"); }
+    fn static FromUnixIn(ts:int, tz:string): instance { return new DateTime(ts, tz); }
+    fn static FromMillis(ms:int): instance        { return new DateTime(int(ms / 1000), "UTC"); }
+
+    // Parse ISO 8601 string treated as UTC.
+    fn static Parse(s:string, tz:string|nil): instance {
+        let ts = Time.Parse(s, "ISO");
+        return new DateTime(ts, (tz == nil ? "UTC" : tz));
+    }
+
+    // Parse with explicit strftime/named format.
+    fn static ParseFmt(s:string, fmt:string, tz:string|nil): instance {
+        let ts = Time.Parse(s, fmt);
+        return new DateTime(ts, (tz == nil ? "UTC" : tz));
+    }
+
+    // Construct from calendar components interpreted in the given timezone.
+    fn static Of(year:int, month:int, day:int, hour:int, minute:int, second:int, tz:string|nil): instance {
+        let tzStr = (tz == nil ? "UTC" : tz);
+        let iso = String.PadLeft(str(year),   4, "0") + "-" +
+                  String.PadLeft(str(month),  2, "0") + "-" +
+                  String.PadLeft(str(day),    2, "0") + "T" +
+                  String.PadLeft(str(hour),   2, "0") + ":" +
+                  String.PadLeft(str(minute), 2, "0") + ":" +
+                  String.PadLeft(str(second), 2, "0");
+        let ts = Time.Parse(iso, "ISO") - (DateTime._TzOffset(tzStr) * 60);
+        return new DateTime(ts, tzStr);
+    }
+
+    // ── Timezone registry ─────────────────────────────────────────────────────
+
+    fn static Timezones(): array {
+        let result = Object.Keys(_DT_TZ_BUILTIN);
+        let custom = Object.Keys(_DT_TZ);
+        foreach (k in custom) { Array.Append(result, k); }
+        return result;
+    }
+
+    fn static HasTimezone(tz:string): bool {
+        let found = false;
+        try {
+            DateTime._TzOffset(tz);
+            found = true;
+        } catch (e) {
+            found = false;
+        }
+        return found;
+    }
+
+    fn static RegisterTimezone(name:string, offsetMins:int) {
+        _DT_TZ[name] = offsetMins;
+    }
+}
+
+export { DateTime, Duration };

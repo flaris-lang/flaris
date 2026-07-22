@@ -1,0 +1,361 @@
+// test_jwt.fls
+// Tests for Jwt.fls - HS256 encode, decode, verify, and claims validation.
+
+import { Jwt } from library("libs/Jwt", "1.0");
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn assert(name:string, cond:bool) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name);
+        failed += 1;
+    }
+}
+
+fn Main() {
+    let jwt    = new Jwt();
+    let secret = "super-secret";
+    let now    = Time.Now();
+
+    // ============================================================
+    //  Base64Url helpers
+    // ============================================================
+
+    assert("B64Url encode hello",
+        jwt.Base64UrlEncodeString("hello") == "aGVsbG8");
+
+    assert("B64Url decode hello",
+        jwt.Base64UrlDecodeToString("aGVsbG8") == "hello");
+
+    let rt = jwt.Base64UrlDecodeToString(jwt.Base64UrlEncodeString("Man"));
+    assert("B64Url round-trip 'Man'", rt == "Man");
+
+    // ============================================================
+    //  Encode / Decode
+    // ============================================================
+
+    let payload = { sub: "user-123", role: "admin" };
+    let token = jwt.EncodeHS256(payload, secret, { iat: now, exp: now + 3600 });
+
+    assert("EncodeHS256 returns string", token != nil);
+    assert("Token has 3 parts", len(String.Split(token, ".")) == 3);
+
+    let decoded = jwt.Decode(token);
+    assert("Decode not nil",          decoded != nil);
+    assert("Decode sub",              decoded.payload.sub == "user-123");
+    assert("Decode role",             decoded.payload.role == "admin");
+    assert("Decode exp present",      decoded.payload.exp == now + 3600);
+    assert("Decode header alg",       decoded.header.alg == "HS256");
+    assert("Decode header typ",       decoded.header.typ == "JWT");
+    assert("Decode signingInput",     len(decoded.signingInput) > 0);
+    assert("Decode signatureHex len", len(decoded.signatureHex) == 64);
+
+    // EncodeHS256 with omitted options
+    let tokenNoOpts = jwt.EncodeHS256({ sub: "bare" }, secret);
+    assert("EncodeHS256 omitted options", tokenNoOpts != nil);
+    assert("EncodeHS256 omitted options verifies", jwt.VerifyHS256(tokenNoOpts, secret));
+
+    // ============================================================
+    //  VerifyHS256
+    // ============================================================
+
+    assert("Verify own token",        jwt.VerifyHS256(token, secret));
+    assert("Verify wrong secret",     !jwt.VerifyHS256(token, "wrong-secret"));
+    assert("Verify tampered token",   !jwt.VerifyHS256(token + "x", secret));
+    assert("Verify empty string",     !jwt.VerifyHS256("", secret));
+    assert("Verify malformed",        !jwt.VerifyHS256("a.b", secret));
+
+    let knownToken  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30";
+    let knownSecret = "a-string-secret-at-least-256-bits-long";
+    assert("Verify jwt.io known token", jwt.VerifyHS256(knownToken, knownSecret));
+
+    let knownDecoded = jwt.Decode(knownToken);
+    assert("Known token sub",   knownDecoded.payload.sub == "1234567890");
+    assert("Known token name",  knownDecoded.payload.name == "John Doe");
+    assert("Known token admin", knownDecoded.payload.admin == true);
+
+    // ============================================================
+    //  VerifyHS256WithClaims - valid token
+    // ============================================================
+
+    assert("WithClaims basic",
+        jwt.VerifyHS256WithClaims(token, secret, { now: now }));
+
+    assert("WithClaims with leeway",
+        jwt.VerifyHS256WithClaims(token, secret, { now: now, leeway: 30 }));
+
+    assert("WithClaims requireExp present",
+        jwt.VerifyHS256WithClaims(token, secret, { now: now, requireExp: true }));
+
+    assert("WithClaims requireIat present",
+        jwt.VerifyHS256WithClaims(token, secret, { now: now, requireIat: true }));
+
+    // VerifyHS256WithClaims with omitted options
+    assert("WithClaims omitted options",
+        jwt.VerifyHS256WithClaims(token, secret));
+
+    // ============================================================
+    //  VerifyHS256WithClaims - expired token
+    // ============================================================
+
+    let expiredToken = jwt.EncodeHS256(
+        { sub: "old-user" },
+        secret,
+        { iat: now - 7200, exp: now - 3600 }
+    );
+    assert("Expired token fails", !jwt.VerifyHS256WithClaims(expiredToken, secret, { now: now }));
+
+    assert("Expired token passes with large leeway",
+        jwt.VerifyHS256WithClaims(expiredToken, secret, { now: now, leeway: 7200 }));
+
+    // ============================================================
+    //  VerifyHS256WithClaims - nbf (not before)
+    // ============================================================
+
+    let nbfToken = jwt.EncodeHS256(
+        { sub: "future-user" },
+        secret,
+        { iat: now, nbf: now + 600, exp: now + 3600 }
+    );
+
+    assert("nbf in future fails",
+        !jwt.VerifyHS256WithClaims(nbfToken, secret, { now: now }));
+
+    assert("nbf in future passes with leeway",
+        jwt.VerifyHS256WithClaims(nbfToken, secret, { now: now, leeway: 600 }));
+
+    assert("nbf passes when now is past nbf",
+        jwt.VerifyHS256WithClaims(nbfToken, secret, { now: now + 601 }));
+
+    // ============================================================
+    //  VerifyHS256WithClaims - requireExp on token without exp
+    // ============================================================
+
+    let noExpToken = jwt.EncodeHS256(
+        { sub: "no-exp" },
+        secret,
+        { iat: now }
+    );
+
+    assert("No exp passes without requireExp",
+        jwt.VerifyHS256WithClaims(noExpToken, secret, { now: now }));
+
+    assert("No exp fails with requireExp",
+        !jwt.VerifyHS256WithClaims(noExpToken, secret, { now: now, requireExp: true }));
+
+    // ============================================================
+    //  VerifyHS256WithClaims - wrong secret still fails claims check
+    // ============================================================
+
+    assert("Wrong secret fails even with valid claims",
+        !jwt.VerifyHS256WithClaims(token, "wrong", { now: now }));
+
+    // ============================================================
+    //  IsExpired
+    // ============================================================
+
+    assert("IsExpired: valid token is not expired",    !jwt.IsExpired(token));
+    assert("IsExpired: expired token is expired",       jwt.IsExpired(expiredToken));
+    assert("IsExpired: no exp token is not expired",   !jwt.IsExpired(noExpToken));
+    assert("IsExpired: malformed token returns true",   jwt.IsExpired("not.a.token"));
+
+    // ============================================================
+    //  ExpiresAt
+    // ============================================================
+
+    assert("ExpiresAt: returns exp",        jwt.ExpiresAt(token) == now + 3600);
+    assert("ExpiresAt: expired token",      jwt.ExpiresAt(expiredToken) == now - 3600);
+    assert("ExpiresAt: no exp returns nil", jwt.ExpiresAt(noExpToken) == nil);
+    assert("ExpiresAt: malformed nil",      jwt.ExpiresAt("bad") == nil);
+
+    // ============================================================
+    //  GetClaim
+    // ============================================================
+
+    assert("GetClaim: sub",          jwt.GetClaim(token, "sub") == "user-123");
+    assert("GetClaim: role",         jwt.GetClaim(token, "role") == "admin");
+    assert("GetClaim: exp",          jwt.GetClaim(token, "exp") == now + 3600);
+    assert("GetClaim: missing key",  jwt.GetClaim(token, "nonexistent") == nil);
+    assert("GetClaim: malformed",    jwt.GetClaim("bad.token", "sub") == nil);
+
+    // GetClaim on known token
+    assert("GetClaim known name",    jwt.GetClaim(knownToken, "name") == "John Doe");
+    assert("GetClaim known admin",   jwt.GetClaim(knownToken, "admin") == true);
+
+    // ============================================================
+    //  Garbage / malformed tokens
+    // ============================================================
+
+    // No dots at all
+    assert("Decode garbage no-dots",   jwt.Decode("notajwt") == nil);
+    assert("Verify garbage no-dots",   !jwt.VerifyHS256("notajwt", secret));
+    assert("GetClaim garbage no-dots", jwt.GetClaim("notajwt", "sub") == nil);
+    assert("IsExpired garbage",        jwt.IsExpired("notajwt"));
+
+    // Valid 3-part structure but payload is not JSON
+    // parts[1] = base64url("this is not json")
+    let nonJsonToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dGhpcyBpcyBub3QganNvbg.fakeSig";
+    assert("Decode non-JSON payload nil",   jwt.Decode(nonJsonToken) == nil);
+    assert("Verify non-JSON payload false", !jwt.VerifyHS256(nonJsonToken, secret));
+    assert("GetClaim non-JSON nil",         jwt.GetClaim(nonJsonToken, "sub") == nil);
+
+    // Invalid base64url characters in signature
+    let badB64Token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0In0.!!invalid!!";
+    assert("Decode bad-base64 sig nil",   jwt.Decode(badB64Token) == nil);
+    assert("Verify bad-base64 sig false", !jwt.VerifyHS256(badB64Token, secret));
+
+    // ============================================================
+    //  GetClaimFromDecoded
+    // ============================================================
+
+    let decodedForClaim = jwt.Decode(token);
+    assert("GetClaimFromDecoded: sub",
+        jwt.GetClaimFromDecoded(decodedForClaim, "sub") == "user-123");
+    assert("GetClaimFromDecoded: role",
+        jwt.GetClaimFromDecoded(decodedForClaim, "role") == "admin");
+    assert("GetClaimFromDecoded: exp",
+        jwt.GetClaimFromDecoded(decodedForClaim, "exp") == now + 3600);
+    assert("GetClaimFromDecoded: missing key returns nil",
+        jwt.GetClaimFromDecoded(decodedForClaim, "nonexistent") == nil);
+    assert("GetClaimFromDecoded: nil decoded returns nil",
+        jwt.GetClaimFromDecoded(nil, "sub") == nil);
+
+    let decodedKnown = jwt.Decode(knownToken);
+    assert("GetClaimFromDecoded: known token name",
+        jwt.GetClaimFromDecoded(decodedKnown, "name") == "John Doe");
+    assert("GetClaimFromDecoded: known token admin",
+        jwt.GetClaimFromDecoded(decodedKnown, "admin") == true);
+
+    // ============================================================
+    //  Refresh
+    // ============================================================
+
+    // Success: refreshing a valid token returns a new valid token
+    let refreshed = Jwt.Refresh(token, secret, 7200);
+    assert("Refresh: returns non-nil on valid token", refreshed != nil);
+    assert("Refresh: result verifies with same secret",
+        jwt.VerifyHS256(refreshed, secret));
+    assert("Refresh: new exp is approximately now+7200",
+        jwt.GetClaim(refreshed, "exp") >= Time.Now() + 7199 &&
+        jwt.GetClaim(refreshed, "exp") <= Time.Now() + 7201);
+    assert("Refresh: sub claim is preserved",
+        jwt.GetClaim(refreshed, "sub") == "user-123");
+
+    // Failure: wrong secret → nil
+    let refreshedBadSecret = Jwt.Refresh(token, "wrong-secret", 3600);
+    assert("Refresh: wrong secret returns nil", refreshedBadSecret == nil);
+
+    // Failure: malformed token → nil
+    let refreshedMalformed = Jwt.Refresh("not.a.jwt", secret, 3600);
+    assert("Refresh: malformed token returns nil", refreshedMalformed == nil);
+
+    // Failure: empty token → nil
+    let refreshedEmpty = Jwt.Refresh("", secret, 3600);
+    assert("Refresh: empty token returns nil", refreshedEmpty == nil);
+
+    // ============================================================
+    //  HS512 (HMAC-SHA512)
+    // ============================================================
+
+    let t512 = jwt.EncodeHS512(payload, secret, { iat: now, exp: now + 3600 });
+    assert("EncodeHS512 returns string",   t512 != nil);
+    assert("HS512 header alg is HS512",    jwt.Decode(t512).header.alg == "HS512");
+    assert("HS512 verifies own token",     jwt.VerifyHS512(t512, secret));
+    assert("HS512 rejects wrong secret",   !jwt.VerifyHS512(t512, "wrong-secret"));
+    assert("HS512 rejects tampered token", !jwt.VerifyHS512(t512 + "x", secret));
+    assert("HS512 HS256 verifier rejects HS512 sig", !jwt.VerifyHS256(t512, secret));
+    assert("HS512 WithClaims valid",       jwt.VerifyHS512WithClaims(t512, secret, { now: now }));
+    let t512exp = jwt.EncodeHS512({ sub: "x" }, secret, { exp: now - 10 });
+    assert("HS512 WithClaims expired fails", !jwt.VerifyHS512WithClaims(t512exp, secret, { now: now }));
+
+    // ============================================================
+    //  EdDSA (Ed25519) - asymmetric
+    // ============================================================
+
+    let kp  = Crypto.Ed25519KeyPair();
+    let kp2 = Crypto.Ed25519KeyPair();
+    let ted = jwt.EncodeEdDSA(payload, kp.SecretKey, { iat: now, exp: now + 3600 });
+    assert("EncodeEdDSA returns string",   ted != nil);
+    assert("EdDSA header alg is EdDSA",    jwt.Decode(ted).header.alg == "EdDSA");
+    assert("EdDSA payload preserved",      jwt.Decode(ted).payload.sub == "user-123");
+    assert("EdDSA verifies with public key", jwt.VerifyEdDSA(ted, kp.PublicKey));
+    assert("EdDSA rejects wrong public key", !jwt.VerifyEdDSA(ted, kp2.PublicKey));
+    assert("EdDSA rejects tampered token",   !jwt.VerifyEdDSA(ted + "x", kp.PublicKey));
+    assert("EdDSA WithClaims valid",         jwt.VerifyEdDSAWithClaims(ted, kp.PublicKey, { now: now }));
+    let tedExp = jwt.EncodeEdDSA({ sub: "x" }, kp.SecretKey, { exp: now - 10 });
+    assert("EdDSA WithClaims expired fails", !jwt.VerifyEdDSAWithClaims(tedExp, kp.PublicKey, { now: now }));
+
+    // ============================================================
+    //  Summary
+    // ============================================================
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed.");
+    if (failed > 0) {
+        Console.Error("Some JWT tests FAILED.");
+        return 1;
+    }
+    Console.Ok("All JWT tests passed!");
+
+    let bJwt    = new Jwt();
+    let bSecret = "super-secret-bench-key";
+    let bPay    = { sub: "user-42", role: "admin", uid: 1234 };
+    let bToken  = bJwt.EncodeHS256(bPay, bSecret, { iat: 1700000000, exp: 1700086400 });
+    let bStr    = "Hello, World! This is a base64 encoding test.";
+
+    Console.WriteLine("\n\n=== JWT Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Base64Url helpers ]");
+    bench("Base64UrlEncodeString  (45-char input)", fn() {
+        let s = bJwt.Base64UrlEncodeString(bStr); _sink = _sink + 1;
+    }, 5000);
+    bench("Base64UrlDecodeToString  (base64url - str)", fn() {
+        let s = bJwt.Base64UrlDecodeToString(bJwt.Base64UrlEncodeString(bStr));
+        _sink = _sink + 1;
+    }, 3000);
+
+    Console.WriteLine("\n[ Token lifecycle ]");
+    bench("EncodeHS256  (sign + encode)", fn() {
+        let t = bJwt.EncodeHS256(bPay, bSecret, nil); _sink = _sink + 1;
+    }, 500);
+    bench("Decode  (base64+JSON, no verify)", fn() {
+        let d = bJwt.Decode(bToken); _sink = _sink + 1;
+    }, 2000);
+    bench("VerifyHS256  (HMAC-SHA256 check)", fn() {
+        let ok = bJwt.VerifyHS256(bToken, bSecret); _sink = _sink + 1;
+    }, 500);
+    bench("GetClaim  (re-decodes token each call)", fn() {
+        let v = bJwt.GetClaim(bToken, "sub"); _sink = _sink + 1;
+    }, 2000);
+    let bDecoded = bJwt.Decode(bToken);
+    bench("GetClaimFromDecoded  (pre-decoded, O(1))", fn() {
+        let v = bJwt.GetClaimFromDecoded(bDecoded, "sub"); _sink = _sink + 1;
+    }, 2000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return 0;
+}

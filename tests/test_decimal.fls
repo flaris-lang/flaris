@@ -1,0 +1,530 @@
+// test_decimal.fls - Tests for Decimal.fls
+
+import { Decimal } from library("Decimal", "1.0");
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn eq(name, a, b) {
+    if (a == b) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name + "  got=" + Convert.ToString(a) + "  want=" + Convert.ToString(b));
+        failed += 1;
+    }
+}
+
+fn dstr(name, a, want) {
+    eq(name, Decimal.ToString(a), want);
+}
+
+fn ok(name, cond) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name);
+        failed += 1;
+    }
+}
+
+// ================================================================
+// Construction and ToString
+// ================================================================
+
+fn test_construction() {
+    Console.WriteLine("-- construction");
+
+    dstr("From(0)",            Decimal.From(0),        "0");
+    dstr("From(1)",            Decimal.From(1),        "1");
+    dstr("From(-1)",           Decimal.From(-1),       "-1");
+    dstr("From(1000000)",      Decimal.From(1000000),  "1000000");
+    dstr("From(-999999)",      Decimal.From(-999999),  "-999999");
+
+    dstr("From '0'",           Decimal.From("0"),          "0");
+    dstr("From '1.0'",         Decimal.From("1.0"),         "1.0");
+    dstr("From '3.14'",        Decimal.From("3.14"),        "3.14");
+    dstr("From '-2.718'",      Decimal.From("-2.718"),      "-2.718");
+    dstr("From '.5'",          Decimal.From(".5"),           "0.5");
+    dstr("From '0.001'",       Decimal.From("0.001"),       "0.001");
+    dstr("From '0.00'",        Decimal.From("0.00"),        "0.00");
+    dstr("From '123.456789'",  Decimal.From("123.456789"), "123.456789");
+    dstr("From '-0.1'",        Decimal.From("-0.1"),        "-0.1");
+    dstr("From large",
+        Decimal.From("9999999999999.9999999999"),
+        "9999999999999.9999999999");
+    dstr("From '1000000.000001'",
+        Decimal.From("1000000.000001"),
+        "1000000.000001");
+
+    dstr("Zero()",  Decimal.Zero(), "0");
+    dstr("One()",   Decimal.One(),  "1");
+}
+
+// ================================================================
+// ToFloat / ToInt
+// ================================================================
+
+fn test_conversions() {
+    Console.WriteLine("-- conversions");
+
+    ok("ToFloat 3.14", Math.Abs(Decimal.ToFloat(Decimal.From("3.14")) - 3.14) < 0.0001);
+    ok("ToFloat -2.5", Math.Abs(Decimal.ToFloat(Decimal.From("-2.5")) - (-2.5)) < 0.0001);
+    ok("ToFloat 0",    Decimal.ToFloat(Decimal.Zero()) == 0.0);
+
+    eq("ToInt 0",       Decimal.ToInt(Decimal.From("0")),     0);
+    eq("ToInt 42",      Decimal.ToInt(Decimal.From("42")),    42);
+    eq("ToInt -7",      Decimal.ToInt(Decimal.From("-7")),   -7);
+    eq("ToInt 3.9",     Decimal.ToInt(Decimal.From("3.9")),   3);
+    eq("ToInt -3.9",    Decimal.ToInt(Decimal.From("-3.9")), -3);
+    ok("ToInt huge nil",
+        Decimal.ToInt(Decimal.From("99999999999999999999")) == nil);
+}
+
+// ================================================================
+// Comparison
+// ================================================================
+
+fn test_comparison() {
+    Console.WriteLine("-- comparison");
+
+    var a = Decimal.From("5.0");
+    var b = Decimal.From("3.0");
+    var c = Decimal.From("5.0");
+    var n = Decimal.From("-5.0");
+
+    eq("Cmp(5,3)=1",    Decimal.Cmp(a, b),  1);
+    eq("Cmp(3,5)=-1",   Decimal.Cmp(b, a), -1);
+    eq("Cmp(5,5)=0",    Decimal.Cmp(a, c),  0);
+    eq("Cmp(-5,3)=-1",  Decimal.Cmp(n, b), -1);
+    eq("Cmp(3,-5)=1",   Decimal.Cmp(b, n),  1);
+
+    // Different scales, equal values
+    ok("Eq 1.0 vs 1.00",  Decimal.Eq(Decimal.From("1.0"),  Decimal.From("1.00")));
+    ok("Eq 0.5 vs 0.500", Decimal.Eq(Decimal.From("0.5"),  Decimal.From("0.500")));
+    ok("Lt true",         Decimal.Lt(b, a));
+    ok("Lt false",        !Decimal.Lt(a, b));
+    ok("Lte equal",       Decimal.Lte(a, c));
+    ok("Gt true",         Decimal.Gt(a, b));
+    ok("Gte equal",       Decimal.Gte(a, c));
+    ok("Gte greater",     Decimal.Gte(a, b));
+
+    ok("IsZero true",     Decimal.IsZero(Decimal.Zero()));
+    ok("IsZero false",    !Decimal.IsZero(a));
+    ok("IsNeg true",      Decimal.IsNeg(n));
+    ok("IsNeg false",     !Decimal.IsNeg(a));
+    ok("IsPos true",      Decimal.IsPos(a));
+    ok("IsPos false",     !Decimal.IsPos(Decimal.Zero()));
+
+    // Zero comparisons with different signs
+    ok("Cmp -0 vs 0",  Decimal.Cmp(Decimal.From("-0.00"), Decimal.From("0.00")) == 0);
+}
+
+// ================================================================
+// Neg / Abs
+// ================================================================
+
+fn test_neg_abs() {
+    Console.WriteLine("-- Neg / Abs");
+
+    dstr("Neg(3.14)",   Decimal.Neg(Decimal.From("3.14")),  "-3.14");
+    dstr("Neg(-3.14)",  Decimal.Neg(Decimal.From("-3.14")),  "3.14");
+    dstr("Neg(0)",      Decimal.Neg(Decimal.Zero()),          "0");
+    dstr("Abs(3.14)",   Decimal.Abs(Decimal.From("3.14")),   "3.14");
+    dstr("Abs(-3.14)",  Decimal.Abs(Decimal.From("-3.14")),  "3.14");
+    dstr("Abs(0)",      Decimal.Abs(Decimal.Zero()),          "0");
+}
+
+// ================================================================
+// Addition
+// ================================================================
+
+fn test_add() {
+    Console.WriteLine("-- Add");
+
+    eq("0+0",       Decimal.ToString(Decimal.Add(Decimal.From("0"),    Decimal.From("0"))),    "0");
+    eq("1+1",       Decimal.ToString(Decimal.Add(Decimal.From("1.0"),  Decimal.From("1.0"))),  "2.0");
+    eq("0.1+0.2",   Decimal.ToString(Decimal.Add(Decimal.From("0.1"),  Decimal.From("0.2"))),  "0.3");
+    eq("0.99+0.01", Decimal.ToString(Decimal.Add(Decimal.From("0.99"), Decimal.From("0.01"))), "1.00");
+
+    // Cross-sign
+    eq("5.5+(-3.2)",  Decimal.ToString(Decimal.Add(Decimal.From("5.5"),  Decimal.From("-3.2"))),  "2.3");
+    eq("3.2+(-5.5)",  Decimal.ToString(Decimal.Add(Decimal.From("3.2"),  Decimal.From("-5.5"))), "-2.3");
+    eq("-3+(-2)",     Decimal.ToString(Decimal.Add(Decimal.From("-3"),   Decimal.From("-2"))),    "-5");
+    eq("5+(-5)",      Decimal.ToString(Decimal.Add(Decimal.From("5.00"), Decimal.From("-5.00"))), "0.00");
+
+    // Different scales
+    eq("1.5 + 0.25",  Decimal.ToString(Decimal.Add(Decimal.From("1.5"),  Decimal.From("0.25"))),  "1.75");
+    eq("10 + 0.001",  Decimal.ToString(Decimal.Add(Decimal.From("10"),   Decimal.From("0.001"))), "10.001");
+
+    // Large with carry
+    eq("big carry",
+        Decimal.ToString(Decimal.Add(
+            Decimal.From("999999999999.999"),
+            Decimal.From("0.001"))),
+        "1000000000000.000");
+}
+
+// ================================================================
+// Subtraction
+// ================================================================
+
+fn test_sub() {
+    Console.WriteLine("-- Sub");
+
+    eq("10-3",    Decimal.ToString(Decimal.Sub(Decimal.From("10"),   Decimal.From("3"))),   "7");
+    eq("3-10",    Decimal.ToString(Decimal.Sub(Decimal.From("3"),    Decimal.From("10"))), "-7");
+    eq("1.0-0.3", Decimal.ToString(Decimal.Sub(Decimal.From("1.0"),  Decimal.From("0.3"))), "0.7");
+    eq("0-0",     Decimal.ToString(Decimal.Sub(Decimal.Zero(),       Decimal.Zero())),        "0");
+
+    eq("big borrow",
+        Decimal.ToString(Decimal.Sub(
+            Decimal.From("1000000000000.000"),
+            Decimal.From("0.001"))),
+        "999999999999.999");
+}
+
+// ================================================================
+// Multiplication
+// ================================================================
+
+fn test_mul() {
+    Console.WriteLine("-- Mul");
+
+    eq("0*99",      Decimal.ToString(Decimal.Mul(Decimal.Zero(),        Decimal.From("99"))),     "0");
+    eq("1*42",      Decimal.ToString(Decimal.Mul(Decimal.One(),         Decimal.From("42"))),     "42");
+    eq("3*4",       Decimal.ToString(Decimal.Mul(Decimal.From("3"),     Decimal.From("4"))),      "12");
+    eq("-3*4",      Decimal.ToString(Decimal.Mul(Decimal.From("-3"),    Decimal.From("4"))),      "-12");
+    eq("-3*-4",     Decimal.ToString(Decimal.Mul(Decimal.From("-3"),    Decimal.From("-4"))),     "12");
+    eq("1.5*2",     Decimal.ToString(Decimal.Mul(Decimal.From("1.5"),   Decimal.From("2"))),      "3.0");
+    eq("1.5*2.0",   Decimal.ToString(Decimal.Mul(Decimal.From("1.5"),   Decimal.From("2.0"))),   "3.00");
+    eq("0.1*0.1",   Decimal.ToString(Decimal.Mul(Decimal.From("0.1"),   Decimal.From("0.1"))),   "0.01");
+    eq("19.99*100", Decimal.ToString(Decimal.Mul(Decimal.From("19.99"), Decimal.From("100"))),   "1999.00");
+
+    // 123456789 * 987654321 = 121932631112635269
+    eq("large mul",
+        Decimal.ToString(Decimal.Mul(Decimal.From("123456789"), Decimal.From("987654321"))),
+        "121932631112635269");
+}
+
+// ================================================================
+// Division
+// ================================================================
+
+fn test_div() {
+    Console.WriteLine("-- Div");
+
+    eq("10/3 prec=2",  Decimal.ToString(Decimal.Div(Decimal.From("10"), Decimal.From("3"),  2)), "3.33");
+    eq("1/3 prec=6",   Decimal.ToString(Decimal.Div(Decimal.From("1"),  Decimal.From("3"),  6)), "0.333333");
+    eq("1/7 prec=4",   Decimal.ToString(Decimal.Div(Decimal.From("1"),  Decimal.From("7"),  4)), "0.1428");
+    eq("22/7 prec=5",  Decimal.ToString(Decimal.Div(Decimal.From("22"), Decimal.From("7"),  5)), "3.14285");
+    eq("1/4 prec=4",   Decimal.ToString(Decimal.Div(Decimal.From("1"),  Decimal.From("4"),  4)), "0.2500");
+    eq("6/2 prec=2",   Decimal.ToString(Decimal.Div(Decimal.From("6"),  Decimal.From("2"),  2)), "3.00");
+    eq("0/5 prec=2",   Decimal.ToString(Decimal.Div(Decimal.From("0"),  Decimal.From("5"),  2)), "0.00");
+
+    // Negative
+    eq("-10/3 prec=2", Decimal.ToString(Decimal.Div(Decimal.From("-10"), Decimal.From("3"), 2)), "-3.33");
+    eq("10/-3 prec=2", Decimal.ToString(Decimal.Div(Decimal.From("10"), Decimal.From("-3"), 2)), "-3.33");
+
+    // Scaled inputs
+    eq("1.5/0.5 prec=2",
+        Decimal.ToString(Decimal.Div(Decimal.From("1.5"), Decimal.From("0.5"), 2)), "3.00");
+    eq("10.0/3.0 prec=3",
+        Decimal.ToString(Decimal.Div(Decimal.From("10.0"), Decimal.From("3.0"), 3)), "3.333");
+
+    // Division by zero returns nil
+    ok("div by zero nil", Decimal.Div(Decimal.From("5"), Decimal.Zero(), 2) == nil);
+}
+
+// ================================================================
+// Power
+// ================================================================
+
+fn test_pow() {
+    Console.WriteLine("-- Pow");
+
+    eq("2^0",    Decimal.ToString(Decimal.Pow(Decimal.From("2"),   0)),  "1");
+    eq("2^1",    Decimal.ToString(Decimal.Pow(Decimal.From("2"),   1)),  "2");
+    eq("2^10",   Decimal.ToString(Decimal.Pow(Decimal.From("2"),  10)), "1024");
+    eq("(-2)^3", Decimal.ToString(Decimal.Pow(Decimal.From("-2"),  3)),  "-8");
+    eq("(-2)^4", Decimal.ToString(Decimal.Pow(Decimal.From("-2"),  4)),  "16");
+    eq("1.5^2",  Decimal.ToString(Decimal.Pow(Decimal.From("1.5"), 2)),  "2.25");
+    eq("0.1^3",  Decimal.ToString(Decimal.Pow(Decimal.From("0.1"), 3)),  "0.001");
+
+    ok("Pow neg exp nil", Decimal.Pow(Decimal.From("2"), -1) == nil);
+}
+
+// ================================================================
+// Truncate
+// ================================================================
+
+fn test_truncate() {
+    Console.WriteLine("-- Truncate");
+
+    eq("3.789-2",  Decimal.ToString(Decimal.Truncate(Decimal.From("3.789"),  2)), "3.78");
+    eq("3.789-0",  Decimal.ToString(Decimal.Truncate(Decimal.From("3.789"),  0)), "3");
+    eq("-3.789-0", Decimal.ToString(Decimal.Truncate(Decimal.From("-3.789"), 0)), "-3");
+    eq("0.9-0",    Decimal.ToString(Decimal.Truncate(Decimal.From("0.9"),    0)), "0");
+    eq("-0.9-0",   Decimal.ToString(Decimal.Truncate(Decimal.From("-0.9"),   0)), "0");
+    eq("3.1-3",    Decimal.ToString(Decimal.Truncate(Decimal.From("3.1"),    3)), "3.1");
+    eq("5-0",      Decimal.ToString(Decimal.Truncate(Decimal.From("5"),      0)), "5");
+}
+
+// ================================================================
+// Round
+// ================================================================
+
+fn test_round() {
+    Console.WriteLine("-- Round");
+
+    eq("3.145-2",   Decimal.ToString(Decimal.Round(Decimal.From("3.145"), 2)), "3.15");
+    eq("3.144-2",   Decimal.ToString(Decimal.Round(Decimal.From("3.144"), 2)), "3.14");
+    eq("3.5-0",     Decimal.ToString(Decimal.Round(Decimal.From("3.5"),   0)), "4");
+    eq("2.5-0",     Decimal.ToString(Decimal.Round(Decimal.From("2.5"),   0)), "3");
+    eq("-3.5-0",    Decimal.ToString(Decimal.Round(Decimal.From("-3.5"),  0)), "-4");
+    eq("0.005-2",   Decimal.ToString(Decimal.Round(Decimal.From("0.005"), 2)), "0.01");
+    eq("0.004-2",   Decimal.ToString(Decimal.Round(Decimal.From("0.004"), 2)), "0.00");
+    eq("1.999-2",   Decimal.ToString(Decimal.Round(Decimal.From("1.999"), 2)), "2.00");
+    eq("no change", Decimal.ToString(Decimal.Round(Decimal.From("3.1"),   3)), "3.1");
+}
+
+// ================================================================
+// Floor / Ceil
+// ================================================================
+
+fn test_floor_ceil() {
+    Console.WriteLine("-- Floor / Ceil");
+
+    eq("Floor(3.2)",   Decimal.ToString(Decimal.Floor(Decimal.From("3.2"))),   "3");
+    eq("Floor(3.0)",   Decimal.ToString(Decimal.Floor(Decimal.From("3.0"))),   "3");
+    eq("Floor(-3.2)",  Decimal.ToString(Decimal.Floor(Decimal.From("-3.2"))), "-4");
+    eq("Floor(-3.0)",  Decimal.ToString(Decimal.Floor(Decimal.From("-3.0"))), "-3");
+    eq("Floor(0.9)",   Decimal.ToString(Decimal.Floor(Decimal.From("0.9"))),   "0");
+    eq("Floor(-0.1)",  Decimal.ToString(Decimal.Floor(Decimal.From("-0.1"))), "-1");
+    eq("Floor(5)",     Decimal.ToString(Decimal.Floor(Decimal.From("5"))),     "5");
+
+    eq("Ceil(3.2)",    Decimal.ToString(Decimal.Ceil(Decimal.From("3.2"))),    "4");
+    eq("Ceil(3.0)",    Decimal.ToString(Decimal.Ceil(Decimal.From("3.0"))),    "3");
+    eq("Ceil(-3.2)",   Decimal.ToString(Decimal.Ceil(Decimal.From("-3.2"))),  "-3");
+    eq("Ceil(-3.0)",   Decimal.ToString(Decimal.Ceil(Decimal.From("-3.0"))),  "-3");
+    eq("Ceil(0.1)",    Decimal.ToString(Decimal.Ceil(Decimal.From("0.1"))),    "1");
+    eq("Ceil(-0.9)",   Decimal.ToString(Decimal.Ceil(Decimal.From("-0.9"))),   "0");
+    eq("Ceil(5)",      Decimal.ToString(Decimal.Ceil(Decimal.From("5"))),      "5");
+}
+
+// ================================================================
+// Financial scenario
+// ================================================================
+
+fn test_financial() {
+    Console.WriteLine("-- financial scenario");
+
+    // price * tax rate, rounded to 2 decimal places
+    var price = Decimal.From("19.99");
+    var rate  = Decimal.From("0.08");
+    var tax   = Decimal.Round(Decimal.Mul(price, rate), 2);
+    eq("19.99 * 0.08 rounded", Decimal.ToString(tax), "1.60");
+
+    // Running sum
+    var total = Decimal.Zero();
+    total = Decimal.Add(total, Decimal.From("10.50"));
+    total = Decimal.Add(total, Decimal.From("3.25"));
+    total = Decimal.Add(total, Decimal.From("0.99"));
+    eq("running sum", Decimal.ToString(total), "14.74");
+
+    // Large financial division
+    var interest = Decimal.Div(Decimal.From("1000000"), Decimal.From("12"), 6);
+    eq("1000000/12 prec=6", Decimal.ToString(interest), "83333.333333");
+}
+
+// ================================================================
+// Sign / Max / Min
+// ================================================================
+
+fn test_sign_max_min() {
+    Console.WriteLine("-- Sign / Max / Min");
+
+    eq("Sign(3.14)=1",    Decimal.Sign(Decimal.From("3.14")),   1);
+    eq("Sign(-2.5)=-1",   Decimal.Sign(Decimal.From("-2.5")), -1);
+    eq("Sign(0)=0",       Decimal.Sign(Decimal.Zero()),         0);
+    eq("Sign(-0.00)=0",   Decimal.Sign(Decimal.From("-0.00")),  0);
+
+    var a = Decimal.From("5.5");
+    var b = Decimal.From("3.2");
+    var c = Decimal.From("5.5");
+
+    dstr("Max(5.5,3.2)=5.5",  Decimal.Max(a, b), "5.5");
+    dstr("Max(3.2,5.5)=5.5",  Decimal.Max(b, a), "5.5");
+    dstr("Max(5.5,5.5)=5.5",  Decimal.Max(a, c), "5.5");
+    dstr("Max(-1,0)=0",
+        Decimal.Max(Decimal.From("-1"), Decimal.Zero()),  "0");
+
+    dstr("Min(5.5,3.2)=3.2",  Decimal.Min(a, b), "3.2");
+    dstr("Min(3.2,5.5)=3.2",  Decimal.Min(b, a), "3.2");
+    dstr("Min(5.5,5.5)=5.5",  Decimal.Min(a, c), "5.5");
+    dstr("Min(-1,0)=-1",
+        Decimal.Min(Decimal.From("-1"), Decimal.Zero()), "-1");
+}
+
+// ================================================================
+// IsInteger
+// ================================================================
+
+fn test_isinteger() {
+    Console.WriteLine("-- IsInteger");
+
+    ok("IsInteger(0)",      Decimal.IsInteger(Decimal.Zero()));
+    ok("IsInteger(1)",      Decimal.IsInteger(Decimal.One()));
+    ok("IsInteger(42)",     Decimal.IsInteger(Decimal.From("42")));
+    ok("IsInteger(-7)",     Decimal.IsInteger(Decimal.From("-7")));
+    ok("IsInteger(3.0)",    Decimal.IsInteger(Decimal.From("3.0")));
+    ok("IsInteger(1.00)",   Decimal.IsInteger(Decimal.From("1.00")));
+    ok("!IsInteger(3.14)",  !Decimal.IsInteger(Decimal.From("3.14")));
+    ok("!IsInteger(0.001)", !Decimal.IsInteger(Decimal.From("0.001")));
+    ok("!IsInteger(-0.5)",  !Decimal.IsInteger(Decimal.From("-0.5")));
+    // After truncation: the truncated value has scale 0 and is integer
+    ok("IsInteger(Truncate(3.9,0))",
+        Decimal.IsInteger(Decimal.Truncate(Decimal.From("3.9"), 0)));
+}
+
+// ================================================================
+// RoundHalfEven
+// ================================================================
+
+fn test_roundhalfeven() {
+    Console.WriteLine("-- RoundHalfEven");
+
+    // Normal rounding (same as Round when not on the tie)
+    eq("2.4-0",   Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("2.4"),   0)), "2");
+    eq("2.6-0",   Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("2.6"),   0)), "3");
+    eq("3.144-2", Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("3.144"), 2)), "3.14");
+    eq("3.146-2", Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("3.146"), 2)), "3.15");
+
+    // Tie cases: round to nearest even
+    // 2.5 -> last kept digit is 2 (even) -> stay at 2
+    eq("2.5-0 (even)",   Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("2.5"),   0)), "2");
+    // 3.5 -> last kept digit is 3 (odd) -> round up to 4
+    eq("3.5-0 (even)",   Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("3.5"),   0)), "4");
+    // 4.5 -> last kept digit is 4 (even) -> stay at 4
+    eq("4.5-0 (even)",   Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("4.5"),   0)), "4");
+    // 5.5 -> last kept digit is 5 (odd) -> round up to 6
+    eq("5.5-0 (even)",   Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("5.5"),   0)), "6");
+    // -2.5 -> magnitude tie, last kept digit 2 (even) -> stay at -2
+    eq("-2.5-0 (even)",  Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("-2.5"),  0)), "-2");
+    // -3.5 -> magnitude tie, last kept digit 3 (odd) -> round up magnitude to -4
+    eq("-3.5-0 (even)",  Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("-3.5"),  0)), "-4");
+
+    // Fractional tie
+    // 1.25 to 1 place: last kept digit 2 (even) -> stay at 1.2
+    eq("1.25-1 (even)",  Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("1.25"),  1)), "1.2");
+    // 1.35 to 1 place: last kept digit 3 (odd) -> round up to 1.4
+    eq("1.35-1 (even)",  Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("1.35"),  1)), "1.4");
+
+    // No change when scale already within places
+    eq("no change",  Decimal.ToString(Decimal.RoundHalfEven(Decimal.From("3.1"), 3)), "3.1");
+}
+
+// ================================================================
+// Main
+// ================================================================
+
+fn Main() {
+    Console.WriteLine("=== Decimal test suite ===");
+
+    test_construction();
+    test_conversions();
+    test_comparison();
+    test_neg_abs();
+    test_add();
+    test_sub();
+    test_mul();
+    test_div();
+    test_pow();
+    test_truncate();
+    test_round();
+    test_floor_ceil();
+    test_financial();
+    test_sign_max_min();
+    test_isinteger();
+    test_roundhalfeven();
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + Convert.ToString(passed) + " passed, " + Convert.ToString(failed) + " failed.");
+    if (failed > 0) {
+        Console.Error("Some Decimal tests FAILED.");
+        return 1;
+    }
+    Console.Ok("All Decimal tests passed!");
+
+    let d_a   = Decimal.From(123456789);
+    let d_b   = Decimal.From(987654321);
+    let d_pi  = Decimal.From("3.14159265358979323846");
+    let d_big = Decimal.From("99999999999999999999.999999999999");
+
+    Console.WriteLine("\n\n=== Decimal Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Construction ]");
+    bench("From  int (123456789)", fn() {
+        let v = Decimal.From(123456789); _sink = _sink + 1;
+    }, 2000);
+    bench("From  string (\"3.14159265358979323846\")", fn() {
+        let v = Decimal.From("3.14159265358979323846"); _sink = _sink + 1;
+    }, 500);
+
+    Console.WriteLine("\n[ Arithmetic ]");
+    bench("Add   int-scale", fn() {
+        let r = Decimal.Add(d_a, d_b); _sink = _sink + 1;
+    }, 2000);
+    bench("Mul   int-scale", fn() {
+        let r = Decimal.Mul(d_a, d_b); _sink = _sink + 1;
+    }, 1000);
+    bench("Div   pi / 7  precision=10", fn() {
+        let r = Decimal.Div(d_pi, Decimal.From(7), 10); _sink = _sink + 1;
+    }, 300);
+    bench("Pow   pi ^ 4", fn() {
+        let r = Decimal.Pow(d_pi, 4); _sink = _sink + 1;
+    }, 1000);
+
+    Console.WriteLine("\n[ Rounding ]");
+    bench("Round  pi to 6 places", fn() {
+        let r = Decimal.Round(d_pi, 6); _sink = _sink + 1;
+    }, 1000);
+    bench("RoundHalfEven  pi to 6 places", fn() {
+        let r = Decimal.RoundHalfEven(d_pi, 6); _sink = _sink + 1;
+    }, 1000);
+    bench("Floor  pi", fn() {
+        let r = Decimal.Floor(d_pi); _sink = _sink + 1;
+    }, 1000);
+    bench("Ceil   pi", fn() {
+        let r = Decimal.Ceil(d_pi); _sink = _sink + 1;
+    }, 1000);
+
+    Console.WriteLine("\n[ Output ]");
+    bench("ToString  big decimal", fn() {
+        let s = Decimal.ToString(d_big); _sink = _sink + 1;
+    }, 1000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return 0;
+}

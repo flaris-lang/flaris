@@ -1,0 +1,466 @@
+// XML.fls - XML parser and builder for Flaris.
+// Version: 1.0
+//
+// Parses well-formed XML into a node tree. All methods are static.
+//
+// Supported: elements, attributes, text content, self-closing tags, CDATA,
+//   entity references (&amp; &lt; &gt; &quot; &apos;).
+//   Comments and XML declarations are skipped silently.
+//
+// Node structure (every node is a plain object):
+//   { tag: string, attrs: object, text: string, children: array }
+//   Element nodes: tag = element name, attrs = attribute map, children = child nodes.
+//   Text/CDATA nodes: tag = "", text = content, children = [].
+//   Mixed content: element nodes may have both children and a direct text field
+//   (the first text node's content is promoted to .text for convenience).
+//
+// Usage:
+//   import { XML } from library("XML", "1.0");
+//
+//   let src = "<books><book id=\"1\"><title>Dune</title></book></books>";
+//   let doc = XML.Parse(src);
+//
+//   let book = XML.Find(doc, "book");          // first <book> anywhere
+//   Console.WriteLine(book.attrs.id);          // "1"
+//   Console.WriteLine(XML.Child(book, "title").text);  // "Dune"
+//
+//   // Iterate all matching children
+//   XML.EachChild(doc, "book", fn(n) {
+//       Console.WriteLine(n.attrs.id, XML.Text(n));
+//   });
+//
+//   // Build XML from a node tree
+//   let out    = XML.Build(doc);               // compact string
+//   let pretty = XML.Pretty(doc, "  ");        // indented
+//
+//   // Load from file
+//   let fdoc = XML.ParseFile("config.xml");
+//
+// Parsing:
+//   XML.Parse(source:string)         →  root node (or nil on error)
+//   XML.ParseFile(path:string)       →  root node (or nil on error)
+//
+// Serialization:
+//   XML.Build(node)                  →  compact XML string
+//   XML.Pretty(node, indent?)        →  indented XML string; indent defaults to "  "
+//
+// Searching (all search the entire subtree recursively):
+//   XML.Find(node, tag)              →  first matching child node or nil
+//   XML.FindAll(node, tag)           →  array of all matching nodes (depth-first)
+//   XML.FindBy(node, tag, attr, val) →  first node with matching tag + attribute value
+//   XML.Child(node, tag)             →  direct child with tag (not recursive)
+//   XML.EachChild(node, tag, fn(n))  - iterate direct children matching tag
+//
+// Convenience:
+//   XML.Text(node)                   →  string - concatenated text of all text nodes
+//   XML.Attr(node, key, default?)    →  attribute value or default
+
+class XML {
+
+    // ── Mutable cursor state (set by Parse, used by all _* helpers) ───────────
+    let _src:     string = "";
+    let _n:       int    = 0;
+    let _pos:     int    = 0;
+    let _results: array  = [];
+
+    // ── Low-level helpers ─────────────────────────────────────────────────────
+
+    fn _peek() : string {
+        if (this._pos >= this._n) return "";
+        return String.Substr(this._src, this._pos, 1);
+    }
+
+    fn _peekAt(offset: int) : string {
+        let p = this._pos + offset;
+        if (p >= this._n) return "";
+        return String.Substr(this._src, p, 1);
+    }
+
+    fn _find(sub: string) : int {
+        return String.IndexOfFrom(this._src, sub, this._pos);
+    }
+
+    fn _skipSpace() {
+        while (this._pos < this._n) {
+            let c = String.Substr(this._src, this._pos, 1);
+            if (c != " " && c != "\t" && c != "\n" && c != "\r") break;
+            this._pos += 1;
+        }
+    }
+
+    // ── Entity codec ──────────────────────────────────────────────────────────
+
+    fn _decode(s: string) : string {
+        if (!String.Contains(s, "&")) return s;
+        var r = String.Replace(s,    "&amp;",  "&");
+        r      = String.Replace(r,   "&lt;",   "<");
+        r      = String.Replace(r,   "&gt;",   ">");
+        r      = String.Replace(r,   "&quot;", "\"");
+        r      = String.Replace(r,   "&apos;", "'");
+        return r;
+    }
+
+    fn _encode(s: string) : string {
+        var r = String.Replace(s,    "&",   "&amp;");
+        r      = String.Replace(r,   "<",   "&lt;");
+        r      = String.Replace(r,   ">",   "&gt;");
+        r      = String.Replace(r,   "\"",  "&quot;");
+        r      = String.Replace(r,   "'",   "&apos;");
+        return r;
+    }
+
+    // ── Name parser ───────────────────────────────────────────────────────────
+
+    fn _parseName() : string {
+        let end = String.IndexOfAnyFrom(this._src, " \t\n\r>/=\"'<", this._pos);
+        if (end < 0) end = this._n;
+        let name = String.Substr(this._src, this._pos, end - this._pos);
+        this._pos = end;
+        return name;
+    }
+
+    // ── Attribute value ───────────────────────────────────────────────────────
+
+    fn _parseAttrVal() : string {
+        let quote = this._peek();
+        if (quote != "\"" && quote != "'") return "";
+        this._pos += 1;
+        let close = String.IndexOfFrom(this._src, quote, this._pos);
+        if (close < 0) {
+            let val = String.Substr(this._src, this._pos, this._n - this._pos);
+            this._pos = this._n;
+            return this._decode(val);
+        }
+        let val = String.Substr(this._src, this._pos, close - this._pos);
+        this._pos = close + 1;
+        return this._decode(val);
+    }
+
+    // ── Attribute list ────────────────────────────────────────────────────────
+
+    fn _parseAttrs() : object {
+        let attrs = {};
+        while (true) {
+            this._skipSpace();
+            let c = this._peek();
+            if (c == ">" || c == "/" || c == "" || c == "<") break;
+
+            let key = this._parseName();
+            if (String.Length(key) == 0) break;
+
+            this._skipSpace();
+            if (this._peek() != "=") {
+                attrs[key] = true;
+                continue;
+            }
+            this._pos += 1;
+            this._skipSpace();
+            attrs[key] = this._parseAttrVal();
+        }
+        return attrs;
+    }
+
+    // ── Element parser ────────────────────────────────────────────────────────
+
+    fn _parseElem() : object {
+        this._skipSpace();
+        if (this._pos >= this._n) return nil;
+        if (this._peek() != "<") return nil;
+        this._pos += 1;
+
+        let c1 = this._peek();
+
+        // PI  <?...?>
+        if (c1 == "?") {
+            let end = this._find("?>");
+            if (end >= 0) this._pos = end + 2;
+            return this._parseElem();
+        }
+
+        // DOCTYPE / Comment / CDATA
+        if (c1 == "!") {
+            let c2 = this._peekAt(1);
+
+            if (c2 == "-") {
+                let end = this._find("-->");
+                if (end >= 0) this._pos = end + 3;
+                return this._parseElem();
+            }
+
+            if (c2 == "[") {
+                this._pos += 8; // skip "![CDATA["
+                let end = this._find("]]>");
+                var text = "";
+                if (end >= 0) {
+                    text = String.Substr(this._src, this._pos, end - this._pos);
+                    this._pos = end + 3;
+                } else {
+                    text = String.Substr(this._src, this._pos, this._n - this._pos);
+                    this._pos = this._n;
+                }
+                return { tag: "", text: text, attrs: {}, children: [] };
+            }
+
+            let end = this._find(">");
+            if (end >= 0) this._pos = end + 1;
+            return this._parseElem();
+        }
+
+        // Regular open tag
+        let tag = this._parseName();
+        if (String.Length(tag) == 0) return nil;
+
+        let attrs = this._parseAttrs();
+        this._skipSpace();
+
+        // Self-closing />
+        if (this._peek() == "/") {
+            this._pos += 2;
+            return { tag: tag, text: "", attrs: attrs, children: [] };
+        }
+
+        if (this._peek() == ">") this._pos += 1;
+
+        // Collect children / text
+        var children = [];
+        var text     = "";
+
+        while (this._pos < this._n) {
+            let c = this._peek();
+
+            if (c == "<") {
+                if (this._peekAt(1) == "/") {
+                    this._pos += 2;
+                    let closeTag = this._parseName();
+                    if (closeTag != tag) {
+                        Console.WriteLine("[XML] Warning: mismatched tag </" + closeTag + "> inside <" + tag + ">");
+                    }
+                    this._skipSpace();
+                    if (this._peek() == ">") this._pos += 1;
+                    break;
+                }
+
+                let child = this._parseElem();
+                if (child != nil) {
+                    children = Array.Append(children, child);
+                }
+
+            } else {
+                let tEnd = String.IndexOfFrom(this._src, "<", this._pos);
+                if (tEnd < 0) tEnd = this._n;
+                let chunk   = String.Substr(this._src, this._pos, tEnd - this._pos);
+                let trimmed = String.Trim(chunk);
+                if (String.Length(trimmed) > 0) {
+                    text = text + this._decode(chunk);
+                }
+                this._pos = tEnd;
+            }
+        }
+
+        return { tag: tag, text: String.Trim(text), attrs: attrs, children: children };
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    fn static Parse(source: string) {
+        if (source == nil) return nil;
+        let p   = new XML();
+        p._src  = str(source);
+        p._n    = String.Length(p._src);
+        p._pos  = 0;
+        return p._parseElem();
+    }
+
+    // Parse XML from a file. Returns nil if the file cannot be read.
+    fn static ParseFile(path: string) {
+        let src = File.ReadText(path);
+        if (src == nil) return nil;
+        return XML.Parse(src);
+    }
+
+    fn static Build(node) : string {
+        if (node == nil) return "";
+        let b = new XML();
+        return b._buildNode(node);
+    }
+
+    fn _buildNode(node) : string {
+        if (node == nil) return "";
+
+        if (node.tag == "") return this._encode(node.text);
+
+        var open = "<" + node.tag;
+        foreach (attrVal, attrKey in node.attrs) {
+            open = open + " " + attrKey + "=\"" + this._encode(str(attrVal)) + "\"";
+        }
+
+        let nc      = len(node.children);
+        let hasText = node.text != nil && String.Length(str(node.text)) > 0;
+
+        if (nc == 0 && !hasText) {
+            return open + "/>";
+        }
+
+        let nParts = 1 + (hasText ? 1 : 0) + nc + 1;
+        let parts  = Array.Create(nParts);
+        var idx    = 0;
+
+        parts[idx] = open + ">";
+        idx += 1;
+
+        if (hasText) {
+            parts[idx] = this._encode(str(node.text));
+            idx += 1;
+        }
+
+        iter (i from 0 to nc - 1) {
+            parts[idx] = this._buildNode(node.children[i]);
+            idx += 1;
+        }
+
+        parts[idx] = "</" + node.tag + ">";
+
+        return String.Join(parts, "");
+    }
+
+    // Pretty-print with indentation. indent defaults to two spaces.
+    fn static Pretty(node, indent) : string {
+        if (node == nil) return "";
+        let ind = (indent == nil) ? "  " : str(indent);
+        let b   = new XML();
+        return b._prettyNode(node, ind, 0);
+    }
+
+    fn _prettyNode(node, indent: string, depth: int) : string {
+        if (node == nil) return "";
+
+        // Text/CDATA node
+        if (node.tag == "") {
+            let t = String.Trim(this._encode(node.text));
+            if (String.Length(t) == 0) return "";
+            return String.Repeat(indent, depth) + t + "\n";
+        }
+
+        let pad  = String.Repeat(indent, depth);
+        var open = pad + "<" + node.tag;
+        foreach (attrVal, attrKey in node.attrs) {
+            open = open + " " + attrKey + "=\"" + this._encode(str(attrVal)) + "\"";
+        }
+
+        let nc      = len(node.children);
+        let hasText = node.text != nil && String.Length(str(node.text)) > 0;
+
+        if (nc == 0 && !hasText) {
+            return open + "/>\n";
+        }
+
+        // Inline: single text child, no element children
+        if (hasText && nc == 0) {
+            return open + ">" + this._encode(str(node.text)) + "</" + node.tag + ">\n";
+        }
+
+        var parts = [open + "\n"];
+
+        if (hasText) {
+            parts = Array.Append(parts, String.Repeat(indent, depth + 1) + this._encode(str(node.text)) + "\n");
+        }
+
+        iter (i from 0 to nc - 1) {
+            parts = Array.Append(parts, this._prettyNode(node.children[i], indent, depth + 1));
+        }
+
+        parts = Array.Append(parts, pad + "</" + node.tag + ">\n");
+        return String.Join(parts, "");
+    }
+
+    // Find first node (depth-first) whose tag matches.
+    fn static Find(node, tag: string) {
+        if (node == nil) return nil;
+        if (node.tag == tag) return node;
+        let n = len(node.children);
+        iter (i from 0 to n - 1) {
+            let found = XML.Find(node.children[i], tag);
+            if (found != nil) return found;
+        }
+        return nil;
+    }
+
+    // Collect all nodes (depth-first) whose tag matches.
+    fn static FindAll(node, tag: string) {
+        if (node == nil) return [];
+        let acc = new XML();
+        acc._findAllInto(node, tag);
+        return acc._results;
+    }
+
+    fn _findAllInto(node, tag: string) {
+        if (node == nil) return;
+        if (node.tag == tag) this._results = Array.Append(this._results, node);
+        let n = len(node.children);
+        iter (i from 0 to n - 1) {
+            this._findAllInto(node.children[i], tag);
+        }
+    }
+
+    // Find first node (depth-first) with the given tag and attribute value.
+    fn static FindBy(node, tag: string, attr: string, value) {
+        if (node == nil) return nil;
+        if (node.tag == tag) {
+            let v = Object.TryGet(node.attrs, attr, nil);
+            if (v == str(value)) return node;
+        }
+        let n = len(node.children);
+        iter (i from 0 to n - 1) {
+            let found = XML.FindBy(node.children[i], tag, attr, value);
+            if (found != nil) return found;
+        }
+        return nil;
+    }
+
+    // Return direct child whose tag matches, or nil.
+    fn static Child(node, tag: string) {
+        if (node == nil) return nil;
+        let n = len(node.children);
+        iter (i from 0 to n - 1) {
+            if (node.children[i].tag == tag) return node.children[i];
+        }
+        return nil;
+    }
+
+    // Invoke callback for each direct child whose tag matches.
+    fn static EachChild(node, tag: string, callback: fn) {
+        if (node == nil) return;
+        let n = len(node.children);
+        iter (i from 0 to n - 1) {
+            if (node.children[i].tag == tag) {
+                callback(node.children[i]);
+            }
+        }
+    }
+
+    // Return all concatenated text content under a node (depth-first).
+    fn static Text(node) : string {
+        if (node == nil) return "";
+        if (node.tag == "") return node.text;
+        var parts = [];
+        if (node.text != nil && String.Length(str(node.text)) > 0) {
+            parts = Array.Append(parts, str(node.text));
+        }
+        let n = len(node.children);
+        iter (i from 0 to n - 1) {
+            let ct = XML.Text(node.children[i]);
+            if (String.Length(ct) > 0) {
+                parts = Array.Append(parts, ct);
+            }
+        }
+        return String.Join(parts, "");
+    }
+
+    // Return attribute value or default if absent.
+    fn static Attr(node, key: string, def) {
+        if (node == nil) return def;
+        return Object.TryGet(node.attrs, key, def);
+    }
+}
+
+export { XML };

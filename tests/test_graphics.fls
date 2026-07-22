@@ -1,0 +1,660 @@
+// test_graphics.fls - Test suite for libs/Graphics.fls (high-level 2D drawing
+// wrapper over the builtin Gfx software rasterizer).
+//
+// All checks are deterministic, headless pixel-readback assertions: draw with
+// the stateful style context, then verify exact 0xAARRGGBB values with
+// GetPixel. The PNG round-trip writes to the system temp dir and deletes the
+// file afterwards.
+
+import { Graphics } from library("Graphics", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+global WHITE = 0xFFFFFFFF;
+global BLACK = 0xFF000000;
+global RED   = 0xFFFF0000;
+global GREEN = 0xFF00FF00;
+global BLUE  = 0xFF0000FF;
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+// Count pixels in the w x h region at (x,y) that differ from `bg`.
+fn countDiff(g:Graphics, x:int, y:int, w:int, h:int, bg:int) : int {
+    let n = 0;
+    iter (dy from 0 to h - 1) {
+        iter (dx from 0 to w - 1) {
+            if (g.GetPixel(x + dx, y + dy) != bg) n += 1;
+        }
+    }
+    return n;
+}
+
+// ============================================================
+// Construction & accessors
+// ============================================================
+
+fn test_construction() {
+    Console.WriteLine("-- construction");
+
+    let g = new Graphics(64, 48);
+    checkEq(g.Width(),  64, "Width() after new");
+    checkEq(g.Height(), 48, "Height() after new");
+    check(g.GetGfx() != nil, "GetGfx() returns the underlying canvas");
+
+    let c = Graphics.Create(10, 20);
+    checkEq(c.Width(),  10, "Create() width");
+    checkEq(c.Height(), 20, "Create() height");
+
+    // Dimensions are clamped to at least 1x1.
+    let tiny = new Graphics(0, -5);
+    checkEq(tiny.Width(),  1, "width clamped to 1");
+    checkEq(tiny.Height(), 1, "height clamped to 1");
+}
+
+// ============================================================
+// Style state (stroke / fill / thickness)
+// ============================================================
+
+fn test_style() {
+    Console.WriteLine("-- style state");
+
+    let g = new Graphics(8, 8);
+    checkEq(g.StrokeColor(), 0xFFFFFFFF, "default stroke is opaque white");
+    checkEq(g.FillColor(),   0,          "default fill is 0 (no fill)");
+    checkEq(g.Thickness(),   1,          "default thickness is 1");
+
+    g.SetStroke(RED);
+    g.SetFill(BLUE);
+    g.SetThickness(3);
+    checkEq(g.StrokeColor(), RED,  "SetStroke round-trip");
+    checkEq(g.FillColor(),   BLUE, "SetFill round-trip");
+    checkEq(g.Thickness(),   3,    "SetThickness round-trip");
+
+    g.SetThickness(0);
+    checkEq(g.Thickness(), 1, "thickness clamped to at least 1");
+}
+
+// ============================================================
+// Static color helpers
+// ============================================================
+
+fn test_colors() {
+    Console.WriteLine("-- color helpers");
+
+    checkEq(Graphics.RGB(255, 0, 0),   0xFFFF0000, "RGB red");
+    checkEq(Graphics.RGB(0, 255, 0),   0xFF00FF00, "RGB green");
+    checkEq(Graphics.RGB(0, 0, 255),   0xFF0000FF, "RGB blue");
+    checkEq(Graphics.RGB(18, 52, 86),  0xFF123456, "RGB packs channels");
+
+    checkEq(Graphics.RGBA(1, 2, 3, 4), 0x04010203, "RGBA packs alpha");
+    checkEq(Graphics.RGBA(255, 255, 255, 255), 0xFFFFFFFF, "RGBA white");
+
+    // Pure primaries are exact in HSL.
+    checkEq(Graphics.HSL(0.0,   1.0, 0.5), 0xFFFF0000, "HSL(0)   = red");
+    checkEq(Graphics.HSL(120.0, 1.0, 0.5), 0xFF00FF00, "HSL(120) = green");
+    checkEq(Graphics.HSL(240.0, 1.0, 0.5), 0xFF0000FF, "HSL(240) = blue");
+    checkEq(Graphics.HSL(0.0,   0.0, 1.0), 0xFFFFFFFF, "HSL l=1  = white");
+    checkEq(Graphics.HSL(0.0,   0.0, 0.0), 0xFF000000, "HSL l=0  = black");
+}
+
+// ============================================================
+// Pixel operations (Clear / Pixel / GetPixel)
+// ============================================================
+
+fn test_pixels() {
+    Console.WriteLine("-- pixel ops");
+
+    let g = new Graphics(64, 48);
+    g.Clear(WHITE);
+    checkEq(g.GetPixel(0, 0),   WHITE, "Clear sets (0,0)");
+    checkEq(g.GetPixel(63, 47), WHITE, "Clear sets (w-1,h-1)");
+
+    g.Pixel(5, 7, RED);
+    checkEq(g.GetPixel(5, 7), RED,   "Pixel writes single pixel");
+    checkEq(g.GetPixel(6, 7), WHITE, "neighbour untouched");
+
+    check(g.GetPixel(-1, 0)  == nil, "GetPixel(-1,0) out of bounds -> nil");
+    check(g.GetPixel(64, 0)  == nil, "GetPixel(w,0) out of bounds -> nil");
+    check(g.GetPixel(0, 48)  == nil, "GetPixel(0,h) out of bounds -> nil");
+}
+
+// ============================================================
+// Lines (Line / HLine / VLine / Polyline)
+// ============================================================
+
+fn test_lines() {
+    Console.WriteLine("-- lines");
+
+    let g = new Graphics(64, 64);
+    g.Clear(BLACK);
+    g.SetStroke(RED);
+
+    g.Line(0, 10, 63, 10);
+    checkEq(g.GetPixel(0, 10),  RED, "Line start pixel");
+    checkEq(g.GetPixel(32, 10), RED, "Line mid pixel");
+    checkEq(g.GetPixel(63, 10), RED, "Line end pixel");
+    checkEq(g.GetPixel(32, 12), BLACK, "pixel off the line untouched");
+
+    g.SetStroke(GREEN);
+    g.HLine(2, 20, 20);
+    checkEq(g.GetPixel(2, 20),  GREEN, "HLine start");
+    checkEq(g.GetPixel(20, 20), GREEN, "HLine end");
+    checkEq(g.GetPixel(21, 20), BLACK, "HLine stops at x1");
+
+    g.VLine(30, 5, 25);
+    checkEq(g.GetPixel(30, 5),  GREEN, "VLine start");
+    checkEq(g.GetPixel(30, 25), GREEN, "VLine end");
+    checkEq(g.GetPixel(30, 26), BLACK, "VLine stops at y1");
+
+    // Diagonal line hits both endpoints.
+    g.SetStroke(BLUE);
+    g.Line(40, 40, 50, 50);
+    checkEq(g.GetPixel(40, 40), BLUE, "diagonal start");
+    checkEq(g.GetPixel(50, 50), BLUE, "diagonal end");
+    checkEq(g.GetPixel(45, 45), BLUE, "diagonal midpoint");
+
+    // Polyline: open path through 3 points.
+    g.SetStroke(WHITE);
+    g.Polyline([5, 55, 20, 55, 20, 60]);
+    checkEq(g.GetPixel(12, 55), WHITE, "Polyline horizontal segment");
+    checkEq(g.GetPixel(20, 58), WHITE, "Polyline vertical segment");
+    checkEq(g.GetPixel(5, 60),  BLACK, "Polyline is open (no closing edge)");
+}
+
+// ============================================================
+// Rectangles (Rect / FillRect / RoundRect family)
+// ============================================================
+
+fn test_rects() {
+    Console.WriteLine("-- rectangles");
+
+    let g = new Graphics(64, 64);
+    g.Clear(BLACK);
+    g.SetStroke(GREEN);
+    g.SetFill(0);
+
+    g.Rect(10, 10, 20, 15);
+    checkEq(g.GetPixel(10, 10), GREEN, "Rect top-left corner");
+    checkEq(g.GetPixel(29, 10), GREEN, "Rect top-right corner");
+    checkEq(g.GetPixel(10, 24), GREEN, "Rect bottom-left corner");
+    checkEq(g.GetPixel(29, 24), GREEN, "Rect bottom-right corner");
+    checkEq(g.GetPixel(20, 17), BLACK, "Rect interior untouched");
+
+    // FillRect with fill == 0 is a no-op.
+    g.FillRect(40, 10, 10, 10);
+    checkEq(g.GetPixel(44, 14), BLACK, "FillRect no-op when fill == 0");
+
+    g.SetFill(BLUE);
+    g.FillRect(40, 10, 10, 10);
+    checkEq(g.GetPixel(40, 10), BLUE,  "FillRect top-left");
+    checkEq(g.GetPixel(49, 19), BLUE,  "FillRect bottom-right");
+    checkEq(g.GetPixel(39, 10), BLACK, "FillRect left edge exclusive");
+    checkEq(g.GetPixel(50, 10), BLACK, "FillRect right edge exclusive");
+
+    // FillRoundRect: center filled, sharp corner rounded away.
+    g.FillRoundRect(5, 30, 20, 16, 5);
+    checkEq(g.GetPixel(15, 38), BLUE,  "FillRoundRect center filled");
+    checkEq(g.GetPixel(5, 30),  BLACK, "FillRoundRect corner rounded away");
+
+    // RoundRect outline: straight edge midpoints are stroked.
+    g.RoundRect(35, 30, 20, 16, 4);
+    checkEq(g.GetPixel(45, 30), GREEN, "RoundRect top edge");
+    checkEq(g.GetPixel(45, 45), GREEN, "RoundRect bottom edge");
+    checkEq(g.GetPixel(35, 38), GREEN, "RoundRect left edge");
+    checkEq(g.GetPixel(35, 30), BLACK, "RoundRect corner rounded away");
+
+    // DrawRoundRect: fill + stroke in one call.
+    let g2 = new Graphics(40, 40);
+    g2.Clear(BLACK);
+    g2.SetStroke(GREEN);
+    g2.SetFill(RED);
+    g2.DrawRoundRect(5, 5, 30, 30, 6);
+    checkEq(g2.GetPixel(20, 20), RED,   "DrawRoundRect interior filled");
+    checkEq(g2.GetPixel(20, 5),  GREEN, "DrawRoundRect top edge stroked");
+    checkEq(g2.GetPixel(5, 5),   BLACK, "DrawRoundRect corner rounded away");
+
+    // Small radius degrades to plain Rect / FillRect.
+    let g3 = new Graphics(20, 20);
+    g3.Clear(BLACK);
+    g3.SetStroke(WHITE);
+    g3.SetFill(BLUE);
+    g3.FillRoundRect(2, 2, 10, 10, 0);
+    checkEq(g3.GetPixel(2, 2), BLUE, "FillRoundRect r=0 fills square corner");
+    g3.RoundRect(2, 2, 10, 10, 0);
+    checkEq(g3.GetPixel(2, 2), WHITE, "RoundRect r=0 strokes square corner");
+}
+
+// ============================================================
+// Circles & ellipses
+// ============================================================
+
+fn test_circles() {
+    Console.WriteLine("-- circles & ellipses");
+
+    let g = new Graphics(64, 48);
+    g.Clear(BLACK);
+    g.SetStroke(WHITE);
+    g.SetFill(RED);
+
+    g.FillCircle(32, 24, 10);
+    checkEq(g.GetPixel(32, 24), RED,   "FillCircle center");
+    checkEq(g.GetPixel(36, 24), RED,   "FillCircle interior");
+    checkEq(g.GetPixel(32, 12), BLACK, "FillCircle outside radius untouched");
+
+    // Outline only: on-path stroked, center untouched.
+    let g2 = new Graphics(64, 48);
+    g2.Clear(BLACK);
+    g2.SetStroke(WHITE);
+    g2.SetFill(RED);
+    g2.Circle(32, 24, 10);
+    checkEq(g2.GetPixel(32, 14), WHITE, "Circle top point stroked");
+    checkEq(g2.GetPixel(42, 24), WHITE, "Circle right point stroked");
+    checkEq(g2.GetPixel(32, 24), BLACK, "Circle interior untouched");
+
+    // DrawCircle = fill + stroke in one call.
+    let g3 = new Graphics(64, 48);
+    g3.Clear(BLACK);
+    g3.SetStroke(WHITE);
+    g3.SetFill(RED);
+    g3.DrawCircle(32, 24, 10);
+    checkEq(g3.GetPixel(32, 24), RED,   "DrawCircle interior filled");
+    checkEq(g3.GetPixel(32, 14), WHITE, "DrawCircle rim stroked");
+
+    // FillCircle with fill == 0 is a no-op.
+    let g4 = new Graphics(32, 32);
+    g4.Clear(BLACK);
+    g4.SetFill(0);
+    g4.FillCircle(16, 16, 8);
+    checkEq(g4.GetPixel(16, 16), BLACK, "FillCircle no-op when fill == 0");
+
+    // Ellipse outline: extreme points on both axes stroked.
+    let g5 = new Graphics(64, 48);
+    g5.Clear(BLACK);
+    g5.SetStroke(GREEN);
+    g5.SetFill(BLUE);
+    g5.Ellipse(32, 24, 14, 8);
+    checkEq(g5.GetPixel(46, 24), GREEN, "Ellipse right extreme stroked");
+    checkEq(g5.GetPixel(18, 24), GREEN, "Ellipse left extreme stroked");
+    checkEq(g5.GetPixel(32, 24), BLACK, "Ellipse interior untouched");
+
+    g5.FillEllipse(32, 24, 14, 8);
+    checkEq(g5.GetPixel(32, 24), BLUE, "FillEllipse center filled");
+    checkEq(g5.GetPixel(32, 4),  BLACK, "FillEllipse outside untouched");
+}
+
+// ============================================================
+// Arcs, pies & polygons
+// ============================================================
+
+fn test_arcs_polys() {
+    Console.WriteLine("-- arcs, pies & polygons");
+
+    let g = new Graphics(64, 64);
+    g.Clear(BLACK);
+    g.SetStroke(WHITE);
+    g.SetFill(RED);
+
+    // Quarter arc 0..90 degrees: endpoints at (cx+r,cy) and (cx,cy+r).
+    g.Arc(32, 24, 10, 0, 90);
+    checkEq(g.GetPixel(42, 24), WHITE, "Arc start point (0 deg)");
+    checkEq(g.GetPixel(32, 34), WHITE, "Arc end point (90 deg)");
+    checkEq(g.GetPixel(22, 24), BLACK, "Arc opposite side untouched");
+
+    // Filled pie wedge: interior point at 45 degrees, half radius.
+    let g2 = new Graphics(64, 64);
+    g2.Clear(BLACK);
+    g2.SetStroke(WHITE);
+    g2.SetFill(RED);
+    g2.FillPie(32, 24, 10, 0, 90);
+    checkEq(g2.GetPixel(35, 27), RED,   "FillPie interior filled");
+    checkEq(g2.GetPixel(29, 21), BLACK, "FillPie opposite quadrant untouched");
+
+    // Pie outline includes the two radial edges.
+    let g3 = new Graphics(64, 64);
+    g3.Clear(BLACK);
+    g3.SetStroke(GREEN);
+    g3.Pie(32, 24, 10, 0, 90);
+    checkEq(g3.GetPixel(37, 24), GREEN, "Pie radial edge stroked");
+
+    // Polygon outline: point on the top edge.
+    let g4 = new Graphics(64, 64);
+    g4.Clear(BLACK);
+    g4.SetStroke(GREEN);
+    g4.SetFill(BLUE);
+    g4.Polygon([10, 5, 50, 5, 30, 40]);
+    checkEq(g4.GetPixel(30, 5),  GREEN, "Polygon top edge stroked");
+    checkEq(g4.GetPixel(30, 15), BLACK, "Polygon interior untouched");
+
+    g4.FillPolygon([10, 5, 50, 5, 30, 40]);
+    checkEq(g4.GetPixel(30, 15), BLUE,  "FillPolygon interior filled");
+    checkEq(g4.GetPixel(5, 20),  BLACK, "FillPolygon exterior untouched");
+
+    // FillPolygon with fill == 0 is a no-op.
+    let g5 = new Graphics(32, 32);
+    g5.Clear(BLACK);
+    g5.SetFill(0);
+    g5.FillPolygon([2, 2, 30, 2, 16, 30]);
+    checkEq(g5.GetPixel(16, 10), BLACK, "FillPolygon no-op when fill == 0");
+}
+
+// ============================================================
+// Text
+// ============================================================
+
+fn test_text() {
+    Console.WriteLine("-- text");
+
+    // Metric math is pure and deterministic (8x8 font).
+    checkEq(Graphics.Create(1, 1).TextWidth("abc", 1, nil), 24, "TextWidth scale 1");
+    checkEq(Graphics.Create(1, 1).TextWidth("abc", 2, nil), 48, "TextWidth scale 2");
+    checkEq(Graphics.Create(1, 1).TextWidth("ab", 1, 2),    20, "TextWidth with letter spacing");
+    checkEq(Graphics.Create(1, 1).TextHeight(1), 8,  "TextHeight scale 1");
+    checkEq(Graphics.Create(1, 1).TextHeight(3), 24, "TextHeight scale 3");
+
+    let m = Graphics.Create(1, 1).TextMetrics("hey", 2, nil);
+    checkEq(m.width,  48, "TextMetrics width");
+    checkEq(m.height, 16, "TextMetrics height");
+
+    // DrawText puts glyph pixels on the canvas.
+    let g = new Graphics(64, 32);
+    g.Clear(BLACK);
+    g.SetStroke(WHITE);
+    g.DrawText(2, 2, "A");
+    let lit = countDiff(g, 2, 2, 8, 8, BLACK);
+    check(lit > 0, "DrawText renders pixels");
+
+    // DrawChar(65) renders the same glyph as DrawText("A").
+    g.DrawChar(20, 2, 65);
+    let same = true;
+    iter (dy from 0 to 7) {
+        iter (dx from 0 to 7) {
+            if (g.GetPixel(2 + dx, 2 + dy) != g.GetPixel(20 + dx, 2 + dy)) same = false;
+        }
+    }
+    check(same, "DrawChar(65) matches DrawText(\"A\")");
+
+    // Scaled text covers a larger area.
+    let g2 = new Graphics(64, 32);
+    g2.Clear(BLACK);
+    g2.SetStroke(WHITE);
+    g2.DrawTextEx(2, 2, "A", 2);
+    let lit2 = countDiff(g2, 2, 2, 16, 16, BLACK);
+    check(lit2 > lit, "DrawTextEx scale 2 lights more pixels");
+
+    // DrawCharScaled honours the scale factor.
+    let g3 = new Graphics(64, 32);
+    g3.Clear(BLACK);
+    g3.SetStroke(WHITE);
+    g3.DrawCharScaled(2, 2, 65, 2);
+    let lit3 = countDiff(g3, 2, 2, 16, 16, BLACK);
+    check(lit3 > lit, "DrawCharScaled scale 2 lights more pixels");
+}
+
+// ============================================================
+// Compositing (Blit / Draw / CopyRect / Blend)
+// ============================================================
+
+fn test_compositing() {
+    Console.WriteLine("-- compositing");
+
+    let g = new Graphics(64, 64);
+    g.Clear(BLACK);
+
+    // Blit a 4x4 flat ARGB array.
+    let px = [];
+    iter (i from 0 to 15) { Array.Append(px, GREEN); }
+    g.Blit(10, 10, 4, 4, px);
+    checkEq(g.GetPixel(10, 10), GREEN, "Blit top-left");
+    checkEq(g.GetPixel(13, 13), GREEN, "Blit bottom-right");
+    checkEq(g.GetPixel(14, 10), BLACK, "Blit outside region untouched");
+
+    // Draw: composite another Graphics instance.
+    let src = new Graphics(8, 8);
+    src.Clear(RED);
+    g.Draw(src, 40, 30);
+    checkEq(g.GetPixel(40, 30), RED,   "Draw top-left of src");
+    checkEq(g.GetPixel(47, 37), RED,   "Draw bottom-right of src");
+    checkEq(g.GetPixel(48, 38), BLACK, "Draw outside src untouched");
+
+    // DrawGfx: same composite via the raw Gfx handle.
+    g.DrawGfx(src.GetGfx(), 40, 50);
+    checkEq(g.GetPixel(40, 50), RED, "DrawGfx composites raw handle");
+
+    // CopyRect returns an independent sub-image.
+    let sub = g.CopyRect(40, 30, 8, 8);
+    checkEq(sub.Width(),  8, "CopyRect width");
+    checkEq(sub.Height(), 8, "CopyRect height");
+    checkEq(sub.GetPixel(0, 0), RED, "CopyRect copies pixels");
+    sub.Pixel(0, 0, BLUE);
+    checkEq(g.GetPixel(40, 30), RED, "CopyRect is independent of source");
+
+    // Blend: full-opacity alpha blend equals the source.
+    let g2 = new Graphics(32, 32);
+    g2.Clear(BLACK);
+    g2.Blend(src, 4, 4);
+    checkEq(g2.GetPixel(4, 4), RED, "Blend alpha=255 overwrites");
+
+    // BlendRect with alpha 0 leaves the destination unchanged.
+    let g3 = new Graphics(32, 32);
+    g3.Clear(BLACK);
+    g3.BlendRect(src, 4, 4, 0);
+    checkEq(g3.GetPixel(4, 4), BLACK, "BlendRect alpha=0 is invisible");
+}
+
+// ============================================================
+// Filters & image effects
+// ============================================================
+
+fn test_filters() {
+    Console.WriteLine("-- filters & effects");
+
+    // Filter on a region: pixels inside remapped, outside untouched.
+    let g = new Graphics(16, 16);
+    g.Clear(BLACK);
+    g.Filter(fn(_p) { return 0xFF112233; }, 0, 0, 4, 4);
+    checkEq(g.GetPixel(0, 0), 0xFF112233, "Filter remaps region pixel");
+    checkEq(g.GetPixel(3, 3), 0xFF112233, "Filter remaps region corner");
+    checkEq(g.GetPixel(5, 5), BLACK,      "Filter leaves outside untouched");
+
+    // FilterAll covers the whole canvas.
+    g.FilterAll(fn(_p) { return BLUE; });
+    checkEq(g.GetPixel(0, 0),   BLUE, "FilterAll remaps (0,0)");
+    checkEq(g.GetPixel(15, 15), BLUE, "FilterAll remaps (w-1,h-1)");
+
+    // GrayscaleAll: red becomes a mid gray with r == g == b, alpha preserved.
+    let g2 = new Graphics(16, 16);
+    g2.Clear(RED);
+    g2.GrayscaleAll();
+    let gp = g2.GetPixel(8, 8);
+    let r = (gp >> 16) & 0xFF;
+    let gg = (gp >> 8) & 0xFF;
+    let b = gp & 0xFF;
+    check(r == gg && gg == b, "GrayscaleAll gives r == g == b");
+    check(r > 0 && r < 255,   "grayscale of red is a mid gray");
+    checkEq((gp >> 24) & 0xFF, 0xFF, "GrayscaleAll preserves alpha");
+
+    // Grayscale on a region only.
+    let g3 = new Graphics(16, 16);
+    g3.Clear(RED);
+    g3.Grayscale(0, 0, 8, 8);
+    let inR = g3.GetPixel(2, 2);
+    check(((inR >> 16) & 0xFF) == ((inR >> 8) & 0xFF), "Grayscale region converted");
+    checkEq(g3.GetPixel(12, 12), RED, "Grayscale outside region untouched");
+
+    // BrightnessAll(2.0): 100 -> 200 per channel, exact.
+    let g4 = new Graphics(16, 16);
+    g4.Clear(0xFF646464);
+    g4.BrightnessAll(2.0);
+    checkEq(g4.GetPixel(8, 8), 0xFFC8C8C8, "BrightnessAll doubles channels");
+
+    // Brightness clamps at 255.
+    let g5 = new Graphics(16, 16);
+    g5.Clear(0xFFC8C8C8);
+    g5.Brightness(0, 0, 16, 16, 2.0);
+    checkEq(g5.GetPixel(8, 8), WHITE, "Brightness clamps to 255");
+}
+
+// ============================================================
+// Transforms (Resize / Rescale)
+// ============================================================
+
+fn test_transforms() {
+    Console.WriteLine("-- transforms");
+
+    let g = new Graphics(8, 8);
+    g.Clear(RED);
+    g.Resize(16, 16);
+    checkEq(g.Width(),  16, "Resize updates Width()");
+    checkEq(g.Height(), 16, "Resize updates Height()");
+    checkEq(g.GetPixel(15, 15), RED, "Resize keeps solid color");
+
+    g.RescaleUniform(2.0);
+    checkEq(g.Width(),  32, "RescaleUniform doubles width");
+    checkEq(g.Height(), 32, "RescaleUniform doubles height");
+    checkEq(g.GetPixel(31, 31), RED, "RescaleUniform keeps solid color");
+
+    g.Rescale(0.5, 0.5);
+    checkEq(g.Width(),  16, "Rescale halves width");
+    checkEq(g.Height(), 16, "Rescale halves height");
+    checkEq(g.GetPixel(0, 0), RED, "Rescale keeps solid color");
+}
+
+// ============================================================
+// PNG round-trip (Save / FromFile / LoadImage / ToBlock)
+// ============================================================
+
+fn test_png_roundtrip() {
+    Console.WriteLine("-- png round-trip");
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_gfx_test_" + str(Time.Millis()) + ".png");
+
+    let g = new Graphics(20, 12);
+    g.Clear(BLUE);
+    g.Pixel(3, 4, RED);
+    g.Pixel(19, 11, GREEN);
+
+    check(g.Save(path) == true, "Save returns true");
+    check(File.Exists(path),    "PNG file exists on disk");
+
+    let loaded = Graphics.FromFile(path);
+    check(loaded != nil, "FromFile loads the PNG");
+    if (loaded != nil) {
+        checkEq(loaded.Width(),  20, "loaded width");
+        checkEq(loaded.Height(), 12, "loaded height");
+        checkEq(loaded.GetPixel(0, 0),   BLUE,  "loaded background pixel");
+        checkEq(loaded.GetPixel(3, 4),   RED,   "loaded marker pixel");
+        checkEq(loaded.GetPixel(19, 11), GREEN, "loaded corner pixel");
+    }
+
+    let img = Graphics.LoadImage(path);
+    check(img != nil, "LoadImage loads the PNG");
+    if (img != nil) {
+        checkEq(img.GetPixel(3, 4), RED, "LoadImage pixel matches");
+    }
+
+    File.Delete(path);
+    check(!File.Exists(path), "temp PNG deleted");
+
+    check(Graphics.FromFile(path) == nil, "FromFile on missing file -> nil");
+
+    // In-memory PNG: block starts with the PNG signature.
+    let blk = g.ToBlock();
+    check(blk != nil,    "ToBlock returns a block");
+    check(len(blk) > 8,  "ToBlock has content");
+    checkEq(blk[0] & 0xFF, 0x89, "PNG signature byte 0");
+    checkEq(blk[1] & 0xFF, 0x50, "PNG signature byte 1 ('P')");
+    checkEq(blk[2] & 0xFF, 0x4E, "PNG signature byte 2 ('N')");
+    checkEq(blk[3] & 0xFF, 0x47, "PNG signature byte 3 ('G')");
+}
+
+// ============================================================
+// Benchmarks
+// ============================================================
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Graphics benchmarks ===");
+
+    let g = new Graphics(256, 256);
+    g.SetStroke(WHITE);
+    g.SetFill(RED);
+
+    let t0 = Time.Ticks();
+    iter (i from 0 to 1999) { g.Clear(0xFF3366CC); }
+    Console.WriteLine("Clear 256x256      (2000 iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    t0 = Time.Ticks();
+    iter (i from 0 to 1999) { g.FillRect(32, 32, 128, 128); }
+    Console.WriteLine("FillRect 128x128   (2000 iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    t0 = Time.Ticks();
+    iter (i from 0 to 999) { g.FillCircle(128, 128, 60); }
+    Console.WriteLine("FillCircle r=60    (1000 iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    t0 = Time.Ticks();
+    iter (i from 0 to 1999) { g.Line(0, 0, 255, 255); }
+    Console.WriteLine("Line diagonal      (2000 iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    let poly = [30, 30, 220, 40, 200, 220, 60, 200, 90, 120];
+    t0 = Time.Ticks();
+    iter (i from 0 to 999) { g.FillPolygon(poly); }
+    Console.WriteLine("FillPolygon 5-vert (1000 iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    t0 = Time.Ticks();
+    iter (i from 0 to 999) { g.DrawText(10, 10, "The quick brown fox"); }
+    Console.WriteLine("DrawText 19 chars  (1000 iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    t0 = Time.Ticks();
+    iter (i from 0 to 19) { let _b = g.ToBlock(); }
+    Console.WriteLine("PNG encode 256x256 (20 iters):   ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    Console.WriteLine("=== benchmarks done ===");
+}
+
+fn Main() {
+    Console.WriteLine("=== Graphics test suite ===");
+
+    test_construction();
+    test_style();
+    test_colors();
+    test_pixels();
+    test_lines();
+    test_rects();
+    test_circles();
+    test_arcs_polys();
+    test_text();
+    test_compositing();
+    test_filters();
+    test_transforms();
+    test_png_roundtrip();
+    test_benchmarks();
+
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    if (testsFailed == 0) {
+        Console.WriteLine("✅ All Graphics tests passed!");
+    } else {
+        Console.WriteLine("❌ Some Graphics tests failed");
+    }
+    return testsFailed;
+}

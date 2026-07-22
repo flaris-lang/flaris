@@ -1,0 +1,910 @@
+// =============================================================================
+// BinaryIO.fls - Binary serialization and deserialization for Flaris.
+// Version: 1.0
+//
+// Six classes covering every binary I/O use case:
+//
+//   BinaryWriter       - growable in-memory write buffer (block-backed, fast).
+//                        This is Flaris's in-memory stream (the C# MemoryStream
+//                        equivalent): write typed values, then ToBuffer() -> block.
+//   BinaryReader       - cursor-based reader over a block
+//   BinaryStreamWriter - writes directly to an open stream (file, socket, pipe)
+//   BinaryStreamReader - reads directly from an open stream
+//   BinaryFileWriter   - opens a file path; inherits BinaryStreamWriter
+//   BinaryFileReader   - opens a file path; inherits BinaryStreamReader
+//
+// Usage:
+//   import { BinaryWriter, BinaryReader,
+//            BinaryFileWriter, BinaryFileReader } from library("BinaryIO", "1.0");
+//
+//   // In-memory write / read round-trip
+//   let w = new BinaryWriter();
+//   w.WriteU32(0xDEADBEEF);
+//   w.WriteString("hello");
+//   let blk = w.ToBuffer();
+//
+//   let r = new BinaryReader(blk);
+//   Console.WriteLine(r.ReadU32());     // 3735928559
+//   Console.WriteLine(r.ReadString());  // hello
+//
+//   // File I/O
+//   let fw = new BinaryFileWriter("data.bin");
+//   fw.WriteU64(12345); fw.Close();
+//
+//   let fr = new BinaryFileReader("data.bin");
+//   Console.WriteLine(fr.ReadU64());    // 12345
+//   fr.Close();
+//
+// Endianness:
+//   Default is little-endian.  Pass true as the second constructor argument,
+//   or call SetBigEndian(true), to switch.  Individual multi-byte methods obey
+//   the current setting.
+//
+// Float methods (WriteF32 / WriteF64 / ReadF32 / ReadF64) work in safe mode -
+// they use Buffer.*FloatAt directly on the backing block (no -u needed).
+//
+// =============================================================================
+//
+// BinaryWriter API
+// ----------------
+//   Constructor(bigEndian?)
+//   WriteU8(v)  WriteI8(v)  WriteBool(v)
+//   WriteU16(v) WriteI16(v)
+//   WriteU24(v) WriteI24(v)
+//   WriteU32(v) WriteI32(v)
+//   WriteU64(v) WriteI64(v)
+//   WriteF32(v) WriteF64(v)          - IEEE 32/64-bit float
+//   WriteString(s)                   - u16 length prefix + UTF-8 bytes
+//   WriteString32(s)                 - u32 length prefix
+//   WriteStringVar(s)                - LEB128 length prefix
+//   WriteCString(s)                  - null-terminated
+//   WriteStringFixed(s, n)           - fixed-width n bytes, zero-padded or truncated
+//   WriteBytes(block)
+//   WriteArray(arr)                  - array of integers as bytes; chainable
+//   WritePad(n)                      - n zero bytes
+//   WriteVarUInt(v)                  - LEB128 unsigned
+//   WriteVarInt(v)                   - LEB128 zigzag signed
+//   WriteBits(v, n)                  - write n bits from v (LSB first)
+//   FlushBits()                      - flush any partial byte
+//   Align(n)                         - pad to n-byte boundary
+//   Mark()  Reset()                  - save and restore position
+//   Seek(pos)  Position()  Size()
+//   EnableChecksum()  ResetChecksum()  Checksum()  - ISO-HDLC CRC32
+//   SetBigEndian(bool)
+//   ToBuffer()  →  block             - returns filled bytes as a new block
+//   Clear()                          - reset position to 0
+//   Flush()                          - no-op for in-memory writer
+//
+// BinaryReader API
+// ----------------
+//   Constructor(block, bigEndian?)
+//   ReadU8()  ReadI8()  ReadBool()
+//   ReadU16() ReadI16()
+//   ReadU24() ReadI24()
+//   ReadU32() ReadI32()
+//   ReadU64() ReadI64()
+//   ReadF32() ReadF64()              - IEEE 32/64-bit float
+//   ReadString()                     - reads u16-prefixed string
+//   ReadString32()                   - reads u32-prefixed string
+//   ReadStringVar()                  - reads LEB128-prefixed string
+//   ReadStringFixed(n)               - reads exactly n bytes as string
+//   ReadCString()                    - reads until null byte
+//   ReadBytes(n)  →  block
+//   ReadRemaining()  →  block
+//   ReadVarUInt()  ReadVarInt()
+//   ReadBits(n)  AlignBits()
+//   PeekU8()  PeekU16()  PeekU32()  - read without advancing
+//   Skip(n)  Align(n)
+//   Mark()  Reset()
+//   Seek(pos)  Position()  Size()  BytesLeft()  IsEOF()
+//   EnableChecksum()  ResetChecksum()  Checksum()
+//   Slice(offset, n)  →  BinaryReader - sub-reader over a region
+//   CopyTo(writer, n)
+//
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// Internal CRC32 helper (ISO-HDLC, poly 0xEDB88320)
+// -----------------------------------------------------------------------------
+fn _bio_crc_step(crc:int, b:int):int {
+    crc = crc ^ (b & 0xFF);
+    let i:int = 0;
+    while (i < 8) {
+        if ((crc & 1) != 0) {
+            crc = (crc >> 1) ^ 0xEDB88320;
+        } else {
+            crc = crc >> 1;
+        }
+        i += 1;
+    }
+    return crc;
+}
+
+
+// =============================================================================
+// BinaryWriter  (block-backed: direct native byte stores, no array boxing)
+// =============================================================================
+class BinaryWriter
+{
+    let _buf:block    = nil;
+    let _cap:int      = 0;
+    let _pos:int      = 0;
+    let _size:int     = 0;   // high-water mark: max byte ever written
+    let _be:bool      = false;
+    let _mark:int     = 0;
+    let _bit_buf:int  = 0;
+    let _bit_cnt:int  = 0;
+    let _csum_on:bool = false;
+    let _csum:int     = 0xFFFFFFFF;
+
+    fn Constructor(bigEndian:bool|nil) {
+        _buf = Buffer.Create(256, 1);
+        _cap = 256;
+        _be  = (bigEndian == true);
+    }
+
+    // ---- internal ----
+
+    fn _grow(need:int) {
+        let c:int = _cap;
+        while (c < _pos + need) { c = c * 2; }
+        Buffer.Reserve(_buf, c);
+        _cap = c;
+    }
+
+    fn _wb(v:int) {
+        let b:int = v & 0xFF;
+        if (_pos >= _cap) { _grow(1); }
+        Buffer.WriteU8At(_buf, _pos, b);
+        _pos += 1;
+        if (_csum_on) { _csum = _bio_crc_step(_csum, b); }
+    }
+
+    // ---- integer writes ----
+
+    fn WriteU8(v:int) {
+        let b:int = v & 0xFF;
+        if (_pos >= _cap) { _grow(1); }
+        Buffer.WriteU8At(_buf, _pos, b);
+        _pos += 1;
+        if (_csum_on) { _csum = _bio_crc_step(_csum, b); }
+    }
+    fn WriteI8(v:int)    { WriteU8(v); }
+    fn WriteBool(v:bool) { WriteU8(v ? 1 : 0); }
+
+    fn WriteU16(v:int) {
+        let p:int = _pos;
+        if (p + 2 > _cap) { _grow(2); }
+        if (_csum_on) {
+            if (_be) { _wb(v >> 8); _wb(v); }
+            else     { _wb(v); _wb(v >> 8); }
+        } else {
+            Buffer.WriteU16At(_buf, p, v, _be);
+            _pos = p + 2;
+        }
+    }
+    fn WriteI16(v:int) { WriteU16(v); }
+
+    fn WriteU32(v:int) {
+        let p:int = _pos;
+        if (p + 4 > _cap) { _grow(4); }
+        if (_csum_on) {
+            if (_be) { _wb(v >> 24); _wb(v >> 16); _wb(v >> 8); _wb(v); }
+            else     { _wb(v); _wb(v >> 8); _wb(v >> 16); _wb(v >> 24); }
+        } else {
+            Buffer.WriteU32At(_buf, p, v, _be);
+            _pos = p + 4;
+        }
+    }
+    fn WriteI32(v:int) { WriteU32(v); }
+
+    fn WriteU64(v:int) {
+        let p:int = _pos;
+        if (p + 8 > _cap) { _grow(8); }
+        if (_csum_on) {
+            if (_be) {
+                _wb(v >> 56); _wb(v >> 48); _wb(v >> 40); _wb(v >> 32);
+                _wb(v >> 24); _wb(v >> 16); _wb(v >> 8);  _wb(v);
+            } else {
+                _wb(v);       _wb(v >> 8);  _wb(v >> 16); _wb(v >> 24);
+                _wb(v >> 32); _wb(v >> 40); _wb(v >> 48); _wb(v >> 56);
+            }
+        } else {
+            Buffer.WriteU64At(_buf, p, v, _be);
+            _pos = p + 8;
+        }
+    }
+    fn WriteI64(v:int) { WriteU64(v); }
+
+    fn WriteU24(v:int) {
+        let p:int = _pos;
+        if (p + 3 > _cap) { _grow(3); }
+        if (_csum_on) {
+            if (_be) { _wb(v >> 16); _wb(v >> 8); _wb(v); }
+            else     { _wb(v); _wb(v >> 8); _wb(v >> 16); }
+        } else {
+            if (_be) {
+                Buffer.WriteU8At(_buf, p,   (v >> 16) & 0xFF);
+                Buffer.WriteU8At(_buf, p+1, (v >> 8)  & 0xFF);
+                Buffer.WriteU8At(_buf, p+2,  v & 0xFF);
+            } else {
+                Buffer.WriteU8At(_buf, p,    v & 0xFF);
+                Buffer.WriteU8At(_buf, p+1, (v >> 8)  & 0xFF);
+                Buffer.WriteU8At(_buf, p+2, (v >> 16) & 0xFF);
+            }
+            _pos = p + 3;
+        }
+    }
+    fn WriteI24(v:int) { WriteU24(v); }
+
+    // ---- float writes ----
+    // Buffer.WriteFloat*At handles the IEEE encoding + endianness directly on the
+    // backing block (bounds-checked, no -u, no per-call Memory.Alloc/Free). In
+    // checksum mode we write then re-feed the bytes through _wb so the CRC sees
+    // them in wire order (the bytes are already laid down, so _wb just re-emits).
+
+    fn WriteF32(v:float) {
+        let p:int = _pos;
+        if (p + 4 > _cap) { _grow(4); }
+        Buffer.WriteFloat32At(_buf, p, v, _be);
+        if (_csum_on) {
+            _wb(Buffer.ReadU8At(_buf, p));   _wb(Buffer.ReadU8At(_buf, p + 1));
+            _wb(Buffer.ReadU8At(_buf, p + 2)); _wb(Buffer.ReadU8At(_buf, p + 3));
+        } else {
+            _pos = p + 4;
+        }
+    }
+
+    fn WriteF64(v:float) {
+        let p:int = _pos;
+        if (p + 8 > _cap) { _grow(8); }
+        Buffer.WriteFloat64At(_buf, p, v, _be);
+        if (_csum_on) {
+            iter (i from 0 to 7) { _wb(Buffer.ReadU8At(_buf, p + i)); }
+        } else {
+            _pos = p + 8;
+        }
+    }
+
+    // ---- string writes ----
+
+    fn _writeStr(s:string, n:int) {
+        if (n == 0) { return; }
+        let p:int = _pos;
+        if (p + n > _cap) { _grow(n); }
+        if (_csum_on) {
+            let bytes:array = Buffer.ToArray(Buffer.FromString(s));
+            iter (i from 0 to n - 1) { _wb(bytes[i]); }
+        } else {
+            Buffer.CopyStringAt(_buf, p, s, n);
+            _pos = p + n;
+        }
+    }
+
+    // Flattened fast paths: the common (non-checksum) case writes the length
+    // prefix + bytes with direct Buffer.* calls in a single method, avoiding the
+    // WriteU16/WriteU32/_writeStr dispatch fan-out (~2x fewer method calls). The
+    // checksum case falls back to the byte-stepping helpers so the CRC still sees
+    // every byte.
+    fn WriteString(s:string) {
+        let n:int = len(s);
+        if (_csum_on) { WriteU16(n); _writeStr(s, n); return; }
+        let p:int = _pos;
+        if (p + 2 + n > _cap) { _grow(2 + n); }
+        Buffer.WriteU16At(_buf, p, n, _be);
+        if (n > 0) { Buffer.CopyStringAt(_buf, p + 2, s, n); }
+        _pos = p + 2 + n;
+    }
+
+    fn WriteString32(s:string) {
+        let n:int = len(s);
+        if (_csum_on) { WriteU32(n); _writeStr(s, n); return; }
+        let p:int = _pos;
+        if (p + 4 + n > _cap) { _grow(4 + n); }
+        Buffer.WriteU32At(_buf, p, n, _be);
+        if (n > 0) { Buffer.CopyStringAt(_buf, p + 4, s, n); }
+        _pos = p + 4 + n;
+    }
+
+    fn WriteStringVar(s:string) {
+        let n:int = len(s);
+        WriteVarUInt(n);                       // variable-width prefix keeps its helper
+        if (_csum_on) { _writeStr(s, n); return; }
+        let p:int = _pos;
+        if (p + n > _cap) { _grow(n); }
+        if (n > 0) { Buffer.CopyStringAt(_buf, p, s, n); }
+        _pos = p + n;
+    }
+
+    fn WriteCString(s:string) {
+        let n:int = len(s);
+        if (_csum_on) { _writeStr(s, n); _wb(0); return; }
+        let p:int = _pos;
+        if (p + n + 1 > _cap) { _grow(n + 1); }
+        if (n > 0) { Buffer.CopyStringAt(_buf, p, s, n); }
+        Buffer.WriteU8At(_buf, p + n, 0);
+        _pos = p + n + 1;
+    }
+
+    fn WriteStringFixed(s:string, n:int) {
+        let slen:int = len(s);
+        let p:int = _pos;
+        if (p + n > _cap) { _grow(n); }
+        let copy:int = slen < n ? slen : n;
+        if (copy > 0) { Buffer.CopyStringAt(_buf, p, s, copy); }
+        let i:int = copy;
+        while (i < n) { Buffer.WriteU8At(_buf, p + i, 0); i += 1; }
+        _pos = p + n;
+    }
+
+    // ---- raw bytes ----
+
+    fn WriteBytes(src:block) {
+        let n:int = len(src);
+        if (n == 0) { return; }
+        let p:int = _pos;
+        if (p + n > _cap) { _grow(n); }
+        if (_csum_on) {
+            iter (i from 0 to n - 1) { _wb(Buffer.ReadU8At(src, i)); }
+        } else {
+            Buffer.Copy(src, 0, _buf, p, n);
+            _pos = p + n;
+        }
+    }
+
+    fn WritePad(n:int) {
+        if (_pos + n > _cap) { _grow(n); }
+        let i:int = 0;
+        while (i < n) { Buffer.WriteU8At(_buf, _pos, 0); _pos += 1; i += 1; }
+    }
+
+    fn WriteArray(arr:array) : instance {
+        iter (i from 0 to len(arr) - 1) { this.WriteU8(arr[i]); }
+        return this;
+    }
+
+    fn Align(n:int) {
+        while (_pos % n != 0) { _wb(0); }
+    }
+
+    // ---- variable-length integers ----
+
+    fn WriteVarUInt(v:int) {
+        while (true) {
+            let b:int = v & 0x7F;
+            v = v >> 7;
+            if (v != 0) { _wb(b | 0x80); }
+            else        { _wb(b); break; }
+        }
+    }
+
+    fn WriteVarInt(v:int) {
+        WriteVarUInt((v << 1) ^ (v >> 63));
+    }
+
+    // ---- bit-level writes ----
+
+    fn WriteBits(v:int, n:int) {
+        let i:int = 0;
+        while (i < n) {
+            _bit_buf = _bit_buf | (((v >> i) & 1) << _bit_cnt);
+            _bit_cnt += 1;
+            if (_bit_cnt == 8) {
+                _wb(_bit_buf);
+                _bit_buf = 0;
+                _bit_cnt = 0;
+            }
+            i += 1;
+        }
+    }
+
+    fn FlushBits() {
+        if (_bit_cnt > 0) {
+            _wb(_bit_buf);
+            _bit_buf = 0;
+            _bit_cnt = 0;
+        }
+    }
+
+    // ---- mark / reset ----
+
+    fn Mark()  { _mark = _pos; }
+    fn Reset() {
+        if (_pos > _size) { _size = _pos; }
+        _pos = _mark;
+    }
+
+    // ---- checksum (CRC32) ----
+
+    fn EnableChecksum() { _csum_on = true; _csum = 0xFFFFFFFF; }
+    fn ResetChecksum()  { _csum = 0xFFFFFFFF; }
+    fn Checksum():int   { return _csum_on ? (_csum ^ 0xFFFFFFFF) : 0; }
+
+    // ---- misc ----
+
+    fn SetBigEndian(be:bool) { _be = be; }
+    fn Flush() { return; }
+
+    // ---- cursor / state ----
+
+    fn Seek(pos:int) {
+        if (_pos > _size) { _size = _pos; }
+        if (pos >= 0 && pos <= _size) { _pos = pos; }
+    }
+
+    fn Position():int { return _pos; }
+    fn Size():int     { return _pos > _size ? _pos : _size; }
+
+    fn ToBuffer():block {
+        let s:int = _pos > _size ? _pos : _size;
+        return Buffer.Slice(_buf, 0, s);
+    }
+
+    fn Clear() {
+        _pos  = 0;
+        _size = 0;
+    }
+}
+
+
+// =============================================================================
+// BinaryReader  (block-backed: direct native byte loads, no array conversion)
+// =============================================================================
+class BinaryReader
+{
+    let _buf:block    = nil;
+    let _len:int      = 0;
+    let _pos:int      = 0;
+    let _be:bool      = false;
+    let _mark:int     = 0;
+    let _bit_buf:int  = 0;
+    let _bit_cnt:int  = 0;
+    let _csum_on:bool = false;
+    let _csum:int     = 0xFFFFFFFF;
+
+    fn Constructor(src:block, bigEndian:bool|nil) {
+        _buf = src;
+        _len = len(src);
+        _pos = 0;
+        _be  = (bigEndian == true);
+    }
+
+    // ---- internal ----
+
+    fn _rb():int {
+        if (_pos >= _len) { return 0; }
+        let v:int = Buffer.ReadU8At(_buf, _pos);
+        _pos += 1;
+        if (_csum_on) { _csum = _bio_crc_step(_csum, v); }
+        return v;
+    }
+
+    // ---- integer reads ----
+
+    fn ReadU8():int {
+        let p:int = _pos;
+        if (p >= _len) { return 0; }
+        let v:int = Buffer.ReadU8At(_buf, p);
+        _pos = p + 1;
+        if (_csum_on) { _csum = _bio_crc_step(_csum, v); }
+        return v;
+    }
+    fn ReadI8():int    { let v:int = ReadU8(); return v >= 128 ? v - 256 : v; }
+    fn ReadBool():bool { return ReadU8() != 0; }
+
+    fn ReadU16():int {
+        let p:int = _pos;
+        if (!_csum_on and p + 2 <= _len) {
+            _pos = p + 2;
+            return Buffer.ReadU16At(_buf, p, _be);
+        }
+        let a:int = _rb(); let b:int = _rb();
+        return _be ? ((a << 8) | b) : (a | (b << 8));
+    }
+    fn ReadI16():int {
+        let v:int = ReadU16();
+        return v >= 32768 ? v - 65536 : v;
+    }
+
+    fn ReadU32():int {
+        let p:int = _pos;
+        if (!_csum_on and p + 4 <= _len) {
+            _pos = p + 4;
+            return Buffer.ReadU32At(_buf, p, _be);
+        }
+        let a:int = _rb(); let b:int = _rb();
+        let c:int = _rb(); let d:int = _rb();
+        if (_be) { return (a << 24) | (b << 16) | (c << 8) | d; }
+        return a | (b << 8) | (c << 16) | (d << 24);
+    }
+    fn ReadI32():int {
+        let v:int = ReadU32();
+        return v >= 2147483648 ? v - 4294967296 : v;
+    }
+
+    fn ReadU64():int {
+        let p:int = _pos;
+        if (!_csum_on and p + 8 <= _len) {
+            _pos = p + 8;
+            return Buffer.ReadU64At(_buf, p, _be);
+        }
+        let lo:int = 0; let hi:int = 0;
+        if (_be) { hi = ReadU32(); lo = ReadU32(); }
+        else     { lo = ReadU32(); hi = ReadU32(); }
+        return (hi * 4294967296) + lo;
+    }
+    fn ReadI64():int { return ReadU64(); }
+
+    fn ReadU24():int {
+        let p:int = _pos;
+        if (!_csum_on and p + 3 <= _len) {
+            _pos = p + 3;
+            let a:int = Buffer.ReadU8At(_buf, p);
+            let b:int = Buffer.ReadU8At(_buf, p+1);
+            let c:int = Buffer.ReadU8At(_buf, p+2);
+            if (_be) { return (a << 16) | (b << 8) | c; }
+            return a | (b << 8) | (c << 16);
+        }
+        let a:int = _rb(); let b:int = _rb(); let c:int = _rb();
+        if (_be) { return (a << 16) | (b << 8) | c; }
+        return a | (b << 8) | (c << 16);
+    }
+    fn ReadI24():int {
+        let v:int = ReadU24();
+        return v >= 8388608 ? v - 16777216 : v;
+    }
+
+    // ---- float reads ----
+    // Buffer.ReadFloat*At decodes the IEEE value + endianness directly from the
+    // backing block (bounds-checked, no -u). The bytes stay in _buf, so in
+    // checksum mode we still step _rb over them to advance _pos and update the CRC.
+
+    fn ReadF32():float {
+        let p:int = _pos;
+        if (p + 4 > _len) { _pos = _len; return 0.0; }
+        let v:float = Buffer.ReadFloat32At(_buf, p, _be);
+        if (_csum_on) { _rb(); _rb(); _rb(); _rb(); }
+        else { _pos = p + 4; }
+        return v;
+    }
+
+    fn ReadF64():float {
+        let p:int = _pos;
+        if (p + 8 > _len) { _pos = _len; return 0.0; }
+        let v:float = Buffer.ReadFloat64At(_buf, p, _be);
+        if (_csum_on) { iter (i from 0 to 7) { _rb(); } }
+        else { _pos = p + 8; }
+        return v;
+    }
+
+    // ---- string reads ----
+
+    fn ReadString():string {
+        let n:int = ReadU16();
+        return ReadStringFixed(n);
+    }
+
+    fn ReadCString():string {
+        let start:int = _pos;
+        // Locate the NUL terminator with the native byte search. IndexOf scans the
+        // whole backing block, so clamp to _len: an unterminated string (no NUL
+        // before _len, or none at all -> -1) runs to _len, matching the old loop.
+        let idx:int = Buffer.IndexOf(_buf, 0, start);
+        let end:int = (idx < 0 || idx >= _len) ? _len : idx;
+        let n:int = end - start;
+        _pos = end + 1;
+        if (n == 0) { return ""; }
+        return Buffer.ToString(Buffer.Slice(_buf, start, n));
+    }
+
+    fn ReadStringFixed(n:int):string {
+        if (n == 0) { return ""; }
+        let p:int = _pos;
+        if (p + n > _len) { n = _len - p; }
+        _pos = p + n;
+        return Buffer.ToString(Buffer.Slice(_buf, p, n));
+    }
+
+    fn ReadString32():string  { return ReadStringFixed(ReadU32()); }
+    fn ReadStringVar():string { return ReadStringFixed(ReadVarUInt()); }
+
+    // ---- raw bytes ----
+
+    fn ReadBytes(n:int):block {
+        let p:int = _pos;
+        if (p + n > _len) { n = _len - p; }
+        _pos = p + n;
+        return Buffer.Slice(_buf, p, n);
+    }
+
+    fn Skip(n:int) {
+        _pos += n;
+        if (_pos > _len) { _pos = _len; }
+    }
+
+    fn Align(n:int) {
+        while (_pos % n != 0 && _pos < _len) { _pos += 1; }
+    }
+
+    fn PeekU8():int {
+        if (_pos >= _len) { return 0; }
+        return Buffer.ReadU8At(_buf, _pos);
+    }
+
+    fn PeekU16():int {
+        let saved:int = _pos; let v:int = ReadU16(); _pos = saved; return v;
+    }
+
+    fn PeekU32():int {
+        let saved:int = _pos; let v:int = ReadU32(); _pos = saved; return v;
+    }
+
+    fn ReadRemaining():block {
+        return ReadBytes(_len - _pos);
+    }
+
+    // ---- variable-length integers ----
+
+    fn ReadVarUInt():int {
+        let result:int = 0;
+        let shift:int  = 0;
+        while (true) {
+            let b:int = _rb();
+            result = result | ((b & 0x7F) << shift);
+            if ((b & 0x80) == 0) { break; }
+            shift += 7;
+            if (shift >= 63) { break; }
+        }
+        return result;
+    }
+
+    fn ReadVarInt():int {
+        let u:int = ReadVarUInt();
+        return (u >> 1) ^ -(u & 1);
+    }
+
+    // ---- bit-level reads ----
+
+    fn ReadBits(n:int):int {
+        let result:int = 0;
+        let i:int = 0;
+        while (i < n) {
+            if (_bit_cnt == 0) {
+                _bit_buf = _rb();
+                _bit_cnt = 8;
+            }
+            result   = result | ((_bit_buf & 1) << i);
+            _bit_buf = _bit_buf >> 1;
+            _bit_cnt -= 1;
+            i += 1;
+        }
+        return result;
+    }
+
+    fn AlignBits() {
+        _bit_buf = 0;
+        _bit_cnt = 0;
+    }
+
+    // ---- mark / reset ----
+
+    fn Mark()  { _mark = _pos; }
+    fn Reset() { _pos  = _mark; }
+
+    // ---- slice / copy ----
+
+    fn Slice(offset:int, n:int):instance {
+        let end:int = offset + n;
+        if (end > _len) { end = _len; }
+        return new BinaryReader(Buffer.Slice(_buf, offset, end - offset), _be);
+    }
+
+    fn CopyTo(w:instance, n:int) {
+        let i:int = 0;
+        while (i < n) { w.WriteU8(_rb()); i += 1; }
+    }
+
+    // ---- checksum (CRC32) ----
+
+    fn EnableChecksum() { _csum_on = true; _csum = 0xFFFFFFFF; }
+    fn ResetChecksum()  { _csum = 0xFFFFFFFF; }
+    fn Checksum():int   { return _csum_on ? (_csum ^ 0xFFFFFFFF) : 0; }
+
+    // ---- cursor / state ----
+
+    fn Seek(pos:int) {
+        if (pos >= 0 && pos <= _len) { _pos = pos; }
+    }
+
+    fn Position():int  { return _pos; }
+    fn Size():int      { return _len; }
+    fn BytesLeft():int { return _len - _pos; }
+    fn IsEOF():bool    { return _pos >= _len; }
+}
+
+
+// =============================================================================
+// BinaryStreamWriter  (stream-backed, native C builtins)
+// =============================================================================
+class BinaryStreamWriter
+{
+    let _s:stream = nil;
+    let _be:bool  = false;
+
+    fn Constructor(s:stream, bigEndian:bool|nil) {
+        _s  = s;
+        _be = (bigEndian == true);
+    }
+
+    fn WriteU8(v:int)    { Stream.WriteU8(_s, v); }
+    fn WriteI8(v:int)    { Stream.WriteU8(_s, v & 0xFF); }
+    fn WriteBool(v:bool) { Stream.WriteU8(_s, v ? 1 : 0); }
+    fn WriteU16(v:int)   { Stream.WriteU16(_s, v, _be); }
+    fn WriteI16(v:int)   { Stream.WriteU16(_s, v, _be); }
+    fn WriteU32(v:int)   { Stream.WriteU32(_s, v, _be); }
+    fn WriteI32(v:int)   { Stream.WriteU32(_s, v, _be); }
+    fn WriteU64(v:int)   { Stream.WriteU64(_s, v, _be); }
+    fn WriteI64(v:int)   { Stream.WriteU64(_s, v, _be); }
+
+    fn WriteU24(v:int) {
+        if (_be) { Stream.WriteU8(_s, v >> 16); Stream.WriteU8(_s, v >> 8); Stream.WriteU8(_s, v); }
+        else     { Stream.WriteU8(_s, v);       Stream.WriteU8(_s, v >> 8); Stream.WriteU8(_s, v >> 16); }
+    }
+    fn WriteI24(v:int) { WriteU24(v); }
+
+    fn WriteString(s:string) {
+        let buf:block = Buffer.FromString(s);
+        let n:int     = len(buf);
+        Stream.WriteU16(_s, n, _be);
+        Stream.WriteBytes(_s, buf, n);
+    }
+
+    fn WriteCString(s:string) {
+        let buf:block = Buffer.FromString(s);
+        Stream.WriteBytes(_s, buf, len(buf));
+        Stream.WriteU8(_s, 0);
+    }
+
+    fn WriteStringFixed(s:string, n:int) {
+        let buf:block = Buffer.FromString(s);
+        let slen:int  = len(buf);
+        Stream.WriteBytes(_s, buf, slen < n ? slen : n);
+        let i:int = slen;
+        while (i < n) { Stream.WriteU8(_s, 0); i += 1; }
+    }
+
+    fn WriteBytes(buf:block) {
+        Stream.WriteBytes(_s, buf, len(buf));
+    }
+
+    fn WritePad(n:int) {
+        iter (i from 0 to n - 1) { Stream.WriteU8(_s, 0); }
+    }
+
+    fn Seek(pos:int)  { Stream.Seek(_s, pos); }
+    fn Position():int { return Stream.Tell(_s); }
+
+    fn Flush() { Stream.Flush(_s); }
+
+    fn Close() {
+        Stream.Flush(_s);
+        Stream.Close(_s);
+    }
+}
+
+
+// =============================================================================
+// BinaryStreamReader  (stream-backed, native C builtins)
+// =============================================================================
+class BinaryStreamReader
+{
+    let _s:stream = nil;
+    let _be:bool  = false;
+
+    fn Constructor(s:stream, bigEndian:bool|nil) {
+        _s  = s;
+        _be = (bigEndian == true);
+    }
+
+    fn ReadU8():int    { return Stream.ReadU8(_s); }
+    fn ReadI8():int    { let v:int = Stream.ReadU8(_s); return v >= 128 ? v - 256 : v; }
+    fn ReadBool():bool { return Stream.ReadU8(_s) != 0; }
+    fn ReadU16():int   { return Stream.ReadU16(_s, _be); }
+    fn ReadI16():int   { let v:int = Stream.ReadU16(_s, _be); return v >= 32768 ? v - 65536 : v; }
+    fn ReadU32():int   { return Stream.ReadU32(_s, _be); }
+    fn ReadI32():int   { let v:int = Stream.ReadU32(_s, _be); return v >= 2147483648 ? v - 4294967296 : v; }
+    fn ReadU64():int   { return Stream.ReadU64(_s, _be); }
+    fn ReadI64():int   { return Stream.ReadU64(_s, _be); }
+
+    fn ReadU24():int {
+        let a:int = Stream.ReadU8(_s);
+        let b:int = Stream.ReadU8(_s);
+        let c:int = Stream.ReadU8(_s);
+        if (_be) { return (a << 16) | (b << 8) | c; }
+        return a | (b << 8) | (c << 16);
+    }
+    fn ReadI24():int {
+        let v:int = ReadU24();
+        return v >= 8388608 ? v - 16777216 : v;
+    }
+
+    fn ReadString():string {
+        let n:int = Stream.ReadU16(_s, _be);
+        if (n == 0) return "";
+        let buf:block = Stream.ReadBytes(_s, n);
+        return Buffer.ToString(buf);
+    }
+
+    fn ReadCString():string {
+        let bytes:array = [];
+        let b:int = Stream.ReadU8(_s);
+        while (b != 0) {
+            Array.Append(bytes, b);
+            b = Stream.ReadU8(_s);
+        }
+        let buf:block = Buffer.Create(len(bytes), 1);
+        Buffer.FromArray(buf, bytes);
+        return Buffer.ToString(buf);
+    }
+
+    fn ReadStringFixed(n:int):string {
+        if (n == 0) return "";
+        let buf:block = Stream.ReadBytes(_s, n);
+        return Buffer.ToString(buf);
+    }
+
+    fn ReadBytes(n:int):block { return Stream.ReadBytes(_s, n); }
+
+    fn Skip(n:int)    { Stream.Seek(_s, Stream.Tell(_s) + n); }
+    fn Seek(pos:int)  { Stream.Seek(_s, pos); }
+    fn Position():int { return Stream.Tell(_s); }
+
+    // Stream size is not known without seeking to end; IsEOF is conservative.
+    // For file-backed streams, use BinaryFileReader which knows total size.
+    fn IsEOF() : bool {
+        // Best-effort: attempt to peek; stream readers don't expose total size.
+        return false;  // conservative default; use BytesLeft() for file readers
+    }
+
+    // Stream total size is not available without seeking; returns -1 (unknown).
+    fn BytesLeft() : int { return -1; }
+
+    fn PeekU8() : int {
+        let pos:int = Stream.Tell(_s);
+        let v:int   = Stream.ReadU8(_s);
+        Stream.Seek(_s, pos);
+        return v;
+    }
+
+    fn Close() { Stream.Close(_s); }
+}
+
+
+// =============================================================================
+// BinaryFileWriter
+// =============================================================================
+class BinaryFileWriter : BinaryStreamWriter
+{
+    fn Constructor(path:string, bigEndian:bool|nil) {
+        let s:stream = Stream.Open(path, "w");
+        if (is_nil(s)) { throw(1, "BinaryFileWriter: cannot open '" + path + "' for writing"); }
+        super(s, bigEndian);
+    }
+}
+
+
+// =============================================================================
+// BinaryFileReader
+// =============================================================================
+class BinaryFileReader : BinaryStreamReader
+{
+    fn Constructor(path:string, bigEndian:bool|nil) {
+        let s:stream = Stream.Open(path, "r");
+        if (is_nil(s)) { throw(1, "BinaryFileReader: cannot open '" + path + "' for reading"); }
+        super(s, bigEndian);
+    }
+}
+
+
+export { BinaryWriter, BinaryReader, BinaryStreamWriter, BinaryStreamReader, BinaryFileWriter, BinaryFileReader };

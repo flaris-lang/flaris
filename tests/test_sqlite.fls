@@ -1,0 +1,422 @@
+// test_sqlite.fls - Test suite for the SQLite FFI binding
+//
+// Run (from repo root):
+//   flarisvm --unsafe tests/test_sqlite.fls --libs='./libs'
+//
+// Prerequisites:
+//   - libs/sqlite_ffi.dylib (or .so) compiled - run ./libs/build_sqlite.sh
+//   - SQLite.fls compiled: flarisvm --compile libs/SQLite.fls libs/SQLite.flx
+//
+// Uses an in-memory database - no setup required.
+
+import { SQLite } from library("SQLite", "1.0");
+
+// ── Benchmark helpers ────────────────────────────────────────────────────────
+
+global _sink = 0;
+global _bdb  = nil;   // DB handle captured by bench lambdas
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 44),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine("------------------------------------------------------------"); }
+
+fn bench_sqlite(db) {
+    _bdb = db;
+
+    // Scratch table used by INSERT benchmarks; isolated from test data
+    db.Exec("CREATE TABLE bench_data (id INTEGER PRIMARY KEY, val TEXT, n REAL)");
+
+    Console.WriteLine("\n========================================");
+    Console.WriteLine(" SQLite Benchmarks");
+    Console.WriteLine("========================================");
+    Console.WriteLine(String.PadRight("benchmark", 44), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("[ Read - in-memory, 3-row table ]");
+
+    bench("ScalarInt  COUNT(*)", fn() {
+        _sink = _bdb.ScalarInt("SELECT COUNT(*) FROM users");
+    }, 2000);
+
+    bench("Query      SELECT 3 rows", fn() {
+        let r = _bdb.Query("SELECT id, name, score FROM users ORDER BY id");
+        _sink = len(r);
+    }, 2000);
+
+    bench("QueryParams  WHERE name = ?", fn() {
+        let r = _bdb.QueryParams("SELECT id, score FROM users WHERE name = ?", ["Alice"]);
+        _sink = len(r);
+    }, 2000);
+
+    benchSep();
+    Console.WriteLine("[ Write - autocommit vs transaction ]");
+
+    bench("ExecParams  INSERT  (autocommit)", fn() {
+        _bdb.ExecParams("INSERT INTO bench_data (val, n) VALUES (?, ?)", ["x", 1.0]);
+    }, 1000);
+
+    // One transaction wrapping 100 inserts - measures throughput, not latency
+    bench("Exec  BEGIN+100×INSERT+COMMIT", fn() {
+        _bdb.Exec("BEGIN");
+        iter (i from 0 to 99) {
+            _bdb.ExecParams("INSERT INTO bench_data (val, n) VALUES (?, ?)", ["t", float(i)]);
+        }
+        _bdb.Exec("COMMIT");
+        _bdb.Exec("DELETE FROM bench_data");
+    }, 20);
+
+    db.Exec("DROP TABLE bench_data");
+}
+
+// ── Test framework ───────────────────────────────────────────────────────────
+
+global passed = 0;
+global failed = 0;
+
+fn check(label:string, cond:bool) {
+    if (cond) {
+        Console.WriteLine("  [PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("  [FAIL] " + label);
+        failed += 1;
+    }
+}
+
+fn checkEq(label:string, actual, expected) {
+    if (actual == expected) {
+        Console.WriteLine("  [PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("  [FAIL] " + label
+            + "  expected=" + str(expected)
+            + "  got="      + str(actual));
+        failed += 1;
+    }
+}
+
+fn checkNotNil(label:string, val) {
+    check(label + " (not nil)", val != nil);
+}
+
+fn checkHasKey(label:string, obj, key:string) {
+    check(label + " has key '" + key + "'", key in obj);
+}
+
+// ── Test groups ──────────────────────────────────────────────────────────────
+
+fn test_open(db) {
+    Console.WriteLine("\n[1] Open");
+    checkNotNil("SQLite.Open returned instance", db);
+}
+
+fn test_create_table(db) {
+    Console.WriteLine("\n[2] Exec - CREATE TABLE");
+
+    let n = db.Exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, score REAL, active INTEGER)");
+    check("CREATE TABLE returns >= 0", n >= 0);
+
+    let n2 = db.Exec("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)");
+    check("second CREATE TABLE returns >= 0", n2 >= 0);
+}
+
+fn test_insert_exec(db) {
+    Console.WriteLine("\n[3] ExecParams - INSERT");
+
+    let r1 = db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Alice", 9.5, 1]);
+    checkEq("INSERT Alice - 1 row affected", r1, 1);
+
+    let r2 = db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Bob", 7.0, 0]);
+    checkEq("INSERT Bob - 1 row affected", r2, 1);
+
+    let r3 = db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Carol", 8.25, 1]);
+    checkEq("INSERT Carol - 1 row affected", r3, 1);
+
+    let r4 = db.ExecParams("INSERT INTO config (key, value) VALUES (?, ?)", ["app_name", "FlarisDB"]);
+    checkEq("INSERT config - 1 row affected", r4, 1);
+}
+
+fn test_last_insert_id(db) {
+    Console.WriteLine("\n[4] LastInsertId");
+
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Dave", 6.0, 1]);
+    let id = db.LastInsertId();
+    check("LastInsertId >= 1", id >= 1);
+
+    // Second insert bumps the id
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Eve", 5.5, 0]);
+    let id2 = db.LastInsertId();
+    check("LastInsertId increments", id2 > id);
+
+    // Clean up the extra rows
+    db.ExecParams("DELETE FROM users WHERE name = ?", ["Dave"]);
+    db.ExecParams("DELETE FROM users WHERE name = ?", ["Eve"]);
+}
+
+fn test_scalar_int(db) {
+    Console.WriteLine("\n[5] ScalarInt");
+
+    let count = db.ScalarInt("SELECT COUNT(*) FROM users");
+    checkEq("COUNT(*) = 3", count, 3);
+
+    let bad = db.ScalarInt("SELECT COUNT(*) FROM no_such_table_xyz");
+    checkEq("bad table - nil", bad, nil);
+}
+
+fn test_scalar_string(db) {
+    Console.WriteLine("\n[6] ScalarString");
+
+    let app = db.ScalarString("SELECT value FROM config WHERE key = 'app_name'");
+    checkEq("config lookup = 'FlarisDB'", app, "FlarisDB");
+
+    let missing = db.ScalarString("SELECT value FROM config WHERE key = 'nope'");
+    checkEq("missing row - nil", missing, nil);
+}
+
+fn test_query_rows(db) {
+    Console.WriteLine("\n[7] Query - row count and keys");
+
+    let rows = db.Query("SELECT id, name, score, active FROM users ORDER BY id");
+    checkEq("row count = 3", len(rows), 3);
+    checkHasKey("row[0] has 'id'",     rows[0], "id");
+    checkHasKey("row[0] has 'name'",   rows[0], "name");
+    checkHasKey("row[0] has 'score'",  rows[0], "score");
+    checkHasKey("row[0] has 'active'", rows[0], "active");
+}
+
+fn test_query_types(db) {
+    Console.WriteLine("\n[8] Query - type mapping");
+
+    let rows = db.Query("SELECT id, name, score FROM users ORDER BY id");
+
+    // SQLite INTEGER - int
+    check("id is int",      type(rows[0].id)    == Type.Int);
+    checkEq("Alice id = 1", rows[0].id,          1);
+
+    // SQLite TEXT - string
+    check("name is string",    type(rows[0].name) == Type.String);
+    checkEq("Alice name",      rows[0].name,       "Alice");
+
+    // SQLite REAL - float
+    check("score is float",    type(rows[0].score) == Type.Float);
+    checkEq("Alice score 9.5", rows[0].score,       9.5);
+}
+
+fn test_query_values(db) {
+    Console.WriteLine("\n[9] Query - row values");
+
+    let rows = db.Query("SELECT name, score FROM users ORDER BY id");
+    checkEq("row[0] name", rows[0].name, "Alice");
+    checkEq("row[1] name", rows[1].name, "Bob");
+    checkEq("row[2] name", rows[2].name, "Carol");
+    checkEq("Bob score",   rows[1].score, 7.0);
+    checkEq("Carol score", rows[2].score, 8.25);
+}
+
+fn test_query_empty(db) {
+    Console.WriteLine("\n[10] Query - empty result");
+
+    let rows = db.Query("SELECT * FROM users WHERE name = 'Nobody'");
+    checkEq("empty result is array", type(rows), Type.Array);
+    checkEq("empty array length = 0", len(rows), 0);
+}
+
+fn test_query_null(db) {
+    Console.WriteLine("\n[11] Query - NULL columns become nil");
+
+    db.ExecParams("INSERT INTO users (name, score) VALUES (?, ?)", ["Null_Test", nil]);
+    let rows = db.QueryParams("SELECT score FROM users WHERE name = ?", ["Null_Test"]);
+    checkEq("NULL score - nil", rows[0].score, nil);
+    db.ExecParams("DELETE FROM users WHERE name = ?", ["Null_Test"]);
+}
+
+fn test_query_params(db) {
+    Console.WriteLine("\n[12] QueryParams - parameterized SELECT");
+
+    let rows = db.QueryParams(
+        "SELECT name, score FROM users WHERE active = ? ORDER BY name",
+        [1]);
+    checkEq("active=1 count = 2", len(rows), 2);
+    checkEq("first is Alice",     rows[0].name, "Alice");
+    checkEq("Alice score",        rows[0].score, 9.5);
+
+    let single = db.QueryParams("SELECT id FROM users WHERE name = ?", ["Bob"]);
+    checkEq("Bob row count = 1", len(single), 1);
+    check("Bob id >= 1", single[0].id >= 1);
+
+    // Float param
+    let hi = db.QueryParams("SELECT name FROM users WHERE score > ? ORDER BY score DESC", [8.0]);
+    checkEq("score > 8.0 count = 2", len(hi), 2);
+}
+
+fn test_exec_update_delete(db) {
+    Console.WriteLine("\n[13] ExecParams - UPDATE and DELETE");
+
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Temp", 1.0, 0]);
+
+    let upd = db.ExecParams("UPDATE users SET score = ? WHERE name = ?", [2.0, "Temp"]);
+    checkEq("UPDATE returns 1", upd, 1);
+
+    let verify = db.QueryParams("SELECT score FROM users WHERE name = ?", ["Temp"]);
+    checkEq("updated score = 2.0", verify[0].score, 2.0);
+
+    let del = db.ExecParams("DELETE FROM users WHERE name = ?", ["Temp"]);
+    checkEq("DELETE returns 1", del, 1);
+}
+
+fn test_exec_error(db) {
+    Console.WriteLine("\n[14] Exec - error handling");
+
+    let bad = db.Exec("DELETE FROM no_such_table_xyz");
+    checkEq("bad Exec - -1", bad, -1);
+
+    let bad2 = db.Query("SELECT * FROM no_such_table_xyz");
+    check("bad Query has error key", "error" in bad2);
+    check("error message non-empty", len(bad2.error) > 0);
+}
+
+fn test_transaction(db) {
+    Console.WriteLine("\n[15] Transaction");
+
+    db.Exec("BEGIN");
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Txn1", 3.0, 1]);
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["Txn2", 4.0, 1]);
+    db.Exec("COMMIT");
+
+    let count = db.ScalarInt("SELECT COUNT(*) FROM users WHERE name LIKE 'Txn%'");
+    checkEq("both txn rows committed", count, 2);
+
+    // Rollback test
+    db.Exec("BEGIN");
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["TxnRoll", 0.0, 0]);
+    db.Exec("ROLLBACK");
+
+    let rolled = db.ScalarInt("SELECT COUNT(*) FROM users WHERE name = 'TxnRoll'");
+    checkEq("rolled-back row gone", rolled, 0);
+
+    db.Exec("DELETE FROM users WHERE name LIKE 'Txn%'");
+}
+
+fn test_query_one(db) {
+    Console.WriteLine("\n[16] QueryOne / QueryOneParams");
+
+    let row = db.QueryOne("SELECT name, score FROM users WHERE name = 'Alice'");
+    checkNotNil("QueryOne found Alice",       row);
+    checkEq("QueryOne name",                  row.name,  "Alice");
+    checkEq("QueryOne score",                 row.score, 9.5);
+
+    let none = db.QueryOne("SELECT name FROM users WHERE name = 'DoesNotExist'");
+    checkEq("QueryOne on empty - nil",        none, nil);
+
+    let rowp = db.QueryOneParams("SELECT name FROM users WHERE score > ?", [9.0]);
+    checkNotNil("QueryOneParams found row",   rowp);
+
+    let nonep = db.QueryOneParams("SELECT name FROM users WHERE score > ?", [100.0]);
+    checkEq("QueryOneParams empty - nil",     nonep, nil);
+}
+
+fn test_scalar_params(db) {
+    Console.WriteLine("\n[17] ScalarIntParams / ScalarStringParams");
+
+    let cnt = db.ScalarIntParams("SELECT COUNT(*) FROM users WHERE score > ?", [5.0]);
+    check("ScalarIntParams count > 0", cnt > 0);
+
+    let name = db.ScalarStringParams("SELECT name FROM users WHERE name = ?", ["Alice"]);
+    checkEq("ScalarStringParams name", name, "Alice");
+
+    let miss = db.ScalarIntParams("SELECT COUNT(*) FROM users WHERE score > ?", [999.0]);
+    checkEq("ScalarIntParams zero result", miss, 0);
+
+    let misss = db.ScalarStringParams("SELECT name FROM users WHERE name = ?", ["Nobody"]);
+    checkEq("ScalarStringParams missing - nil", misss, nil);
+}
+
+fn test_transaction_helper(db) {
+    Console.WriteLine("\n[18] Transaction(fn) helper - commit + rollback");
+
+    // Commit path: f returns true
+    let ok = db.Transaction(fn() {
+        db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["TxH1", 1.0, 1]);
+        db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["TxH2", 2.0, 1]);
+        return true;
+    });
+    checkEq("Transaction commit returns true", ok, true);
+    let committed = db.ScalarInt("SELECT COUNT(*) FROM users WHERE name LIKE 'TxH%'");
+    checkEq("both rows committed", committed, 2);
+
+    // Rollback path: f returns false
+    let fail = db.Transaction(fn() {
+        db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["TxHRoll", 0.0, 0]);
+        return false;
+    });
+    checkEq("Transaction rollback returns false", fail, false);
+    let rolled = db.ScalarInt("SELECT COUNT(*) FROM users WHERE name = 'TxHRoll'");
+    checkEq("rolled-back row absent", rolled, 0);
+
+    // Clean up
+    db.Exec("DELETE FROM users WHERE name LIKE 'TxH%'");
+}
+
+fn test_close(db) {
+    Console.WriteLine("\n[19] Close");
+
+    let ok = db.Close();
+    checkEq("Close() returns true", ok, true);
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+fn Main() {
+    Console.WriteLine("========================================");
+    Console.WriteLine(" SQLite FFI Test Suite");
+    Console.WriteLine("========================================");
+
+    let db = SQLite.Open(":memory:");
+    if (db == nil) {
+        Console.Error("SQLite.Open returned nil - check sqlite_ffi binary.");
+        return 1;
+    }
+
+    test_open(db);
+    test_create_table(db);
+    test_insert_exec(db);
+    test_last_insert_id(db);
+    test_scalar_int(db);
+    test_scalar_string(db);
+    test_query_rows(db);
+    test_query_types(db);
+    test_query_values(db);
+    test_query_empty(db);
+    test_query_null(db);
+    test_query_params(db);
+    test_exec_update_delete(db);
+    test_exec_error(db);
+    test_transaction(db);
+    test_query_one(db);
+    test_scalar_params(db);
+    test_transaction_helper(db);
+    bench_sqlite(db);
+    test_close(db);
+
+    Console.WriteLine("\n========================================");
+    Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed");
+
+    if (failed == 0) {
+        Console.WriteLine("All tests passed.");
+        return 0;
+    }
+    Console.WriteLine("Some tests FAILED.");
+    return 1;
+}

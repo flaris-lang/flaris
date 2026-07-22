@@ -1,0 +1,1048 @@
+// datetime_test.fls - Test suite for Datetime.fls
+// Run: flarisvm datetime_test.fls
+
+import {DateTime, Duration} from library("Datetime", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + "  expected=" + str(expected) + "  got=" + str(actual));
+    }
+}
+
+// Fixed reference point: 2024-03-15T12:30:45 UTC (Friday, leap year, Q1, week 11)
+global REF_TS = 1710505845;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. Duration - basics
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_basics() {
+    Console.WriteLine("== Duration basics ==");
+    let d = new Duration(3661);
+    checkEq(d.TotalSeconds(), 3661, "TotalSeconds");
+    checkEq(d.TotalMilliseconds(), 3661000, "TotalMilliseconds");
+    checkEq(d.Hours(),   1, "Hours");
+    checkEq(d.Minutes(), 1, "Minutes");
+    checkEq(d.Seconds(), 1, "Seconds");
+    check(!d.IsNegative(), "IsNegative false");
+    check(!d.IsZero(),     "IsZero false");
+    let zero = new Duration(0);
+    check(zero.IsZero(), "IsZero true");
+    let neg = new Duration(-90);
+    check(neg.IsNegative(), "IsNegative true");
+    checkEq(neg.Abs().TotalSeconds(), 90, "Abs");
+    checkEq(neg.Negate().TotalSeconds(), 90, "Negate");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Duration - static constructors
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_static() {
+    Console.WriteLine("== Duration static constructors ==");
+    checkEq(Duration.FromSeconds(90).TotalSeconds(),        90,     "Seconds(90)");
+    checkEq(Duration.FromMinutes(2).TotalSeconds(),         120,    "Minutes(2)");
+    checkEq(Duration.FromHours(1).TotalSeconds(),           3600,   "Hours(1)");
+    checkEq(Duration.FromDays(1).TotalSeconds(),            86400,  "Days(1)");
+    checkEq(Duration.FromWeeks(1).TotalSeconds(),           604800, "Weeks(1)");
+    checkEq(Duration.FromMilliseconds(5000).TotalSeconds(), 5,      "Milliseconds(5000)");
+    let d = Duration.FromHours(1).Add(Duration.FromMinutes(30));
+    checkEq(d.TotalSeconds(), 5400, "Add Hours+Minutes");
+    let d2 = Duration.FromHours(2).Sub(Duration.FromMinutes(30));
+    checkEq(d2.TotalSeconds(), 5400, "Sub");
+    let d3 = Duration.FromHours(1).Scale(2);
+    checkEq(d3.TotalSeconds(), 7200, "Scale");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. Duration - ToString and Parse
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_tostring_parse() {
+    Console.WriteLine("== Duration ToString / Parse ==");
+    checkEq(Duration.FromHours(1).Add(Duration.FromMinutes(2)).Add(Duration.FromSeconds(3)).ToString(),
+            "01:02:03", "ToString 01:02:03");
+    checkEq(new Duration(0).ToString(),     "00:00:00",  "ToString zero");
+    checkEq(new Duration(-3661).ToString(), "-01:01:01", "ToString negative");
+    checkEq(Duration.Parse("01:30:00").TotalSeconds(), 5400, "Parse 01:30:00");
+    checkEq(Duration.Parse("00:00:45").TotalSeconds(), 45,   "Parse 00:00:45");
+    checkEq(Duration.Parse("02:15").TotalSeconds(),    8100, "Parse 02:15");
+    let p4 = Duration.Parse("-01:00:00");
+    check(p4.IsNegative(), "Parse negative IsNegative");
+    checkEq(p4.TotalSeconds(), -3600, "Parse negative value");
+    let orig = Duration.FromHours(3).Add(Duration.FromMinutes(7)).Add(Duration.FromSeconds(55));
+    checkEq(Duration.Parse(orig.ToString()).TotalSeconds(), orig.TotalSeconds(), "Round-trip");
+    check(Duration.Parse("not-a-duration") == nil, "Parse invalid returns nil");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. Duration - comparison and Between
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_compare() {
+    Console.WriteLine("== Duration comparison ==");
+    let a = Duration.FromHours(1);
+    let b = Duration.FromHours(2);
+    check(a.IsShorterThan(b), "IsShorterThan");
+    check(b.IsLongerThan(a),  "IsLongerThan");
+    check(a.Equals(Duration.FromMinutes(60)), "Equals");
+    let d1 = DateTime.FromUnix(REF_TS);
+    let d2 = DateTime.FromUnix(REF_TS + 3600);
+    checkEq(Duration.Between(d1, d2).TotalSeconds(), 3600, "Between");
+    check(Duration.Between(d2, d1).IsNegative(), "Between negative");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. DateTime - components
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_datetime_components() {
+    Console.WriteLine("== DateTime components ==");
+    let d = DateTime.FromUnix(REF_TS);
+    checkEq(d.YearUTC(),   2024, "YearUTC");
+    checkEq(d.MonthUTC(),  3,    "MonthUTC");
+    checkEq(d.DayUTC(),    15,   "DayUTC");
+    checkEq(d.HourUTC(),   12,   "HourUTC");
+    checkEq(d.MinuteUTC(), 30,   "MinuteUTC");
+    checkEq(d.SecondUTC(), 45,   "SecondUTC");
+    let berlin = d.InZone("Europe/Berlin");
+    checkEq(berlin.Hour(),   13,   "Berlin Hour");
+    checkEq(berlin.Minute(), 30,   "Berlin Minute");
+    checkEq(berlin.Year(),   2024, "Berlin Year");
+    checkEq(d.Unix(),       REF_TS,        "Unix");
+    checkEq(d.UnixMillis(), REF_TS * 1000, "UnixMillis");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. DateTime.Of and Parse
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_datetime_of_parse() {
+    Console.WriteLine("== DateTime.Of / Parse ==");
+    checkEq(DateTime.Of(2024, 3, 15, 12, 30, 45, "UTC").Unix(),              REF_TS, "Of UTC");
+    checkEq(DateTime.Of(2024, 3, 15, 13, 30, 45, "Europe/Berlin").Unix(),    REF_TS, "Of Berlin-UTC");
+    checkEq(DateTime.Parse("2024-03-15T12:30:45", "UTC").Unix(),             REF_TS, "Parse ISO UTC");
+    checkEq(DateTime.FromMillis(REF_TS * 1000).Unix(),                       REF_TS, "FromMillis");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Simple arithmetic
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_datetime_arithmetic() {
+    Console.WriteLine("== DateTime simple arithmetic ==");
+    let d = DateTime.FromUnix(REF_TS);
+    checkEq(d.AddSeconds(15).SecondUTC(), 0,  "AddSeconds");
+    checkEq(d.AddMinutes(30).MinuteUTC(), 0,  "AddMinutes");
+    checkEq(d.AddHours(12).HourUTC(),     0,  "AddHours");
+    checkEq(d.AddDays(1).DayUTC(),        16, "AddDays");
+    checkEq(d.AddWeeks(1).DayUTC(),       22, "AddWeeks");
+    checkEq(d.Add(Duration.FromHours(2)).HourUTC(),  14, "Add Duration");
+    checkEq(d.Sub(Duration.FromHours(2)).HourUTC(),  10, "Sub Duration");
+    checkEq(d.Add(Duration.FromHours(2)).Diff(d).TotalSeconds(), 7200, "Diff");
+    checkEq(d.DiffDays(d.AddDays(3)), -3, "DiffDays");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Calendar arithmetic
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_calendar_arithmetic() {
+    Console.WriteLine("== Calendar arithmetic ==");
+    let jan31 = DateTime.Of(2024, 1, 31, 0, 0, 0, "UTC");
+    let feb   = jan31.AddMonths(1);
+    checkEq(feb.Month(), 2,  "AddMonths Jan-Feb month");
+    checkEq(feb.Day(),   29, "AddMonths Jan31-Feb29 leap");
+    checkEq(DateTime.Of(2023, 1, 31, 0, 0, 0, "UTC").AddMonths(1).Day(), 28, "AddMonths Jan31-Feb28 non-leap");
+    let jan = DateTime.Of(2024, 11, 15, 0, 0, 0, "UTC").AddMonths(2);
+    checkEq(jan.Year(), 2025, "AddMonths cross-year");
+    checkEq(jan.Month(), 1,   "AddMonths cross-year month");
+    let prev = DateTime.Of(2024, 3, 31, 0, 0, 0, "UTC").AddMonths(-1);
+    checkEq(prev.Month(), 2,  "AddMonths negative");
+    checkEq(prev.Day(),   29, "AddMonths negative clamp");
+    let d2025 = DateTime.Of(2024, 6, 15, 0, 0, 0, "UTC").AddYears(1);
+    checkEq(d2025.Year(),  2025, "AddYears year");
+    checkEq(d2025.Month(), 6,    "AddYears month");
+    checkEq(d2025.Day(),   15,   "AddYears day");
+    let ny = DateTime.Of(2024, 2, 29, 0, 0, 0, "UTC").AddYears(1);
+    checkEq(ny.Year(), 2025, "AddYears leap year");
+    checkEq(ny.Day(),  28,   "AddYears leap clamp");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Calendar accessors
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_calendar_accessors() {
+    Console.WriteLine("== Calendar accessors ==");
+    checkEq(DateTime.Of(2024, 1,  1,  0,0,0,"UTC").DayOfYear(), 1,   "DayOfYear Jan1");
+    checkEq(DateTime.FromUnix(REF_TS).DayOfYear(),              75,  "DayOfYear Mar15");
+    checkEq(DateTime.Of(2024, 12, 31, 0,0,0,"UTC").DayOfYear(), 366, "DayOfYear Dec31 leap");
+    checkEq(DateTime.FromUnix(REF_TS).WeekOfYear(), 11, "WeekOfYear wk11");
+    checkEq(DateTime.Of(2024,  1, 1, 0,0,0,"UTC").Quarter(), 1, "Q1");
+    checkEq(DateTime.Of(2024,  4, 1, 0,0,0,"UTC").Quarter(), 2, "Q2");
+    checkEq(DateTime.Of(2024,  7, 1, 0,0,0,"UTC").Quarter(), 3, "Q3");
+    checkEq(DateTime.Of(2024, 10, 1, 0,0,0,"UTC").Quarter(), 4, "Q4");
+    check(DateTime.Of(2024, 1, 1, 0,0,0,"UTC").IsLeapYear(),  "2024 leap");
+    check(!DateTime.Of(2023, 1, 1, 0,0,0,"UTC").IsLeapYear(), "2023 not leap");
+    check(!DateTime.Of(1900, 1, 1, 0,0,0,"UTC").IsLeapYear(), "1900 not leap");
+    check(DateTime.Of(2000, 1, 1, 0,0,0,"UTC").IsLeapYear(),  "2000 leap");
+    checkEq(DateTime.Of(2024, 2, 1, 0,0,0,"UTC").DaysInMonth(), 29, "Feb2024=29");
+    checkEq(DateTime.Of(2023, 2, 1, 0,0,0,"UTC").DaysInMonth(), 28, "Feb2023=28");
+    checkEq(DateTime.Of(2024, 4, 1, 0,0,0,"UTC").DaysInMonth(), 30, "Apr=30");
+    checkEq(DateTime.Of(2024, 1, 1, 0,0,0,"UTC").DaysInMonth(), 31, "Jan=31");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. Predicates
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_predicates() {
+    Console.WriteLine("== Predicates ==");
+    let fri = DateTime.FromUnix(REF_TS);
+    check(fri.IsWeekday(),  "Friday IsWeekday");
+    check(!fri.IsWeekend(), "Friday not IsWeekend");
+    check(fri.AddDays(1).IsWeekend(), "Saturday IsWeekend");
+    check(fri.AddDays(2).IsWeekend(), "Sunday IsWeekend");
+    let d1 = DateTime.Of(2024, 3, 15, 8,  0, 0, "UTC");
+    let d2 = DateTime.Of(2024, 3, 15, 20, 0, 0, "UTC");
+    let d3 = DateTime.Of(2024, 3, 16, 8,  0, 0, "UTC");
+    check(d1.IsSameDay(d2),  "IsSameDay true");
+    check(!d1.IsSameDay(d3), "IsSameDay false");
+    check(d1.IsSameMonth(d3), "IsSameMonth true");
+    check(!d1.IsSameMonth(DateTime.Of(2024, 4, 1, 0,0,0,"UTC")), "IsSameMonth false");
+    check(d1.IsSameYear(DateTime.Of(2024, 12, 31, 0,0,0,"UTC")), "IsSameYear true");
+    check(!d1.IsSameYear(DateTime.Of(2025, 1, 1, 0,0,0,"UTC")),  "IsSameYear false");
+    let start = DateTime.Of(2024, 3,  1, 0,0,0,"UTC");
+    let end   = DateTime.Of(2024, 3, 31, 0,0,0,"UTC");
+    check(fri.IsInRange(start, end), "IsInRange inside");
+    check(!d3.AddMonths(1).IsInRange(start, end), "IsInRange outside");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. Boundary helpers
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_boundaries() {
+    Console.WriteLine("== Boundary helpers ==");
+    let d = DateTime.FromUnix(REF_TS);
+    let sod = d.StartOfDay();
+    checkEq(sod.HourUTC(), 0, "StartOfDay hour");
+    checkEq(sod.DayUTC(),  15, "StartOfDay day");
+    let eod = d.EndOfDay();
+    checkEq(eod.HourUTC(),   23, "EndOfDay hour");
+    checkEq(eod.MinuteUTC(), 59, "EndOfDay minute");
+    checkEq(eod.SecondUTC(), 59, "EndOfDay second");
+    let sow = d.StartOfWeek();
+    checkEq(sow.DayUTC(),     11, "StartOfWeek day");
+    checkEq(sow.WeekdayUTC(), 1,  "StartOfWeek is Monday");
+    let eow = d.EndOfWeek();
+    checkEq(eow.DayUTC(),     17, "EndOfWeek day");
+    checkEq(eow.WeekdayUTC(), 0,  "EndOfWeek is Sunday");
+    checkEq(d.StartOfMonth().DayUTC(),  1,  "StartOfMonth day");
+    checkEq(d.EndOfMonth().DayUTC(),    31, "EndOfMonth Mar=31");
+    checkEq(d.EndOfMonth().HourUTC(),   23, "EndOfMonth hour");
+    checkEq(DateTime.Of(2024, 2, 10, 0,0,0,"UTC").EndOfMonth().DayUTC(), 29, "EndOfMonth Feb2024=29");
+    checkEq(d.StartOfYear().MonthUTC(), 1,  "StartOfYear month");
+    checkEq(d.StartOfYear().DayUTC(),   1,  "StartOfYear day");
+    checkEq(d.EndOfYear().MonthUTC(),   12, "EndOfYear month");
+    checkEq(d.EndOfYear().DayUTC(),     31, "EndOfYear day");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Comparison and range
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_comparison_range() {
+    Console.WriteLine("== Comparison and range ==");
+    let a = DateTime.FromUnix(REF_TS);
+    let b = DateTime.FromUnix(REF_TS + 3600);
+    let c = DateTime.FromUnix(REF_TS - 3600);
+    check(a.IsBefore(b), "IsBefore");
+    check(a.IsAfter(c),  "IsAfter");
+    check(a.Equals(DateTime.FromUnix(REF_TS)), "Equals true");
+    check(!a.Equals(b), "Equals false");
+    checkEq(b.AddHours(5).Clamp(a, b).Unix(),      b.Unix(),              "Clamp high");
+    checkEq(c.Clamp(a, b).Unix(),                  a.Unix(),              "Clamp low");
+    checkEq(a.AddMinutes(30).Clamp(a, b).Unix(),   a.AddMinutes(30).Unix(), "Clamp mid");
+    checkEq(DateTime.Min(a, b).Unix(), a.Unix(), "Min");
+    checkEq(DateTime.Max(a, b).Unix(), b.Unix(), "Max");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. Timezone and formatting
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_timezone_formatting() {
+    Console.WriteLine("== Timezone and formatting ==");
+    let d = DateTime.FromUnix(REF_TS);
+    checkEq(d.UtcOffset(),    0,        "UTC offset=0");
+    checkEq(d.FormatOffset(), "+00:00", "FormatOffset UTC");
+    checkEq(d.InZone("Europe/Berlin").FormatOffset(),    "+01:00", "FormatOffset Berlin");
+    checkEq(d.InZone("America/New_York").FormatOffset(), "-05:00", "FormatOffset NY");
+    checkEq(d.InZone("Europe/Berlin").ToISO(), "2024-03-15T13:30:45+01:00", "ToISO Berlin");
+    checkEq(d.ToISO(),                         "2024-03-15T12:30:45+00:00", "ToISO UTC");
+    checkEq(d.Unix(), d.InZone("Europe/Berlin").Unix(), "InZone preserves ts");
+    check(DateTime.HasTimezone("Europe/Berlin"),      "HasTimezone known");
+    check(!DateTime.HasTimezone("Mars/OlympusMons"),  "HasTimezone unknown");
+    check(len(DateTime.Timezones()) > 50,             "Timezones count");
+    DateTime.RegisterTimezone("Test/Custom", 90);
+    check(DateTime.HasTimezone("Test/Custom"),                     "RegisterTimezone");
+    checkEq(d.InZone("Test/Custom").UtcOffset(), 90,               "RegisterTimezone offset");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14. Duration TotalX extensions
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_totalx() {
+    Console.WriteLine("== Duration TotalX ==");
+    let d = Duration.FromWeeks(2);
+    checkEq(d.TotalWeeks(),   2.0,     "TotalWeeks 2");
+    checkEq(d.TotalDays(),    14.0,    "TotalDays 14");
+    checkEq(d.TotalHours(),   336.0,   "TotalHours 336");
+    checkEq(d.TotalMinutes(), 20160.0, "TotalMinutes 20160");
+    check(Math.AbsF(Duration.FromDays(1).TotalWeeks() - (1.0 / 7.0)) < 1e-9, "TotalWeeks fraction");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. ToString, Format, FormatUTC, ToUTC, FromUnixIn
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_datetime_formatting_extra() {
+    Console.WriteLine("== DateTime formatting extras ==");
+    let d = DateTime.FromUnix(REF_TS);
+    check(String.Contains(d.ToString(), "2024"), "ToString has year");
+    check(String.Contains(d.ToString(), "UTC"),  "ToString has TZ");
+    checkEq(d.Format("%Y/%m/%d"), "2024/03/15", "Format strftime");
+    let berlin = d.InZone("Europe/Berlin");
+    checkEq(berlin.FormatUTC("%H:%M"), "12:30", "FormatUTC ignores zone");
+    checkEq(berlin.Format("%H:%M"),    "13:30", "Format respects zone");
+    let utc = berlin.ToUTC();
+    checkEq(utc.Unix(),     berlin.Unix(), "ToUTC timestamp");
+    checkEq(utc.Timezone(), "UTC",         "ToUTC label");
+    let ny = DateTime.FromUnixIn(REF_TS, "America/New_York");
+    checkEq(ny.Unix(),     REF_TS,            "FromUnixIn ts");
+    checkEq(ny.Timezone(), "America/New_York", "FromUnixIn tz");
+    checkEq(ny.Hour(),     7,                  "FromUnixIn local hour");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. DayName, MonthName, DayNameShort, MonthNameShort
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_names() {
+    Console.WriteLine("== DayName / MonthName ==");
+    let d = DateTime.FromUnix(REF_TS);
+    checkEq(d.DayName(),            "Friday",   "DayName Friday");
+    checkEq(d.MonthName(),          "March",    "MonthName March");
+    checkEq(d.AddDays(1).DayName(), "Saturday", "DayName Saturday");
+    checkEq(d.AddDays(2).DayName(), "Sunday",   "DayName Sunday");
+    checkEq(DateTime.Of(2024,  1, 1, 0,0,0,"UTC").MonthName(), "January",  "MonthName Jan");
+    checkEq(DateTime.Of(2024, 12, 1, 0,0,0,"UTC").MonthName(), "December", "MonthName Dec");
+
+    // Short names
+    checkEq(d.DayNameShort(),            "Fri", "DayNameShort Fri");
+    checkEq(d.AddDays(1).DayNameShort(), "Sat", "DayNameShort Sat");
+    checkEq(d.AddDays(2).DayNameShort(), "Sun", "DayNameShort Sun");
+    checkEq(d.MonthNameShort(),          "Mar", "MonthNameShort Mar");
+    checkEq(DateTime.Of(2024,  1, 1, 0,0,0,"UTC").MonthNameShort(), "Jan", "MonthNameShort Jan");
+    checkEq(DateTime.Of(2024, 12, 1, 0,0,0,"UTC").MonthNameShort(), "Dec", "MonthNameShort Dec");
+    checkEq(DateTime.Of(2024,  6, 1, 0,0,0,"UTC").MonthNameShort(), "Jun", "MonthNameShort Jun");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 17. NextWeekday, PreviousWeekday
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_next_prev_weekday() {
+    Console.WriteLine("== NextWeekday / PreviousWeekday ==");
+    let fri = DateTime.FromUnix(REF_TS);  // Friday 2024-03-15
+    let nextMon = fri.NextWeekday(1);
+    checkEq(nextMon.DayUTC(),  18, "NextWeekday Mon day");
+    checkEq(nextMon.Weekday(), 1,  "NextWeekday Mon weekday");
+    checkEq(fri.NextWeekday(5).DayUTC(), 22, "NextWeekday same=next week");
+    let prevMon = fri.PreviousWeekday(1);
+    checkEq(prevMon.DayUTC(),  11, "PreviousWeekday Mon day");
+    checkEq(prevMon.Weekday(), 1,  "PreviousWeekday Mon weekday");
+    checkEq(fri.PreviousWeekday(5).DayUTC(), 8, "PreviousWeekday same=last week");
+}
+
+fn _bdDate(y, m, d) { return DateTime.Of(y, m, d, 12, 0, 0, nil); }
+
+fn test_business_days() {
+    Console.WriteLine("== Business-day arithmetic ==");
+
+    // 2024-01-05 is a Friday (Weekday 5); 2024-01-06/07 weekend; 2024-01-08 Mon.
+    let fri = _bdDate(2024, 1, 5);
+    let sat = _bdDate(2024, 1, 6);
+    let mon = _bdDate(2024, 1, 8);
+
+    check(fri.IsBusinessDay(),  "Fri is a business day");
+    check(!sat.IsBusinessDay(), "Sat is not a business day");
+
+    checkEq(fri.AddBusinessDays(1).DayUTC(),  8,  "Fri +1 bd -> Mon 8");
+    checkEq(fri.AddBusinessDays(5).DayUTC(),  12, "Fri +5 bd -> Fri 12");
+    checkEq(fri.AddBusinessDays(0).DayUTC(),  5,  "Fri +0 bd -> self 5");
+    checkEq(mon.AddBusinessDays(-1).DayUTC(), 5,  "Mon -1 bd -> Fri 5");
+
+    checkEq(sat.NextBusinessDay().DayUTC(),     8, "Sat NextBusinessDay -> Mon 8");
+    checkEq(mon.PreviousBusinessDay().DayUTC(), 5, "Mon PreviousBusinessDay -> Fri 5");
+
+    checkEq(mon.BusinessDaysUntil(_bdDate(2024, 1, 12)), 4, "Mon..Fri business days = 4");
+    checkEq(fri.BusinessDaysUntil(mon), 1, "Fri..Mon business days = 1");
+    checkEq(fri.BusinessDaysUntil(fri), 0, "same day = 0");
+    checkEq(_bdDate(2024, 1, 12).BusinessDaysUntil(mon), -4, "backwards Fri12..Mon8 = -4");
+
+    // Holidays: treat Mon 2024-01-08 as a holiday.
+    let hol = [ _bdDate(2024, 1, 8) ];
+    check(!mon.IsBusinessDay(hol), "Mon is not a business day on holiday");
+    checkEq(fri.AddBusinessDays(1, hol).DayUTC(), 9, "Fri +1 bd skips holiday Mon -> Tue 9");
+    checkEq(fri.BusinessDaysUntil(_bdDate(2024, 1, 12), hol), 4, "Fri..Fri12 with Mon holiday = 4");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. Duration.Days and Duration.Equals edge cases
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_days() {
+    Console.WriteLine("== Duration.Days ==");
+    checkEq(Duration.FromDays(3).Days(),                     3, "Days 3");
+    checkEq(Duration.FromHours(25).Days(),                   1, "Days 25h=1d");
+    checkEq(Duration.FromHours(48).Days(),                   2, "Days 48h=2d");
+    checkEq(new Duration(0).Days(),                          0, "Days zero");
+    // Negative duration: Days() returns non-negative component part
+    checkEq(new Duration(-86400 * 2 - 3661).Days(),          2, "Days negative 2d+");
+    // Equals
+    check(Duration.FromMinutes(120).Equals(Duration.FromHours(2)), "Equals 120m=2h");
+    check(!Duration.FromMinutes(90).Equals(Duration.FromHours(2)), "Equals 90m!=2h");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 19. DateTime.Now, NowIn, NowLocal, Today, ToLocal
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_now_today_local() {
+    Console.WriteLine("== Now / Today / ToLocal ==");
+    let now = DateTime.Now();
+    check(now != nil, "Now not nil");
+    checkEq(now.Timezone(), "UTC", "Now is UTC");
+    check(now.Year() >= 2024, "Now year reasonable");
+
+    let nowBerlin = DateTime.NowIn("Europe/Berlin");
+    check(nowBerlin != nil, "NowIn not nil");
+    checkEq(nowBerlin.Timezone(), "Europe/Berlin", "NowIn timezone label");
+    // Same underlying timestamp
+    check(Math.AbsF(float(now.Unix() - nowBerlin.Unix())) < 2, "NowIn same ts as Now");
+
+    let nowLocal = DateTime.NowLocal();
+    check(nowLocal != nil, "NowLocal not nil");
+    checkEq(nowLocal.Timezone(), "local", "NowLocal timezone label");
+
+    // Today returns start-of-day
+    let today = DateTime.Today("UTC");
+    checkEq(today.HourUTC(), 0,  "Today hour=0");
+    checkEq(today.MinuteUTC(), 0, "Today minute=0");
+    checkEq(today.SecondUTC(), 0, "Today second=0");
+    checkEq(today.Timezone(), "UTC", "Today timezone");
+
+    let todayBerlin = DateTime.Today("Europe/Berlin");
+    checkEq(todayBerlin.Hour(), 0,  "Today Berlin hour=0");
+    checkEq(todayBerlin.Timezone(), "Europe/Berlin", "Today Berlin tz");
+
+    // ToLocal
+    let d = DateTime.FromUnix(REF_TS);
+    let local = d.ToLocal();
+    checkEq(local.Unix(), d.Unix(), "ToLocal preserves ts");
+    checkEq(local.Timezone(), "local", "ToLocal label");
+
+    // IsToday - a fixed past date should not be today
+    let past = DateTime.FromUnix(REF_TS);
+    check(!past.IsToday(), "IsToday false for past");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 20. DateTime.ParseFmt
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_parsefmt() {
+    Console.WriteLine("== DateTime.ParseFmt ==");
+    // Parse using strftime format; result should match DateTime.Of for the same date/time
+    let ref = DateTime.Of(2024, 3, 15, 12, 30, 45, "UTC");
+    let parsed = DateTime.ParseFmt("2024-03-15 12:30:45", "%Y-%m-%d %H:%M:%S", "UTC");
+    checkEq(parsed.Unix(), ref.Unix(), "ParseFmt strftime round-trip");
+    checkEq(parsed.Timezone(), "UTC", "ParseFmt timezone");
+    // Without tz arg (nil → UTC)
+    let parsed2 = DateTime.ParseFmt("2024-03-15 12:30:45", "%Y-%m-%d %H:%M:%S", nil);
+    checkEq(parsed2.Unix(), ref.Unix(), "ParseFmt nil tz");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 21. DateTime.Ago
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_ago() {
+    Console.WriteLine("== Ago ==");
+    // We can't rely on Now() being a fixed value, so test the shape of the output
+    // by constructing relative datetimes from Now.
+    let now = DateTime.Now();
+
+    // 30 seconds ago
+    let ago30s = now.Sub(Duration.FromSeconds(30));
+    let s30 = ago30s.Ago();
+    check(String.Contains(s30, "second"), "Ago 30s contains 'second'");
+    check(String.Contains(s30, "ago"),    "Ago 30s contains 'ago'");
+
+    // 5 minutes ago
+    let ago5m = now.Sub(Duration.FromMinutes(5));
+    let s5m = ago5m.Ago();
+    check(String.Contains(s5m, "minute"), "Ago 5m contains 'minute'");
+    check(String.Contains(s5m, "ago"),    "Ago 5m contains 'ago'");
+
+    // 3 hours ago
+    let ago3h = now.Sub(Duration.FromHours(3));
+    let s3h = ago3h.Ago();
+    check(String.Contains(s3h, "hour"), "Ago 3h contains 'hour'");
+    check(String.Contains(s3h, "ago"),  "Ago 3h contains 'ago'");
+
+    // 2 days ago
+    let ago2d = now.Sub(Duration.FromDays(2));
+    let s2d = ago2d.Ago();
+    check(String.Contains(s2d, "day"), "Ago 2d contains 'day'");
+    check(String.Contains(s2d, "ago"), "Ago 2d contains 'ago'");
+
+    // 1 minute from now (future)
+    let soon = now.Add(Duration.FromMinutes(1));
+    let sFuture = soon.Ago();
+    check(String.Contains(sFuture, "from now"), "Ago future contains 'from now'");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 23. DiffHours, DiffMinutes
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_diff_extras() {
+    Console.WriteLine("== DiffHours / DiffMinutes ==");
+    let a = DateTime.FromUnix(REF_TS);
+    let b = a.AddHours(3).AddMinutes(30);
+    checkEq(a.DiffHours(b),    -3.5,   "DiffHours a-b");
+    checkEq(b.DiffHours(a),     3.5,   "DiffHours b-a");
+    checkEq(a.DiffMinutes(b), -210.0,  "DiffMinutes a-b");
+    checkEq(b.DiffMinutes(a),  210.0,  "DiffMinutes b-a");
+    checkEq(a.DiffHours(a),     0.0,   "DiffHours same");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 24. Duration component parts vs total accessors
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_component_parts() {
+    Console.WriteLine("== Duration component parts ==");
+
+    // Hours() returns floor(abs/3600) - NOT capped at 23 like a clock face.
+    let d25h = Duration.FromHours(25);
+    checkEq(d25h.Hours(),        25,  "Hours 25h=25 (total, not modular)");
+    checkEq(d25h.Minutes(),       0,  "Minutes 25h=0");
+    checkEq(d25h.Seconds(),       0,  "Seconds 25h=0");
+    checkEq(d25h.Days(),          1,  "Days 25h=1");
+
+    // 90 minutes: Hours=1, Minutes=30.
+    let d90m = Duration.FromMinutes(90);
+    checkEq(d90m.Hours(),   1,  "Hours 90m=1");
+    checkEq(d90m.Minutes(), 30, "Minutes 90m=30");
+    checkEq(d90m.Days(),    0,  "Days 90m=0");
+
+    // 1 second short of a full day.
+    let d = new Duration(86399);
+    checkEq(d.Days(),    0,     "Days 86399s=0");
+    checkEq(d.Hours(),   23,    "Hours 86399s=23");
+    checkEq(d.Minutes(), 59,    "Minutes 86399s=59");
+    checkEq(d.Seconds(), 59,    "Seconds 86399s=59");
+
+    // Exactly zero.
+    checkEq(new Duration(0).Days(),    0, "Days zero=0");
+    checkEq(new Duration(0).Hours(),   0, "Hours zero=0");
+    checkEq(new Duration(0).Minutes(), 0, "Minutes zero=0");
+    checkEq(new Duration(0).Seconds(), 0, "Seconds zero=0");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. Duration.Scale (float factor), Negate (positive), Abs (idempotent)
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_scale_negate_abs() {
+    Console.WriteLine("== Duration Scale / Negate / Abs extras ==");
+
+    // Scale with float factor - result is truncated to int seconds.
+    let d = Duration.FromHours(1);
+    checkEq(d.Scale(0.5).TotalSeconds(), 1800, "Scale 0.5 of 1h = 1800s");
+    checkEq(d.Scale(1.5).TotalSeconds(), 5400, "Scale 1.5 of 1h = 5400s");
+    checkEq(d.Scale(0).TotalSeconds(),      0, "Scale 0 = zero duration");
+    checkEq(d.Scale(-1).TotalSeconds(), -3600, "Scale -1 negates");
+
+    // Negate on a positive duration.
+    let pos = Duration.FromMinutes(45);
+    let neg = pos.Negate();
+    check(neg.IsNegative(),                     "Negate positive → negative");
+    checkEq(neg.TotalSeconds(), -2700,          "Negate positive value");
+
+    // Negate on zero.
+    check(new Duration(0).Negate().IsZero(),    "Negate zero stays zero");
+
+    // Abs is idempotent on a positive duration.
+    let pos2 = Duration.FromDays(3);
+    checkEq(pos2.Abs().TotalSeconds(), pos2.TotalSeconds(), "Abs positive idempotent");
+
+    // Abs on zero.
+    check(new Duration(0).Abs().IsZero(), "Abs zero stays zero");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. Duration.FromWeeks with fractional weeks
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_from_weeks_frac() {
+    Console.WriteLine("== Duration.FromWeeks fractional ==");
+    checkEq(Duration.FromWeeks(0.5).TotalSeconds(), 302400, "FromWeeks 0.5 = 302400s");
+    checkEq(Duration.FromWeeks(2).TotalDays(),        14.0, "FromWeeks 2 = 14 days");
+    checkEq(Duration.FromWeeks(0).TotalSeconds(),        0, "FromWeeks 0 = zero");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. DateTime.Today with nil tz
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_today_nil_tz() {
+    Console.WriteLine("== DateTime.Today nil tz ==");
+    let t = DateTime.Today(nil);
+    checkEq(t.HourUTC(),   0,     "Today(nil) hour=0");
+    checkEq(t.MinuteUTC(), 0,     "Today(nil) minute=0");
+    checkEq(t.SecondUTC(), 0,     "Today(nil) second=0");
+    checkEq(t.Timezone(),  "UTC", "Today(nil) timezone=UTC");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. DateTime.Clamp at boundary (value equals min or max)
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_clamp_boundary() {
+    Console.WriteLine("== Clamp at boundary ==");
+    let a = DateTime.FromUnix(REF_TS);
+    let b = DateTime.FromUnix(REF_TS + 3600);
+
+    // Exactly at min → stays at min.
+    checkEq(a.Clamp(a, b).Unix(), a.Unix(), "Clamp at min boundary");
+    // Exactly at max → stays at max.
+    checkEq(b.Clamp(a, b).Unix(), b.Unix(), "Clamp at max boundary");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 29. DateTime.Min / Max with equal timestamps
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_min_max_equal() {
+    Console.WriteLine("== Min / Max with equal timestamps ==");
+    let a = DateTime.FromUnix(REF_TS);
+    let b = DateTime.FromUnix(REF_TS);
+    checkEq(DateTime.Min(a, b).Unix(), REF_TS, "Min equal");
+    checkEq(DateTime.Max(a, b).Unix(), REF_TS, "Max equal");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30. InZone chain and ToUTC round-trip through multiple zones
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_inzone_chain_toutc() {
+    Console.WriteLine("== InZone chain / ToUTC round-trip ==");
+    let utc = DateTime.FromUnix(REF_TS);
+
+    // Hop UTC → Berlin → Tokyo → back to UTC; timestamp must be invariant.
+    let tokyo = utc.InZone("Europe/Berlin").InZone("Asia/Tokyo");
+    checkEq(tokyo.Unix(), REF_TS, "InZone chain preserves ts");
+    checkEq(tokyo.UtcOffset(), 540, "Tokyo offset 540 min");
+
+    let back = tokyo.ToUTC();
+    checkEq(back.Unix(),     REF_TS, "ToUTC after chain ts");
+    checkEq(back.Timezone(), "UTC",  "ToUTC after chain label");
+
+    // InZone on UTC gives correct local hour for LA (-480 min = UTC-8).
+    let la = utc.InZone("America/Los_Angeles");
+    checkEq(la.Hour(), 4, "LA hour from UTC 12:30");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 31. RegisterTimezone with negative offset
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_register_timezone_negative() {
+    Console.WriteLine("== RegisterTimezone negative offset ==");
+    DateTime.RegisterTimezone("Test/West", -120);
+    check(DateTime.HasTimezone("Test/West"),               "HasTimezone Test/West");
+    let d = DateTime.FromUnix(REF_TS);
+    checkEq(d.InZone("Test/West").UtcOffset(),   -120,    "Test/West offset -120");
+    // Local hour should be UTC-2: 12 - 2 = 10.
+    checkEq(d.InZone("Test/West").Hour(),          10,    "Test/West local hour");
+    checkEq(d.InZone("Test/West").FormatOffset(), "-02:00", "Test/West FormatOffset");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 32. Ago - singular forms (1 second, 1 minute, 1 hour, 1 day)
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_ago_singular() {
+    Console.WriteLine("== Ago singular forms ==");
+    let now = DateTime.Now();
+
+    let s1 = now.Sub(Duration.FromSeconds(1)).Ago();
+    check(String.Contains(s1, "1 second"), "Ago 1s singular");
+    check(!String.Contains(s1, "seconds"), "Ago 1s not plural");
+
+    let s2 = now.Sub(Duration.FromMinutes(1)).Ago();
+    check(String.Contains(s2, "1 minute"), "Ago 1m singular");
+    check(!String.Contains(s2, "minutes"), "Ago 1m not plural");
+
+    let s3 = now.Sub(Duration.FromHours(1)).Ago();
+    check(String.Contains(s3, "1 hour"), "Ago 1h singular");
+    check(!String.Contains(s3, "hours"), "Ago 1h not plural");
+
+    let s4 = now.Sub(Duration.FromDays(1)).Ago();
+    check(String.Contains(s4, "1 day"), "Ago 1d singular");
+    check(!String.Contains(s4, "days"), "Ago 1d not plural");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 33. IsSameDay across timezone boundary
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_issameday_timezone() {
+    Console.WriteLine("== IsSameDay across timezone ==");
+    // 2024-03-15 23:30 UTC is 2024-03-16 00:30 in UTC+1 (Berlin).
+    let lateUtc    = DateTime.Of(2024, 3, 15, 23, 30, 0, "UTC");
+    let earlyBerlin = lateUtc.InZone("Europe/Berlin");
+
+    // UTC day is the 15th; Berlin local day is the 16th.
+    checkEq(lateUtc.DayUTC(),     15, "lateUtc DayUTC=15");
+    checkEq(earlyBerlin.Day(),    16, "Berlin local day=16");
+
+    // IsSameDay compares local components, so UTC-view vs Berlin-view differ.
+    check(!lateUtc.IsSameDay(earlyBerlin), "IsSameDay differs across timezone");
+
+    // Two datetimes that share the same local date in their respective zones.
+    let utcDay  = DateTime.Of(2024, 3, 15, 6, 0, 0, "UTC");
+    let utcDay2 = DateTime.Of(2024, 3, 15, 18, 0, 0, "UTC");
+    check(utcDay.IsSameDay(utcDay2), "IsSameDay same UTC day");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 34. DayOfYear - non-leap Feb 28 and Dec 31
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_dayofyear_extra() {
+    Console.WriteLine("== DayOfYear extra boundary cases ==");
+    // Feb 28 non-leap year → day 59.
+    checkEq(DateTime.Of(2023, 2, 28, 0,0,0,"UTC").DayOfYear(), 59, "DayOfYear 2023 Feb28=59");
+    // Dec 31 non-leap year → 365.
+    checkEq(DateTime.Of(2023, 12, 31, 0,0,0,"UTC").DayOfYear(), 365, "DayOfYear 2023 Dec31=365");
+    // Feb 29 leap year → day 60.
+    checkEq(DateTime.Of(2024, 2, 29, 0,0,0,"UTC").DayOfYear(), 60, "DayOfYear 2024 Feb29=60");
+    // Jan 1 any year → 1.
+    checkEq(DateTime.Of(2023, 1, 1, 0,0,0,"UTC").DayOfYear(), 1, "DayOfYear Jan1=1");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 35. WeekOfYear boundary - first and last week
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_weekofyear_boundary() {
+    Console.WriteLine("== WeekOfYear boundary ==");
+    // 2024-01-04 (Thursday) is in ISO week 1 of 2024.
+    checkEq(DateTime.Of(2024, 1, 4, 0,0,0,"UTC").WeekOfYear(), 1, "WeekOfYear 2024-01-04=1");
+    // 2024-01-01 (Monday) is in ISO week 1 of 2024.
+    checkEq(DateTime.Of(2024, 1, 1, 0,0,0,"UTC").WeekOfYear(), 1, "WeekOfYear 2024-01-01=1");
+    // 2024-12-28 (Saturday) is in ISO week 52 of 2024.
+    checkEq(DateTime.Of(2024, 12, 28, 0,0,0,"UTC").WeekOfYear(), 52, "WeekOfYear 2024-12-28=52");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 36. Quarter - all months explicitly
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_quarter_all_months() {
+    Console.WriteLine("== Quarter all months ==");
+    checkEq(DateTime.Of(2024,  1, 15, 0,0,0,"UTC").Quarter(), 1, "Jan → Q1");
+    checkEq(DateTime.Of(2024,  2, 15, 0,0,0,"UTC").Quarter(), 1, "Feb → Q1");
+    checkEq(DateTime.Of(2024,  3, 15, 0,0,0,"UTC").Quarter(), 1, "Mar → Q1");
+    checkEq(DateTime.Of(2024,  4, 15, 0,0,0,"UTC").Quarter(), 2, "Apr → Q2");
+    checkEq(DateTime.Of(2024,  5, 15, 0,0,0,"UTC").Quarter(), 2, "May → Q2");
+    checkEq(DateTime.Of(2024,  6, 15, 0,0,0,"UTC").Quarter(), 2, "Jun → Q2");
+    checkEq(DateTime.Of(2024,  7, 15, 0,0,0,"UTC").Quarter(), 3, "Jul → Q3");
+    checkEq(DateTime.Of(2024,  8, 15, 0,0,0,"UTC").Quarter(), 3, "Aug → Q3");
+    checkEq(DateTime.Of(2024,  9, 15, 0,0,0,"UTC").Quarter(), 3, "Sep → Q3");
+    checkEq(DateTime.Of(2024, 10, 15, 0,0,0,"UTC").Quarter(), 4, "Oct → Q4");
+    checkEq(DateTime.Of(2024, 11, 15, 0,0,0,"UTC").Quarter(), 4, "Nov → Q4");
+    checkEq(DateTime.Of(2024, 12, 15, 0,0,0,"UTC").Quarter(), 4, "Dec → Q4");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 37. NextWeekday / PreviousWeekday across month boundary
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_next_prev_weekday_month_boundary() {
+    Console.WriteLine("== NextWeekday / PreviousWeekday across month boundary ==");
+    // 2024-03-29 is a Friday. Next Monday (1) is 2024-04-01.
+    let fri29 = DateTime.Of(2024, 3, 29, 0,0,0,"UTC");
+    let nextMon = fri29.NextWeekday(1);
+    checkEq(nextMon.MonthUTC(), 4,  "NextWeekday crosses month → April");
+    checkEq(nextMon.DayUTC(),   1,  "NextWeekday crosses month → day 1");
+    checkEq(nextMon.Weekday(),  1,  "NextWeekday result is Monday");
+
+    // 2024-04-01 is a Monday. Previous Friday (5) is 2024-03-29.
+    let mon1 = DateTime.Of(2024, 4, 1, 0,0,0,"UTC");
+    let prevFri = mon1.PreviousWeekday(5);
+    checkEq(prevFri.MonthUTC(), 3,  "PreviousWeekday crosses month → March");
+    checkEq(prevFri.DayUTC(),   29, "PreviousWeekday crosses month → day 29");
+    checkEq(prevFri.Weekday(),  5,  "PreviousWeekday result is Friday");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 38. Duration.Add / Sub commutativity and chain
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_add_sub_chain() {
+    Console.WriteLine("== Duration Add/Sub chain ==");
+    let h1 = Duration.FromHours(1);
+    let m30 = Duration.FromMinutes(30);
+    let s45 = Duration.FromSeconds(45);
+
+    // Add is not truly commutative by identity but sum must be same.
+    checkEq(h1.Add(m30).TotalSeconds(), m30.Add(h1).TotalSeconds(), "Add commutative");
+
+    // Chain: 1h + 30m + 45s = 5445s.
+    checkEq(h1.Add(m30).Add(s45).TotalSeconds(), 5445, "Add chain 1h+30m+45s");
+
+    // Sub then Add back returns original.
+    checkEq(h1.Sub(m30).Add(m30).TotalSeconds(), h1.TotalSeconds(), "Sub then Add returns original");
+
+    // Subtracting more than available gives negative.
+    let neg = m30.Sub(h1);
+    check(neg.IsNegative(), "Sub more than available → negative");
+    checkEq(neg.TotalSeconds(), -1800, "Sub result value");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 39. Duration.Equals edge cases
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_equals_edge() {
+    Console.WriteLine("== Duration.Equals edge cases ==");
+    // Self equality.
+    let d = Duration.FromHours(2);
+    check(d.Equals(d), "Equals self");
+
+    // Negate of negate equals original.
+    check(d.Negate().Negate().Equals(d), "Negate twice equals original");
+
+    // Zero equality.
+    check(new Duration(0).Equals(new Duration(0)), "Zero equals zero");
+    check(!new Duration(0).Equals(Duration.FromSeconds(1)), "Zero not equals 1s");
+
+    // IsLongerThan / IsShorterThan symmetric.
+    let a = Duration.FromSeconds(10);
+    let b = Duration.FromSeconds(20);
+    check(a.IsShorterThan(b) && b.IsLongerThan(a), "IsShorterThan/IsLongerThan symmetric");
+    check(!a.IsLongerThan(b),  "a not IsLongerThan b");
+    check(!b.IsShorterThan(a), "b not IsShorterThan a");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 40. DateTime.DaysInMonth - all months, leap vs non-leap
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_daysinmonth_all() {
+    Console.WriteLine("== DaysInMonth all months ==");
+    let months31 = [1, 3, 5, 7, 8, 10, 12];
+    let months30 = [4, 6, 9, 11];
+    foreach (m in months31) {
+        checkEq(DateTime.Of(2024, m, 1, 0,0,0,"UTC").DaysInMonth(), 31,
+                "DaysInMonth m=" + str(m) + "=31");
+    }
+    foreach (m in months30) {
+        checkEq(DateTime.Of(2024, m, 1, 0,0,0,"UTC").DaysInMonth(), 30,
+                "DaysInMonth m=" + str(m) + "=30");
+    }
+    checkEq(DateTime.Of(2024, 2, 1, 0,0,0,"UTC").DaysInMonth(), 29, "DaysInMonth Feb leap=29");
+    checkEq(DateTime.Of(2023, 2, 1, 0,0,0,"UTC").DaysInMonth(), 28, "DaysInMonth Feb non-leap=28");
+    checkEq(DateTime.Of(1900, 2, 1, 0,0,0,"UTC").DaysInMonth(), 28, "DaysInMonth Feb 1900=28");
+    checkEq(DateTime.Of(2000, 2, 1, 0,0,0,"UTC").DaysInMonth(), 29, "DaysInMonth Feb 2000=29");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 41. DateTime.HasTimezone - custom vs unknown vs built-in
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_has_timezone() {
+    Console.WriteLine("== HasTimezone ==");
+    check(DateTime.HasTimezone("UTC"),                "HasTimezone UTC");
+    check(DateTime.HasTimezone("GMT"),                "HasTimezone GMT");
+    check(DateTime.HasTimezone("America/Chicago"),    "HasTimezone America/Chicago");
+    check(DateTime.HasTimezone("Asia/Tokyo"),         "HasTimezone Asia/Tokyo");
+    check(!DateTime.HasTimezone("Fake/Zone"),         "HasTimezone unknown false");
+    check(!DateTime.HasTimezone(""),                  "HasTimezone empty false");
+
+    // A newly registered zone should appear immediately.
+    DateTime.RegisterTimezone("Test/East2", 330);
+    check(DateTime.HasTimezone("Test/East2"),         "HasTimezone newly registered");
+    let ts = DateTime.FromUnix(REF_TS).InZone("Test/East2");
+    checkEq(ts.UtcOffset(), 330, "Test/East2 offset=330");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 42. DateTime.IsSameMonth and IsSameYear edge cases
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_issame_month_year_edge() {
+    Console.WriteLine("== IsSameMonth / IsSameYear edge cases ==");
+    let dec2024 = DateTime.Of(2024, 12, 31, 23, 59, 59, "UTC");
+    let jan2025 = DateTime.Of(2025,  1,  1,  0,  0,  0, "UTC");
+
+    check(!dec2024.IsSameMonth(jan2025), "IsSameMonth Dec24/Jan25 false");
+    check(!dec2024.IsSameYear(jan2025),  "IsSameYear 2024/2025 false");
+    check(dec2024.IsSameYear(DateTime.Of(2024, 1, 1, 0,0,0,"UTC")), "IsSameYear 2024 both");
+
+    // Same timestamp in two zones can cross a month boundary.
+    // 2024-03-31 23:00 UTC → April in UTC+2 (e.g. Africa/Johannesburg offset=120).
+    let utcEndMarch = DateTime.Of(2024, 3, 31, 23, 0, 0, "UTC");
+    let johannesburg = utcEndMarch.InZone("Africa/Johannesburg");
+    checkEq(utcEndMarch.MonthUTC(), 3,  "UTC March");
+    checkEq(johannesburg.Month(),   4,  "Johannesburg April");
+    check(!utcEndMarch.IsSameMonth(johannesburg), "IsSameMonth UTC-March vs Jo'burg-April false");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 43. DateTime.IsInRange edge cases (at boundaries)
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_isinrange_edge() {
+    Console.WriteLine("== IsInRange edge cases ==");
+    let start = DateTime.FromUnix(REF_TS);
+    let end   = DateTime.FromUnix(REF_TS + 7200);
+    let mid   = DateTime.FromUnix(REF_TS + 3600);
+
+    check(start.IsInRange(start, end), "IsInRange at start boundary");
+    check(end.IsInRange(start, end),   "IsInRange at end boundary");
+    check(mid.IsInRange(start, end),   "IsInRange in middle");
+    check(!DateTime.FromUnix(REF_TS - 1).IsInRange(start, end), "IsInRange just before start");
+    check(!DateTime.FromUnix(REF_TS + 7201).IsInRange(start, end), "IsInRange just after end");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 44. Duration.Between with same DateTime
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_duration_between_same() {
+    Console.WriteLine("== Duration.Between same DateTime ==");
+    let d = DateTime.FromUnix(REF_TS);
+    let between = Duration.Between(d, d);
+    check(between.IsZero(), "Between same → zero");
+    checkEq(between.TotalSeconds(), 0, "Between same → 0s");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
+fn Main() {
+    Console.WriteLine("=== datetime.fls test start ===");
+
+    test_duration_basics();
+    test_duration_static();
+    test_duration_tostring_parse();
+    test_duration_compare();
+    test_datetime_components();
+    test_datetime_of_parse();
+    test_datetime_arithmetic();
+    test_calendar_arithmetic();
+    test_calendar_accessors();
+    test_predicates();
+    test_boundaries();
+    test_comparison_range();
+    test_timezone_formatting();
+    test_duration_totalx();
+    test_datetime_formatting_extra();
+    test_names();
+    test_next_prev_weekday();
+    test_business_days();
+    test_duration_days();
+    test_now_today_local();
+    test_parsefmt();
+    test_ago();
+    test_diff_extras();
+    test_duration_component_parts();
+    test_duration_scale_negate_abs();
+    test_duration_from_weeks_frac();
+    test_today_nil_tz();
+    test_clamp_boundary();
+    test_min_max_equal();
+    test_inzone_chain_toutc();
+    test_register_timezone_negative();
+    test_ago_singular();
+    test_issameday_timezone();
+    test_dayofyear_extra();
+    test_weekofyear_boundary();
+    test_quarter_all_months();
+    test_next_prev_weekday_month_boundary();
+    test_duration_add_sub_chain();
+    test_duration_equals_edge();
+    test_daysinmonth_all();
+    test_has_timezone();
+    test_issame_month_year_edge();
+    test_isinrange_edge();
+    test_duration_between_same();
+
+    Console.WriteLine("=== datetime.fls test done ===");
+    Console.WriteLine("Tests run: " + str(testsRun) + "  failed: " + str(testsFailed));
+
+    if (testsFailed > 0) { return testsFailed; }
+    Console.Ok("All tests passed!");
+
+    let dur1h  = Duration.FromHours(1);
+    let dur30m = Duration.FromMinutes(30);
+    let dt_ref = DateTime.Of(2024, 3, 15, 12, 30, 45, "UTC");
+
+    Console.WriteLine("\n\n=== DateTime/Duration Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Duration - construction & arithmetic ]");
+    bench("Duration.FromSeconds  (construct)", fn() {
+        let d = Duration.FromSeconds(3661); _sink = _sink + 1;
+    }, 10000);
+    bench("Duration.FromHours    (construct)", fn() {
+        let d = Duration.FromHours(2); _sink = _sink + 1;
+    }, 10000);
+    bench("Duration  Add (1h + 30m)", fn() {
+        let d = dur1h.Add(dur30m); _sink = _sink + 1;
+    }, 10000);
+    bench("Duration  Scale (×2)", fn() {
+        let d = dur1h.Scale(2); _sink = _sink + 1;
+    }, 10000);
+    bench("Duration  ToString", fn() {
+        let s = dur1h.ToString(); _sink = _sink + 1;
+    }, 10000);
+    bench("Duration  Parse  \"1h30m\"", fn() {
+        let d = Duration.Parse("1h30m"); _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ DateTime - construction & accessors ]");
+    bench("DateTime.Of  (year/month/day/... UTC)", fn() {
+        let d = DateTime.Of(2024, 3, 15, 12, 30, 45, "UTC"); _sink = _sink + 1;
+    }, 5000);
+    bench("DateTime.Parse  ISO 8601", fn() {
+        let d = DateTime.Parse("2024-03-15T12:30:45", "UTC"); _sink = _sink + 1;
+    }, 3000);
+    bench("DateTime  Year/Month/Day accessors", fn() {
+        let y = dt_ref.Year();
+        let m = dt_ref.Month();
+        let d = dt_ref.Day();
+        _sink = _sink + y;
+    }, 10000);
+    bench("DateTime  Format  \"YYYY-MM-DD\"", fn() {
+        let s = dt_ref.Format("YYYY-MM-DD"); _sink = _sink + 1;
+    }, 5000);
+    bench("DateTime  Format  full ISO", fn() {
+        let s = dt_ref.Format("YYYY-MM-DDTHH:mm:ssZ"); _sink = _sink + 1;
+    }, 5000);
+    bench("DateTime  AddDays(7)", fn() {
+        let d = dt_ref.AddDays(7); _sink = _sink + 1;
+    }, 5000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

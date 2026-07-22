@@ -1,0 +1,332 @@
+// ============================================================
+//  SQLite.fls - SQLite client library for Flaris
+//  Version: 1.0
+// ============================================================
+//
+// SETUP
+// -----
+// SQLite is bundled on macOS and most Linux distributions - no install
+// needed in most cases.
+//
+// If libsqlite3 is missing:
+//   Ubuntu/Debian:  apt install libsqlite3-dev
+//   Fedora:         dnf install sqlite-devel
+//   macOS (upgrade): brew install sqlite
+//   Windows:        winget install SQLite.SQLite
+//                   (or download sqlite3.dll + sqlite3.h from https://sqlite.org/download.html)
+//
+// Compile the FFI plugin (run from repo root):
+//
+//   macOS:         gcc -shared -fPIC -O2 -o libs/sqlite_ffi.dylib libs/sqlite_ffi.c -lsqlite3
+//   Linux:         gcc -shared -fPIC -O2 -o libs/sqlite_ffi.so   libs/sqlite_ffi.c -lsqlite3
+//   Windows MinGW: gcc -shared -O2 -o libs/sqlite_ffi.dll libs/sqlite_ffi.c -lsqlite3
+//   Windows MSVC:  cl /LD libs/sqlite_ffi.c /link sqlite3.lib
+//
+// Run your script with the -u flag:
+//   flarisvm --unsafe script.fls --libs='./libs'
+//
+// QUICK START
+// -----------
+//   import { SQLite } from library("SQLite", "1.0");
+//
+//   let db = SQLite.Open("./mydata.db");
+//   if (db == nil) { Console.Error("Could not open database"); return 1; }
+//
+//   db.Exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, score REAL)");
+//
+//   db.ExecParams("INSERT INTO users (name, score) VALUES (?, ?)", ["Alice", 9.5]);
+//   let id = db.LastInsertId();
+//
+//   let rows = db.QueryParams("SELECT id, name, score FROM users WHERE score > ?", [5.0]);
+//   foreach (row in rows) {
+//       Console.WriteLine(row.id, row.name, row.score);
+//   }
+//
+//   db.Close();
+//
+// IN-MEMORY DATABASES
+// --------------------
+// Pass ":memory:" to Open for a temporary database that lives only for the
+// duration of the program - useful for tests and caches:
+//
+//   let db = SQLite.Open(":memory:");
+//
+// PARAMETERS
+// -----------
+// SQLite uses ? as the placeholder (not $1 like PostgreSQL).
+// All array element types are supported: int, float, bool, string, nil (- NULL).
+//
+//   db.QueryParams("SELECT * FROM t WHERE a = ? AND b = ?", [42, "hello"]);
+//
+// TYPE MAPPING
+// ------------
+//   SQLite INTEGER  -  int
+//   SQLite REAL     -  float
+//   SQLite TEXT     -  string
+//   SQLite BLOB     -  string (hex-encoded)
+//   SQLite NULL     -  nil
+//
+// ERROR HANDLING
+// --------------
+// Query / QueryParams return { error: "message" } on failure.
+//   let result = db.Query("SELECT * FROM users");
+//   if ("error" in result) { Console.Error(result.error); }
+//
+// Exec / ExecParams return -1 on error.
+// Open returns nil on failure.
+//
+// COMMON PATTERNS
+// ---------------
+// Check if table exists:
+//   let n = db.ScalarInt(
+//       "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'");
+//   if (n == 0) { db.Exec("CREATE TABLE users (...)"); }
+//
+// Insert and get new ID:
+//   db.ExecParams("INSERT INTO items (name) VALUES (?)", [name]);
+//   let newId = db.LastInsertId();
+//
+// Transactions (manual):
+//   db.Begin();
+//   db.ExecParams("INSERT INTO log (msg) VALUES (?)", [msg]);
+//   db.ExecParams("UPDATE counters SET n = n + 1 WHERE key = ?", [key]);
+//   db.Commit();
+//
+// Transactions (automatic - preferred):
+//   db.Transaction(fn() {
+//       db.ExecParams("INSERT INTO log (msg) VALUES (?)", [msg]);
+//       db.ExecParams("UPDATE counters SET n = n + 1 WHERE key = ?", [key]);
+//   });
+//   // ROLLBACKs automatically on exception or if the callback returns false.
+//
+// TROUBLESHOOTING
+// ---------------
+//   Open returns nil       -  check path is writable; parent directory must exist
+//   Exception.UnsafeOperation  -  add --unsafe flag: flarisvm --unsafe script.fls
+//   "symbol not found"     -  recompile sqlite_ffi; check build_sqlite.sh
+//
+// API REFERENCE
+// -------------
+// Opening:
+//   SQLite.Open(path)                      →  SQLite instance or nil
+//     path = ":memory:" for in-memory database
+//
+// Queries (return array of row objects, or { error: "msg" } on failure):
+//   Query(sql)
+//   QueryParams(sql, params:array)         - use ? placeholders
+//   QueryOne(sql)                          →  single row object or nil
+//   QueryOneParams(sql, params:array)
+//
+// Scalars (execute and return a single value):
+//   ScalarInt(sql)                         →  int or nil
+//   ScalarIntParams(sql, params)
+//   ScalarString(sql)                      →  string or nil
+//   ScalarStringParams(sql, params)
+//
+// Execution (return rows affected, or -1 on error):
+//   Exec(sql)
+//   ExecParams(sql, params:array)
+//
+// Transactions (automatic):
+//   Transaction(fn)   - calls fn(); auto-COMMIT on success, ROLLBACK on throw or false return
+//
+// Transactions (manual):
+//   Begin()   Commit()   Rollback()
+//
+// Exec error details:
+//   ExecError(sql)              - like Exec but returns { error: string } instead of -1
+//   ExecParamsError(sql, params)
+//
+// Misc:
+//   LastInsertId()                         →  int
+//   Close()
+//
+// ============================================================
+
+class SQLite {
+    let _db = nil; 
+    let _sq_close = nil; 
+    let _sq_exec = nil; 
+    let _sq_exec_p = nil; 
+    let _sq_last_err = nil; 
+    let _sq_last_id = nil; 
+    let _sq_qp = nil; 
+    let _sq_query = nil; 
+
+    fn static _lib_path() {
+        // Bare name - Ffi.Load resolves it from ~/.flaris/ffi ($FLARIS_FFI),
+        // appending the platform extension (.dylib/.so/.dll) automatically.
+        return "sqlite_ffi";
+    }
+
+    fn Constructor(handle: int, lib) {
+        this._db           = handle;
+        this._sq_query     = Ffi.GetFunction(lib, "sqlite_query");
+        this._sq_qp        = Ffi.GetFunction(lib, "sqlite_query_params");
+        this._sq_exec      = Ffi.GetFunction(lib, "sqlite_exec");
+        this._sq_exec_p    = Ffi.GetFunction(lib, "sqlite_exec_params");
+        this._sq_last_err  = Ffi.GetFunction(lib, "sqlite_last_error");
+        this._sq_last_id   = Ffi.GetFunction(lib, "sqlite_last_insert_id");
+        this._sq_close     = Ffi.GetFunction(lib, "sqlite_close");
+    }
+
+    // SQLite.Open(path) - SQLite | nil
+    // Opens or creates a database file. Pass ":memory:" for a temporary in-memory DB.
+    fn static Open(path: string) {
+        let lib = Ffi.Load(SQLite._lib_path(), nil);
+        if (lib == nil) { return nil; }
+        let sq_open = Ffi.GetFunction(lib, "sqlite_open");
+        if (sq_open == nil) { return nil; }
+        let handle = sq_open(path);
+        if (handle == nil || handle == 0) { return nil; }
+        return new SQLite(handle, lib);
+    }
+
+    // db.Query(sql) - array<object> | { error: string }
+    // Never interpolate user input - use QueryParams instead.
+    fn Query(sql: string) {
+        return this._sq_query(this._db, sql);
+    }
+
+    // db.QueryParams(sql, params) - array<object> | { error: string }
+    // Use ? placeholders; pass values as array.
+    fn QueryParams(sql: string, params) {
+        return this._sq_qp(this._db, sql, params);
+    }
+
+    // db.QueryOne(sql) - object | nil   Returns first row or nil; nil on empty or error.
+    fn QueryOne(sql: string) {
+        let rows = this._sq_query(this._db, sql);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        return rows[0];
+    }
+
+    // db.QueryOneParams(sql, params) - object | nil
+    fn QueryOneParams(sql: string, params) {
+        let rows = this._sq_qp(this._db, sql, params);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        return rows[0];
+    }
+
+    // db.ScalarInt(sql) - int | nil
+    fn ScalarInt(sql: string) {
+        let rows = this._sq_query(this._db, sql);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        let v = nil;
+        foreach (x in rows[0]) { v = x; break; }
+        return v;
+    }
+
+    // db.ScalarIntParams(sql, params) - int | nil
+    fn ScalarIntParams(sql: string, params) {
+        let rows = this._sq_qp(this._db, sql, params);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        let v = nil;
+        foreach (x in rows[0]) { v = x; break; }
+        return v;
+    }
+
+    // db.ScalarString(sql) - string | nil
+    fn ScalarString(sql: string) {
+        let rows = this._sq_query(this._db, sql);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        let v = nil;
+        foreach (x in rows[0]) { v = x; break; }
+        return v == nil ? nil : str(v);
+    }
+
+    // db.ScalarStringParams(sql, params) - string | nil
+    fn ScalarStringParams(sql: string, params) {
+        let rows = this._sq_qp(this._db, sql, params);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        let v = nil;
+        foreach (x in rows[0]) { v = x; break; }
+        return v == nil ? nil : str(v);
+    }
+
+    // db.Exec(sql) - int  (affected rows, -1 on error)
+    // For CREATE TABLE, INSERT, UPDATE, DELETE. Never interpolate user input.
+    fn Exec(sql: string) {
+        return this._sq_exec(this._db, sql);
+    }
+
+    // db.ExecParams(sql, params) - int  (affected rows, -1 on error)
+    // Use ? placeholders; pass values as array.
+    fn ExecParams(sql: string, params) {
+        return this._sq_exec_p(this._db, sql, params);
+    }
+
+    // db.ExecError(sql) - { error: string } | int
+    // Like Exec but returns { error: string } on failure so the message is accessible.
+    fn ExecError(sql: string) {
+        let n = this._sq_exec(this._db, sql);
+        if (n == -1) {
+            let msg = this._sq_last_err(this._db);
+            return { error: msg == nil ? "exec failed" : msg };
+        }
+        return n;
+    }
+
+    // db.ExecParamsError(sql, params) - { error: string } | int
+    fn ExecParamsError(sql: string, params) {
+        let n = this._sq_exec_p(this._db, sql, params);
+        if (n == -1) {
+            let msg = this._sq_last_err(this._db);
+            return { error: msg == nil ? "exec failed" : msg };
+        }
+        return n;
+    }
+
+    // db.Begin() - bool
+    fn Begin() {
+        return this.Exec("BEGIN") != -1;
+    }
+
+    // db.Commit() - bool
+    fn Commit() {
+        return this.Exec("COMMIT") != -1;
+    }
+
+    // db.Rollback() - bool
+    fn Rollback() {
+        return this.Exec("ROLLBACK") != -1;
+    }
+
+    // db.Transaction(f) - bool
+    // Wraps f() in BEGIN/COMMIT. ROLLBACKs and rethrows on exception; rolls back
+    // and returns false if f() returns false.
+    fn Transaction(f: fn) {
+        this.Exec("BEGIN");
+        try {
+            let ok = f();
+            if (ok == false) {
+                this.Exec("ROLLBACK");
+                return false;
+            }
+            this.Exec("COMMIT");
+            return true;
+        } catch (e) {
+            this.Exec("ROLLBACK");
+            throw(e.Code, e.Message);
+        }
+    }
+
+    // db.LastInsertId() - int
+    // Row ID of the last successful INSERT.
+    fn LastInsertId() {
+        return this._sq_last_id(this._db);
+    }
+
+    // db.Close() - bool
+    fn Close() {
+        return this._sq_close(this._db);
+    }
+}
+
+export { SQLite };

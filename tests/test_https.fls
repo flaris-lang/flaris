@@ -1,0 +1,246 @@
+// test_https.fls - Test suite for Https.fls (TLS-over-FFI HTTPS client).
+//
+
+// Hard checks are deterministic and need no network:
+//   - plugin loads and exposes its symbols
+//   - empty-object FFI argument does not raise (safe_malloc(0) regression)
+//   - plain Http.Get on an https:// URL throws the redirect-to-Https error
+//   - the TLS transport object has the expected shape
+// Network checks (live GET/HEAD, certificate verification) are SOFT: they warn
+// but never fail the suite, so transient connectivity never breaks CI.
+
+import { Https, Status, ContentType } from library("Https", "1.0");
+import { Http } from library("Http", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global netOk       = false;
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+// Soft assertion: reports but does not fail the run (used for network paths).
+fn soft(cond, msg) {
+    if (!cond) { Console.WriteLine("  (soft) ", msg); }
+}
+
+
+
+// ============================================================
+// Transport wiring (no network)
+// ============================================================
+
+fn test_transport_shape() {
+    Console.WriteLine("-- transport shape");
+    let tr = Https._transport();
+    check(tr != nil, "transport built");
+    if (tr == nil) { return; }
+    check(tr.secure == true, "transport.secure == true");
+    check(tr.connect  != nil, "transport.connect present");
+    check(tr.write    != nil, "transport.write present");
+    check(tr.readLine != nil, "transport.readLine present");
+    check(tr.readN    != nil, "transport.readN present");
+    check(tr.readAll  != nil, "transport.readAll present");
+    check(tr.close    != nil, "transport.close present");
+}
+
+// Timeout configuration is deterministic and needs no network.
+fn test_timeout_config() {
+    Console.WriteLine("-- timeout config");
+    checkEq(Https.GetTimeout(), 120000, "default timeout is 120s");
+
+    let original = Https.GetTimeout();
+    Https.SetTimeout(300000);
+    checkEq(Https.GetTimeout(), 300000, "SetTimeout updates default");
+
+    // A custom per-request transport must still be a valid transport object.
+    let tr = Https.Transport({ timeoutMs: 5000 });
+    check(tr != nil, "Https.Transport builds a transport");
+    check(tr != nil && tr.connect != nil, "custom transport has connect");
+
+    Https.SetTimeout(original);   // restore so later tests use the default
+    checkEq(Https.GetTimeout(), original, "SetTimeout restores default");
+}
+
+// Plain Http must refuse https:// and point the user at the Https library.
+fn test_plain_http_rejects_https() {
+    Console.WriteLine("-- plain Http rejects https://");
+    let threw = false;
+    var code  = 0;
+    try {
+        Http.Get("https://api.github.com/");
+    } catch (e) {
+        threw = true;
+        code  = e.Code;
+    }
+    check(threw, "Http.Get on https:// throws");
+    checkEq(code, 100, "Http.Get on https:// throws code 100");
+}
+
+// ============================================================
+// Request encoding (offline - via a mock transport)
+// ============================================================
+// A fake transport records the bytes the engine writes and replays a canned
+// HTTP/1.1 response, so the whole request path is exercised without a network.
+
+global _mockReq  = "";
+global _mockStep = 0;
+
+fn _mockTransport() {
+    _mockReq  = "";
+    _mockStep = 0;
+    return {
+        secure:   true,
+        connect:  fn(_h, _p) { return 1; },
+        write:    fn(_c, d)  { _mockReq = _mockReq + d; },
+        readLine: fn(_c) {
+            _mockStep += 1;
+            if (_mockStep == 1) { return "HTTP/1.1 200 OK"; }
+            if (_mockStep == 2) { return "Content-Length: 2"; }
+            if (_mockStep == 3) { return ""; }   // blank line ends headers
+            return nil;
+        },
+        readN:   fn(_c, _n) { return "ok"; },
+        readAll: fn(_c)     { return "ok"; },
+        close:   fn(_c)     { return nil; }
+    };
+}
+
+// Regression: Https.Post(url, objectBody) must JSON-encode the object (quoted
+// keys) and set Content-Length to the JSON byte length - not the default
+// value->string repr with a key-count Content-Length.
+fn test_object_body_is_json() {
+    Console.WriteLine("-- object body is JSON-encoded");
+    let payload = { name: "Alice", n: 2 };
+    let res = Http.Request("POST", "https://mock.test/x", payload,
+                           ContentType.JSON, nil, _mockTransport());
+    check(res != nil && res.status == 200, "mock POST returns 200");
+    check(String.Contains(_mockReq, "\"name\":\"Alice\""), "object body has quoted JSON keys");
+    check(!String.Contains(_mockReq, "{name:"),            "object body is not the default repr");
+    let json = Json.Stringify(payload);
+    check(String.Contains(_mockReq, "Content-Length: " + Convert.ToString(len(json))),
+          "Content-Length is JSON byte length (not key count)");
+    check(String.Contains(_mockReq, "Content-Type: application/json"), "Content-Type: application/json sent");
+}
+
+// A pre-encoded string body must pass through unchanged (no double-encoding).
+fn test_string_body_passthrough() {
+    Console.WriteLine("-- string body passes through");
+    let body = "a=1&b=2";
+    let res = Http.Request("POST", "https://mock.test/x", body,
+                           ContentType.FormEncoded, nil, _mockTransport());
+    check(res != nil, "mock POST returns a response");
+    check(String.Contains(_mockReq, "\r\n\r\na=1&b=2"), "string body sent verbatim");
+    check(String.Contains(_mockReq, "Content-Length: 7"), "Content-Length matches string length");
+}
+
+// ============================================================
+// Live network (SOFT - warns only)
+// ============================================================
+
+fn test_live_get() {
+    Console.WriteLine("-- live GET (soft)");
+    let res = Https.Get("https://api.github.com/", { "User-Agent": "flaris-test" });
+    if (res == nil) {
+        Console.WriteLine("  (skip) no network / host unreachable");
+        return;
+    }
+    netOk = true;
+    soft(res.status == Status.OK, "github GET status == 200 (got " + Convert.ToString(res.status) + ")");
+    soft(len(res.body) > 0,       "github GET body non-empty");
+    let j = Json.Parse(res.body);
+    soft(j != nil,                "github GET body parses as JSON");
+    if (j != nil) {
+        soft(Object.HasKey(j, "current_user_url"), "github root payload has expected key");
+    }
+}
+
+fn test_live_head() {
+    Console.WriteLine("-- live HEAD (soft)");
+    if (!netOk) { Console.WriteLine("  (skip) network down"); return; }
+    let res = Https.Head("https://api.github.com/", { "User-Agent": "flaris-test" });
+    soft(res != nil,                 "HEAD returns a response");
+    if (res != nil) {
+        soft(res.status == Status.OK, "HEAD status == 200");
+        soft(res.headers != nil,      "HEAD returns headers");
+    }
+}
+
+// Certificate verification: a wrong-hostname cert must be rejected (nil) when
+// verifying, but accepted by the insecure variant.
+fn test_cert_verification() {
+    Console.WriteLine("-- certificate verification (soft)");
+    if (!netOk) { Console.WriteLine("  (skip) network down"); return; }
+    let bad = Https.Get("https://wrong.host.badssl.com/");
+    soft(bad == nil, "verified GET to wrong-hostname cert is rejected (nil)");
+    let ok = Https.GetInsecure("https://wrong.host.badssl.com/");
+    soft(ok != nil, "insecure GET to wrong-hostname cert succeeds");
+}
+
+// ============================================================
+// Benchmarks (offline - transport construction / symbol binding)
+// ============================================================
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Https benchmarks ===");
+
+    let iters = 2000;
+
+    // Cost of building a fresh TLS transport (builtin Tls closures).
+    let t0 = Time.Ticks();
+    iter (i from 0 to iters - 1) {
+        let _tr = Https._buildTransport({ insecure: false });
+    }
+    Console.WriteLine("buildTransport (", iters, " iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    // Optional throughput benchmark - only if the network came up.
+    if (netOk) {
+        let n = 5;
+        let t1 = Time.Ticks();
+        iter (i from 0 to n - 1) {
+            let _r = Https.Get("https://api.github.com/", { "User-Agent": "flaris-bench" });
+        }
+        Console.WriteLine("live GET x", n, ": ",
+                          String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t1)]), " ms");
+    } else {
+        Console.WriteLine("live GET benchmark skipped (no network)");
+    }
+
+    Console.WriteLine("=== benchmarks done ===");
+}
+
+fn Main() {
+    Console.WriteLine("=== Https test suite ===");
+
+    test_transport_shape();
+    test_timeout_config();
+    test_plain_http_rejects_https();
+    test_object_body_is_json();
+    test_string_body_passthrough();
+    test_live_get();
+    test_live_head();
+    test_cert_verification();
+    test_benchmarks();
+
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    if (testsFailed == 0) {
+        Console.WriteLine("✅ All Https tests passed!");
+    } else {
+        Console.WriteLine("❌ Some Https tests failed");
+    }
+    return testsFailed;
+}

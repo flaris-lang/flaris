@@ -1,0 +1,433 @@
+// BitConverter.fls - Binary ↔ numeric type conversions for Flaris.
+// Version: 1.0
+//
+// Converts between Flaris numeric types and raw byte blocks (block).
+// All functions are static - use BitConverter directly, no instance needed.
+// Byte order is little-endian by default; pass bigEndian=true to any method to reverse.
+// No -u flag required - pure Flaris math, no FFI.
+//
+// Usage:
+//   import { BitConverter } from library("BitConverter", "1.0");
+//
+//   // Encode a 32-bit integer to bytes
+//   let blk = BitConverter.GetBytesInt32(0x12345678);
+//   Console.WriteLine(BitConverter.ToString(blk));    // "78-56-34-12" (LE)
+//   Console.WriteLine(BitConverter.ToHex(blk));       // "78563412"
+//
+//   // Decode back
+//   Console.WriteLine(BitConverter.ToInt32(blk, 0));  // 305419896
+//
+//   // Float round-trip
+//   let fb   = BitConverter.GetBytesFloat64(3.14159);
+//   let back = BitConverter.ToFloat64(fb, 0);         // ≈ 3.14159
+//
+//   // Read from a larger block at an offset
+//   let ToInt32 = BitConverter.ToInt32(largeBlk, 8);  // read at byte offset 8
+//
+// Encoding (return a new block):
+//   GetBytesInt16(v, bigEndian?)    →  2-byte block
+//   GetBytesInt32(v, bigEndian?)    →  4-byte block
+//   GetBytesInt64(v, bigEndian?)    →  8-byte block
+//   GetBytesUInt16(v, bigEndian?)   →  2-byte block (unsigned)
+//   GetBytesUInt32(v, bigEndian?)   →  4-byte block (unsigned)
+//   GetBytesFloat32(v, bigEndian?)  →  4-byte block
+//   GetBytesFloat64(v, bigEndian?)  →  8-byte block
+//   GetBytesBool(v)                 →  1-byte block (0 or 1)
+//
+// Decoding (read from block at byte offset):
+//   ToInt16(blk, offset, bigEndian?)    →  int
+//   ToInt32(blk, offset, bigEndian?)    →  int
+//   ToInt64(blk, offset, bigEndian?)    →  int
+//   ToUInt16(blk, offset, bigEndian?)   →  int
+//   ToUInt32(blk, offset, bigEndian?)   →  int
+//   ToFloat32(blk, offset, bigEndian?)  →  float
+//   ToFloat64(blk, offset, bigEndian?)  →  float
+//   ToBool(blk, offset)                 →  bool  (byte != 0)
+//
+// Formatting:
+//   ToString(blk)     →  string  - "XX-XX-XX-…" uppercase hex with dashes
+//   ToHex(blk)        →  string  - lowercase hex without separator
+//   FromHex(s)        →  block   - parse hex string (spaces and dashes ignored)
+//
+// Utility:
+//   IsLittleEndian()  →  bool    - true on x86/ARM little-endian hosts
+
+class BitConverter {
+
+    // =========================================================================
+    // Internal helpers
+    // =========================================================================
+
+    // Build a block from an array of byte values (0–255).
+    fn static _block(bytes:array):block {
+        let n:int = len(bytes);
+        let blk:block = Buffer.Create(n, 1);
+        Buffer.FromArray(blk, bytes);
+        return blk;
+    }
+
+    // Read n bytes from blk starting at offset; return as LE byte array.
+    fn static _bytes(blk:block, offset:int, n:int):array {
+        let arr:array = Buffer.ToArray(blk);
+        let out:array = [];
+        iter (i from 0 to n - 1) {
+            Array.Append(out, arr[offset + i]);
+        }
+        return out;
+    }
+
+    // Apply big-endian reversal if requested.
+    fn static _maybe_reverse(bytes:array, bigEndian?:bool):array {
+        if (bigEndian == true) { Array.Reverse(bytes); }
+        return bytes;
+    }
+
+    // =========================================================================
+    // Float pack helpers (IEEE 754, no -u needed)
+    // =========================================================================
+
+    // Pack a float value into 4 LE bytes (float32 representation).
+    fn static _pack_f32(v:float):array {
+        if (Math.IsNaN(v)) {
+            return [0x00, 0x00, 0xC0, 0x7F];          // quiet NaN: 7FC00000 LE
+        }
+        let sign:int = 0;
+        if (v < 0.0) { sign = 1; v = -v; }
+        if (!Math.IsFinite(v)) {
+            return [0x00, 0x00, 0x80, sign == 1 ? 0xFF : 0x7F];  // ±Inf
+        }
+        if (v == 0) {
+            return [0x00, 0x00, 0x00, sign == 1 ? 0x80 : 0x00];  // ±0
+        }
+        if (v > 3.4028235e38) {
+            return [0x00, 0x00, 0x80, sign == 1 ? 0xFF : 0x7F];  // overflow - ±Inf
+        }
+
+        let exp:int      = int(Math.Floor(Math.Log(v) / Math.Log(2.0)));
+        var scaled:float = v / Math.Pow(2.0, float(exp));
+        // Correct any off-by-one from log precision
+        if (scaled >= 2.0)            { exp += 1; scaled = scaled / 2.0; }
+        else if (scaled < 1.0)        { exp -= 1; scaled = scaled * 2.0; }
+
+        let biased_exp:int = 0;
+        let mantissa:int   = 0;
+
+        if (exp < -126) {
+            // Denormal
+            biased_exp = 0;
+            mantissa   = int(Math.Floor(v / Math.Pow(2.0, -149.0) + 0.5));
+        } else {
+            biased_exp = exp + 127;
+            mantissa   = int(Math.Floor((scaled - 1.0) * 8388608.0 + 0.5));
+            if (mantissa >= 8388608) { mantissa = 0; biased_exp += 1; }
+            if (biased_exp >= 255)   {
+                return [0x00, 0x00, 0x80, sign == 1 ? 0xFF : 0x7F];
+            }
+        }
+
+        let bits:int = (sign << 31) | (biased_exp << 23) | mantissa;
+        return [bits & 0xFF, (bits >> 8) & 0xFF, (bits >> 16) & 0xFF, (bits >> 24) & 0xFF];
+    }
+
+    // Pack a float value into 8 LE bytes (float64 representation).
+    fn static _pack_f64(v:float):array {
+        if (Math.IsNaN(v)) {
+            return [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x7F];  // quiet NaN LE
+        }
+        let sign:int = 0;
+        if (v < 0.0) { sign = 1; v = -v; }
+        if (!Math.IsFinite(v)) {
+            return [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, sign == 1 ? 0xFF : 0x7F];
+        }
+        if (v == 0) {
+            return [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, sign == 1 ? 0x80 : 0x00];
+        }
+
+        let exp:int      = int(Math.Floor(Math.Log(v) / Math.Log(2.0)));
+        var scaled:float = v / Math.Pow(2.0, float(exp));
+        if (scaled >= 2.0)     { exp += 1; scaled = scaled / 2.0; }
+        else if (scaled < 1.0) { exp -= 1; scaled = scaled * 2.0; }
+
+        let biased_exp:int = 0;
+        let mant_f:float   = 0.0;
+
+        if (exp < -1022) {
+            biased_exp = 0;
+            mant_f     = v / Math.Pow(2.0, -1074.0);
+        } else {
+            biased_exp = exp + 1023;
+            mant_f     = (scaled - 1.0) * 4503599627370496.0;  // * 2^52
+        }
+
+        let mant_int:int = int(Math.Floor(mant_f + 0.5));
+        if (mant_int >= 4503599627370496) {
+            mant_int = 0; biased_exp += 1;
+            if (biased_exp >= 2047) {
+                return [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, sign == 1 ? 0xFF : 0x7F];
+            }
+        }
+
+        let mant_lo:int = mant_int & 0xFFFFFFFF;
+        let mant_hi:int = (mant_int >> 32) & 0xFFFFF;   // top 20 of 52 mantissa bits
+        let hi32:int    = (sign << 31) | (biased_exp << 20) | mant_hi;
+        let lo32:int    = mant_lo;
+
+        return [
+            lo32 & 0xFF, (lo32 >> 8) & 0xFF, (lo32 >> 16) & 0xFF, (lo32 >> 24) & 0xFF,
+            hi32 & 0xFF, (hi32 >> 8) & 0xFF, (hi32 >> 16) & 0xFF, (hi32 >> 24) & 0xFF
+        ];
+    }
+
+    // Unpack 4 LE bytes into a float (float32 decode).
+    fn static _unpack_f32(b:array):float {
+        let sign:int       = (b[3] >> 7) & 1;
+        let biased_exp:int = ((b[3] & 0x7F) << 1) | ((b[2] >> 7) & 1);
+        let mantissa:int   = ((b[2] & 0x7F) << 16) | (b[1] << 8) | b[0];
+
+        if (biased_exp == 255) {
+            if (mantissa == 0) { return sign == 1 ? -Math.Infinity : Math.Infinity; }
+            return Math.NaN;
+        }
+        let v:float = 0.0;
+        if (biased_exp == 0) {
+            v = float(mantissa) / 8388608.0 * Math.Pow(2.0, -126.0);
+        } else {
+            v = (1.0 + float(mantissa) / 8388608.0) * Math.Pow(2.0, float(biased_exp - 127));
+        }
+        return sign == 1 ? -v : v;
+    }
+
+    // Unpack 8 LE bytes into a float (float64 decode).
+    fn static _unpack_f64(b:array):float {
+        let sign:int       = (b[7] >> 7) & 1;
+        let biased_exp:int = ((b[7] & 0x7F) << 4) | ((b[6] >> 4) & 0x0F);
+
+        // Build 52-bit mantissa as a float to avoid int64 overflow concerns
+        let mant_f:float = float(b[6] & 0x0F);
+        let i:int = 5;
+        while (i >= 0) {
+            mant_f = mant_f * 256.0 + float(b[i]);
+            i -= 1;
+        }
+
+        if (biased_exp == 2047) {
+            if (mant_f == 0) { return sign == 1 ? -Math.Infinity : Math.Infinity; }
+            return Math.NaN;
+        }
+        let v:float = 0.0;
+        if (biased_exp == 0) {
+            v = mant_f / 4503599627370496.0 * Math.Pow(2.0, -1022.0);
+        } else {
+            v = (1.0 + mant_f / 4503599627370496.0) * Math.Pow(2.0, float(biased_exp - 1023));
+        }
+        return sign == 1 ? -v : v;
+    }
+
+    // =========================================================================
+    // GetBytes - numeric - block
+    // =========================================================================
+
+    // GetBytesInt64(v, bigEndian?) - block  (8 bytes, signed 64-bit)
+    fn static GetBytesInt64(v:int, bigEndian?:bool):block {
+        let bytes:array = [];
+        iter (i from 0 to 7) {
+            Array.Append(bytes, (v >> (i * 8)) & 0xFF);
+        }
+        return _block(_maybe_reverse(bytes, bigEndian));
+    }
+
+    // GetBytesInt32(v, bigEndian?) - block  (4 bytes, signed 32-bit)
+    fn static GetBytesInt32(v:int, bigEndian?:bool):block {
+        let bytes:array = [];
+        iter (i from 0 to 3) {
+            Array.Append(bytes, (v >> (i * 8)) & 0xFF);
+        }
+        return _block(_maybe_reverse(bytes, bigEndian));
+    }
+
+    // GetBytesInt16(v, bigEndian?) - block  (2 bytes, signed 16-bit)
+    fn static GetBytesInt16(v:int, bigEndian?:bool):block {
+        let bytes:array = [(v & 0xFF), (v >> 8) & 0xFF];
+        return _block(_maybe_reverse(bytes, bigEndian));
+    }
+
+    // GetBytesFloat64(v, bigEndian?) - block  (8 bytes, IEEE 754 double)
+    fn static GetBytesFloat64(v, bigEndian?:bool):block {
+        let bytes:array = _pack_f64(float(v));
+        return _block(_maybe_reverse(bytes, bigEndian));
+    }
+
+    // GetBytesFloat32(v, bigEndian?) - block  (4 bytes, IEEE 754 single)
+    fn static GetBytesFloat32(v, bigEndian?:bool):block {
+        let bytes:array = _pack_f32(float(v));
+        return _block(_maybe_reverse(bytes, bigEndian));
+    }
+
+    // GetBytesBool(v) - block  (1 byte: 0x00 or 0x01)
+    fn static GetBytesBool(v:bool):block {
+        return _block([v == true ? 1 : 0]);
+    }
+
+    // GetBytesUInt16(v, bigEndian?) - block  (2 bytes, unsigned 16-bit, 0–65535)
+    fn static GetBytesUInt16(v:int, bigEndian?:bool):block {
+        let uv:int = v & 0xFFFF;
+        let bytes:array = [(uv & 0xFF), (uv >> 8) & 0xFF];
+        return _block(_maybe_reverse(bytes, bigEndian));
+    }
+
+    // GetBytesUInt32(v, bigEndian?) - block  (4 bytes, unsigned 32-bit, 0–4294967295)
+    fn static GetBytesUInt32(v:int, bigEndian?:bool):block {
+        let uv:int = v & 0xFFFFFFFF;
+        let bytes:array = [];
+        iter (i from 0 to 3) {
+            Array.Append(bytes, (uv >> (i * 8)) & 0xFF);
+        }
+        return _block(_maybe_reverse(bytes, bigEndian));
+    }
+
+    // =========================================================================
+    // To* - block - numeric
+    // =========================================================================
+
+    // ToInt64(blk, offset, bigEndian?) - int  (signed 64-bit)
+    fn static ToInt64(blk:block, offset:int, bigEndian?:bool):int {
+        let b:array = _bytes(blk, offset, 8);
+        if (bigEndian == true) { Array.Reverse(b); }
+        // b[0]=LSB, b[7]=MSB
+        let v:int = 0;
+        let i:int = 7;
+        while (i >= 0) {
+            v = (v << 8) | b[i];
+            i -= 1;
+        }
+        return v;
+    }
+
+    // ToInt32(blk, offset, bigEndian?) - int  (signed 32-bit)
+    fn static ToInt32(blk:block, offset:int, bigEndian?:bool):int {
+        let b:array = _bytes(blk, offset, 4);
+        if (bigEndian == true) { Array.Reverse(b); }
+        let v:int = b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
+        if (v >= 2147483648) { v = v - 4294967296; }
+        return v;
+    }
+
+    // ToInt16(blk, offset, bigEndian?) - int  (signed 16-bit)
+    fn static ToInt16(blk:block, offset:int, bigEndian?:bool):int {
+        let b:array = _bytes(blk, offset, 2);
+        if (bigEndian == true) { Array.Reverse(b); }
+        let v:int = b[0] | (b[1] << 8);
+        if (v >= 32768) { v = v - 65536; }
+        return v;
+    }
+
+    // ToUInt16(blk, offset, bigEndian?) - int  (unsigned 16-bit, 0–65535)
+    fn static ToUInt16(blk:block, offset:int, bigEndian?:bool):int {
+        let b:array = _bytes(blk, offset, 2);
+        if (bigEndian == true) { Array.Reverse(b); }
+        return (b[0] | (b[1] << 8)) & 0xFFFF;
+    }
+
+    // ToUInt32(blk, offset, bigEndian?) - int  (unsigned 32-bit, 0–4294967295)
+    fn static ToUInt32(blk:block, offset:int, bigEndian?:bool):int {
+        let b:array = _bytes(blk, offset, 4);
+        if (bigEndian == true) { Array.Reverse(b); }
+        return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) & 0xFFFFFFFF;
+    }
+
+    // ToFloat64(blk, offset, bigEndian?) - float  (IEEE 754 double)
+    fn static ToFloat64(blk:block, offset:int, bigEndian?:bool):float {
+        let b:array = _bytes(blk, offset, 8);
+        if (bigEndian == true) { Array.Reverse(b); }
+        return _unpack_f64(b);
+    }
+
+    // ToFloat32(blk, offset, bigEndian?) - float  (IEEE 754 single - float64)
+    fn static ToFloat32(blk:block, offset:int, bigEndian?:bool):float {
+        let b:array = _bytes(blk, offset, 4);
+        if (bigEndian == true) { Array.Reverse(b); }
+        return _unpack_f32(b);
+    }
+
+    // ToBool(blk, offset) - bool  (0x00 = false, anything else = true)
+    fn static ToBool(blk:block, offset:int):bool {
+        let arr:array = Buffer.ToArray(blk);
+        return arr[offset] != 0;
+    }
+
+    // =========================================================================
+    // Utility
+    // =========================================================================
+
+    // ToString(blk) - string  - "FF-0A-3B-..." uppercase hex pairs with dashes.
+    fn static ToString(blk:block):string {
+        let arr:array = Buffer.ToArray(blk);
+        let n:int     = len(arr);
+        if (n == 0) { return ""; }
+
+        let hex:string  = "0123456789ABCDEF";
+        let parts:array = [];
+        iter (i from 0 to n - 1) {
+            let b:int    = arr[i];
+            let hi:string = String.Substr(hex, (b >> 4) & 0xF, 1);
+            let lo:string = String.Substr(hex, b & 0xF, 1);
+            Array.Append(parts, hi + lo);
+        }
+        return String.Join(parts, "-");
+    }
+
+    // ToHex(blk) - string  - "FF0A3B..." uppercase hex pairs, no separator.
+    fn static ToHex(blk:block):string {
+        let arr:array = Buffer.ToArray(blk);
+        let n:int     = len(arr);
+        if (n == 0) { return ""; }
+
+        let hex:string = "0123456789ABCDEF";
+        var result:string = "";
+        iter (i from 0 to n - 1) {
+            let b:int = arr[i];
+            let hi:string = String.Substr(hex, (b >> 4) & 0xF, 1);
+            let lo:string = String.Substr(hex, b & 0xF, 1);
+            result = result + hi + lo;
+        }
+        return result;
+    }
+
+    // FromHex(s) - block  - parse hex string (with or without dashes/spaces) into a block.
+    // Each pair of hex chars is one byte. Returns empty block for empty/invalid input.
+    fn static FromHex(s:string):block {
+        // Strip spaces and dashes, convert to uppercase
+        let cleaned:string = "";
+        let n:int = len(s);
+        iter (i from 0 to n - 1) {
+            let ch:string = String.Substr(s, i, 1);
+            if (ch != "-" && ch != " ") {
+                cleaned = cleaned + String.ToUpper(ch);
+            }
+        }
+        let cl:int = len(cleaned);
+        if (cl == 0 || cl % 2 != 0) { return Buffer.Create(0, 1); }
+
+        let hexChars:string = "0123456789ABCDEF";
+        let bytes:array = [];
+        var valid:bool = true;
+        iter (i from 0 to (cl / 2) - 1) {
+            let hi_ch:string = String.Substr(cleaned, i * 2, 1);
+            let lo_ch:string = String.Substr(cleaned, i * 2 + 1, 1);
+            let hi_idx:int = String.IndexOf(hexChars, hi_ch);
+            let lo_idx:int = String.IndexOf(hexChars, lo_ch);
+            if (hi_idx < 0 || lo_idx < 0) { valid = false; }
+            else { Array.Append(bytes, (hi_idx << 4) | lo_idx); }
+        }
+        if (!valid) { return Buffer.Create(0, 1); }
+        return _block(bytes);
+    }
+
+    // IsLittleEndian() - bool
+    // All modern targets (x86, x64, ARM little-endian) return true.
+    fn static IsLittleEndian():bool {
+        return true;
+    }
+}
+
+export { BitConverter };

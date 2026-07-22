@@ -1,0 +1,515 @@
+// test_lexer.fls - Test suite + benchmarks for Lexer.fls
+// Run: flarisvm tests/test_lexer.fls --libs='./libs'
+
+import { Lexer } from library("Lexer", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn chk(label: string, cond: bool) {
+    if (cond) {
+        passed += 1;
+    } else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label);
+    }
+}
+
+fn chkEq(label: string, got, expected) {
+    if (got == expected) {
+        passed += 1;
+    } else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label + " - expected: " + str(expected) + "  got: " + str(got));
+    }
+}
+
+// Shared lexer configured like a small scripting language
+fn makeLang() : instance {
+    let lex = new Lexer();
+    lex.Word("a-zA-Z_", "a-zA-Z0-9_")
+       .Number()
+       .Quote("\"", "string")
+       .Quote("'",  "string")
+       .LineComment("//")
+       .BlockComment("/*", "*/")
+       .Operator("==").Operator("!=").Operator("<=").Operator(">=")
+       .Operators("+-*/=<>!&|^~%(){}[];:,.")
+       .Keywords(["if","else","while","for","return","fn","let","var","true","false","nil"], "keyword")
+       .Skip(" \t\n\r");
+    return lex;
+}
+
+// ============================================================
+// Words and identifiers
+// ============================================================
+
+fn testWords() {
+    Console.WriteLine("--- Words ---");
+
+    let lex = new Lexer();
+    lex.Word("a-zA-Z_", "a-zA-Z0-9_").Skip(" ");
+
+    let t = lex.Tokenize("hello world _foo Bar123");
+    chkEq("words count",    len(t), 4);
+    chkEq("words [0].type", t[0].type, "word");
+    chkEq("words [0].val",  t[0].val,  "hello");
+    chkEq("words [1].val",  t[1].val,  "world");
+    chkEq("words [2].val",  t[2].val,  "_foo");
+    chkEq("words [3].val",  t[3].val,  "Bar123");
+
+    // Single character word
+    let t2 = lex.Tokenize("x");
+    chkEq("single char word", t2[0].val, "x");
+
+    // Word touching operator boundary (no skip between)
+    let lex2 = new Lexer();
+    lex2.Word("a-zA-Z", "a-zA-Z").Operators("=").Skip(" ");
+    let t3 = lex2.Tokenize("foo=bar");
+    chkEq("word op word count", len(t3), 3);
+    chkEq("word op word [0]",   t3[0].val, "foo");
+    chkEq("word op word [1]",   t3[1].val, "=");
+    chkEq("word op word [2]",   t3[2].val, "bar");
+}
+
+// ============================================================
+// Numbers
+// ============================================================
+
+fn testNumbers() {
+    Console.WriteLine("--- Numbers ---");
+
+    let lex = new Lexer();
+    lex.Number().Operators("+-*/").Skip(" ");
+
+    let t = lex.Tokenize("42 3.14 0 100");
+    chkEq("numbers count",      len(t), 4);
+    chkEq("numbers [0].type",   t[0].type, "number");
+    chkEq("numbers [0].val",    t[0].val,  42);
+    chkEq("numbers [1].val",    t[1].val,  3.14);
+    chkEq("numbers [2].val",    t[2].val,  0);
+    chkEq("numbers [3].val",    t[3].val,  100);
+
+    // Integer vs float type
+    chkEq("int type",   type(t[0].val), Type.Int);
+    chkEq("float type", type(t[1].val), Type.Float);
+
+    // Numbers in expression
+    let t2 = lex.Tokenize("1+2*3");
+    chkEq("expr count", len(t2), 5);
+    chkEq("expr [0]",   t2[0].val, 1);
+    chkEq("expr [1]",   t2[1].val, "+");
+    chkEq("expr [4]",   t2[4].val, 3);
+}
+
+// ============================================================
+// Quoted strings
+// ============================================================
+
+fn testStrings() {
+    Console.WriteLine("--- Strings ---");
+
+    let lex = new Lexer();
+    lex.Quote("\"", "string").Quote("'", "string").Skip(" ");
+
+    let t = lex.Tokenize("\"hello\" 'world'");
+    chkEq("strings count",    len(t), 2);
+    chkEq("strings [0].type", t[0].type, "string");
+    chkEq("strings [0].val",  t[0].val,  "hello");
+    chkEq("strings [1].val",  t[1].val,  "world");
+
+    // Escape sequences
+    let t2 = lex.Tokenize("\"line1\\nline2\" \"tab\\there\" \"quote\\\"end\"");
+    chkEq("escape \\n",     t2[0].val, "line1\nline2");
+    chkEq("escape \\t",     t2[1].val, "tab\there");
+    chkEq("escape \\\"",    t2[2].val, "quote\"end");
+
+    // Empty string
+    let t3 = lex.Tokenize("\"\"");
+    chkEq("empty string val",  t3[0].val, "");
+    chkEq("empty string type", t3[0].type, "string");
+
+    // String with spaces inside
+    let t4 = lex.Tokenize("\"hello world\"");
+    chkEq("string with spaces", t4[0].val, "hello world");
+}
+
+// ============================================================
+// Line comments
+// ============================================================
+
+fn testLineComments() {
+    Console.WriteLine("--- Line comments ---");
+
+    let lex = new Lexer();
+    lex.Word("a-zA-Z_", "a-zA-Z0-9_").LineComment("//").LineComment("#").Skip(" \t\n\r");
+
+    let t = lex.Tokenize("foo // this is ignored\nbar");
+    chkEq("line comment count",  len(t), 2);
+    chkEq("line comment [0]",    t[0].val, "foo");
+    chkEq("line comment [1]",    t[1].val, "bar");
+
+    // Hash comment
+    let t2 = lex.Tokenize("x # ignored\ny");
+    chkEq("hash comment count",  len(t2), 2);
+    chkEq("hash comment [1]",    t2[1].val, "y");
+
+    // Comment at end of file (no trailing newline)
+    let t3 = lex.Tokenize("foo // eof comment");
+    chkEq("comment at eof count", len(t3), 1);
+    chkEq("comment at eof val",   t3[0].val, "foo");
+
+    // Only comment, no tokens
+    let t4 = lex.Tokenize("// just a comment");
+    chkEq("only comment empty", len(t4), 0);
+}
+
+// ============================================================
+// Block comments
+// ============================================================
+
+fn testBlockComments() {
+    Console.WriteLine("--- Block comments ---");
+
+    let lex = new Lexer();
+    lex.Word("a-zA-Z_", "a-zA-Z0-9_").BlockComment("/*", "*/").Skip(" \t\n\r");
+
+    let t = lex.Tokenize("foo /* ignored */ bar");
+    chkEq("block comment count", len(t), 2);
+    chkEq("block comment [0]",   t[0].val, "foo");
+    chkEq("block comment [1]",   t[1].val, "bar");
+
+    // Multi-line block comment
+    let t2 = lex.Tokenize("a /* line1\nline2\nline3 */ b");
+    chkEq("multiline block count", len(t2), 2);
+    chkEq("multiline block [0]",   t2[0].val, "a");
+    chkEq("multiline block [1]",   t2[1].val, "b");
+
+    // Line tracking after block comment with newlines
+    chkEq("line after block comment", t2[1].line, 3);
+}
+
+// ============================================================
+// Keywords
+// ============================================================
+
+fn testKeywords() {
+    Console.WriteLine("--- Keywords ---");
+
+    let lex = new Lexer();
+    lex.Word("a-zA-Z_", "a-zA-Z0-9_")
+       .Keywords(["if","else","while","return"], "keyword")
+       .Skip(" ");
+
+    let t = lex.Tokenize("if foo else return while bar");
+    chkEq("keywords count",        len(t), 6);
+    chkEq("keywords [0].type",     t[0].type, "keyword");
+    chkEq("keywords [0].val",      t[0].val,  "if");
+    chkEq("keywords [1].type",     t[1].type, "word");
+    chkEq("keywords [1].val",      t[1].val,  "foo");
+    chkEq("keywords [2].type",     t[2].type, "keyword");
+    chkEq("keywords [4].type",     t[4].type, "keyword");
+    chkEq("keywords [5].type",     t[5].type, "word");
+
+    // Keyword prefix is not a keyword
+    let t2 = lex.Tokenize("iffy");
+    chkEq("keyword prefix is word", t2[0].type, "word");
+    chkEq("keyword prefix val",     t2[0].val,  "iffy");
+}
+
+// ============================================================
+// Operators - single and multi-char
+// ============================================================
+
+fn testOperators() {
+    Console.WriteLine("--- Operators ---");
+
+    let lex = new Lexer();
+    lex.Operator("==").Operator("!=").Operator("<=").Operator(">=")
+       .Operators("=<>!+-").Skip(" ");
+
+    // Multi-char operators take priority over single-char
+    let t = lex.Tokenize("== != <= >= = < >");
+    chkEq("ops count",   len(t), 7);
+    chkEq("ops == val",  t[0].val, "==");
+    chkEq("ops != val",  t[1].val, "!=");
+    chkEq("ops <= val",  t[2].val, "<=");
+    chkEq("ops >= val",  t[3].val, ">=");
+    chkEq("ops = val",   t[4].val, "=");
+    chkEq("ops < val",   t[5].val, "<");
+    chkEq("ops > val",   t[6].val, ">");
+
+    // No space between ops
+    let t2 = lex.Tokenize("a==b");
+    let lex2 = new Lexer();
+    lex2.Word("a-zA-Z", "a-zA-Z").Operator("==").Operators("=").Skip(" ");
+    let t3 = lex2.Tokenize("a==b");
+    chkEq("no-space ops count", len(t3), 3);
+    chkEq("no-space ops [1]",   t3[1].val, "==");
+}
+
+// ============================================================
+// Line and column tracking
+// ============================================================
+
+fn testLineCol() {
+    Console.WriteLine("--- Line/col tracking ---");
+
+    let lex = makeLang();
+
+    let t = lex.Tokenize("let x = 42;\nif (x > 0) {\n    return x;\n}");
+    chkEq("line 1 let",    t[0].line, 1);
+    chkEq("col  1 let",    t[0].col,  1);
+    chkEq("line 1 x",      t[1].line, 1);
+    chkEq("col  1 x",      t[1].col,  5);
+    // t[4]=";" t[5]="if" - semicolon is also tokenized by makeLang
+    chkEq("line 2 if",     t[5].line, 2);
+    chkEq("col  2 if",     t[5].col,  1);
+    chkEq("line 3 return", t[12].line, 3);
+
+    // Comment preserves line tracking
+    let t2 = lex.Tokenize("a\n// comment\nb");
+    chkEq("line after comment", t2[1].line, 3);
+
+    // Block comment with newlines preserves line tracking
+    let t3 = lex.Tokenize("a\n/*\nfoo\nbar\n*/\nb");
+    chkEq("line after block comment", t3[1].line, 6);
+}
+
+// ============================================================
+// Lexer.Quick - static convenience
+// ============================================================
+
+fn testQuick() {
+    Console.WriteLine("--- Lexer.Quick ---");
+
+    let t = Lexer.Quick("x = 3 / 5 + y", {
+        word:    "a-zA-Z_",
+        number:  true,
+        ops:     "=+-/*",
+        skip:    " \t",
+    });
+
+    chkEq("Quick count",  len(t), 7);
+    chkEq("Quick [0]",    t[0].val, "x");
+    chkEq("Quick [1]",    t[1].val, "=");
+    chkEq("Quick [2]",    t[2].val, 3);
+    chkEq("Quick [3]",    t[3].val, "/");
+    chkEq("Quick [4]",    t[4].val, 5);
+    chkEq("Quick [5]",    t[5].val, "+");
+    chkEq("Quick [6]",    t[6].val, "y");
+
+    // Quick with string and line comment
+    let t2 = Lexer.Quick("greet(\"world\") // hi", {
+        word:        "a-zA-Z_",
+        string:      "\"",
+        lineComment: "//",
+        ops:         "()",
+        skip:        " \t\n\r",
+    });
+    chkEq("Quick string count", len(t2), 4);
+    chkEq("Quick string val",   t2[2].val, "world");
+    chkEq("Quick string type",  t2[2].type, "string");
+}
+
+// ============================================================
+// Edge cases
+// ============================================================
+
+fn testEdgeCases() {
+    Console.WriteLine("--- Edge cases ---");
+
+    let lex = makeLang();
+
+    // Empty source
+    let t0 = lex.Tokenize("");
+    chkEq("empty source", len(t0), 0);
+
+    // Only whitespace
+    let t1 = lex.Tokenize("   \t\n  ");
+    chkEq("only whitespace", len(t1), 0);
+
+    // Only a comment
+    let t2 = lex.Tokenize("// nothing here");
+    chkEq("only comment", len(t2), 0);
+
+    // Unknown character emitted as 'unknown'
+    let t3 = lex.Tokenize("x @ y");
+    chkEq("unknown char count", len(t3), 3);
+    chkEq("unknown char type",  t3[1].type, "unknown");
+    chkEq("unknown char val",   t3[1].val,  "@");
+
+    // Reuse same lexer multiple times
+    let t4 = lex.Tokenize("if x");
+    let t5 = lex.Tokenize("return y");
+    chkEq("reuse [0] first",  t4[0].val, "if");
+    chkEq("reuse [0] second", t5[0].val, "return");
+
+    // Adjacent strings
+    let t6 = lex.Tokenize("\"a\"\"b\"");
+    chkEq("adjacent strings count", len(t6), 2);
+    chkEq("adjacent strings [0]",   t6[0].val, "a");
+    chkEq("adjacent strings [1]",   t6[1].val, "b");
+}
+
+// ============================================================
+// Realistic source input
+// ============================================================
+
+fn testRealistic() {
+    Console.WriteLine("--- Realistic source ---");
+
+    let lex = makeLang();
+    let src = """
+fn factorial(n: int) : int {
+    // base case
+    if (n <= 1) {
+        return 1;
+    }
+    return n * factorial(n - 1);
+}
+let result = factorial(10);
+Console.WriteLine("Result: " + str(result));
+""";
+
+    let t = lex.Tokenize(src);
+    chk("realistic token count > 40", len(t) > 40);
+
+    // First real token should be 'fn' keyword
+    chkEq("realistic [0] type", t[0].type, "keyword");
+    chkEq("realistic [0] val",  t[0].val,  "fn");
+
+    // 'factorial' should be a word
+    chkEq("realistic [1] type", t[1].type, "word");
+    chkEq("realistic [1] val",  t[1].val,  "factorial");
+
+    // Comment should be skipped entirely
+    let types = [];
+    iter (i from 0 to len(t) - 1) {
+        if (t[i].type == "unknown") types = Array.Append(types, t[i].val);
+    }
+    chkEq("no unexpected unknowns", len(types), 0);
+}
+
+// ============================================================
+// Benchmark helpers
+// ============================================================
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();  // warmup
+
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 42),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),  8), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.3f}", [us]), 10), " µs/call"
+    );
+}
+
+fn benchSep() {
+    Console.WriteLine(String.Repeat("-", 72));
+}
+
+// ============================================================
+// Benchmarks
+// ============================================================
+
+fn runBenchmarks() {
+    Console.WriteLine("\n--- Benchmarks ---");
+    Console.WriteLine(
+        String.PadRight("name", 42),
+        String.PadLeft("total", 8), "       ",
+        String.PadLeft("µs/call", 10)
+    );
+    benchSep();
+
+    // Pre-build lexers outside the timed loop
+    let mathLex = new Lexer();
+    mathLex.Word("a-zA-Z", "a-zA-Z0-9").Number().Operators("+-*/^=()").Skip(" \t");
+
+    let langLex = makeLang();
+
+    // Tiny math expression (~10 tokens)
+    bench("Math: sin(x) + 3.14 * y^2  [~10 tok]", fn() {
+        mathLex.Tokenize("sin(x) + 3.14 * y^2");
+    }, 5000);
+
+    // Medium expression (~25 tokens)
+    bench("Math: complex expr          [~25 tok]", fn() {
+        mathLex.Tokenize("(a + b) * (c - d) / (e + f) ^ 2 + sqrt(x * y)");
+    }, 5000);
+
+    // Small code snippet (~30 tokens)
+    bench("Code: if/else block         [~30 tok]", fn() {
+        langLex.Tokenize("if (x > 0) { return x * 2; } else { return -1; }");
+    }, 5000);
+
+    // Build a larger source once, then benchmark repeated tokenization
+    var bigSrc: string = "";
+    iter (i from 0 to 49) {
+        bigSrc = bigSrc + "let x" + str(i) + " = " + str(i) + " * 3.14;\n";
+        bigSrc = bigSrc + "if (x" + str(i) + " > 100) { return x" + str(i) + "; } // check\n";
+    }
+    let bigLen = String.Length(bigSrc);
+
+    bench("Code: 100-line source        [~500 tok]", fn() {
+        langLex.Tokenize(bigSrc);
+    }, 200);
+
+    benchSep();
+    Console.WriteLine("Source length for 100-line bench: " + str(bigLen) + " chars");
+
+    // Words-heavy source (identifiers dominate - exercises IndexOfAnyFrom)
+    var wordSrc: string = "";
+    iter (i from 0 to 199) {
+        wordSrc = wordSrc + "identifier" + str(i) + " ";
+    }
+    bench("Words: 200 identifiers       [200 tok]", fn() {
+        langLex.Tokenize(wordSrc);
+    }, 1000);
+
+    // Numbers-heavy source
+    var numSrc: string = "";
+    iter (i from 0 to 199) {
+        numSrc = numSrc + str(i) + " ";
+    }
+    bench("Numbers: 200 integers        [200 tok]", fn() {
+        langLex.Tokenize(numSrc);
+    }, 1000);
+
+    benchSep();
+}
+
+// ============================================================
+// Entry point
+// ============================================================
+
+fn Main() {
+    testWords();
+    testNumbers();
+    testStrings();
+    testLineComments();
+    testBlockComments();
+    testKeywords();
+    testOperators();
+    testLineCol();
+    testQuick();
+    testEdgeCases();
+    testRealistic();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: " + str(passed + failed) + "  failed: " + str(failed));
+    if (failed == 0) {
+        Console.Ok("All Lexer tests passed!");
+    } else {
+        Console.WriteLine("Some tests FAILED.");
+    }
+
+    runBenchmarks();
+    return failed;
+}

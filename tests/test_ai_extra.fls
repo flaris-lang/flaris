@@ -1,0 +1,100 @@
+// test_ai_extra.fls
+// Offline tests for AI helpers that do NOT need an Ollama server: the tool
+// (function-calling) definition builders and the image base64 helper.
+// The live tool-calling loop (AI.RunTools) and Vision are exercised by
+// test_ai.fls when a capable model is available.
+//
+//   flarisvm ./tests/test_ai_extra.fls --libs='./libs'
+
+import { AI } from library("AI", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) { testsFailed += 1; Console.WriteLine("FAIL: ", msg); }
+}
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+fn test_tool_builder() {
+    Console.WriteLine("-- AI.Tool");
+
+    let params = {
+        type: "object",
+        properties: { city: { type: "string", description: "City name" } },
+        required: ["city"]
+    };
+    let tool = AI.Tool("get_weather", "Get weather for a city", params);
+
+    checkEq(tool.type, "function", "tool type");
+    checkEq(tool.function.name, "get_weather", "tool function name");
+    checkEq(tool.function.description, "Get weather for a city", "tool description");
+    checkEq(tool.function.parameters.required[0], "city", "tool parameters carried through");
+
+    // Round-trips through JSON (this is how it is sent to Ollama).
+    let json = Json.Stringify(tool);
+    check(String.Contains(json, "\"name\":\"get_weather\""), "tool serialises name");
+    check(String.Contains(json, "\"type\":\"function\""), "tool serialises type");
+}
+
+fn test_tool_result() {
+    Console.WriteLine("-- AI.ToolResult");
+
+    let r = AI.ToolResult("get_weather", "sunny, 21C");
+    checkEq(r.role, "tool", "tool result role");
+    checkEq(r.tool_name, "get_weather", "tool result name");
+    checkEq(r.content, "sunny, 21C", "tool result content");
+
+    // Non-string content is stringified.
+    let r2 = AI.ToolResult("calc", 42);
+    checkEq(r2.content, "42", "non-string content stringified");
+}
+
+fn test_image_file() {
+    Console.WriteLine("-- AI.ImageFile");
+
+    let path = "/tmp/flaris_ai_img_test.bin";
+    File.WriteText(path, "hi");                  // 2 bytes
+    let b64 = AI.ImageFile(path);
+    checkEq(b64, "aGk=", "ImageFile base64-encodes file bytes");
+
+    checkEq(AI.ImageFile("/tmp/no_such_file_xyz.bin"), nil, "missing file -> nil");
+
+    File.Delete(path);
+}
+
+fn test_benchmarks() {
+    Console.WriteLine("=== AI helper benchmarks ===");
+    let iters = 20000;
+
+    let t0 = Time.Ticks();
+    iter (i from 0 to iters - 1) {
+        let _t = AI.Tool("f", "d", { type: "object", properties: { x: { type: "number" } } });
+    }
+    Console.WriteLine("AI.Tool build (", iters, " iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+    Console.WriteLine("=== benchmarks done ===");
+}
+
+fn Main() {
+    Console.WriteLine("=== AI extra (offline) test suite ===");
+
+    test_tool_builder();
+    test_tool_result();
+    test_image_file();
+    test_benchmarks();
+
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    if (testsFailed == 0) {
+        Console.WriteLine("✅ All AI extra tests passed!");
+    } else {
+        Console.WriteLine("❌ Some AI extra tests failed");
+    }
+}

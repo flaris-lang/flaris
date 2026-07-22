@@ -1,0 +1,673 @@
+// WebSocket.fls - WebSocket client for Flaris. Requires -u flag.
+// Version: 1.0
+//
+// Implements RFC 6455 client-side handshake and framing.
+// Supports text and binary frames, ping/pong, clean close, and ws:// + wss://
+// (wss:// uses the built-in Tls module - OS-native TLS, no extra setup).
+// Limitations: no fragmentation, no compression.
+//
+// Usage:
+//   import { Ws } from library("WebSocket", "1.0");
+//
+//   let ws = Ws.Connect("echo.websocket.org", 80, "/");
+//   if (ws == nil) { Console.WriteLine("connection failed"); }
+//
+//   ws.SendText("hello");
+//   let msg = ws.Receive();       // { opcode, data, isBinary }
+//   Console.WriteLine(msg.data);  // "hello" (echo server)
+//
+//   ws.Ping();
+//   ws.Close(1000, "bye");
+//   ws.IsOpen();                  // false after close
+//
+// Connecting:
+//   WebSocket.Connect(host, port, path?, extraHeaders?, secure?)  →  instance (throws on failure)
+//   WebSocket.ConnectUrl(url, extraHeaders?)  →  instance   - "ws://..." or "wss://..."
+//   - path defaults to "/"; secure=true upgrades the transport to TLS (wss://)
+//   - extraHeaders is an optional object: { "Authorization": "Bearer ..." }
+//   wss:// runs over the built-in Tls module (no plugin); -u is still required
+//   because the framing uses the Memory module.
+//
+// Sending:
+//   SendText(text)       →  bool
+//   SendBinary(block)    →  bool
+//   SendJson(value)      →  bool  - Json.Stringify(value) then SendText
+//
+// Receiving:
+//   Receive()            →  { opcode:int, data:string|block, isBinary:bool } or nil
+//   ReceiveText()        →  string or nil  - expects text frame
+//   ReceiveJson()        →  parsed object or nil
+//
+// Control:
+//   Ping(data?)          →  bool
+//   Pong(data?)          →  bool
+//   Close(code?, reason?) - sends close frame; code default 1000
+//   IsOpen()             →  bool
+//   CloseCode()          →  int
+//   CloseReason()        →  string
+//
+// Opcodes (static constants):
+//   Ws.OpcodeText()  Ws.OpcodeBinary()  Ws.OpcodePing()
+//   Ws.OpcodePong()  Ws.OpcodeClose()   Ws.OpcodeCont()
+
+class Ws {
+    fn static Guid(): string {
+        return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    }
+
+    fn static OpcodeCont(): int   { return 0x0; }
+    fn static OpcodeText(): int   { return 0x1; }
+    fn static OpcodeBinary(): int { return 0x2; }
+    fn static OpcodeClose(): int  { return 0x8; }
+    fn static OpcodePing(): int   { return 0x9; }
+    fn static OpcodePong(): int   { return 0xA; }
+
+    fn static EnsurePath(path: string): string {
+        if (path == nil || path == "") return "/";
+        if (String.StartsWith(path, "/")) return path;
+        return "/" + path;
+    }
+
+    fn static MakeClientKey(): string {
+        let raw = Crypto.RandomBytes(16);
+        return Util.Base64Encode(raw);
+    }
+
+    fn static MakeAccept(clientKey: string): string {
+        let sha1Hex = Hash.Sha1(clientKey + Ws.Guid());
+        let raw = Util.HexToBin(sha1Hex);
+        return Util.Base64Encode(raw);
+    }
+
+    fn static ParseHeaderLine(line: string): array {
+        let idx = String.IndexOf(line, ":");
+        if (idx < 0) return ["", ""];
+
+        let name = String.ToLower(String.Trim(String.Left(line, idx)));
+        let value = String.Trim(String.Substr(line, idx + 1));
+        return [name, value];
+    }
+
+    fn static BuildRequest(host: string, path: string, key: string, extraHeaders): string {
+        let lines = [];
+        Array.Append(lines, "GET " + path + " HTTP/1.1");
+        Array.Append(lines, "Host: " + host);
+        Array.Append(lines, "Upgrade: websocket");
+        Array.Append(lines, "Connection: Upgrade");
+        Array.Append(lines, "Sec-WebSocket-Version: 13");
+        Array.Append(lines, "Sec-WebSocket-Key: " + key);
+
+        if (extraHeaders != nil) {
+            foreach (v, k in extraHeaders) {
+                Array.Append(lines, str(k) + ": " + str(v));
+            }
+        }
+
+        return String.Join(lines, "\r\n") + "\r\n\r\n";
+    }
+
+    fn static ReadHttpHeaders(tr): object {
+        let statusLine = tr.readLine();
+        let headers = { _statusLine: statusLine };
+
+        while (true) {
+            let line = tr.readLine();
+            if (line == nil || line == "") break;
+
+            let kv = Ws.ParseHeaderLine(line);
+            if (kv[0] != "") {
+                headers[kv[0]] = kv[1];
+            }
+        }
+
+        return headers;
+    }
+
+    fn static StringToBlock(text: string): block {
+        return Buffer.FromString(text);
+    }
+
+    fn static BlockToString(buf: block): string {
+        return Buffer.ToString(buf);
+    }
+
+    fn static ReadU16BE(buf: block, off: int): int {
+        let b0 = Memory.Read8(buf, off);
+        let b1 = Memory.Read8(buf, off + 1);
+        return u16((b0 << 8) | b1);
+    }
+
+    fn static WriteU16BE(buf: block, off: int, v: int) {
+        Memory.Write8(buf, (v >> 8) & 255, off);
+        Memory.Write8(buf, v & 255, off + 1);
+    }
+
+    fn static ReadU64BE(buf: block, off: int): int {
+        let v = 0;
+        let i = 0;
+        while (i < 8) {
+            v = (v << 8) | Memory.Read8(buf, off + i);
+            i += 1;
+        }
+        return v;
+    }
+
+    fn static WriteU64BE(buf: block, off: int, v: int) {
+        let i = 7;
+        while (i >= 0) {
+            Memory.Write8(buf, v & 255, off + i);
+            v = v >> 8;
+            i -= 1;
+        }
+    }
+
+    fn static XorMaskInPlace(buf: block, mask: block, count: int) {
+        let m0 = Memory.Read8(mask, 0);
+        let m1 = Memory.Read8(mask, 1);
+        let m2 = Memory.Read8(mask, 2);
+        let m3 = Memory.Read8(mask, 3);
+        let i = 0;
+        let end4 = count - (count & 3);
+        while (i < end4) {
+            Memory.Write8(buf, Memory.Read8(buf, i)   ^ m0, i);
+            Memory.Write8(buf, Memory.Read8(buf, i+1) ^ m1, i+1);
+            Memory.Write8(buf, Memory.Read8(buf, i+2) ^ m2, i+2);
+            Memory.Write8(buf, Memory.Read8(buf, i+3) ^ m3, i+3);
+            i += 4;
+        }
+        let ms = [m0, m1, m2, m3];
+        while (i < count) {
+            Memory.Write8(buf, Memory.Read8(buf, i) ^ ms[i & 3], i);
+            i += 1;
+        }
+    }
+
+    fn static XorMaskRangeInPlace(buf: block, start: int, mask: block, count: int) {
+        let m0 = Memory.Read8(mask, 0);
+        let m1 = Memory.Read8(mask, 1);
+        let m2 = Memory.Read8(mask, 2);
+        let m3 = Memory.Read8(mask, 3);
+        let i = 0;
+        let end4 = count - (count & 3);
+        while (i < end4) {
+            let off = start + i;
+            Memory.Write8(buf, Memory.Read8(buf, off)   ^ m0, off);
+            Memory.Write8(buf, Memory.Read8(buf, off+1) ^ m1, off+1);
+            Memory.Write8(buf, Memory.Read8(buf, off+2) ^ m2, off+2);
+            Memory.Write8(buf, Memory.Read8(buf, off+3) ^ m3, off+3);
+            i += 4;
+        }
+        let ms = [m0, m1, m2, m3];
+        while (i < count) {
+            let off = start + i;
+            Memory.Write8(buf, Memory.Read8(buf, off) ^ ms[i & 3], off);
+            i += 1;
+        }
+    }
+
+    fn static HeaderGet(headers: object, name: string): string {
+        let key = String.ToLower(name);
+        let v = headers[key];
+        if (v == nil) return "";
+        return str(v);
+    }
+
+    fn static ValidateControlPayload(opcode:int, payloadLen:int) {
+        if (opcode == Ws.OpcodeClose() || opcode == Ws.OpcodePing() || opcode == Ws.OpcodePong()) {
+            if (payloadLen > 125) {
+                throw(Exception.RuntimeError, "Control frame payload too large");
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Transport abstraction
+    // --------------------------------------------------------
+    // The handshake and framing code talks to one of these instead of Stream
+    // directly, so the same logic runs over plain TCP (ws://) or TLS (wss://).
+    // Shape: { secure, writeStr(s)->bool, writeBlock(b)->bool, readLine()->str|nil,
+    //          readBytes(n)->block|nil, isOpen()->bool, close()->bool }.
+
+    // Plain TCP transport over a Stream socket.
+    fn static _plainTransport(s): object {
+        return {
+            secure:     false,
+            writeStr:   fn(data) { return Stream.WriteString(s, data); },
+            writeBlock: fn(blk)  { return Stream.WriteAll(s, blk); },
+            readLine:   fn()     { return Stream.ReadLine(s); },
+            readBytes:  fn(n)    { return Stream.ReadBytes(s, n); },
+            isOpen:     fn()     { return Stream.IsOpen(s); },
+            close:      fn()     { return Stream.Close(s); }
+        };
+    }
+
+    // TLS transport over a built-in Tls handle. Tls works in strings, so blocks
+    // are bridged via Buffer.ToString / Buffer.FromString (both binary-safe).
+    fn static _tlsTransport(h): object {
+        return {
+            secure:     true,
+            writeStr:   fn(data) { return Tls.Write(h, data) != -1; },
+            writeBlock: fn(blk)  { return Tls.Write(h, Buffer.ToString(blk)) != -1; },
+            readLine:   fn()     { return Tls.ReadLine(h); },
+            readBytes:  fn(n)    { let str = Tls.ReadN(h, n); return (str == nil) ? nil : Buffer.FromString(str); },
+            isOpen:     fn()     { return true; },   // Tls has no IsOpen; logical state tracked via .closed
+            close:      fn()     { return Tls.Close(h); }
+        };
+    }
+}
+
+class WebSocketClient {
+    let host = nil; 
+    let path = nil; 
+    let port = nil; 
+    let secure = nil; 
+    let tr = nil; 
+    let closeCode = 0; 
+    let closeReason: string = nil; 
+    let closed = nil; 
+    fn static Connect(host: string, port: int, path, headers, secure): instance {
+        let tr = nil;
+        if (secure == true) {
+            // Built-in TLS (Tls module): verified handshake, 5 s connect timeout.
+            let h = Tls.Connect(host, port, false, 5000);
+            if (h == 0) {
+                throw(Exception.IOError, "Failed to establish TLS connection");
+            }
+            tr = Ws._tlsTransport(h);
+        } else {
+            let s = Stream.Connect("tcp", host, port);
+            if (s == nil) {
+                throw(Exception.IOError, "Failed to connect socket");
+            }
+            Stream.SetTimeout(s, 5000, 5000);
+            tr = Ws._plainTransport(s);
+        }
+
+        let reqPath = Ws.EnsurePath(path);
+        let key = Ws.MakeClientKey();
+        let request = Ws.BuildRequest(host, reqPath, key, headers);
+
+        if (!tr.writeStr(request)) {
+            tr.close();
+            throw(Exception.IOError, "Failed to write WebSocket handshake");
+        }
+
+        let response = Ws.ReadHttpHeaders(tr);
+        let statusLine = response._statusLine ?? "";
+
+        if (!String.StartsWith(statusLine, "HTTP/1.1 101") &&
+            !String.StartsWith(statusLine, "HTTP/1.0 101")) {
+            tr.close();
+            throw(Exception.RuntimeError, "WebSocket upgrade failed: " + statusLine);
+        }
+
+        let upgrade = String.ToLower(Ws.HeaderGet(response, "upgrade"));
+        let connection = String.ToLower(Ws.HeaderGet(response, "connection"));
+        let accept = Ws.HeaderGet(response, "sec-websocket-accept");
+        let expected = Ws.MakeAccept(key);
+
+        if (upgrade != "websocket") {
+            tr.close();
+            throw(Exception.RuntimeError, "Missing or invalid Upgrade header");
+        }
+
+        if (String.IndexOf(connection, "upgrade") < 0) {
+            tr.close();
+            throw(Exception.RuntimeError, "Missing or invalid Connection header");
+        }
+
+        if (accept != expected) {
+            tr.close();
+            throw(Exception.RuntimeError, "Invalid Sec-WebSocket-Accept");
+        }
+
+        let ws = new WebSocketClient();
+        ws.tr = tr;
+        ws.secure = (secure == true);
+        ws.host = host;
+        ws.port = port;
+        ws.path = reqPath;
+        ws.closed = false;
+        ws.closeCode = 0;
+        ws.closeReason = "";
+        return ws;
+    }
+
+    fn IsOpen(): bool {
+        return !this.closed && this.tr.isOpen();
+    }
+
+    fn CloseCode(): int { return this.closeCode; }
+    fn CloseReason(): string { return this.closeReason; }
+
+    fn SendText(text: string): bool {
+        return this.SendFrame(Ws.OpcodeText(), Ws.StringToBlock(text));
+    }
+
+    fn SendBinary(data: block): bool {
+        return this.SendFrame(Ws.OpcodeBinary(), data);
+    }
+
+    fn SendJson(value): bool {
+        return this.SendText(Json.Stringify(value));
+    }
+
+    fn Ping(data): bool {
+        let payload = nil;
+
+        if (data != nil) {
+            let t = type(data);
+            if (t == Type.String) {
+                payload = Ws.StringToBlock(data);
+            } else {
+                payload = data;
+            }
+        }
+
+        if (payload != nil && len(payload) > 125) {
+            throw(Exception.RuntimeError, "Ping payload too large");
+        }
+
+        return this.SendFrame(Ws.OpcodePing(), payload);
+    }
+
+    fn Pong(data): bool {
+        let payload = nil;
+
+        if (data != nil) {
+            let t = type(data);
+            if (t == Type.String) {
+                payload = Ws.StringToBlock(data);
+            } else {
+                payload = data;
+            }
+        }
+
+        if (payload != nil && len(payload) > 125) {
+            throw(Exception.RuntimeError, "Pong payload too large");
+        }
+
+        return this.SendFrame(Ws.OpcodePong(), payload);
+    }
+
+    fn Close(code, reason): bool {
+        if (this.closed) {
+            if (this.tr.isOpen()) this.tr.close();
+            return true;
+        }
+
+        let payload = nil;
+
+        if (code != nil) {
+            let reasonText = reason ?? "";
+            let reasonBlock = Ws.StringToBlock(reasonText);
+            let l = len(reasonBlock);
+            let total = 2 + l;
+
+            if (total > 125) {
+                throw(Exception.RuntimeError, "Close reason too large");
+            }
+
+            let buf = Buffer.Create(total, 1);
+            Ws.WriteU16BE(buf, 0, code);
+
+            if (l > 0) {
+                Buffer.Copy(reasonBlock, 0, buf, 2, l);
+            }
+
+            payload = buf;
+        }
+
+        this.SendFrame(Ws.OpcodeClose(), payload);
+        this.closed = true;
+        this.tr.close();
+        return true;
+    }
+
+    fn Abort(): bool {
+        this.closed = true;
+        if (this.tr.isOpen()) {
+            return this.tr.close();
+        }
+        return true;
+    }
+
+    fn SendFrame(opcode: int, payload): bool {
+        if (this.closed) {
+            throw(Exception.InvalidState, "WebSocket already closed");
+        }
+
+        let data = payload;
+        if (data == nil) data = Buffer.Create(0, 1);
+
+        let n = len(data);
+        Ws.ValidateControlPayload(opcode, n);
+
+        let headerLen = 2;
+        if (n >= 126 && n <= 65535) {
+            headerLen = 4;
+        } else if (n > 65535) {
+            headerLen = 10;
+        }
+
+        let mask = Crypto.RandomBytes(4);
+        let frame = Buffer.Create(headerLen + 4 + n, 1);
+        Buffer.Fill(frame, 0);
+
+        Memory.Write8(frame, 0x80 | (opcode & 0x0F), 0);
+
+        if (n < 126) {
+            Memory.Write8(frame, 0x80 | n, 1);
+        } else if (n <= 65535) {
+            Memory.Write8(frame, 0x80 | 126, 1);
+            Ws.WriteU16BE(frame, 2, n);
+        } else {
+            Memory.Write8(frame, 0x80 | 127, 1);
+            Ws.WriteU64BE(frame, 2, n);
+        }
+
+        let maskOff = headerLen;
+        let payloadOff = headerLen + 4;
+
+        Buffer.Copy(mask, 0, frame, maskOff, 4);
+
+        if (n > 0) {
+            Buffer.Copy(data, 0, frame, payloadOff, n);
+            Ws.XorMaskRangeInPlace(frame, payloadOff, mask, n);
+        }
+
+        return this.tr.writeBlock(frame);
+    }
+
+    fn ReadFrame(): object {
+        if (this.closed) {
+            throw(Exception.InvalidState, "WebSocket already closed");
+        }
+
+        let head = this.tr.readBytes(2);
+        if (head == nil || len(head) < 2) {
+            this.closed = true;
+            throw(Exception.IOError, "Failed to read WebSocket frame header");
+        }
+
+        let b0 = Memory.Read8(head, 0);
+        let b1 = Memory.Read8(head, 1);
+
+        let fin = (b0 & 0x80) != 0;
+        let rsv = b0 & 0x70;
+        let opcode = b0 & 0x0F;
+        let masked = (b1 & 0x80) != 0;
+        let len7 = b1 & 0x7F;
+
+        if (rsv != 0) {
+            throw(Exception.RuntimeError, "RSV bits set but extensions not supported");
+        }
+
+        let payloadLen = 0;
+
+        if (len7 < 126) {
+            payloadLen = len7;
+        } else if (len7 == 126) {
+            let ext2 = this.tr.readBytes(2);
+            if (ext2 == nil || len(ext2) < 2) {
+                throw(Exception.IOError, "Failed to read extended payload length");
+            }
+            payloadLen = Ws.ReadU16BE(ext2, 0);
+        } else {
+            let ext8 = this.tr.readBytes(8);
+            if (ext8 == nil || len(ext8) < 8) {
+                throw(Exception.IOError, "Failed to read extended payload length");
+            }
+            payloadLen = Ws.ReadU64BE(ext8, 0);
+        }
+
+        Ws.ValidateControlPayload(opcode, payloadLen);
+
+        if ((opcode == Ws.OpcodeClose() || opcode == Ws.OpcodePing() || opcode == Ws.OpcodePong()) && !fin) {
+            throw(Exception.RuntimeError, "Fragmented control frames not allowed");
+        }
+
+        let maskKey = nil;
+        if (masked) {
+            maskKey = this.tr.readBytes(4);
+            if (maskKey == nil || len(maskKey) < 4) {
+                throw(Exception.IOError, "Failed to read masking key");
+            }
+        }
+
+        let payload = Buffer.Create(payloadLen, 1);
+        if (payloadLen > 0) {
+            let raw = this.tr.readBytes(payloadLen);
+            if (raw == nil || len(raw) < payloadLen) {
+                throw(Exception.IOError, "Failed to read frame payload");
+            }
+            Buffer.Copy(raw, 0, payload, 0, payloadLen);
+        }
+
+        if (masked && payloadLen > 0) {
+            Ws.XorMaskInPlace(payload, maskKey, payloadLen);
+        }
+
+        if (!fin) {
+            throw(Exception.RuntimeError, "Fragmented WebSocket frames not supported yet");
+        }
+
+        let frame = {
+            Fin: fin,
+            Opcode: opcode,
+            Payload: payload,
+            Length: payloadLen,
+            Masked: masked,
+            Text: nil,
+            Json: nil,
+            CloseCode: nil,
+            CloseReason: nil
+        };
+
+        if (opcode == Ws.OpcodeText()) {
+            frame.Text = Ws.BlockToString(payload);
+        }
+
+        if (opcode == Ws.OpcodeClose()) {
+            if (payloadLen == 1) {
+                throw(Exception.RuntimeError, "Invalid close frame payload length");
+            }
+
+            if (payloadLen >= 2) {
+                frame.CloseCode = Ws.ReadU16BE(payload, 0);
+                if (payloadLen > 2) {
+                    let reasonBuf = Buffer.Slice(payload, 2, payloadLen - 2);
+                    frame.CloseReason = Ws.BlockToString(reasonBuf);
+                } else {
+                    frame.CloseReason = "";
+                }
+            }
+        }
+
+        return frame;
+    }
+
+    fn Receive(): object {
+        while (true) {
+            let frame = this.ReadFrame();
+
+            if (frame.Opcode == Ws.OpcodePing()) {
+                this.Pong(frame.Payload);
+                continue;
+            }
+
+            if (frame.Opcode == Ws.OpcodeClose()) {
+                this.closed = true;
+                this.closeCode = frame.CloseCode ?? 0;
+                this.closeReason = frame.CloseReason ?? "";
+
+                if (this.tr.isOpen()) {
+                    this.SendFrame(Ws.OpcodeClose(), nil);
+                    this.tr.close();
+                }
+
+                return frame;
+            }
+
+            return frame;
+        }
+    }
+
+    fn ReceiveText(): string {
+        let frame = this.Receive();
+        if (frame.Opcode != Ws.OpcodeText()) {
+            throw(Exception.RuntimeError, "Expected text frame");
+        }
+        return frame.Text;
+    }
+
+    fn ReceiveBinary(): block {
+        let frame = this.Receive();
+        if (frame.Opcode != Ws.OpcodeBinary()) {
+            throw(Exception.RuntimeError, "Expected binary frame");
+        }
+        return frame.Payload;
+    }
+
+    fn ReceiveJson() {
+        let text = this.ReceiveText();
+        return Json.Parse(text);
+    }
+}
+
+class WebSocket {
+    // secure? = true upgrades to TLS (wss://). Omit for plain ws:// (default).
+    fn static Connect(host: string, port: int, path, headers, secure?): instance {
+        return WebSocketClient.Connect(host, port, path ?? "/", headers, secure ?? false);
+    }
+
+    // Convenience: TLS (wss://) on host[:port], port defaulting to 443.
+    fn static ConnectSecure(host: string, port, path, headers): instance {
+        return WebSocketClient.Connect(host, port ?? 443, path ?? "/", headers, true);
+    }
+
+    // Connect from a "ws://host[:port]/path" or "wss://..." URL.
+    fn static ConnectUrl(url: string, headers?): instance {
+        let lower  = String.ToLower(url);
+        let secure = false;
+        let rest   = nil;
+        if (String.StartsWith(lower, "wss://"))     { secure = true;  rest = String.Substr(url, 6); }
+        else if (String.StartsWith(lower, "ws://")) { secure = false; rest = String.Substr(url, 5); }
+        else { throw(Exception.RuntimeError, "WebSocket URL must start with ws:// or wss://"); }
+
+        let slash     = String.IndexOf(rest, "/");
+        let authority = (slash < 0) ? rest : String.Left(rest, slash);
+        let path      = (slash < 0) ? "/"  : String.Substr(rest, slash);
+
+        let host  = authority;
+        let port  = secure ? 443 : 80;
+        let colon = String.IndexOf(authority, ":");
+        if (colon >= 0) {
+            host = String.Left(authority, colon);
+            port = Convert.ParseInt(String.Substr(authority, colon + 1));
+        }
+        return WebSocketClient.Connect(host, port, path, headers ?? nil, secure);
+    }
+}
+
+export { WebSocket, Ws };

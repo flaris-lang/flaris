@@ -1,0 +1,494 @@
+// CSV.fls - CSV parser and serializer for Flaris.
+// Version: 1.0
+//
+// RFC 4180 compliant: handles quoted fields, embedded delimiters, embedded
+// newlines, embedded quotes, CRLF and LF line endings.
+// TSV support: pass { delimiter: "\t" }.
+//
+// Usage:
+//   import { CSV } from library("CSV", "1.0");
+//
+//   // Parse string - with header row → array of objects
+//   let rows = CSV.Parse("name,age\nAlice,30\nBob,25", { headers: true });
+//   Console.WriteLine(rows[0].name);   // "Alice"
+//   Console.WriteLine(rows[0].age);    // "30" (or 30 if types:true)
+//
+//   // Parse without headers → array of arrays
+//   let grid = CSV.Parse("1,2\n3,4");  // [[1,2],[3,4]] with types:true
+//
+//   // Parse directly from a file
+//   let rows = CSV.ParseFile("data.csv", { headers: true, types: true });
+//
+//   // Serialize array of objects or arrays back to CSV string
+//   let csv = CSV.Stringify(rows);          // headers auto-detected from object keys
+//   CSV.WriteFile("out.csv", rows);         // write to file
+//   CSV.AppendFile("log.csv", newRows);     // append; suppresses duplicate header row
+//
+//   // Stream large files without loading all rows at once
+//   CSV.ForEachFile("big.csv", fn(row, i) {
+//       Console.WriteLine(row.name);
+//   }, { headers: true });
+//
+//   // Read only the first n rows (with header)
+//   let preview = CSV.Head("data.csv", 5, { headers: true });
+//
+//   // Look up a column index by name
+//   let idx = CSV.ColumnIndex(["name","age","city"], "age");  // => 1
+//
+// Options (opts object, all optional):
+//   delimiter : string  - field separator; default ","
+//   quote     : string  - quote character; default "\""
+//   headers   : bool|array - Parse: true = use first row as header (returns objects)
+//                            Stringify/Write: array of column names sets order
+//   trim      : bool    - Parse: strip whitespace from each field
+//   types     : bool    - Parse: auto-convert "123" → int, "3.14" → float,
+//                         "true"/"TRUE" → bool (case-insensitive)
+//   nullValues: array   - Parse (with types): field strings to treat as nil
+//                         (e.g. ["", "NA", "null"]); default keeps "" as ""
+//   comment   : string  - Parse: skip lines starting with this char (e.g. "#")
+//   crlf      : bool    - Stringify/Write: use \\r\\n line endings (RFC 4180 strict)
+//   sanitize  : bool    - Stringify/Write: escape formula-injection in string
+//                         fields (prefix leading = + - @ with '); numbers untouched
+//
+// API:
+//   CSV.Parse(src:string, opts?)            →  array of objects (headers) or arrays
+//   CSV.ParseFile(path:string, opts?)       →  same, reads from file
+//   CSV.ParseLine(line:string, delim?, quote?) →  array of field strings (one row)
+//   CSV.ForEach(src:string, fn(row,i), opts?)  - stream rows from string
+//   CSV.ForEachFile(path, fn(row,i), opts?)    - stream rows from file
+//   CSV.Head(path, n:int, opts?)            →  first n rows
+//   CSV.Stringify(rows:array, opts?)        →  CSV string
+//   CSV.WriteFile(path, rows, opts?)        - write CSV to file
+//   CSV.AppendFile(path, rows, opts?)       - append to file (no duplicate header)
+//   CSV.ColumnIndex(headers:array, name)    →  int  (-1 if not found)
+//   CSV.Infer(s:string)                     →  inferred scalar (bool/int/float/string)
+
+class CSV {
+
+    // =========================================================================
+    // Cursor helpers
+    // =========================================================================
+
+    fn static _cur(src:string) {
+        return { s: src, p: 0, n: String.Length(src) };
+    }
+
+    // Byte value of a single-character option string ("," -> 44); -1 when the
+    // option is empty so it can never match a real byte.
+    fn static _optByte(s:string): int {
+        if (String.Length(s) == 0) return -1;
+        return int(s[0]);   // s[i] is a char; the byte scanners compare against ints
+    }
+
+    // =========================================================================
+    // Core parsing
+    //
+    // The scanners work on raw bytes (s[i] returns an int) so the hot loops
+    // allocate nothing; field text is materialized with a single Substr per
+    // run. Delimiter, quote, and comment are single-byte characters.
+    // =========================================================================
+
+    // Skip one newline sequence (LF or CRLF) at current cursor position.
+    fn static _skipNl(c) {
+        if (c.p >= c.n) return;
+        let b = c.s[c.p];
+        if (b == 13) {                                   // \r
+            c.p += 1;
+            if (c.p < c.n and c.s[c.p] == 10) c.p += 1;  // \n
+        } else if (b == 10) {                            // \n
+            c.p += 1;
+        }
+    }
+
+    // Skip to end of current line without consuming the newline itself.
+    fn static _skipToNl(c) {
+        while (c.p < c.n) {
+            let b = c.s[c.p];
+            if (b == 10 or b == 13) break;
+            c.p += 1;
+        }
+    }
+
+    // Parse one field from cursor. Returns the field string and leaves the
+    // cursor on the trailing delimiter or line ending. The cursor fields are
+    // hoisted into locals so the per-byte loop does no property lookups.
+    fn static _parseField(c, delimB:int, quoteB:int): string {
+        let src = c.s;
+        let n   = c.n;
+        let p   = c.p;
+
+        if (p < n and src[p] == quoteB) {
+            // Quoted field - consume everything up to the closing quote.
+            // A doubled quote inside is an escaped quote character.
+            p += 1;
+            let out = "";
+            let runStart = p;
+            while (true) {
+                if (p >= n) {
+                    out += String.Substr(src, runStart, p - runStart);
+                    break;
+                }
+                if (src[p] == quoteB) {
+                    if (p + 1 < n and src[p + 1] == quoteB) {
+                        // Escaped quote: keep the run plus one quote byte.
+                        out += String.Substr(src, runStart, p - runStart + 1);
+                        p += 2;
+                        runStart = p;
+                    } else {
+                        out += String.Substr(src, runStart, p - runStart);
+                        p += 1;
+                        break;
+                    }
+                } else {
+                    p += 1;
+                }
+            }
+            c.p = p;
+            return out;
+        }
+
+        // Unquoted field - read until delimiter, CR, LF, or end.
+        let start = p;
+        while (p < n) {
+            let b = src[p];
+            if (b == delimB or b == 10 or b == 13) break;
+            p += 1;
+        }
+        c.p = p;
+        return String.Substr(src, start, p - start);
+    }
+
+    // Parse one complete row. Returns array of field strings, or nil at EOF.
+    fn static _parseRow(c, delimB:int, quoteB:int) {
+        let src = c.s;
+        let n   = c.n;
+        if (c.p >= n) return nil;
+        let row = [];
+        while (true) {
+            let field = CSV._parseField(c, delimB, quoteB);
+            Array.Append(row, field);
+            let p = c.p;
+            if (p >= n) break;
+            if (src[p] == delimB) {
+                c.p = p + 1;   // consume delimiter and read next field
+            } else {
+                CSV._skipNl(c);
+                break;
+            }
+        }
+        return row;
+    }
+
+    // =========================================================================
+    // Type coercion
+    // =========================================================================
+
+    // Convert a string field to its most specific native type:
+    //   "true"/"false" - bool, integer strings - int, decimal strings - float,
+    //   everything else stays string.
+    fn static _inArray(arr, v): bool {
+        if (arr == nil) return false;
+        iter (i from 0 to len(arr) - 1) {
+            if (arr[i] == v) return true;
+        }
+        return false;
+    }
+
+    // Infer a scalar type from a CSV field string: booleans (case-insensitive),
+    // integers, floats, otherwise the original string. Fields listed in
+    // `nullSet` (when given) become nil.
+    fn static _coerceVal(s:string, nullSet) {
+        if (CSV._inArray(nullSet, s)) return nil;
+        let lc = String.ToLower(s);
+        if (lc == "true")  return true;
+        if (lc == "false") return false;
+        let iv = Convert.ParseInt(s);
+        if (iv != nil) return iv;
+        let fv = Convert.ParseFloat(s);
+        if (fv != nil) return fv;
+        return s;
+    }
+
+    fn static _coerce(s:string) { return CSV._coerceVal(s, nil); }
+
+    // Public single-value type inference (booleans, ints, floats, else string).
+    fn static Infer(s:string) { return CSV._coerceVal(s, nil); }
+
+    // Apply type inference to every element of a row array in-place.
+    fn static _coerceRow(row:array, nullSet) {
+        iter (i from 0 to len(row) - 1) {
+            row[i] = CSV._coerceVal(row[i], nullSet);
+        }
+    }
+
+    // =========================================================================
+    // Shared parse core
+    // =========================================================================
+
+    // Internal driver used by Parse, ForEach, and Head.
+    //   callback(row) is called for each data row (after header processing).
+    //   limit >= 0 stops after that many data rows; -1 means unlimited.
+    fn static _parseCore(src:string, opts?, callback, limit:int) {
+        let delim   = (opts != nil and opts.delimiter != nil) ? opts.delimiter : ",";
+        let quote   = (opts != nil and opts.quote     != nil) ? opts.quote     : "\"";
+        let useHdrs = (opts != nil and opts.headers   != nil) ? opts.headers   : false;
+        let doTrim  = (opts != nil and opts.trim      != nil) ? opts.trim      : false;
+        let doTypes = (opts != nil and opts.types     != nil) ? opts.types     : false;
+        let comment = (opts != nil and opts.comment   != nil) ? opts.comment   : nil;
+        let nullVals = (opts != nil and opts.nullValues != nil) ? opts.nullValues : nil;
+
+        let delimB   = CSV._optByte(delim);
+        let quoteB   = CSV._optByte(quote);
+        let commentB = (comment != nil) ? CSV._optByte(comment) : -1;
+
+        let c     = CSV._cur(src);
+        let hdrs  = nil;
+        let count = 0;
+
+        while (true) {
+            if (c.p >= c.n) break;
+            if (limit >= 0 and count >= limit) break;
+
+            let b = c.s[c.p];
+
+            // Skip blank lines
+            if (b == 13 or b == 10) {
+                CSV._skipNl(c);
+                continue;
+            }
+
+            // Skip comment lines
+            if (commentB >= 0 and b == commentB) {
+                CSV._skipToNl(c);
+                CSV._skipNl(c);
+                continue;
+            }
+
+            let row = CSV._parseRow(c, delimB, quoteB);
+            if (row == nil) break;
+
+            if (doTrim) {
+                iter (i from 0 to len(row) - 1) {
+                    row[i] = String.Trim(row[i]);
+                }
+            }
+
+            // First row becomes headers when opts.headers is true.
+            if (useHdrs and hdrs == nil) {
+                hdrs = row;
+                continue;
+            }
+
+            if (hdrs != nil) {
+                // Build an object keyed by header names.
+                let obj = {};
+                iter (i from 0 to len(hdrs) - 1) {
+                    let key = hdrs[i];
+                    let val = (i < len(row)) ? row[i] : "";
+                    obj[key] = doTypes ? CSV._coerceVal(val, nullVals) : val;
+                }
+                callback(obj);
+            } else {
+                if (doTypes) { CSV._coerceRow(row, nullVals); }
+                callback(row);
+            }
+
+            count += 1;
+        }
+    }
+
+    // =========================================================================
+    // Public API - parsing
+    // =========================================================================
+
+    // Parse a single line of CSV text. Useful for one-off / streaming use.
+    // delim: field separator (default ",")
+    // quote: quote character (default "\"")
+    fn static ParseLine(line:string, delim?:string, quote?:string) {
+        let d = (delim != nil) ? delim : ",";
+        let q = (quote != nil) ? quote : "\"";
+        let c = CSV._cur(line);
+        let row = CSV._parseRow(c, CSV._optByte(d), CSV._optByte(q));
+        return (row != nil) ? row : [];
+    }
+
+    // Parse a CSV string. Returns array of arrays (default) or array of objects
+    // when opts.headers is true (first row becomes property names).
+    fn static Parse(src:string, opts?) {
+        let result = [];
+        CSV._parseCore(src, opts, fn(row) { Array.Append(result, row); }, -1);
+        return result;
+    }
+
+    // Read a file and parse its contents as CSV.
+    fn static ParseFile(path:string, opts?) {
+        return CSV.Parse(File.ReadText(path), opts);
+    }
+
+    // Call callback(row) for each row without accumulating results in memory.
+    // Useful for large files where you want to process row-by-row.
+    fn static ForEach(src:string, callback, opts?) {
+        CSV._parseCore(src, opts, callback, -1);
+    }
+
+    // Call callback(row) for each row in a file without loading it all at once.
+    fn static ForEachFile(path:string, callback, opts?) {
+        CSV._parseCore(File.ReadText(path), opts, callback, -1);
+    }
+
+    // Parse only the first n data rows. Efficient for previewing large files.
+    fn static Head(src:string, n:int, opts?) {
+        let result = [];
+        CSV._parseCore(src, opts, fn(row) { Array.Append(result, row); }, n);
+        return result;
+    }
+
+    // =========================================================================
+    // Public API - serialization
+    // =========================================================================
+
+    // True when a field must be quoted: contains delimiter, quote char, LF, or CR.
+    // Both "\n" and "\r" are checked separately so bare CR-only line endings
+    // (rare but valid in some CSV dialects) are also quoted correctly.
+    fn static _needsQuote(field:string, delim:string, quote:string): bool {
+        return String.Contains(field, delim)
+            or String.Contains(field, quote)
+            or String.Contains(field, "\n")
+            or String.Contains(field, "\r");
+    }
+
+    // Wrap a field in quotes, doubling any embedded quote characters.
+    fn static _quoteField(field:string, quote:string): string {
+        return quote + String.Replace(field, quote, quote + quote) + quote;
+    }
+
+    // Defuse CSV formula injection: a spreadsheet treats a cell beginning with
+    // = + - @ (or TAB/CR) as a formula, so prefix such string fields with a
+    // single quote. Only applied to string values - numbers are left intact.
+    fn static _sanitizeField(field:string): string {
+        if (field == "") return field;
+        let c = String.Substr(field, 0, 1);
+        if (c == "=" or c == "+" or c == "-" or c == "@" or c == "\t" or c == "\r") {
+            return "'" + field;
+        }
+        return field;
+    }
+
+    // Render one row (array of values) as a CSV line string. When `sanitize` is
+    // true, string fields are passed through _sanitizeField first.
+    fn static _rowToLine(row:array, delim:string, quote:string, sanitize:bool): string {
+        let parts = [];
+        iter (i from 0 to len(row) - 1) {
+            var field = str(row[i]);
+            if (sanitize and Type.Is(row[i], Type.String)) {
+                field = CSV._sanitizeField(field);
+            }
+            if (CSV._needsQuote(field, delim, quote)) {
+                field = CSV._quoteField(field, quote);
+            }
+            Array.Append(parts, field);
+        }
+        return String.Join(parts, delim);
+    }
+
+    // Serialize rows to a CSV string.
+    //   rows: array of arrays  - written as-is
+    //   rows: array of objects - opts.headers sets column order;
+    //                            falls back to Object.Keys(rows[0])
+    //
+    // opts.crlf (bool) - use "\r\n" as line separator (RFC 4180 compliant);
+    //                     default false (use "\n").
+    fn static Stringify(rows:array, opts?): string {
+        if (len(rows) == 0) return "";
+
+        let delim   = (opts != nil and opts.delimiter != nil) ? opts.delimiter : ",";
+        let quote   = (opts != nil and opts.quote     != nil) ? opts.quote     : "\"";
+        let hdrKeys = (opts != nil and opts.headers   != nil) ? opts.headers   : nil;
+        let useCrlf = (opts != nil and opts.crlf      != nil) ? opts.crlf      : false;
+        let doSan   = (opts != nil and opts.sanitize  != nil) ? opts.sanitize  : false;
+        let nl      = useCrlf ? "\r\n" : "\n";
+
+        let isObjs = type(rows[0]) == Type.Object;
+
+        if (isObjs and hdrKeys == nil) {
+            hdrKeys = Object.Keys(rows[0]);
+        }
+
+        let lines = [];
+
+        if (hdrKeys != nil) {
+            Array.Append(lines, CSV._rowToLine(hdrKeys, delim, quote, doSan));
+        }
+
+        iter (i from 0 to len(rows) - 1) {
+            let row = rows[i];
+            if (isObjs) {
+                let vals = [];
+                iter (j from 0 to len(hdrKeys) - 1) {
+                    let v = row[hdrKeys[j]];
+                    Array.Append(vals, (v != nil) ? v : "");
+                }
+                Array.Append(lines, CSV._rowToLine(vals, delim, quote, doSan));
+            } else {
+                Array.Append(lines, CSV._rowToLine(row, delim, quote, doSan));
+            }
+        }
+
+        return String.Join(lines, nl) + nl;
+    }
+
+    // Serialize and write directly to a file.
+    fn static WriteFile(path:string, rows:array, opts?) {
+        return File.WriteText(path, CSV.Stringify(rows, opts));
+    }
+
+    // Append rows to an existing CSV file, or create it if it does not exist.
+    // When the file already has content the header row is suppressed so the
+    // existing header is not duplicated.  When the file is new (or empty) rows
+    // are written with opts as-is (headers included by default for object rows).
+    fn static AppendFile(path:string, rows:array, opts?) {
+        let existing = File.ReadText(path);
+        if (existing != nil and String.Length(existing) > 0) {
+            let delim = (opts != nil and opts.delimiter != nil) ? opts.delimiter : ",";
+            let quote = (opts != nil and opts.quote     != nil) ? opts.quote     : "\"";
+            let doSan = (opts != nil and opts.sanitize  != nil) ? opts.sanitize  : false;
+            if (len(rows) == 0) return true;
+            let isObjs = type(rows[0]) == Type.Object;
+            if (isObjs) {
+                // Determine key order from the existing file's header line
+                let firstLine = String.Split(existing, "\n")[0];
+                let hdrKeys   = CSV.ParseLine(firstLine, delim);
+                var dataStr   = "";
+                iter (i from 0 to len(rows) - 1) {
+                    let row  = rows[i];
+                    let vals = Array.Create(len(hdrKeys));
+                    iter (j from 0 to len(hdrKeys) - 1) {
+                        let v = Object.TryGet(row, hdrKeys[j], "");
+                        vals[j] = (v != nil) ? v : "";
+                    }
+                    dataStr = dataStr + CSV._rowToLine(vals, delim, quote, doSan) + "\n";
+                }
+                return File.WriteText(path, existing + dataStr);
+            } else {
+                // Array rows - no header needed at all
+                var dataStr = "";
+                iter (i from 0 to len(rows) - 1) {
+                    dataStr = dataStr + CSV._rowToLine(rows[i], delim, quote, doSan) + "\n";
+                }
+                return File.WriteText(path, existing + dataStr);
+            }
+        }
+        return CSV.WriteFile(path, rows, opts);
+    }
+
+    // Return the zero-based index of `name` in the headers array,
+    // or -1 if not found.
+    fn static ColumnIndex(headers:array, name:string) : int {
+        iter (i from 0 to len(headers) - 1) {
+            if (str(headers[i]) == name) return i;
+        }
+        return -1;
+    }
+}
+
+export { CSV };

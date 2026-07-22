@@ -1,0 +1,754 @@
+// ============================================================
+// test_logger.fls - test suite for Logger.fls
+// Run: flarisvm test_logger.fls
+// ============================================================
+
+import { Logger } from library("Logger", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+// ============================================================
+// 1. Level constants
+// ============================================================
+
+fn test_constants() {
+    Console.WriteLine("== Level constants ==");
+    checkEq(Logger.DEBUG, 0, "DEBUG == 0");
+    checkEq(Logger.INFO,  1, "INFO  == 1");
+    checkEq(Logger.WARN,  2, "WARN  == 2");
+    checkEq(Logger.ERROR, 3, "ERROR == 3");
+    checkEq(Logger.FATAL, 4, "FATAL == 4");
+}
+
+// ============================================================
+// 2. Default state
+// ============================================================
+
+fn test_defaults() {
+    Console.WriteLine("== Default state ==");
+    let log = new Logger();
+    checkEq(log.GetLevel(), 1, "default level is INFO (1)");
+    check(log.IsEnabled(),     "default enabled");
+}
+
+// ============================================================
+// 3. SetLevel / GetLevel - int and string
+// ============================================================
+
+fn test_set_level() {
+    Console.WriteLine("== SetLevel / GetLevel ==");
+    let log = new Logger();
+
+    log.SetLevel(Logger.DEBUG);
+    checkEq(log.GetLevel(), 0, "SetLevel(int 0) -> DEBUG");
+
+    log.SetLevel(Logger.WARN);
+    checkEq(log.GetLevel(), 2, "SetLevel(int 2) -> WARN");
+
+    log.SetLevel("error");
+    checkEq(log.GetLevel(), 3, "SetLevel(string 'error')");
+
+    log.SetLevel("DEBUG");
+    checkEq(log.GetLevel(), 0, "SetLevel(string 'DEBUG') case-insensitive");
+
+    log.SetLevel("info");
+    checkEq(log.GetLevel(), 1, "SetLevel(string 'info')");
+
+    log.SetLevel("warn");
+    checkEq(log.GetLevel(), 2, "SetLevel(string 'warn')");
+
+    log.SetLevel("fatal");
+    checkEq(log.GetLevel(), 4, "SetLevel(string 'fatal')");
+
+    log.SetLevel(-99);
+    checkEq(log.GetLevel(), 0, "SetLevel(-99) clamps to 0");
+
+    log.SetLevel(99);
+    checkEq(log.GetLevel(), 4, "SetLevel(99) clamps to 4");
+
+    let threw = false;
+    try {
+        log.SetLevel("nonsense");
+    } catch (e) {
+        threw = true;
+    }
+    check(threw, "SetLevel('nonsense') throws");
+}
+
+// ============================================================
+// 4. Enable / Disable / IsEnabled
+// ============================================================
+
+fn test_enable_disable() {
+    Console.WriteLine("== Enable / Disable ==");
+    let log = new Logger();
+
+    check(log.IsEnabled(), "starts enabled");
+
+    log.Disable();
+    check(!log.IsEnabled(), "Disable() -> not enabled");
+
+    log.Enable();
+    check(log.IsEnabled(), "Enable() -> enabled again");
+}
+
+// ============================================================
+// 5. Instance independence
+// ============================================================
+
+fn test_instance_independence() {
+    Console.WriteLine("== Instance independence ==");
+    let a = new Logger();
+    let b = new Logger();
+
+    a.SetLevel(Logger.DEBUG);
+    b.SetLevel(Logger.ERROR);
+
+    checkEq(a.GetLevel(), 0, "a.level == DEBUG");
+    checkEq(b.GetLevel(), 3, "b.level == ERROR");
+
+    a.Disable();
+    check(!a.IsEnabled(), "a disabled");
+    check(b.IsEnabled(),  "b still enabled");
+}
+
+// ============================================================
+// 6. SetOutput
+// ============================================================
+
+fn test_set_output() {
+    Console.WriteLine("== SetOutput ==");
+    let log = new Logger();
+
+    let ok = log.SetOutput("stdout");
+    check(ok, "SetOutput('stdout') returns true");
+
+    ok = log.SetOutput("stderr");
+    check(ok, "SetOutput('stderr') returns true");
+
+    ok = log.SetOutput(0);
+    check(ok, "SetOutput(0) returns true");
+
+    ok = log.SetOutput(1);
+    check(ok, "SetOutput(1) returns true");
+
+    let threw = false;
+    try {
+        log.SetOutput("file", nil);
+    } catch (e) {
+        threw = true;
+    }
+    check(threw, "SetOutput('file', nil) throws");
+
+    ok = log.SetOutput("file", Path.Combine(Os.TempDir(), "_test_logger.log"));
+    check(ok, "SetOutput('file', path) returns true");
+
+    threw = false;
+    try {
+        log.SetOutput("syslog", nil);
+    } catch (e) {
+        threw = true;
+    }
+    check(threw, "SetOutput('syslog') throws");
+}
+
+// ============================================================
+// 7. File sink
+// ============================================================
+
+fn test_file_sink() {
+    Console.WriteLine("== File sink ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_verify.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+
+    log.Debug("debug message");
+    log.Info("info message");
+    log.Warn("warn message");
+    log.Error("error message");
+
+    check(File.Exists(path), "log file was created");
+
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[DBG] debug message"), "file contains DBG line");
+    check(String.Contains(contents, "[INF] info message"),  "file contains INF line");
+    check(String.Contains(contents, "[WRN] warn message"),  "file contains WRN line");
+    check(String.Contains(contents, "[ERR] error message"), "file contains ERR line");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 8. Level filtering
+// ============================================================
+
+fn test_level_filtering() {
+    Console.WriteLine("== Level filtering ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_filter.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.WARN);
+    log.SetOutput("file", path);
+
+    log.Debug("suppressed debug", nil);
+    log.Info("suppressed info",   nil);
+    log.Warn("should appear",     nil);
+    log.Error("should appear",    nil);
+
+    let contents = File.ReadText(path);
+    check(!String.Contains(contents, "suppressed"),         "debug/info suppressed by WARN level");
+    check(String.Contains(contents, "[WRN] should appear"), "warn passes WARN filter");
+    check(String.Contains(contents, "[ERR] should appear"), "error passes WARN filter");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 9. Disabled suppresses all output
+// ============================================================
+
+fn test_disabled_suppresses() {
+    Console.WriteLine("== Disabled suppresses output ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_disabled.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+    log.Disable();
+
+    log.Debug("suppressed", nil);
+    log.Info("suppressed",  nil);
+    log.Error("suppressed", nil);
+
+    if (File.Exists(path)) {
+        let contents = File.ReadText(path);
+        check(contents == "", "disabled logger writes nothing");
+        File.Delete(path);
+    } else {
+        check(true, "disabled logger creates no file");
+    }
+}
+
+// ============================================================
+// 10. Log() generic method
+// ============================================================
+
+fn test_log_generic() {
+    Console.WriteLine("== Log() generic method ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_generic.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+
+    log.Log(Logger.DEBUG, "via Log int");
+    log.Log(Logger.INFO,  "via Log info");
+    log.Log("warn",       "via Log string");
+
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[DBG] via Log int"),    "Log(int) works");
+    check(String.Contains(contents, "[INF] via Log info"),   "Log(INFO) works");
+    check(String.Contains(contents, "[WRN] via Log string"), "Log(string) works");
+
+    let threw = false;
+    try {
+        log.Log("invalid", "msg", nil);
+    } catch (e) {
+        threw = true;
+    }
+    check(threw, "Log('invalid') throws");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 11. Object JSON field
+// ============================================================
+
+fn test_object_field() {
+    Console.WriteLine("== Object JSON field ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_obj.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+
+    log.Info("with object", { port: 8080, host: "localhost" });
+
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[INF] with object"), "line prefix present");
+    check(String.Contains(contents, "8080"),              "object port in output");
+    check(String.Contains(contents, "localhost"),         "object host in output");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 12. SetSyslog
+// ============================================================
+
+fn test_syslog() {
+    Console.WriteLine("== SetSyslog ==");
+    let log = new Logger();
+
+    let ok = log.SetSyslog("", nil);
+    check(ok, "SetSyslog('') disables cleanly");
+
+    ok = log.SetSyslog("none", nil);
+    check(ok, "SetSyslog('none') disables cleanly");
+
+    ok = log.SetSyslog("255.255.255.255", 51400);
+    check(ok == true || ok == false, "SetSyslog bad host returns bool");
+
+    ok = log.SetSyslog("none", nil);
+    check(ok, "SetSyslog('none') cleans up after bad host");
+}
+
+// ============================================================
+// 13. Numeric sink alias
+// ============================================================
+
+fn test_numeric_sink() {
+    Console.WriteLine("== Numeric sink aliases ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_numsink.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetOutput(2, path);
+    log.Info("via numeric sink 2", nil);
+
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[INF] via numeric sink 2"), "numeric sink 2 writes to file");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 14. LevelName (static)
+// ============================================================
+
+fn test_level_name() {
+    Console.WriteLine("== LevelName ==");
+    checkEq(Logger.LevelName(0), "DEBUG",   "LevelName(0) = DEBUG");
+    checkEq(Logger.LevelName(1), "INFO",    "LevelName(1) = INFO");
+    checkEq(Logger.LevelName(2), "WARN",    "LevelName(2) = WARN");
+    checkEq(Logger.LevelName(3), "ERROR",   "LevelName(3) = ERROR");
+    checkEq(Logger.LevelName(4), "FATAL",   "LevelName(4) = FATAL");
+    checkEq(Logger.LevelName(99), "UNKNOWN","LevelName(99) = UNKNOWN");
+    checkEq(Logger.LevelName(-1), "UNKNOWN","LevelName(-1) = UNKNOWN");
+}
+
+// ============================================================
+// 15. SetPrefix
+// ============================================================
+
+fn test_prefix() {
+    Console.WriteLine("== SetPrefix ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_prefix.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+    log.SetPrefix("[MyService]");
+
+    log.Info("hello");
+    log.Warn("world");
+
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[MyService] [INF] hello"), "prefix on info line");
+    check(String.Contains(contents, "[MyService] [WRN] world"), "prefix on warn line");
+
+    // Clearing prefix
+    log.SetPrefix("");
+    log.Debug("no prefix");
+    let updated = File.ReadText(path);
+    let lines = String.SplitLines(updated);
+    let lastLine = lines[len(lines) - 1];
+    check(String.StartsWith(lastLine, "[DBG]"), "cleared prefix: line starts with [DBG]");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 16. SetTimestamp
+// ============================================================
+
+fn test_timestamp() {
+    Console.WriteLine("== SetTimestamp ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_ts.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+    log.SetTimestamp(true);
+
+    log.Info("timestamped message");
+
+    let contents = File.ReadText(path);
+    // Timestamp format: YYYY-MM-DDThh:mm:ss
+    check(String.Contains(contents, "T"), "timestamp contains T separator");
+    check(String.Contains(contents, "[INF] timestamped message"), "message still present with timestamp");
+
+    // Disabling timestamp
+    log.SetTimestamp(false);
+    log.Info("no timestamp");
+
+    let lines = String.SplitLines(File.ReadText(path));
+    // Last non-empty line should start with [INF]
+    let last = "";
+    iter (i from 0 to len(lines) - 1) {
+        if (len(lines[i]) > 0) { last = lines[i]; }
+    }
+    check(String.StartsWith(last, "[INF]"), "disabled timestamp: line starts with [INF]");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 17. Prefix + Timestamp together
+// ============================================================
+
+fn test_prefix_and_timestamp() {
+    Console.WriteLine("== Prefix + Timestamp ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_pts.log");
+
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+    log.SetTimestamp(true);
+    log.SetPrefix("[API]");
+
+    log.Error("combined");
+
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[API] [ERR] combined"), "prefix+timestamp has prefix and tag");
+    check(String.Contains(contents, "T"),                    "prefix+timestamp has timestamp");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 18. SetColor (notThrows - writes to stdout)
+// ============================================================
+
+fn test_set_color() {
+    Console.WriteLine("== SetColor ==");
+    let log = new Logger();
+
+    let threw = false;
+    try {
+        log.SetColor(true);
+    } catch (e) {
+        threw = true;
+    }
+    check(!threw, "SetColor(true) does not throw");
+
+    threw = false;
+    try {
+        log.SetColor(false);
+    } catch (e) {
+        threw = true;
+    }
+    check(!threw, "SetColor(false) does not throw");
+
+    // Verify color mode is recorded - write to file where color is suppressed,
+    // output should still contain the plain level tag.
+    let path = Path.Combine(Os.TempDir(), "_test_logger_color.log");
+    if (File.Exists(path)) { File.Delete(path); }
+    log.SetColor(true);
+    log.SetOutput("file", path);
+    log.SetLevel(Logger.DEBUG);
+    log.Info("color-off-for-file");
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[INF] color-off-for-file"), "file sink still writes plain tag when color=true");
+    File.Delete(path);
+}
+
+// ============================================================
+// 19. Child logger
+// ============================================================
+
+fn test_child() {
+    Console.WriteLine("== Child ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_child.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let parent = new Logger();
+    parent.SetLevel(Logger.DEBUG);
+    parent.SetOutput("file", path);
+    parent.SetPrefix("[Parent]");
+
+    let child = parent.Child("Worker");
+
+    // Child inherits level
+    checkEq(child.GetLevel(), 0, "child inherits parent level");
+
+    // Child has combined prefix
+    child.Info("child message");
+    let contents = File.ReadText(path);
+    check(String.Contains(contents, "[Parent].Worker"), "child has combined prefix");
+    check(String.Contains(contents, "[INF] child message"), "child writes INF line");
+
+    // Parent and child are independent instances
+    child.SetLevel(Logger.ERROR);
+    checkEq(parent.GetLevel(), 0, "changing child level does not affect parent");
+    checkEq(child.GetLevel(),  3, "child level updated independently");
+
+    // Deeper nesting
+    let grandchild = child.Child("Task");
+    check(String.Contains(grandchild._prefix, "Worker"), "grandchild prefix contains Worker");
+    check(String.Contains(grandchild._prefix, "Task"),   "grandchild prefix contains Task");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// 20. InfoWith / DebugWith / WarnWith / ErrorWith / _formatFields
+// ============================================================
+
+fn test_with_methods() {
+    Console.WriteLine("== InfoWith / DebugWith / WarnWith / ErrorWith ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_with.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetLevel(Logger.DEBUG);
+    log.SetOutput("file", path);
+
+    log.InfoWith("startup",  { port: 8080, env: "prod" });
+    log.DebugWith("trace",   { step: 1 });
+    log.WarnWith("slow",     { latency: 250 });
+    log.ErrorWith("failure", { code: 500 });
+
+    let contents = File.ReadText(path);
+
+    // InfoWith
+    check(String.Contains(contents, "[INF] startup"),  "InfoWith writes INF line");
+    check(String.Contains(contents, "port=8080"),      "InfoWith includes port field");
+    check(String.Contains(contents, "env=prod"),       "InfoWith includes env field");
+
+    // DebugWith
+    check(String.Contains(contents, "[DBG] trace"),    "DebugWith writes DBG line");
+    check(String.Contains(contents, "step=1"),         "DebugWith includes step field");
+
+    // WarnWith
+    check(String.Contains(contents, "[WRN] slow"),     "WarnWith writes WRN line");
+    check(String.Contains(contents, "latency=250"),    "WarnWith includes latency field");
+
+    // ErrorWith
+    check(String.Contains(contents, "[ERR] failure"),  "ErrorWith writes ERR line");
+    check(String.Contains(contents, "code=500"),       "ErrorWith includes code field");
+
+    File.Delete(path);
+}
+
+fn test_format_fields() {
+    Console.WriteLine("== _formatFields ==");
+    let log = new Logger();
+
+    let result = log._formatFields({ a: 1, b: "hello" });
+    check(String.Contains(result, "a=1"),       "_formatFields includes a=1");
+    check(String.Contains(result, "b=hello"),   "_formatFields includes b=hello");
+    check(String.StartsWith(result, " "),       "_formatFields starts with space separator");
+
+    let empty = log._formatFields({});
+    checkEq(empty, "", "_formatFields empty object returns empty string");
+}
+
+fn test_json_output() {
+    Console.WriteLine("== JSON output ==");
+    let path = Path.Combine(Os.TempDir(), "flaris_test_logger_json.log");
+    if (File.Exists(path)) File.Delete(path);
+
+    let log = new Logger();
+    log.SetJson(true);
+    log.SetOutput("file", path);
+    log.SetPrefix("svc");
+    log.Info("hello", { userId: 42, ok: true });
+    log.Error("boom", { code: 500 });
+    log.InfoWith("metric", { latencyMs: 12 });
+
+    let lines = String.Split(String.Trim(File.ReadText(path)), "\n");
+    checkEq(len(lines), 3, "JSON: one object per log call");
+
+    let e0 = Json.Parse(lines[0]);
+    checkEq(e0.level, "INFO", "JSON level");
+    checkEq(e0.msg, "hello", "JSON msg");
+    checkEq(e0.userId, 42, "JSON merged field userId");
+    checkEq(e0.ok, true, "JSON merged field ok");
+    checkEq(e0.logger, "svc", "JSON logger prefix");
+    check(Object.HasKey(e0, "time"), "JSON has time");
+
+    let e1 = Json.Parse(lines[1]);
+    checkEq(e1.level, "ERROR", "JSON error level");
+    checkEq(e1.code, 500, "JSON error field");
+
+    let e2 = Json.Parse(lines[2]);
+    checkEq(e2.latencyMs, 12, "JSON InfoWith carries fields structurally");
+
+    File.Delete(path);
+}
+
+fn test_rotation() {
+    Console.WriteLine("== File rotation ==");
+    let path = Path.Combine(Os.TempDir(), "flaris_test_logger_rot.log");
+    var c = 0;
+    while (c <= 5) { if (File.Exists(path + "." + str(c))) File.Delete(path + "." + str(c)); c += 1; }
+    if (File.Exists(path)) File.Delete(path);
+
+    let log = new Logger();
+    log.SetOutput("file", path);
+    log.SetRotation(200, 3);     // rotate ~every 200 bytes, keep 3 backups
+
+    var i = 0;
+    while (i < 60) { log.Info("rotation line " + str(i) + " with some padding"); i += 1; }
+
+    check(File.Exists(path),        "active log exists after rotation");
+    check(File.Exists(path + ".1"), "backup .1 created");
+    check(File.Exists(path + ".2"), "backup .2 created");
+    check(File.Exists(path + ".3"), "backup .3 created");
+    check(!File.Exists(path + ".4"), "no .4 (maxFiles=3 respected)");
+
+    // cleanup
+    File.Delete(path);
+    var k = 1;
+    while (k <= 3) { if (File.Exists(path + "." + str(k))) File.Delete(path + "." + str(k)); k += 1; }
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+fn async Main() {
+    Console.WriteLine("=== Logger test suite ===");
+
+    test_constants();
+    test_defaults();
+    test_set_level();
+    test_enable_disable();
+    test_instance_independence();
+    test_set_output();
+    test_file_sink();
+    test_level_filtering();
+    test_disabled_suppresses();
+    test_log_generic();
+    test_object_field();
+    test_syslog();
+    test_numeric_sink();
+    test_level_name();
+    test_prefix();
+    test_timestamp();
+    test_prefix_and_timestamp();
+    test_set_color();
+    test_child();
+    test_with_methods();
+    test_format_fields();
+    test_json_output();
+    test_rotation();
+
+    Console.WriteLine("=== Done ===");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+
+    if (testsFailed > 0) {
+        Console.Error("Some tests FAILED.");
+        return testsFailed;
+    }
+    Console.Ok("All tests passed!");
+
+    let bench_path = Path.Combine(Os.TempDir(), "_bench_logger.log");
+    if (File.Exists(bench_path)) { File.Delete(bench_path); }
+
+    let log_off  = new Logger();
+    log_off.Disable();
+
+    let log_filt = new Logger();
+    log_filt.SetLevel("warn");
+
+    let log_file = new Logger();
+    log_file.SetOutput("file", bench_path);
+    log_file.SetLevel("debug");
+
+    Console.WriteLine("\n\n=== Logger Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ No-output paths ]");
+    bench("Info()  logger disabled  (Disable())", fn() {
+        log_off.Info("msg"); _sink = _sink + 1;
+    }, 20000);
+    bench("Info()  level-filtered   (level=warn)", fn() {
+        log_filt.Info("msg"); _sink = _sink + 1;
+    }, 20000);
+    bench("Debug() level-filtered   (level=warn)", fn() {
+        log_filt.Debug("msg"); _sink = _sink + 1;
+    }, 20000);
+
+    Console.WriteLine("\n[ File I/O paths  (writes to /tmp/_bench_logger.log) ]");
+    bench("Info()  to file  plain string", fn() {
+        log_file.Info("benchmark message"); _sink = _sink + 1;
+    }, 2000);
+    bench("Warn()  to file  with object field", fn() {
+        log_file.Warn("event", { id: _sink, ok: true }); _sink = _sink + 1;
+    }, 1000);
+    bench("Error() to file  plain string", fn() {
+        log_file.Error("error message"); _sink = _sink + 1;
+    }, 2000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    if (File.Exists(bench_path)) { File.Delete(bench_path); }
+    return testsFailed;
+}

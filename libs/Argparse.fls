@@ -1,0 +1,987 @@
+// =============================================================================
+// Argparse.fls - Command-line argument parser for Flaris (Python argparse style).
+// Version: 1.0
+//
+// Declarative CLI parsing: declare the options and positionals you accept, and
+// the parser handles tokenizing, type conversion, validation, defaults, help
+// text and subcommands.
+//
+// Usage:
+//   import { ArgumentParser } from library("Argparse", "1.0");
+//
+//   let p = new ArgumentParser({ prog: "mytool", description: "Do a thing." });
+//   p.AddArgument(["-v", "--verbose"], { action: "store_true", help: "chatty output" });
+//   p.AddArgument("--count",  { type: "int", defaultValue: 1, help: "repeat count" });
+//   p.AddArgument("--mode",   { choices: ["fast", "slow"], defaultValue: "fast" });
+//   p.AddArgument("src",      { nargs: "+", help: "source files" });
+//
+//   let a = p.ParseArgs();          // defaults to Os.Args()
+//   if (a.verbose) { Console.WriteLine("count=", a.count, " src=", a.src); }
+//
+// Because Os.Args() does not include the script name, `prog` defaults to
+// "program" - pass it explicitly for accurate usage/help output.
+//
+// ArgumentParser:
+//   new ArgumentParser(opts?)
+//       opts: { prog, description, epilog, version, addHelp:true,
+//               allowAbbrev:true, exitOnError:true }
+//   .AddArgument(flags, opts?)  -  flags is "src" (positional), "-v"/"--verbose",
+//                                  or an array ["-v", "--verbose"]
+//   .AddSubparsers(opts?)          -  { dest:"command", required:false, title, help }
+//   .AddMutuallyExclusiveGroup(opts?) - { required:false }
+//   .AddArgumentGroup(title, description?)
+//   .SetDefaults(obj)              -  seed values not tied to any argument
+//   .ParseArgs(argv?)              -  argv defaults to Os.Args(); returns object
+//   .ParseKnownArgs(argv?)         -  [namespace, unrecognizedArray]
+//   .FormatUsage()  .FormatHelp()  .PrintUsage()  .PrintHelp()
+//   .Error(msg)                    -  usage + message to stderr, exit code 2
+//
+// AddArgument options:
+//   action    "store" (default) | "store_true" | "store_false" | "store_const"
+//             | "append" | "count" | "help" | "version"
+//   type      "string" (default) | "int" | "float" | "bool"
+//   nargs     int N | "?" | "*" | "+"      (N values / optional / any / one-or-more)
+//   default   value used when the argument is absent
+//   const     value stored by "store_const", or by "?" nargs with a bare flag
+//   required  bool - error if an optional argument is missing
+//
+//   `default` and `const` are Flaris keywords, so an unquoted object key cannot
+//   spell them. Write them quoted ({ "default": 1 }) or use the equivalent
+//   aliases `defaultValue` / `constValue` ({ defaultValue: 1 }).
+//   choices   array of allowed values (checked after type conversion)
+//   dest      target key in the result object (derived from the flag otherwise)
+//   metavar   placeholder shown in usage/help
+//   help      one-line description; "" hides the argument from help
+//
+// Parsing rules:
+//   --name value    --name=value    -n value    -nvalue    -abc (combined flags)
+//   --              everything after it is treated as a positional
+//   Long options may be abbreviated to any unambiguous prefix (allowAbbrev).
+//   A token like "-3" is a negative number, not an option, unless a numeric-
+//   looking option is registered.
+//
+// Subcommands:
+//   let sub   = p.AddSubparsers({ dest: "command", required: true });
+//   let build = sub.AddParser("build", { help: "build the project" });
+//   build.AddArgument("--release", { action: "store_true" });
+//   let a = p.ParseArgs(["build", "--release"]);   // a.command == "build"
+//
+// Errors:
+//   With exitOnError (the default) a usage message goes to stderr and the VM
+//   exits with code 2. Set { exitOnError: false } to raise instead, so a caller
+//   can try/catch - useful in tests and REPLs.
+// =============================================================================
+
+// =============================================================================
+// _Argument - the specification of a single option or positional.
+// =============================================================================
+
+class _Argument
+{
+    let flags:array      = [];        // ["-v", "--verbose"]; empty for a positional
+    let dest:string      = "";
+    let action:string    = "store";
+    let vtype:string     = "string";
+    let nargs             = nil;      // nil | int | "?" | "*" | "+"
+    let defval            = nil;
+    let constval          = nil;
+    let required:bool    = false;
+    let choices           = nil;      // array of allowed values, or nil
+    let help:string      = "";
+    let metavar:string   = "";
+    let positional:bool  = false;
+    let mutexId:int      = -1;        // index into the parser's mutex group list
+    let groupId:int      = -1;        // index into the parser's display group list
+
+    // True when the action consumes no value from argv.
+    fn IsFlagLike(): bool {
+        return action == "store_true" || action == "store_false"
+            || action == "store_const" || action == "count"
+            || action == "help" || action == "version";
+    }
+
+    // Placeholder used in usage/help output.
+    fn Placeholder(): string {
+        if (metavar != "") return metavar;
+        if (positional) return dest;
+        return String.ToUpper(dest);
+    }
+
+    // "-v, --verbose COUNT" - the left column of the help listing.
+    fn Invocation(): string {
+        if (positional) return this.Placeholder();
+        let joined = String.Join(flags, ", ");
+        if (this.IsFlagLike()) return joined;
+        return joined + " " + this.Placeholder();
+    }
+}
+
+// =============================================================================
+// _MutexGroup - arguments of which at most one may appear.
+// =============================================================================
+
+class _MutexGroup
+{
+    let _parser           = nil;
+    let _id:int          = 0;
+    let _required:bool   = false;
+
+    fn Constructor(parser, id:int, required:bool) {
+        _parser   = parser;
+        _id       = id;
+        _required = required;
+    }
+
+    fn AddArgument(flags, opts?) {
+        let a = _parser.AddArgument(flags, opts);
+        a.mutexId = _id;
+        return a;
+    }
+}
+
+// =============================================================================
+// _ArgumentGroup - a titled section in the help output.
+// =============================================================================
+
+class _ArgumentGroup
+{
+    let _parser          = nil;
+    let _id:int         = 0;
+
+    fn Constructor(parser, id:int) {
+        _parser = parser;
+        _id     = id;
+    }
+
+    fn AddArgument(flags, opts?) {
+        let a = _parser.AddArgument(flags, opts);
+        a.groupId = _id;
+        return a;
+    }
+}
+
+// =============================================================================
+// _SubParsers - registry of named subcommands, each with its own parser.
+// =============================================================================
+
+class _SubParsers
+{
+    // The parent's prog name and error mode are copied rather than holding the
+    // parent itself: the parent already owns this object, and a back-reference
+    // would form a cycle that reference counting can never collect.
+    let _parentProg:string = "program";
+    let _parentExit:bool   = true;
+    let _dest:string     = "command";
+    let _required:bool   = false;
+    let _title:string    = "commands";
+    let _help:string     = "";
+    let _names:array     = [];        // command names, in registration order
+    let _parsers          = nil;      // name -> ArgumentParser
+    let _helps             = nil;     // name -> one-line help
+
+    fn Constructor(parent, opts?) {
+        _parentProg = parent.ProgName();
+        _parentExit = parent.ExitsOnError();
+        _parsers    = {};
+        _helps      = {};
+        _names      = [];
+        if (opts != nil) {
+            _dest     = Object.TryGet(opts, "dest",     "command");
+            _required = Object.TryGet(opts, "required", false);
+            _title    = Object.TryGet(opts, "title",    "commands");
+            _help     = Object.TryGet(opts, "help",     "");
+        }
+    }
+
+    // Register a subcommand and return its parser.
+    fn AddParser(name:string, opts?) {
+        let o = (opts != nil) ? Object.Clone(opts) : {};
+        o["prog"]        = _parentProg + " " + name;
+        o["exitOnError"] = _parentExit;
+        let p = new ArgumentParser(o);
+        Array.Append(_names, name);
+        _parsers[name] = p;
+        _helps[name]   = Object.TryGet(o, "help", "");
+        return p;
+    }
+
+    fn Names(): array   { return _names; }
+    fn Dest(): string   { return _dest; }
+    fn IsRequired(): bool { return _required; }
+    fn Title(): string  { return _title; }
+    fn Get(name:string) { return Object.TryGet(_parsers, name, nil); }
+    fn HelpFor(name:string): string { return Object.TryGet(_helps, name, ""); }
+}
+
+// =============================================================================
+// ArgumentParser - declares the accepted arguments and parses an argv array.
+// =============================================================================
+
+class ArgumentParser
+{
+    let _prog:string        = "program";
+    let _description:string = "";
+    let _epilog:string      = "";
+    let _version:string     = "";
+    let _addHelp:bool       = true;
+    let _allowAbbrev:bool   = true;
+    let _exitOnError:bool   = true;
+
+    let _args:array         = [];     // every _Argument, registration order
+    let _optionals:array    = [];     // subset: flag-bearing
+    let _positionals:array  = [];     // subset: positional
+    let _flagMap             = nil;   // "--verbose" -> _Argument
+    let _mutexRequired:array = [];    // per mutex group: is one required
+    let _groupTitles:array  = [];     // per display group: title
+    let _groupDescs:array   = [];     // per display group: description
+    let _subparsers          = nil;
+    let _defaults            = nil;   // extra keys seeded into the namespace
+
+    fn Constructor(opts?) {
+        _args          = [];
+        _optionals     = [];
+        _positionals   = [];
+        _flagMap       = {};
+        _mutexRequired = [];
+        _groupTitles   = [];
+        _groupDescs    = [];
+        _defaults      = {};
+
+        if (opts != nil) {
+            _prog        = Object.TryGet(opts, "prog",        "program");
+            _description = Object.TryGet(opts, "description", "");
+            _epilog      = Object.TryGet(opts, "epilog",      "");
+            _version     = Object.TryGet(opts, "version",     "");
+            _addHelp     = Object.TryGet(opts, "addHelp",     true);
+            _allowAbbrev = Object.TryGet(opts, "allowAbbrev", true);
+            _exitOnError = Object.TryGet(opts, "exitOnError", true);
+        }
+
+        if (_addHelp) {
+            this.AddArgument(["-h", "--help"],
+                             { action: "help", help: "show this help message and exit" });
+        }
+        if (_version != "") {
+            this.AddArgument("--version",
+                             { action: "version", help: "show the version and exit" });
+        }
+    }
+
+    fn ProgName(): string    { return _prog; }
+    fn ExitsOnError(): bool  { return _exitOnError; }
+
+    // -------------------------------------------------------------------------
+    // Declaration
+    // -------------------------------------------------------------------------
+
+    // Register an option or positional. `flags` is a name, a flag, or an array
+    // of flags. Returns the created _Argument.
+    fn AddArgument(flags, opts?) {
+        let list = [];
+        if (Type.Is(flags, Type.String)) {
+            Array.Append(list, flags);
+        } else if (Type.Is(flags, Type.Array)) {
+            foreach (f in flags) { Array.Append(list, f); }
+        } else {
+            throw(1, "Argparse.AddArgument: flags must be a string or an array of strings");
+        }
+        if (len(list) == 0) {
+            throw(1, "Argparse.AddArgument: at least one flag or name is required");
+        }
+
+        let o = (opts != nil) ? opts : {};
+        let a = new _Argument();
+
+        // A leading "-" marks an option; anything else is a positional name.
+        let first = list[0];
+        a.positional = !String.StartsWith(first, "-");
+
+        if (a.positional) {
+            if (len(list) != 1) {
+                throw(1, "Argparse.AddArgument: a positional takes exactly one name");
+            }
+            a.dest     = first;
+            a.required = true;
+        } else {
+            a.flags = list;
+            // dest comes from the first long flag, else the first short flag.
+            let picked = "";
+            foreach (f in list) {
+                if (String.StartsWith(f, "--") && picked == "") { picked = String.Substr(f, 2); }
+            }
+            if (picked == "") { picked = String.Substr(list[0], 1); }
+            a.dest = String.Replace(picked, "-", "_");
+        }
+
+        a.dest     = Object.TryGet(o, "dest",     a.dest);
+        a.action   = Object.TryGet(o, "action",   "store");
+        a.vtype    = Object.TryGet(o, "type",     "string");
+        a.nargs    = Object.TryGet(o, "nargs",    nil);
+        a.choices  = Object.TryGet(o, "choices",  nil);
+        a.help     = Object.TryGet(o, "help",     "");
+        a.metavar  = Object.TryGet(o, "metavar",  "");
+        a.required = Object.TryGet(o, "required", a.required);
+
+        // `default` and `const` are Flaris keywords, so an unquoted object key
+        // cannot spell them. Both the quoted key and a keyword-free alias work.
+        a.constval = Object.TryGet(o, "const", Object.TryGet(o, "constValue", nil));
+
+        // Flag-like actions have implicit defaults so the namespace key always exists.
+        let dflt = Object.TryGet(o, "default", Object.TryGet(o, "defaultValue", nil));
+        if (dflt == nil) {
+            if (a.action == "store_true")  { dflt = false; }
+            else if (a.action == "store_false") { dflt = true; }
+            else if (a.action == "count")  { dflt = 0; }
+            else if (a.action == "append") { dflt = nil; }
+        }
+        a.defval = dflt;
+
+        if (a.action == "store_true")  { a.constval = true;  a.vtype = "bool"; }
+        if (a.action == "store_false") { a.constval = false; a.vtype = "bool"; }
+
+        // A positional with nargs "?" or "*" is satisfiable with nothing.
+        if (a.positional && (a.nargs == "?" || a.nargs == "*")) { a.required = false; }
+
+        Array.Append(_args, a);
+        if (a.positional) {
+            Array.Append(_positionals, a);
+        } else {
+            Array.Append(_optionals, a);
+            foreach (f in a.flags) {
+                if (Object.HasKey(_flagMap, f)) {
+                    throw(1, "Argparse.AddArgument: duplicate flag '" + f + "'");
+                }
+                _flagMap[f] = a;
+            }
+        }
+        return a;
+    }
+
+    fn AddSubparsers(opts?) {
+        if (_subparsers != nil) {
+            throw(1, "Argparse.AddSubparsers: subparsers already registered");
+        }
+        _subparsers = new _SubParsers(this, opts);
+        return _subparsers;
+    }
+
+    fn AddMutuallyExclusiveGroup(opts?) {
+        let req = (opts != nil) ? Object.TryGet(opts, "required", false) : false;
+        Array.Append(_mutexRequired, req);
+        return new _MutexGroup(this, len(_mutexRequired) - 1, req);
+    }
+
+    fn AddArgumentGroup(title:string, description?: string) {
+        Array.Append(_groupTitles, title);
+        Array.Append(_groupDescs, description ?? "");
+        return new _ArgumentGroup(this, len(_groupTitles) - 1);
+    }
+
+    // Seed namespace keys that no argument writes (e.g. a per-subcommand handler).
+    fn SetDefaults(obj) {
+        if (obj == nil) return this;
+        foreach (k in Object.Keys(obj)) { _defaults[k] = obj[k]; }
+        return this;
+    }
+
+    // -------------------------------------------------------------------------
+    // Errors
+    // -------------------------------------------------------------------------
+
+    // Report a usage error: stderr + exit 2, or raise when exitOnError is false.
+    fn Error(msg:string) {
+        if (_exitOnError) {
+            Console.Error(this.FormatUsage());
+            Console.Error(_prog + ": error: " + msg);
+            VM.Exit(2);
+            return nil;
+        }
+        throw(2, _prog + ": error: " + msg);
+    }
+
+    // -------------------------------------------------------------------------
+    // Help
+    // -------------------------------------------------------------------------
+
+    // One argument's usage fragment, e.g. "[--count COUNT]" or "src [src ...]".
+    fn _usageFragment(a): string {
+        let ph = a.Placeholder();
+
+        if (a.positional) {
+            if (a.nargs == "*")      return "[" + ph + " ...]";
+            if (a.nargs == "+")      return ph + " [" + ph + " ...]";
+            if (a.nargs == "?")      return "[" + ph + "]";
+            if (Type.Is(a.nargs, Type.Int)) {
+                let parts = [];
+                iter (i from 1 to a.nargs) { Array.Append(parts, ph); }
+                return String.Join(parts, " ");
+            }
+            return ph;
+        }
+
+        let flag = a.flags[0];
+        let body = flag;
+        if (!a.IsFlagLike()) {
+            if (a.nargs == "*")      { body = flag + " [" + ph + " ...]"; }
+            else if (a.nargs == "+") { body = flag + " " + ph + " [" + ph + " ...]"; }
+            else if (a.nargs == "?") { body = flag + " [" + ph + "]"; }
+            else if (Type.Is(a.nargs, Type.Int)) {
+                let parts = [];
+                iter (i from 1 to a.nargs) { Array.Append(parts, ph); }
+                body = flag + " " + String.Join(parts, " ");
+            } else {
+                body = flag + " " + ph;
+            }
+        }
+        if (a.required) return body;
+        return "[" + body + "]";
+    }
+
+    fn FormatUsage(): string {
+        let parts = [];
+        Array.Append(parts, "usage: " + _prog);
+
+        foreach (a in _optionals) {
+            if (a.help != "" || a.action == "help") {
+                Array.Append(parts, this._usageFragment(a));
+            }
+        }
+        foreach (a in _positionals) { Array.Append(parts, this._usageFragment(a)); }
+
+        if (_subparsers != nil) {
+            let cmd = String.Join(_subparsers.Names(), "|");
+            let frag = "{" + cmd + "} ...";
+            if (!_subparsers.IsRequired()) { frag = "[" + frag + "]"; }
+            Array.Append(parts, frag);
+        }
+        return String.Join(parts, " ");
+    }
+
+    // Render "  invocation    help" with a shared, width-capped help column.
+    fn _formatRows(rows:array): string {
+        let width = 0;
+        foreach (r in rows) {
+            let n = String.Length(r[0]);
+            if (n > width) { width = n; }
+        }
+        if (width > 28) { width = 28; }
+
+        let out = [];
+        foreach (r in rows) {
+            let left = r[0];
+            let help = r[1];
+            if (help == "") {
+                Array.Append(out, "  " + left);
+            } else if (String.Length(left) > width) {
+                // Too wide for the shared column: help goes on the next line.
+                Array.Append(out, "  " + left);
+                Array.Append(out, "  " + String.Repeat(" ", width) + "  " + help);
+            } else {
+                Array.Append(out, "  " + String.PadRight(left, width) + "  " + help);
+            }
+        }
+        return String.Join(out, "\n");
+    }
+
+    fn FormatHelp(): string {
+        let out = [];
+        Array.Append(out, this.FormatUsage());
+        if (_description != "") { Array.Append(out, ""); Array.Append(out, _description); }
+
+        // Positionals.
+        let posRows = [];
+        foreach (a in _positionals) {
+            if (a.help != "") { Array.Append(posRows, [a.Invocation(), a.help]); }
+        }
+        if (len(posRows) > 0) {
+            Array.Append(out, "");
+            Array.Append(out, "positional arguments:");
+            Array.Append(out, this._formatRows(posRows));
+        }
+
+        // Subcommands.
+        if (_subparsers != nil) {
+            let subRows = [];
+            foreach (n in _subparsers.Names()) {
+                Array.Append(subRows, [n, _subparsers.HelpFor(n)]);
+            }
+            if (len(subRows) > 0) {
+                Array.Append(out, "");
+                Array.Append(out, _subparsers.Title() + ":");
+                Array.Append(out, this._formatRows(subRows));
+            }
+        }
+
+        // Ungrouped options, then each titled group in declaration order.
+        let optRows = [];
+        foreach (a in _optionals) {
+            if (a.help != "" && a.groupId < 0) {
+                Array.Append(optRows, [a.Invocation(), this._helpWithDefault(a)]);
+            }
+        }
+        if (len(optRows) > 0) {
+            Array.Append(out, "");
+            Array.Append(out, "options:");
+            Array.Append(out, this._formatRows(optRows));
+        }
+
+        iter (g from 0 to len(_groupTitles) - 1) {
+            let rows = [];
+            foreach (a in _args) {
+                if (a.groupId == g && a.help != "") {
+                    Array.Append(rows, [a.Invocation(), this._helpWithDefault(a)]);
+                }
+            }
+            if (len(rows) > 0) {
+                Array.Append(out, "");
+                Array.Append(out, _groupTitles[g] + ":");
+                if (_groupDescs[g] != "") { Array.Append(out, "  " + _groupDescs[g]); }
+                Array.Append(out, this._formatRows(rows));
+            }
+        }
+
+        if (_epilog != "") { Array.Append(out, ""); Array.Append(out, _epilog); }
+        return String.Join(out, "\n");
+    }
+
+    // Append "(choices: ...)" / "(default: ...)" hints to an argument's help.
+    fn _helpWithDefault(a): string {
+        let s = a.help;
+        if (a.choices != nil) {
+            let cs = [];
+            foreach (c in a.choices) { Array.Append(cs, str(c)); }
+            s = s + " (choices: " + String.Join(cs, ", ") + ")";
+        }
+        if (a.defval != nil && !a.IsFlagLike() && a.action != "append") {
+            s = s + " (default: " + str(a.defval) + ")";
+        }
+        return s;
+    }
+
+    fn PrintUsage() { Console.WriteLine(this.FormatUsage()); return nil; }
+    fn PrintHelp()  { Console.WriteLine(this.FormatHelp()); return nil; }
+
+    // -------------------------------------------------------------------------
+    // Lookup
+    // -------------------------------------------------------------------------
+
+    // Resolve a long flag, allowing an unambiguous prefix when allowAbbrev.
+    fn _lookupLong(name:string) {
+        if (Object.HasKey(_flagMap, name)) { return _flagMap[name]; }
+        if (!_allowAbbrev) { return nil; }
+
+        let hits = [];
+        foreach (f in Object.Keys(_flagMap)) {
+            if (String.StartsWith(f, "--") && String.StartsWith(f, name)) {
+                let a = _flagMap[f];
+                if (!Array.Contains(hits, a)) { Array.Append(hits, a); }
+            }
+        }
+        if (len(hits) == 1) { return hits[0]; }
+        if (len(hits) > 1)  { this.Error("ambiguous option: " + name); }
+        return nil;
+    }
+
+    // True when tok should be read as an option rather than a positional value.
+    fn _looksLikeOption(tok:string): bool {
+        if (!String.StartsWith(tok, "-")) return false;
+        if (tok == "-" || tok == "--")    return false;
+        if (Object.HasKey(_flagMap, tok)) return true;
+        // "-3" / "-2.5" are negative numbers unless a numeric option is declared.
+        let rest = String.Substr(tok, 1);
+        if (Convert.ParseFloat(rest) != nil) { return this._hasNumericFlag(); }
+        return true;
+    }
+
+    fn _hasNumericFlag(): bool {
+        foreach (f in Object.Keys(_flagMap)) {
+            if (Convert.ParseFloat(String.Substr(f, 1)) != nil) { return true; }
+        }
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Conversion and validation
+    // -------------------------------------------------------------------------
+
+    fn _convert(a, raw:string) {
+        if (a.vtype == "int") {
+            let v = Convert.ParseInt(raw);
+            if (v == nil) {
+                this.Error("argument " + this._label(a) + ": invalid int value: '" + raw + "'");
+                return nil;
+            }
+            return v;
+        }
+        if (a.vtype == "float") {
+            let v = Convert.ParseFloat(raw);
+            if (v == nil) {
+                this.Error("argument " + this._label(a) + ": invalid float value: '" + raw + "'");
+                return nil;
+            }
+            return v;
+        }
+        if (a.vtype == "bool") {
+            let s = String.ToLower(raw);
+            if (s == "true"  || s == "1" || s == "yes" || s == "on")  return true;
+            if (s == "false" || s == "0" || s == "no"  || s == "off") return false;
+            this.Error("argument " + this._label(a) + ": invalid bool value: '" + raw + "'");
+            return nil;
+        }
+        return raw;
+    }
+
+    fn _label(a): string {
+        if (a.positional) return a.dest;
+        return String.Join(a.flags, "/");
+    }
+
+    fn _checkChoices(a, value) {
+        if (a.choices == nil) return true;
+        if (Array.Contains(a.choices, value)) return true;
+        let cs = [];
+        foreach (c in a.choices) { Array.Append(cs, str(c)); }
+        this.Error("argument " + this._label(a) + ": invalid choice: '" + str(value)
+                   + "' (choose from " + String.Join(cs, ", ") + ")");
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Parsing
+    // -------------------------------------------------------------------------
+
+    fn ParseArgs(argv?) {
+        let r = this.ParseKnownArgs(argv);
+        let ns    = r[0];
+        let extra = r[1];
+        if (len(extra) > 0) {
+            this.Error("unrecognized arguments: " + String.Join(extra, " "));
+        }
+        return ns;
+    }
+
+    // Parse argv, returning [namespace, unrecognizedTokens].
+    fn ParseKnownArgs(argv?) {
+        let av = argv ?? Os.Args();
+
+        let ns      = {};
+        let extras  = [];
+        let posToks = [];
+        let seen    = {};          // dest -> true, for required/mutex checks
+        let mutexHit = {};         // mutex group id -> the flag that claimed it
+
+        foreach (k in Object.Keys(_defaults)) { ns[k] = _defaults[k]; }
+        foreach (a in _args) {
+            if (a.action != "help" && a.action != "version") { ns[a.dest] = a.defval; }
+        }
+
+        let subName    = nil;
+        let subArgv    = [];
+        let endOfFlags = false;
+        let i          = 0;
+        let n          = len(av);
+
+        while (i < n) {
+            let tok = av[i];
+
+            if (endOfFlags) {
+                Array.Append(posToks, tok);
+                i = i + 1;
+            } else if (tok == "--") {
+                endOfFlags = true;
+                i = i + 1;
+            } else if (this._looksLikeOption(tok)) {
+                let consumed = this._parseOption(av, i, tok, ns, seen, mutexHit, extras);
+                i = consumed;
+            } else if (_subparsers != nil && _subparsers.Get(tok) != nil
+                       && this._positionalsSatisfied(posToks)) {
+                // The subcommand claims this token and every one after it.
+                subName = tok;
+                subArgv = Array.Slice(av, i + 1);
+                i = n;
+            } else {
+                Array.Append(posToks, tok);
+                i = i + 1;
+            }
+        }
+
+        this._assignPositionals(posToks, ns, seen, extras);
+
+        // Required optionals.
+        foreach (a in _optionals) {
+            if (a.required && !Object.HasKey(seen, a.dest)) {
+                this.Error("the following arguments are required: " + this._label(a));
+            }
+        }
+        // Required mutex groups.
+        iter (g from 0 to len(_mutexRequired) - 1) {
+            if (_mutexRequired[g] && !Object.HasKey(mutexHit, str(g))) {
+                let names = [];
+                foreach (a in _args) {
+                    if (a.mutexId == g) { Array.Append(names, this._label(a)); }
+                }
+                this.Error("one of the arguments " + String.Join(names, " ") + " is required");
+            }
+        }
+
+        // Subcommand dispatch.
+        if (_subparsers != nil) {
+            if (subName == nil) {
+                if (_subparsers.IsRequired()) {
+                    this.Error("a command is required (choose from "
+                               + String.Join(_subparsers.Names(), ", ") + ")");
+                }
+                ns[_subparsers.Dest()] = nil;
+            } else {
+                ns[_subparsers.Dest()] = subName;
+                let sp  = _subparsers.Get(subName);
+                let sub = sp.ParseKnownArgs(subArgv);
+                let subNs = sub[0];
+                foreach (k in Object.Keys(subNs)) { ns[k] = subNs[k]; }
+                foreach (e in sub[1]) { Array.Append(extras, e); }
+            }
+        }
+
+        return [ns, extras];
+    }
+
+    // True when the positional tokens gathered so far already satisfy every
+    // declared positional - i.e. the next bare token can start a subcommand.
+    fn _positionalsSatisfied(posToks:array): bool {
+        let need = 0;
+        foreach (a in _positionals) {
+            if (Type.Is(a.nargs, Type.Int))            { need = need + a.nargs; }
+            else if (a.nargs == "+")                   { need = need + 1; }
+            else if (a.nargs != "*" && a.nargs != "?") { need = need + 1; }
+        }
+        return len(posToks) >= need;
+    }
+
+    // Handle one option token at av[i]; returns the next index to read.
+    fn _parseOption(av:array, i:int, tok:string, ns, seen, mutexHit, extras:array): int {
+        if (String.StartsWith(tok, "--")) {
+            let name     = tok;
+            let inlineV  = nil;
+            let hasInline = false;
+            let eq = String.IndexOf(tok, "=");
+            if (eq > 0) {
+                name      = String.Substr(tok, 0, eq);
+                inlineV   = String.Substr(tok, eq + 1);
+                hasInline = true;
+            }
+            let a = this._lookupLong(name);
+            if (a == nil) {
+                Array.Append(extras, tok);
+                return i + 1;
+            }
+            return this._applyOption(a, av, i + 1, inlineV, hasInline, ns, seen, mutexHit);
+        }
+
+        // Short cluster: "-v", "-abc", "-n5", "-n" "5".
+        let j    = 1;
+        let tlen = String.Length(tok);
+        let next = i + 1;
+        while (j < tlen) {
+            let f = "-" + String.Substr(tok, j, 1);
+            let a = Object.TryGet(_flagMap, f, nil);
+            if (a == nil) {
+                Array.Append(extras, f);
+                j = j + 1;
+            } else if (a.IsFlagLike()) {
+                next = this._applyOption(a, av, next, nil, false, ns, seen, mutexHit);
+                j = j + 1;
+            } else {
+                // Value-taking: the rest of the cluster is the value if non-empty.
+                let rest = String.Substr(tok, j + 1);
+                if (rest != "") {
+                    next = this._applyOption(a, av, next, rest, true, ns, seen, mutexHit);
+                } else {
+                    next = this._applyOption(a, av, next, nil, false, ns, seen, mutexHit);
+                }
+                j = tlen;
+            }
+        }
+        return next;
+    }
+
+    // Store one option's value(s). `at` is the index of the first unread token;
+    // returns the index just past whatever this option consumed.
+    fn _applyOption(a, av:array, at:int, inlineV, hasInline:bool, ns, seen, mutexHit): int {
+        let n = len(av);
+
+        // Mutual exclusion.
+        if (a.mutexId >= 0) {
+            let key = str(a.mutexId);
+            let prev = Object.TryGet(mutexHit, key, nil);
+            if (prev != nil && prev != this._label(a)) {
+                this.Error("argument " + this._label(a) + ": not allowed with " + prev);
+            }
+            mutexHit[key] = this._label(a);
+        }
+        seen[a.dest] = true;
+
+        if (a.action == "help") {
+            this.PrintHelp();
+            if (_exitOnError) { VM.Exit(0); }
+            return n;
+        }
+        if (a.action == "version") {
+            Console.WriteLine(_prog + " " + _version);
+            if (_exitOnError) { VM.Exit(0); }
+            return n;
+        }
+        if (a.action == "count") {
+            let cur = Object.TryGet(ns, a.dest, 0);
+            ns[a.dest] = (cur ?? 0) + 1;
+            return at;
+        }
+        if (a.IsFlagLike()) {
+            ns[a.dest] = a.constval;
+            return at;
+        }
+
+        // Gather the raw value tokens this option takes.
+        let raws = [];
+        let idx  = at;
+        if (hasInline) {
+            Array.Append(raws, inlineV);
+        } else if (Type.Is(a.nargs, Type.Int)) {
+            iter (k from 1 to a.nargs) {
+                if (idx < n && !this._looksLikeOption(av[idx])) {
+                    Array.Append(raws, av[idx]);
+                    idx = idx + 1;
+                }
+            }
+            if (len(raws) < a.nargs) {
+                this.Error("argument " + this._label(a) + ": expected " + str(a.nargs) + " argument(s)");
+                return idx;
+            }
+        } else if (a.nargs == "*" || a.nargs == "+") {
+            while (idx < n && !this._looksLikeOption(av[idx]) && av[idx] != "--") {
+                Array.Append(raws, av[idx]);
+                idx = idx + 1;
+            }
+            if (a.nargs == "+" && len(raws) == 0) {
+                this.Error("argument " + this._label(a) + ": expected at least one argument");
+                return idx;
+            }
+        } else if (a.nargs == "?") {
+            if (idx < n && !this._looksLikeOption(av[idx])) {
+                Array.Append(raws, av[idx]);
+                idx = idx + 1;
+            }
+        } else {
+            if (idx < n && !this._looksLikeOption(av[idx])) {
+                Array.Append(raws, av[idx]);
+                idx = idx + 1;
+            } else {
+                this.Error("argument " + this._label(a) + ": expected one argument");
+                return idx;
+            }
+        }
+
+        // Convert, validate, store.
+        let vals = [];
+        foreach (r in raws) {
+            let v = this._convert(a, r);
+            if (!this._checkChoices(a, v)) { return idx; }
+            Array.Append(vals, v);
+        }
+
+        let isList = (a.nargs == "*" || a.nargs == "+" || Type.Is(a.nargs, Type.Int));
+
+        if (a.action == "append") {
+            let cur = Object.TryGet(ns, a.dest, nil);
+            if (cur == nil) { cur = []; ns[a.dest] = cur; }
+            if (isList) { Array.Append(cur, vals); }
+            else if (len(vals) > 0) { Array.Append(cur, vals[0]); }
+            return idx;
+        }
+
+        if (isList) {
+            ns[a.dest] = vals;
+        } else if (len(vals) > 0) {
+            ns[a.dest] = vals[0];
+        } else if (a.nargs == "?") {
+            ns[a.dest] = (a.constval != nil) ? a.constval : a.defval;
+        }
+        return idx;
+    }
+
+    // Distribute the collected bare tokens across the declared positionals.
+    fn _assignPositionals(toks:array, ns, seen, extras:array) {
+        let total = len(toks);
+
+        // Minimum each positional must take.
+        let mins = [];
+        let need = 0;
+        foreach (a in _positionals) {
+            let m = 1;
+            if (Type.Is(a.nargs, Type.Int)) { m = a.nargs; }
+            else if (a.nargs == "*")        { m = 0; }
+            else if (a.nargs == "?")        { m = 0; }
+            else if (a.nargs == "+")        { m = 1; }
+            Array.Append(mins, m);
+            need = need + m;
+        }
+
+        if (total < need) {
+            let missing = [];
+            let acc = 0;
+            let k = 0;
+            foreach (a in _positionals) {
+                acc = acc + mins[k];
+                if (acc > total) { Array.Append(missing, a.dest); }
+                k = k + 1;
+            }
+            this.Error("the following arguments are required: " + String.Join(missing, ", "));
+            return nil;
+        }
+
+        let surplus = total - need;
+        let pos     = 0;
+        let k       = 0;
+        foreach (a in _positionals) {
+            let take = mins[k];
+            // The first slot that can grow absorbs every extra token.
+            if (surplus > 0 && (a.nargs == "*" || a.nargs == "+")) {
+                take = take + surplus;
+                surplus = 0;
+            } else if (surplus > 0 && a.nargs == "?") {
+                take = take + 1;
+                surplus = surplus - 1;
+            }
+
+            let raws = [];
+            iter (x from 0 to take - 1) {
+                if (pos < total) { Array.Append(raws, toks[pos]); pos = pos + 1; }
+            }
+
+            let vals = [];
+            foreach (r in raws) {
+                let v = this._convert(a, r);
+                if (!this._checkChoices(a, v)) { return nil; }
+                Array.Append(vals, v);
+            }
+
+            let isList = (a.nargs == "*" || a.nargs == "+" || Type.Is(a.nargs, Type.Int));
+            if (len(raws) > 0) { seen[a.dest] = true; }
+
+            if (isList) {
+                ns[a.dest] = vals;
+            } else if (len(vals) > 0) {
+                ns[a.dest] = vals[0];
+            }
+            k = k + 1;
+        }
+
+        // Anything left over is unrecognized.
+        while (pos < total) {
+            Array.Append(extras, toks[pos]);
+            pos = pos + 1;
+        }
+        return nil;
+    }
+}
+
+export { ArgumentParser };

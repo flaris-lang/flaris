@@ -1,0 +1,409 @@
+// test_cache.fls - Test suite + benchmarks for Cache.fls
+// Run: flarisvm tests/test_cache.fls --libs='./libs'
+
+import { Cache } from library("Cache", "1.0");
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+
+fn check(label: string, cond: bool) {
+    if (cond) {
+        passed = passed + 1;
+    } else {
+        failed = failed + 1;
+        Console.WriteLine("[FAIL] " + label);
+    }
+}
+
+// ============================================================
+// Benchmark helpers
+// ============================================================
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();   // warmup
+
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+
+    let ms: float  = Time.TicksToMs(dt);
+    let us: float  = Time.TicksToUs(dt) / float(n);
+
+    Console.WriteLine(
+        String.PadRight(name, 44),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() {
+    Console.WriteLine("------------------------------------------------------------");
+}
+
+// Pre-built warm caches used by benchmarks (globals so lambdas can capture)
+global _bc_small  = new Cache(100);    // cap 100,  pre-filled
+global _bc_medium = new Cache(1000);   // cap 1000, pre-filled
+global _bc_large  = new Cache(5000);   // cap 5000, pre-filled
+
+fn fillCache(c: instance, n: int) {
+    iter (i from 0 to n - 1) {
+        c.Set(i, i * 2);
+    }
+}
+
+fn async Main() {
+    // ============================================================
+    // 1. Basic LRU (no TTL)
+    Console.WriteLine("--- 1. Basic LRU (no TTL) ---");
+    let c = new Cache(3);
+    c.Set("a", 1).Set("b", 2).Set("c", 3);
+    check("Size == 3", c.Size() == 3);
+    check("Get a == 1", c.Get("a") == 1);
+    check("Get b == 2", c.Get("b") == 2);
+    check("Has c == true", c.Has("c") == true);
+
+    // ============================================================
+    // 2. LRU eviction
+    Console.WriteLine("--- 2. LRU eviction ---");
+    // Set(a,b,c) -> Get(a) -> [b,c,a] -> Get(b) -> [c,a,b] -> oldest=c -> Set(d) evicts c
+    c.Set("d", 4);
+    check("Size still 3 after evict", c.Size() == 3);
+    check("c evicted (LRU oldest)", c.Get("c") == nil);
+    check("d present", c.Get("d") == 4);
+    check("a still present", c.Get("a") == 1);
+
+    // ============================================================
+    // 3. Delete
+    Console.WriteLine("--- 3. Delete ---");
+    c.Delete("b");
+    check("Has b == false after Delete", c.Has("b") == false);
+    check("Size == 2 after Delete", c.Size() == 2);
+
+    // ============================================================
+    // 4. Clear
+    Console.WriteLine("--- 4. Clear ---");
+    c.Clear();
+    check("Size == 0 after Clear", c.Size() == 0);
+    check("Get on cleared returns nil", c.Get("a") == nil);
+
+    // ============================================================
+    // 5. TTL expiry
+    Console.WriteLine("--- 5. TTL expiry ---");
+    let tc = new Cache(10, 100); // 100 ms TTL
+    tc.Set("x", 42);
+    check("x alive immediately", tc.Get("x") == 42);
+    Os.Sleep(200);
+    check("x expired after 200 ms", tc.Get("x") == nil);
+    check("Has x == false when expired", tc.Has("x") == false);
+    check("Size == 0 when expired", tc.Size() == 0);
+
+    // ============================================================
+    // 6. Stats
+    Console.WriteLine("--- 6. Stats ---");
+    let sc = new Cache(5);
+    sc.Set("k", 99);
+    sc.Get("k");          // hit
+    sc.Get("missing");    // miss
+    let stats = sc.Stats();
+    check("Stats.Hits == 1", stats.Hits == 1);
+    check("Stats.Misses == 1", stats.Misses == 1);
+    check("Stats.Evictions == 0", stats.Evictions == 0);
+
+    let ec = new Cache(2);
+    ec.Set("x", 1).Set("y", 2).Set("z", 3);  // z evicts x
+    let es = ec.Stats();
+    check("Stats.Evictions == 1", es.Evictions == 1);
+
+    // ============================================================
+    // 7. Keys
+    Console.WriteLine("--- 7. Keys ---");
+    let kc = new Cache(5);
+    kc.Set("a", 1).Set("b", 2).Set("c", 3);
+    kc.Get("a");  // touch a -> order: [b, c, a]
+    let keys = kc.Keys();
+    check("Keys length == 3", len(keys) == 3);
+    check("Keys[0] is LRU oldest (b)", keys[0] == "b");
+    check("Keys[2] is MRU newest (a)", keys[2] == "a");
+
+    // ============================================================
+    // 8. Optional TTL (no second arg)
+    Console.WriteLine("--- 8. Optional TTL (no second arg) ---");
+    let c2 = new Cache(5);
+    c2.Set("z", 99);
+    check("Get works without TTL arg", c2.Get("z") == 99);
+
+    // ============================================================
+    // 9. Integer keys
+    Console.WriteLine("--- 9. Integer keys ---");
+    let ic = new Cache(4);
+    ic.Set(1, "one").Set(2, "two");
+    check("int key Get 1", ic.Get(1) == "one");
+    check("int key Has 2", ic.Has(2) == true);
+
+    // ============================================================
+    // 10. Overwrite existing key
+    Console.WriteLine("--- 10. Overwrite existing key ---");
+    let oc = new Cache(3);
+    oc.Set("k", 1);
+    oc.Set("k", 2);
+    check("overwrite keeps size 1", oc.Size() == 1);
+    check("overwrite returns new value", oc.Get("k") == 2);
+
+    // ============================================================
+    // 11. Invalid capacity
+    Console.WriteLine("--- 11. Invalid capacity ---");
+    let threw = false;
+    try {
+        let bad = new Cache(0);
+    } catch (e) {
+        threw = true;
+    }
+    check("Cache(0) throws", threw);
+
+    // ============================================================
+    // 12. ToString
+    Console.WriteLine("--- 12. ToString ---");
+    check("ToString non-empty", len(c2.ToString()) > 0);
+
+    // ============================================================
+    // 13. Capacity
+    Console.WriteLine("--- 13. Capacity ---");
+    let cap3 = new Cache(7);
+    check("Capacity returns constructor value", cap3.Capacity() == 7);
+    cap3.Set("a", 1).Set("b", 2);
+    check("Capacity unchanged after inserts", cap3.Capacity() == 7);
+
+    // ============================================================
+    // 14. HitRate
+    Console.WriteLine("--- 14. HitRate ---");
+    let hr = new Cache(10);
+    check("HitRate 0.0 before any access", hr.HitRate() == 0.0);
+    hr.Set("x", 1);
+    hr.Get("x");          // hit
+    hr.Get("x");          // hit
+    hr.Get("missing");    // miss
+    // 2 hits / 3 total = 0.666...
+    check("HitRate 2/3 ~= 0.666", hr.HitRate() > 0.66 && hr.HitRate() < 0.67);
+    let hrAll = new Cache(5);
+    hrAll.Set("a", 1);
+    hrAll.Get("a");
+    check("HitRate 1.0 when all hits", hrAll.HitRate() == 1.0);
+
+    // ============================================================
+    // 15. GetOrSet
+    Console.WriteLine("--- 15. GetOrSet ---");
+    let goc = new Cache(5);
+    let ctr1 = { n: 0 };
+    let v1 = goc.GetOrSet("k", fn() { ctr1.n += 1; return 42; });
+    check("GetOrSet computes value on miss", v1 == 42);
+    check("GetOrSet factory called once", ctr1.n == 1);
+    let v2 = goc.GetOrSet("k", fn() { ctr1.n += 1; return 99; });
+    check("GetOrSet returns cached on hit", v2 == 42);
+    check("GetOrSet factory not called again", ctr1.n == 1);
+    // GetOrSet with TTL cache: value expires then recomputes
+    let ttlGoc = new Cache(5, 100);
+    ttlGoc.GetOrSet("e", fn() { return 7; });
+    Os.Sleep(200);
+    let ctr2 = { n: 0 };
+    let v3 = ttlGoc.GetOrSet("e", fn() { ctr2.n += 1; return 8; });
+    check("GetOrSet recomputes after TTL expiry", v3 == 8);
+    check("GetOrSet factory called after expiry", ctr2.n == 1);
+
+    // ============================================================
+    // 16. SetMany
+    Console.WriteLine("--- 16. SetMany ---");
+    let mc = new Cache(10);
+    mc.SetMany({ x: 1, y: 2, z: 3 });
+    check("SetMany size == 3", mc.Size() == 3);
+    check("SetMany Get x == 1", mc.Get("x") == 1);
+    check("SetMany Get y == 2", mc.Get("y") == 2);
+    check("SetMany Get z == 3", mc.Get("z") == 3);
+    // SetMany returns this (chaining)
+    let mc2 = new Cache(10);
+    mc2.SetMany({ a: 10 }).SetMany({ b: 20 });
+    check("SetMany chaining", mc2.Size() == 2);
+
+    // ============================================================
+    // 17. GetMany
+    Console.WriteLine("--- 17. GetMany ---");
+    let gmc = new Cache(10);
+    gmc.Set("a", 1).Set("b", 2).Set("c", 3);
+    let vals = gmc.GetMany(["a", "b", "c"]);
+    check("GetMany length == 3", len(vals) == 3);
+    check("GetMany [0] == 1", vals[0] == 1);
+    check("GetMany [1] == 2", vals[1] == 2);
+    check("GetMany [2] == 3", vals[2] == 3);
+    // Missing key returns nil
+    let vals2 = gmc.GetMany(["a", "no-such", "c"]);
+    check("GetMany missing key is nil", vals2[1] == nil);
+    // Empty key list
+    let vals3 = gmc.GetMany([]);
+    check("GetMany empty keys returns []", len(vals3) == 0);
+
+    // ============================================================
+    // 18. Expire
+    Console.WriteLine("--- 18. Expire ---");
+    let exp = new Cache(10, 100); // 100 ms TTL
+    exp.Set("a", 1).Set("b", 2).Set("c", 3);
+    check("Expire: size 3 before expiry", exp.Size() == 3);
+    Os.Sleep(200);
+    exp.Expire();
+    check("Expire: size 0 after sweep", exp.Size() == 0);
+    check("Expire: returns this (chaining)", exp.Clear().Size() == 0);
+    // Expire on cache without TTL does nothing
+    let noTtl = new Cache(5);
+    noTtl.Set("x", 1).Set("y", 2);
+    noTtl.Expire();
+    check("Expire: no-TTL cache unaffected", noTtl.Size() == 2);
+    // Expire only removes expired entries, leaves live ones
+    let mixed = new Cache(10, 150);
+    mixed.Set("old", 1);
+    Os.Sleep(200);
+    mixed.Set("fresh", 2); // reset TTL for this entry
+    mixed.Expire();
+    check("Expire: removes expired, keeps fresh", mixed.Size() == 1);
+    check("Expire: fresh entry survives", mixed.Get("fresh") == 2);
+
+    // ============================================================
+    // 19. Persistence (Save / Load / FromFile)
+    Console.WriteLine("--- 19. Persistence ---");
+    let pPath = Path.Combine(Os.TempDir(), "flaris_test_cache_persist.json");
+    if (File.Exists(pPath)) File.Delete(pPath);
+    let pc = new Cache(10);
+    pc.Set("a", 1).Set("b", { x: 2 }).Set("c", [3, 4, 5]);
+    check("Save returns true", pc.Save(pPath) == true);
+    check("Save wrote file", File.Exists(pPath));
+
+    let lc = new Cache(10);
+    check("Load returns true", lc.Load(pPath) == true);
+    check("Load restores size", lc.Size() == 3);
+    check("Load restores scalar", lc.Get("a") == 1);
+    check("Load restores object", lc.Get("b").x == 2);
+    check("Load restores array", lc.Get("c")[1] == 4);
+    check("Load clears prior entries", lc.Load(pPath) == true && lc.Size() == 3);
+    check("Load missing file -> false", lc.Load(Path.Combine(Os.TempDir(), "flaris_no_such_cache.json")) == false);
+
+    let fc = Cache.FromFile(pPath);
+    check("FromFile builds cache", fc != nil && fc.Size() == 3);
+    check("FromFile capacity from file", fc.Capacity() == 10);
+    check("FromFile missing -> nil", Cache.FromFile(Path.Combine(Os.TempDir(), "flaris_no_such_cache.json")) == nil);
+    File.Delete(pPath);
+
+    // ============================================================
+    // 20. Async GetOrSet
+    Console.WriteLine("--- 20. Async GetOrSet ---");
+    let ac = new Cache(10);
+    let av1 = await Cache.GetOrSetAsync(ac, "k", fn() { return 99; });
+    check("async GetOrSet computes value", av1 == 99);
+    let av2 = await Cache.GetOrSetAsync(ac, "k", fn() { return -1; });
+    check("async GetOrSet hits cache (no recompute)", av2 == 99);
+
+    // ============================================================
+    // Test summary
+    Console.WriteLine("\n============================================================");
+    Console.WriteLine("Tests: " + str(passed) + " passed, " + str(failed) + " failed");
+    if (failed > 0) throw(1, str(failed) + " test(s) FAILED");
+
+    // ============================================================
+    // Benchmarks
+    // ============================================================
+
+    // Pre-fill read-only caches (these are only read in Get/Has benches)
+    fillCache(_bc_small,  100);
+    fillCache(_bc_medium, 1000);
+    fillCache(_bc_large,  5000);
+
+    Console.WriteLine("\n\n=== Cache Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 44), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    // -- Set (insert, no eviction) --
+    Console.WriteLine("\n[ Set - fresh cache, no eviction ]");
+
+    bench("Set  100 distinct keys (cap=100)", fn() {
+        let b = new Cache(100);
+        iter (i from 0 to 99) { b.Set(i, i); }
+        _sink = b.Size();
+    }, 200);
+
+    bench("Set  1000 distinct keys (cap=1000)", fn() {
+        let b = new Cache(1000);
+        iter (i from 0 to 999) { b.Set(i, i); }
+        _sink = b.Size();
+    }, 20);
+
+    // -- Set (with LRU eviction) --
+    Console.WriteLine("\n[ Set - over capacity, continuous eviction ]");
+
+    bench("Set  evicting (cap=100, 200 inserts)", fn() {
+        let b = new Cache(100);
+        iter (i from 0 to 199) { b.Set(i, i); }
+        _sink = b.Size();
+    }, 200);
+
+    bench("Set  evicting (single key into full cap=100)", fn() {
+        // Use a dedicated eviction cache; key cycles 0-199 to keep evicting
+        _bc_small.Set(_sink % 200, _sink);
+        _sink = _sink + 1;
+    }, 5000);
+
+    // Re-fill _bc_small after eviction bench mutated it
+    _bc_small.Clear();
+    fillCache(_bc_small, 100);
+
+    // -- Get (hit) --
+    Console.WriteLine("\n[ Get - cache hit (O(1) LRU touch) ]");
+
+    bench("Get  hit  key=50  (cap=100,  n=100)", fn() {
+        let v = _bc_small.Get(50);
+        _sink = _sink + 1;
+    }, 10000);
+
+    bench("Get  hit  key=500 (cap=1000, n=1000)", fn() {
+        let v = _bc_medium.Get(500);
+        _sink = _sink + 1;
+    }, 5000);
+
+    bench("Get  hit  key=2500 (cap=5000, n=5000)", fn() {
+        let v = _bc_large.Get(2500);
+        _sink = _sink + 1;
+    }, 1000);
+
+    // -- Get (miss) --
+    Console.WriteLine("\n[ Get - cache miss (HashMap lookup only) ]");
+
+    bench("Get  miss  (cap=100)", fn() {
+        let v = _bc_small.Get("no-such-key");
+        _sink = _sink + 1;
+    }, 20000);
+
+    bench("Get  miss  (cap=1000)", fn() {
+        let v = _bc_medium.Get("no-such-key");
+        _sink = _sink + 1;
+    }, 20000);
+
+    // -- Has --
+    Console.WriteLine("\n[ Has ]");
+
+    bench("Has  existing (cap=100)", fn() {
+        if (_bc_small.Has(50)) { _sink = _sink + 1; }
+    }, 10000);
+
+    bench("Has  missing  (cap=100)", fn() {
+        if (!_bc_small.Has("no-such-key")) { _sink = _sink + 1; }
+    }, 20000);
+
+    // -- Mixed workload (all keys guaranteed to exist) --
+    Console.WriteLine("\n[ Mixed workload - interleaved Set+Get, warm cap=100 ]");
+
+    bench("Mixed  overwrite existing + Get hit", fn() {
+        let key: int = _sink % 100;
+        _bc_small.Set(key, _sink);            // overwrite, moves to MRU
+        let v = _bc_small.Get((key + 1) % 100); // always hits a neighbour key
+        _sink = _sink + 1;
+    }, 5000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink) + "  (prevents dead-code elimination)");
+}

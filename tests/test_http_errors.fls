@@ -1,0 +1,47 @@
+// Cross-module typed exceptions, exercised through a real library.
+// Http raises Exception subclasses (HttpError / HttpUnsupportedError) on the
+// deterministic "unsupported operation" paths - no network needed - so we can
+// verify subclass dispatch (is / type-switch) across module boundaries.
+import { Http, HttpError, HttpUnsupportedError } from library("Http", "1.0");
+
+global _fail = 0;
+fn expect(cond, msg) {
+    if (!cond) { Console.WriteLine("FAIL: " + msg); _fail = _fail + 1; }
+}
+
+fn classify(e) {
+    switch (e) {
+        case HttpUnsupportedError: return "unsupported"; // most specific first
+        case HttpError:            return "http";
+        case Exception:            return "other";
+    }
+    return "none";
+}
+
+fn Main() {
+    Console.WriteLine("== Http typed errors (cross-module) ==");
+
+    // StreamPost over https is unsupported and throws before any network I/O.
+    let caught = nil;
+    try {
+        Http.StreamPost("https://example.com/x", "body", fn(line) { });
+        expect(false, "StreamPost(https) should have thrown");
+    } catch (e) {
+        caught = e;
+    }
+
+    expect(caught != nil, "an exception was thrown");
+    // subclass chain: HttpUnsupportedError -> HttpError -> Exception
+    expect(caught is HttpUnsupportedError, "is HttpUnsupportedError (self)");
+    expect(caught is HttpError, "is HttpError (parent)");
+    expect(caught is Exception, "is Exception (root)");
+    expect(caught.Code == 100, "Code field preserved");
+    expect(len(caught.Error) > 0, "Error message present");
+
+    // type-switch dispatches to the most specific matching case
+    expect(classify(caught) == "unsupported", "type-switch picks HttpUnsupportedError");
+
+    if (_fail == 0) { Console.WriteLine("All tests passed!"); }
+    else { Console.WriteLine("Tests failed: " + str(_fail)); }
+    return _fail;
+}

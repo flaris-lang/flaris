@@ -1,0 +1,269 @@
+// StringBuilder.fls - Efficient mutable string builder for Flaris.
+// Version: 1.0
+//
+// Accumulates string parts in an array; the final string is materialised
+// only when ToString(), Insert(), Remove(), or Replace() is called.
+// All Append* methods return this for chaining. O(1) per append.
+//
+// Usage:
+//   import { StringBuilder } from library("StringBuilder", "1.0");
+//
+//   let sb = new StringBuilder();
+//   sb.Append("Hello").Append(", ").Append("World").AppendLine("!");
+//   Console.WriteLine(sb.ToString());   // "Hello, World!\n"
+//
+//   // Format and join
+//   sb.Clear();
+//   sb.AppendFormat("{0} = {1}", [key, value]);
+//   sb.AppendJoin(["a","b","c"], ", ");  // "a, b, c"
+//
+//   // Pad columns
+//   sb.AppendPadLeft("42", 6, " ");     // "    42"
+//   sb.AppendPadRight("hi", 8, "-");    // "hi------"
+//
+// Constructor:
+//   new StringBuilder(initial?)   - optional starting string
+//
+// Appending (all return this):
+//   Append(value)                  - coerce to string and append
+//   AppendChar(c:char)             - append a single character
+//   AppendLine(value?)             - append value + newline
+//   AppendRepeat(value, n)         - append value n times
+//   AppendFormat(fmt, args)        - printf-style: {0}, {1}, …
+//   AppendJoin(arr, sep)           - join array with separator
+//   AppendPadLeft(s, width, pad)   - right-align s in width chars
+//   AppendPadRight(s, width, pad)  - left-align s in width chars
+//
+// Editing (materialises the string):
+//   Insert(pos, value)             - insert at character position
+//   Remove(start, length)          - delete characters
+//   Replace(old, new)              - replace all occurrences
+//   Trim()                         - trim leading/trailing whitespace
+//   ToUpper()  ToLower()
+//
+// Query:
+//   Contains(s)  →  bool
+//   IndexOf(s)   →  int  (-1 if not found)
+//   GetLength()  →  int
+//   IsEmpty()    →  bool
+//
+// Output:
+//   ToString()   →  string  (materialises; subsequent appends start fresh)
+//   Clear()                 - reset to empty
+
+class StringBuilder {
+    let _len: int = 0; 
+    let _parts = nil; 
+
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    // initial - optional starting string (any type, coerced via str()).
+    fn Constructor(initial) {
+        this._parts = [];
+        this._len   = 0;
+
+        if (initial != nil) {
+            let s = str(initial);
+            Array.Append(this._parts, s);
+            this._len = String.Length(s);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Core append operations  (all return `this` for chaining)
+    // -------------------------------------------------------------------------
+
+    // Append any value - coerced to string.
+    fn Append(value) {
+        let s = str(value);
+        Array.Append(this._parts, s);
+        this._len += String.Length(s);
+        return this;
+    }
+
+    // Append a char value without calling str() (avoids quoting artefacts).
+    fn AppendChar(c:char) {
+        let s = "" + c;   // concat with empty string gives a 1-char string
+        Array.Append(this._parts, s);
+        this._len += 1;
+        return this;
+    }
+
+    // Append value followed by a newline.  Value may be nil to append only "\n".
+    fn AppendLine(value) {
+        if (value != nil) {
+            let s = str(value);
+            Array.Append(this._parts, s);
+            this._len += String.Length(s);
+        }
+        Array.Append(this._parts, "\n");
+        this._len += 1;
+        return this;
+    }
+
+    // Append a repeated string n times.
+    fn AppendRepeat(value, n:int) {
+        if (n <= 0) return this;
+        let s = str(value);
+        let rep = String.Repeat(s, n);
+        Array.Append(this._parts, rep);
+        this._len += String.Length(rep);
+        return this;
+    }
+
+    // Append String.Format(fmt, args[0], args[1], ...) using an array of args.
+    // Example: sb.AppendFormat("{0} is {1}", ["Flaris", 42]);
+    fn AppendFormat(fmt:string, args:array) {
+        let s = String.FormatArray(fmt, args);
+        Array.Append(this._parts, s);
+        this._len += String.Length(s);
+        return this;
+    }
+
+    // Append each element of an array, separated by sep.
+    fn AppendJoin(arr:array, sep:string) {
+        let s = String.Join(arr, sep);
+        Array.Append(this._parts, s);
+        this._len += String.Length(s);
+        return this;
+    }
+
+    // -------------------------------------------------------------------------
+    // Mutating operations (materialise the buffer first)
+    // -------------------------------------------------------------------------
+
+    // Insert a value at byte position pos within the accumulated string.
+    fn Insert(pos:int, value) {
+        let current = this._Materialise();
+        let s       = str(value);
+        let result  = String.Insert(current, pos, s);
+        this._parts = [result];
+        this._len   = String.Length(result);
+        return this;
+    }
+
+    // Remove `length` bytes starting at byte position `start`.
+    fn Remove(start:int, length:int) {
+        let current = this._Materialise();
+        let left    = String.Substr(current, 0, start);
+        let right   = String.Substr(current, start + length);
+        let result  = left + right;
+        this._parts = [result];
+        this._len   = String.Length(result);
+        return this;
+    }
+
+    // Replace all occurrences of `old` with `new` in the accumulated string.
+    fn Replace(old:string, news:string) {
+        let result  = String.Replace(this._Materialise(), old, news);
+        this._parts = [result];
+        this._len   = String.Length(result);
+        return this;
+    }
+
+    // Trim leading and trailing whitespace from the accumulated string.
+    fn Trim() {
+        let result  = String.Trim(this._Materialise());
+        this._parts = [result];
+        this._len   = String.Length(result);
+        return this;
+    }
+
+    // Convert the whole buffer to uppercase.
+    fn ToUpper() {
+        let result  = String.ToUpper(this._Materialise());
+        this._parts = [result];
+        this._len   = String.Length(result);
+        return this;
+    }
+
+    // Convert the whole buffer to lowercase.
+    fn ToLower() {
+        let result  = String.ToLower(this._Materialise());
+        this._parts = [result];
+        this._len   = String.Length(result);
+        return this;
+    }
+
+    // -------------------------------------------------------------------------
+    // State management
+    // -------------------------------------------------------------------------
+
+    // Reset to empty without allocating a new object.
+    fn Clear() {
+        this._parts = [];
+        this._len   = 0;
+        return this;
+    }
+
+    // -------------------------------------------------------------------------
+    // Padding helpers  (all return `this` for chaining)
+    // -------------------------------------------------------------------------
+
+    // Append `s` left-padded to at least `width` chars using `padChar`.
+    fn AppendPadLeft(s:string, width:int, padChar:string) : instance {
+        return this.Append(String.PadLeft(s, width, padChar));
+    }
+
+    // Append `s` right-padded to at least `width` chars using `padChar`.
+    fn AppendPadRight(s:string, width:int, padChar:string) : instance {
+        return this.Append(String.PadRight(s, width, padChar));
+    }
+
+    // -------------------------------------------------------------------------
+    // Capacity hint
+    // -------------------------------------------------------------------------
+
+    // Pre-reserve capacity hint (no-op - arrays grow dynamically, documents API).
+    fn EnsureCapacity(_n:int) : instance { return this; }
+
+    // -------------------------------------------------------------------------
+    // Search  (materialise only when needed)
+    // -------------------------------------------------------------------------
+
+    // Return true if the accumulated content contains `s`.
+    fn Contains(s:string) : bool {
+        return String.Contains(this.ToString(), s);
+    }
+
+    // Return byte index of first occurrence of `s`, or -1 if not found.
+    fn IndexOf(s:string) : int {
+        return String.IndexOf(this.ToString(), s);
+    }
+
+    // -------------------------------------------------------------------------
+    // Query / terminal
+    // -------------------------------------------------------------------------
+
+    // Current byte length of all accumulated content (O(1) - no join needed).
+    fn GetLength() {
+        return this._len;
+    }
+
+    fn IsEmpty() {
+        return this._len == 0;
+    }
+
+    // Materialise and return the final string.  This is the only allocation.
+    fn ToString() {
+        return this._Materialise();
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
+    // Join all parts into a single string and collapse the backing array.
+    // Called by any operation that needs random-access into the content.
+    fn _Materialise() {
+        if (len(this._parts) == 0) return "";
+        if (len(this._parts) == 1) return this._parts[0];
+        let result  = String.Join(this._parts, "");
+        this._parts = [result];          // collapse - next append stays fast
+        return result;
+    }
+}
+
+export { StringBuilder };

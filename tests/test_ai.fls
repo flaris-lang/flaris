@@ -1,0 +1,281 @@
+// test_ai.fls - Test suite for AI.fls (Ollama client)
+//
+// Requires Ollama running on http://localhost:11434 with at least one model.
+//
+// Run:
+//   flarisvm tests/test_ai.fls --libs='./libs'
+
+import { AI } from library("AI", "1.0");
+
+global MODEL       = "qwen3:8b";
+global _pass       = 0;
+global _fail       = 0;
+global _sink       = "";
+global _stream_buf = "";
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn ok(cond, msg) {
+    if (cond) { _pass = _pass + 1; }
+    else { _fail = _fail + 1; Console.WriteLine("  FAIL: " + msg); }
+}
+
+fn notNil(val, msg)        { ok(val != nil, msg + " (got nil)"); }
+fn contains(s, sub, msg)   { ok(String.Contains(Convert.ToString(s), sub), msg); }
+fn section(name)           { Console.WriteLine("\n== " + name + " =="); }
+
+fn bench(name: string, f: fn, n: int) {
+    f();
+    let t0 = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let ms   = Time.TicksToMs(Time.Ticks() - t0);
+    let each = ms / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 44),
+        String.PadLeft(String.FormatArray("{0:.1f}", [ms]),   8), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.1f}", [each]), 8), " ms/call"
+    );
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+fn test_models() {
+    section("Models");
+    let models = AI.Models();
+    notNil(models, "Models() returns list");
+    ok(len(models) > 0, "at least one model");
+    if (models != nil && len(models) > 0) {
+        ok("name" in models[0], "model has 'name'");
+        Console.WriteLine("  Available:");
+        foreach (m in models) { Console.WriteLine("    " + m.name); }
+    }
+}
+
+fn test_model_info() {
+    section("ModelInfo");
+    let info = AI.ModelInfo(MODEL);
+    notNil(info, "ModelInfo returns object");
+    if (info != nil) {
+        ok("details" in info, "info has 'details'");
+        Console.WriteLine("  Family: " + Convert.ToString(info.details.family));
+    }
+}
+
+fn test_chat() {
+    section("Chat (blocking)");
+
+    let r1 = AI.Chat(MODEL, [{ role: "user", content: "Reply with exactly one word: PONG" }], { think: false });
+    notNil(r1, "Chat returns string");
+    ok(len(r1) > 0, "Chat non-empty");
+    Console.WriteLine("  Response: " + r1);
+
+    let r2 = AI.Chat(MODEL, [
+        { role: "user",      content: "Remember the number 42." },
+        { role: "assistant", content: "I will remember 42." },
+        { role: "user",      content: "What number? Digits only." }
+    ], { think: false });
+    notNil(r2, "multi-turn Chat");
+    contains(r2, "42", "multi-turn recalls 42");
+    Console.WriteLine("  Multi-turn: " + r2);
+}
+
+fn test_ask() {
+    section("Ask (system+user shorthand)");
+    let r = AI.Ask(MODEL,
+        "You are a pirate. Every reply must start with 'Arrr!'.",
+        "Hello, who are you?",
+        { think: false }
+    );
+    notNil(r, "Ask returns string");
+    contains(r, "Arrr", "Ask: system prompt respected");
+    Console.WriteLine("  Reply: " + r);
+}
+
+fn test_chat_json() {
+    section("ChatJson");
+    let obj = AI.ChatJson(MODEL, [
+        { role: "user", content: "Return a JSON object with keys 'name' (string) and 'score' (number). Use name=Alice score=99." }
+    ], { think: false });
+    notNil(obj, "ChatJson returns object");
+    if (obj != nil) {
+        ok("name" in obj || "score" in obj, "ChatJson has expected keys");
+        Console.WriteLine("  Parsed: name=" + Convert.ToString(obj.name) + " score=" + Convert.ToString(obj.score));
+    }
+}
+
+fn test_chat_stats() {
+    section("ChatStats");
+    let s = AI.ChatStats(MODEL, [{ role: "user", content: "Say: hi" }], { think: false });
+    notNil(s, "ChatStats returns object");
+    if (s != nil) {
+        notNil(s.content, "ChatStats.content");
+        ok(s.evalTokens > 0, "ChatStats.evalTokens > 0");
+        ok(s.totalMs > 0.0, "ChatStats.totalMs > 0");
+        Console.WriteLine("  Tokens: prompt=" + Convert.ToString(s.promptTokens) +
+                          " eval=" + Convert.ToString(s.evalTokens) +
+                          " ms=" + String.FormatArray("{0:.1f}", [s.totalMs]));
+    }
+}
+
+fn test_generate() {
+    section("Generate (blocking)");
+    let g = AI.Generate(MODEL, "The capital of France is", { think: false });
+    notNil(g, "Generate returns string");
+    contains(g, "Paris", "Generate completes correctly");
+    Console.WriteLine("  Completion: " + g);
+}
+
+fn test_chat_stream() {
+    section("ChatStream");
+    _stream_buf = "";
+    Console.Write("  Streaming: ");
+    AI.ChatStream(MODEL, [
+        { role: "user", content: "Count 1 to 5, one number per line, nothing else." }
+    ], fn(token) {
+        _stream_buf = _stream_buf + token;
+        Console.Write(token);
+    }, { think: false });
+    Console.WriteLine("");
+    ok(len(_stream_buf) > 0, "ChatStream buffer non-empty");
+    contains(_stream_buf, "1", "ChatStream has '1'");
+    contains(_stream_buf, "5", "ChatStream has '5'");
+}
+
+fn test_generate_stream() {
+    section("GenerateStream");
+    _stream_buf = "";
+    Console.Write("  Streaming: ");
+    AI.GenerateStream(MODEL, "Roses are red,", fn(token) {
+        _stream_buf = _stream_buf + token;
+        Console.Write(token);
+    }, { think: false });
+    Console.WriteLine("");
+    ok(len(_stream_buf) > 0, "GenerateStream buffer non-empty");
+}
+
+fn test_conversation() {
+    section("AIConversation");
+    let conv = AI.Conversation(MODEL, { think: false });
+    conv.System("You are a geography expert. Answer in one sentence.");
+
+    let r1 = conv.Say("What is the capital of Japan?");
+    notNil(r1, "conv.Say returns string");
+    contains(r1, "Tokyo", "conv: correct capital");
+    Console.WriteLine("  Turn 1: " + r1);
+
+    let r2 = conv.Say("What is its approximate population?");
+    notNil(r2, "conv.Say turn 2");
+    ok(len(r2) > 0, "conv turn 2 non-empty");
+    Console.WriteLine("  Turn 2: " + r2);
+
+    ok(len(conv.History()) == 5, "history has 5 entries (system + 2×user+assistant)");
+
+    // Stream turn
+    _stream_buf = "";
+    Console.Write("  Stream: ");
+    conv.Stream("Name one famous landmark there.", fn(token) {
+        _stream_buf = _stream_buf + token;
+        Console.Write(token);
+    });
+    Console.WriteLine("");
+    ok(len(_stream_buf) > 0, "conv.Stream non-empty");
+    ok(len(conv.History()) == 7, "history has 7 entries after stream");
+
+    conv.Reset();
+    ok(len(conv.History()) == 0, "conv.Reset clears history");
+}
+
+fn async test_async() {
+    section("Async (ChatAsync / GenerateAsync)");
+
+    // Fire two calls concurrently
+    let p1 = AI.ChatAsync(MODEL, [{ role: "user", content: "Reply with the word: ONE" }], { think: false });
+    let p2 = AI.ChatAsync(MODEL, [{ role: "user", content: "Reply with the word: TWO" }], { think: false });
+    let r1 = await p1;
+    let r2 = await p2;
+
+    notNil(r1, "ChatAsync r1 non-nil");
+    notNil(r2, "ChatAsync r2 non-nil");
+    Console.WriteLine("  r1: " + Convert.ToString(r1));
+    Console.WriteLine("  r2: " + Convert.ToString(r2));
+
+    let p3 = AI.GenerateAsync(MODEL, "The sun is a", { think: false });
+    let r3 = await p3;
+    notNil(r3, "GenerateAsync non-nil");
+    Console.WriteLine("  GenerateAsync: " + Convert.ToString(r3));
+}
+
+fn test_client() {
+    section("AI.Client (custom endpoint)");
+    let client = AI.Client("http://localhost:11434");
+    let r = client.Chat(MODEL, [{ role: "user", content: "Say only: OK" }], { think: false });
+    notNil(r, "AIClient.Chat returns string");
+    Console.WriteLine("  Reply: " + r);
+}
+
+fn test_errors() {
+    section("Error handling");
+    ok(AI.Chat("no-such-model-xyz", [{ role: "user", content: "hi" }]) == nil, "missing model → nil");
+    ok(AI.Client("http://localhost:19999").Chat(MODEL, [{ role: "user", content: "hi" }]) == nil, "unreachable → nil");
+    ok(AI.ModelInfo("no-such-model-xyz") == nil, "ModelInfo missing model → nil");
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn async Main() {
+    Console.WriteLine("=== AI.fls test suite (Ollama @ localhost:11434, model: " + MODEL + ") ===");
+
+    test_models();
+    test_model_info();
+    test_chat();
+    test_ask();
+    test_chat_json();
+    test_chat_stats();
+    test_generate();
+    test_chat_stream();
+    test_generate_stream();
+    test_conversation();
+    await test_async();
+    test_client();
+    test_errors();
+
+    Console.WriteLine("\n----------------------------------------");
+    Console.WriteLine("Results: " + Convert.ToString(_pass) + " passed, " + Convert.ToString(_fail) + " failed.");
+    if (_fail == 0) { Console.WriteLine("All tests passed."); }
+    else            { Console.WriteLine("SOME TESTS FAILED."); }
+
+    // ── Benchmarks ────────────────────────────────────────────────────────────
+    Console.WriteLine("\n========================================");
+    Console.WriteLine(" Benchmarks (n=3)");
+    Console.WriteLine("========================================");
+    Console.WriteLine(String.PadRight("benchmark", 44), String.PadLeft("total", 8), "       ", String.PadLeft("ms/call", 8));
+    Console.WriteLine("----------------------------------------------------------------------");
+
+    bench("Chat - 1-word reply, stream:false", fn() {
+        _sink = AI.Chat(MODEL, [{ role: "user", content: "Reply: OK" }], { think: false });
+    }, 3);
+
+    bench("Ask - 1-word reply", fn() {
+        _sink = AI.Ask(MODEL, "Reply in one word.", "Say: YES", { think: false });
+    }, 3);
+
+    bench("ChatStats - 1-word reply", fn() {
+        let s = AI.ChatStats(MODEL, [{ role: "user", content: "Reply: OK" }], { think: false });
+        _sink = Convert.ToString(s.evalTokens);
+    }, 3);
+
+    bench("Generate - short completion", fn() {
+        _sink = AI.Generate(MODEL, "1+1=", { think: false });
+    }, 3);
+
+    bench("Models()", fn() {
+        _sink = Convert.ToString(len(AI.Models()));
+    }, 5);
+
+    bench("ModelInfo()", fn() {
+        _sink = Convert.ToString(AI.ModelInfo(MODEL) != nil);
+    }, 3);
+
+    Console.WriteLine("\nNote: async/streaming benchmarks omitted (dominated by model inference).");
+    return _fail;
+}

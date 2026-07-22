@@ -1,0 +1,583 @@
+// Promise.fls - Async composition with promises for Flaris.
+// Version: 1.0
+//
+// A Promise represents a value that will be available in the future.
+// Promises are fiber-based: Await() yields the current fiber until the
+// promise is settled, so the scheduler can continue running other fibers.
+//
+// Usage:
+//   import { Promise } from library("Promise", "1.0");
+//
+//   // Run work in a fiber and await the result
+//   let p = Promise.Run(fn() { return Http.Get("http://example.com"); });
+//   let res = p.Await();
+//
+//   // Chain: Then / Catch / Finally
+//   Promise.Run(fn() { return fetchData(); })
+//       .Then(fn(v) { Console.WriteLine("ok:", v); })
+//       .Catch(fn(e) { Console.WriteLine("err:", e); });
+//
+//   // Combinators (blocking: yield until all settle)
+//   let results = Promise.All([p1, p2, p3]);   // array of resolved values
+//   let first   = Promise.Race([p1, p2]);       // first resolved value
+//   let any     = Promise.Any([p1, p2, p3]);    // first non-rejected value
+//
+// Creating:
+//   new Promise()                   - empty; call Resolve/Reject manually
+//   Promise.Resolved(value)         - already-resolved promise
+//   Promise.Rejected(reason)        - already-rejected promise
+//   Promise.Canceled(reason)
+//   Promise.From(value)             - wraps value if not already a Promise
+//   Promise.Run(workFn)             - run fn in a fiber; returns Promise
+//   Promise.Delay(ms, value?)       - resolves after ms milliseconds
+//   Promise.RejectAfter(ms, reason)
+//
+// Settling (on an empty promise):
+//   Resolve(value)  Reject(reason)  Cancel(reason)
+//
+// State:
+//   IsPending()  IsResolved()  IsRejected()  IsCanceled()  IsSettled()
+//   State()  →  string    Value()  →  any    Id()  →  int
+//
+// Chaining (returns new Promise):
+//   Then(onFulfilled)               - called when resolved
+//   Catch(onRejected)               - called when rejected
+//   ThenCatch(onFulfilled, onRejected)
+//   Finally(onFinally)              - called always on settle
+//
+// Awaiting:
+//   Await()                         - blocks fiber; returns resolved value or throws
+//   AwaitResult()                   →  { ok:bool, value, reason }  - never throws
+//   TryAwait(defaultValue)          - returns defaultValue on rejection/cancel
+//
+// Timeout / cancellation:
+//   Timeout(ms)                     - reject after ms if still pending
+//   CancelAfter(ms)                 - cancel after ms if still pending
+//   CancelNow()
+//
+// Combinators (static, blocking):
+//   Promise.All(promises)           →  array of values; throws if any rejects
+//   Promise.Race(promises)          →  first settled value
+//   Promise.Any(promises)           →  first resolved value; throws if all reject
+//   Promise.AllSettled(promises)    →  array of { ok, value, reason }
+//   Promise.FirstSettled(promises)  →  { ok, value, reason }
+//
+// Constraints:
+//   Lambdas passed to Then/Catch/Finally/Run cannot capture enclosing locals -
+//   only parameters and globals are accessible inside them (Flaris language rule).
+
+global _pr_store = {};   // id -> Promise instance
+global _pr_next  = 0;    // monotonic id counter
+
+fn _PromiseRetryWorker() {
+    let self = Fiber.FromId(Fiber.Id());
+    while (!Fiber.HasMessage(self)) { Fiber.Sleep(0); }
+
+    let msg        = Fiber.GetMessage(self);
+    let pid        = msg.id;
+    let fn_        = msg.fn_;
+    let maxAttempts = msg.maxAttempts;
+    let delayMs    = msg.delayMs;
+
+    var attempt = 0;
+    var lastErr = nil;
+    while (attempt < maxAttempts) {
+        attempt = attempt + 1;
+        try {
+            let result = fn_();
+            Promise.Notify(pid, result);
+            return;
+        } catch (e) {
+            lastErr = e.Error;
+            if (attempt < maxAttempts && delayMs > 0) {
+                Fiber.Sleep(delayMs);
+            }
+        }
+    }
+    Promise.Fail(pid, lastErr);
+}
+
+fn _PromiseDelayedWorker() {
+    let self = Fiber.FromId(Fiber.Id());
+    while (!Fiber.HasMessage(self)) { Fiber.Sleep(0); }
+
+    let msg = Fiber.GetMessage(self);
+    let pid = msg.id;
+    let delay = msg.ms;
+    let kind = msg.kind;
+    let value = msg.value;
+
+    Fiber.Sleep(delay);
+
+    if (kind == "resolve") {
+        Promise.Notify(pid, value);
+    } else if (kind == "reject") {
+        Promise.Fail(pid, value);
+    } else if (kind == "cancel") {
+        Promise.CancelId(pid, value);
+    }
+}
+
+class Promise {
+    let _handlers = nil; 
+    let _state: string = "pending"; 
+    let _value = nil; 
+    let id = 0;
+
+    fn Constructor() {
+        _pr_next        = _pr_next + 1;
+        this.id         = _pr_next;
+        this._state     = "pending";   // "pending" | "resolved" | "rejected" | "canceled"
+        this._value     = nil;
+        this._handlers  = [];          // [{onFulfilled, onRejected, onFinally, next}]
+        _pr_store[str(this.id)] = this;
+    }
+
+    // ── Inspection ────────────────────────────────────────────────────────────
+
+    fn IsPending(): bool   { return this._state == "pending";  }
+    fn IsResolved(): bool  { return this._state == "resolved"; }
+    fn IsRejected(): bool  { return this._state == "rejected"; }
+    fn IsCanceled(): bool  { return this._state == "canceled"; }
+    fn IsSettled(): bool   { return this._state != "pending";  }
+    fn State(): string     { return this._state; }
+    fn Value()             { return this._value; }
+    fn Id(): int           { return this.id; }
+
+    fn ToString(): string {
+        return "Promise{id=" + str(this.id) + ", state=" + this._state + "}";
+    }
+
+    // ── Settlement ────────────────────────────────────────────────────────────
+
+    fn Resolve(v) {
+        if (this._state != "pending") { return; }
+        this._state = "resolved";
+        this._value = v;
+        this._Dispatch();
+    }
+
+    fn Reject(r) {
+        if (this._state != "pending") { return; }
+        this._state = "rejected";
+        this._value = r;
+        this._Dispatch();
+    }
+
+    fn Cancel(reason) {
+        if (this._state != "pending") { return; }
+        if (reason == nil) { reason = "canceled"; }
+        this._state = "canceled";
+        this._value = reason;
+        this._Dispatch();
+    }
+
+    fn _PropagateTo(next:instance, state:string, value) {
+        if (state == "resolved") {
+            next.Resolve(value);
+        } else if (state == "canceled") {
+            next.Cancel(value);
+        } else {
+            next.Reject(value);
+        }
+    }
+
+    fn _Dispatch() {
+        let state = this._state;
+        let value = this._value;
+
+        foreach (h in this._handlers) {
+
+            if (state == "resolved") {
+                if (h.onFulfilled != nil) {
+                    try {
+                        let result = h.onFulfilled(value);
+
+                        if (h.onFinally != nil) {
+                            try {
+                                h.onFinally();
+                            } catch (e2) {
+                                h.next.Reject(e2);
+                                continue;
+                            }
+                        }
+
+                        h.next.Resolve(result);
+                    } catch (e) {
+                        h.next.Reject(e);
+                    }
+                } else {
+                    if (h.onFinally != nil) {
+                        try {
+                            h.onFinally();
+                        } catch (e) {
+                            h.next.Reject(e);
+                            continue;
+                        }
+                    }
+                    h.next.Resolve(value);
+                }
+            } else {
+                if (h.onRejected != nil) {
+                    try {
+                        let result = h.onRejected(value);
+
+                        if (h.onFinally != nil) {
+                            try {
+                                h.onFinally();
+                            } catch (e2) {
+                                h.next.Reject(e2);
+                                continue;
+                            }
+                        }
+
+                        h.next.Resolve(result);
+                    } catch (e) {
+                        h.next.Reject(e);
+                    }
+                } else {
+                    if (h.onFinally != nil) {
+                        try {
+                            h.onFinally();
+                        } catch (e) {
+                            h.next.Reject(e);
+                            continue;
+                        }
+                    }
+                    this._PropagateTo(h.next, state, value);
+                }
+            }
+        }
+
+        this._handlers = [];
+        Object.Delete(_pr_store, str(this.id));
+    }
+
+    // ── Chaining ──────────────────────────────────────────────────────────────
+
+    fn Then(onFulfilled:fn): instance {
+        let next = new Promise();
+        Array.Append(this._handlers, {
+            onFulfilled: onFulfilled,
+            onRejected: nil,
+            onFinally: nil,
+            next: next
+        });
+
+        if (this._state != "pending") { this._Dispatch(); }
+        return next;
+    }
+
+    fn Catch(onRejected:fn): instance {
+        let next = new Promise();
+        Array.Append(this._handlers, {
+            onFulfilled: nil,
+            onRejected: onRejected,
+            onFinally: nil,
+            next: next
+        });
+
+        if (this._state != "pending") { this._Dispatch(); }
+        return next;
+    }
+
+    fn ThenCatch(onFulfilled:fn, onRejected:fn): instance {
+        let next = new Promise();
+        Array.Append(this._handlers, {
+            onFulfilled: onFulfilled,
+            onRejected: onRejected,
+            onFinally: nil,
+            next: next
+        });
+
+        if (this._state != "pending") { this._Dispatch(); }
+        return next;
+    }
+
+    fn Finally(onFinally:fn): instance {
+        let next = new Promise();
+        Array.Append(this._handlers, {
+            onFulfilled: nil,
+            onRejected: nil,
+            onFinally: onFinally,
+            next: next
+        });
+
+        if (this._state != "pending") { this._Dispatch(); }
+        return next;
+    }
+
+    // ── Waiting ───────────────────────────────────────────────────────────────
+
+    fn Await() {
+        let spins = 0;
+        while (this._state == "pending") {
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+
+        if (this._state == "rejected") {
+            throw(1, str(this._value));
+        }
+
+        if (this._state == "canceled") {
+            throw(1, str(this._value));
+        }
+
+        return this._value;
+    }
+
+    fn AwaitResult(): object {
+        let spins = 0;
+        while (this._state == "pending") {
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+        return {
+            ok: this._state == "resolved",
+            state: this._state,
+            value: this._value
+        };
+    }
+
+    fn TryAwait(defaultValue) {
+        let spins = 0;
+        while (this._state == "pending") {
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+        if (this._state == "resolved") { return this._value; }
+        return defaultValue;
+    }
+
+    fn Timeout(ms:int): instance {
+        if (this._state != "pending") { return this; }
+
+        let fid = Fiber.Run(_PromiseDelayedWorker);
+        Fiber.SendMessage(Fiber.FromId(fid), {
+            id: this.id,
+            ms: ms,
+            kind: "reject",
+            value: "timeout after " + str(ms) + "ms"
+        });
+        return this;
+    }
+
+    fn CancelAfter(ms:int): instance {
+        if (this._state != "pending") { return this; }
+
+        let fid = Fiber.Run(_PromiseDelayedWorker);
+        Fiber.SendMessage(Fiber.FromId(fid), {
+            id: this.id,
+            ms: ms,
+            kind: "cancel",
+            value: "canceled after " + str(ms) + "ms"
+        });
+        return this;
+    }
+
+    fn CancelNow(): instance {
+        this.Cancel("canceled");
+        return this;
+    }
+
+    // ── Static: pre-settled promises ─────────────────────────────────────────
+
+    fn static Resolved(value): instance {
+        let p = new Promise();
+        p.Resolve(value);
+        return p;
+    }
+
+    fn static Rejected(reason): instance {
+        let p = new Promise();
+        p.Reject(reason);
+        return p;
+    }
+
+    fn static Canceled(reason): instance {
+        let p = new Promise();
+        p.Cancel(reason);
+        return p;
+    }
+
+    fn static From(value): instance {
+        return Promise.Resolved(value);
+    }
+
+    // ── Static: delayed settlement helpers ───────────────────────────────────
+
+    fn static Delay(ms:int, value): instance {
+        let p = new Promise();
+        let fid = Fiber.Run(_PromiseDelayedWorker);
+        Fiber.SendMessage(Fiber.FromId(fid), {
+            id: p.id,
+            ms: ms,
+            kind: "resolve",
+            value: value
+        });
+        return p;
+    }
+
+    fn static RejectAfter(ms:int, reason): instance {
+        let p = new Promise();
+        let fid = Fiber.Run(_PromiseDelayedWorker);
+        Fiber.SendMessage(Fiber.FromId(fid), {
+            id: p.id,
+            ms: ms,
+            kind: "reject",
+            value: reason
+        });
+        return p;
+    }
+
+    fn static CancelAfterNew(ms:int, reason): instance {
+        let p = new Promise();
+        let fid = Fiber.Run(_PromiseDelayedWorker);
+        Fiber.SendMessage(Fiber.FromId(fid), {
+            id: p.id,
+            ms: ms,
+            kind: "cancel",
+            value: reason
+        });
+        return p;
+    }
+
+    // ── Static: combinators (blocking helpers) ───────────────────────────────
+
+    fn static All(promises:array): array {
+        let spins = 0;
+        while (true) {
+            let pending = 0;
+            foreach (p in promises) {
+                if (p._state == "pending") { pending = pending + 1; }
+            }
+            if (pending == 0) { break; }
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+
+        let results = [];
+        foreach (p in promises) {
+            if (p._state == "rejected" || p._state == "canceled") {
+                throw(1, str(p._value));
+            }
+            Array.Append(results, p._value);
+        }
+        return results;
+    }
+
+    fn static Race(promises:array) {
+        let spins = 0;
+        while (true) {
+            foreach (p in promises) {
+                if (p._state != "pending") {
+                    if (p._state == "rejected" || p._state == "canceled") {
+                        throw(1, str(p._value));
+                    }
+                    return p._value;
+                }
+            }
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+    }
+
+    fn static FirstSettled(promises:array): object {
+        let spins = 0;
+        while (true) {
+            foreach (p in promises) {
+                if (p._state != "pending") {
+                    return { state: p._state, value: p._value };
+                }
+            }
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+    }
+
+    fn static AllSettled(promises:array): array {
+        let spins = 0;
+        while (true) {
+            let pending = 0;
+            foreach (p in promises) {
+                if (p._state == "pending") { pending = pending + 1; }
+            }
+            if (pending == 0) { break; }
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+
+        let results = [];
+        foreach (p in promises) {
+            Array.Append(results, { state: p._state, value: p._value });
+        }
+        return results;
+    }
+
+    fn static Any(promises:array) {
+        if (len(promises) == 0) {
+            throw(1, "Promise.Any: empty array");
+        }
+
+        let spins = 0;
+        while (true) {
+            let allSettled = true;
+            foreach (p in promises) {
+                if (p._state == "resolved") { return p._value; }
+                if (p._state == "pending")  { allSettled = false; }
+            }
+            if (allSettled) {
+                throw(1, "Promise.Any: all promises rejected or canceled");
+            }
+            spins += 1;
+            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+        }
+    }
+
+    // ── Static: fiber-based work helpers ──────────────────────────────────────
+
+    fn static Run(workFn:fn): instance {
+        let p = new Promise();
+        let fid = Fiber.Run(workFn);
+        Fiber.SendMessage(Fiber.FromId(fid), p.id);
+        return p;
+    }
+
+    fn static ReceiveId() {
+        let self = Fiber.FromId(Fiber.Id());
+        while (!Fiber.HasMessage(self)) { Fiber.Sleep(0); }
+        return Fiber.GetMessage(self);
+    }
+
+    fn static Notify(id:int, value) {
+        let p = _pr_store[str(id)];
+        if (p != nil) { p.Resolve(value); }
+    }
+
+    fn static Fail(id:int, reason) {
+        let p = _pr_store[str(id)];
+        if (p != nil) { p.Reject(reason); }
+    }
+
+    fn static CancelId(id:int, reason) {
+        let p = _pr_store[str(id)];
+        if (p != nil) { p.Cancel(reason); }
+    }
+
+    // ── Static: retry helper ──────────────────────────────────────────────────
+
+    fn static Retry(fn_:fn, maxAttempts:int, delayMs:int): instance {
+        let p   = new Promise();
+        let fid = Fiber.Run(_PromiseRetryWorker);
+        Fiber.SendMessage(Fiber.FromId(fid), {
+            id:          p.id,
+            fn_:         fn_,
+            maxAttempts: maxAttempts,
+            delayMs:     delayMs
+        });
+        return p;
+    }
+}
+
+export {Promise};

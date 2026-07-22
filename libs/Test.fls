@@ -1,0 +1,435 @@
+// Test.fls - Unit test framework for Flaris.
+// Version: 1.0
+//
+// Usage:
+//   import { Test } from library("Test", "1.0");
+//
+//   let t = Test.Suite("Math");
+//
+//   t.beforeEach(fn() { /* runs before each test */ });
+//   t.afterEach(fn()  { /* runs after each test  */ });
+//
+//   t.it("adds correctly", fn() {
+//       t.eq(1 + 1, 2);
+//       t.approxEq(0.1 + 0.2, 0.3, 1e-9);
+//   });
+//
+//   t.it("array equality", fn() {
+//       t.deepEq([1, 2, 3], [1, 2, 3]);
+//   });
+//
+//   t.it("throws on bad input", fn() {
+//       t.throws(fn() { throw 1, "bad"; });
+//       t.throwsCode(fn() { throw 42, "msg"; }, 42);
+//   });
+//
+//   t.skip("not ready yet", fn() { ... });   // counts as skipped, not failed
+//
+//   return t.run();       // prints results; returns 0 (pass) or 1 (fail)
+//
+//   // Multiple suites:
+//   return Test.RunAll([t1, t2, t3]);   // aggregate exit code
+//
+// Suite lifecycle:
+//   Test.Suite(name)       →  Test instance
+//   .beforeEach(fn())      - run before every test in this suite
+//   .afterEach(fn())       - run after every test in this suite
+//   .it(label, fn())       - register a test case
+//   .skip(label, fn())     - register but skip (marked in output, not failed)
+//   .run()                 →  int  (0 = all passed, 1 = any failed)
+//   Test.RunAll(suites)    →  int  (0 = all passed, 1 = any failed)
+//
+// Assertions (all accept an optional label as last argument):
+//   t.eq(a, b)             - a == b
+//   t.neq(a, b)            - a != b
+//   t.ok(val)              - val is truthy
+//   t.notOk(val)           - val is falsy
+//   t.isNil(val)           - val == nil
+//   t.notNil(val)          - val != nil
+//   t.gt(a, b)             - a > b
+//   t.gte(a, b)            - a >= b
+//   t.lt(a, b)             - a < b
+//   t.lte(a, b)            - a <= b
+//   t.approxEq(a, b, eps)  - |a - b| < eps  (for float comparisons)
+//   t.deepEq(a, b)         - deep structural equality (objects, arrays, scalars)
+//   t.contains(haystack, needle)  - string substring or array element check
+//   t.startsWith(s, prefix)
+//   t.endsWith(s, suffix)
+//   t.matches(s, pattern)  - regex match
+//   t.throws(fn())         - fn must throw any exception
+//   t.throwsCode(fn(), code)  - fn must throw with the given error code
+//   t.notThrows(fn())      - fn must not throw
+
+// Unique error code used by _fail so run() can distinguish assertion
+// failures (expected) from unexpected runtime errors in test bodies.
+const _TEST_FAIL_CODE = 241;
+
+class Test {
+
+    let name:     string = "Tests";
+    let _tests:   array  = [];
+    let _before:  array  = [];
+    let _after:   array  = [];
+    let _passed:  int    = 0;
+    let _failed:  int    = 0;
+    let _skipped: int    = 0;
+
+    // ── Factory ───────────────────────────────────────────────────────────────
+
+    fn static Suite(suiteName) {
+        let t     = new Test();
+        t.name    = str(suiteName);
+        t._tests  = [];
+        t._before = [];
+        t._after  = [];
+        return t;
+    }
+
+    // ── Hooks ─────────────────────────────────────────────────────────────────
+
+    fn beforeEach(f: fn) {
+        this._before = Array.Append(this._before, f);
+    }
+
+    fn afterEach(f: fn) {
+        this._after = Array.Append(this._after, f);
+    }
+
+    // ── Test registration ─────────────────────────────────────────────────────
+
+    fn it(label: string, f: fn) {
+        this._tests = Array.Append(this._tests, { label: label, func: f, skipped: false });
+    }
+
+    fn skip(label: string, _f) {
+        this._tests = Array.Append(this._tests, { label: label, func: nil, skipped: true });
+    }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    fn _fail(msg: string) {
+        throw(_TEST_FAIL_CODE, msg);
+    }
+
+    // ── Assertions ────────────────────────────────────────────────────────────
+
+    fn eq(a, b, label) {
+        if (a != b) {
+            let m = "eq: expected=" + str(b) + " got=" + str(a);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn neq(a, b, label) {
+        if (a == b) {
+            let m = "neq: both=" + str(a);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn ok(val, label) {
+        if (!val) {
+            let m = "ok: expected truthy, got " + str(val);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn notOk(val, label) {
+        if (val) {
+            let m = "notOk: expected falsy, got " + str(val);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn isNil(val, label) {
+        if (val != nil) {
+            let m = "isNil: expected nil, got " + str(val);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn notNil(val, label) {
+        if (val == nil) {
+            let m = "notNil: got nil";
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn gt(a, b, label) {
+        if (!(a > b)) {
+            let m = "gt: " + str(a) + " not > " + str(b);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn gte(a, b, label) {
+        if (!(a >= b)) {
+            let m = "gte: " + str(a) + " not >= " + str(b);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn lt(a, b, label) {
+        if (!(a < b)) {
+            let m = "lt: " + str(a) + " not < " + str(b);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn lte(a, b, label) {
+        if (!(a <= b)) {
+            let m = "lte: " + str(a) + " not <= " + str(b);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn approxEq(a: float, b: float, eps, label) {
+        let e = (eps == nil) ? 1e-9 : float(eps);
+        var diff = a - b;
+        if (diff < 0.0) diff = 0.0 - diff;
+        if (diff > e) {
+            let m = "approxEq: |" + str(a) + " - " + str(b) + "| = " + str(diff) + " > eps=" + str(e);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn contains(haystack, needle, label) {
+        if (!String.Contains(str(haystack), str(needle))) {
+            let m = "contains: \"" + str(needle) + "\" not in \"" + str(haystack) + "\"";
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn startsWith(s, prefix, label) {
+        if (!String.StartsWith(str(s), str(prefix))) {
+            let m = "startsWith: \"" + str(s) + "\" does not start with \"" + str(prefix) + "\"";
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn endsWith(s, suffix, label) {
+        if (!String.EndsWith(str(s), str(suffix))) {
+            let m = "endsWith: \"" + str(s) + "\" does not end with \"" + str(suffix) + "\"";
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn matches(s, pattern: string, label) {
+        if (!Regex.IsMatch(str(s), pattern)) {
+            let m = "matches: \"" + str(s) + "\" did not match /" + pattern + "/";
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    // Structural (deep) equality for arrays and primitives.
+    // Uses len() + indexing to detect arrays; falls back to == for scalars.
+    fn deepEq(a, b, label) {
+        if (!this._deepEqual(a, b)) {
+            let m = "deepEq: expected " + str(b) + " got " + str(a);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn _deepEqual(a, b) : bool {
+        if (a == b) return true;
+        if (a == nil || b == nil) return false;
+        var na = -1;
+        var nb = -1;
+        try { na = len(a); } catch (_e) { na = -1; }
+        try { nb = len(b); } catch (_e) { nb = -1; }
+        // len() returns 0 for non-array types (int, float, bool).
+        // Use the string representation to distinguish: arrays stringify as "[…]".
+        if (na == 0 && !String.StartsWith(str(a), "[")) na = -1;
+        if (nb == 0 && !String.StartsWith(str(b), "[")) nb = -1;
+        if (na < 0 || nb < 0) return false;
+        if (na != nb) return false;
+        iter (i from 0 to na - 1) {
+            if (!this._deepEqual(a[i], b[i])) return false;
+        }
+        return true;
+    }
+
+    fn throws(f, label) {
+        var threw = false;
+        try {
+            f();
+        } catch (e) {
+            threw = true;
+        }
+        if (!threw) {
+            let m = "throws: no exception was raised";
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    // Assert that f() throws with a specific error code.
+    fn throwsCode(f, code, label) {
+        var threw = false;
+        var actualCode = nil;
+        try {
+            f();
+        } catch (e) {
+            threw = true;
+            actualCode = e.Code;
+        }
+        if (!threw) {
+            let m = "throwsCode: no exception was raised";
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+        if (threw && actualCode != code) {
+            let m = "throwsCode: expected code=" + str(code) + " got=" + str(actualCode);
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    fn notThrows(f, label) {
+        var caught = nil;
+        try {
+            f();
+        } catch (e) {
+            caught = str(e.Error);
+        }
+        if (caught != nil) {
+            let m = "notThrows: raised " + caught;
+            if (label != nil) m = label + ": " + m;
+            this._fail(m);
+        }
+    }
+
+    // ── Runner ────────────────────────────────────────────────────────────────
+
+    fn run(): int {
+        Console.SetColor(33);
+        Console.Write("▶ ");
+        Console.SetColor(0);
+        Console.WriteLine(this.name);
+
+        let n    = len(this._tests);
+        this._passed  = 0;
+        this._failed  = 0;
+        this._skipped = 0;
+
+        iter (i from 0 to n - 1) {
+            let entry = this._tests[i];
+
+            if (entry.skipped == true) {
+                this._skipped += 1;
+                Console.SetColor(33);
+                Console.Write("  ◌ ");
+                Console.SetColor(0);
+                Console.WriteLine(entry.label);
+            } else {
+                // beforeEach hooks
+                iter (bi from 0 to len(this._before) - 1) {
+                    try { this._before[bi](); } catch (_e) { _e = nil; }
+                }
+
+                var passed = true;
+                var reason = "";
+                var isError = false;
+
+                try {
+                    entry.func();
+                } catch (e) {
+                    passed = false;
+                    if (e.Code == _TEST_FAIL_CODE) {
+                        reason = str(e.Error);
+                    } else {
+                        reason = "ERROR [" + str(e.Code) + "]: " + str(e.Error);
+                        isError = true;
+                    }
+                }
+
+                // afterEach hooks (run even on failure)
+                iter (ai from 0 to len(this._after) - 1) {
+                    try { this._after[ai](); } catch (_e) { _e = nil; }
+                }
+
+                if (passed) {
+                    this._passed += 1;
+                    Console.SetColor(32);
+                    Console.Write("  ✓ ");
+                    Console.SetColor(0);
+                    Console.WriteLine(entry.label);
+                } else {
+                    this._failed += 1;
+                    Console.SetColor(31);
+                    Console.Write(isError ? "  ! " : "  ✗ ");
+                    Console.SetColor(0);
+                    Console.Write(entry.label);
+                    Console.SetColor(90);
+                    Console.WriteLine("  - " + reason);
+                    Console.SetColor(0);
+                }
+            }
+        }
+
+        Console.WriteLine("");
+        if (this._failed == 0 && this._skipped == 0) {
+            Console.SetColor(32);
+            Console.WriteLine("  " + str(n) + " passed");
+        } else {
+            Console.Write("  ");
+            Console.SetColor(32);
+            Console.Write(str(this._passed) + " passed");
+            Console.SetColor(0);
+            if (this._skipped > 0) {
+                Console.Write("  ");
+                Console.SetColor(33);
+                Console.Write(str(this._skipped) + " skipped");
+                Console.SetColor(0);
+            }
+            if (this._failed > 0) {
+                Console.Write("  ");
+                Console.SetColor(31);
+                Console.Write(str(this._failed) + " failed");
+                Console.SetColor(0);
+            }
+            Console.WriteLine("");
+        }
+        Console.SetColor(0);
+        Console.WriteLine("");
+
+        // Break the t→closure→t reference cycle so the GC can collect normally.
+        this._tests  = [];
+        this._before = [];
+        this._after  = [];
+
+        return this._failed;
+    }
+
+    // Run an array of suites and print an aggregate summary.
+    fn static RunAll(suites) : int {
+        var total = 0;
+        iter (i from 0 to len(suites) - 1) {
+            total += suites[i].run();
+        }
+        let col = (total == 0) ? 32 : 31;
+        Console.SetColor(col);
+        let msg = (total == 0) ? "all passed" : str(total) + " failed";
+        Console.WriteLine("══ " + str(len(suites)) + " suite(s): " + msg);
+        Console.SetColor(0);
+        return total;
+    }
+}
+
+export { Test };

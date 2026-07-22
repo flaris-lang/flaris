@@ -1,0 +1,557 @@
+// test_audio.fls
+// Tests for Audio.fls - covers all sections and exercises inheritance.
+//
+// Run:  flarisvm test_audio.fls
+
+import { Audio } from library("Audio", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg, "  expected=", expected, "  got=", actual);
+    }
+}
+
+fn checkApprox(actual, expected, msg) {
+    testsRun += 1;
+    if (!(actual ≈ expected)) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL (approx):", msg, "  expected≈", expected, "  got=", actual);
+    }
+}
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn checkRange(actual, lo, hi, msg) {
+    testsRun += 1;
+    if (actual < lo || actual > hi) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL (range):", msg, "  expected [", lo, "..", hi, "]  got=", actual);
+    }
+}
+
+// ============================================================
+//  1. Inheritance
+// ============================================================
+fn test_inheritance(a) {
+    Console.WriteLine("== Inheritance ==");
+
+    check(Class.InstanceOf(a, Audio), "a instanceof Audio");
+    // Note: Signals not in scope here - inherited methods prove the chain.
+
+    let wave = a.Sine(64, 440.0, 44100.0, 1.0, 0.0);
+    check(len(wave) == 64, "Sine (inherited) returns 64 samples");
+    check(a.RMS(wave) > 0.0, "RMS (inherited) > 0 on sine");
+
+    let win = a.Hann(64);
+    check(len(win) == 64, "Hann (inherited) returns 64 samples");
+    checkApprox(win[0], 0.0, "Hann[0] == 0");
+
+    // LowPass: (signal, cutoff, sampleRate, q)
+    let filtered = a.LowPass(wave, 1000.0, 44100.0, 0.707);
+    check(len(filtered) == 64, "LowPass (inherited) preserves length");
+}
+
+// ============================================================
+//  2. Envelope
+// ============================================================
+fn test_envelope(a) {
+    Console.WriteLine("== Envelope ==");
+
+    let sr = 44100.0;
+    let n  = 44100;
+
+    let env = a.ADSR(n, sr, 0.01, 0.1, 0.7, 0.2);
+    checkEq(len(env), n, "ADSR length == n");
+    checkApprox(env[0], 0.0, "ADSR starts at 0");
+
+    let attackEnd  = int(0.01 * sr);
+    checkRange(env[attackEnd], 0.95, 1.0, "ADSR peak near 1.0 after attack");
+
+    let sustainMid = attackEnd + int(0.1 * sr) + int(0.3 * sr);
+    checkRange(env[sustainMid], 0.65, 0.75, "ADSR sustain ≈ 0.7");
+
+    checkRange(env[n-1], 0.0, 0.05, "ADSR ends near 0");
+
+    let sig    = a.Sine(n, 440.0, sr, 1.0, 0.0);
+    let shaped = a.ApplyEnvelope(sig, env);
+    checkEq(len(shaped), n, "ApplyEnvelope preserves length");
+    check(a.Energy(shaped) < a.Energy(sig), "ApplyEnvelope reduces energy");
+
+    let fi = a.FadeIn(sig, 1000);
+    checkApprox(fi[0], 0.0, "FadeIn first sample = 0");
+    check(Math.AbsF(fi[500]) > Math.AbsF(fi[0]), "FadeIn ramps up");
+
+    // FadeOut: (i+1)/n formula guarantees last sample = 0
+    let fo = a.FadeOut(sig, 1000);
+    checkApprox(fo[n-1], 0.0, "FadeOut last sample = 0");
+}
+
+// ============================================================
+//  3. Gain & Dynamics
+// ============================================================
+fn test_gain_dynamics(a) {
+    Console.WriteLine("== Gain & Dynamics ==");
+
+    let sig = a.Sine(1024, 440.0, 44100.0, 0.5, 0.0);
+
+    checkRange(a.Peak(a.Gain(sig, 6.0206)),  0.95, 1.05, "+6dB peak ≈ 1.0");
+    checkRange(a.Peak(a.Gain(sig, -6.0206)), 0.23, 0.27, "-6dB peak ≈ 0.25");
+    checkApprox(a.Peak(a.Gain(sig, 0.0)), a.Peak(sig), "0dB gain unchanged");
+
+    let loud    = a.Gain(sig, 20.0);
+    let clipped = a.Clip(loud, 0.8);
+    check(a.Peak(clipped) <= 0.8, "Clip: peak <= threshold");
+
+    let comp = a.Compress(loud, 44100.0, 0.5, 4.0, 0.005, 0.1);
+    check(a.Peak(comp) < a.Peak(loud), "Compress reduces peak");
+    checkEq(len(comp), len(loud), "Compress preserves length");
+}
+
+// ============================================================
+//  4. Stereo
+// ============================================================
+fn test_stereo(a) {
+    Console.WriteLine("== Stereo ==");
+
+    let L = a.Sine(512, 440.0, 44100.0, 1.0, 0.0);
+    let R = a.Sine(512, 880.0, 44100.0, 0.5, 0.0);
+
+    let stereo = a.Interleave(L, R);
+    checkEq(len(stereo), 1024, "Interleave: length = 2 × mono");
+    checkApprox(stereo[0], L[0], "Interleave: first sample = L[0]");
+    checkApprox(stereo[1], R[0], "Interleave: second sample = R[0]");
+
+    let split = a.Deinterleave(stereo);
+    checkEq(len(split.left),  512, "Deinterleave: left length");
+    checkEq(len(split.right), 512, "Deinterleave: right length");
+    checkApprox(split.left[10],  L[10], "Deinterleave: left matches original");
+    checkApprox(split.right[10], R[10], "Deinterleave: right matches original");
+
+    let mono   = a.Sine(512, 440.0, 44100.0, 1.0, 0.0);
+    let panned = a.Pan(mono, 0.0);
+    checkRange(a.Peak(panned.left),  0.69, 0.72, "Pan(0): left ≈ √0.5");
+    checkRange(a.Peak(panned.right), 0.69, 0.72, "Pan(0): right ≈ √0.5");
+
+    let panL = a.Pan(mono, -1.0);
+    check(a.Peak(panL.left) > a.Peak(panL.right), "Pan(-1): left > right");
+    checkRange(a.Peak(panL.right), 0.0, 0.0001, "Pan(-1): right ≈ 0");
+
+    let panR = a.Pan(mono, 1.0);
+    check(a.Peak(panR.right) > a.Peak(panR.left), "Pan(+1): right > left");
+    checkRange(a.Peak(panR.left), 0.0, 0.0001, "Pan(+1): left ≈ 0");
+}
+
+// ============================================================
+//  5. Pitch
+// ============================================================
+fn test_pitch(a) {
+    Console.WriteLine("== Pitch ==");
+
+    checkApprox(a.MidiToHz(69), 440.0,    "A4 = 440 Hz");
+    checkApprox(a.MidiToHz(60), 261.6256, "C4 ≈ 261.63 Hz");
+    checkApprox(a.MidiToHz(57), 220.0,    "A3 = 220 Hz");
+
+    checkEq(a.HzToMidi(440.0),  69, "440 Hz = MIDI 69");
+    checkEq(a.HzToMidi(220.0),  57, "220 Hz = MIDI 57");
+    checkEq(a.HzToMidi(261.63), 60, "261.63 Hz ≈ MIDI 60");
+
+    checkApprox(a.NoteToHz("A4"),  440.0,    "A4 - 440 Hz");
+    checkApprox(a.NoteToHz("A3"),  220.0,    "A3 - 220 Hz");
+    checkApprox(a.NoteToHz("C4"),  261.6256, "C4 - 261.63 Hz");
+    checkApprox(a.NoteToHz("C#4"), 277.1826, "C#4 - 277.18 Hz");
+    check(a.NoteToHz("X9") == 0.0, "invalid note - 0");
+
+    let tone440 = a.Sine(4096, 440.0, 44100.0, 1.0, 0.0);
+    checkRange(a.PitchDetect(tone440, 44100.0, 80.0, 1200.0), 435.0, 445.0,
+               "PitchDetect 440 Hz ±5 Hz");
+
+    let tone220 = a.Sine(4096, 220.0, 44100.0, 1.0, 0.0);
+    checkRange(a.PitchDetect(tone220, 44100.0, 80.0, 500.0), 215.0, 225.0,
+               "PitchDetect 220 Hz ±5 Hz");
+}
+
+// ============================================================
+//  6. Spectral
+// ============================================================
+fn test_spectral(a) {
+    Console.WriteLine("== Spectral ==");
+
+    let tone = a.Sine(4096, 440.0, 44100.0, 1.0, 0.0);
+
+    checkRange(a.DominantFrequency(tone, 44100.0), 420.0, 460.0,
+               "DominantFrequency 440 Hz ±20 Hz");
+
+    let spec = a.Spectrum(tone);
+    checkEq(len(spec), 2048, "Spectrum: length = n/2");
+
+    Console.WriteLine("Spectrum bins:");
+    let peakDb = Math.MaxOf(spec);
+    check(peakDb > 0.0, "Spectrum: peak bin > 0 dB");
+    check(spec[0] < peakDb, "Spectrum: DC bin < signal peak");
+}
+
+// ============================================================
+//  7. Utility  (Normalize, StereoToMono, Mix)
+// ============================================================
+fn test_utility(a) {
+    Console.WriteLine("== Utility ==");
+
+    // Normalize: peak should be 1.0 after normalization.
+    let sig = a.Sine(256, 440.0, 44100.0, 0.3, 0.0);
+    let normed = a.Normalize(sig);
+    checkEq(len(normed), 256, "Normalize: length preserved");
+    checkRange(a.Peak(normed), 0.999, 1.001, "Normalize: peak = 1.0");
+
+    // Normalize on silence should not crash and return same-length array.
+    let silSig = a.Silence(32);
+    let normSil = a.Normalize(silSig);
+    checkEq(len(normSil), 32, "Normalize silence: length preserved");
+    checkApprox(a.RMS(normSil), 0.0, "Normalize silence: still silent");
+
+    // StereoToMono: average of left and right channels.
+    let left  = a.Sine(128, 440.0, 44100.0, 0.8, 0.0);
+    let right = a.Sine(128, 440.0, 44100.0, 0.4, 0.0);
+    let mono  = a.StereoToMono(left, right);
+    checkEq(len(mono), 128, "StereoToMono: length = min(L, R)");
+    checkApprox(mono[0], (left[0] + right[0]) * 0.5, "StereoToMono[0] = avg(L,R)");
+    checkApprox(mono[64], (left[64] + right[64]) * 0.5, "StereoToMono[64] = avg(L,R)");
+
+    // StereoToMono with mismatched lengths: result = min(len(L),len(R)).
+    let longL  = a.Sine(200, 440.0, 44100.0, 1.0, 0.0);
+    let shortR = a.Sine(100, 440.0, 44100.0, 1.0, 0.0);
+    let monoMix = a.StereoToMono(longL, shortR);
+    checkEq(len(monoMix), 100, "StereoToMono: clamps to shorter channel");
+
+    // Mix(a, b, weight): blends with weight towards b.
+    let s1  = a.Silence(64);          // all 0.0
+    let s2  = a.Sine(64, 440.0, 44100.0, 1.0, 0.0);
+
+    let mix0 = a.Mix(s1, s2, 0.0);   // weight 0 -> all s1 (silence)
+    checkEq(len(mix0), 64, "Mix(w=0): length preserved");
+    checkApprox(a.RMS(mix0), 0.0, "Mix(w=0): result = s1 (silence)");
+
+    let mix1 = a.Mix(s1, s2, 1.0);   // weight 1 -> all s2
+    checkEq(len(mix1), 64, "Mix(w=1): length preserved");
+    checkApprox(a.RMS(mix1), a.RMS(s2), "Mix(w=1): result = s2");
+
+    let mixH = a.Mix(s1, s2, 0.5);   // weight 0.5 -> half of s2
+    checkEq(len(mixH), 64, "Mix(w=0.5): length preserved");
+    checkRange(a.RMS(mixH), a.RMS(s2) * 0.45, a.RMS(s2) * 0.55, "Mix(w=0.5): RMS ≈ half of s2");
+
+    // Mix clips to shorter length.
+    let longSig  = a.Sine(200, 440.0, 44100.0, 1.0, 0.0);
+    let shortSig = a.Sine(100, 880.0, 44100.0, 1.0, 0.0);
+    let mixLen = a.Mix(longSig, shortSig, 0.5);
+    checkEq(len(mixLen), 100, "Mix: result length = min(a,b)");
+}
+
+// ============================================================
+//  8. Editing
+// ============================================================
+fn test_editing(a) {
+    Console.WriteLine("== Editing ==");
+
+    let s1 = a.Sine(100, 440.0, 44100.0, 1.0, 0.0);
+    let s2 = a.Sine(200, 880.0, 44100.0, 0.5, 0.0);
+
+    let cat = a.Concat(s1, s2);
+    checkEq(len(cat), 300, "Concat: length = 100 + 200");
+    checkApprox(cat[0],   s1[0], "Concat: first sample = s1[0]");
+    checkApprox(cat[100], s2[0], "Concat: seam sample = s2[0]");
+
+    let trimmed = a.Trim(s1, 10, 20);
+    checkEq(len(trimmed), 20, "Trim: returns 20 samples");
+    checkApprox(trimmed[0], s1[10], "Trim: starts at offset");
+
+    // Trim past end clamps - Subset(s1, 90, 10) = 10 samples
+    let clamped = a.Trim(s1, 90, 50);
+    checkEq(len(clamped), 10, "Trim: clamps at signal end");
+
+    let rep = a.Repeat(s1, 3);
+    checkEq(len(rep), 300, "Repeat ×3: length = 300");
+    checkApprox(rep[100], s1[0], "Repeat: second copy at index 100");
+    checkApprox(rep[200], s1[0], "Repeat: third copy at index 200");
+
+    let sil = a.Silence(256);
+    checkEq(len(sil), 256, "Silence: correct length");
+    checkApprox(sil[0],   0.0, "Silence: first = 0");
+    checkApprox(sil[255], 0.0, "Silence: last = 0");
+    checkApprox(a.RMS(sil), 0.0, "Silence: RMS = 0");
+}
+
+// ============================================================
+//  8. WAV I/O roundtrip
+// ============================================================
+fn test_wav_io(a) {
+    Console.WriteLine("== WAV I/O ==");
+
+    let sr   = 44100;
+    let tone = a.Sine(sr, 440.0, float(sr), 0.8, 0.0);
+    let path = "/tmp/test_audio_roundtrip.wav";
+
+    let ok = a.WriteWav(path, tone, sr);
+    check(ok, "WriteWav returns true");
+    check(File.Exists(path), "WAV file exists after write");
+    checkEq(File.Size(path), 44 + sr * 2, "WAV file size correct");
+
+    let loaded = a.ReadWav(path);
+    check(loaded != nil, "ReadWav returns non-nil");
+    checkEq(loaded.sampleRate, sr, "ReadWav: sampleRate preserved");
+    checkEq(len(loaded.signal), sr, "ReadWav: sample count preserved");
+    checkRange(a.Peak(loaded.signal), 0.799, 0.801,
+               "ReadWav: peak ≈ 0.8 after 16-bit roundtrip");
+
+    let slice = a.Trim(loaded.signal, 0, 4096);
+    checkRange(a.DominantFrequency(slice, float(sr)), 430.0, 450.0,
+               "ReadWav: DominantFrequency ≈ 440 Hz");
+
+    File.Delete(path);
+    check(!File.Exists(path), "WAV file cleaned up");
+}
+
+// ============================================================
+//  Benchmarks
+// ============================================================
+fn bench_audio(a) {
+    let SR    = 44100.0;
+    let sig64   = a.Sine(64,    440.0, SR, 1.0, 0.0);
+    let sig1K   = a.Sine(1024,  440.0, SR, 1.0, 0.0);
+    let sig44k  = a.Sine(44100, 440.0, SR, 1.0, 0.0);
+    let sig4096 = a.Sine(4096,  440.0, SR, 1.0, 0.0);
+    let path    = "/tmp/_bench_audio.wav";
+
+    Console.WriteLine("\n\n=== Audio Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Signal generation ]");
+    bench("Sine  (1024 samples)", fn() {
+        let s = a.Sine(1024, 440.0, SR, 1.0, 0.0); _sink += 1;
+    }, 1000);
+    bench("Sine  (44100 samples)", fn() {
+        let s = a.Sine(44100, 440.0, SR, 1.0, 0.0); _sink += 1;
+    }, 20);
+    bench("Noise  (1024 samples)", fn() {
+        let s = a.Noise(1024, 1.0); _sink += 1;
+    }, 1000);
+
+    Console.WriteLine("\n[ Windows & statistics ]");
+    bench("Hann  (1024)", fn() {
+        let w = a.Hann(1024); _sink += 1;
+    }, 2000);
+    bench("RMS  (1024 samples)", fn() {
+        let v = a.RMS(sig1K); _sink += 1;
+    }, 5000);
+    bench("Peak  (1024 samples)", fn() {
+        let v = a.Peak(sig1K); _sink += 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ Filters ]");
+    bench("LowPass  (1024 samples)", fn() {
+        let s = a.LowPass(sig1K, 1000.0, SR, 0.707); _sink += 1;
+    }, 500);
+    bench("LowPass  (44100 samples)", fn() {
+        let s = a.LowPass(sig44k, 1000.0, SR, 0.707); _sink += 1;
+    }, 10);
+    bench("Compress  (1024 samples)", fn() {
+        let s = a.Compress(sig1K, SR, 0.5, 4.0, 0.005, 0.1); _sink += 1;
+    }, 500);
+
+    Console.WriteLine("\n[ Spectral ]");
+    bench("FFT  (1024 samples)", fn() {
+        let s = a.FFT(sig1K); _sink += 1;
+    }, 200);
+    bench("FFT  (4096 samples)", fn() {
+        let s = a.FFT(sig4096); _sink += 1;
+    }, 50);
+    bench("Magnitude  (1024 bins)", fn() {
+        let spec = a.FFT(sig1K);
+        let m = a.Magnitude(spec); _sink += 1;
+    }, 200);
+    bench("DominantFrequency  (4096 samples)", fn() {
+        let f = a.DominantFrequency(sig4096, SR); _sink += 1;
+    }, 10);
+
+    Console.WriteLine("\n[ Pitch ]");
+    bench("PitchDetect  (4096 samples, 80-1200 Hz)", fn() {
+        let f = a.PitchDetect(sig4096, SR, 80.0, 1200.0); _sink += 1;
+    }, 5);
+    bench("MidiToHz  (×1000)", fn() {
+        iter (i from 0 to 999) { let f = a.MidiToHz(60 + (i & 63)); }
+        _sink += 1;
+    }, 200);
+    bench("NoteToHz  (×100)", fn() {
+        iter (i from 0 to 99) { let f = a.NoteToHz("A4"); }
+        _sink += 1;
+    }, 200);
+
+    Console.WriteLine("\n[ Editing ]");
+    bench("Concat  (100 + 200 samples)", fn() {
+        let s = a.Concat(a.Trim(sig1K, 0, 100), a.Trim(sig1K, 0, 200)); _sink += 1;
+    }, 5000);
+    bench("Repeat  (1024 samples × 3)", fn() {
+        let s = a.Repeat(sig1K, 3); _sink += 1;
+    }, 1000);
+
+    let adsr_n    = 44100;
+    let adsr_sr   = 44100.0;
+    let adsr_runs = 5;
+    let adsr_t0   = Time.Ticks();
+    iter (_ai from 0 to adsr_runs-1) {
+        let e = a.ADSR(adsr_n, adsr_sr, 0.01, 0.1, 0.7, 0.2); _sink += 1;
+    }
+    let adsr_dt = Time.Ticks() - adsr_t0;
+    let adsr_ms = Time.TicksToMs(adsr_dt);
+    let adsr_us = Time.TicksToUs(adsr_dt) / float(adsr_runs);
+    Console.WriteLine(
+        String.PadRight("ADSR  (44100 samples, SR=44100)", 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [adsr_ms]),  9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [adsr_us]), 11), " µs/call"
+    );
+
+    Console.WriteLine("\n[ WAV I/O ]");
+    a.WriteWav(path, sig44k, 44100);  // ensure file exists for read bench
+    bench("WriteWav  (44100 samples, 16-bit PCM)", fn() {
+        a.WriteWav(path, sig44k, 44100); _sink += 1;
+    }, 5);
+    bench("ReadWav  (44100 samples)", fn() {
+        let r = a.ReadWav(path); _sink += 1;
+    }, 5);
+    File.Delete(path);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+}
+
+// ============================================================
+//  Run all
+// ============================================================
+fn Main() {
+    let a = new Audio();
+
+    test_inheritance(a);
+    test_envelope(a);
+    test_gain_dynamics(a);
+    test_stereo(a);
+    test_pitch(a);
+    test_spectral(a);
+    test_utility(a);
+    test_editing(a);
+    test_wav_io(a);
+
+    // ============================================================
+    //  9. Additional Normalize / StereoToMono / Mix inline tests
+    // ============================================================
+
+    Console.WriteLine("== Normalize / StereoToMono / Mix (inline) ==");
+
+    // --- Normalize ---
+
+    // Peak-normalising a sine with amplitude 0.5 should give peak = 1.0.
+    let normIn = a.Sine(512, 440.0, 44100.0, 0.5, 0.0);
+    let normOut = a.Normalize(normIn);
+    checkEq(len(normOut), 512, "Normalize inline: length preserved");
+    checkRange(a.Peak(normOut), 0.999, 1.001, "Normalize inline: peak = 1.0");
+
+    // Normalise a signal with mixed +/- values; the loudest absolute value wins.
+    let normAsym = a.Normalize([-2.0, 1.0, 0.5]);
+    checkRange(normAsym[0], -1.001, -0.999, "Normalize asymmetric: most-neg -> -1");
+    checkRange(normAsym[1],  0.499,  0.501, "Normalize asymmetric: 1.0/2 = 0.5");
+
+    // Silence in -> silence out, same length.
+    let normSilIn = a.Silence(16);
+    let normSilOut = a.Normalize(normSilIn);
+    checkEq(len(normSilOut), 16, "Normalize silence: length unchanged");
+    checkApprox(a.RMS(normSilOut), 0.0, "Normalize silence: RMS still 0");
+
+    // --- StereoToMono ---
+
+    // Equal channels: mono = each channel value (average of identical values).
+    let monoEqL = a.Sine(64, 440.0, 44100.0, 1.0, 0.0);
+    let monoEqR = a.Sine(64, 440.0, 44100.0, 1.0, 0.0);
+    let monoEq  = a.StereoToMono(monoEqL, monoEqR);
+    checkEq(len(monoEq), 64, "StereoToMono equal ch: length");
+    checkApprox(monoEq[10], monoEqL[10], "StereoToMono equal ch: value = channel value");
+
+    // Opposite-phase channels: mono should be near-silence.
+    let monoPhsL = a.Sine(128, 440.0, 44100.0,  1.0, 0.0);
+    let monoPhsR = a.Sine(128, 440.0, 44100.0, -1.0, 0.0);
+    let monoPhs  = a.StereoToMono(monoPhsL, monoPhsR);
+    checkEq(len(monoPhs), 128, "StereoToMono anti-phase: length");
+    checkApprox(a.RMS(monoPhs), 0.0, "StereoToMono anti-phase: RMS ≈ 0");
+
+    // Mismatched lengths: result clamps to shorter.
+    let monoLongL  = a.Sine(200, 440.0, 44100.0, 1.0, 0.0);
+    let monoShortR = a.Sine(80,  440.0, 44100.0, 1.0, 0.0);
+    let monoMixed  = a.StereoToMono(monoLongL, monoShortR);
+    checkEq(len(monoMixed), 80, "StereoToMono mismatched: clamps to shorter");
+
+    // --- Mix ---
+
+    // weight=0 -> result equals a.
+    let mixA = a.Sine(64, 220.0, 44100.0, 0.8, 0.0);
+    let mixB = a.Sine(64, 880.0, 44100.0, 0.4, 0.0);
+    let mix0 = a.Mix(mixA, mixB, 0.0);
+    checkEq(len(mix0), 64, "Mix w=0: length");
+    checkApprox(mix0[20], mixA[20], "Mix w=0: sample == a[i]");
+
+    // weight=1 -> result equals b.
+    let mix1 = a.Mix(mixA, mixB, 1.0);
+    checkEq(len(mix1), 64, "Mix w=1: length");
+    checkApprox(mix1[20], mixB[20], "Mix w=1: sample == b[i]");
+
+    // weight=0.5 -> result is midpoint of a and b.
+    let mix5 = a.Mix(mixA, mixB, 0.5);
+    checkApprox(mix5[20], (mixA[20] + mixB[20]) * 0.5, "Mix w=0.5: sample = midpoint(a,b)");
+
+    // Mixing silence with a signal at weight=0.5 halves the amplitude.
+    let mixSilA = a.Silence(64);
+    let mixSilB = a.Sine(64, 440.0, 44100.0, 1.0, 0.0);
+    let mixSil  = a.Mix(mixSilA, mixSilB, 0.5);
+    checkRange(a.Peak(mixSil), 0.49, 0.51, "Mix silence+sine w=0.5: peak ≈ 0.5");
+
+    // Mismatched lengths clip to shorter.
+    let mixLong  = a.Sine(200, 440.0, 44100.0, 1.0, 0.0);
+    let mixShort = a.Sine(80,  880.0, 44100.0, 1.0, 0.0);
+    let mixLen   = a.Mix(mixLong, mixShort, 0.5);
+    checkEq(len(mixLen), 80, "Mix mismatched: result length = shorter");
+
+    Console.WriteLine("");
+    if (testsFailed == 0) {
+        Console.Ok("All ", testsRun, " tests passed.");
+    } else {
+        Console.WriteLine(testsFailed, " / ", testsRun, "tests FAILED.");
+    }
+
+    bench_audio(a);
+
+    return testsFailed == 0 ? 0 : 1;
+}

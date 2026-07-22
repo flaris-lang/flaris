@@ -1,0 +1,949 @@
+// test_binary_io.fls  v2.0
+// Run: flarisvm test_binary_io.fls
+
+import { BinaryWriter, BinaryReader, BinaryStreamWriter, BinaryStreamReader, BinaryFileWriter, BinaryFileReader } from library("BinaryIO", "1.0");
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+global _bw:instance  = nil;
+global _br:instance  = nil;
+global BATCH:int = 1000;
+
+fn check(label, got, expected) {
+    if (got == expected) {
+        Console.WriteLine("[PASS] ", label);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] ", label, " - got: ", got, " expected: ", expected);
+        failed += 1;
+    }
+}
+
+// =============================================================================
+// 1.0 compatibility tests
+// =============================================================================
+
+fn test_u8_i8_bool() {
+    let w = new BinaryWriter(nil);
+    w.WriteU8(0);
+    w.WriteU8(255);
+    w.WriteU8(127);
+    w.WriteBool(true);
+    w.WriteBool(false);
+    w.WriteI8(-1);
+    w.WriteI8(-128);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("U8 zero",    r.ReadU8(),   0);
+    check("U8 max",     r.ReadU8(),   255);
+    check("U8 mid",     r.ReadU8(),   127);
+    check("Bool true",  r.ReadBool(), true);
+    check("Bool false", r.ReadBool(), false);
+    check("I8 -1",      r.ReadI8(),  -1);
+    check("I8 -128",    r.ReadI8(),  -128);
+    check("EOF",        r.IsEOF(),    true);
+}
+
+fn test_u16_i16_le() {
+    let w = new BinaryWriter(nil);
+    w.WriteU16(0);
+    w.WriteU16(65535);
+    w.WriteU16(0x1234);
+    w.WriteI16(-1);
+    w.WriteI16(-32768);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("U16 zero",   r.ReadU16(),  0);
+    check("U16 max",    r.ReadU16(),  65535);
+    check("U16 0x1234", r.ReadU16(),  0x1234);
+    check("I16 -1",     r.ReadI16(), -1);
+    check("I16 -32768", r.ReadI16(), -32768);
+}
+
+fn test_u16_endian() {
+    let w = new BinaryWriter(nil);
+    w.WriteU16(0x1234);
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("U16 BE round-trip", r.ReadU16(), 0x1234);
+
+    let wle = new BinaryWriter(false);
+    wle.WriteU16(0x1234);
+    let rle = new BinaryReader(wle.ToBuffer(), nil);
+    check("LE low-byte first",   rle.ReadU8(), 0x34);
+    check("LE high-byte second", rle.ReadU8(), 0x12);
+
+    let wbe = new BinaryWriter(true);
+    wbe.WriteU16(0x1234);
+    let rbe = new BinaryReader(wbe.ToBuffer(), true);
+    check("BE high-byte first",  rbe.ReadU8(), 0x12);
+    check("BE low-byte second",  rbe.ReadU8(), 0x34);
+}
+
+fn test_u32_i32() {
+    let w = new BinaryWriter(nil);
+    w.WriteU32(0);
+    w.WriteU32(0xDEADBEEF);
+    w.WriteI32(-1);
+    w.WriteI32(-2147483648);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("U32 zero",       r.ReadU32(),  0);
+    check("U32 0xDEADBEEF", r.ReadU32(),  0xDEADBEEF);
+    check("I32 -1",         r.ReadI32(), -1);
+    check("I32 min",        r.ReadI32(), -2147483648);
+}
+
+fn test_u64() {
+    let w = new BinaryWriter(nil);
+    w.WriteU64(0);
+    w.WriteU64(1);
+    w.WriteU64(0x0000000100000000);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("U64 zero",      r.ReadU64(), 0);
+    check("U64 one",       r.ReadU64(), 1);
+    check("U64 hi=1 lo=0", r.ReadU64(), 0x0000000100000000);
+}
+
+fn test_u24() {
+    let w = new BinaryWriter(nil);
+    w.WriteU24(0);
+    w.WriteU24(0xFFFFFF);
+    w.WriteU24(0xABCDEF);
+    w.WriteI24(-1);
+    w.WriteI24(-8388608);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("U24 zero",      r.ReadU24(),  0);
+    check("U24 max",       r.ReadU24(),  0xFFFFFF);
+    check("U24 0xABCDEF",  r.ReadU24(),  0xABCDEF);
+    check("I24 -1",        r.ReadI24(), -1);
+    check("I24 min",       r.ReadI24(), -8388608);
+
+    let wbe = new BinaryWriter(true);
+    wbe.WriteU24(0x123456);
+    let rbe = new BinaryReader(wbe.ToBuffer(), true);
+    check("U24 BE byte0", rbe.ReadU8(), 0x12);
+    check("U24 BE byte1", rbe.ReadU8(), 0x34);
+    check("U24 BE byte2", rbe.ReadU8(), 0x56);
+}
+
+fn test_strings() {
+    let w = new BinaryWriter(nil);
+    w.WriteString("hello");
+    w.WriteString("");
+    w.WriteCString("world");
+    w.WriteStringFixed("abc", 3);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("String 'hello'",         r.ReadString(),       "hello");
+    check("String empty",           r.ReadString(),       "");
+    check("CString 'world'",        r.ReadCString(),      "world");
+    check("StringFixed 'abc' n=3",  r.ReadStringFixed(3), "abc");
+}
+
+fn test_align_pad() {
+    let w = new BinaryWriter(nil);
+    w.WriteU8(0xAA);
+    w.Align(4);
+    w.WriteU8(0xBB);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("Align: byte before", r.ReadU8(), 0xAA);
+    check("Align: pad 0",       r.ReadU8(), 0);
+    check("Align: pad 1",       r.ReadU8(), 0);
+    check("Align: pad 2",       r.ReadU8(), 0);
+    check("Align: byte after",  r.ReadU8(), 0xBB);
+}
+
+fn test_writepad_skip() {
+    let w = new BinaryWriter(nil);
+    w.WriteU8(1);
+    w.WritePad(3);
+    w.WriteU8(2);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("WritePad: before",     r.ReadU8(), 1);
+    r.Skip(3);
+    check("WritePad: after skip", r.ReadU8(), 2);
+}
+
+fn test_seek_overwrite() {
+    let w = new BinaryWriter(nil);
+    w.WriteU32(0);
+    w.WriteU8(0xAA);
+    w.WriteU8(0xBB);
+    w.WriteU8(0xCC);
+    let payload = w.Size() - 4;
+    w.Seek(0);
+    w.WriteU32(payload);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("Seek: patched length", r.ReadU32(), 3);
+    check("Seek: byte 0",         r.ReadU8(),  0xAA);
+    check("Seek: byte 1",         r.ReadU8(),  0xBB);
+    check("Seek: byte 2",         r.ReadU8(),  0xCC);
+}
+
+fn test_raw_bytes() {
+    let w = new BinaryWriter(nil);
+    let src = Buffer.Create(4, 1);
+    Buffer.FromArray(src, [0x11, 0x22, 0x33, 0x44]);
+    w.WriteBytes(src);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    let out = Buffer.ToArray(r.ReadBytes(4));
+    check("Bytes[0]", out[0], 0x11);
+    check("Bytes[1]", out[1], 0x22);
+    check("Bytes[2]", out[2], 0x33);
+    check("Bytes[3]", out[3], 0x44);
+}
+
+fn test_peek_remaining() {
+    let w = new BinaryWriter(nil);
+    w.WriteU8(0xAA);
+    w.WriteU8(0xBB);
+    w.WriteU8(0xCC);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("Peek does not advance",  r.PeekU8(),    0xAA);
+    check("Peek leaves position 0", r.Position(),  0);
+    r.ReadU8();
+    check("Peek after read",        r.PeekU8(),    0xBB);
+
+    let rem = Buffer.ToArray(r.ReadRemaining());
+    check("ReadRemaining len",  len(rem), 2);
+    check("ReadRemaining [0]",  rem[0],   0xBB);
+    check("ReadRemaining [1]",  rem[1],   0xCC);
+    check("ReadRemaining EOF",  r.IsEOF(), true);
+}
+
+fn test_cursor_state() {
+    let w = new BinaryWriter(nil);
+    w.WriteU32(0x12345678);
+    check("Writer size", w.Size(), 4);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("Reader size",         r.Size(),      4);
+    check("BytesLeft start",     r.BytesLeft(), 4);
+    r.ReadU16();
+    check("Position after U16",  r.Position(),  2);
+    check("BytesLeft after U16", r.BytesLeft(), 2);
+}
+
+// =============================================================================
+// 2.0 new features
+// =============================================================================
+
+fn test_varint() {
+    let w = new BinaryWriter(nil);
+
+    w.WriteVarUInt(0);
+    w.WriteVarUInt(127);
+    w.WriteVarUInt(128);
+    w.WriteVarUInt(300);
+    w.WriteVarUInt(16383);
+    w.WriteVarUInt(16384);
+
+    w.WriteVarInt(0);
+    w.WriteVarInt(1);
+    w.WriteVarInt(-1);
+    w.WriteVarInt(63);
+    w.WriteVarInt(-64);
+    w.WriteVarInt(2147483647);
+    w.WriteVarInt(-2147483648);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("VarUInt 0",     r.ReadVarUInt(), 0);
+    check("VarUInt 127",   r.ReadVarUInt(), 127);
+    check("VarUInt 128",   r.ReadVarUInt(), 128);
+    check("VarUInt 300",   r.ReadVarUInt(), 300);
+    check("VarUInt 16383", r.ReadVarUInt(), 16383);
+    check("VarUInt 16384", r.ReadVarUInt(), 16384);
+
+    check("VarInt 0",       r.ReadVarInt(), 0);
+    check("VarInt 1",       r.ReadVarInt(), 1);
+    check("VarInt -1",      r.ReadVarInt(), -1);
+    check("VarInt 63",      r.ReadVarInt(), 63);
+    check("VarInt -64",     r.ReadVarInt(), -64);
+    check("VarInt max i32", r.ReadVarInt(), 2147483647);
+    check("VarInt min i32", r.ReadVarInt(), -2147483648);
+
+    let w2 = new BinaryWriter(nil);
+    w2.WriteVarUInt(127);
+    check("VarUInt 127 = 1 byte", w2.Size(), 1);
+
+    let w3 = new BinaryWriter(nil);
+    w3.WriteVarUInt(128);
+    check("VarUInt 128 = 2 bytes", w3.Size(), 2);
+}
+
+fn test_string32_and_stringvar() {
+    let w = new BinaryWriter(nil);
+    w.WriteString32("hello32");
+    w.WriteString32("");
+    w.WriteStringVar("hellovar");
+    w.WriteStringVar("");
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("String32 'hello32'",   r.ReadString32(),  "hello32");
+    check("String32 empty",       r.ReadString32(),  "");
+    check("StringVar 'hellovar'", r.ReadStringVar(), "hellovar");
+    check("StringVar empty",      r.ReadStringVar(), "");
+}
+
+fn test_peek_multi() {
+    let w = new BinaryWriter(nil);
+    w.WriteU16(0xABCD);
+    w.WriteU32(0x12345678);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+
+    check("PeekU16 value",      r.PeekU16(),   0xABCD);
+    check("PeekU16 no advance", r.Position(),  0);
+
+    r.ReadU16();
+
+    check("PeekU32 value",      r.PeekU32(),   0x12345678);
+    check("PeekU32 no advance", r.Position(),  2);
+
+    r.ReadU32();
+    check("PeekU32 after read", r.IsEOF(), true);
+}
+
+fn test_mark_reset() {
+    // Reader mark/reset
+    let w = new BinaryWriter(nil);
+    w.WriteU8(0xAA);
+    w.WriteU8(0xBB);
+    w.WriteU8(0xCC);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    r.ReadU8();
+    r.Mark();
+    check("Mark: read BB",  r.ReadU8(), 0xBB);
+    check("Mark: read CC",  r.ReadU8(), 0xCC);
+    check("Mark: at EOF",   r.IsEOF(),  true);
+    r.Reset();
+    check("Reset: pos back",   r.Position(), 1);
+    check("Reset: re-read BB", r.ReadU8(),   0xBB);
+
+    // Writer mark/reset - patch-back pattern
+    let w2 = new BinaryWriter(nil);
+    w2.Mark();
+    w2.WriteU32(0);
+    w2.WriteU8(0x11);
+    w2.WriteU8(0x22);
+    w2.WriteU8(0x33);
+    let data_size:int = w2.Size() - 4;
+    w2.Reset();
+    w2.WriteU32(data_size);
+
+    let r2 = new BinaryReader(w2.ToBuffer(), nil);
+    check("Mark/Reset writer: length field", r2.ReadU32(), 3);
+    check("Mark/Reset writer: byte 0",       r2.ReadU8(),  0x11);
+    check("Mark/Reset writer: byte 1",       r2.ReadU8(),  0x22);
+    check("Mark/Reset writer: byte 2",       r2.ReadU8(),  0x33);
+}
+
+fn test_bits() {
+    let w = new BinaryWriter(nil);
+    w.WriteBits(0b101,   3);
+    w.WriteBits(0b11010, 5);
+    w.WriteBits(0b1100,  4);
+    w.FlushBits();
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("Bits 3-bit field",  r.ReadBits(3), 5);
+    check("Bits 5-bit field",  r.ReadBits(5), 26);
+    check("Bits 4-bit field",  r.ReadBits(4), 12);
+    r.AlignBits();
+
+    check("Bits writer size = 2", w.Size(), 2);
+
+    let w2 = new BinaryWriter(nil);
+    w2.WriteBits(0xA5, 8);
+    w2.FlushBits();
+    let r2 = new BinaryReader(w2.ToBuffer(), nil);
+    check("Bits full byte", r2.ReadBits(8), 0xA5);
+
+    let w3 = new BinaryWriter(nil);
+    w3.WriteU8(0xFF);
+    w3.WriteU8(0x42);
+    let r3 = new BinaryReader(w3.ToBuffer(), nil);
+    r3.ReadBits(4);
+    r3.AlignBits();
+    check("AlignBits then ReadU8", r3.ReadU8(), 0x42);
+}
+
+fn test_slice() {
+    let w = new BinaryWriter(nil);
+    w.WriteU32(0xCAFEBABE);
+    w.WriteU8(0x01);
+    w.WriteU8(0x02);
+    w.WriteU8(0x03);
+    w.WriteU8(0x0A);
+    w.WriteU8(0x0B);
+    w.WriteU8(0x0C);
+    w.WriteU8(0x0D);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("Slice: header", r.ReadU32(), 0xCAFEBABE);
+
+    let chunk1 = r.Slice(4, 3);
+    check("Slice chunk1 [0]", chunk1.ReadU8(), 0x01);
+    check("Slice chunk1 [1]", chunk1.ReadU8(), 0x02);
+    check("Slice chunk1 [2]", chunk1.ReadU8(), 0x03);
+    check("Slice chunk1 EOF", chunk1.IsEOF(),  true);
+
+    let chunk2 = r.Slice(7, 4);
+    check("Slice chunk2 [0]", chunk2.ReadU8(), 0x0A);
+    check("Slice chunk2 [1]", chunk2.ReadU8(), 0x0B);
+    check("Slice chunk2 [2]", chunk2.ReadU8(), 0x0C);
+    check("Slice chunk2 [3]", chunk2.ReadU8(), 0x0D);
+    check("Slice chunk2 EOF", chunk2.IsEOF(),  true);
+
+    check("Slice: parent pos unchanged", r.Position(), 4);
+}
+
+fn test_copy_to() {
+    let w = new BinaryWriter(nil);
+    w.WriteU8(0x11);
+    w.WriteU8(0x22);
+    w.WriteU8(0x33);
+    w.WriteU8(0x44);
+    w.WriteU8(0x55);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    r.ReadU8();
+
+    let w2 = new BinaryWriter(nil);
+    r.CopyTo(w2, 3);
+
+    let r2 = new BinaryReader(w2.ToBuffer(), nil);
+    check("CopyTo size",  w2.Size(),   3);
+    check("CopyTo [0]",   r2.ReadU8(), 0x22);
+    check("CopyTo [1]",   r2.ReadU8(), 0x33);
+    check("CopyTo [2]",   r2.ReadU8(), 0x44);
+
+    check("CopyTo src pos", r.Position(), 4);
+}
+
+fn test_checksum() {
+    let w = new BinaryWriter(nil);
+    w.EnableChecksum();
+    w.WriteU8(65);
+    w.WriteU8(66);
+    w.WriteU8(67);
+    let wcrc:int = w.Checksum();
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    r.EnableChecksum();
+    r.ReadU8();
+    r.ReadU8();
+    r.ReadU8();
+    let rcrc:int = r.Checksum();
+
+    check("Checksum writer==reader", wcrc, rcrc);
+
+    r.Seek(0);
+    r.ResetChecksum();
+    r.ReadU8();
+    let partial:int = r.Checksum();
+    check("Checksum partial != full", partial != rcrc, true);
+
+    let we = new BinaryWriter(nil);
+    we.EnableChecksum();
+    check("Checksum empty = 0", we.Checksum(), 0);
+}
+
+fn test_file_mode() {
+    let path:string = Path.Combine(Os.TempDir(), "bio2_test.bin");
+
+    let bw = new BinaryFileWriter(path, false);
+    bw.WriteU32(0xDEADBEEF);
+    bw.WriteU16(0x1234);
+    bw.WriteString("stream");
+    bw.Close();
+
+    let br = new BinaryFileReader(path, false);
+    check("File U32",    br.ReadU32(),    0xDEADBEEF);
+    check("File U16",    br.ReadU16(),    0x1234);
+    check("File String", br.ReadString(), "stream");
+    br.Close();
+}
+
+fn test_file_mode_be() {
+    let path:string = Path.Combine(Os.TempDir(), "bio2_test_be.bin");
+
+    let bw = new BinaryFileWriter(path, true);
+    bw.WriteU32(0x12345678);
+    bw.WriteU16(0xABCD);
+    bw.Close();
+
+    let br = new BinaryFileReader(path, true);
+    check("File BE U32", br.ReadU32(), 0x12345678);
+    check("File BE U16", br.ReadU16(), 0xABCD);
+    br.Close();
+}
+
+// =============================================================================
+// 2.0 additional coverage
+// =============================================================================
+
+fn test_writearray() {
+    // WriteArray writes each element as a U8 byte
+    let w = new BinaryWriter(nil);
+    w.WriteArray([0x10, 0x20, 0x30, 0x40, 0x50]);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("WriteArray size",  w.Size(),   5);
+    check("WriteArray [0]",   r.ReadU8(), 0x10);
+    check("WriteArray [1]",   r.ReadU8(), 0x20);
+    check("WriteArray [2]",   r.ReadU8(), 0x30);
+    check("WriteArray [3]",   r.ReadU8(), 0x40);
+    check("WriteArray [4]",   r.ReadU8(), 0x50);
+    check("WriteArray EOF",   r.IsEOF(),  true);
+
+    // Empty array produces no bytes
+    let w2 = new BinaryWriter(nil);
+    w2.WriteArray([]);
+    check("WriteArray empty", w2.Size(), 0);
+}
+
+fn test_varuint_edge_cases() {
+    // 0     encodes as 1 byte (0x00)
+    // 127   encodes as 1 byte (0x7F)
+    // 128   encodes as 2 bytes (0x80, 0x01)
+    // 16383 encodes as 2 bytes (0xFF, 0x7F)
+    // 16384 encodes as 3 bytes (0x80, 0x80, 0x01)
+    let w0 = new BinaryWriter(nil);  w0.WriteVarUInt(0);
+    let w1 = new BinaryWriter(nil);  w1.WriteVarUInt(127);
+    let w2 = new BinaryWriter(nil);  w2.WriteVarUInt(128);
+    let w3 = new BinaryWriter(nil);  w3.WriteVarUInt(16383);
+    let w4 = new BinaryWriter(nil);  w4.WriteVarUInt(16384);
+
+    check("VarUInt 0 encodes as 1 byte",     w0.Size(), 1);
+    check("VarUInt 127 encodes as 1 byte",   w1.Size(), 1);
+    check("VarUInt 128 encodes as 2 bytes",  w2.Size(), 2);
+    check("VarUInt 16383 encodes as 2 bytes", w3.Size(), 2);
+    check("VarUInt 16384 encodes as 3 bytes", w4.Size(), 3);
+
+    let w = new BinaryWriter(nil);
+    w.WriteVarUInt(0);
+    w.WriteVarUInt(127);
+    w.WriteVarUInt(128);
+    w.WriteVarUInt(16383);
+    w.WriteVarUInt(16384);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("VarUInt edge 0",     r.ReadVarUInt(), 0);
+    check("VarUInt edge 127",   r.ReadVarUInt(), 127);
+    check("VarUInt edge 128",   r.ReadVarUInt(), 128);
+    check("VarUInt edge 16383", r.ReadVarUInt(), 16383);
+    check("VarUInt edge 16384", r.ReadVarUInt(), 16384);
+}
+
+fn test_varint_zigzag() {
+    let w = new BinaryWriter(nil);
+    w.WriteVarInt(0);
+    w.WriteVarInt(1);
+    w.WriteVarInt(-1);
+    w.WriteVarInt(63);
+    w.WriteVarInt(-64);
+    w.WriteVarInt(64);
+    w.WriteVarInt(-65);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("VarInt zigzag 0",    r.ReadVarInt(),  0);
+    check("VarInt zigzag 1",    r.ReadVarInt(),  1);
+    check("VarInt zigzag -1",   r.ReadVarInt(), -1);
+    check("VarInt zigzag 63",   r.ReadVarInt(),  63);
+    check("VarInt zigzag -64",  r.ReadVarInt(), -64);
+    check("VarInt zigzag 64",   r.ReadVarInt(),  64);
+    check("VarInt zigzag -65",  r.ReadVarInt(), -65);
+
+    // positive values encode as even unsigned, negative as odd
+    let wp = new BinaryWriter(nil);  wp.WriteVarInt(1);
+    let wn = new BinaryWriter(nil);  wn.WriteVarInt(-1);
+    let rp = new BinaryReader(wp.ToBuffer(), nil);
+    let rn = new BinaryReader(wn.ToBuffer(), nil);
+    check("VarInt 1 encodes as U8=2",  rp.ReadU8(), 2);
+    check("VarInt -1 encodes as U8=1", rn.ReadU8(), 1);
+}
+
+fn test_bits_3bit() {
+    // Write three 3-bit values and read them back
+    let w = new BinaryWriter(nil);
+    w.WriteBits(0b000, 3);
+    w.WriteBits(0b101, 3);
+    w.WriteBits(0b111, 3);
+    w.FlushBits();
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("WriteBits 3-bit 0b000", r.ReadBits(3), 0);
+    check("WriteBits 3-bit 0b101", r.ReadBits(3), 5);
+    check("WriteBits 3-bit 0b111", r.ReadBits(3), 7);
+    r.AlignBits();
+    check("WriteBits 3-bit EOF after AlignBits", r.IsEOF(), true);
+}
+
+fn test_flush_align_bits() {
+    // FlushBits pads partial byte with zeros
+    let w = new BinaryWriter(nil);
+    w.WriteBits(0b11, 2);   // 2 bits written
+    w.FlushBits();           // should flush 1 byte padded to 0b00000011
+    check("FlushBits size = 1 byte", w.Size(), 1);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("FlushBits raw byte = 0x03", r.ReadU8(), 0x03);
+
+    // AlignBits discards remaining bits in current byte
+    let w2 = new BinaryWriter(nil);
+    w2.WriteU8(0xF0);
+    w2.WriteU8(0x42);
+    let r2 = new BinaryReader(w2.ToBuffer(), nil);
+    r2.ReadBits(3);          // consume 3 bits from 0xF0
+    r2.AlignBits();          // discard remaining 5 bits
+    check("AlignBits discards rest of byte", r2.ReadU8(), 0x42);
+}
+
+fn test_mark_reset_writer() {
+    // Mark then Reset seeks writer back to marked position
+    let w = new BinaryWriter(nil);
+    w.WriteU16(0xAAAA);
+    w.Mark();
+    w.WriteU16(0xBBBB);
+    w.WriteU16(0xCCCC);
+    w.Reset();
+    w.WriteU16(0x1234);  // overwrites 0xBBBB
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("Mark/Reset writer: pre-mark word",      r.ReadU16(), 0xAAAA);
+    check("Mark/Reset writer: overwritten word",   r.ReadU16(), 0x1234);
+    check("Mark/Reset writer: post-reset untouched", r.ReadU16(), 0xCCCC);
+}
+
+fn test_mark_reset_reader() {
+    let w = new BinaryWriter(nil);
+    w.WriteU8(0x01);
+    w.WriteU8(0x02);
+    w.WriteU8(0x03);
+    w.WriteU8(0x04);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    r.ReadU8();    // advance past 0x01
+    r.Mark();      // mark at position 1
+    r.ReadU8();    // read 0x02
+    r.ReadU8();    // read 0x03
+    r.Reset();     // seek back to position 1
+    check("Mark/Reset reader: re-read after reset", r.ReadU8(), 0x02);
+    check("Mark/Reset reader: continues forward",   r.ReadU8(), 0x03);
+    check("Mark/Reset reader: next byte",           r.ReadU8(), 0x04);
+    check("Mark/Reset reader: EOF",                 r.IsEOF(),  true);
+}
+
+fn test_checksum_crc32() {
+    // Known CRC32 of "ABC" (0x41, 0x42, 0x43) = 0xA3830348
+    let w = new BinaryWriter(nil);
+    w.EnableChecksum();
+    w.WriteU8(0x41);
+    w.WriteU8(0x42);
+    w.WriteU8(0x43);
+    let wcrc:int = w.Checksum();
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    r.EnableChecksum();
+    r.ReadU8();
+    r.ReadU8();
+    r.ReadU8();
+    let rcrc:int = r.Checksum();
+
+    check("Checksum CRC32 writer==reader", wcrc, rcrc);
+    check("Checksum CRC32 ABC = 0xA3830348", wcrc, 0xA3830348);
+
+    // ResetChecksum restarts accumulation
+    r.Seek(0);
+    r.ResetChecksum();
+    r.ReadU8();   // only 0x41
+    let partial:int = r.Checksum();
+    check("Checksum partial (1 byte) != full (3 bytes)", partial != rcrc, true);
+
+    // EnableChecksum on empty writer yields 0
+    let we = new BinaryWriter(nil);
+    we.EnableChecksum();
+    check("Checksum empty writer = 0", we.Checksum(), 0);
+}
+
+fn test_writearray_chaining() {
+    // WriteArray returns `this` for chaining; verify return value is the same writer
+    let w = new BinaryWriter(nil);
+    let ret:instance = w.WriteArray([0xAB, 0xCD]);
+    // Both bytes should appear in the buffer
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("WriteArray chaining [0]", r.ReadU8(), 0xAB);
+    check("WriteArray chaining [1]", r.ReadU8(), 0xCD);
+}
+
+fn test_peek_u8_no_advance() {
+    let w = new BinaryWriter(nil);
+    w.WriteU8(0x77);
+    w.WriteU8(0x88);
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("PeekU8 first byte value",    r.PeekU8(),   0x77);
+    check("PeekU8 position unchanged",  r.Position(), 0);
+    check("PeekU8 again same value",    r.PeekU8(),   0x77);
+    r.ReadU8();
+    check("PeekU8 after ReadU8",        r.PeekU8(),   0x88);
+    check("PeekU8 position = 1",        r.Position(), 1);
+    r.ReadU8();
+    check("PeekU8 at EOF returns 0",    r.PeekU8(),   0);
+
+}
+
+fn test_writestring_fixed() {
+    // WriteStringFixed pads short strings and truncates long ones
+    let w = new BinaryWriter(nil);
+    w.WriteStringFixed("hi",    5);   // "hi\0\0\0"
+    w.WriteStringFixed("hello", 5);   // exact fit
+    w.WriteStringFixed("toolong", 4); // truncated to "tool"
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("WriteStringFixed short: h",   r.ReadU8(), 104);  // 'h'
+    check("WriteStringFixed short: i",   r.ReadU8(), 105);  // 'i'
+    check("WriteStringFixed short: pad0", r.ReadU8(), 0);
+    check("WriteStringFixed short: pad1", r.ReadU8(), 0);
+    check("WriteStringFixed short: pad2", r.ReadU8(), 0);
+
+    check("WriteStringFixed exact: h",  r.ReadU8(), 104);  // 'h'
+    check("WriteStringFixed exact: e",  r.ReadU8(), 101);  // 'e'
+    check("WriteStringFixed exact: l",  r.ReadU8(), 108);  // 'l'
+    check("WriteStringFixed exact: l2", r.ReadU8(), 108);  // 'l'
+    check("WriteStringFixed exact: o",  r.ReadU8(), 111);  // 'o'
+
+    check("WriteStringFixed trunc: t",  r.ReadU8(), 116);  // 't'
+    check("WriteStringFixed trunc: o",  r.ReadU8(), 111);  // 'o'
+    check("WriteStringFixed trunc: o2", r.ReadU8(), 111);  // 'o'
+    check("WriteStringFixed trunc: l",  r.ReadU8(), 108);  // 'l'
+
+    check("WriteStringFixed total size", w.Size(), 14);
+}
+
+fn test_readstring_fixed_and_cstring() {
+    let w = new BinaryWriter(nil);
+    w.WriteStringFixed("abc", 3);
+    w.WriteStringFixed("XY",  4);   // "XY\0\0"
+    w.WriteCString("hello");
+    w.WriteCString("");
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("ReadStringFixed 3",       r.ReadStringFixed(3), "abc");
+    // ReadStringFixed reads 4 bytes; Flaris strings stop at null, so visible part is "XY"
+    check("ReadStringFixed 4 (starts with XY)", String.StartsWith(r.ReadStringFixed(4), "XY"), true);
+    check("ReadCString hello",       r.ReadCString(), "hello");
+    check("ReadCString empty",       r.ReadCString(), "");
+    check("CString round-trip EOF",  r.IsEOF(), true);
+}
+
+// =============================================================================
+// Benchmark
+// =============================================================================
+
+fn bench(name:string, f:fn, n:int, batch:int) {
+    f(); f(); f();
+
+    let t0:int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt:int = Time.Ticks() - t0;
+
+    let ms:float = Time.TicksToMs(dt);
+    let ns:float = (Time.TicksToUs(dt) * 1000.0) / float(n * batch);
+
+    Console.WriteLine(
+        String.PadRight(name, 42),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]), 9), "ms ",
+        String.PadLeft(String.FormatArray("{0:.2f}", [ns]), 11), "ns/op"
+    );
+}
+
+fn test_benchmark() {
+    let N:int = 10000;
+    _bw = new BinaryWriter(nil);
+
+    let pre = new BinaryWriter(nil);
+    iter (i from 0 to BATCH - 1) { pre.WriteU32(0xDEADBEEF); }
+    _br = new BinaryReader(pre.ToBuffer(), nil);
+
+    Console.WriteLine("== Benchmark ==");
+
+    bench("baseline (empty loop)", fn() {
+        iter (i from 0 to BATCH - 1) { _sink = 0; }
+    }, N, BATCH);
+
+    bench("WriteU8", fn() {
+        _bw.Seek(0);
+        iter (i from 0 to BATCH - 1) { _bw.WriteU8(0xFF); }
+    }, N, BATCH);
+
+    bench("WriteU32", fn() {
+        _bw.Seek(0);
+        iter (i from 0 to BATCH - 1) { _bw.WriteU32(0xDEADBEEF); }
+    }, N, BATCH);
+
+    bench("WriteU64", fn() {
+        _bw.Seek(0);
+        iter (i from 0 to BATCH - 1) { _bw.WriteU64(0x0000000100000000); }
+    }, N, BATCH);
+
+    bench("WriteString", fn() {
+        _bw.Seek(0);
+        iter (i from 0 to BATCH - 1) { _bw.WriteString("hello"); }
+    }, N, BATCH);
+
+    bench("ReadU32 (pre-filled buf)", fn() {
+        _br.Seek(0);
+        iter (i from 0 to BATCH - 1) { _sink = _br.ReadU32(); }
+    }, N, BATCH);
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+// Buffer.* primitives added alongside the async work: search / compare / fill /
+// signed + float typed reads. No -u needed (all operate on GC-owned blocks).
+fn test_buffer_primitives() {
+    let b = Buffer.FromString("hello world");
+    check("IndexOf byte",      Buffer.IndexOf(b, 111), 4);       // 'o'
+    check("IndexOf substr",    Buffer.IndexOf(b, "world"), 6);
+    check("IndexOf miss",      Buffer.IndexOf(b, "zz"), -1);
+    check("IndexOf from",      Buffer.IndexOf(b, 111, 5), 7);    // second 'o'
+    check("IndexOf empty",     Buffer.IndexOf(b, ""), 0);
+
+    let c = Buffer.FromString("hello world");
+    let d = Buffer.FromString("hello WORLD");
+    check("Equals same",       Buffer.Equals(b, c), true);
+    check("Equals diff",       Buffer.Equals(b, d), false);
+    check("Compare eq",        Buffer.Compare(b, c), 0);
+    check("Compare gt",        Buffer.Compare(b, d), 1);
+
+    let fr = Buffer.Create(8, 1);
+    Buffer.Fill(fr, 0);
+    check("FillRange ok",      Buffer.FillRange(fr, 2, 3, 65), true);
+    check("FillRange in",      Buffer.ReadU8At(fr, 2), 65);
+    check("FillRange edge",    Buffer.ReadU8At(fr, 5), 0);
+    check("FillRange oob",     Buffer.FillRange(fr, 6, 5, 1), false);
+
+    // Signed reads: 0xFF -> -1 signed, 255 unsigned.
+    let sb = Buffer.Create(4, 1);
+    Buffer.WriteU8At(sb, 0, 255);
+    check("ReadU8At",          Buffer.ReadU8At(sb, 0), 255);
+    check("ReadI8At",          Buffer.ReadI8At(sb, 0), -1);
+
+    // Float round-trips.
+    let f = Buffer.Create(16, 1);
+    check("WriteFloat32At",    Buffer.WriteFloat32At(f, 0, 1.5), true);
+    check("ReadFloat32At",     Buffer.ReadFloat32At(f, 0), 1.5);
+    check("WriteFloat64At",    Buffer.WriteFloat64At(f, 4, 2.5), true);
+    check("ReadFloat64At",     Buffer.ReadFloat64At(f, 4), 2.5);
+    check("ReadFloat32At oob", Buffer.ReadFloat32At(f, 100), 0.0);
+
+    // nil argument must not corrupt state (validate_args lets nil through).
+    check("Equals nil",        Buffer.Equals(nil, b), false);
+    check("ChangeToString nil",Buffer.ChangeToString(nil), false);
+    check("nil intact",        nil == nil, true);
+}
+
+// BinaryWriter/Reader float methods now use Buffer.*FloatAt (no -u). Round-trip
+// through the in-memory writer in both byte orders, plus checksum mode.
+fn test_binary_float_io() {
+    // Little-endian round-trip
+    let w = new BinaryWriter(nil);
+    w.WriteF32(1.5);
+    w.WriteF64(2.5);
+    w.WriteF32(-0.25);
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    check("F32 LE round-trip",  r.ReadF32(), 1.5);
+    check("F64 LE round-trip",  r.ReadF64(), 2.5);
+    check("F32 LE negative",    r.ReadF32(), -0.25);
+
+    // Big-endian round-trip
+    let wb = new BinaryWriter(true);
+    wb.WriteF32(1.5);
+    wb.WriteF64(2.5);
+    let rb = new BinaryReader(wb.ToBuffer(), true);
+    check("F32 BE round-trip",  rb.ReadF32(), 1.5);
+    check("F64 BE round-trip",  rb.ReadF64(), 2.5);
+
+    // Checksum mode must still cover the float bytes.
+    let wc = new BinaryWriter(nil);
+    wc.EnableChecksum();
+    wc.WriteF64(3.25);
+    let cksum = wc.Checksum();
+    check("F64 checksum nonzero", cksum != 0, true);
+    let rc = new BinaryReader(wc.ToBuffer(), nil);
+    check("F64 checksum round-trip", rc.ReadF64(), 3.25);
+
+    // Read past end returns 0.0 (no crash / no -u).
+    let re = new BinaryReader(Buffer.Create(2, 1), nil);
+    check("F32 read past EOF", re.ReadF32(), 0.0);
+}
+
+fn Main() {
+    Console.WriteLine("--- 1.0 compatibility ---");
+    test_u8_i8_bool();
+    test_u16_i16_le();
+    test_u16_endian();
+    test_u32_i32();
+    test_u64();
+    test_u24();
+    test_strings();
+    test_align_pad();
+    test_writepad_skip();
+    test_seek_overwrite();
+    test_raw_bytes();
+    test_peek_remaining();
+    test_cursor_state();
+
+    Console.WriteLine("--- 2.0 new features ---");
+    test_varint();
+    test_string32_and_stringvar();
+    test_peek_multi();
+    test_mark_reset();
+    test_bits();
+    test_slice();
+    test_copy_to();
+    test_checksum();
+    test_file_mode();
+    test_file_mode_be();
+
+    Console.WriteLine("--- additional coverage ---");
+    test_writearray();
+    test_varuint_edge_cases();
+    test_varint_zigzag();
+    test_bits_3bit();
+    test_flush_align_bits();
+    test_mark_reset_writer();
+    test_mark_reset_reader();
+    test_checksum_crc32();
+    test_writearray_chaining();
+    test_peek_u8_no_advance();
+    test_writestring_fixed();
+    test_readstring_fixed_and_cstring();
+    test_buffer_primitives();
+    test_binary_float_io();
+
+    test_benchmark();
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: ", passed, " passed, ", failed, " failed.");
+    if (failed == 0) {
+        Console.Ok("All tests passed.");
+        return 0;
+    } else {
+        Console.WriteLine("FAILURES DETECTED.");
+        return 1;
+    }
+}

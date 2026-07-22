@@ -1,0 +1,668 @@
+// ============================================================
+//  Redis.fls - Redis client library for Flaris (via hiredis)
+//  Version: 1.0
+// ============================================================
+//
+// SETUP
+// -----
+// Install hiredis:
+//   macOS:   brew install hiredis
+//   Ubuntu:  apt install libhiredis-dev
+//   Fedora:  dnf install hiredis-devel
+//
+// Compile the FFI plugin (run from repo root):
+//
+//   macOS:
+//     gcc -shared -fPIC -O2 -o libs/redis_ffi.dylib libs/redis_ffi.c \
+//         -I$(brew --prefix hiredis)/include/hiredis \
+//         -L$(brew --prefix hiredis)/lib -lhiredis
+//   Linux:
+//     gcc -shared -fPIC -O2 -o libs/redis_ffi.so libs/redis_ffi.c -lhiredis
+//
+// Run with -u flag:
+//   flarisvm -u script.fls --libs='./libs'
+//
+// QUICK START
+// -----------
+//   import { Redis } from library("Redis", "1.0");
+//
+//   let r = Redis.Connect("127.0.0.1", 6379);
+//   if (r == nil) { Console.Error("Could not connect to Redis"); return 1; }
+//
+//   r.Set("greeting", "hello");
+//   let val = r.Get("greeting");            // - "hello"
+//
+//   r.SetEx("session:123", 3600, token);   // expires in 1 hour
+//   let ttl = r.Ttl("session:123");         // - seconds remaining
+//
+//   r.Incr("visits");
+//   let n = r.Get("visits");               // - "1" (Redis returns strings)
+//
+//   r.LPush("queue", "job1");
+//   let job = r.RPop("queue");             // - "job1"
+//
+//   r.HSet("user:42", "name", "Alice");
+//   let name = r.HGet("user:42", "name");  // - "Alice"
+//
+//   r.Expire("user:42", 86400);
+//   r.Del("greeting");
+//
+//   r.Close();
+//
+// RETURN TYPES
+// ------------
+// Redis reply types are mapped to Flaris types:
+//   Integer reply   -  int
+//   Simple string   -  string  (e.g. "OK", "PONG")
+//   Bulk string     -  string
+//   Nil reply       -  nil     (key not found, empty list pop, etc.)
+//   Array reply     -  array<string>
+//   Double reply    -  float
+//   Boolean reply   -  bool
+//   Error reply     -  { error: "message" }
+//   Map reply       -  object
+//
+// ERROR HANDLING
+// --------------
+// Commands that return { error: "…" } on failure - check with:
+//   let v = r.Get("mykey");
+//   if (v != nil && "error" in v) { Console.Error(v.error); }
+//
+// Most commands just return nil on missing keys, which is the normal case.
+// Connect returns nil on failure.
+//
+// RAW COMMANDS
+// ------------
+// For commands not covered by the high-level methods, use Cmd():
+//   r.Cmd("PING")
+//   r.Cmd("DEBUG SLEEP 0")
+//   r.Cmd("CONFIG GET maxmemory")
+//
+// For commands where a value might contain spaces, use CmdArgv() with
+// an explicit array of string arguments:
+//   r.CmdArgv(["SET", "mykey", "value with spaces"])
+//
+// COMMON PATTERNS
+// ---------------
+// Session store:
+//   r.SetEx("session:" + sessionId, 3600, JSON.Stringify(userData));
+//   let data = JSON.Parse(r.Get("session:" + sessionId));
+//
+// Rate limiting (atomic):
+//   let n = r.Incr("rate:" + ip);
+//   if (n == 1) { r.Expire("rate:" + ip, 60); }
+//   if (n > 100) { Console.Error("Rate limited"); return 429; }
+//
+// Simple job queue:
+//   r.LPush("jobs", JSON.Stringify(job));         // enqueue
+//   let raw = r.BRPop("jobs", 5);                  // blocking dequeue (5s timeout)
+//   if (raw != nil) { let job = JSON.Parse(raw[1]); ... }
+//
+// Pub/Sub: not supported (requires async or a dedicated connection).
+// For pub/sub use the raw hiredis subscribe flow with a fiber.
+//
+// TROUBLESHOOTING
+// ---------------
+//   Connect returns nil       -  check Redis is running; default port is 6379
+//   Exception.UnsafeOperation -  add -u flag
+//   "symbol not found"        -  recompile redis_ffi; check build_redis.sh
+//   All commands return nil   -  connection may have been closed; reconnect
+//
+// API REFERENCE
+// -------------
+// Connection:
+//   Redis.Connect(host, port)  →  Redis instance or nil
+//   Close()
+//   Ping()     →  "PONG"
+//   DbSize()   →  int
+//   FlushDb()
+//
+// Raw commands (for anything not listed below):
+//   Cmd(cmd:string)            - single-string command, e.g. Cmd("PING")
+//   CmdArgv(argv:array)        - explicit argument list; use when values may contain spaces
+//
+// Strings:
+//   Set(key, value)            Get(key)           GetDel(key)
+//   SetEx(key, seconds, value) SetNx(key, value)
+//   MGet(keys:array)           →  array of values (nil for missing)
+//   Incr(key)     IncrBy(key, n)     IncrByFloat(key, n)
+//   Decr(key)     DecrBy(key, n)
+//
+// Keys:
+//   Del(key)      Exists(key)     Rename(key, newkey)
+//   Expire(key, seconds)    Persist(key)    Ttl(key)
+//   Keys(pattern)           →  array of matching key names
+//
+// Lists:
+//   LPush(key, value)    RPush(key, value)
+//   LPop(key)            RPop(key)
+//   BLPop(key, timeout)  BRPop(key, timeout)   - blocking; timeout 0 = wait forever
+//   LLen(key)            LRange(key, start, stop)
+//
+// Hashes:
+//   HSet(key, field, value)   HGet(key, field)    HDel(key, field)
+//   HExists(key, field)       HGetAll(key)  →  object
+//   HKeys(key)  HVals(key)    HLen(key)     HIncrBy(key, field, n)
+//
+// Sets:
+//   SAdd(key, member)    SRem(key, member)
+//   SIsMember(key, member)    SMembers(key)    SCard(key)
+//
+// Sorted sets:
+//   ZAdd(key, score, member)    ZRem(key, member)
+//   ZScore(key, member)         ZIncrBy(key, increment, member)
+//   ZRange(key, start, stop)    ZRevRange(key, start, stop)
+//   ZRank(key, member)          ZRevRank(key, member)
+//   ZCount(key, min, max)       ZCard(key)
+//
+// Streams:
+//   XAdd(key, fields)                          →  string (new id)  fields: object
+//   XAddId(key, id, fields)                    →  string
+//   XLen(key)                                  →  int
+//   XDel(key, id)                              →  int
+//   XTrim(key, maxlen, approximate?)           →  int (entries trimmed)
+//   XRange(key, start, end, count?)            →  array<{id, fields}>
+//   XRevRange(key, end, start, count?)         →  array<{id, fields}>
+//   XRead(key, lastId, count?, blockMs?)       →  array<{id, fields}> | nil
+//   XGroupCreate(key, group, id?, mkstream?)   →  "OK" | { error }
+//   XGroupDestroy(key, group)                  →  int
+//   XGroupSetId(key, group, id)                →  "OK"
+//   XReadGroup(group, consumer, key, id,
+//              count?, blockMs?)               →  array<{id, fields}> | nil
+//     id: ">" = new messages; "0" = re-deliver PEL
+//   XAck(key, group, id)                       →  int
+//   XAckMany(key, group, ids)                  →  int
+//   XPending(key, group)                       →  { count, minId, maxId, consumers }
+//   XPendingRange(key, group, start, end,
+//                count, minIdleMs?)            →  array<{id, consumer, idleMs, deliveries}>
+//   XClaim(key, group, consumer,
+//          minIdleMs, ids)                     →  array<{id, fields}>
+//   XAutoClaim(key, group, consumer,
+//              minIdleMs, start, count?)       →  { next, messages } | nil
+//   EnsureStream(key, group)                   →  "OK" | { error }  (idempotent)
+//
+// ============================================================
+
+class Redis {
+    let _close = nil; 
+    let _cmdargv = nil; 
+    let _command = nil; 
+    let _conn = nil; 
+
+    // Change if necessary to point to the compiled FFI library; defaults to "./libs/redis_ffi.*"
+    fn static _lib_path() {
+        // Bare name - Ffi.Load resolves it from ~/.flaris/ffi ($FLARIS_FFI),
+        // appending the platform extension (.dylib/.so/.dll) automatically.
+        return "redis_ffi";
+    }
+
+    fn Constructor(handle: int, lib) {
+        this._conn    = handle;
+        this._command = Ffi.GetFunction(lib, "redis_command");
+        this._cmdargv = Ffi.GetFunction(lib, "redis_command_argv");
+        this._close   = Ffi.GetFunction(lib, "redis_close");
+    }
+
+    // Redis.Connect(host, port) - Redis | nil
+    fn static Connect(host: string, port: int) {
+        let lib = Ffi.Load(Redis._lib_path(), nil);
+        if (lib == nil) { return nil; }
+        let fn_connect = Ffi.GetFunction(lib, "redis_connect");
+        if (fn_connect == nil) { return nil; }
+        let handle = fn_connect(host, port);
+        if (handle == nil || handle == 0) { return nil; }
+        return new Redis(handle, lib);
+    }
+
+    // ── Internal dispatch helpers ────────────────────────────────────────────
+    // Calling an FFI function stored as `this.field(args)` from a class method
+    // would implicitly prepend `this` as the first argument. These helpers
+    // extract the FFI function to a local variable first, bypassing that.
+
+    fn _c(cmd: string) {
+        let f = this._command; return f(this._conn, cmd);
+    }
+    fn _a(argv) {
+        let f = this._cmdargv; return f(this._conn, argv);
+    }
+
+    // ── Raw command access ───────────────────────────────────────────────────
+
+    // r.Cmd(cmdstring) - raw command with space-separated args.
+    // Safe when no value can contain a space (PING, DEL, INCR, DBSIZE, …).
+    fn Cmd(cmd: string) { return this._c(cmd); }
+
+    // r.CmdArgv(args) - pre-split array of strings; safe for any value.
+    fn CmdArgv(argv) { return this._a(argv); }
+
+    // ── String commands ──────────────────────────────────────────────────────
+
+    // r.Set(key, value) - "OK" | { error }   value may be any type
+    fn Set(key: string, value) { return this._a(["SET", key, str(value)]); }
+
+    // r.SetEx(key, seconds, value) - "OK"  - set with expiry
+    fn SetEx(key: string, seconds: int, value) {
+        return this._a(["SETEX", key, str(seconds), str(value)]);
+    }
+
+    // r.SetNx(key, value) - int (1 = set, 0 = key already exists)
+    fn SetNx(key: string, value) { return this._a(["SETNX", key, str(value)]); }
+
+    // r.Get(key) - string | nil
+    fn Get(key: string) { return this._a(["GET", key]); }
+
+    // r.GetDel(key) - string | nil  - get and delete atomically
+    fn GetDel(key: string) { return this._a(["GETDEL", key]); }
+
+    // r.MGet(keys_array) - array<string|nil>
+    fn MGet(mkeys) {
+        return this._a(["MGET"] + mkeys);
+    }
+
+    // r.Incr(key) - int
+    fn Incr(key: string) { return this._a(["INCR", key]); }
+
+    // r.IncrBy(key, n) - int
+    fn IncrBy(key: string, n: int) { return this._a(["INCRBY", key, str(n)]); }
+
+    // r.IncrByFloat(key, n) - float
+    fn IncrByFloat(key: string, n: float) {
+        let s = this._a(["INCRBYFLOAT", key, str(n)]);
+        return s == nil ? nil : float(s);
+    }
+
+    // r.Decr(key) - int
+    fn Decr(key: string) { return this._a(["DECR", key]); }
+
+    // r.DecrBy(key, n) - int
+    fn DecrBy(key: string, n: int) { return this._a(["DECRBY", key, str(n)]); }
+
+    // ── Key commands ─────────────────────────────────────────────────────────
+
+    // r.Del(key) - int (keys deleted)
+    fn Del(key: string) { return this._a(["DEL", key]); }
+
+    // r.Exists(key) - int (1 = exists, 0 = not found)
+    fn Exists(key: string) { return this._a(["EXISTS", key]); }
+
+    // r.Expire(key, seconds) - int (1 = set, 0 = key not found)
+    fn Expire(key: string, seconds: int) { return this._a(["EXPIRE", key, str(seconds)]); }
+
+    // r.Persist(key) - int (1 = TTL removed, 0 = key not found or no TTL)
+    fn Persist(key: string) { return this._a(["PERSIST", key]); }
+
+    // r.Ttl(key) - int  (-1 = no TTL, -2 = key not found, else seconds remaining)
+    fn Ttl(key: string) { return this._a(["TTL", key]); }
+
+    // r.Rename(key, newkey) - "OK" | { error }
+    fn Rename(key: string, newkey: string) { return this._a(["RENAME", key, newkey]); }
+
+    // r.Keys(pattern) - array<string>   (use sparingly on large keyspaces)
+    fn Keys(pattern: string) { return this._a(["KEYS", pattern]); }
+
+    // ── List commands ────────────────────────────────────────────────────────
+
+    // r.LPush(key, value) - int (new list length)   value may be any type
+    fn LPush(key: string, value) { return this._a(["LPUSH", key, str(value)]); }
+
+    // r.RPush(key, value) - int
+    fn RPush(key: string, value) { return this._a(["RPUSH", key, str(value)]); }
+
+    // r.LPop(key) - string | nil
+    fn LPop(key: string) { return this._a(["LPOP", key]); }
+
+    // r.RPop(key) - string | nil
+    fn RPop(key: string) { return this._a(["RPOP", key]); }
+
+    // r.BLPop(key, timeout) - array [key, value] | nil  (blocking; timeout in seconds)
+    fn BLPop(key: string, timeout: int) { return this._a(["BLPOP", key, str(timeout)]); }
+
+    // r.BRPop(key, timeout) - array [key, value] | nil  (blocking; timeout in seconds)
+    fn BRPop(key: string, timeout: int) { return this._a(["BRPOP", key, str(timeout)]); }
+
+    // r.LLen(key) - int
+    fn LLen(key: string) { return this._a(["LLEN", key]); }
+
+    // r.LRange(key, start, stop) - array<string>
+    fn LRange(key: string, start: int, stop: int) {
+        return this._a(["LRANGE", key, str(start), str(stop)]);
+    }
+
+    // ── Hash commands ────────────────────────────────────────────────────────
+
+    // r.HSet(key, field, value) - int   value may be any type
+    fn HSet(key: string, field: string, value) {
+        return this._a(["HSET", key, field, str(value)]);
+    }
+
+    // r.HGet(key, field) - string | nil
+    fn HGet(key: string, field: string) { return this._a(["HGET", key, field]); }
+
+    // r.HDel(key, field) - int
+    fn HDel(key: string, field: string) { return this._a(["HDEL", key, field]); }
+
+    // r.HExists(key, field) - int (1/0)
+    fn HExists(key: string, field: string) { return this._a(["HEXISTS", key, field]); }
+
+    // r.HGetAll(key) - object { field: value, … } | nil
+    // HGETALL returns a flat array [f1, v1, f2, v2, …]; this method converts it.
+    fn HGetAll(key: string) {
+        let raw = this._a(["HGETALL", key]);
+        if (raw == nil || len(raw) == 0) { return nil; }
+        let obj = {};
+        let i = 0;
+        while (i + 1 < len(raw)) { obj[raw[i]] = raw[i + 1]; i += 2; }
+        return obj;
+    }
+
+    // r.HKeys(key) - array<string>
+    fn HKeys(key: string) { return this._a(["HKEYS", key]); }
+
+    // r.HVals(key) - array<string>
+    fn HVals(key: string) { return this._a(["HVALS", key]); }
+
+    // r.HLen(key) - int
+    fn HLen(key: string) { return this._a(["HLEN", key]); }
+
+    // r.HIncrBy(key, field, n) - int
+    fn HIncrBy(key: string, field: string, n: int) {
+        return this._a(["HINCRBY", key, field, str(n)]);
+    }
+
+    // ── Set commands ─────────────────────────────────────────────────────────
+
+    // r.SAdd(key, member) - int (1 = added, 0 = already a member)   member may be any type
+    fn SAdd(key: string, member) { return this._a(["SADD", key, str(member)]); }
+
+    // r.SRem(key, member) - int
+    fn SRem(key: string, member) { return this._a(["SREM", key, str(member)]); }
+
+    // r.SIsMember(key, member) - int (1/0)
+    fn SIsMember(key: string, member) { return this._a(["SISMEMBER", key, str(member)]); }
+
+    // r.SMembers(key) - array<string>
+    fn SMembers(key: string) { return this._a(["SMEMBERS", key]); }
+
+    // r.SCard(key) - int
+    fn SCard(key: string) { return this._a(["SCARD", key]); }
+
+    // ── Sorted set commands ──────────────────────────────────────────────────
+
+    // r.ZAdd(key, score, member) - int
+    fn ZAdd(key: string, score: float, member: string) {
+        return this._a(["ZADD", key, str(score), member]);
+    }
+
+    // r.ZRem(key, member) - int (1 = removed, 0 = not a member)
+    fn ZRem(key: string, member: string) { return this._a(["ZREM", key, member]); }
+
+    // r.ZScore(key, member) - float | nil
+    fn ZScore(key: string, member: string) {
+        let s = this._a(["ZSCORE", key, member]);
+        return s == nil ? nil : float(s);
+    }
+
+    // r.ZIncrBy(key, increment, member) - float  (new score)
+    fn ZIncrBy(key: string, increment: float, member: string) {
+        let s = this._a(["ZINCRBY", key, str(increment), member]);
+        return s == nil ? nil : float(s);
+    }
+
+    // r.ZRange(key, start, stop) - array<string>   (lowest to highest)
+    fn ZRange(key: string, start: int, stop: int) {
+        return this._a(["ZRANGE", key, str(start), str(stop)]);
+    }
+
+    // r.ZRevRange(key, start, stop) - array<string>   (highest to lowest)
+    fn ZRevRange(key: string, start: int, stop: int) {
+        return this._a(["ZREVRANGE", key, str(start), str(stop)]);
+    }
+
+    // r.ZRank(key, member) - int | nil   (0 = lowest score)
+    fn ZRank(key: string, member: string) { return this._a(["ZRANK", key, member]); }
+
+    // r.ZRevRank(key, member) - int | nil   (0 = highest score)
+    fn ZRevRank(key: string, member: string) { return this._a(["ZREVRANK", key, member]); }
+
+    // r.ZCount(key, min, max) - int   min/max are score strings e.g. "1.0", "-inf", "+inf"
+    fn ZCount(key: string, min: string, max: string) {
+        return this._a(["ZCOUNT", key, min, max]);
+    }
+
+    // r.ZCard(key) - int
+    fn ZCard(key: string) { return this._a(["ZCARD", key]); }
+
+    // ── Stream helpers ───────────────────────────────────────────────────────
+
+    // Convert flat [f1,v1,f2,v2,...] array to object { f1:v1, f2:v2, ... }
+    fn _parseFields(arr) {
+        if (arr == nil) { return {}; }
+        let obj = {};
+        let i = 0;
+        while (i + 1 < len(arr)) { obj[arr[i]] = arr[i + 1]; i += 2; }
+        return obj;
+    }
+
+    // Convert raw stream entry [id, [f1,v1,...]] to { id, fields }
+    fn _parseEntry(raw) {
+        if (raw == nil || len(raw) < 2) { return nil; }
+        return { id: raw[0], fields: this._parseFields(raw[1]) };
+    }
+
+    // Convert array of raw entries to array of { id, fields }
+    fn _parseEntries(raw) {
+        if (raw == nil) { return []; }
+        let out = [];
+        let i = 0;
+        while (i < len(raw)) {
+            Array.Append(out, this._parseEntry(raw[i]));
+            i += 1;
+        }
+        return out;
+    }
+
+    // ── Stream commands ──────────────────────────────────────────────────────
+
+    // r.XAdd(key, fields) - string (new message id) | nil
+    // fields: object { field: value, ... }; auto-generates id (*)
+    fn XAdd(key: string, fields) {
+        let argv = ["XADD", key, "*"];
+        foreach (val, field in fields) {
+            Array.Append(argv, field);
+            Array.Append(argv, str(val));
+        }
+        return this._a(argv);
+    }
+
+    // r.XAddId(key, id, fields) - add with explicit id (e.g. "0-1" or "*")
+    fn XAddId(key: string, id: string, fields) {
+        let argv = ["XADD", key, id];
+        foreach (val, field in fields) {
+            Array.Append(argv, field);
+            Array.Append(argv, str(val));
+        }
+        return this._a(argv);
+    }
+
+    // r.XLen(key) - int
+    fn XLen(key: string) { return this._a(["XLEN", key]); }
+
+    // r.XDel(key, id) - int (entries deleted)
+    fn XDel(key: string, id: string) { return this._a(["XDEL", key, id]); }
+
+    // r.XTrim(key, maxlen, approximate?) - int (entries trimmed)
+    // approximate: true = use ~ for best-effort trimming (faster)
+    fn XTrim(key: string, maxlen: int, approximate?) {
+        if (approximate == true) {
+            return this._a(["XTRIM", key, "MAXLEN", "~", str(maxlen)]);
+        }
+        return this._a(["XTRIM", key, "MAXLEN", str(maxlen)]);
+    }
+
+    // r.XRange(key, start, end, count?) - array<{id, fields}>
+    // start/end: "-" and "+" for full range, or message ids
+    fn XRange(key: string, start: string, end: string, count?) {
+        let argv = ["XRANGE", key, start, end];
+        if (count != nil) { Array.Append(argv, "COUNT"); Array.Append(argv, str(count)); }
+        return this._parseEntries(this._a(argv));
+    }
+
+    // r.XRevRange(key, end, start, count?) - array<{id, fields}> (newest first)
+    fn XRevRange(key: string, end: string, start: string, count?) {
+        let argv = ["XREVRANGE", key, end, start];
+        if (count != nil) { Array.Append(argv, "COUNT"); Array.Append(argv, str(count)); }
+        return this._parseEntries(this._a(argv));
+    }
+
+    // r.XRead(key, lastId, count?, blockMs?) - array<{id, fields}> | nil
+    // lastId: "$" for new-only, "0" for all, or a specific id
+    // blockMs: 0 = block forever; nil = non-blocking
+    fn XRead(key: string, lastId: string, count?, blockMs?) {
+        let argv = ["XREAD"];
+        if (count   != nil) { Array.Append(argv, "COUNT"); Array.Append(argv, str(count)); }
+        if (blockMs != nil) { Array.Append(argv, "BLOCK"); Array.Append(argv, str(blockMs)); }
+        Array.Append(argv, "STREAMS");
+        Array.Append(argv, key);
+        Array.Append(argv, lastId);
+        let raw = this._a(argv);
+        // XREAD returns [[streamname, [[id, fields], ...]], ...]
+        if (raw == nil || len(raw) == 0) { return nil; }
+        let streamData = raw[0];
+        if (streamData == nil || len(streamData) < 2) { return nil; }
+        return this._parseEntries(streamData[1]);
+    }
+
+    // r.XGroupCreate(key, group, id?, mkstream?) - "OK" | { error }
+    // id: "$" (default) = only new messages; "0" = all existing messages
+    // mkstream: true = create stream if it doesn't exist
+    fn XGroupCreate(key: string, group: string, id?, mkstream?) {
+        let startId = (id != nil) ? id : "$";
+        let argv = ["XGROUP", "CREATE", key, group, startId];
+        if (mkstream == true) { Array.Append(argv, "MKSTREAM"); }
+        return this._a(argv);
+    }
+
+    // r.XGroupDestroy(key, group) - int (1 = destroyed, 0 = not found)
+    fn XGroupDestroy(key: string, group: string) {
+        return this._a(["XGROUP", "DESTROY", key, group]);
+    }
+
+    // r.XGroupSetId(key, group, id) - "OK"
+    // Reset last-delivered-id; use "$" to skip all existing messages
+    fn XGroupSetId(key: string, group: string, id: string) {
+        return this._a(["XGROUP", "SETID", key, group, id]);
+    }
+
+    // r.XReadGroup(group, consumer, key, id, count?, blockMs?) - array<{id, fields}> | nil
+    // id: ">" = only new undelivered messages; "0" = re-deliver pending (PEL)
+    // blockMs: 0 = block forever; nil = non-blocking
+    fn XReadGroup(group: string, consumer: string, key: string, id: string, count?, blockMs?) {
+        let argv = ["XREADGROUP", "GROUP", group, consumer];
+        if (count   != nil) { Array.Append(argv, "COUNT"); Array.Append(argv, str(count)); }
+        if (blockMs != nil) { Array.Append(argv, "BLOCK"); Array.Append(argv, str(blockMs)); }
+        Array.Append(argv, "STREAMS");
+        Array.Append(argv, key);
+        Array.Append(argv, id);
+        let raw = this._a(argv);
+        if (raw == nil || len(raw) == 0) { return nil; }
+        let streamData = raw[0];
+        if (streamData == nil || len(streamData) < 2) { return nil; }
+        return this._parseEntries(streamData[1]);
+    }
+
+    // r.XAck(key, group, id) - int (messages acknowledged)
+    fn XAck(key: string, group: string, id: string) {
+        return this._a(["XACK", key, group, id]);
+    }
+
+    // r.XAckMany(key, group, ids) - int (ids is an array of id strings)
+    fn XAckMany(key: string, group: string, ids) {
+        return this._a(["XACK", key, group] + ids);
+    }
+
+    // r.XPending(key, group) - summary { count, minId, maxId, consumers } | nil
+    // consumers: array of { name, count }
+    fn XPending(key: string, group: string) {
+        let raw = this._a(["XPENDING", key, group]);
+        if (raw == nil || len(raw) < 4) { return nil; }
+        let consumers = [];
+        if (raw[3] != nil) {
+            let j = 0;
+            while (j < len(raw[3])) {
+                let c = raw[3][j];
+                Array.Append(consumers, { name: c[0], count: int(c[1]) });
+                j += 1;
+            }
+        }
+        return { count: raw[0], minId: raw[1], maxId: raw[2], consumers: consumers };
+    }
+
+    // r.XPendingRange(key, group, start, end, count, minIdleMs?) - array<{id, consumer, idleMs, deliveries}>
+    // start/end: "-" / "+" or ids; minIdleMs filters by idle time (Redis 7.0+)
+    fn XPendingRange(key: string, group: string, start: string, end: string, count: int, minIdleMs?) {
+        let argv = ["XPENDING", key, group];
+        if (minIdleMs != nil) { Array.Append(argv, "IDLE"); Array.Append(argv, str(minIdleMs)); }
+        Array.Append(argv, start);
+        Array.Append(argv, end);
+        Array.Append(argv, str(count));
+        let raw = this._a(argv);
+        if (raw == nil) { return []; }
+        let out = [];
+        let i = 0;
+        while (i < len(raw)) {
+            let entry = raw[i];
+            Array.Append(out, {
+                id:         entry[0],
+                consumer:   entry[1],
+                idleMs:     int(entry[2]),
+                deliveries: int(entry[3])
+            });
+            i += 1;
+        }
+        return out;
+    }
+
+    // r.XClaim(key, group, consumer, minIdleMs, ids) - array<{id, fields}>
+    // Claim ownership of pending messages idle for >= minIdleMs
+    fn XClaim(key: string, group: string, consumer: string, minIdleMs: int, ids) {
+        let argv = ["XCLAIM", key, group, consumer, str(minIdleMs)] + ids;
+        return this._parseEntries(this._a(argv));
+    }
+
+    // r.XAutoClaim(key, group, consumer, minIdleMs, start, count?) - { next, messages } | nil
+    // Atomically scan + claim stalled PEL entries (Redis 6.2+)
+    // next: "0-0" means scan complete
+    fn XAutoClaim(key: string, group: string, consumer: string, minIdleMs: int, start: string, count?) {
+        let argv = ["XAUTOCLAIM", key, group, consumer, str(minIdleMs), start];
+        if (count != nil) { Array.Append(argv, "COUNT"); Array.Append(argv, str(count)); }
+        let raw = this._a(argv);
+        if (raw == nil || len(raw) < 2) { return nil; }
+        return { next: raw[0], messages: this._parseEntries(raw[1]) };
+    }
+
+    // r.EnsureStream(key, group) - "OK" | { error }
+    // Idempotent: creates stream + group; silently ignores BUSYGROUP if already exists.
+    fn EnsureStream(key: string, group: string) {
+        let result = this.XGroupCreate(key, group, "0", true);
+        if (result != nil && "error" in result) {
+            if (!String.Contains(result.error, "BUSYGROUP")) { return result; }
+        }
+        return "OK";
+    }
+
+    // ── Server ───────────────────────────────────────────────────────────────
+
+    // r.Ping() - "PONG" | { error }
+    fn Ping()    { return this._c("PING"); }
+
+    // r.FlushDb() - "OK"
+    fn FlushDb() { return this._c("FLUSHDB"); }
+
+    // r.DbSize() - int
+    fn DbSize()  { return this._c("DBSIZE"); }
+
+    // r.Close()
+    fn Close() { let f = this._close; return f(this._conn); }
+}
+
+export { Redis };

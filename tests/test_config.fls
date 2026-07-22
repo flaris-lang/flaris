@@ -1,0 +1,587 @@
+// config_test.fls - Test suite for Config class
+// Run: flarisvm config_test.fls
+
+import { Config } from library("Config", "1.0");
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(label, got, expected) {
+    if (got == expected) {
+        passed += 1;
+        Console.WriteLine("  PASS  " + label);
+    } else {
+        failed += 1;
+        Console.WriteLine("  FAIL  " + label);
+        Console.WriteLine("        expected: " + str(expected));
+        Console.WriteLine("        got:      " + str(got));
+    }
+}
+
+fn checkTrue(label, got) {
+    check(label, got, true);
+}
+
+// =============================================================================
+// Test groups
+// =============================================================================
+
+fn test_basic_scalars() {
+    Console.WriteLine("\n[1] Basic scalars");
+    let c = new Config();
+    c.Load("title   = \"My App\"\nversion = 3\npi      = 3.14\nenabled = true\nratio   = 1.5e2\n");
+    check("string",    c.GetString("title", nil),  "My App");
+    check("int",       c.GetInt("version", nil),   3);
+    check("float",     c.GetFloat("pi", nil),      3.14);
+    check("bool",      c.GetBool("enabled", nil),  true);
+    check("sci float", c.GetFloat("ratio", nil),   150.0);
+}
+
+fn test_sections() {
+    Console.WriteLine("\n[2] Sections");
+    let c = new Config();
+    c.Load("[database]\nhost = \"localhost\"\nport = 5432\n\n[cache]\nttl = 60\n");
+    check("db.host",   c.GetString("database.host", nil), "localhost");
+    check("db.port",   c.GetInt("database.port", nil),    5432);
+    check("cache.ttl", c.GetInt("cache.ttl", nil),        60);
+    checkTrue("sections count", len(c.Sections()) == 2);
+}
+
+fn test_dotted_keys() {
+    Console.WriteLine("\n[3] Dotted keys");
+    let c = new Config();
+    c.Load("server.host = \"0.0.0.0\"\nserver.port = 8080\n");
+    check("dotted host", c.GetString("server.host", nil), "0.0.0.0");
+    check("dotted port", c.GetInt("server.port", nil),    8080);
+}
+
+fn test_arrays() {
+    Console.WriteLine("\n[4] Arrays");
+    let c = new Config();
+    c.Load("ports  = [80, 443, 8080]\nlabels = [\"web\", \"api\", \"db\"]\nempty  = []\n");
+    let ports = c.GetArray("ports");
+    check("array len",   len(ports),              3);
+    check("array[0]",    ports[0],                80);
+    check("array[2]",    ports[2],                8080);
+    check("str array",   c.GetArray("labels")[1], "api");
+    check("empty array", len(c.GetArray("empty")), 0);
+}
+
+fn test_inline_tables() {
+    Console.WriteLine("\n[5] Inline tables");
+    let c = new Config();
+    c.Load("point = { x = 10, y = 20 }\n");
+    check("inline x", c.GetInt("point.x", nil), 10);
+    check("inline y", c.GetInt("point.y", nil), 20);
+}
+
+fn test_array_of_tables() {
+    Console.WriteLine("\n[6] Array of tables");
+    let c = new Config();
+    c.Load("[[products]]\nname  = \"Widget\"\nprice = 9.99\n\n[[products]]\nname  = \"Gadget\"\nprice = 24.99\n");
+    let products = c.GetArray("products");
+    check("aot count",    len(products),      2);
+    check("aot[0].name",  products[0].name,   "Widget");
+    check("aot[1].price", products[1].price,  24.99);
+}
+
+fn test_string_escapes() {
+    Console.WriteLine("\n[7] String escapes");
+    let c = new Config();
+    c.Load("path   = \"C:\\\\Users\\\\admin\"\ntabbed = \"col1\\tcol2\"\n");
+    check("backslash", c.GetString("path", nil),   "C:\\Users\\admin");
+    check("tab",       c.GetString("tabbed", nil), "col1\tcol2");
+}
+
+fn test_literal_strings() {
+    Console.WriteLine("\n[8] Literal strings");
+    let c = new Config();
+    c.Load("regex = 'C:\\Users\\n'\n");
+    check("literal no escape", c.GetString("regex", nil), "C:\\Users\\n");
+}
+
+fn test_number_formats() {
+    Console.WriteLine("\n[9] Number formats");
+    let c = new Config();
+    c.Load("hex   = 0xFF\noct   = 0o77\nbin   = 0b1010\nunder = 1_000_000\nneg   = -42\n");
+    check("hex",         c.GetInt("hex", nil),   255);
+    check("octal",       c.GetInt("oct", nil),   63);
+    check("binary",      c.GetInt("bin", nil),   10);
+    check("underscores", c.GetInt("under", nil), 1000000);
+    check("negative",    c.GetInt("neg", nil),   -42);
+}
+
+fn test_comments() {
+    Console.WriteLine("\n[10] Comments");
+    let c = new Config();
+    c.Load("# top comment\nkey = \"value\"  # inline comment\n");
+    check("comment ignored", c.GetString("key", nil), "value");
+}
+
+fn test_has_and_defaults() {
+    Console.WriteLine("\n[11] Has / defaults");
+    let c = new Config();
+    c.Load("x = 1\n");
+    checkTrue("has x",      c.Has("x"));
+    checkTrue("missing y",  !c.Has("y"));
+    check("default int",    c.GetInt("y", 99),      99);
+    check("default string", c.GetString("y", "hi"), "hi");
+    check("default bool",   c.GetBool("y", true),   true);
+    // optional default - omitted means nil returned on missing key
+    check("no default int",    c.GetInt("y"),    nil);
+    check("no default string", c.GetString("y"), nil);
+    check("no default bool",   c.GetBool("y"),   nil);
+    // key exists - default irrelevant whether passed or not
+    check("exists no default", c.GetInt("x"), 1);
+}
+
+fn test_set_remove() {
+    Console.WriteLine("\n[12] Set / Remove");
+    let c = new Config();
+    c.Load("x = 1\n");
+    c.Set("x", 42);
+    check("set overwrites",   c.GetInt("x", nil),            42);
+    c.Set("nested.key", "hello");
+    check("set nested",       c.GetString("nested.key", nil), "hello");
+    c.Remove("x");
+    checkTrue("remove clears", !c.Has("x"));
+}
+
+fn test_chaining() {
+    Console.WriteLine("\n[13] Chaining");
+    let c = new Config();
+    c.Set("a", 1).Set("b", 2).Set("c", 3);
+    check("chain a", c.GetInt("a", nil), 1);
+    check("chain b", c.GetInt("b", nil), 2);
+    check("chain c", c.GetInt("c", nil), 3);
+}
+
+fn test_round_trip() {
+    Console.WriteLine("\n[14] Round-trip");
+    let c1 = new Config();
+    c1.Load("name = \"Flaris\"\nversion = 1\n\n[server]\nhost = \"0.0.0.0\"\nport = 9000\n");
+    let c2 = new Config();
+    c2.Load(c1.ToString());
+    check("rt name",        c2.GetString("name", nil),        "Flaris");
+    check("rt version",     c2.GetInt("version", nil),        1);
+    check("rt server.host", c2.GetString("server.host", nil), "0.0.0.0");
+    check("rt server.port", c2.GetInt("server.port", nil),    9000);
+}
+
+fn test_get_section() {
+    Console.WriteLine("\n[15] GetSection");
+    let c = new Config();
+    c.Load("[db]\nhost = \"localhost\"\nport = 5432\n");
+    let sec = c.GetSection("db");
+    check("section host", sec.host, "localhost");
+    check("section port", sec.port, 5432);
+    checkTrue("missing section empty", Object.Count(c.GetSection("nope")) == 0);
+}
+
+fn test_bools() {
+    Console.WriteLine("\n[16] Bool edge cases");
+    let c = new Config();
+    c.Load("a = true\nb = false\n");
+    check("true",  c.GetBool("a", nil), true);
+    check("false", c.GetBool("b", nil), false);
+}
+
+fn test_get_array_fallback() {
+    Console.WriteLine("\n[17] GetArray fallback");
+    let c = new Config();
+    c.Load("x = 1\n");
+    let arr = c.GetArray("missing");
+    checkTrue("missing key returns empty array", is_array(arr));
+    checkTrue("empty array has length 0",        len(arr) == 0);
+}
+
+fn test_keys() {
+    Console.WriteLine("\n[18] Keys");
+    let c = new Config();
+    c.Load("a = 1\nb = 2\n\n[section]\nx = 10\ny = 20\n");
+
+    let top = c.Keys(nil);
+    checkTrue("top-level has a",       Array.Contains(top, "a"));
+    checkTrue("top-level has b",       Array.Contains(top, "b"));
+    checkTrue("top-level has section", Array.Contains(top, "section"));
+
+    let sec = c.Keys("section");
+    checkTrue("section has x",  Array.Contains(sec, "x"));
+    checkTrue("section has y",  Array.Contains(sec, "y"));
+    check("section key count",  len(sec), 2);
+
+    // empty string behaves like nil - returns top-level
+    let top2 = c.Keys("");
+    checkTrue("empty string = top-level", Array.Contains(top2, "a"));
+}
+
+fn test_merge() {
+    Console.WriteLine("\n[19] Merge");
+    let base = new Config();
+    base.Load("host = \"localhost\"\nport = 8080\ndebug = false\n");
+
+    let override = new Config();
+    override.Load("port = 9090\ndebug = true\nextra = \"yes\"\n");
+
+    base.Merge(override);
+    check("merge: unchanged key",  base.GetString("host", nil),  "localhost");
+    check("merge: overridden int",  base.GetInt("port", nil),    9090);
+    check("merge: overridden bool", base.GetBool("debug", nil),  true);
+    check("merge: new key",         base.GetString("extra", nil), "yes");
+
+    // Merge returns self for chaining
+    let c1 = new Config();
+    c1.Load("x = 1\n");
+    let c2 = new Config();
+    c2.Load("y = 2\n");
+    let c3 = new Config();
+    c3.Load("z = 3\n");
+    c1.Merge(c2).Merge(c3);
+    check("merge chaining x", c1.GetInt("x", nil), 1);
+    check("merge chaining y", c1.GetInt("y", nil), 2);
+    check("merge chaining z", c1.GetInt("z", nil), 3);
+}
+
+fn test_defaults() {
+    Console.WriteLine("\n[20] Defaults");
+    let c = new Config();
+    c.Load("host = \"prod\"\nport = 443\n");
+
+    // Keys already present must not be overwritten
+    c.Defaults({ host: "fallback", port: 80, debug: false, name: "app" });
+    check("defaults: existing string unchanged", c.GetString("host", nil),  "prod");
+    check("defaults: existing int unchanged",    c.GetInt("port", nil),     443);
+    // Missing keys get filled in
+    check("defaults: new bool set",   c.GetBool("debug", nil),   false);
+    check("defaults: new string set", c.GetString("name", nil),  "app");
+
+    // Defaults returns self for chaining
+    let c2 = new Config();
+    c2.Defaults({ a: 1 }).Defaults({ b: 2 });
+    check("defaults chaining a", c2.GetInt("a", nil), 1);
+    check("defaults chaining b", c2.GetInt("b", nil), 2);
+}
+
+fn test_from_object() {
+    Console.WriteLine("\n[21] FromObject");
+    let obj = { title: "Hello", count: 7, active: true };
+    let c = Config.FromObject(obj);
+    check("FromObject string", c.GetString("title", nil),  "Hello");
+    check("FromObject int",    c.GetInt("count", nil),     7);
+    check("FromObject bool",   c.GetBool("active", nil),   true);
+    checkTrue("FromObject has title",  c.Has("title"));
+    checkTrue("FromObject no missing", !c.Has("nope"));
+}
+
+fn test_get_raw() {
+    Console.WriteLine("\n[22] Get (raw)");
+    let c = new Config();
+    c.Load("num = 42\nname = \"Alice\"\nflag = true\n\n[meta]\nversion = 2\n");
+    check("Get int",    c.Get("num"),          42);
+    check("Get string", c.Get("name"),         "Alice");
+    check("Get bool",   c.Get("flag"),         true);
+    check("Get nested", c.Get("meta.version"), 2);
+    check("Get missing returns nil", c.Get("no_such_key"), nil);
+}
+
+fn test_save_load_file() {
+    Console.WriteLine("\n[23] Save / LoadFile");
+    let path = Path.Combine(Os.TempDir(), "config_test_roundtrip.toml");
+    let c1 = new Config();
+    c1.Load("app = \"TestApp\"\nversion = 5\nenabled = true\n\n[db]\nhost = \"127.0.0.1\"\nport = 3306\n");
+    c1.Save(path);
+
+    let c2 = new Config();
+    c2.LoadFile(path);
+    check("LoadFile: app",     c2.GetString("app", nil),     "TestApp");
+    check("LoadFile: version", c2.GetInt("version", nil),    5);
+    check("LoadFile: enabled", c2.GetBool("enabled", nil),   true);
+    check("LoadFile: db.host", c2.GetString("db.host", nil), "127.0.0.1");
+    check("LoadFile: db.port", c2.GetInt("db.port", nil),    3306);
+}
+
+fn test_multiline_strings() {
+    Console.WriteLine("\n[24] Multi-line strings");
+    let c = new Config();
+    // Basic multi-line basic string (triple-quote)
+    c.Load("bio = \"\"\"\nLine one\nLine two\n\"\"\"\n");
+    let bio = c.GetString("bio", nil);
+    checkTrue("ml basic contains Line one", String.Contains(bio, "Line one"));
+    checkTrue("ml basic contains Line two", String.Contains(bio, "Line two"));
+
+    // Multi-line literal string (triple-single-quote)
+    let c2 = new Config();
+    c2.Load("raw = '''\nno \\n escape here\n'''\n");
+    let raw = c2.GetString("raw", nil);
+    checkTrue("ml literal no escape", String.Contains(raw, "no \\n escape here"));
+}
+
+fn test_yaml_scalars() {
+    Console.WriteLine("\n[25] YAML - scalars");
+    let c = new Config();
+    c.LoadYaml("name: Alice\nage: 30\npi: 3.14\nactive: true\ndisabled: false\nempty:\n");
+    check("yaml string",  c.GetString("name", nil),   "Alice");
+    check("yaml int",     c.GetInt("age", nil),        30);
+    check("yaml float",   c.GetFloat("pi", nil),       3.14);
+    check("yaml bool t",  c.GetBool("active", nil),    true);
+    check("yaml bool f",  c.GetBool("disabled", nil),  false);
+    check("yaml null",    c.Get("empty"),               nil);
+}
+
+fn test_yaml_nested() {
+    Console.WriteLine("\n[26] YAML - nested mappings");
+    let c = new Config();
+    c.LoadYaml("server:\n  host: localhost\n  port: 8080\ndatabase:\n  name: mydb\n  ssl: false\n");
+    check("yaml nested string", c.GetString("server.host", nil),   "localhost");
+    check("yaml nested int",    c.GetInt("server.port", nil),      8080);
+    check("yaml nested string2",c.GetString("database.name", nil), "mydb");
+    check("yaml nested bool",   c.GetBool("database.ssl", nil),    false);
+    checkTrue("yaml sections count", len(c.Sections()) == 2);
+}
+
+fn test_yaml_sequences() {
+    Console.WriteLine("\n[27] YAML - sequences");
+    let c = new Config();
+    c.LoadYaml("ports:\n  - 80\n  - 443\n  - 8080\ntags:\n  - web\n  - api\n");
+    let ports = c.GetArray("ports");
+    check("yaml seq len",   len(ports),  3);
+    check("yaml seq [0]",   ports[0],    80);
+    check("yaml seq [2]",   ports[2],    8080);
+    let tags = c.GetArray("tags");
+    check("yaml str seq",   tags[1],     "api");
+}
+
+fn test_yaml_inline_flow() {
+    Console.WriteLine("\n[28] YAML - inline flow");
+    let c = new Config();
+    c.LoadYaml("point: {x: 10, y: 20}\ncolors: [red, green, blue]\n");
+    check("yaml flow map x",   c.GetInt("point.x", nil), 10);
+    check("yaml flow map y",   c.GetInt("point.y", nil), 20);
+    let colors = c.GetArray("colors");
+    check("yaml flow array len", len(colors), 3);
+    check("yaml flow array[1]",  colors[1],   "green");
+}
+
+fn test_yaml_booleans() {
+    Console.WriteLine("\n[29] YAML - boolean aliases");
+    let c = new Config();
+    c.LoadYaml("a: yes\nb: no\nc: on\nd: off\ne: true\nf: false\n");
+    check("yaml yes",   c.GetBool("a", nil), true);
+    check("yaml no",    c.GetBool("b", nil), false);
+    check("yaml on",    c.GetBool("c", nil), true);
+    check("yaml off",   c.GetBool("d", nil), false);
+    check("yaml true",  c.GetBool("e", nil), true);
+    check("yaml false", c.GetBool("f", nil), false);
+}
+
+fn test_yaml_load_file() {
+    Console.WriteLine("\n[30] YAML - LoadYamlFile");
+    let path = Path.Combine(Os.TempDir(), "config_test.yaml");
+    File.WriteText(path, "service: gateway\nretries: 3\ntimeout: 1.5\nenabled: true\n");
+    let c = new Config();
+    c.LoadYamlFile(path);
+    check("yaml file string",  c.GetString("service", nil), "gateway");
+    check("yaml file int",     c.GetInt("retries", nil),    3);
+    check("yaml file float",   c.GetFloat("timeout", nil),  1.5);
+    check("yaml file bool",    c.GetBool("enabled", nil),   true);
+}
+
+fn test_yaml_multiline_blocks() {
+    Console.WriteLine("\n[31] YAML - multiline literal (|) and folded (>)");
+
+    // Literal block: newlines preserved, trailing newline included
+    let c1 = new Config();
+    c1.LoadYaml("poem: |\n  line one\n  line two\n  line three\nnext: done\n");
+    let poem = c1.GetString("poem", nil);
+    checkTrue("literal | contains line one",   String.Contains(poem, "line one"));
+    checkTrue("literal | contains line two",   String.Contains(poem, "line two"));
+    checkTrue("literal | contains line three", String.Contains(poem, "line three"));
+    checkTrue("literal | has newline",         String.Contains(poem, "\n"));
+    check("literal | next key unaffected",     c1.GetString("next", nil), "done");
+
+    // Folded block: newlines become spaces (paragraph folding)
+    let c2 = new Config();
+    c2.LoadYaml("desc: >\n  This is a\n  long sentence.\nnext: ok\n");
+    let desc = c2.GetString("desc", nil);
+    checkTrue("folded > contains 'This is a'",    String.Contains(desc, "This is a"));
+    checkTrue("folded > contains 'long sentence'", String.Contains(desc, "long sentence"));
+    checkTrue("folded > words joined with space",  String.Contains(desc, "This is a long sentence"));
+    check("folded > next key unaffected",          c2.GetString("next", nil), "ok");
+
+    // Literal block alongside sequences and nested mappings
+    let c3 = new Config();
+    c3.LoadYaml("server:\n  host: example.com\n  notes: |\n    line A\n    line B\nports:\n  - 80\n  - 443\n");
+    check("mixed: server.host",     c3.GetString("server.host", nil), "example.com");
+    let notes = c3.GetString("server.notes", nil);
+    checkTrue("mixed: notes line A", String.Contains(notes, "line A"));
+    checkTrue("mixed: notes line B", String.Contains(notes, "line B"));
+    let ports = c3.GetArray("ports");
+    check("mixed: ports len",  len(ports), 2);
+    check("mixed: ports[0]",   ports[0],   80);
+    check("mixed: ports[1]",   ports[1],   443);
+}
+
+fn test_dotenv() {
+    Console.WriteLine("\n[32] .env loader + ${VAR} interpolation");
+
+    let env = "# a comment\n" +
+              "export NAME=flaris\n" +
+              "GREETING=\"hello $NAME\"\n" +
+              "LITERAL='raw $NAME'\n" +
+              "PORT=8080 # inline comment\n" +
+              "URL=http://localhost:${PORT}/api\n" +
+              "WITH_DEFAULT=${MISSING:-fallback}\n" +
+              "ESCAPED=cost is \\$5\n" +
+              "\n" +
+              "EMPTY=\n";
+    let c = new Config();
+    c.LoadEnv(env);
+    check(".env export key",           c.GetString("NAME", nil),         "flaris");
+    check(".env $VAR interpolation",   c.GetString("GREETING", nil),     "hello flaris");
+    check(".env single-quote literal", c.GetString("LITERAL", nil),      "raw $NAME");
+    check(".env inline comment strip", c.GetString("PORT", nil),         "8080");
+    check(".env ${VAR} interpolation", c.GetString("URL", nil),          "http://localhost:8080/api");
+    check(".env ${VAR:-default}",      c.GetString("WITH_DEFAULT", nil), "fallback");
+    check(".env escaped \\$",          c.GetString("ESCAPED", nil),      "cost is $5");
+    check(".env empty value",          c.GetString("EMPTY", nil),        "");
+
+    // OS environment fallback
+    Os.Setenv("FLARIS_CFG_TEST", "fromenv");
+    let c2 = new Config();
+    c2.LoadEnv("X=${FLARIS_CFG_TEST}");
+    check(".env resolves OS env", c2.GetString("X", nil), "fromenv");
+
+    // interpolation disabled
+    let c3 = new Config();
+    c3.LoadEnv("NAME=base\nREF=$NAME", false);
+    check(".env interpolate=false leaves $VAR", c3.GetString("REF", nil), "$NAME");
+
+    // standalone Interpolate with extraVars
+    let c4 = new Config();
+    c4.Set("path", "${ROOT}/bin");
+    c4.Interpolate({ ROOT: "/opt/app" });
+    check("Interpolate with extraVars", c4.GetString("path", nil), "/opt/app/bin");
+
+    // LoadEnvFile
+    let p = Path.Combine(Os.TempDir(), "flaris_test_config.env");
+    File.WriteText(p, "A=1\nB=two\nC=${A}-${B}\n");
+    let c5 = new Config();
+    c5.LoadEnvFile(p);
+    check(".env file C interpolated", c5.GetString("C", nil), "1-two");
+    File.Delete(p);
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+fn Main() {
+    test_basic_scalars();
+    test_sections();
+    test_dotted_keys();
+    test_arrays();
+    test_inline_tables();
+    test_array_of_tables();
+    test_string_escapes();
+    test_literal_strings();
+    test_number_formats();
+    test_comments();
+    test_has_and_defaults();
+    test_set_remove();
+    test_chaining();
+    test_round_trip();
+    test_get_section();
+    test_bools();
+    test_get_array_fallback();
+    test_keys();
+    test_merge();
+    test_defaults();
+    test_from_object();
+    test_get_raw();
+    test_save_load_file();
+    test_multiline_strings();
+    test_yaml_scalars();
+    test_yaml_nested();
+    test_yaml_sequences();
+    test_yaml_inline_flow();
+    test_yaml_booleans();
+    test_yaml_load_file();
+    test_yaml_multiline_blocks();
+    test_dotenv();
+
+    Console.WriteLine("\n" + String.Repeat("=", 40));
+    Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed");
+
+    if (failed > 0) {
+        Console.WriteLine("Some tests FAILED.");
+        return 1;
+    }
+    Console.WriteLine("All tests passed.");
+
+    let toml_small = "name = \"Alice\"\nage = 30\nactive = true\n";
+    let toml_medium = "[server]\nhost = \"localhost\"\nport = 8080\ntimeout = 30\n\n[database]\nurl = \"postgres://localhost/mydb\"\npool = 10\nssl = false\n\n[logging]\nlevel = \"info\"\nfile = \"/var/log/app.log\"\n";
+    let cfg_warm = new Config();
+    cfg_warm.Load(toml_medium);
+
+    Console.WriteLine("\n\n=== Config Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Parse (Load) ]");
+    bench("Load  small TOML  (3 keys)", fn() {
+        let c = new Config();
+        c.Load(toml_small);
+        _sink = _sink + 1;
+    }, 1000);
+    bench("Load  medium TOML (3 sections, 9 keys)", fn() {
+        let c = new Config();
+        c.Load(toml_medium);
+        _sink = _sink + 1;
+    }, 300);
+
+    Console.WriteLine("\n[ Read (warm config) ]");
+    bench("GetString  existing key", fn() {
+        let v = cfg_warm.GetString("server.host", ""); _sink = _sink + 1;
+    }, 10000);
+    bench("GetInt     existing key", fn() {
+        let v = cfg_warm.GetInt("server.port", 0); _sink = _sink + v;
+    }, 10000);
+    bench("GetBool    existing key", fn() {
+        let v = cfg_warm.GetBool("database.ssl", false); _sink = _sink + 1;
+    }, 10000);
+    bench("GetString  missing key (default fallback)", fn() {
+        let v = cfg_warm.GetString("no.such.key", "fallback"); _sink = _sink + 1;
+    }, 10000);
+
+    Console.WriteLine("\n[ Write ]");
+    bench("Set  new key + GetString", fn() {
+        cfg_warm.Set("bench.key", str(_sink));
+        let v = cfg_warm.GetString("bench.key", "");
+        _sink = _sink + 1;
+    }, 5000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return 0;
+}

@@ -1,0 +1,708 @@
+// test_redis.fls - Test suite for the Redis FFI binding
+//
+// Run (from repo root):
+//   flarisvm --unsafe tests/test_redis.fls --libs='./libs'
+//
+// Prerequisites:
+//   - libs/redis_ffi.dylib (or .so) compiled - run ./libs/build_redis.sh
+//   - Redis.fls compiled: flarisvm --compile libs/Redis.fls libs/Redis.flx
+//   - A running Redis instance on 127.0.0.1:6379
+//
+// All keys are prefixed with "flaris_test:" and flushed after each group
+// so the suite is safe to run against a shared Redis instance.
+
+import { Redis } from library("Redis", "1.0");
+
+const HOST = "127.0.0.1";
+const PORT  = 6379;
+const PFX   = "flaris_test:";
+
+// ── Benchmark helpers ────────────────────────────────────────────────────────
+
+global _sink = 0;
+global _br   = nil;   // Redis handle captured by bench lambdas
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 44),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine("------------------------------------------------------------"); }
+
+fn bench_redis(r) {
+    _br = r;
+    let bk  = PFX + "bench:str";
+    let bhk = PFX + "bench:hash";
+    let blk = PFX + "bench:list";
+    let bck = PFX + "bench:ctr";
+
+    // Seed key for GET-hit benchmark
+    r.Set(bk, "benchvalue");
+
+    Console.WriteLine("\n========================================");
+    Console.WriteLine(" Redis Benchmarks");
+    Console.WriteLine("========================================");
+    Console.WriteLine(String.PadRight("benchmark", 44), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("[ String commands ]");
+
+    bench("Set   key - value", fn() {
+        _br.Set(bk, "benchvalue");
+    }, 2000);
+
+    bench("Get   key (hit)", fn() {
+        _sink = _br.Get(bk);
+    }, 2000);
+
+    bench("Get   missing key (miss)", fn() {
+        _sink = _br.Get(PFX + "bench:no_such_key");
+    }, 2000);
+
+    bench("Incr  counter", fn() {
+        _sink = _br.Incr(bck);
+    }, 2000);
+
+    benchSep();
+    Console.WriteLine("[ Hash commands ]");
+
+    bench("HSet  field", fn() {
+        _br.HSet(bhk, "field", "value");
+    }, 2000);
+
+    bench("HGet  field (hit)", fn() {
+        _sink = _br.HGet(bhk, "field");
+    }, 2000);
+
+    bench("HGetAll  3 fields", fn() {
+        _br.HSet(bhk, "a", "1");
+        _br.HSet(bhk, "b", "2");
+        _sink = _br.HGetAll(bhk);
+    }, 1000);
+
+    benchSep();
+    Console.WriteLine("[ List commands ]");
+
+    bench("LPush  value", fn() {
+        _br.LPush(blk, "item");
+    }, 2000);
+
+    bench("LPop   value", fn() {
+        _sink = _br.LPop(blk);
+    }, 2000);
+
+    // Cleanup bench keys
+    r.Del(bk);
+    r.Del(bhk);
+    r.Del(blk);
+    r.Del(bck);
+}
+
+// ── Test framework ───────────────────────────────────────────────────────────
+
+global passed = 0;
+global failed = 0;
+
+fn check(label:string, cond:bool) {
+    if (cond) {
+        Console.WriteLine("  [PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("  [FAIL] " + label);
+        failed += 1;
+    }
+}
+
+fn checkEq(label:string, actual, expected) {
+    if (actual == expected) {
+        Console.WriteLine("  [PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("  [FAIL] " + label
+            + "  expected=" + str(expected)
+            + "  got="      + str(actual));
+        failed += 1;
+    }
+}
+
+fn checkNotNil(label:string, val) {
+    check(label + " (not nil)", val != nil);
+}
+
+fn cleanup(r) {
+    // Delete all keys created during tests
+    let keys = r.Keys(PFX + "*");
+    if (keys != nil) {
+        foreach (k in keys) { r.Del(k); }
+    }
+}
+
+// ── Test groups ──────────────────────────────────────────────────────────────
+
+fn test_connect(r) {
+    Console.WriteLine("\n[1] Connect + Ping");
+    checkNotNil("Redis.Connect returned instance", r);
+    let pong = r.Ping();
+    checkEq("Ping - PONG", pong, "PONG");
+}
+
+fn test_strings(r) {
+    Console.WriteLine("\n[2] String commands");
+
+    let k = PFX + "str";
+    r.Set(k, "hello");
+    checkEq("Get after Set",        r.Get(k),    "hello");
+
+    r.Set(k, "world");
+    checkEq("Get after overwrite",  r.Get(k),    "world");
+
+    checkEq("Get missing - nil",    r.Get(PFX + "no_such_key_xyz"), nil);
+
+    // GetDel
+    let val = r.GetDel(k);
+    checkEq("GetDel returns value", val, "world");
+    checkEq("key gone after GetDel", r.Get(k), nil);
+
+    // SetNx
+    r.Set(k, "original");
+    let nx1 = r.SetNx(k, "new");
+    checkEq("SetNx on existing key - 0", nx1, 0);
+    checkEq("value unchanged after SetNx", r.Get(k), "original");
+
+    let nx2 = r.SetNx(PFX + "nx_new", "fresh");
+    checkEq("SetNx on new key - 1", nx2, 1);
+
+    r.Del(k);
+    r.Del(PFX + "nx_new");
+}
+
+fn test_incr_decr(r) {
+    Console.WriteLine("\n[3] Incr / Decr");
+
+    let k = PFX + "counter";
+    let v1 = r.Incr(k);
+    checkEq("first Incr - 1", v1, 1);
+
+    let v2 = r.Incr(k);
+    checkEq("second Incr - 2", v2, 2);
+
+    let v3 = r.IncrBy(k, 10);
+    checkEq("IncrBy 10 - 12", v3, 12);
+
+    let v4 = r.Decr(k);
+    checkEq("Decr - 11", v4, 11);
+
+    r.Del(k);
+}
+
+fn test_expiry(r) {
+    Console.WriteLine("\n[4] Expiry - SetEx / Expire / Ttl");
+
+    let k = PFX + "expiry";
+    r.SetEx(k, 3600, "temporary");
+    checkEq("Get after SetEx",    r.Get(k), "temporary");
+
+    let ttl = r.Ttl(k);
+    check("Ttl > 0",              ttl > 0);
+    check("Ttl <= 3600",          ttl <= 3600);
+
+    // Expire resets TTL
+    r.Expire(k, 7200);
+    let ttl2 = r.Ttl(k);
+    check("Ttl after Expire > 3600", ttl2 > 3600);
+
+    r.Del(k);
+    checkEq("Ttl of missing key - -2", r.Ttl(PFX + "no_such_key_xyz"), -2);
+}
+
+fn test_key_ops(r) {
+    Console.WriteLine("\n[5] Key operations - Del / Exists / Keys");
+
+    let k = PFX + "keyop";
+    r.Set(k, "1");
+    checkEq("Exists - 1",             r.Exists(k), 1);
+    checkEq("Del - 1",                r.Del(k),    1);
+    checkEq("Exists after Del - 0",   r.Exists(k), 0);
+    checkEq("Del missing - 0",        r.Del(PFX + "no_such_key_xyz"), 0);
+
+    // Keys pattern
+    r.Set(PFX + "kp_a", "1");
+    r.Set(PFX + "kp_b", "2");
+    let found = r.Keys(PFX + "kp_*");
+    checkEq("Keys returns 2 matches", len(found), 2);
+
+    r.Del(PFX + "kp_a");
+    r.Del(PFX + "kp_b");
+}
+
+fn test_mget(r) {
+    Console.WriteLine("\n[6] MGet");
+
+    let k1 = PFX + "mg1";
+    let k2 = PFX + "mg2";
+    r.Set(k1, "alpha");
+    r.Set(k2, "beta");
+
+    let vals = r.MGet([k1, k2, PFX + "mg_missing"]);
+    checkEq("MGet length = 3",    len(vals), 3);
+    checkEq("MGet[0] = alpha",    vals[0],   "alpha");
+    checkEq("MGet[1] = beta",     vals[1],   "beta");
+    checkEq("MGet[2] missing nil", vals[2],  nil);
+
+    r.Del(k1);
+    r.Del(k2);
+}
+
+fn test_lists(r) {
+    Console.WriteLine("\n[7] List commands");
+
+    let k = PFX + "list";
+
+    let n1 = r.RPush(k, "a");
+    checkEq("RPush - 1", n1, 1);
+    let n2 = r.RPush(k, "b");
+    checkEq("RPush - 2", n2, 2);
+    r.LPush(k, "z");
+
+    checkEq("LLen - 3", r.LLen(k), 3);
+
+    let range = r.LRange(k, 0, -1);
+    checkEq("LRange length = 3", len(range), 3);
+    checkEq("LRange[0] = z",     range[0],   "z");
+    checkEq("LRange[1] = a",     range[1],   "a");
+    checkEq("LRange[2] = b",     range[2],   "b");
+
+    checkEq("LPop - z",  r.LPop(k), "z");
+    checkEq("RPop - b",  r.RPop(k), "b");
+    checkEq("LLen - 1",  r.LLen(k), 1);
+
+    checkEq("LPop empty - nil", r.LPop(PFX + "no_such_list_xyz"), nil);
+
+    r.Del(k);
+}
+
+fn test_hashes(r) {
+    Console.WriteLine("\n[8] Hash commands");
+
+    let k = PFX + "hash";
+
+    r.HSet(k, "name",  "Alice");
+    r.HSet(k, "score", "9.5");
+    r.HSet(k, "city",  "Stockholm");
+
+    checkEq("HGet name",    r.HGet(k, "name"),   "Alice");
+    checkEq("HGet score",   r.HGet(k, "score"),  "9.5");
+    checkEq("HGet missing - nil", r.HGet(k, "no_field"), nil);
+
+    checkEq("HExists present - 1",  r.HExists(k, "name"),     1);
+    checkEq("HExists missing - 0",  r.HExists(k, "no_field"), 0);
+    checkEq("HLen - 3",             r.HLen(k),                3);
+
+    let hkeys = r.HKeys(k);
+    checkEq("HKeys length = 3", len(hkeys), 3);
+
+    let all = r.HGetAll(k);
+    checkNotNil("HGetAll not nil", all);
+    checkEq("HGetAll name",  all.name,  "Alice");
+    checkEq("HGetAll score", all.score, "9.5");
+    checkEq("HGetAll city",  all.city,  "Stockholm");
+
+    r.HDel(k, "city");
+    checkEq("HLen after HDel - 2", r.HLen(k), 2);
+
+    r.Del(k);
+}
+
+fn test_sets(r) {
+    Console.WriteLine("\n[9] Set commands");
+
+    let k = PFX + "set";
+
+    checkEq("SAdd - 1",                r.SAdd(k, "foo"), 1);
+    checkEq("SAdd duplicate - 0",      r.SAdd(k, "foo"), 0);
+    r.SAdd(k, "bar");
+    r.SAdd(k, "baz");
+
+    checkEq("SCard - 3",                  r.SCard(k),            3);
+    checkEq("SIsMember present - 1",      r.SIsMember(k, "foo"), 1);
+    checkEq("SIsMember missing - 0",      r.SIsMember(k, "zzz"), 0);
+
+    let members = r.SMembers(k);
+    checkEq("SMembers length = 3", len(members), 3);
+
+    checkEq("SRem - 1",               r.SRem(k, "bar"), 1);
+    checkEq("SCard after SRem - 2",   r.SCard(k),       2);
+
+    r.Del(k);
+}
+
+fn test_sorted_sets(r) {
+    Console.WriteLine("\n[10] Sorted set commands");
+
+    let k = PFX + "zset";
+
+    r.ZAdd(k, 1.0, "one");
+    r.ZAdd(k, 2.0, "two");
+    r.ZAdd(k, 3.0, "three");
+
+    checkEq("ZCard - 3",             r.ZCard(k),         3);
+    checkEq("ZRank 'one' - 0",       r.ZRank(k, "one"),  0);
+    checkEq("ZRank 'three' - 2",     r.ZRank(k, "three"), 2);
+    checkEq("ZRank missing - nil",   r.ZRank(k, "zzz"),  nil);
+
+    let score = r.ZScore(k, "two");
+    checkNotNil("ZScore not nil", score);
+
+    let range = r.ZRange(k, 0, -1);
+    checkEq("ZRange length = 3",  len(range), 3);
+    checkEq("ZRange[0] = one",    range[0],   "one");
+    checkEq("ZRange[2] = three",  range[2],   "three");
+
+    r.Del(k);
+}
+
+fn test_extended_strings(r) {
+    Console.WriteLine("\n[11] Extended string - IncrByFloat / DecrBy / Persist / Rename");
+
+    let k = PFX + "extstr";
+
+    // IncrByFloat
+    r.Set(k, "10");
+    let f1 = r.IncrByFloat(k, 1.5);
+    checkEq("IncrByFloat 10 + 1.5 - 11.5", f1, 11.5);
+    let f2 = r.IncrByFloat(k, -2.5);
+    checkEq("IncrByFloat 11.5 - 2.5 - 9.0", f2, 9.0);
+
+    // DecrBy
+    let c = PFX + "decr";
+    r.Set(c, "100");
+    let d = r.DecrBy(c, 25);
+    checkEq("DecrBy 100 - 25 - 75", d, 75);
+    r.Del(c);
+
+    // Persist: set TTL then remove it
+    r.SetEx(k, 3600, "temp");
+    check("Ttl > 0 before Persist", r.Ttl(k) > 0);
+    r.Persist(k);
+    checkEq("Ttl = -1 after Persist", r.Ttl(k), -1);
+
+    // Rename
+    let k2 = PFX + "extstr_renamed";
+    r.Rename(k, k2);
+    checkNotNil("value accessible under new key", r.Get(k2));
+    checkEq("old key gone after Rename", r.Get(k), nil);
+    r.Del(k2);
+}
+
+fn test_extended_hashes(r) {
+    Console.WriteLine("\n[12] Extended hash - HVals / HIncrBy");
+
+    let k = PFX + "hash2";
+    r.HSet(k, "x", "10");
+    r.HSet(k, "y", "20");
+    r.HSet(k, "z", "30");
+
+    let vals = r.HVals(k);
+    checkEq("HVals length = 3", len(vals), 3);
+
+    let n = r.HIncrBy(k, "x", 5);
+    checkEq("HIncrBy 10 + 5 - 15", n, 15);
+
+    r.Del(k);
+}
+
+fn test_extended_sorted_sets(r) {
+    Console.WriteLine("\n[13] Extended sorted sets - ZRem / ZScore(float) / ZIncrBy / ZRevRange / ZRevRank / ZCount");
+
+    let k = PFX + "zset2";
+    r.ZAdd(k, 1.0, "alpha");
+    r.ZAdd(k, 2.0, "beta");
+    r.ZAdd(k, 3.0, "gamma");
+
+    // ZScore returns float now
+    let sc = r.ZScore(k, "beta");
+    checkEq("ZScore(beta) = 2.0", sc, 2.0);
+    checkEq("ZScore missing - nil", r.ZScore(k, "zzz"), nil);
+
+    // ZIncrBy
+    let ns = r.ZIncrBy(k, 1.5, "beta");
+    checkEq("ZIncrBy beta +1.5 - 3.5", ns, 3.5);
+
+    // ZRevRange (highest first)
+    let rev = r.ZRevRange(k, 0, -1);
+    checkEq("ZRevRange length = 3", len(rev), 3);
+    checkEq("ZRevRange[0] = beta (score 3.5)", rev[0], "beta");
+
+    // ZRevRank
+    checkEq("ZRevRank beta = 0 (highest)", r.ZRevRank(k, "beta"), 0);
+    checkEq("ZRevRank alpha = 2 (lowest)",  r.ZRevRank(k, "alpha"), 2);
+    checkEq("ZRevRank missing - nil",       r.ZRevRank(k, "zzz"), nil);
+
+    // ZCount
+    checkEq("ZCount -inf +inf = 3",  r.ZCount(k, "-inf", "+inf"), 3);
+    checkEq("ZCount 1 2 = 1",        r.ZCount(k, "1", "2"),       1);
+
+    // ZRem
+    let rem = r.ZRem(k, "alpha");
+    checkEq("ZRem - 1", rem, 1);
+    checkEq("ZCard after ZRem - 2", r.ZCard(k), 2);
+    checkEq("ZRem missing - 0", r.ZRem(k, "zzz"), 0);
+
+    r.Del(k);
+}
+
+fn test_blpop(r) {
+    Console.WriteLine("\n[14] BLPop / BRPop - non-blocking with existing list");
+
+    let k = PFX + "blk";
+    r.RPush(k, "job1");
+    r.RPush(k, "job2");
+
+    // BLPop with timeout 0 should return immediately since list has items
+    let got = r.BLPop(k, 1);
+    checkNotNil("BLPop returned array", got);
+    checkEq("BLPop[1] = job1", got[1], "job1");
+
+    r.Del(k);
+}
+
+fn test_flexible_types(r) {
+    Console.WriteLine("\n[15] Flexible value types (int / float / bool coerced to string)");
+
+    let k = PFX + "flex";
+
+    r.Set(k, 42);
+    checkEq("Set int, Get - '42'", r.Get(k), "42");
+
+    r.Set(k, 3.14);
+    let fval = r.Get(k);
+    checkNotNil("Set float, Get not nil", fval);
+
+    r.Set(k, true);
+    let bval = r.Get(k);
+    checkNotNil("Set bool, Get not nil", bval);
+
+    let hk = PFX + "flexhash";
+    r.HSet(hk, "count", 7);
+    checkEq("HSet int field, HGet - '7'", r.HGet(hk, "count"), "7");
+
+    r.Del(k);
+    r.Del(hk);
+}
+
+fn test_raw_cmd(r) {
+    Console.WriteLine("\n[16] Cmd / CmdArgv");
+
+    let pong = r.Cmd("PING");
+    checkEq("Cmd PING - PONG", pong, "PONG");
+
+    let k = PFX + "raw";
+    r.CmdArgv(["SET", k, "value with spaces"]);
+    checkEq("CmdArgv SET + GET roundtrip", r.Get(k), "value with spaces");
+    r.Del(k);
+}
+
+fn test_dbsize(r) {
+    Console.WriteLine("\n[17] DbSize");
+
+    let sz = r.DbSize();
+    check("DbSize >= 0", sz >= 0);
+}
+
+fn test_streams(r) {
+    Console.WriteLine("\n[18] Streams");
+
+    let k = PFX + "stream";
+    r.Del(k);
+
+    // XAddId - explicit, monotonically increasing ids (deterministic)
+    checkEq("XAddId returns the id",      r.XAddId(k, "1-1", { temp: 21, unit: "C" }), "1-1");
+    r.XAddId(k, "2-2", { temp: 23, unit: "C" });
+    r.XAddId(k, "3-3", { temp: 25, unit: "C" });
+    checkEq("XLen after 3 adds",          r.XLen(k), 3);
+
+    // XRange - full range, fields decoded into an object (values are strings)
+    let all = r.XRange(k, "-", "+", nil);
+    checkEq("XRange returns all 3",       len(all), 3);
+    checkEq("XRange[0].id",               all[0].id, "1-1");
+    checkEq("XRange[0].fields.temp",      all[0].fields.temp, "21");
+    checkEq("XRange[0].fields.unit",      all[0].fields.unit, "C");
+    checkEq("XRange COUNT limits result", len(r.XRange(k, "-", "+", 2)), 2);
+
+    // XRevRange - newest first
+    let rev = r.XRevRange(k, "+", "-", nil);
+    checkEq("XRevRange newest first",     rev[0].id, "3-3");
+
+    // XRead - "0" = all, then incremental from a given id
+    checkEq("XRead from 0 returns all",   len(r.XRead(k, "0", nil, nil)), 3);
+    let newer = r.XRead(k, "2-2", nil, nil);
+    checkEq("XRead after 2-2 count",      len(newer), 1);
+    checkEq("XRead after 2-2 id",         newer[0].id, "3-3");
+    checkEq("XRead with no new data",     r.XRead(k, "9-9", nil, nil), nil);
+
+    // XDel
+    checkEq("XDel removes one entry",     r.XDel(k, "2-2"), 1);
+    checkEq("XLen after delete",          r.XLen(k), 2);
+
+    // XAdd - auto-generated id (timestamp-based, sorts after explicit ids)
+    let autoId = r.XAdd(k, { evt: "tick" });
+    checkNotNil("XAdd returns an id",     autoId);
+    check("XAdd id is <ms>-<seq>",        String.Contains(autoId, "-"));
+    checkEq("XLen after auto add",        r.XLen(k), 3);
+
+    // XTrim - cap the stream length
+    r.XTrim(k, 1, nil);
+    checkEq("XLen after XTrim to 1",      r.XLen(k), 1);
+
+    r.Del(k);
+}
+
+fn test_stream_groups(r) {
+    Console.WriteLine("\n[19] Stream consumer groups");
+
+    let k = PFX + "stream_g";
+    let g = "grp1";
+    r.Del(k);
+
+    // EnsureStream is idempotent (creates stream + group, ignores BUSYGROUP)
+    checkEq("EnsureStream returns OK",        r.EnsureStream(k, g), "OK");
+    checkEq("EnsureStream is idempotent",     r.EnsureStream(k, g), "OK");
+
+    r.XAddId(k, "1-1", { n: 1 });
+    r.XAddId(k, "2-2", { n: 2 });
+
+    // XReadGroup - deliver undelivered (">") to consumer c1
+    let msgs = r.XReadGroup(g, "c1", k, ">", nil, nil);
+    checkEq("XReadGroup delivers 2",          len(msgs), 2);
+    checkEq("XReadGroup[0].id",               msgs[0].id, "1-1");
+    checkEq("XReadGroup[0].fields.n",         msgs[0].fields.n, "1");
+    checkEq("XReadGroup nothing new left",    r.XReadGroup(g, "c1", k, ">", nil, nil), nil);
+
+    // XPending summary - both messages are now unacknowledged
+    let pend = r.XPending(k, g);
+    checkNotNil("XPending summary",           pend);
+    checkEq("XPending count is 2",            pend.count, 2);
+
+    // XAck one, pending drops to 1
+    checkEq("XAck acknowledges one",          r.XAck(k, g, "1-1"), 1);
+    checkEq("XPending count after ack",       r.XPending(k, g).count, 1);
+
+    // XPendingRange - detail of the remaining pending entry
+    let pr = r.XPendingRange(k, g, "-", "+", 10, nil);
+    checkEq("XPendingRange count",            len(pr), 1);
+    checkEq("XPendingRange[0].id",            pr[0].id, "2-2");
+    checkEq("XPendingRange[0].consumer",      pr[0].consumer, "c1");
+    check("XPendingRange[0].deliveries >= 1", pr[0].deliveries >= 1);
+
+    // XAckMany the rest, pending clears
+    checkEq("XAckMany acknowledges rest",     r.XAckMany(k, g, ["2-2"]), 1);
+    checkEq("XPending empty after ackmany",   r.XPending(k, g).count, 0);
+
+    checkEq("XGroupDestroy returns 1",        r.XGroupDestroy(k, g), 1);
+
+    r.Del(k);
+}
+
+fn test_stream_claim(r) {
+    Console.WriteLine("\n[20] Stream claim / auto-claim");
+
+    let k = PFX + "stream_c";
+    let g = "grp";
+    r.Del(k);
+    r.EnsureStream(k, g);
+    r.XAddId(k, "1-1", { n: 1 });
+    r.XAddId(k, "2-2", { n: 2 });
+    r.XAddId(k, "3-3", { n: 3 });
+
+    // c1 reads everything -> all three become pending under c1
+    checkEq("claim setup: c1 reads 3", len(r.XReadGroup(g, "c1", k, ">", nil, nil)), 3);
+
+    // XClaim - c2 takes over 1-1 and 2-2 (minIdleMs 0 = claim immediately)
+    let claimed = r.XClaim(k, g, "c2", 0, ["1-1", "2-2"]);
+    checkEq("XClaim returns 2 entries",   len(claimed), 2);
+    checkEq("XClaim[0].id",               claimed[0].id, "1-1");
+    checkEq("XClaim[0].fields.n",         claimed[0].fields.n, "1");
+    checkEq("still 3 pending after claim", len(r.XPendingRange(k, g, "-", "+", 10, nil)), 3);
+
+    // XAutoClaim - c3 scans from the start and claims stalled entries
+    let ac = r.XAutoClaim(k, g, "c3", 0, "0", nil);
+    checkNotNil("XAutoClaim result",      ac);
+    checkNotNil("XAutoClaim next cursor", ac.next);
+    check("XAutoClaim claimed >= 1",      len(ac.messages) >= 1);
+
+    // XGroupSetId - reset the group's last-delivered id
+    checkEq("XGroupSetId returns OK",     r.XGroupSetId(k, g, "0"), "OK");
+
+    r.Del(k);
+}
+
+fn test_close(r) {
+    Console.WriteLine("\n[21] Close");
+    // Close is void - just confirm it doesn't crash
+    r.Close();
+    check("Close did not crash", true);
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+fn Main() {
+    Console.WriteLine("========================================");
+    Console.WriteLine(" Redis FFI Test Suite");
+    Console.WriteLine("========================================");
+
+    let r = Redis.Connect(HOST, PORT);
+    if (r == nil) {
+        Console.WriteLine("Redis not available at " + HOST + ":" + str(PORT) + " - FAILED (start redis-server on " + str(PORT) + " first).");
+        return 1;
+    }
+
+    // Clean any leftover keys from a previous interrupted run
+    cleanup(r);
+
+    test_connect(r);
+    test_strings(r);
+    test_incr_decr(r);
+    test_expiry(r);
+    test_key_ops(r);
+    test_mget(r);
+    test_lists(r);
+    test_hashes(r);
+    test_sets(r);
+    test_sorted_sets(r);
+    test_extended_strings(r);
+    test_extended_hashes(r);
+    test_extended_sorted_sets(r);
+    test_blpop(r);
+    test_flexible_types(r);
+    test_raw_cmd(r);
+    test_dbsize(r);
+    test_streams(r);
+    test_stream_groups(r);
+    test_stream_claim(r);
+
+    bench_redis(r);
+
+    // Final cleanup before close
+    cleanup(r);
+
+    test_close(r);
+
+    Console.WriteLine("\n========================================");
+    Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed");
+
+    if (failed == 0) {
+        Console.Ok("All tests passed.");
+        return 0;
+    }
+    Console.WriteLine("Some tests FAILED.");
+    return 1;
+}

@@ -1,0 +1,1075 @@
+// Graph.fls - Directed/undirected weighted graph for Flaris.
+// Version: 1.0
+//
+// Node IDs can be int or string. Edge weights default to native int/float;
+// call WithBigInt() or WithDecimal() to use arbitrary-precision weights.
+// By default the graph is undirected; call AsDirected() to switch.
+//
+// Usage:
+//   import { Graph } from library("Graph", "1.0");
+//
+//   let g = new Graph();                    // undirected, native weights
+//   g.AddEdge("A", "B", 4);
+//   g.AddEdge("A", "C", 2);
+//   g.AddEdge("B", "C", 1);
+//
+//   Console.WriteLine(g.BFS("A"));          // ["A", "B", "C"]
+//   let path = g.ShortestPath("A", "C");    // { path: ["A","C"], distance: 2 }
+//   Console.WriteLine(g.IsConnected());     // true
+//
+//   // Directed graph with BigInt weights
+//   let dg = (new Graph()).AsDirected().WithBigInt();
+//   dg.AddEdge("X", "Y", BigInt.From("999999999999"));
+//
+// Configuration (call before adding edges; returns this):
+//   AsDirected()   - switch to directed mode
+//   AsUndirected() - switch to undirected mode (default)
+//   WithBigInt()   - use BigInt weights (import BigInt separately)
+//   WithDecimal()  - use Decimal weights (import Decimal separately)
+//
+// Nodes:
+//   AddNode(id)              - add node if not present; returns this
+//   RemoveNode(id)           - remove node and all its edges; returns this
+//   HasNode(id)              →  bool
+//   Nodes()                  →  array of all node IDs
+//   NodeCount()              →  int
+//
+// Edges:
+//   AddEdge(src, dst, weight?) - weight defaults to 1; returns this
+//   RemoveEdge(src, dst)       - returns this
+//   HasEdge(src, dst)          →  bool
+//   GetEdgeWeight(src, dst)    →  weight or nil
+//   EdgesFrom(id)              →  array of { To, Weight }
+//   Neighbors(id)              →  array of neighbour node IDs
+//   EdgeCount()                →  int
+//
+// Degrees:
+//   InDegree(node)   →  int   - directed only: edges pointing in
+//   OutDegree(node)  →  int   - directed only: edges pointing out
+//   Degree(node)     →  int   - undirected: total edges; directed: in + out
+//
+// Traversal (disconnected nodes are NOT visited):
+//   BFS(start)       →  array of node IDs in breadth-first order
+//   DFS(start)       →  array of node IDs in depth-first order
+//
+// Shortest paths:
+//   BFSPath(start, end)   →  array of node IDs (unweighted, BFS)
+//   Dijkstra(start)       →  object mapping node → { dist, prev }  (no negative weights)
+//   ShortestPath(start, end)  →  { path:array, distance } or nil if unreachable
+//   AStar(start, end, heuristic)  →  path array or nil; heuristic(node) estimates
+//                                    remaining cost (admissible; no negative weights)
+//   BellmanFord(start)    →  { Distances, Prev, HasNegativeCycle }  (negative weights ok)
+//   FloydWarshall()       →  { Dist, Next, HasNegativeCycle }  (all-pairs)
+//   Graph.FloydWarshallPath(result, u, v)  →  path array or nil  (static)
+//
+// Graph properties:
+//   IsConnected()           →  bool  - undirected only (throws on directed)
+//   IsWeaklyConnected()     →  bool  - directed: connected ignoring direction
+//   ConnectedComponents()   →  array of arrays of node IDs (weakly-connected)
+//   HasCycle()              →  bool  - DFS for undirected, Kahn's for directed
+//   TopologicalSort()       →  array of node IDs (directed, acyclic only)
+//   Transpose()             →  new Graph with all edges reversed (directed only)
+//
+// Minimum spanning tree:
+//   Kruskal()               →  array of { src, dst, weight } edges (undirected only)
+//   Prim(start?)            →  array of { src, dst, weight } edges (start's component)
+//
+// Misc:
+//   Clear()                 - remove all nodes and edges; returns this
+//   IsDirected()            →  bool
+//   WeightType()            →  string: "native", "bigint", or "decimal"
+//   ToString()              →  human-readable adjacency summary
+
+import { BigInt }  from library("BigInt",  "1.0");
+import { Decimal } from library("Decimal", "1.0");
+
+class Graph {
+    let _adj = nil; 
+    let _directed = false;
+    let _edgeCount = 0;
+    let _wNative = nil; 
+    let _weightType: string = nil; 
+    fn Constructor() {
+        this._directed   = false;
+        this._weightType = "native";
+        this._wNative    = true;
+        this._adj        = Collections.HashMap();  // node -> [{To, Weight}]
+        this._edgeCount  = 0;
+    }
+
+    fn AsDirected(): instance {
+        this._directed = true;
+        return this;
+    }
+
+    fn AsUndirected(): instance {
+        this._directed = false;
+        return this;
+    }
+
+    fn WithBigInt(): instance {
+        this._weightType = "bigint";
+        this._wNative    = false;
+        return this;
+    }
+
+    fn WithDecimal(): instance {
+        this._weightType = "decimal";
+        this._wNative    = false;
+        return this;
+    }
+
+    // ---------- Weight helpers ----------
+
+    fn _wZero() {
+        if (this._wNative) return 0;
+        if (this._weightType == "bigint")  return BigInt.Zero();
+        return Decimal.Zero();
+    }
+
+    fn _wOne() {
+        if (this._wNative) return 1;
+        if (this._weightType == "bigint")  return BigInt.One();
+        return Decimal.One();
+    }
+
+    fn _wAdd(a, b) {
+        if (this._wNative) return a + b;
+        if (this._weightType == "bigint")  return BigInt.Add(a, b);
+        return Decimal.Add(a, b);
+    }
+
+    fn _wLt(a, b): bool {
+        if (this._wNative) return a < b;
+        if (this._weightType == "bigint")  return BigInt.Lt(a, b);
+        return Decimal.Lt(a, b);
+    }
+
+    // ---------- Nodes ----------
+
+    fn AddNode(id): instance {
+        if (!this._adj.Has(id)) {
+            this._adj.Set(id, []);
+        }
+        return this;
+    }
+
+    fn RemoveNode(id): instance {
+        if (!this._adj.Has(id)) return this;
+
+        let degree: int = len(this._adj.Get(id));
+        this._edgeCount = this._edgeCount - degree;
+        this._adj.Delete(id);
+
+        let remaining: array = this._adj.Keys();
+        foreach (n in remaining) {
+            let edges: array   = this._adj.Get(n);
+            let trimmed: array = [];
+            let removed: int   = 0;
+            foreach (e in edges) {
+                if (e.To == id) {
+                    removed = removed + 1;
+                } else {
+                    Array.Append(trimmed, e);
+                }
+            }
+            if (removed > 0) {
+                this._adj.Set(n, trimmed);
+                if (this._directed) {
+                    this._edgeCount = this._edgeCount - removed;
+                }
+            }
+        }
+
+        return this;
+    }
+
+    fn HasNode(id): bool  { return this._adj.Has(id); }
+    fn Nodes(): array     { return this._adj.Keys(); }
+    fn NodeCount(): int   { return this._adj.Size(); }
+
+    // ---------- Edges ----------
+
+    fn AddEdge(src, dst, weight): instance {
+        if (src == dst) return this;  // self-loops not supported
+        if (weight == nil) weight = this._wOne();
+
+        this.AddNode(src);
+        this.AddNode(dst);
+
+        // Inline duplicate check (AddNode guarantees both keys exist)
+        let srcEdges = this._adj.Get(src);
+        foreach (e in srcEdges) {
+            if (e.To == dst) return this;
+        }
+
+        Array.Append(srcEdges, { To: dst, Weight: weight });
+        this._edgeCount = this._edgeCount + 1;
+
+        if (!this._directed) {
+            Array.Append(this._adj.Get(dst), { To: src, Weight: weight });
+        }
+
+        return this;
+    }
+
+    fn RemoveEdge(src, dst): instance {
+        if (!this._adj.Has(src)) return this;
+
+        let edges: array    = this._adj.Get(src);
+        let newEdges: array = [];
+        let removed: bool   = false;
+        foreach (e in edges) {
+            if (e.To == dst && !removed) {
+                removed = true;
+            } else {
+                Array.Append(newEdges, e);
+            }
+        }
+
+        if (!removed) return this;
+
+        this._adj.Set(src, newEdges);
+        this._edgeCount = this._edgeCount - 1;
+
+        if (!this._directed) {
+            let rev: array    = this._adj.Get(dst);
+            let newRev: array = [];
+            let removedRev: bool = false;
+            foreach (e in rev) {
+                if (e.To == src && !removedRev) {
+                    removedRev = true;
+                } else {
+                    Array.Append(newRev, e);
+                }
+            }
+            this._adj.Set(dst, newRev);
+        }
+
+        return this;
+    }
+
+    fn HasEdge(src, dst): bool {
+        if (!this._adj.Has(src)) return false;
+        foreach (e in this._adj.Get(src)) {
+            if (e.To == dst) return true;
+        }
+        return false;
+    }
+
+    fn GetEdgeWeight(src, dst) {
+        if (!this._adj.Has(src)) return nil;
+        foreach (e in this._adj.Get(src)) {
+            if (e.To == dst) return e.Weight;
+        }
+        return nil;
+    }
+
+    // Returns the raw edge objects [{To, Weight}] for all edges leaving id.
+    fn EdgesFrom(id): array {
+        if (!this._adj.Has(id)) return [];
+        return this._adj.Get(id);
+    }
+
+    // Returns an array of neighbor node IDs (not edge objects).
+    fn Neighbors(id): array {
+        if (!this._adj.Has(id)) return [];
+        let edges: array  = this._adj.Get(id);
+        let ids: array    = [];
+        foreach (e in edges) {
+            Array.Append(ids, e.To);
+        }
+        return ids;
+    }
+
+    fn EdgeCount(): int { return this._edgeCount; }
+
+    // ---------- Traversal ----------
+
+    fn BFS(start): array {
+        if (!this._adj.Has(start)) return [];
+
+        let visited = Collections.HashMap();
+        let queue = Collections.Queue();
+        let order: array      = [];
+
+        visited.Set(start, true);
+        queue.Enqueue(start);
+
+        while (!queue.IsEmpty()) {
+            let node = queue.Dequeue();
+            Array.Append(order, node);
+
+            foreach (e in this._adj.Get(node)) {
+                if (!visited.Has(e.To)) {
+                    visited.Set(e.To, true);
+                    queue.Enqueue(e.To);
+                }
+            }
+        }
+
+        return order;
+    }
+
+    fn DFS(start): array {
+        if (!this._adj.Has(start)) return [];
+
+        let visited = Collections.HashMap();
+        let stack = Collections.Stack();
+        let order: array      = [];
+
+        stack.Push(start);
+
+        while (!stack.IsEmpty()) {
+            let node = stack.Pop();
+            if (!visited.Has(node)) {
+                visited.Set(node, true);
+                Array.Append(order, node);
+
+                foreach (e in this._adj.Get(node)) {
+                    if (!visited.Has(e.To)) {
+                        stack.Push(e.To);
+                    }
+                }
+            }
+        }
+
+        return order;
+    }
+
+    // ---------- Path finding ----------
+
+    fn BFSPath(start, end) {
+        if (!this._adj.Has(start) || !this._adj.Has(end)) return nil;
+        if (start == end) return [start];
+
+        let visited = Collections.HashMap();
+        let prev = Collections.HashMap();
+        let queue = Collections.Queue();
+
+        visited.Set(start, true);
+        queue.Enqueue(start);
+
+        while (!queue.IsEmpty()) {
+            let node = queue.Dequeue();
+
+            foreach (e in this._adj.Get(node)) {
+                if (!visited.Has(e.To)) {
+                    visited.Set(e.To, true);
+                    prev.Set(e.To, node);
+                    if (e.To == end) {
+                        return Graph._buildPath(prev, start, end);
+                    }
+                    queue.Enqueue(e.To);
+                }
+            }
+        }
+
+        return nil;
+    }
+
+    // Dijkstra's algorithm. Negative edge weights are not supported and will
+    // raise an exception. For negative weights, use Bellman-Ford instead.
+    fn Dijkstra(start) {
+        if (!this._adj.Has(start)) return nil;
+
+        let dist = Collections.HashMap();
+        let prev = Collections.HashMap();
+        let visited = Collections.HashMap();
+        let nodes: array      = this._adj.Keys();
+
+        // Guard: negative weights produce incorrect results in Dijkstra.
+        let zero = this._wZero();
+        foreach (n in nodes) {
+            foreach (e in this._adj.Get(n)) {
+                if (this._wLt(e.Weight, zero)) {
+                    throw(400, "Graph.Dijkstra: negative edge weights are not supported");
+                }
+            }
+        }
+
+        dist.Set(start, zero);
+
+        while (true) {
+            let u     = nil;
+            let uDist = nil;
+            foreach (n in nodes) {
+                if (visited.Get(n) == nil) {
+                    let d = dist.Get(n);
+                    if (d != nil and (uDist == nil or this._wLt(d, uDist))) {
+                        uDist = d;
+                        u     = n;
+                    }
+                }
+            }
+
+            if (u == nil) break;
+
+            visited.Set(u, true);
+
+            foreach (e in this._adj.Get(u)) {
+                if (visited.Get(e.To) == nil) {
+                    let nd  = this._wAdd(uDist, e.Weight);
+                    let cur = dist.Get(e.To);
+                    if (cur == nil or this._wLt(nd, cur)) {
+                        dist.Set(e.To, nd);
+                        prev.Set(e.To, u);
+                    }
+                }
+            }
+        }
+
+        return { Distances: dist, Prev: prev };
+    }
+
+    fn ShortestPath(start, end) {
+        if (start == end) return [start];
+
+        let result = this.Dijkstra(start);
+        if (result == nil) return nil;
+        if (!result.Distances.Has(end)) return nil;
+
+        return Graph._buildPath(result.Prev, start, end);
+    }
+
+    // A* search from start to end using an admissible heuristic.
+    // `heuristic` is a function fn(nodeId) -> estimated remaining cost to end.
+    // It must never overestimate (admissible) and must return the same weight
+    // type as the graph (a number for native, BigInt/Decimal otherwise).
+    // Returns the path as an array of node IDs, or nil if end is unreachable.
+    // Like Dijkstra, negative edge weights are rejected.
+    fn AStar(start, end, heuristic) {
+        if (!this._adj.Has(start) || !this._adj.Has(end)) return nil;
+        if (start == end) return [start];
+
+        let zero = this._wZero();
+        let nodes: array = this._adj.Keys();
+        foreach (n in nodes) {
+            foreach (e in this._adj.Get(n)) {
+                if (this._wLt(e.Weight, zero)) {
+                    throw(400, "Graph.AStar: negative edge weights are not supported");
+                }
+            }
+        }
+
+        let g      = Collections.HashMap();  // best known cost from start
+        let prev   = Collections.HashMap();
+        let closed = Collections.HashMap();
+        let open   = Collections.HashMap();  // frontier set: node -> true
+
+        g.Set(start, zero);
+        open.Set(start, true);
+
+        while (open.Size() > 0) {
+            // Pick the open node with the lowest f = g + h (linear scan, to
+            // match Dijkstra's O(V^2) approach in this pure-Flaris library).
+            let u  = nil;
+            let uF = nil;
+            foreach (n in open.Keys()) {
+                let f = this._wAdd(g.Get(n), heuristic(n));
+                if (uF == nil or this._wLt(f, uF)) {
+                    uF = f;
+                    u  = n;
+                }
+            }
+
+            if (u == end) {
+                return Graph._buildPath(prev, start, end);
+            }
+
+            open.Delete(u);
+            closed.Set(u, true);
+
+            let gu = g.Get(u);
+            foreach (e in this._adj.Get(u)) {
+                if (!closed.Has(e.To)) {
+                    let nd  = this._wAdd(gu, e.Weight);
+                    let cur = g.Get(e.To);
+                    if (cur == nil or this._wLt(nd, cur)) {
+                        g.Set(e.To, nd);
+                        prev.Set(e.To, u);
+                        open.Set(e.To, true);
+                    }
+                }
+            }
+        }
+
+        return nil;
+    }
+
+    // Bellman-Ford single-source shortest paths. Supports negative edge weights
+    // and detects negative cycles. Returns { Distances, Prev, HasNegativeCycle }
+    // (Distances/Prev are HashMaps; unreached nodes are absent), or nil if start
+    // is not in the graph. When HasNegativeCycle is true the distances are not
+    // reliable. Note: on an undirected graph any negative edge is a negative
+    // cycle (u->v->u).
+    fn BellmanFord(start) {
+        if (!this._adj.Has(start)) return nil;
+
+        let dist = Collections.HashMap();
+        let prev = Collections.HashMap();
+        let nodes: array = this._adj.Keys();
+        let n: int = len(nodes);
+
+        dist.Set(start, this._wZero());
+
+        // Relax all edges up to |V|-1 times, stopping early once stable.
+        var pass: int = 0;
+        while (pass < n - 1) {
+            var changed: bool = false;
+            foreach (u in nodes) {
+                let du = dist.Get(u);
+                if (du != nil) {
+                    foreach (e in this._adj.Get(u)) {
+                        let nd  = this._wAdd(du, e.Weight);
+                        let cur = dist.Get(e.To);
+                        if (cur == nil or this._wLt(nd, cur)) {
+                            dist.Set(e.To, nd);
+                            prev.Set(e.To, u);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if (!changed) break;
+            pass = pass + 1;
+        }
+
+        // A further relaxation on a full pass means a negative cycle exists.
+        var negCycle: bool = false;
+        foreach (u in nodes) {
+            let du = dist.Get(u);
+            if (du != nil) {
+                foreach (e in this._adj.Get(u)) {
+                    let nd  = this._wAdd(du, e.Weight);
+                    let cur = dist.Get(e.To);
+                    if (cur == nil or this._wLt(nd, cur)) {
+                        negCycle = true;
+                    }
+                }
+            }
+        }
+
+        return { Distances: dist, Prev: prev, HasNegativeCycle: negCycle };
+    }
+
+    // Floyd-Warshall all-pairs shortest paths. Returns
+    // { Dist, Next, HasNegativeCycle }. Dist is a nested HashMap:
+    // Dist.Get(u).Get(v) -> shortest distance (absent if unreachable). Next
+    // supports reconstruction via Graph.FloydWarshallPath(result, u, v).
+    // HasNegativeCycle is true if any node lies on a negative cycle; when set,
+    // the distances involving that cycle are not meaningful.
+    fn FloydWarshall() {
+        let nodes: array = this._adj.Keys();
+        let zero = this._wZero();
+
+        let dist = Collections.HashMap();
+        let next = Collections.HashMap();
+        foreach (u in nodes) {
+            dist.Set(u, Collections.HashMap());
+            next.Set(u, Collections.HashMap());
+        }
+
+        // Distance 0 to self; direct edge weights otherwise (keep the minimum
+        // when parallel edges exist).
+        foreach (u in nodes) {
+            let du = dist.Get(u);
+            let nu = next.Get(u);
+            du.Set(u, zero);
+            nu.Set(u, u);
+            foreach (e in this._adj.Get(u)) {
+                let cur = du.Get(e.To);
+                if (cur == nil or this._wLt(e.Weight, cur)) {
+                    du.Set(e.To, e.Weight);
+                    nu.Set(e.To, e.To);
+                }
+            }
+        }
+
+        foreach (k in nodes) {
+            foreach (i in nodes) {
+                let distI = dist.Get(i);
+                let dik   = distI.Get(k);
+                if (dik != nil) {
+                    let nextI  = next.Get(i);
+                    let distK  = dist.Get(k);
+                    let nextIK = nextI.Get(k);
+                    foreach (j in nodes) {
+                        let dkj = distK.Get(j);
+                        if (dkj != nil) {
+                            let nd  = this._wAdd(dik, dkj);
+                            let cur = distI.Get(j);
+                            if (cur == nil or this._wLt(nd, cur)) {
+                                distI.Set(j, nd);
+                                nextI.Set(j, nextIK);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        var negCycle: bool = false;
+        foreach (u in nodes) {
+            let duu = dist.Get(u).Get(u);
+            if (duu != nil and this._wLt(duu, zero)) {
+                negCycle = true;
+            }
+        }
+
+        return { Dist: dist, Next: next, HasNegativeCycle: negCycle };
+    }
+
+    // Reconstruct the shortest path u -> v from a FloydWarshall() result.
+    // Returns an array of node IDs, or nil if no path exists.
+    fn static FloydWarshallPath(result, u, v) {
+        let next = result.Next;
+        if (!next.Has(u)) return nil;
+        if (next.Get(u).Get(v) == nil) return nil;
+
+        let path: array = [u];
+        var cur = u;
+        var limit: int = next.Size() + 2;  // guard against a malformed Next map
+        while (str(cur) != str(v) && limit > 0) {
+            limit = limit - 1;
+            cur = next.Get(cur).Get(v);
+            if (cur == nil) return nil;
+            Array.Append(path, cur);
+        }
+        return path;
+    }
+
+    fn static _buildPath(prev, start, end): array {
+        let path: array = [];
+        let cur = end;
+        let limit: int = prev.Size() + 2;  // guard against a malformed prev map
+        while (cur != nil && limit > 0) {
+            limit = limit - 1;
+            Array.Append(path, cur);
+            if (cur == start) {
+                cur = nil;
+            } else {
+                cur = prev.Get(cur);
+            }
+        }
+
+        let result: array = [];
+        let n: int = len(path);
+        iter (i from 0 to n - 1) {
+            Array.Append(result, path[n - 1 - i]);
+        }
+        return result;
+    }
+
+    // ---------- Graph analysis ----------
+
+    // Returns true if every node is reachable from every other node.
+    // For directed graphs, use IsWeaklyConnected() or check reachability via BFS.
+    fn IsConnected(): bool {
+        if (this._directed) {
+            throw(400, "Graph.IsConnected: not defined for directed graphs; use IsWeaklyConnected() or check reachability via BFS");
+        }
+        let n: int = this._adj.Size();
+        if (n == 0) return true;
+
+        let nodes: array      = this._adj.Keys();
+        let visited = Collections.HashMap();
+        let queue = Collections.Queue();
+        let start             = nodes[0];
+
+        visited.Set(start, true);
+        queue.Enqueue(start);
+
+        while (!queue.IsEmpty()) {
+            let node = queue.Dequeue();
+            foreach (e in this._adj.Get(node)) {
+                if (!visited.Has(e.To)) {
+                    visited.Set(e.To, true);
+                    queue.Enqueue(e.To);
+                }
+            }
+        }
+
+        return visited.Size() == n;
+    }
+
+    // Returns true if the graph is weakly connected (connected when edge
+    // direction is ignored). Works for both directed and undirected graphs.
+    fn IsWeaklyConnected(): bool {
+        let n: int = this._adj.Size();
+        if (n == 0) return true;
+
+        // Build a temporary undirected adjacency list
+        let undirAdj = Collections.HashMap();
+        let nodes: array = this._adj.Keys();
+        foreach (nd in nodes) { undirAdj.Set(nd, []); }
+        foreach (nd in nodes) {
+            foreach (e in this._adj.Get(nd)) {
+                Array.Append(undirAdj.Get(nd), e.To);
+                if (!undirAdj.Has(e.To)) undirAdj.Set(e.To, []);
+                Array.Append(undirAdj.Get(e.To), nd);
+            }
+        }
+
+        let visited = Collections.HashMap();
+        let queue = Collections.Queue();
+        let start = nodes[0];
+
+        visited.Set(start, true);
+        queue.Enqueue(start);
+
+        while (!queue.IsEmpty()) {
+            let node = queue.Dequeue();
+            foreach (neighbor in undirAdj.Get(node)) {
+                if (!visited.Has(neighbor)) {
+                    visited.Set(neighbor, true);
+                    queue.Enqueue(neighbor);
+                }
+            }
+        }
+
+        return visited.Size() == n;
+    }
+
+    // Returns the connected components as an array of arrays of node IDs.
+    // Edge direction is ignored (weakly-connected components), so this works for
+    // both directed and undirected graphs.
+    fn ConnectedComponents(): array {
+        let n: int = this._adj.Size();
+        if (n == 0) return [];
+
+        // Build an undirected view of the adjacency.
+        let undirAdj = Collections.HashMap();
+        let nodes: array = this._adj.Keys();
+        foreach (nd in nodes) { undirAdj.Set(nd, []); }
+        foreach (nd in nodes) {
+            foreach (e in this._adj.Get(nd)) {
+                Array.Append(undirAdj.Get(nd), e.To);
+                if (!undirAdj.Has(e.To)) undirAdj.Set(e.To, []);
+                Array.Append(undirAdj.Get(e.To), nd);
+            }
+        }
+
+        let visited = Collections.HashMap();
+        let components: array = [];
+
+        foreach (s in nodes) {
+            if (!visited.Has(s)) {
+                let comp: array = [];
+                let queue = Collections.Queue();
+                visited.Set(s, true);
+                queue.Enqueue(s);
+                while (!queue.IsEmpty()) {
+                    let node = queue.Dequeue();
+                    Array.Append(comp, node);
+                    foreach (neighbor in undirAdj.Get(node)) {
+                        if (!visited.Has(neighbor)) {
+                            visited.Set(neighbor, true);
+                            queue.Enqueue(neighbor);
+                        }
+                    }
+                }
+                Array.Append(components, comp);
+            }
+        }
+
+        return components;
+    }
+
+    fn HasCycle(): bool {
+        if (this._directed) {
+            // Kahn's count-only variant - no result array allocation
+            return Graph._hasCycleDirectedKahn(this);
+        }
+
+        // Undirected: iterative DFS - avoids call-frame overflow on deep graphs
+        let visited = Collections.HashMap();
+        let nodes   = this._adj.Keys();
+        foreach (n in nodes) {
+            if (!visited.Has(n)) {
+                if (Graph._cycleUndirectedIter(this, n, visited)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn static _hasCycleDirectedKahn(graph): bool {
+        let nodes    = graph._adj.Keys();
+        let inDegree = Collections.HashMap();
+
+        foreach (n in nodes) {
+            if (!inDegree.Has(n)) inDegree.Set(n, 0);
+            foreach (e in graph._adj.Get(n)) {
+                if (!inDegree.Has(e.To)) inDegree.Set(e.To, 0);
+                inDegree.Set(e.To, inDegree.Get(e.To) + 1);
+            }
+        }
+
+        let queue = Collections.Queue();
+        foreach (n in nodes) {
+            if (inDegree.Get(n) == 0) queue.Enqueue(n);
+        }
+
+        let count: int = 0;
+        let total: int = graph._adj.Size();
+        while (!queue.IsEmpty()) {
+            let node = queue.Dequeue();
+            count = count + 1;
+            foreach (e in graph._adj.Get(node)) {
+                let d: int = inDegree.Get(e.To) - 1;
+                inDegree.Set(e.To, d);
+                if (d == 0) queue.Enqueue(e.To);
+            }
+        }
+
+        return count != total;
+    }
+
+    fn static _cycleUndirectedIter(graph, start, visited): bool {
+        let stack = Collections.Stack();
+        stack.Push({ N: start, P: nil });
+
+        while (!stack.IsEmpty()) {
+            let frame  = stack.Pop();
+            let node   = frame.N;
+            let parent = frame.P;
+
+            if (!visited.Has(node)) {
+                visited.Set(node, true);
+
+                foreach (e in graph._adj.Get(node)) {
+                    if (!visited.Has(e.To)) {
+                        stack.Push({ N: e.To, P: node });
+                    } else if (e.To != parent) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    // Kahn's algorithm - returns nil if a cycle is detected
+    fn TopologicalSort() {
+        if (!this._directed) {
+            throw(400, "Graph: TopologicalSort requires a directed graph");
+        }
+
+        let inDegree = Collections.HashMap();
+        let nodes: array       = this._adj.Keys();
+
+        foreach (n in nodes) {
+            if (!inDegree.Has(n)) inDegree.Set(n, 0);
+            foreach (e in this._adj.Get(n)) {
+                if (!inDegree.Has(e.To)) inDegree.Set(e.To, 0);
+                inDegree.Set(e.To, inDegree.Get(e.To) + 1);
+            }
+        }
+
+        let queue = Collections.Queue();
+        foreach (n in nodes) {
+            if (inDegree.Get(n) == 0) queue.Enqueue(n);
+        }
+
+        let result: array = [];
+        while (!queue.IsEmpty()) {
+            let node = queue.Dequeue();
+            Array.Append(result, node);
+
+            foreach (e in this._adj.Get(node)) {
+                let d: int = inDegree.Get(e.To) - 1;
+                inDegree.Set(e.To, d);
+                if (d == 0) queue.Enqueue(e.To);
+            }
+        }
+
+        if (len(result) != this._adj.Size()) return nil;
+        return result;
+    }
+
+    // Builds the transposed graph (all edges reversed) in O(V + E).
+    fn Transpose(): instance {
+        if (!this._directed) {
+            throw(400, "Graph: Transpose requires a directed graph");
+        }
+
+        let wt: string   = this._weightType;
+        let t: instance  = new Graph();
+        t._directed      = true;
+        t._weightType    = wt;
+        let nodes: array = this._adj.Keys();
+        foreach (n in nodes) { t.AddNode(n); }
+
+        // Bypass HasEdge check - source graph has no duplicates so neither does transpose
+        let edgeCount: int = 0;
+        foreach (n in nodes) {
+            foreach (e in this._adj.Get(n)) {
+                Array.Append(t._adj.Get(e.To), { To: n, Weight: e.Weight });
+                edgeCount = edgeCount + 1;
+            }
+        }
+        t._edgeCount = edgeCount;
+        return t;
+    }
+
+    // ---------- Degree ----------
+
+    // For directed graphs: number of edges pointing TO node.
+    fn InDegree(node): int {
+        if (!this.HasNode(node)) return 0;
+        var count: int = 0;
+        let nodes: array = this.Nodes();
+        iter (i from 0 to len(nodes) - 1) {
+            let n = nodes[i];
+            if (n != node && this.HasEdge(n, node)) count += 1;
+        }
+        return count;
+    }
+
+    // For directed graphs: number of edges leaving node.
+    fn OutDegree(node): int {
+        if (!this.HasNode(node)) return 0;
+        return len(this.Neighbors(node));
+    }
+
+    // For undirected graphs: number of incident edges.
+    // For directed graphs: InDegree + OutDegree.
+    fn Degree(node): int {
+        if (!this.HasNode(node)) return 0;
+        if (this._directed) {
+            return this.InDegree(node) + this.OutDegree(node);
+        }
+        return len(this.Neighbors(node));
+    }
+
+    // ---------- Minimum spanning tree ----------
+
+    // Kruskal's algorithm - minimum spanning tree for undirected graphs.
+    // Returns an array of {from, to, weight} edge objects (n-1 edges for a
+    // connected graph).  Duplicate undirected edges are deduplicated by only
+    // keeping the edge where str(u) < str(v).
+    fn Kruskal(): array {
+        let nodes: array = this.Nodes();
+        let n: int = len(nodes);
+        if (n == 0) return [];
+
+        // Collect unique undirected edges
+        let edges: array = [];
+        iter (i from 0 to n - 1) {
+            let u = nodes[i];
+            let neighbors: array = this.Neighbors(u);
+            iter (j from 0 to len(neighbors) - 1) {
+                let v = neighbors[j];
+                if (str(u) < str(v)) {
+                    let w = this.GetEdgeWeight(u, v);
+                    if (w == nil) w = 1;
+                    Array.Append(edges, { src: u, dst: v, weight: w });
+                }
+            }
+        }
+
+        // Sort edges by weight ascending
+        Array.Sort(edges, fn(a, b) { return a.weight < b.weight; });
+
+        // Union-Find: parent stored in a HashMap keyed by str(node)
+        let parent = Collections.HashMap();
+        iter (i from 0 to n - 1) {
+            parent.Set(str(nodes[i]), nodes[i]);
+        }
+
+        let mst: array = [];
+        let mstSize: int = 0;
+        let edgeCount: int = len(edges);
+
+        iter (i from 0 to edgeCount - 1) {
+            if (mstSize == n - 1) break;
+            let e = edges[i];
+            let rootA = Graph._kruskalFind(parent, e.src);
+            let rootB = Graph._kruskalFind(parent, e.dst);
+            if (str(rootA) != str(rootB)) {
+                Array.Append(mst, e);
+                mstSize += 1;
+                // Union: point rootA's parent to rootB
+                parent.Set(str(rootA), rootB);
+            }
+        }
+
+        return mst;
+    }
+
+    // Union-Find path-compressed find for Kruskal.
+    fn static _kruskalFind(parent, key) {
+        var k: string = str(key);
+        var limit: int = parent.Size() + 2;
+        while (str(parent.Get(k)) != k && limit > 0) {
+            limit -= 1;
+            k = str(parent.Get(k));
+        }
+        return parent.Get(k);
+    }
+
+    // Prim's minimum spanning tree, grown from an optional start node (defaults
+    // to the first node). Treats the graph as undirected. Returns an array of
+    // { src, dst, weight } edges, or [] for an empty graph. For a disconnected
+    // graph only the component containing start is spanned.
+    fn Prim(start) {
+        let nodes: array = this.Nodes();
+        let n: int = len(nodes);
+        if (n == 0) return [];
+        if (start == nil) start = nodes[0];
+        if (!this._adj.Has(start)) return [];
+
+        let visited = Collections.HashMap();
+        visited.Set(start, true);
+
+        let mst: array = [];
+        var count: int = 1;
+
+        while (count < n) {
+            // Cheapest edge crossing from the visited set to an unvisited node.
+            let bestSrc = nil;
+            let bestDst = nil;
+            let bestW   = nil;
+            foreach (u in visited.Keys()) {
+                foreach (e in this._adj.Get(u)) {
+                    if (!visited.Has(e.To)) {
+                        if (bestW == nil or this._wLt(e.Weight, bestW)) {
+                            bestW   = e.Weight;
+                            bestSrc = u;
+                            bestDst = e.To;
+                        }
+                    }
+                }
+            }
+
+            if (bestDst == nil) break;  // remaining nodes are unreachable
+
+            visited.Set(bestDst, true);
+            Array.Append(mst, { src: bestSrc, dst: bestDst, weight: bestW });
+            count = count + 1;
+        }
+
+        return mst;
+    }
+
+    // ---------- Utility ----------
+
+    fn Clear(): instance {
+        this._adj       = Collections.HashMap();
+        this._edgeCount = 0;
+        return this;
+    }
+
+    fn IsDirected(): bool    { return this._directed; }
+    fn WeightType(): string  { return this._weightType; }
+
+    fn ToString(): string {
+        return "Graph(directed=" + str(this._directed) +
+               ", weightType=" + this._weightType +
+               ", nodes="      + str(this._adj.Size()) +
+               ", edges="      + str(this._edgeCount) + ")";
+    }
+}
+
+export Graph;

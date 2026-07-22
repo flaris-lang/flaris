@@ -1,0 +1,322 @@
+// test_template.fls - tests for Template.fls
+
+import { Template } from library("./libs/Template", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn eq(label:string, got, want) {
+    if (got == want) {
+        Console.Ok("[PASS] " + label);
+        passed += 1;
+    } else {
+        Console.Warn("[FAIL] " + label + " | got: " + str(got) + " | want: " + str(want));
+        failed += 1;
+    }
+}
+
+fn chk(label:string, ok:bool) {
+    if (ok) {
+        Console.Ok("[PASS] " + label);
+        passed += 1;
+    } else {
+        Console.Warn("[FAIL] " + label);
+        failed += 1;
+    }
+}
+
+fn Main() {
+    // --- Literal text (no tags) ---
+    eq("literal passthrough",
+        Template.Apply("hello world", {}),
+        "hello world");
+
+    eq("empty template",
+        Template.Apply("", {}),
+        "");
+
+    // --- Variable substitution ---
+    eq("simple var",
+        Template.Apply("Hello, {{name}}!", { name: "Alice" }),
+        "Hello, Alice!");
+
+    eq("missing var -> empty",
+        Template.Apply("{{missing}}", {}),
+        "");
+
+    eq("int var",
+        Template.Apply("count={{n}}", { n: 42 }),
+        "count=42");
+
+    eq("float var",
+        Template.Apply("pi={{v}}", { v: 3.14 }),
+        "pi=3.14");
+
+    // --- HTML escaping ---
+    eq("escape <>&",
+        Template.Apply("{{html}}", { html: "<b>hello & world</b>" }),
+        "&lt;b&gt;hello &amp; world&lt;/b&gt;");
+
+    eq("escape quotes",
+        Template.Apply("{{q}}", { q: "say \"hi\" & 'bye'" }),
+        "say &quot;hi&quot; &amp; &#39;bye&#39;");
+
+    // --- Raw / unescaped ---
+    eq("raw triple brace",
+        Template.Apply("{{{html}}}", { html: "<b>bold</b>" }),
+        "<b>bold</b>");
+
+    // --- Comments ---
+    eq("comment stripped",
+        Template.Apply("a{{! this is ignored }}b", {}),
+        "ab");
+
+    // --- Dot-path access ---
+    eq("nested dot path",
+        Template.Apply("{{user.name}}", { user: { name: "Bob" } }),
+        "Bob");
+
+    eq("deep dot path",
+        Template.Apply("{{a.b.c}}", { a: { b: { c: "deep" } } }),
+        "deep");
+
+    eq("missing nested -> empty",
+        Template.Apply("{{a.b.c}}", { a: { b: {} } }),
+        "");
+
+    // --- Conditionals ---
+    eq("if true",
+        Template.Apply("{{#if show}}yes{{/if}}", { show: true }),
+        "yes");
+
+    eq("if false -> empty",
+        Template.Apply("{{#if show}}yes{{/if}}", { show: false }),
+        "");
+
+    eq("if nil -> empty",
+        Template.Apply("{{#if val}}yes{{/if}}", {}),
+        "");
+
+    eq("if 0 -> falsy",
+        Template.Apply("{{#if n}}yes{{/if}}", { n: 0 }),
+        "");
+
+    eq("if empty string -> falsy",
+        Template.Apply("{{#if s}}yes{{/if}}", { s: "" }),
+        "");
+
+    eq("if empty array -> falsy",
+        Template.Apply("{{#if xs}}yes{{/if}}", { xs: [] }),
+        "");
+
+    eq("if else - true branch",
+        Template.Apply("{{#if ok}}yes{{#else}}no{{/if}}", { ok: true }),
+        "yes");
+
+    eq("if else - false branch",
+        Template.Apply("{{#if ok}}yes{{#else}}no{{/if}}", { ok: false }),
+        "no");
+
+    // --- Each ---
+    eq("each scalar array",
+        Template.Apply("{{#each xs}}{{.}}{{/each}}", { xs: [1, 2, 3] }),
+        "123");
+
+    eq("each with separator literal",
+        Template.Apply("{{#each xs}}{{.}}, {{/each}}", { xs: ["a", "b", "c"] }),
+        "a, b, c, ");
+
+    eq("each _index",
+        Template.Apply("{{#each xs}}{{_index}}{{/each}}", { xs: ["a", "b", "c"] }),
+        "012");
+
+    eq("each _first",
+        Template.Apply("{{#each xs}}{{#if _first}}[{{/if}}{{.}}{{/each}}", { xs: [1, 2, 3] }),
+        "[123");
+
+    eq("each _last",
+        Template.Apply("{{#each xs}}{{.}}{{#if _last}}!{{/if}}{{/each}}", { xs: [1, 2, 3] }),
+        "123!");
+
+    eq("each _count",
+        Template.Apply("{{#each xs}}{{_count}}{{/each}}", { xs: ["a", "b"] }),
+        "22");
+
+    eq("each object items",
+        Template.Apply("{{#each people}}{{name}} {{/each}}", {
+            people: [{ name: "Alice" }, { name: "Bob" }]
+        }),
+        "Alice Bob ");
+
+    eq("each empty array -> empty",
+        Template.Apply("{{#each xs}}x{{/each}}", { xs: [] }),
+        "");
+
+    // --- Outer context access inside each ---
+    eq("outer var inside each",
+        Template.Apply("{{#each xs}}{{title}}:{{.}} {{/each}}", {
+            title: "item",
+            xs: [1, 2]
+        }),
+        "item:1 item:2 ");
+
+    // --- Nested each ---
+    eq("nested each",
+        Template.Apply("{{#each rows}}[{{#each cols}}{{.}}{{/each}}]{{/each}}", {
+            rows: [{ cols: [1, 2] }, { cols: [3, 4] }]
+        }),
+        "[12][34]");
+
+    // --- Compile-once, render-many ---
+    let t = Template.Parse("Hi {{name}}, you are {{age}}.");
+    eq("compile once render 1", t.Render({ name: "Alice", age: 30 }), "Hi Alice, you are 30.");
+    eq("compile once render 2", t.Render({ name: "Bob",   age: 25 }), "Hi Bob, you are 25.");
+
+    // --- Unterminated tag graceful handling ---
+    let broken = Template.Apply("start {{ end", {});
+    chk("unterminated tag does not crash", String.Length(broken) > 0);
+
+    // --- {{#unless}} ---
+    eq("unless false renders body",
+        Template.Apply("{{#unless hidden}}visible{{/unless}}", { hidden: false }),
+        "visible");
+
+    eq("unless true suppresses body",
+        Template.Apply("{{#unless hidden}}visible{{/unless}}", { hidden: true }),
+        "");
+
+    eq("unless nil renders body",
+        Template.Apply("{{#unless val}}default{{/unless}}", {}),
+        "default");
+
+    eq("unless 0 renders body",
+        Template.Apply("{{#unless n}}zero{{/unless}}", { n: 0 }),
+        "zero");
+
+    eq("unless non-empty string suppresses body",
+        Template.Apply("{{#unless s}}empty{{/unless}}", { s: "hello" }),
+        "");
+
+    eq("unless with surrounding text",
+        Template.Apply("A{{#unless skip}}B{{/unless}}C", { skip: false }),
+        "ABC");
+
+    // --- {{> partial}} (Template.Register + render with partial) ---
+    Template.Register("greeting", Template.Parse("Hello, {{name}}!"));
+
+    eq("partial basic render",
+        Template.Apply("{{> greeting}}", { name: "World" }),
+        "Hello, World!");
+
+    eq("partial inherits full context",
+        Template.Apply("{{> greeting}} How are you?", { name: "Alice" }),
+        "Hello, Alice! How are you?");
+
+    eq("partial inline with surrounding text",
+        Template.Apply("--{{> greeting}}--", { name: "Bob" }),
+        "--Hello, Bob!--");
+
+    Template.Register("item", Template.Parse("<li>{{.}}</li>"));
+    eq("partial inside each",
+        Template.Apply("{{#each xs}}{{> item}}{{/each}}", { xs: ["a", "b"] }),
+        "<li>a</li><li>b</li>");
+
+    // unknown partial renders nothing (no crash)
+    chk("unknown partial does not crash",
+        String.Length(Template.Apply("{{> nosuchpartial}}", {})) == 0);
+
+    // --- GetPartial ---
+    let gp = Template.GetPartial("greeting");
+    chk("GetPartial returns non-nil for registered partial", gp != nil);
+
+    // Registered partial can be rendered directly
+    eq("GetPartial result renders correctly",
+        gp.Render({ name: "Carol" }),
+        "Hello, Carol!");
+
+    chk("GetPartial returns nil for unknown name",
+        Template.GetPartial("does_not_exist") == nil);
+
+    // Register overwrites - GetPartial sees updated version
+    Template.Register("greeting", Template.Parse("Hi {{name}}"));
+    let gp2 = Template.GetPartial("greeting");
+    eq("GetPartial sees re-registered partial",
+        gp2.Render({ name: "Dave" }),
+        "Hi Dave");
+
+    // --- Report ---
+    Console.WriteLine("\nResults: " + str(passed) + " passed, " + str(failed) + " failed.");
+    if (failed == 0) {
+        Console.Ok("All Template tests passed!");
+    } else {
+        Console.Warn(str(failed) + " test(s) failed.");
+    }
+
+    // =========================================================================
+    // Benchmarks
+    // =========================================================================
+    Console.WriteLine("\n--- Benchmarks ---");
+
+    let N = 10000;
+
+    // 1. Parse-only: compile a moderately complex template N times
+    let complexSrc = "{{#if title}}<h1>{{title}}</h1>{{/if}}<ul>{{#each items}}<li>{{_index}}: {{name}}</li>{{/each}}</ul>";
+    let t0 = Time.Ticks();
+    let i = 0;
+    while (i < N) {
+        Template.Parse(complexSrc);
+        i += 1;
+    }
+    let dt = Time.Ticks() - t0;
+    Console.WriteLine(String.PadRight("Parse complex template x" + str(N), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(N)]), 8), " us/op");
+
+    // 2. Render-only: compile once, render N times (variable substitution)
+    let tSimple = Template.Parse("Hello, {{name}}! You have {{count}} messages.");
+    let t1 = Time.Ticks();
+    i = 0;
+    while (i < N) {
+        tSimple.Render({ name: "Alice", count: 42 });
+        i += 1;
+    }
+    dt = Time.Ticks() - t1;
+    Console.WriteLine(String.PadRight("Render simple vars x" + str(N), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(N)]), 8), " us/op");
+
+    // 3. Render with each loop (10 items)
+    let tEach = Template.Parse("{{#each items}}{{_index}}: {{name}} ({{score}})  {{/each}}");
+    let benchData = {
+        items: [
+            { name: "Alice", score: 95 }, { name: "Bob",   score: 87 },
+            { name: "Carol", score: 92 }, { name: "Dave",  score: 78 },
+            { name: "Eve",   score: 88 }, { name: "Frank", score: 91 },
+            { name: "Grace", score: 85 }, { name: "Hank",  score: 76 },
+            { name: "Iris",  score: 93 }, { name: "Jack",  score: 82 }
+        ]
+    };
+    let t2 = Time.Ticks();
+    i = 0;
+    while (i < N) {
+        tEach.Render(benchData);
+        i += 1;
+    }
+    dt = Time.Ticks() - t2;
+    Console.WriteLine(String.PadRight("Render each (10 items) x" + str(N), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(N)]), 8), " us/op");
+
+    // 4. Apply (parse+render) for a small template
+    let t3 = Time.Ticks();
+    i = 0;
+    while (i < N) {
+        Template.Apply("{{#if ok}}{{msg}}{{#else}}none{{/if}}", { ok: true, msg: "yes" });
+        i += 1;
+    }
+    dt = Time.Ticks() - t3;
+    Console.WriteLine(String.PadRight("Apply (parse+render, if/else) x" + str(N), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(N)]), 8), " us/op");
+    return failed;
+}

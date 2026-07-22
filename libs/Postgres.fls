@@ -1,0 +1,274 @@
+// ============================================================
+//  Postgres.fls - PostgreSQL client library for Flaris
+//  Version: 1.0
+// ============================================================
+//
+// SETUP
+// -----
+// 1. Install the PostgreSQL C client library:
+//
+//      macOS:   brew install libpq
+//               export PATH="$(brew --prefix libpq)/bin:$PATH"
+//      Ubuntu:  apt install libpq-dev
+//      Fedora:  dnf install libpq-devel
+//
+// 2. Compile the FFI plugin (run from the repo root):
+//
+//      macOS:  gcc -shared -fPIC -O2 -o libs/pg_ffi.dylib libs/pg_ffi.c \
+//                  $(pg_config --cflags) -lpq $(pg_config --ldflags)
+//      Linux:  gcc -shared -fPIC -O2 -o libs/pg_ffi.so   libs/pg_ffi.c \
+//                  $(pg_config --cflags) -lpq $(pg_config --ldflags)
+//
+// 3. Run your script with the -u (unsafe/FFI) flag:
+//
+//      flarisvm --unsafe script.fls --libs='./libs'
+//
+// QUICK START
+// -----------
+//      import { Postgres } from library("Postgres", "1.0");
+//
+//      let db = Postgres.Connect("host=localhost dbname=mydb user=postgres password=secret");
+//      if (db == nil) { Console.Error("Connection failed"); return 1; }
+//
+//      // Always use parameterized queries for user-supplied values
+//      let rows = db.QueryParams(
+//          "SELECT id, name FROM users WHERE active = $1",
+//          [true]);
+//      foreach (row in rows) {
+//          Console.WriteLine(row.id, row.name);
+//      }
+//
+//      let count = db.ScalarInt("SELECT COUNT(*) FROM users");
+//      let ver   = db.ScalarString("SELECT version()");
+//
+//      let n = db.ExecParams(
+//          "UPDATE users SET last_login = NOW() WHERE id = $1",
+//          [userId]);
+//
+//      db.Close();
+//
+// CONNECTION STRINGS
+// ------------------
+// libpq key=value format:
+//   "host=localhost port=5432 dbname=mydb user=postgres password=secret"
+//
+// URI format:
+//   "postgresql://postgres:secret@localhost:5432/mydb"
+//
+// Empty string - libpq reads PGHOST, PGUSER, PGDATABASE, PGPASSWORD from
+// environment variables automatically.
+//
+// TYPE MAPPING
+// ------------
+// PostgreSQL types are mapped to native Flaris types:
+//
+//   int2 / int4 / int8 / serial   -  int
+//   float4 / float8 / numeric      -  float
+//   bool                           -  bool
+//   text / varchar / uuid / json / timestamp / …  -  string
+//   NULL                           -  nil
+//
+// ERROR HANDLING
+// --------------
+// Query / QueryParams return { error: "message" } on failure (not an exception).
+// Check with: if ("error" in result) { ... }
+//
+// Exec / ExecParams return -1 on error.
+//
+// Connect returns nil on failure; libpq prints the reason to stderr.
+//
+// TRANSACTIONS
+// ------------
+// Transactions are plain SQL - there is no wrapper:
+//
+//   db.Exec("BEGIN");
+//   let ok1 = db.ExecParams("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [amount, fromId]);
+//   let ok2 = db.ExecParams("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [amount, toId]);
+//   if (ok1 == 1 && ok2 == 1) { db.Exec("COMMIT"); }
+//   else                       { db.Exec("ROLLBACK"); }
+//
+// RETURNING CLAUSE
+// ----------------
+//   let rows = db.QueryParams(
+//       "INSERT INTO items (name) VALUES ($1) RETURNING id",
+//       [name]);
+//   let newId = rows[0].id;
+//
+// PARAM TYPES
+// -----------
+// QueryParams / ExecParams accept arrays of: int, float, bool, string.
+// nil elements become SQL NULL.  Use $1, $2, … placeholders in the SQL string.
+//
+// SECURITY NOTE
+// -------------
+// FFI libraries are loaded without a SHA-256 fingerprint check here, which
+// means you are trusting the library at the path you compiled.  If you need
+// tamper detection, pass the SHA-256 of your compiled pg_ffi as the second
+// argument to Ffi.Load and run flarisvm --no-verify to enforce it.
+//
+// TROUBLESHOOTING
+// ---------------
+//   Connect returns nil        - check server is running; libpq error is on stderr
+//   Exception.UnsafeOperation  - add --unsafe flag: flarisvm --unsafe script.fls
+//   "symbol not found"         - wrong or stale pg_ffi binary; recompile
+//   "dylib not found"          - run from repo root, or set --libs= to the right path
+//
+// API REFERENCE
+// -------------
+// Connecting:
+//   Postgres.Connect(connstr)              →  Postgres instance or nil
+//
+// Queries (return array of row objects, or { error: "msg" } on failure):
+//   Query(sql)
+//   QueryParams(sql, params:array)         - use $1, $2, … placeholders
+//   QueryOne(sql)                          →  single row object or nil
+//   QueryOneParams(sql, params:array)
+//
+// Scalars (execute and return a single value):
+//   ScalarInt(sql)                         →  int or nil
+//   ScalarIntParams(sql, params)
+//   ScalarString(sql)                      →  string or nil
+//   ScalarStringParams(sql, params)
+//
+// Execution (return rows affected, or -1 on error):
+//   Exec(sql)
+//   ExecParams(sql, params:array)
+//
+// Transactions:
+//   Transaction(fn)   - calls fn(db); auto-COMMIT on success, ROLLBACK on throw
+//
+// Misc:
+//   Close()
+//
+// ============================================================
+
+class Postgres {
+    let _conn = nil; 
+    let _pg_close = nil; 
+    let _pg_exec = nil; 
+    let _pg_exec_p = nil; 
+    let _pg_qp = nil; 
+    let _pg_query = nil; 
+    let _pg_scalar_i = nil; 
+    let _pg_scalar_s = nil; 
+
+    fn static _lib_path() {
+        // Bare name - Ffi.Load resolves it from ~/.flaris/ffi ($FLARIS_FFI),
+        // appending the platform extension (.dylib/.so/.dll) automatically.
+        return "pg_ffi";
+    }
+
+    fn Constructor(handle: int, lib) {
+        this._conn        = handle;
+        this._pg_query    = Ffi.GetFunction(lib, "pg_query");
+        this._pg_qp       = Ffi.GetFunction(lib, "pg_query_params");
+        this._pg_exec     = Ffi.GetFunction(lib, "pg_exec");
+        this._pg_exec_p   = Ffi.GetFunction(lib, "pg_exec_params");
+        this._pg_scalar_i = Ffi.GetFunction(lib, "pg_scalar_int");
+        this._pg_scalar_s = Ffi.GetFunction(lib, "pg_scalar_string");
+        this._pg_close    = Ffi.GetFunction(lib, "pg_close");
+    }
+
+    // Postgres.Connect(connstr) - Postgres | nil
+    fn static Connect(connstr: string) {
+        let lib = Ffi.Load(Postgres._lib_path(), nil);
+        if (lib == nil) { return nil; }
+        let pg_connect = Ffi.GetFunction(lib, "pg_connect");
+        if (pg_connect == nil) { return nil; }
+        let handle = pg_connect(connstr);
+        if (handle == nil || handle == 0) { return nil; }
+        return new Postgres(handle, lib);
+    }
+
+    // db.Query(sql) - array<object> | { error: string }
+    // Each row is an object keyed by column name; types are mapped natively.
+    // Never interpolate user input - use QueryParams instead.
+    fn Query(sql: string) {
+        return this._pg_query(this._conn, sql);
+    }
+
+    // db.QueryParams(sql, params) - array<object> | { error: string }
+    // Parameterized SELECT. Use $1, $2, … placeholders; pass values as array.
+    fn QueryParams(sql: string, params) {
+        return this._pg_qp(this._conn, sql, params);
+    }
+
+    // db.QueryOne(sql) - object | nil   Returns first row or nil; nil on empty or error.
+    fn QueryOne(sql: string) {
+        let rows = this._pg_query(this._conn, sql);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        return rows[0];
+    }
+
+    // db.QueryOneParams(sql, params) - object | nil
+    fn QueryOneParams(sql: string, params) {
+        let rows = this._pg_qp(this._conn, sql, params);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        return rows[0];
+    }
+
+    // db.ScalarInt(sql) - int | nil
+    fn ScalarInt(sql: string) {
+        return this._pg_scalar_i(this._conn, sql);
+    }
+
+    // db.ScalarIntParams(sql, params) - int | nil
+    fn ScalarIntParams(sql: string, params) {
+        let rows = this._pg_qp(this._conn, sql, params);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        let v = nil;
+        foreach (x in rows[0]) { v = x; break; }
+        return v;
+    }
+
+    // db.ScalarString(sql) - string | nil
+    fn ScalarString(sql: string) {
+        return this._pg_scalar_s(this._conn, sql);
+    }
+
+    // db.ScalarStringParams(sql, params) - string | nil
+    fn ScalarStringParams(sql: string, params) {
+        let rows = this._pg_qp(this._conn, sql, params);
+        if ("error" in rows) { return nil; }
+        if (len(rows) == 0)  { return nil; }
+        let v = nil;
+        foreach (x in rows[0]) { v = x; break; }
+        return v == nil ? nil : str(v);
+    }
+
+    // db.Exec(sql) - int  (affected rows, or -1 on error)
+    // For INSERT / UPDATE / DELETE / DDL. Never interpolate user input.
+    fn Exec(sql: string) {
+        return this._pg_exec(this._conn, sql);
+    }
+
+    // db.ExecParams(sql, params) - int  (affected rows, or -1 on error)
+    // Parameterized DML. Use $1, $2, … placeholders; pass values as array.
+    fn ExecParams(sql: string, params) {
+        return this._pg_exec_p(this._conn, sql, params);
+    }
+
+    // db.Transaction(f) - bool
+    // Wraps f() in BEGIN/COMMIT. If f() returns false, rolls back and returns false.
+    // Example: db.Transaction(fn() { return db.ExecParams("...", [...]) == 1; });
+    fn Transaction(f: fn) {
+        this.Exec("BEGIN");
+        let ok = f();
+        if (ok == false) {
+            this.Exec("ROLLBACK");
+            return false;
+        }
+        this.Exec("COMMIT");
+        return true;
+    }
+
+    // db.Close() - bool
+    fn Close() {
+        return this._pg_close(this._conn);
+    }
+}
+
+export { Postgres };

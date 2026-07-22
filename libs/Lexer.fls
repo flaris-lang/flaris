@@ -1,0 +1,531 @@
+// Lexer.fls - General-purpose configurable lexer for Flaris.
+// Version: 1.0
+//
+// Splits any source string into a token stream. Configure via a fluent
+// builder API; use Lexer.Quick() for one-shot tokenisation.
+//
+// Token structure:  { type:string, val, line:int, col:int }
+//   val is a string for word/op/string tokens; int or float for numbers.
+//
+// Usage:
+//   import { Lexer } from library("Lexer", "1.0");
+//
+//   // Build once, tokenize many times
+//   let lex = new Lexer()
+//   lex.Word("a-zA-Z_", "a-zA-Z0-9_")
+//      .Number()
+//      .Quote("\"", "string")
+//      .LineComment("//")
+//      .BlockComment("/*", "*/")
+//      .Operators("+-*/=<>!(){}[];,.")
+//      .Keywords(["if","else","while","for","return","fn","let","var"], "keyword")
+//      .Skip(" \t\n\r")
+//
+//   let tokens = lex.Tokenize(source)
+//   // → [{type:"keyword", val:"if",  line:1, col:1},
+//   //    {type:"op",      val:"(",   line:1, col:4}, ...]
+//
+//   // One-shot convenience - builds and discards the Lexer
+//   let tokens = Lexer.Quick(source, {
+//       word:        "a-zA-Z_",
+//       number:      true,
+//       string:      "\"",
+//       lineComment: "//",
+//       ops:         "+-*/=<>!(),;",
+//       keywords:    ["if","else","while"],
+//       skip:        " \t\n\r",
+//   })
+//
+//   // Math expression example
+//   let lex = new Lexer()
+//   lex.Word("a-zA-Z", "a-zA-Z0-9")
+//      .Number()
+//      .Operators("+-*/^=()")
+//      .Skip(" \t")
+//   let toks = lex.Tokenize("sin(x) + 3.14 * y^2")
+//
+// Configuration - all methods return this for chaining:
+//   Word(start, cont)             - identifier chars; "a-z" ranges are expanded
+//   Number()                      - integer and float literals (val is int or float)
+//   Quote(ch, type)               - quoted string; backslash escapes honoured
+//   LineComment(prefix)           - skip from prefix to end of line
+//   BlockComment(open, close)     - skip enclosed block
+//   Operator(op)                  - add one operator string (any length)
+//   Operators(chars)              - add each char in chars as a single-char operator
+//   Keyword(word, type)           - override word token type for one word
+//   Keywords(words:array, type)   - override for a list of words
+//   Skip(chars)                   - silently consume these characters
+//   Whitespace(chars, type)       - emit whitespace as tokens instead of skipping
+//
+// Static:
+//   Lexer.Quick(src, opts)        - one-shot; opts keys: word, number, string,
+//                                   lineComment, blockComment, ops, keywords, skip
+//
+// Token types (default names):
+//   "word"    - identifier
+//   "number"  - integer or float (val is numeric)
+//   "string"  - quoted string content (quotes stripped, escapes resolved)
+//   "op"      - operator
+//   "keyword" - word matched by Keywords()
+//   "ws"      - whitespace (only when Whitespace() used instead of Skip())
+//   "unknown" - unrecognised character
+
+class Lexer {
+
+    // =========================================================================
+    // Fields
+    // =========================================================================
+
+    let _wordStart:  string = "";
+    let _wordCont:   string = "";
+    let _wordStop:   string = "";     // complement - used with IndexOfAnyFrom
+    let _wordOn:     bool   = false;
+
+    let _numOn:      bool   = false;
+    let _numStop:    string = "";
+
+    let _quotes:     array  = [];     // [{ch, type}]
+    let _lnCmts:     array  = [];     // [prefix, ...]
+    let _blkCmts:    array  = [];     // [{open, close}, ...]
+    let _keywords:   object = {};     // word → type string
+    let _ops:        array  = [];     // sorted longest-first
+    let _skipChars:  string = "";
+    let _wsType:     string = "";     // non-empty → emit whitespace tokens
+
+    let _ready:      bool   = false;
+
+    // =========================================================================
+    // Configuration API
+    // =========================================================================
+
+    fn Constructor() {
+        this._quotes   = [];
+        this._lnCmts   = [];
+        this._blkCmts  = [];
+        this._ops      = [];
+        this._keywords = {};
+    }
+
+    // Word / identifier tokens.  start and cont accept ranges: "a-zA-Z_".
+    fn Word(start: string, cont: string) : instance {
+        this._wordStart = Lexer._expand(start);
+        this._wordCont  = Lexer._expand(cont);
+        this._wordOn    = true;
+        this._ready     = false;
+        return this;
+    }
+
+    // Integer and float literals.  val will be int or float.
+    fn Number() : instance {
+        this._numOn = true;
+        this._ready = false;
+        return this;
+    }
+
+    // Quoted string.  ch is the delimiter (e.g. "\"").  Backslash escapes
+    // \n \t \r \\ and \" / \' are resolved.  val is the content without quotes.
+    fn Quote(ch: string, type: string) : instance {
+        this._quotes = Array.Append(this._quotes, { ch: ch, type: type });
+        return this;
+    }
+
+    // Skip from prefix to end of line (inclusive of the newline).
+    fn LineComment(prefix: string) : instance {
+        this._lnCmts = Array.Append(this._lnCmts, prefix);
+        return this;
+    }
+
+    // Skip from open to close (both inclusive).
+    fn BlockComment(open: string, close: string) : instance {
+        this._blkCmts = Array.Append(this._blkCmts, { open: open, close: close });
+        return this;
+    }
+
+    // Add one operator string (may be multi-character, e.g. "==", "!=").
+    fn Operator(op: string) : instance {
+        this._ops = Array.Append(this._ops, op);
+        this._ready = false;
+        return this;
+    }
+
+    // Add every character in chars as a single-character operator.
+    fn Operators(chars: string) : instance {
+        var i: int = 0;
+        let n: int = String.Length(chars);
+        while (i < n) {
+            this._ops = Array.Append(this._ops, String.Substr(chars, i, 1));
+            i += 1;
+        }
+        this._ready = false;
+        return this;
+    }
+
+    // Override the type of a specific word token.
+    fn Keyword(word: string, type: string) : instance {
+        this._keywords[word] = type;
+        return this;
+    }
+
+    // Override the type for every word in the array.
+    fn Keywords(words: array, type: string) : instance {
+        iter (i from 0 to len(words) - 1) {
+            this._keywords[words[i]] = type;
+        }
+        return this;
+    }
+
+    // Silently consume these characters (e.g. " \t\n\r").
+    fn Skip(chars: string) : instance {
+        this._skipChars = chars;
+        this._wsType    = "";
+        return this;
+    }
+
+    // Like Skip but emit whitespace runs as a token of the given type.
+    fn Whitespace(chars: string, type: string) : instance {
+        this._skipChars = chars;
+        this._wsType    = type;
+        return this;
+    }
+
+    // =========================================================================
+    // Internal helpers
+    // =========================================================================
+
+    // Expand range notation: "a-zA-Z_" → full character set string.
+    // Only handles printable ASCII ranges (codes 32–126).
+    fn static _expand(spec: string) : string {
+        if (!String.Contains(spec, "-")) return spec;
+        let ascii: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+        var result: string = "";
+        var i: int = 0;
+        let n: int = String.Length(spec);
+        while (i < n) {
+            if (i + 2 < n and String.Substr(spec, i + 1, 1) == "-") {
+                let c1: int = String.IndexOf(ascii, String.Substr(spec, i,     1));
+                let c2: int = String.IndexOf(ascii, String.Substr(spec, i + 2, 1));
+                var j: int = c1;
+                while (j <= c2) {
+                    result = result + String.Substr(ascii, j, 1);
+                    j += 1;
+                }
+                i += 3;
+            } else {
+                result = result + String.Substr(spec, i, 1);
+                i += 1;
+            }
+        }
+        return result;
+    }
+
+    // Build a stop-set string: all printable ASCII (32–126) not in contChars.
+    // Used with IndexOfAnyFrom to find word/number token boundaries in one C call.
+    fn static _buildStop(contChars: string) : string {
+        let ascii: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+        var stop: string = "";
+        var i: int = 0;
+        while (i < 95) {
+            let ch: string = String.Substr(ascii, i, 1);
+            if (!String.Contains(contChars, ch)) {
+                stop = stop + ch;
+            }
+            i += 1;
+        }
+        return stop;
+    }
+
+    // Sort operator array longest-first (insertion sort - list is usually tiny).
+    fn static _sortOpsDesc(ops: array) : array {
+        let n: int = len(ops);
+        iter (i from 1 to n - 1) {
+            let key: string = ops[i];
+            var j: int = i - 1;
+            while (j >= 0 and String.Length(ops[j]) < String.Length(key)) {
+                ops[j + 1] = ops[j];
+                j -= 1;
+            }
+            ops[j + 1] = key;
+        }
+        return ops;
+    }
+
+    // Resolve escape sequence after the backslash.
+    fn static _esc(ch: string) : string {
+        if (ch == "n")  return "\n";
+        if (ch == "t")  return "\t";
+        if (ch == "r")  return "\r";
+        if (ch == "\\") return "\\";
+        if (ch == "\"") return "\"";
+        if (ch == "'")  return "'";
+        // Flaris strings cannot hold an embedded NUL, so a "\0" escape maps to
+        // the empty string (a NUL would truncate the string at that byte).
+        if (ch == "0")  return "";
+        return ch;
+    }
+
+    // Prepare derived state; called once before first Tokenize.
+    fn _finalize() {
+        if (this._wordOn) {
+            this._wordStop = Lexer._buildStop(this._wordCont);
+            // _buildStop only covers printable ASCII (32-126).
+            // Explicitly add skip chars and quote delimiters so the scanner
+            // also stops at \n, \t, \r and quote boundaries.
+            var si: int = 0;
+            while (si < String.Length(this._skipChars)) {
+                let sc: string = String.Substr(this._skipChars, si, 1);
+                if (!String.Contains(this._wordStop, sc)) {
+                    this._wordStop = this._wordStop + sc;
+                }
+                si += 1;
+            }
+            iter (qi from 0 to len(this._quotes) - 1) {
+                let qc: string = this._quotes[qi].ch;
+                if (!String.Contains(this._wordStop, qc)) {
+                    this._wordStop = this._wordStop + qc;
+                }
+            }
+        }
+        if (this._numOn) {
+            this._numStop = Lexer._buildStop("0123456789.");
+            // Same: add skip chars so numbers stop at \n, \t, etc.
+            var si: int = 0;
+            while (si < String.Length(this._skipChars)) {
+                let sc: string = String.Substr(this._skipChars, si, 1);
+                if (!String.Contains(this._numStop, sc)) {
+                    this._numStop = this._numStop + sc;
+                }
+                si += 1;
+            }
+        }
+        this._ops   = Lexer._sortOpsDesc(this._ops);
+        this._ready = true;
+    }
+
+    // =========================================================================
+    // Tokenize
+    // =========================================================================
+
+    // Tokenize src and return an array of token objects.
+    fn Tokenize(src: string) : array {
+        if (!this._ready) this._finalize();
+
+        var tokens: array = [];
+        var pos:    int   = 0;
+        var line:   int   = 1;
+        var col:    int   = 1;
+        let n:      int   = String.Length(src);
+
+        while (pos < n) {
+            let ch: string = String.Substr(src, pos, 1);
+
+            // ── Whitespace / skip ─────────────────────────────────────────────
+            if (String.Contains(this._skipChars, ch)) {
+                if (this._wsType != "") {
+                    // Emit whitespace token: accumulate the run
+                    let ws_line: int = line;
+                    let ws_col:  int = col;
+                    var wsval:   string = "";
+                    while (pos < n and String.Contains(this._skipChars, String.Substr(src, pos, 1))) {
+                        let wch = String.Substr(src, pos, 1);
+                        wsval = wsval + wch;
+                        if (wch == "\n") { line += 1; col = 1; } else { col += 1; }
+                        pos += 1;
+                    }
+                    tokens = Array.Append(tokens, { type: this._wsType, val: wsval, line: ws_line, col: ws_col });
+                } else {
+                    if (ch == "\n") { line += 1; col = 1; } else { col += 1; }
+                    pos += 1;
+                }
+                continue;
+            }
+
+            // ── Line comments ─────────────────────────────────────────────────
+            var cmtDone: bool = false;
+            iter (ci from 0 to len(this._lnCmts) - 1) {
+                let pfx: string = this._lnCmts[ci];
+                let plen: int   = String.Length(pfx);
+                if (String.Substr(src, pos, plen) == pfx) {
+                    let end: int = String.IndexOfFrom(src, "\n", pos);
+                    if (end < 0) { pos = n; } else { pos = end; }
+                    cmtDone = true;
+                    break;
+                }
+            }
+            if (cmtDone) continue;
+
+            // ── Block comments ────────────────────────────────────────────────
+            var blkDone: bool = false;
+            iter (bi from 0 to len(this._blkCmts) - 1) {
+                let bc    = this._blkCmts[bi];
+                let olen: int = String.Length(bc.open);
+                if (String.Substr(src, pos, olen) == bc.open) {
+                    let clen: int = String.Length(bc.close);
+                    let end: int  = String.IndexOfFrom(src, bc.close, pos + olen);
+                    let stop: int = (end < 0) ? n : end + clen;
+                    // Count newlines inside the comment for line tracking
+                    var cp: int = pos;
+                    while (cp < stop) {
+                        if (String.Substr(src, cp, 1) == "\n") { line += 1; col = 1; } else { col += 1; }
+                        cp += 1;
+                    }
+                    pos = stop;
+                    blkDone = true;
+                    break;
+                }
+            }
+            if (blkDone) continue;
+
+            // ── Capture token position ────────────────────────────────────────
+            let tok_line: int = line;
+            let tok_col:  int = col;
+
+            // ── Quoted strings ────────────────────────────────────────────────
+            var qDone: bool = false;
+            iter (qi from 0 to len(this._quotes) - 1) {
+                let q = this._quotes[qi];
+                if (ch == q.ch) {
+                    pos += 1; col += 1;   // consume opening quote
+                    var val: string = "";
+                    while (pos < n) {
+                        let qch = String.Substr(src, pos, 1);
+                        if (qch == "\\") {
+                            pos += 1; col += 1;
+                            if (pos < n) {
+                                val = val + Lexer._esc(String.Substr(src, pos, 1));
+                                pos += 1; col += 1;
+                            }
+                        } else if (qch == q.ch) {
+                            pos += 1; col += 1;   // consume closing quote
+                            break;
+                        } else {
+                            val = val + qch;
+                            if (qch == "\n") { line += 1; col = 1; } else { col += 1; }
+                            pos += 1;
+                        }
+                    }
+                    tokens = Array.Append(tokens, { type: q.type, val: val, line: tok_line, col: tok_col });
+                    qDone = true;
+                    break;
+                }
+            }
+            if (qDone) continue;
+
+            // ── Numbers ───────────────────────────────────────────────────────
+            if (this._numOn and String.Contains("0123456789", ch)) {
+                let end: int = String.IndexOfAnyFrom(src, this._numStop, pos);
+                let stop: int = (end < 0) ? n : end;
+                let raw: string = String.Substr(src, pos, stop - pos);
+                var numval = Convert.ParseInt(raw);
+                if (String.Contains(raw, ".")) { numval = Convert.ParseFloat(raw); }
+                col += stop - pos;
+                pos = stop;
+                tokens = Array.Append(tokens, { type: "number", val: numval, line: tok_line, col: tok_col });
+                continue;
+            }
+
+            // ── Words / identifiers ───────────────────────────────────────────
+            if (this._wordOn and String.Contains(this._wordStart, ch)) {
+                let end: int  = String.IndexOfAnyFrom(src, this._wordStop, pos);
+                let stop: int = (end < 0) ? n : end;
+                let word: string = String.Substr(src, pos, stop - pos);
+                col += stop - pos;
+                pos = stop;
+                let ktype = this._keywords[word];
+                let wtype: string = (ktype != nil) ? ktype : "word";
+                tokens = Array.Append(tokens, { type: wtype, val: word, line: tok_line, col: tok_col });
+                continue;
+            }
+
+            // ── Operators (longest match first) ───────────────────────────────
+            var opDone: bool = false;
+            iter (oi from 0 to len(this._ops) - 1) {
+                let op: string = this._ops[oi];
+                let olen: int  = String.Length(op);
+                if (String.Substr(src, pos, olen) == op) {
+                    col += olen;
+                    pos += olen;
+                    tokens = Array.Append(tokens, { type: "op", val: op, line: tok_line, col: tok_col });
+                    opDone = true;
+                    break;
+                }
+            }
+            if (opDone) continue;
+
+            // ── Unknown character ─────────────────────────────────────────────
+            tokens = Array.Append(tokens, { type: "unknown", val: ch, line: tok_line, col: tok_col });
+            col += 1;
+            pos += 1;
+        }
+
+        return tokens;
+    }
+
+    // =========================================================================
+    // Static convenience
+    // =========================================================================
+
+    // One-shot tokenize.  opts keys:
+    //   word        : string - start+cont chars (same set), or {start, cont} object
+    //   number      : bool
+    //   string      : string or array - quote char(s); type defaults to "string"
+    //   lineComment : string or array - line comment prefix(es)
+    //   blockComment: array [open, close]
+    //   ops         : string - single-char operators
+    //   keywords    : array or object - if array, type = "keyword"
+    //   skip        : string - characters to skip
+    fn static Quick(src: string, opts: object) : array {
+        let lex = new Lexer();
+
+        if (opts.word != nil) {
+            if (is_object(opts.word)) {
+                lex.Word(opts.word.start, opts.word.cont);
+            } else {
+                lex.Word(opts.word, opts.word);
+            }
+        }
+
+        if (opts.number == true) { lex.Number(); }
+
+        if (opts.string != nil) {
+            if (is_array(opts.string)) {
+                iter (i from 0 to len(opts.string) - 1) {
+                    lex.Quote(opts.string[i], "string");
+                }
+            } else {
+                lex.Quote(opts.string, "string");
+            }
+        }
+
+        if (opts.lineComment != nil) {
+            if (is_array(opts.lineComment)) {
+                iter (i from 0 to len(opts.lineComment) - 1) {
+                    lex.LineComment(opts.lineComment[i]);
+                }
+            } else {
+                lex.LineComment(opts.lineComment);
+            }
+        }
+
+        if (opts.blockComment != nil) {
+            lex.BlockComment(opts.blockComment[0], opts.blockComment[1]);
+        }
+
+        if (opts.ops != nil) { lex.Operators(opts.ops); }
+
+        if (opts.keywords != nil) {
+            if (is_array(opts.keywords)) {
+                lex.Keywords(opts.keywords, "keyword");
+            } else {
+                // object: {word: type}
+                let _ktype = opts.keywords;
+                // iterate keys not directly supported - use Keywords with array if object
+            }
+        }
+
+        if (opts.skip != nil) { lex.Skip(opts.skip); }
+
+        return lex.Tokenize(src);
+    }
+}
+
+export { Lexer };

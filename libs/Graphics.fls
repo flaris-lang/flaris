@@ -1,0 +1,613 @@
+// Graphics.fls - High-level 2D drawing library for Flaris.
+// Version: 1.0
+//
+// Wraps the low-level Gfx builtin with a stateful style context (stroke color,
+// fill color, line thickness) so callers don't pass color on every call.
+// Produces PNG-compatible images saved to file or in-memory block.
+//
+// Color format: 0xAARRGGBB (32-bit ARGB). Fully opaque = 0xFF_______.
+// Static helpers: Graphics.RGB(r,g,b)  Graphics.RGBA(r,g,b,a)  Graphics.HSL(h,s,l)
+// Fill == 0 means "no fill" (outline only for Rect, Circle, etc.).
+//
+// Usage:
+//   import { Graphics } from library("Graphics", "1.0");
+//
+//   let g = new Graphics(800, 600);           // blank canvas
+//   g.SetStroke(0xFF000000);                  // black outline
+//   g.SetFill(0xFFFF0000);                    // red fill
+//   g.SetThickness(2);
+//   g.Clear(0xFFFFFFFF);                      // white background
+//   g.Circle(400, 300, 100);                  // filled + outlined circle
+//   g.DrawText(10, 10, "Hello");
+//   g.Save("output.png");
+//
+//   let img = Graphics.FromFile("photo.png"); // load existing image
+//   img.GrayscaleAll();
+//   img.Save("gray.png");
+//
+// Constructors:
+//   new Graphics(width, height)
+//   Graphics.Create(width, height)    →  instance
+//   Graphics.FromFile(path)           →  instance or nil
+//   Graphics.LoadImage(path)          →  instance or nil
+//
+// Style:
+//   SetStroke(argb)  SetFill(argb)  SetThickness(n)
+//   StrokeColor()  FillColor()  Thickness()
+//   static RGB(r,g,b)   static RGBA(r,g,b,a)   static HSL(h,s,l)
+//
+// Primitives (use current stroke + fill + thickness):
+//   Clear(color)
+//   Pixel(x,y,color)   GetPixel(x,y)  →  int
+//   Line(x0,y0,x1,y1)   HLine(x0,y,x1)   VLine(x,y0,y1)
+//   Polyline(pts)        - flat int array [x0,y0, x1,y1, ...] (not nested pairs)
+//   Rect(x,y,w,h)        - outline only (stroke)
+//   FillRect(x,y,w,h)   - fill only
+//   RoundRect(x,y,w,h,r)         - outline+fill with rounded corners
+//   DrawRoundRect(x,y,w,h,r)     - outline only
+//   FillRoundRect(x,y,w,h,r)     - fill only
+//   Circle(cx,cy,r)      - outline+fill
+//   DrawCircle(cx,cy,r)  - outline only
+//   FillCircle(cx,cy,r)  - fill only
+//   Ellipse(cx,cy,rx,ry)   FillEllipse(cx,cy,rx,ry)
+//   Arc(cx,cy,r,startDeg,endDeg)   ArcButt(…)
+//   Pie(cx,cy,r,startDeg,endDeg)   FillPie(…)
+//   Polygon(pts)    FillPolygon(pts)  - flat int array [x0,y0, x1,y1, ...] (not nested pairs)
+//
+// Text:
+//   DrawChar(x,y,code)              - single character by codepoint
+//   DrawCharScaled(x,y,code,scale)
+//   DrawText(x,y,text)
+//   DrawTextEx(x,y,text,scale)
+//   TextWidth(text,scale,lspace?)  TextHeight(scale)
+//   TextMetrics(text,scale,lspace?)  →  { width, height }
+//
+// Images & compositing:
+//   DrawImage(file,x,y,w,h)         - draw image file scaled to w×h
+//   DrawImageNearest(file,x,y,w,h)  - nearest-neighbour scaling
+//   Blit(x,y,w,h,pixels)            - raw ARGB pixel array
+//   Draw(src,x,y)                   - composite another Graphics at x,y
+//   DrawGfx(srcGfx,x,y)             - composite a raw Gfx handle
+//   CopyRect(x,y,w,h)               →  new Graphics (sub-image copy)
+//   BlendRect(src,dx,dy,alpha)      - alpha-blend a region
+//   Blend(src,dx,dy)                - full alpha blend
+//
+// Transforms & filters:
+//   Resize(w,h)  Rescale(sx,sy)  RescaleUniform(s)
+//   Filter(callback,x,y,w,h)     - per-pixel fn(argb)→argb on region
+//   FilterAll(callback)
+//   Grayscale(x,y,w,h)  GrayscaleAll()
+//   Brightness(x,y,w,h,factor)   BrightnessAll(factor)
+//
+// Output:
+//   Save(path)       - write PNG to file
+//   ToBlock()        →  block with raw PNG bytes
+//   Width()  Height()  GetGfx()
+
+class Graphics {
+
+    // ----------------------------------------------------------------
+    // Instance fields
+    // ----------------------------------------------------------------
+    let _width:int    = 1;
+    let _height:int   = 1;
+    let _gfx:instance = nil;
+
+    let _stroke:int    = 0xFFFFFFFF;  // default: opaque white
+    let _fill:int      = 0;           // 0 = no fill
+    let _thickness:int = 1;
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    fn Constructor(w:int, h:int) {
+        this._width  = Math.Max(1, w);
+        this._height = Math.Max(1, h);
+        this._gfx    = Gfx.Create(_width, _height);
+    }
+
+    fn static Create(w:int, h:int) : instance {
+        return new Graphics(w, h);
+    }
+
+    fn static FromFile(file:string) : instance|nil {
+        let raw = Gfx.CreateFromFile(file);
+        if (raw == nil) return nil;
+        let gi  = new Graphics(1, 1);
+        gi._gfx    = raw;
+        gi._width  = raw.Width;
+        gi._height = raw.Height;
+        return gi;
+    }
+
+    // ----------------------------------------------------------------
+    // Accessors
+    // ----------------------------------------------------------------
+
+    fn Width()  : int { return _width;  }
+    fn Height() : int { return _height; }
+    fn GetGfx() : instance|nil { return _gfx; }
+
+    // ----------------------------------------------------------------
+    // Style
+    // ----------------------------------------------------------------
+
+    fn SetStroke(argb:int) {
+        _stroke = argb;
+        return;
+    }
+
+    fn SetFill(argb:int) {
+        _fill = argb;
+        return;
+    }
+
+    fn SetThickness(t:int) {
+        _thickness = Math.Max(1, t);
+        return;
+    }
+
+    fn StrokeColor() : int { return _stroke;    }
+    fn FillColor()   : int { return _fill;      }
+    fn Thickness()   : int { return _thickness; }
+
+    // ----------------------------------------------------------------
+    // Pixel operations
+    // ----------------------------------------------------------------
+
+    fn Clear(color:int) {
+        _gfx.Clear(color);
+        return;
+    }
+
+    fn Pixel(x:int, y:int, color:int) {
+        _gfx.SetPixel(x, y, color);
+        return;
+    }
+
+    fn GetPixel(x:int, y:int) : int {
+        return _gfx.GetPixel(x, y);
+    }
+
+    // ----------------------------------------------------------------
+    // Lines
+    // ----------------------------------------------------------------
+
+    fn Line(x0:int, y0:int, x1:int, y1:int) {
+        _gfx.DrawLine(x0, y0, x1, y1, _stroke, _thickness);
+        return;
+    }
+
+    fn HLine(x0:int, y:int, x1:int) {
+        _gfx.DrawHLine(x0, y, x1, _stroke, _thickness);
+        return;
+    }
+
+    fn VLine(x:int, y0:int, y1:int) {
+        _gfx.DrawVLine(x, y0, y1, _stroke, _thickness);
+        return;
+    }
+
+    fn Polyline(pts:array) {
+        _gfx.StrokePath(pts, _stroke, _thickness, 1, 0);  // cap=round, open
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Rectangles
+    // ----------------------------------------------------------------
+
+    fn Rect(x:int, y:int, w:int, h:int) {
+        _gfx.DrawRect(x, y, w, h, _stroke, _thickness);
+        return;
+    }
+
+    fn FillRect(x:int, y:int, w:int, h:int) {
+        if (_fill == 0) return;
+        _gfx.FillRect(x, y, w, h, _fill);
+        return;
+    }
+
+    // Outlined rounded rectangle.
+    // Straight edges via HLine/VLine; corners via ArcButt (pure Flaris).
+    fn RoundRect(x:int, y:int, w:int, h:int, r:int) {
+        let maxr = Math.Min(w, h) / 2;
+        if (r > maxr) r = maxr;
+        if (r < 1) {
+            Rect(x, y, w, h);
+            return;
+        }
+
+        _gfx.DrawHLine(x + r,     y,         x + w - r - 1, _stroke, _thickness);
+        _gfx.DrawHLine(x + r,     y + h - 1, x + w - r - 1, _stroke, _thickness);
+        _gfx.DrawVLine(x,         y + r,     y + h - r - 1,  _stroke, _thickness);
+        _gfx.DrawVLine(x + w - 1, y + r,     y + h - r - 1,  _stroke, _thickness);
+
+        ArcButt(x + r,         y + r,         r, 180, 270);
+        ArcButt(x + w - r - 1, y + r,         r, 270, 360);
+        ArcButt(x + w - r - 1, y + h - r - 1, r,   0,  90);
+        ArcButt(x + r,         y + h - r - 1, r,  90, 180);
+        return;
+    }
+
+    // Filled rounded rectangle.
+    // 3 FillRect bands + 4 FillPie corner quarters (pure Flaris).
+    // Fill then stroke a rounded rectangle in one call.
+    fn DrawRoundRect(x:int, y:int, w:int, h:int, r:int) {
+        if (_fill != 0) FillRoundRect(x, y, w, h, r);
+        RoundRect(x, y, w, h, r);
+        return;
+    }
+
+    fn FillRoundRect(x:int, y:int, w:int, h:int, r:int) {
+        if (_fill == 0) return;
+        let maxr = Math.Min(w, h) / 2;
+        if (r > maxr) r = maxr;
+        if (r < 1) {
+            FillRect(x, y, w, h);
+            return;
+        }
+
+        _gfx.FillRect(x,     y + r,     w,         h - r * 2, _fill);
+        _gfx.FillRect(x + r, y,         w - r * 2, r,         _fill);
+        _gfx.FillRect(x + r, y + h - r, w - r * 2, r,         _fill);
+
+        FillPie(x + r,         y + r,         r, 180, 270);
+        FillPie(x + w - r - 1, y + r,         r, 270, 360);
+        FillPie(x + w - r - 1, y + h - r - 1, r,   0,  90);
+        FillPie(x + r,         y + h - r - 1, r,  90, 180);
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Circles
+    // ----------------------------------------------------------------
+
+    fn Circle(cx:int, cy:int, r:int) {
+        _gfx.DrawCircle(cx, cy, r, _stroke, _thickness, 0);
+        return;
+    }
+
+    fn FillCircle(cx:int, cy:int, r:int) {
+        if (_fill == 0) return;
+        _gfx.DrawCircle(cx, cy, r, _fill, 0, 0);
+        return;
+    }
+
+    // Fill then stroke in one call (skips each if the respective color is 0).
+    fn DrawCircle(cx:int, cy:int, r:int) {
+        if (_fill != 0) _gfx.DrawCircle(cx, cy, r, _fill, 0, 0);
+        _gfx.DrawCircle(cx, cy, r, _stroke, _thickness, 0);
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Ellipses  (pure Flaris)
+    // ----------------------------------------------------------------
+
+    fn _ellipsePts(cx:int, cy:int, rx:int, ry:int) : array {
+        let maxr  = Math.Max(rx, ry);
+        let steps = maxr * 2;
+        if (steps < 32)  steps = 32;
+        if (steps > 360) steps = 360;
+
+        let pts = [];
+        let i = 0;
+        while (i < steps) {
+            let rad = Math.Rad((i * 360) / steps);
+            let px  = cx + Convert.ToInt(Math.Round(rx * Math.Cos(rad)));
+            let py  = cy + Convert.ToInt(Math.Round(ry * Math.Sin(rad)));
+            Array.Append(pts, px);
+            Array.Append(pts, py);
+            i = i + 1;
+        }
+        return pts;
+    }
+
+    fn Ellipse(cx:int, cy:int, rx:int, ry:int) {
+        let pts = _ellipsePts(cx, cy, rx, ry);
+        _gfx.StrokePath(pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
+        return;
+    }
+
+    fn FillEllipse(cx:int, cy:int, rx:int, ry:int) {
+        if (_fill == 0) return;
+        let pts = _ellipsePts(cx, cy, rx, ry);
+        _gfx.FillPolygon(pts, _fill);
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Arcs  (pure Flaris)
+    // ----------------------------------------------------------------
+
+    fn _arcPts(cx:int, cy:int, r:int, startDeg:int, endDeg:int) : array {
+        let a0 = startDeg;
+        let a1 = endDeg;
+        if (a1 < a0) a1 = a1 + 360;
+
+        let sweep = a1 - a0;
+        let steps = sweep;
+        if (steps < 8)   steps = 8;
+        if (steps > 720) steps = 720;
+
+        let pts = [];
+        let i = 0;
+        while (i <= steps) {
+            let deg = a0 + (sweep * i) / steps;
+            let rad = Math.Rad(deg);
+            let px  = cx + Convert.ToInt(Math.Round(r * Math.Cos(rad)));
+            let py  = cy + Convert.ToInt(Math.Round(r * Math.Sin(rad)));
+            Array.Append(pts, px);
+            Array.Append(pts, py);
+            i = i + 1;
+        }
+        return pts;
+    }
+
+    fn Arc(cx:int, cy:int, r:int, startDeg:int, endDeg:int) {
+        let pts = _arcPts(cx, cy, r, startDeg, endDeg);
+        _gfx.StrokePath(pts, _stroke, _thickness, 1, 0);  // cap=round, open
+        return;
+    }
+
+    fn ArcButt(cx:int, cy:int, r:int, startDeg:int, endDeg:int) {
+        let pts = _arcPts(cx, cy, r, startDeg, endDeg);
+        _gfx.StrokePath(pts, _stroke, _thickness, 0, 0);  // cap=butt, open
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Pies  (pure Flaris)
+    // ----------------------------------------------------------------
+
+    fn Pie(cx:int, cy:int, r:int, startDeg:int, endDeg:int) {
+        let arc = _arcPts(cx, cy, r, startDeg, endDeg);
+        let pts = Array.Concat([cx, cy], arc);
+        _gfx.StrokePath(pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
+        return;
+    }
+
+    fn FillPie(cx:int, cy:int, r:int, startDeg:int, endDeg:int) {
+        if (_fill == 0) return;
+        let arc = _arcPts(cx, cy, r, startDeg, endDeg);
+        let pts = Array.Concat([cx, cy], arc);
+        _gfx.FillPolygon(pts, _fill);
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Polygons  (pure Flaris outline; fill uses C)
+    // ----------------------------------------------------------------
+
+    fn Polygon(pts:array) {
+        _gfx.StrokePath(pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
+        return;
+    }
+
+    fn FillPolygon(pts:array) {
+        if (_fill == 0) return;
+        _gfx.FillPolygon(pts, _fill);
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Text
+    // ----------------------------------------------------------------
+
+    fn DrawChar(x:int, y:int, code:int) {
+        _gfx.DrawChar(x, y, code, _stroke, 1);
+        return;
+    }
+
+    fn DrawCharScaled(x:int, y:int, code:int, scale:int) {
+        _gfx.DrawChar(x, y, code, _stroke, scale);
+        return;
+    }
+
+    fn DrawText(x:int, y:int, text:string) {
+        _gfx.DrawText(x, y, text, _stroke, 1);
+        return;
+    }
+
+    fn DrawTextEx(x:int, y:int, text:string, scale:int) {
+        _gfx.DrawText(x, y, text, _stroke, scale);
+        return;
+    }
+
+    // lspace: extra pixels between characters (default 0, matches DrawText).
+    fn TextWidth(text:string, scale:int, lspace) : int {
+        let l = (lspace == nil || lspace < 0) ? 0 : int(lspace);
+        return len(text) * (8 * scale + l);
+    }
+
+    fn TextHeight(scale:int) : int {
+        return 8 * scale;
+    }
+
+    // Returns { width, height } for layout calculations.
+    fn TextMetrics(text:string, scale:int, lspace) : object {
+        let l = (lspace == nil || lspace < 0) ? 0 : int(lspace);
+        return { width: len(text) * (8 * scale + l), height: 8 * scale };
+    }
+
+    // ----------------------------------------------------------------
+    // Images & compositing
+    // ----------------------------------------------------------------
+
+    fn DrawImage(file:string, x:int, y:int, w:int, h:int) {
+        _gfx.DrawImage(file, x, y, w, h, 1);
+        return;
+    }
+
+    fn DrawImageNearest(file:string, x:int, y:int, w:int, h:int) {
+        _gfx.DrawImage(file, x, y, w, h, 0);
+        return;
+    }
+
+    fn Blit(x:int, y:int, w:int, h:int, pixels:array) {
+        _gfx.Blit(x, y, w, h, pixels);
+        return;
+    }
+
+    fn Draw(src:instance, x:int, y:int) {
+        _gfx.Draw(src.GetGfx(), x, y);
+        return;
+    }
+
+    fn DrawGfx(srcGfx:instance, x:int, y:int) {
+        _gfx.Draw(srcGfx, x, y);
+        return;
+    }
+
+    fn CopyRect(x:int, y:int, w:int, h:int) : instance {
+        let sub = _gfx.CopyRect(x, y, w, h);
+        let gi  = new Graphics(w, h);
+        gi._gfx = sub;
+        return gi;
+    }
+
+    // ----------------------------------------------------------------
+    // Output
+    // ----------------------------------------------------------------
+
+    fn Save(path:string) {
+        return _gfx.SaveToFile(path);
+    }
+
+    fn ToBlock() {
+        return _gfx.SaveToBlock();
+    }
+
+    // ----------------------------------------------------------------
+    // Transforms
+    // ----------------------------------------------------------------
+
+    fn Resize(w:int, h:int) {
+        _gfx.Resize(w, h);
+        _width  = w;
+        _height = h;
+        return;
+    }
+
+    fn Rescale(sx:float, sy:float) {
+        _gfx.Rescale(sx, sy);
+        _width  = _gfx.Width;
+        _height = _gfx.Height;
+        return;
+    }
+
+    fn RescaleUniform(s:float) {
+        _gfx.Rescale(s);
+        _width  = _gfx.Width;
+        _height = _gfx.Height;
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Per-pixel filter
+    // ----------------------------------------------------------------
+
+    fn Filter(callback:fn, x:int, y:int, w:int, h:int) {
+        _gfx.Filter(callback, x, y, w, h);
+        return;
+    }
+
+    fn FilterAll(callback:fn) {
+        _gfx.Filter(callback, 0, 0, _width, _height);
+        return;
+    }
+
+    // Offload a region kernel fn(pixels, x, y, w, h, stride) -> scalar to a
+    // worker thread (threadsafe JIT kernel + -j) or run it inline, then fire
+    // cb(surface, result). `pixels` is the 32-bit ARGB block; index a region
+    // pixel as pixels[(y+dy)*stride + (x+dx)]. `surface` handed to cb is the
+    // underlying Gfx image. See Buffer.ProcessCallback for the kernel rules.
+    fn FilterCallback(kernel:fn, x:int, y:int, w:int, h:int, cb:fn) {
+        _gfx.FilterCallback(kernel, x, y, w, h, cb);
+        return;
+    }
+
+    fn FilterCallbackAll(kernel:fn, cb:fn) {
+        _gfx.FilterCallback(kernel, 0, 0, _width, _height, cb);
+        return;
+    }
+
+    // Like FilterCallback, but delivers the kernel result into an event; join
+    // several with Event.WaitFor([ids]).
+    fn FilterEvent(kernel:fn, x:int, y:int, w:int, h:int, eventId:int) {
+        _gfx.FilterEvent(kernel, x, y, w, h, eventId);
+        return;
+    }
+
+    fn FilterEventAll(kernel:fn, eventId:int) {
+        _gfx.FilterEvent(kernel, 0, 0, _width, _height, eventId);
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Image effects
+    // ----------------------------------------------------------------
+
+    fn Grayscale(x:int, y:int, w:int, h:int) {
+        _gfx.Grayscale(x, y, w, h);
+        return;
+    }
+
+    fn GrayscaleAll() {
+        _gfx.Grayscale(0, 0, _width, _height);
+        return;
+    }
+
+    fn Brightness(x:int, y:int, w:int, h:int, factor:float) {
+        _gfx.Brightness(x, y, w, h, factor);
+        return;
+    }
+
+    fn BrightnessAll(factor:float) {
+        _gfx.Brightness(0, 0, _width, _height, factor);
+        return;
+    }
+
+    fn BlendRect(src:instance, dx:int, dy:int, alpha:int) {
+        _gfx.BlendRect(src.GetGfx(), dx, dy, alpha);
+        return;
+    }
+
+    fn Blend(src:instance, dx:int, dy:int) {
+        _gfx.BlendRect(src.GetGfx(), dx, dy, 255);
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Color helpers  (static, return 0xAARRGGBB)
+    // ----------------------------------------------------------------
+
+    // All three implemented in gfx.c.
+    fn static RGB(r:int, g:int, b:int) : int {
+        return Gfx.RGB(r, g, b);
+    }
+
+    fn static RGBA(r:int, g:int, b:int, a:int) : int {
+        return Gfx.RGBA(r, g, b, a);
+    }
+
+    // h: 0-360, s: 0.0-1.0, l: 0.0-1.0
+    fn static HSL(h:float, s:float, l:float) : int {
+        return Gfx.HSL(h, s, l);
+    }
+
+    // ----------------------------------------------------------------
+    // Image loading
+    // ----------------------------------------------------------------
+
+    // Load an image file into a Graphics instance for compositing.
+    // Use g.Draw(loaded, x, y) or g.Blend(loaded, x, y) to composite it.
+    fn static LoadImage(path:string) : instance|nil {
+        return Graphics.FromFile(path);
+    }
+
+}
+
+export { Graphics };

@@ -1,0 +1,360 @@
+// Cache.fls
+// Version: 1.0
+// LRU cache with optional TTL (time-to-live).
+//
+// Usage:
+//   import { Cache } from library("Cache", "1.0");
+//
+//   let c = new Cache(100);           // LRU, capacity 100, no TTL
+//   let c = new Cache(100, 60000);    // LRU, capacity 100, 60 s TTL
+//                                     // TTL is in milliseconds.
+//                                     // Internally, Time.Ticks() returns nanoseconds,
+//                                     // so the stored deadline is: Time.Ticks() + ttl * 1_000_000.
+//
+// API:
+//   Set(key, value)            - insert or update; evicts LRU entry when over capacity
+//   Get(key)                   - returns value or nil if missing/expired
+//   Has(key)                   - returns bool (false if expired)
+//   Delete(key)                - removes a specific key
+//   Clear()                    - removes all entries
+//   Size()                     - number of currently live entries
+//   Capacity()                 - maximum number of entries (as passed to Constructor)
+//   Keys()                     - array of live keys in LRU order (oldest first)
+//   Stats()                    - { Hits, Misses, Evictions, Expired } counters
+//   HitRate()                  - float in [0,1]; 0.0 if no accesses yet
+//   GetOrSet(key, f)           - return cached value or call f(), store and return result
+//   GetMany(keys)              - return array of values (nil for missing/expired) in key order
+//   SetMany(obj)               - batch insert: iterate object entries, call Set(k,v) for each
+//   Expire()                   - sweep all keys, remove expired ones; returns this
+//
+// Persistence (values must be JSON-serializable):
+//   Save(path)                 - write live entries + capacity/ttl to a JSON file; → bool
+//   Load(path, applyMeta?)     - replace entries from a saved file; → bool
+//                                applyMeta=true also restores capacity/ttl
+//   Cache.FromFile(path)       - static: build a new Cache from a saved file (or nil)
+//   (TTL deadlines are not persisted; Load re-applies a fresh TTL to each entry.)
+//
+// Async:
+//   Cache.GetOrSetAsync(cache, key, f)  - static async GetOrSet; use with `await`
+//
+// Keys must be string or int.  Values can be anything.
+// TTL of 0 means "never expire".
+//
+// All operations are O(1) except Keys(), Expire(), GetMany(), SetMany(), and ToString()
+// which are O(n).  The LRU doubly-linked list is embedded directly in the HashMap entries
+// (Prev/Next fields hold neighbour keys), so no separate order array is needed.
+
+class Cache {
+    let _cap = 0;
+    let _data = nil; 
+    let _evictions = 0;
+    let _expired = 0;
+    let _head = nil; 
+    let _hits = 0;
+    let _misses = 0;
+    let _size = 0;
+    let _tail = nil; 
+    let _ttl = 0;
+    fn Constructor(capacity: int, ttl?) {
+        if (capacity <= 0) throw(400, "Cache: capacity must be > 0");
+        this._cap  = capacity;
+        // _ttl is stored in milliseconds; conversion to nanoseconds happens in Set/_isExpired.
+        this._ttl  = ttl == nil ? 0 : ttl;
+        this._data = Collections.HashMap(); // key → { Value, ExpiresAt, Prev, Next }
+        this._head = nil;  // MRU key
+        this._tail = nil;  // LRU key
+        this._size = 0;
+        this._hits      = 0;
+        this._misses    = 0;
+        this._evictions = 0;  // capacity-driven evictions
+        this._expired   = 0;  // TTL-driven removals
+    }
+
+    // ---------- Private ----------
+
+    // Returns true when the entry has a TTL and that deadline has passed.
+    // TTL is stored in ms; Time.Ticks() is in ns, so deadline = ticks + ttl * 1_000_000.
+    fn _isExpired(entry): bool {
+        if (this._ttl == 0) return false;
+        return Time.Ticks() > entry.ExpiresAt;
+    }
+
+    // Unlink key from the doubly-linked list. Entry stays in _data.
+    fn _detach(key) {
+        let e = this._data.Get(key);
+        let p = e.Prev;  // toward MRU head
+        let n = e.Next;  // toward LRU tail
+        if (p != nil) {
+            this._data.Get(p).Next = n;
+        } else {
+            this._head = n;
+        }
+        if (n != nil) {
+            this._data.Get(n).Prev = p;
+        } else {
+            this._tail = p;
+        }
+        e.Prev = nil;
+        e.Next = nil;
+    }
+
+    // Insert key at head (MRU end). Entry must already be in _data.
+    fn _pushHead(key) {
+        let e = this._data.Get(key);
+        let h = this._head;
+        e.Next = h;
+        e.Prev = nil;
+        if (h != nil) {
+            this._data.Get(h).Prev = key;
+        }
+        this._head = key;
+        if (this._tail == nil) {
+            this._tail = key;
+        }
+    }
+
+    // Move an existing key to the MRU head.
+    fn _touch(key) {
+        if (this._head == key) return;
+        this._detach(key);
+        this._pushHead(key);
+    }
+
+    // Remove key from both list and _data. Does NOT update counters - callers do.
+    fn _remove(key) {
+        this._detach(key);
+        this._data.Delete(key);
+        this._size = this._size - 1;
+    }
+
+    // ---------- Public ----------
+
+    fn Set(key, value): instance {
+        // Deadline in nanoseconds: ttl (ms) * 1_000_000 converts to ns.
+        let expiresAt: int = this._ttl == 0 ? 0 : Time.Ticks() + this._ttl * 1000000;
+
+        if (this._data.Has(key)) {
+            let e = this._data.Get(key);
+            e.Value     = value;
+            e.ExpiresAt = expiresAt;
+            this._touch(key);
+            return this;
+        }
+
+        while (this._size >= this._cap) {
+            let lru = this._tail;
+            this._detach(lru);
+            this._data.Delete(lru);
+            this._size      = this._size - 1;
+            this._evictions = this._evictions + 1;
+        }
+
+        this._data.Set(key, { Value: value, ExpiresAt: expiresAt, Prev: nil, Next: nil });
+        this._size = this._size + 1;
+        this._pushHead(key);
+        return this;
+    }
+
+    fn Get(key) {
+        if (!this._data.Has(key)) {
+            this._misses = this._misses + 1;
+            return nil;
+        }
+        let entry = this._data.Get(key);
+        if (this._isExpired(entry)) {
+            this._remove(key);
+            this._expired = this._expired + 1;
+            this._misses  = this._misses + 1;
+            return nil;
+        }
+        this._hits = this._hits + 1;
+        this._touch(key);
+        return entry.Value;
+    }
+
+    fn Has(key): bool {
+        if (!this._data.Has(key)) return false;
+        if (this._isExpired(this._data.Get(key))) {
+            this._remove(key);
+            this._expired = this._expired + 1;
+            return false;
+        }
+        return true;
+    }
+
+    fn Delete(key): instance {
+        if (!this._data.Has(key)) return this;
+        this._remove(key);
+        return this;
+    }
+
+    fn Clear(): instance {
+        this._data = Collections.HashMap();
+        this._head = nil;
+        this._tail = nil;
+        this._size = 0;
+        return this;
+    }
+
+    fn Size(): int {
+        return this._size;
+    }
+
+    // Return the maximum number of entries this cache can hold.
+    fn Capacity(): int {
+        return this._cap;
+    }
+
+    fn Keys(): array {
+        // Walk from LRU tail → MRU head via Prev pointers (oldest first).
+        let result: array = [];
+        let k = this._tail;
+        while (k != nil) {
+            Array.Append(result, k);
+            k = this._data.Get(k).Prev;
+        }
+        return result;
+    }
+
+    fn Stats() {
+        return {
+            Hits:      this._hits,
+            Misses:    this._misses,
+            Evictions: this._evictions,
+            Expired:   this._expired
+        };
+    }
+
+    // Return the ratio of hits to total accesses (hits + misses).
+    // Returns 0.0 if there have been no accesses yet.
+    fn HitRate(): float {
+        let total = this._hits + this._misses;
+        if (total == 0) return 0.0;
+        return float(this._hits) / float(total);
+    }
+
+    // Return the cached value for key if present and not expired.
+    // Otherwise call f(), store the result under key, and return it.
+    fn GetOrSet(key, f: fn) {
+        if (this._data.Has(key)) {
+            let entry = this._data.Get(key);
+            if (!this._isExpired(entry)) {
+                this._hits = this._hits + 1;
+                this._touch(key);
+                return entry.Value;
+            }
+            // Expired - remove and fall through to recompute.
+            this._remove(key);
+            this._expired = this._expired + 1;
+        }
+        let value = f();
+        this.Set(key, value);
+        return value;
+    }
+
+    // Sweep all keys, remove expired ones.  Returns this for chaining.
+    // Collects keys first so we don't mutate the map during iteration.
+    fn Expire(): instance {
+        let all = this.Keys();
+        iter (i from 0 to len(all) - 1) {
+            let k = all[i];
+            if (this._data.Has(k) && this._isExpired(this._data.Get(k))) {
+                this._remove(k);
+                this._expired = this._expired + 1;
+            }
+        }
+        return this;
+    }
+
+    // Batch insert: iterate object entries and call Set for each key/value pair.
+    fn SetMany(obj): instance {
+        foreach (entry in Object.Entries(obj)) {
+            this.Set(entry[0], entry[1]);
+        }
+        return this;
+    }
+
+    // Return an array of values in the same order as keys.
+    // Missing or expired entries produce nil in the corresponding slot.
+    fn GetMany(keys: array): array {
+        let result: array = Array.Create(len(keys));
+        iter (i from 0 to len(keys) - 1) {
+            result[i] = this.Get(keys[i]);
+        }
+        return result;
+    }
+
+    // ---------- Persistence ----------
+
+    // Persist the cache to a JSON file: non-expired entries (oldest first) plus
+    // capacity/ttl metadata. Values must be JSON-serializable. Returns true on
+    // success. TTL deadlines are absolute and clock-relative, so they are not
+    // saved - Load() re-applies a fresh TTL to each restored entry.
+    fn Save(path: string): bool {
+        this.Expire();
+        let entries: array = [];
+        let keys = this.Keys();                  // oldest first
+        iter (i from 0 to len(keys) - 1) {
+            let k = keys[i];
+            Array.Append(entries, { k: k, v: this._data.Get(k).Value });
+        }
+        let payload = { capacity: this._cap, ttl: this._ttl, entries: entries };
+        return File.WriteText(path, Json.Stringify(payload)) == true;
+    }
+
+    // Load entries from a file written by Save(). Existing entries are cleared
+    // first. When applyMeta is true, the saved capacity/ttl replace the current
+    // settings. Returns true on success, false if the file is missing/invalid.
+    fn Load(path: string, applyMeta?): bool {
+        if (!File.Exists(path)) return false;
+        let raw = File.ReadText(path);
+        if (raw == nil) return false;
+        let payload = Json.Parse(raw);
+        if (payload == nil || !Object.HasKey(payload, "entries")) return false;
+
+        if ((applyMeta ?? false) == true) {
+            if (Object.HasKey(payload, "capacity") && payload.capacity > 0) { this._cap = payload.capacity; }
+            if (Object.HasKey(payload, "ttl")) { this._ttl = payload.ttl; }
+        }
+
+        this.Clear();
+        let entries = payload.entries;
+        iter (i from 0 to len(entries) - 1) {
+            let e = entries[i];
+            this.Set(e.k, e.v);                  // oldest first -> MRU order preserved
+        }
+        return true;
+    }
+
+    // Create a new Cache populated from a saved file (capacity/ttl come from the
+    // file). Returns nil if the file is missing or invalid.
+    fn static FromFile(path: string) {
+        if (!File.Exists(path)) return nil;
+        let raw = File.ReadText(path);
+        if (raw == nil) return nil;
+        let payload = Json.Parse(raw);
+        if (payload == nil || !Object.HasKey(payload, "entries")) return nil;
+        let cap = (Object.HasKey(payload, "capacity") && payload.capacity > 0) ? payload.capacity : 128;
+        let ttl = Object.HasKey(payload, "ttl") ? payload.ttl : 0;
+        let c = new Cache(cap, ttl);
+        c.Load(path, false);
+        return c;
+    }
+
+    fn ToString(): string {
+        return "Cache(cap=" + str(this._cap) +
+               ", ttl=" + str(this._ttl) +
+               ", size=" + str(this._size) + ")";
+    }
+
+    // ---------- Async ----------
+
+    // GetOrSet that runs the (possibly slow) factory in a fiber. Await the
+    // result, e.g.  let v = await Cache.GetOrSetAsync(cache, key, fn() { ... });
+    // (Static because instance async methods don't currently resolve on await.)
+    fn static async GetOrSetAsync(cache, key, f: fn) {
+        return cache.GetOrSet(key, f);
+    }
+}
+
+export { Cache };

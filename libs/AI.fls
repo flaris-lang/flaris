@@ -1,0 +1,558 @@
+// ============================================================
+//  AI.fls - Ollama AI client for Flaris
+//  Version: 1.0
+// ============================================================
+//
+// Targets local Ollama (http://localhost:11434) out of the box.
+// This client speaks plain HTTP via the Http library. For https:// cloud
+// endpoints (OpenAI, Anthropic, etc.) either use the Https library directly,
+// or keep this client and front the endpoint with a local HTTP proxy:
+//
+//   # Caddyfile
+//   :8080 { reverse_proxy https://api.openai.com }
+//
+//   let client = AI.Client("http://localhost:8080");
+//
+// Any HTTP-capable reverse proxy works (nginx, caddy, socat, etc.).
+//
+// Run with --libs flag:
+//   flarisvm script.fls --libs='./libs'
+//
+// QUICK START
+// -----------
+//   import { AI } from library("AI", "1.0");
+//
+//   // Blocking chat
+//   let reply = AI.Chat("qwen3:8b", [
+//       { role: "user", content: "What is 2+2?" }
+//   ]);
+//
+//   // System prompt shorthand
+//   let reply = AI.Ask("qwen3:8b", "You are a SQL expert.", "Write a query...");
+//
+//   // Streaming - callback fires per token
+//   AI.ChatStream("qwen3:8b", msgs, fn(token) { Console.Write(token); });
+//
+//   // Stateful conversation
+//   let conv = AI.Conversation("qwen3:8b");
+//   conv.System("You are a helpful assistant.");
+//   Console.WriteLine(conv.Say("What is the capital of France?"));
+//   Console.WriteLine(conv.Say("And its population?"));   // remembers context
+//
+//   // JSON output - returns parsed object
+//   let obj = AI.ChatJson("qwen3:8b", [
+//       { role: "user", content: "Return {\"name\":\"Alice\",\"age\":30} as JSON" }
+//   ]);
+//
+//   // Token stats
+//   let s = AI.ChatStats("qwen3:8b", msgs);
+//   Console.WriteLine(s.content, s.evalTokens, s.totalMs);
+//
+//   // Async - run two calls in parallel
+//   let p1 = AI.ChatAsync("qwen3:8b", msgs1);
+//   let p2 = AI.ChatAsync("qwen3:8b", msgs2);
+//   let r1 = await p1;
+//   let r2 = await p2;
+//
+//   // Model management
+//   AI.Pull("llama3.2");
+//   let info = AI.ModelInfo("qwen3:8b");
+//   let models = AI.Models();
+//
+// OPTIONS
+// -------
+// Pass an opts object as the last argument to Chat / Generate / Ask:
+//   {
+//     think:       bool    - chain-of-thought (qwen3 / deepseek-r1)
+//     temperature: float   - sampling temperature (0.0–2.0)
+//     seed:        int     - RNG seed for reproducible output
+//     top_p:       float   - nucleus sampling (0.0–1.0)
+//   }
+//
+// API REFERENCE
+// -------------
+// Blocking:
+//   AI.Chat(model, messages, opts?)              → string | nil
+//   AI.ChatStream(model, messages, fn, opts?)    → nil  (streams via callback)
+//   AI.ChatJson(model, messages, opts?)          → object | nil
+//   AI.ChatStats(model, messages, opts?)         → { content, promptTokens, evalTokens, totalMs } | nil
+//   AI.Ask(model, system, user, opts?)           → string | nil
+//   AI.Generate(model, prompt, opts?)            → string | nil
+//   AI.GenerateStream(model, prompt, fn, opts?)  → nil
+//
+// Async (use the await keyword):
+//   AI.ChatAsync(model, messages, opts?)         → fiber → string | nil
+//   AI.GenerateAsync(model, prompt, opts?)       → fiber → string | nil
+//
+// Tool / function calling:
+//   AI.Tool(name, description, parameters)       → tool definition (JSON schema params)
+//   AI.ToolResult(name, content)                 → a { role:"tool", ... } message
+//   AI.ChatMessage(model, messages, opts?)       → full assistant message
+//                                                  { role, content, tool_calls? } | nil
+//   AI.RunTools(model, messages, tools, handlers, opts?) → string | nil
+//       - drives the full tool-call loop: handlers is { toolName: fn(args) → result };
+//         `messages` is appended to in place with the transcript.
+//   (Pass tools yourself via opts.tools; force JSON via opts.format = "json".)
+//
+// Vision (multimodal models, e.g. llava / llama3.2-vision):
+//   AI.ImageFile(path)                           → base64 string | nil
+//   AI.Vision(model, prompt, images, opts?)      → string | nil  (images: base64 array)
+//   AI.VisionFiles(model, prompt, paths, opts?)  → string | nil  (reads + encodes files)
+//
+// Embeddings:
+//   AI.Embed(model, input:string)                → array<float> | nil
+//   AI.EmbedMany(model, inputs:array<string>)    → array<array<float>> | nil
+//
+// Models:
+//   AI.Models()                                  → array<object> | nil
+//   AI.ModelInfo(model)                          → object | nil
+//   AI.Pull(model)                               → { success:bool, error?:string }
+//   AI.Delete(model)                             → bool
+//
+// Conversation:
+//   AI.Conversation(model, opts?)                → AIConversation
+//   conv.System(msg)                             - set/prepend system message
+//   conv.Say(userMsg)                            → string | nil
+//   conv.Stream(userMsg, callback)               → string | nil  (streams + adds to history)
+//   conv.History()                               → array<object>
+//   conv.Reset()                                 - clear history
+//
+// Custom endpoint:
+//   AI.Client(baseUrl)                           → AIClient
+//
+// ============================================================
+
+import { Http } from library("Http", "1.0");
+
+// ── AIClient ──────────────────────────────────────────────────────────────────
+
+class AIClient {
+    let _base = nil; 
+
+    fn Constructor(baseUrl: string) {
+        this._base = baseUrl;
+    }
+
+    fn _post(path: string, payload) {
+        return Http.Post(this._base + path, Json.Stringify(payload));
+    }
+
+    // Build Ollama model-level options sub-object from caller opts.
+    fn _modelOptions(opts) {
+        if (opts == nil) { return nil; }
+        if ("temperature" in opts && "seed" in opts) {
+            return { temperature: opts.temperature, seed: opts.seed };
+        }
+        if ("temperature" in opts && "top_p" in opts) {
+            return { temperature: opts.temperature, top_p: opts.top_p };
+        }
+        if ("temperature" in opts) { return { temperature: opts.temperature }; }
+        if ("seed"        in opts) { return { seed:        opts.seed        }; }
+        if ("top_p"       in opts) { return { top_p:       opts.top_p       }; }
+        return nil;
+    }
+
+    fn _think(opts) {
+        if (opts != nil && "think" in opts) { return opts.think; }
+        return false;
+    }
+
+    fn _chatPayload(model, messages, stream, opts) {
+        let think = this._think(opts);
+        let mopts = this._modelOptions(opts);
+        let payload = { model: model, messages: messages, stream: stream, think: think };
+        if (mopts != nil) { payload["options"] = mopts; }
+        if (opts != nil) {
+            // Pass through tool definitions and a forced output format when given.
+            if ("tools"  in opts && opts.tools  != nil) { payload["tools"]  = opts.tools;  }
+            if ("format" in opts && opts.format != nil) { payload["format"] = opts.format; }
+        }
+        return payload;
+    }
+
+    // Call a function value retrieved from a collection. Going through a typed
+    // parameter lets the analyzer accept the dynamic call.
+    fn static _invoke(f:fn, args) { return f(args); }
+
+    // Shallow-merge two option objects (extra wins). Used to inject tools into a
+    // caller's opts without mutating their object.
+    fn static _merge(base, extra) {
+        let out = { };
+        if (base  != nil) { foreach (v, k in base)  { out[k] = v; } }
+        if (extra != nil) { foreach (v, k in extra) { out[k] = v; } }
+        return out;
+    }
+
+    fn _genPayload(model, prompt, stream, opts) {
+        let think = this._think(opts);
+        let mopts = this._modelOptions(opts);
+        if (mopts != nil) {
+            return { model: model, prompt: prompt, stream: stream, think: think, options: mopts };
+        }
+        return { model: model, prompt: prompt, stream: stream, think: think };
+    }
+
+    // ── Chat ─────────────────────────────────────────────────────────────────
+
+    // Chat(model, messages, opts?) → string | nil
+    fn Chat(model: string, messages, opts?) {
+        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts));
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil) { return nil; }
+        return data.message.content;
+    }
+
+    // ChatStream(model, messages, callback, opts?) - callback(token:string)
+    fn ChatStream(model: string, messages, callback: fn, opts?) {
+        let body = Json.Stringify(this._chatPayload(model, messages, true, opts));
+        Http.StreamPost(this._base + "/api/chat", body, fn(line) {
+            let d = Json.Parse(line);
+            if (d != nil && !d.done) { callback(d.message.content); }
+        });
+    }
+
+    // ChatJson(model, messages, opts?) → object | nil
+    // Forces JSON output via Ollama's format option. Returns parsed object.
+    fn ChatJson(model: string, messages, opts?) {
+        let think = this._think(opts);
+        let mopts = this._modelOptions(opts);
+        let payload = nil;
+        if (mopts != nil) {
+            payload = { model: model, messages: messages, stream: false, think: think, format: "json", options: mopts };
+        } else {
+            payload = { model: model, messages: messages, stream: false, think: think, format: "json" };
+        }
+        let res = this._post("/api/chat", payload);
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil) { return nil; }
+        return Json.Parse(data.message.content);
+    }
+
+    // ChatStats(model, messages, opts?) → { content, promptTokens, evalTokens, totalMs } | nil
+    // Same as Chat but also returns token counts and timing from Ollama.
+    fn ChatStats(model: string, messages, opts?) {
+        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts));
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil) { return nil; }
+        return {
+            content:      data.message.content,
+            promptTokens: data.prompt_eval_count,
+            evalTokens:   data.eval_count,
+            totalMs:      float(data.total_duration) / 1000000.0
+        };
+    }
+
+    // Ask(model, system, user, opts?) → string | nil
+    // Shorthand for a single-turn chat with a system prompt.
+    fn Ask(model: string, system: string, user: string, opts?) {
+        return this.Chat(model, [
+            { role: "system", content: system },
+            { role: "user",   content: user   }
+        ], opts);
+    }
+
+    // ── Tool / function calling ───────────────────────────────────────────────
+
+    // ChatMessage(model, messages, opts?) → assistant message object | nil.
+    // Unlike Chat (which returns only the text), this returns the full message
+    // ({ role, content, tool_calls? }), so callers can inspect tool_calls.
+    // Pass tools via opts.tools (see AI.Tool).
+    fn ChatMessage(model: string, messages, opts?) {
+        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts));
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil || !("message" in data)) { return nil; }
+        return data.message;
+    }
+
+    // RunTools(model, messages, tools, handlers, opts?) → string | nil
+    // Drives a full tool-calling loop: the model is called with the tool
+    // definitions; any requested tool_calls are dispatched to `handlers`
+    // (an object mapping tool name -> fn(argsObject) -> result), the results
+    // are appended, and the model is called again until it produces a final
+    // text answer (or a safety cap of rounds is hit). `messages` is appended
+    // to in place, so it holds the full transcript afterwards.
+    fn RunTools(model: string, messages, tools, handlers, opts?) {
+        let callOpts  = AIClient._merge(opts, { tools: tools });
+        let maxRounds = 8;
+        var round:int = 0;
+        while (round < maxRounds) {
+            let msg = this.ChatMessage(model, messages, callOpts);
+            if (msg == nil) { return nil; }
+            Array.Append(messages, msg);
+
+            if (!("tool_calls" in msg) || msg.tool_calls == nil || len(msg.tool_calls) == 0) {
+                return msg.content;   // final answer
+            }
+
+            foreach (call in msg.tool_calls) {
+                let fname = call.function.name;
+                let args  = call.function.arguments;
+                var result = nil;
+                if (handlers != nil && Object.HasKey(handlers, fname)) {
+                    result = AIClient._invoke(handlers[fname], args);
+                } else {
+                    result = "error: no handler registered for tool '" + fname + "'";
+                }
+                Array.Append(messages, AI.ToolResult(fname, result));
+            }
+            round = round + 1;
+        }
+        return nil;   // exceeded round cap without a final answer
+    }
+
+    // ── Vision (multimodal) ───────────────────────────────────────────────────
+
+    // Vision(model, prompt, images, opts?) → string | nil
+    // `images` is an array of base64-encoded image strings (see AI.ImageFile).
+    // Requires a vision-capable model (e.g. llava, llama3.2-vision).
+    fn Vision(model: string, prompt: string, images, opts?) {
+        return this.Chat(model, [
+            { role: "user", content: prompt, images: images }
+        ], opts);
+    }
+
+    // VisionFiles(model, prompt, paths, opts?) → string | nil
+    // Convenience wrapper that reads + base64-encodes the given image files.
+    fn VisionFiles(model: string, prompt: string, paths, opts?) {
+        let imgs:array = [];
+        foreach (p in paths) {
+            let b = AI.ImageFile(p);
+            if (b != nil) { Array.Append(imgs, b); }
+        }
+        return this.Vision(model, prompt, imgs, opts);
+    }
+
+    // ── Generate ─────────────────────────────────────────────────────────────
+
+    // Generate(model, prompt, opts?) → string | nil
+    fn Generate(model: string, prompt: string, opts?) {
+        let res = this._post("/api/generate", this._genPayload(model, prompt, false, opts));
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil) { return nil; }
+        return data.response;
+    }
+
+    // GenerateStream(model, prompt, callback, opts?) - callback(token:string)
+    fn GenerateStream(model: string, prompt: string, callback: fn, opts?) {
+        let body = Json.Stringify(this._genPayload(model, prompt, true, opts));
+        Http.StreamPost(this._base + "/api/generate", body, fn(line) {
+            let d = Json.Parse(line);
+            if (d != nil && !d.done) { callback(d.response); }
+        });
+    }
+
+    // ── Async ─────────────────────────────────────────────────────────────────
+
+    // ChatAsync - run Chat in a fiber; use Fiber.Await() or await keyword.
+    fn async ChatAsync(model: string, messages, opts?) {
+        return this.Chat(model, messages, opts);
+    }
+
+    // GenerateAsync - run Generate in a fiber.
+    fn async GenerateAsync(model: string, prompt: string, opts?) {
+        return this.Generate(model, prompt, opts);
+    }
+
+    // ── Embeddings ────────────────────────────────────────────────────────────
+
+    // Embed(model, input) → array<float> | nil
+    // Requires an embedding model (e.g. nomic-embed-text, mxbai-embed-large).
+    fn Embed(model: string, input: string) {
+        let res = this._post("/api/embed", { model: model, input: input });
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil || !("embeddings" in data)) { return nil; }
+        let embs = data.embeddings;
+        if (embs == nil || len(embs) == 0) { return nil; }
+        return embs[0];
+    }
+
+    // EmbedMany(model, inputs) → array<array<float>> | nil
+    // Embeds multiple strings in a single request.
+    fn EmbedMany(model: string, inputs) {
+        let res = this._post("/api/embed", { model: model, input: inputs });
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil || !("embeddings" in data)) { return nil; }
+        return data.embeddings;
+    }
+
+    // ── Model management ──────────────────────────────────────────────────────
+
+    // Models() → array<object> | nil
+    fn Models() {
+        let res = Http.Get(this._base + "/api/tags");
+        if (res == nil || res.status != 200) { return nil; }
+        let data = Json.Parse(res.body);
+        if (data == nil || !("models" in data)) { return nil; }
+        return data.models;
+    }
+
+    // ModelInfo(model) → object | nil
+    // Returns model details: modelfile, parameters, template, details, etc.
+    fn ModelInfo(model: string) {
+        let res = this._post("/api/show", { model: model });
+        if (res == nil || res.status != 200) { return nil; }
+        return Json.Parse(res.body);
+    }
+
+    // Pull(model) → { success:bool, error?:string }
+    // Downloads a model from the Ollama registry. Blocks until complete.
+    fn Pull(model: string) {
+        let res = this._post("/api/pull", { model: model, stream: false });
+        if (res == nil) { return { success: false, error: "connection failed" }; }
+        if (res.status != 200) { return { success: false, error: "HTTP " + Convert.ToString(res.status) }; }
+        let data = Json.Parse(res.body);
+        if (data == nil) { return { success: false, error: "invalid response" }; }
+        if ("error" in data) { return { success: false, error: data.error }; }
+        return { success: data.status == "success" };
+    }
+
+    // Delete(model) → bool
+    // Removes a locally downloaded model. Requires curl(1).
+    fn Delete(model: string): bool {
+        let res = Http.Curl(this._base + "/api/delete", {
+            method:  "DELETE",
+            body:    Json.Stringify({ model: model }),
+            headers: { "Content-Type": "application/json" }
+        });
+        if (res == nil) { return false; }
+        return res.status == 200;
+    }
+}
+
+// ── AIConversation ─────────────────────────────────────────────────────────────
+
+class AIConversation {
+    let _buf = nil; 
+    let _client = nil; 
+    let _messages = nil; 
+    let _model = nil; 
+    let _opts = nil; 
+
+    fn Constructor(model: string, client, opts?) {
+        this._model    = model;
+        this._client   = client;
+        this._opts     = opts;
+        this._messages = [];
+        this._buf      = "";
+    }
+
+    // System(msg) - prepend (or replace) the system message.
+    fn System(msg: string) {
+        if (len(this._messages) > 0 && this._messages[0].role == "system") {
+            this._messages[0] = { role: "system", content: msg };
+        } else {
+            Array.Append(this._messages, { role: "system", content: msg });
+        }
+    }
+
+    // Say(userMsg) → string | nil - blocking chat, adds both turns to history.
+    fn Say(content: string) {
+        Array.Append(this._messages, { role: "user", content: content });
+        let reply = this._client.Chat(this._model, this._messages, this._opts);
+        if (reply != nil) {
+            Array.Append(this._messages, { role: "assistant", content: reply });
+        }
+        return reply;
+    }
+
+    // Stream(userMsg, callback) → string | nil
+    // Streams the reply token-by-token via callback, then adds the full reply to history.
+    fn Stream(content: string, callback: fn): string {
+        Array.Append(this._messages, { role: "user", content: content });
+        this._buf = "";
+        this._client.ChatStream(this._model, this._messages, fn(token) {
+            this._buf = this._buf + token;
+            callback(token);
+        }, this._opts);
+        if (len(this._buf) > 0) {
+            Array.Append(this._messages, { role: "assistant", content: this._buf });
+        }
+        return this._buf;
+    }
+
+    // History() → array<object> - returns the full message history.
+    fn History() { return this._messages; }
+
+    // Reset() - clears the conversation history.
+    fn Reset() { this._messages = []; }
+}
+
+// ── AI - static facade over localhost:11434 ───────────────────────────────────
+
+class AI {
+
+    fn static _c() { return new AIClient("http://localhost:11434"); }
+
+    // AI.Client(baseUrl) → AIClient
+    fn static Client(baseUrl: string) { return new AIClient(baseUrl); }
+
+    // AI.Conversation(model, opts?) → AIConversation
+    fn static Conversation(model: string, opts?) {
+        return new AIConversation(model, AI._c(), opts);
+    }
+
+    // Blocking
+    fn static Chat(model: string, messages, opts?)                            { return AI._c().Chat(model, messages, opts); }
+    fn static ChatStream(model: string, messages, cb: fn, opts?)        { return AI._c().ChatStream(model, messages, cb, opts); }
+    fn static ChatJson(model: string, messages, opts?)                        { return AI._c().ChatJson(model, messages, opts); }
+    fn static ChatStats(model: string, messages, opts?)                       { return AI._c().ChatStats(model, messages, opts); }
+    fn static Ask(model: string, system: string, user: string, opts?)         { return AI._c().Ask(model, system, user, opts); }
+    fn static Generate(model: string, prompt: string, opts?)                  { return AI._c().Generate(model, prompt, opts); }
+    fn static GenerateStream(model: string, prompt: string, cb: fn, opts?) { return AI._c().GenerateStream(model, prompt, cb, opts); }
+
+    // Tool / function calling
+    fn static ChatMessage(model: string, messages, opts?)                     { return AI._c().ChatMessage(model, messages, opts); }
+    fn static RunTools(model: string, messages, tools, handlers, opts?)       { return AI._c().RunTools(model, messages, tools, handlers, opts); }
+
+    // Build an Ollama tool (function) definition. `parameters` is a JSON-schema
+    // object describing the arguments, e.g.
+    //   AI.Tool("get_weather", "Get weather for a city",
+    //     { type: "object",
+    //       properties: { city: { type: "string", description: "City name" } },
+    //       required: ["city"] });
+    fn static Tool(name: string, description: string, parameters) {
+        return {
+            type: "function",
+            function: { name: name, description: description, parameters: parameters }
+        };
+    }
+
+    // Build a tool-result message to feed back to the model.
+    fn static ToolResult(name: string, content) {
+        return { role: "tool", tool_name: name, content: Convert.ToString(content) };
+    }
+
+    // Vision (multimodal)
+    fn static Vision(model: string, prompt: string, images, opts?)            { return AI._c().Vision(model, prompt, images, opts); }
+    fn static VisionFiles(model: string, prompt: string, paths, opts?)        { return AI._c().VisionFiles(model, prompt, paths, opts); }
+
+    // Read an image file and return its base64 encoding (for Vision images).
+    fn static ImageFile(path: string) {
+        let bytes = File.ReadAllBytes(path);
+        if (bytes == nil) { return nil; }
+        return Util.Base64Encode(bytes);
+    }
+
+    // Async
+    fn static async ChatAsync(model: string, messages, opts?)                 { return AI._c().Chat(model, messages, opts); }
+    fn static async GenerateAsync(model: string, prompt: string, opts?)       { return AI._c().Generate(model, prompt, opts); }
+
+    // Embeddings
+    fn static Embed(model: string, input: string)                             { return AI._c().Embed(model, input); }
+    fn static EmbedMany(model: string, inputs)                                { return AI._c().EmbedMany(model, inputs); }
+
+    // Models
+    fn static Models()                                                        { return AI._c().Models(); }
+    fn static ModelInfo(model: string)                                        { return AI._c().ModelInfo(model); }
+    fn static Pull(model: string)                                             { return AI._c().Pull(model); }
+    fn static Delete(model: string): bool                                     { return AI._c().Delete(model); }
+}
+
+export { AI, AIClient, AIConversation };

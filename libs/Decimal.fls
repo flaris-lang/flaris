@@ -1,0 +1,554 @@
+// Decimal.fls - Arbitrary-precision decimal numbers for Flaris.
+// Version: 1.0
+//
+// Avoids floating-point rounding errors for financial and exact arithmetic.
+// All values are immutable objects. All methods are static - use Decimal.Xxx().
+//
+// Usage:
+//   import { Decimal } from library("Decimal", "1.0");
+//
+//   let price = Decimal.From("19.99");
+//   let tax   = Decimal.From("0.08");
+//   let total = Decimal.Add(price, Decimal.Mul(price, tax));
+//   Console.WriteLine(Decimal.ToString(total));   // "21.5892"
+//   Console.WriteLine(Decimal.ToString(Decimal.Round(total, 2)));  // "21.59"
+//
+//   // Comparisons
+//   if (Decimal.Gt(price, Decimal.From("10"))) { ... }
+//
+//   // Chaining via intermediate values
+//   let result = Decimal.Round(Decimal.Div(Decimal.From("1"), Decimal.From("3"), 10), 4);
+//   Console.WriteLine(Decimal.ToString(result));  // "0.3333"
+//
+// Creating:
+//   Decimal.From(value)          - from string ("3.14"), int, or float
+//   Decimal.Zero()               - 0
+//   Decimal.One()                - 1
+//
+// Arithmetic:
+//   Decimal.Add(a, b)            →  Decimal
+//   Decimal.Sub(a, b)            →  Decimal
+//   Decimal.Mul(a, b)            →  Decimal
+//   Decimal.Div(a, b, precision) →  Decimal  - precision: fractional digits to keep
+//   Decimal.Pow(d, exp:int)      →  Decimal  - integer exponent only
+//   Decimal.Neg(d)               →  Decimal  - unary negation
+//   Decimal.Abs(d)               →  Decimal
+//
+// Rounding:
+//   Decimal.Round(d, places)         →  Decimal  - half-up rounding
+//   Decimal.RoundHalfEven(d, places) →  Decimal  - banker's rounding
+//   Decimal.Truncate(d, places)      →  Decimal  - truncate (no rounding)
+//   Decimal.Floor(d)                 →  Decimal  - round toward -∞
+//   Decimal.Ceil(d)                  →  Decimal  - round toward +∞
+//
+// Comparison:
+//   Decimal.Cmp(a, b)    →  int    - -1, 0, or 1
+//   Decimal.Eq(a, b)     →  bool
+//   Decimal.Lt(a, b)     →  bool
+//   Decimal.Lte(a, b)    →  bool
+//   Decimal.Gt(a, b)     →  bool
+//   Decimal.Gte(a, b)    →  bool
+//   Decimal.Min(a, b)    →  Decimal
+//   Decimal.Max(a, b)    →  Decimal
+//   Decimal.Sign(d)      →  int    - -1, 0, or 1
+//   Decimal.IsZero(d)    →  bool
+//   Decimal.IsNeg(d)     →  bool
+//   Decimal.IsPos(d)     →  bool
+//   Decimal.IsInteger(d) →  bool   - true if scale == 0
+//
+// Conversion:
+//   Decimal.ToString(d)  →  string  - exact decimal string, e.g. "-3.14"
+//   Decimal.ToFloat(d)   →  float   - may lose precision for large values
+//   Decimal.ToInt(d)     →  int     - truncates fractional part
+//
+// Internal representation (for reference):
+//   { sign:int, limbs:array, scale:int }
+//   sign=1 (non-negative) or -1; limbs: little-endian base-10⁶ digits;
+//   value = sign × unscaled × 10^(-scale)
+
+class Decimal {
+
+    const _BASE     = 1000000;
+    const _HALFBASE = 500000;
+
+    // ----------------------------------------------------------------
+    // Internal limb helpers (same representation as BigInt)
+    // ----------------------------------------------------------------
+
+    fn static _idiv(a, b)             { return Convert.ToInt(a / b); }
+    fn static _make(sign, ls, sc)     { return { sign: sign, limbs: ls, scale: sc }; }
+    fn static _zero()                 { return { sign: 1, limbs: [0], scale: 0 }; }
+    fn static _one()                  { return { sign: 1, limbs: [1], scale: 0 }; }
+    fn static _isZeroL(ls)            { return len(ls) == 1 && ls[0] == 0; }
+
+    fn static _trim(ls) {
+        var n = len(ls);
+        while (n > 1 && ls[n - 1] == 0) { Array.RemoveAt(ls, n - 1); n -= 1; }
+        return ls;
+    }
+
+    fn static _copyL(ls) { return Array.Subset(ls, 0, len(ls)); }
+
+    fn static _cmpL(a, b) {
+        var na = len(a); var nb = len(b);
+        if (na != nb) { return na < nb ? -1 : 1; }
+        var i = na - 1;
+        while (i >= 0) {
+            if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+            i -= 1;
+        }
+        return 0;
+    }
+
+    fn static _addL(a, b) {
+        var na = len(a); var nb = len(b);
+        var n = na > nb ? na : nb;
+        var r = []; var carry = 0;
+        iter (i from 0 to n - 1) {
+            var s = (i < na ? a[i] : 0) + (i < nb ? b[i] : 0) + carry;
+            Array.Append(r, s % Decimal._BASE);
+            carry = Decimal._idiv(s, Decimal._BASE);
+        }
+        if (carry > 0) Array.Append(r, carry);
+        return r;
+    }
+
+    fn static _subL(a, b) {    // precondition: a >= b (absolute)
+        var na = len(a); var nb = len(b);
+        var r = []; var borrow = 0;
+        iter (i from 0 to na - 1) {
+            var d = a[i] - (i < nb ? b[i] : 0) - borrow;
+            if (d < 0) { d = d + Decimal._BASE; borrow = 1; } else { borrow = 0; }
+            Array.Append(r, d);
+        }
+        return Decimal._trim(r);
+    }
+
+    fn static _mulL(a, b) {
+        var na = len(a); var nb = len(b);
+        var r = Array.Create(na + nb);
+        Array.Fill(r, 0);
+        var BASE = Decimal._BASE;
+        iter (i from 0 to na - 1) {
+            iter (j from 0 to nb - 1) {
+                r[i + j] = r[i + j] + a[i] * b[j];
+            }
+        }
+        iter (i from 0 to na + nb - 2) {
+            r[i + 1] = r[i + 1] + Decimal._idiv(r[i], BASE);
+            r[i] = r[i] % BASE;
+        }
+        return Decimal._trim(r);
+    }
+
+    // Divide limb array `ls` by a single positive integer `d`. O(n), 2 allocations.
+    fn static _divmodSingle(ls, d) {
+        var n = len(ls);
+        var q = Array.Create(n);
+        Array.Fill(q, 0);
+        var BASE = Decimal._BASE;
+        var rem = 0;
+        var i = n - 1;
+        while (i >= 0) {
+            var cur = rem * BASE + ls[i];
+            q[i] = Decimal._idiv(cur, d);
+            rem = cur % d;
+            i -= 1;
+        }
+        return { q: Decimal._trim(q), r: [rem] };
+    }
+
+    // Divide limb array `ls` by 10^k, discarding the remainder. O(n).
+    // Relies on: floor(floor(a/b)/c) == floor(a/(b*c)) for positive integers.
+    fn static _divByPow10(ls, k) {
+        if (k <= 0) { return Decimal._copyL(ls); }
+        var qi = Decimal._idiv(k, 6);
+        var ri = k % 6;
+        var n  = len(ls);
+        if (qi >= n) { return [0]; }
+        var r = Array.Subset(ls, qi, n - qi);
+        if (ri > 0) {
+            var p = 1;
+            iter (i from 0 to ri - 1) { p = p * 10; }
+            r = Decimal._divmodSingle(r, p).q;
+        }
+        return Decimal._trim(r);
+    }
+
+    fn static _divmodL(a, b) {
+        var c = Decimal._cmpL(a, b);
+        if (c < 0) { return { q: [0], r: Decimal._copyL(a) }; }
+        if (c == 0) { return { q: [1], r: [0] }; }
+
+        var ms = [ Decimal._copyL(b) ];
+        var fs = [ [1] ];
+        while (Decimal._cmpL(ms[len(ms) - 1], a) <= 0) {
+            var last  = ms[len(ms) - 1];
+            var lastf = fs[len(fs) - 1];
+            Array.Append(ms, Decimal._addL(last,  last));
+            Array.Append(fs, Decimal._addL(lastf, lastf));
+        }
+
+        var q = [0]; var r = Decimal._copyL(a);
+        var idx = len(ms) - 1;
+        while (idx >= 0) {
+            if (Decimal._cmpL(r, ms[idx]) >= 0) {
+                r = Decimal._subL(r, ms[idx]);
+                q = Decimal._addL(q, fs[idx]);
+            }
+            idx -= 1;
+        }
+        return { q: q, r: r };
+    }
+
+    // Returns a limb array representing 10^n.
+    fn static _pow10_limbs(n) {
+        var qi = Decimal._idiv(n, 6);
+        var ri = n % 6;
+        var p  = 1;
+        iter (i from 0 to ri - 1) { p = p * 10; }
+        var ls = Array.Create(qi + 1);
+        Array.Fill(ls, 0);
+        ls[qi] = p;
+        return ls;
+    }
+
+    fn static _mulByPow10(ls, n) {
+        if (n == 0) { return Decimal._copyL(ls); }
+        return Decimal._mulL(ls, Decimal._pow10_limbs(n));
+    }
+
+    // Decimal string of the unscaled integer (no sign, no decimal point).
+    fn static _unscaledStr(ls) {
+        var k = len(ls);
+        var s = Convert.ToString(ls[k - 1]);
+        var i = k - 2;
+        while (i >= 0) {
+            s = s + String.PadLeft(Convert.ToString(ls[i]), 6, '0');
+            i -= 1;
+        }
+        return s;
+    }
+
+    // Align two decimals to the same scale. Returns { al, bl, scale }.
+    fn static _align(a, b) {
+        if (a.scale == b.scale) {
+            return { al: Decimal._copyL(a.limbs), bl: Decimal._copyL(b.limbs), scale: a.scale };
+        }
+        if (a.scale < b.scale) {
+            return {
+                al:    Decimal._mulByPow10(a.limbs, b.scale - a.scale),
+                bl:    Decimal._copyL(b.limbs),
+                scale: b.scale
+            };
+        }
+        return {
+            al:    Decimal._copyL(a.limbs),
+            bl:    Decimal._mulByPow10(b.limbs, a.scale - b.scale),
+            scale: a.scale
+        };
+    }
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    fn static From(value) {
+        if (Type.Is(value, Type.Int))    { return Decimal._fromInt(value); }
+        if (Type.Is(value, Type.Float))  { return Decimal._parseStr(Convert.ToString(value)); }
+        if (Type.Is(value, Type.String)) { return Decimal._parseStr(value); }
+        return Decimal._zero();
+    }
+
+    fn static _fromInt(v) {
+        if (v == 0) { return Decimal._zero(); }
+        var sign = v < 0 ? -1 : 1;
+        var u = v < 0 ? -v : v;
+        var ls = [];
+        while (u > 0) { Array.Append(ls, u % Decimal._BASE); u = Decimal._idiv(u, Decimal._BASE); }
+        return { sign: sign, limbs: ls, scale: 0 };
+    }
+
+    fn static _parseStr(s) {
+        if (s == nil || len(s) == 0) { return Decimal._zero(); }
+        var sign = 1;
+        if (String.StartsWith(s, "-")) { sign = -1; s = String.Substr(s, 1); }
+        else if (String.StartsWith(s, "+")) { s = String.Substr(s, 1); }
+
+        var dotIdx = String.IndexOf(s, ".");
+        var intStr = ""; var fracStr = ""; var scale = 0;
+        if (dotIdx < 0) {
+            intStr = s; fracStr = ""; scale = 0;
+        } else {
+            intStr  = dotIdx == 0 ? "0" : String.Substr(s, 0, dotIdx);
+            fracStr = String.Substr(s, dotIdx + 1);
+            scale   = len(fracStr);
+        }
+
+        while (len(intStr) > 1 && String.Left(intStr, 1) == "0") { intStr = String.Substr(intStr, 1); }
+
+        var combined = intStr + fracStr;
+        if (len(combined) == 0) { return { sign: 1, limbs: [0], scale: scale }; }
+
+        var n = len(combined); var ls = []; var j = n;
+        while (j > 0) {
+            var start = j - 6; if (start < 0) start = 0;
+            var v = Convert.ParseInt(String.Substr(combined, start, j - start));
+            if (v == nil) { return Decimal._zero(); }
+            Array.Append(ls, v);
+            j = start;
+        }
+        Decimal._trim(ls);
+        if (Decimal._isZeroL(ls)) { return { sign: 1, limbs: [0], scale: scale }; }
+        return { sign: sign, limbs: ls, scale: scale };
+    }
+
+    fn static Zero() { return Decimal._zero(); }
+    fn static One()  { return Decimal._one(); }
+
+    // ----------------------------------------------------------------
+    // Output
+    // ----------------------------------------------------------------
+
+    fn static ToString(d) {
+        var raw = Decimal._unscaledStr(d.limbs);
+        var result = "";
+        if (d.scale == 0) {
+            result = raw;
+        } else if (len(raw) > d.scale) {
+            var intPart  = String.Substr(raw, 0, len(raw) - d.scale);
+            var fracPart = String.Substr(raw, len(raw) - d.scale);
+            result = intPart + "." + fracPart;
+        } else {
+            result = "0." + String.PadLeft(raw, d.scale, '0');
+        }
+        return (d.sign == -1 && !Decimal._isZeroL(d.limbs)) ? "-" + result : result;
+    }
+
+    fn static ToFloat(d) {
+        return Convert.ParseFloat(Decimal.ToString(d));
+    }
+
+    // Returns the integer part (truncated toward zero) as a Flaris int,
+    // or nil if the value does not fit in int64.
+    fn static ToInt(d) {
+        var t = Decimal.Truncate(d, 0);
+        if (len(t.limbs) > 3) { return nil; }
+        var res = 0; var base = 1;
+        iter (i from 0 to len(t.limbs) - 1) {
+            res = res + t.limbs[i] * base;
+            base = base * Decimal._BASE;
+        }
+        return t.sign == -1 ? -res : res;
+    }
+
+    // ----------------------------------------------------------------
+    // Comparison
+    // ----------------------------------------------------------------
+
+    fn static Cmp(a, b) {
+        if (Decimal._isZeroL(a.limbs) && Decimal._isZeroL(b.limbs)) { return 0; }
+        if (a.sign != b.sign) { return a.sign > b.sign ? 1 : -1; }
+        var p = Decimal._align(a, b);
+        var c = Decimal._cmpL(p.al, p.bl);
+        return a.sign == 1 ? c : -c;
+    }
+
+    fn static Eq(a, b)  { return Decimal.Cmp(a, b) == 0; }
+    fn static Lt(a, b)  { return Decimal.Cmp(a, b) <  0; }
+    fn static Lte(a, b) { return Decimal.Cmp(a, b) <= 0; }
+    fn static Gt(a, b)  { return Decimal.Cmp(a, b) >  0; }
+    fn static Gte(a, b) { return Decimal.Cmp(a, b) >= 0; }
+
+    fn static IsZero(d) { return Decimal._isZeroL(d.limbs); }
+    fn static IsNeg(d)  { return d.sign == -1 && !Decimal._isZeroL(d.limbs); }
+    fn static IsPos(d)  { return d.sign == 1  && !Decimal._isZeroL(d.limbs); }
+
+    // ----------------------------------------------------------------
+    // Arithmetic
+    // ----------------------------------------------------------------
+
+    fn static Neg(d) {
+        if (Decimal._isZeroL(d.limbs)) { return { sign: 1, limbs: [0], scale: d.scale }; }
+        return { sign: -d.sign, limbs: Decimal._copyL(d.limbs), scale: d.scale };
+    }
+
+    fn static Abs(d) { return { sign: 1, limbs: Decimal._copyL(d.limbs), scale: d.scale }; }
+
+    fn static Add(a, b) {
+        var p = Decimal._align(a, b);
+        var sc = p.scale;
+        if (a.sign == b.sign) {
+            return Decimal._make(a.sign, Decimal._addL(p.al, p.bl), sc);
+        }
+        var c = Decimal._cmpL(p.al, p.bl);
+        if (c == 0) { return { sign: 1, limbs: [0], scale: sc }; }
+        if (c  > 0) { return Decimal._make(a.sign, Decimal._subL(p.al, p.bl), sc); }
+        return Decimal._make(b.sign, Decimal._subL(p.bl, p.al), sc);
+    }
+
+    fn static Sub(a, b) { return Decimal.Add(a, Decimal.Neg(b)); }
+
+    fn static Mul(a, b) {
+        if (Decimal._isZeroL(a.limbs) || Decimal._isZeroL(b.limbs)) { return Decimal._zero(); }
+        var sign = a.sign == b.sign ? 1 : -1;
+        return Decimal._make(sign, Decimal._mulL(a.limbs, b.limbs), a.scale + b.scale);
+    }
+
+    // Divide a by b, returning `precision` fractional digits (truncates, does not round).
+    // Returns nil for division by zero.
+    fn static Div(a, b, precision) {
+        if (Decimal._isZeroL(b.limbs)) { return nil; }
+        var sign = a.sign == b.sign ? 1 : -1;
+        // result_unscaled = a_unscaled * 10^shift / b_unscaled, where shift = precision + b.scale - a.scale
+        var shift = precision + b.scale - a.scale;
+        var q = [0];
+        if (len(b.limbs) == 1) {
+            // Fast path: single-limb denominator avoids the O(n log n) doubling algorithm.
+            // Uses: floor(floor(a/b) / 10^k) == floor(a / (b * 10^k)) for positive integers.
+            var bd = b.limbs[0];
+            if (shift >= 0) {
+                q = Decimal._divmodSingle(Decimal._mulByPow10(a.limbs, shift), bd).q;
+            } else {
+                q = Decimal._divByPow10(Decimal._divmodSingle(a.limbs, bd).q, -shift);
+            }
+        } else if (shift >= 0) {
+            q = Decimal._divmodL(Decimal._mulByPow10(a.limbs, shift), b.limbs).q;
+        } else {
+            q = Decimal._divmodL(a.limbs, Decimal._mulByPow10(b.limbs, -shift)).q;
+        }
+        if (Decimal._isZeroL(q)) { return { sign: 1, limbs: [0], scale: precision }; }
+        return { sign: sign, limbs: q, scale: precision };
+    }
+
+    // Integer exponentiation. exp must be a non-negative Flaris int.
+    // Returns nil for negative exp.
+    fn static Pow(d, exp) {
+        if (exp < 0) { return nil; }
+        var result = Decimal._one(); var cur = d;
+        while (exp > 0) {
+            if (exp % 2 == 1) { result = Decimal.Mul(result, cur); }
+            cur = Decimal.Mul(cur, cur);
+            exp = Decimal._idiv(exp, 2);
+        }
+        return result;
+    }
+
+    // ----------------------------------------------------------------
+    // Rounding
+    // ----------------------------------------------------------------
+
+    // Truncate toward zero to `places` fractional digits.
+    // If d already has <= places digits, d is returned unchanged.
+    fn static Truncate(d, places) {
+        if (d.scale <= places) { return d; }
+        var excess = d.scale - places;
+        var dm = Decimal._divmodL(d.limbs, Decimal._pow10_limbs(excess));
+        var q  = Decimal._trim(dm.q);
+        if (Decimal._isZeroL(q)) { return { sign: 1, limbs: [0], scale: places }; }
+        return { sign: d.sign, limbs: q, scale: places };
+    }
+
+    // Round half-up (away from zero on ties) to `places` fractional digits.
+    fn static Round(d, places) {
+        if (d.scale <= places) { return d; }
+        var excess = d.scale - places;
+        var p10 = Decimal._pow10_limbs(excess);
+        var dm  = Decimal._divmodL(d.limbs, p10);
+        var q   = dm.q;
+        // Round up if remainder * 2 >= divisor.
+        var r2  = Decimal._addL(dm.r, dm.r);
+        if (Decimal._cmpL(r2, p10) >= 0) { q = Decimal._addL(q, [1]); }
+        q = Decimal._trim(q);
+        if (Decimal._isZeroL(q)) { return { sign: 1, limbs: [0], scale: places }; }
+        return { sign: d.sign, limbs: q, scale: places };
+    }
+
+    // Largest integer <= d.
+    fn static Floor(d) {
+        var t = Decimal.Truncate(d, 0);
+        if (d.sign == 1 || d.scale == 0 || Decimal._isZeroL(d.limbs)) { return t; }
+        // Negative with fractional part: subtract one more if remainder != 0.
+        var dm = Decimal._divmodL(d.limbs, Decimal._pow10_limbs(d.scale));
+        if (Decimal._isZeroL(dm.r)) { return t; }
+        return { sign: -1, limbs: Decimal._addL(t.limbs, [1]), scale: 0 };
+    }
+
+    // Smallest integer >= d.
+    fn static Ceil(d) {
+        var t = Decimal.Truncate(d, 0);
+        if (d.sign == -1 || d.scale == 0 || Decimal._isZeroL(d.limbs)) { return t; }
+        // Positive with fractional part: add one if remainder != 0.
+        var dm = Decimal._divmodL(d.limbs, Decimal._pow10_limbs(d.scale));
+        if (Decimal._isZeroL(dm.r)) { return t; }
+        return { sign: 1, limbs: Decimal._addL(t.limbs, [1]), scale: 0 };
+    }
+
+    // ----------------------------------------------------------------
+    // Sign / comparison helpers
+    // ----------------------------------------------------------------
+
+    // Return -1 if negative, 0 if zero, 1 if positive.
+    fn static Sign(d) {
+        if (Decimal._isZeroL(d.limbs)) { return 0; }
+        return d.sign;
+    }
+
+    // Return whichever of a, b is greater (or a if equal).
+    fn static Max(a, b) {
+        return Decimal.Cmp(a, b) >= 0 ? a : b;
+    }
+
+    // Return whichever of a, b is smaller (or a if equal).
+    fn static Min(a, b) {
+        return Decimal.Cmp(a, b) <= 0 ? a : b;
+    }
+
+    // ----------------------------------------------------------------
+    // Predicate helpers
+    // ----------------------------------------------------------------
+
+    // True if d has no fractional part (scale == 0, or all fractional digits are zero).
+    fn static IsInteger(d) {
+        if (d.scale == 0) { return true; }
+        var dm = Decimal._divmodL(d.limbs, Decimal._pow10_limbs(d.scale));
+        return Decimal._isZeroL(dm.r);
+    }
+
+    // ----------------------------------------------------------------
+    // Banker's rounding (round-half-to-even)
+    // ----------------------------------------------------------------
+
+    // Round d to `places` fractional digits using round-half-to-even.
+    // When the discarded portion is exactly 0.5 ulp, the last kept digit
+    // is rounded to the nearest even value; otherwise behaviour matches Round.
+    fn static RoundHalfEven(d, places) {
+        if (d.scale <= places) { return d; }
+        var excess = d.scale - places;
+        var p10    = Decimal._pow10_limbs(excess);
+        var dm     = Decimal._divmodL(d.limbs, p10);
+        var q      = dm.q;
+        var r      = dm.r;
+
+        // Compute 2 * remainder and compare with the divisor to detect the tie.
+        var r2 = Decimal._addL(r, r);
+        var cmp = Decimal._cmpL(r2, p10);
+
+        // cmp < 0 (remainder < 0.5 ulp): truncate - keep q as-is.
+        if (cmp > 0) {
+            // Remainder > 0.5 ulp: round up.
+            q = Decimal._addL(q, [1]);
+        } else if (cmp == 0) {
+            // Exactly 0.5 ulp: round to even - increment only if last kept digit is odd.
+            var lastDigit = q[0] % 10;
+            if (lastDigit % 2 != 0) {
+                q = Decimal._addL(q, [1]);
+            }
+        }
+
+        q = Decimal._trim(q);
+        if (Decimal._isZeroL(q)) { return { sign: 1, limbs: [0], scale: places }; }
+        return { sign: d.sign, limbs: q, scale: places };
+    }
+}
+export { Decimal };

@@ -1,0 +1,601 @@
+// test_bitconverter.fls - Tests for BitConverter
+// Run: flarisvm test_bitconverter.fls
+
+import { BitConverter } from library("./BitConverter", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, "  expected=", expected, "  got=", actual);
+    }
+    return 0;
+}
+
+fn checkApprox(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (!(actual ≈ expected)) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL (approx):", msg, "  expected≈", expected, "  got=", actual);
+    }
+    return 0;
+}
+
+// Helper: compare a block's bytes to an expected array
+fn checkBytes(blk, expected, msg) {
+    let arr = Buffer.ToArray(blk);
+    let ok  = len(arr) == len(expected);
+    if (ok) {
+        iter (i from 0 to len(arr) - 1) {
+            if (arr[i] != expected[i]) { ok = false; }
+        }
+    }
+    testsRun = testsRun + 1;
+    if (!ok) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg,
+            "  expected=", String.Join(expected, ","),
+            "  got=", String.Join(arr, ","));
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// IsLittleEndian
+// ---------------------------------------------------------------------------
+fn test_endianness() {
+    Console.WriteLine("== IsLittleEndian ==");
+    check(BitConverter.IsLittleEndian() == true, "IsLittleEndian returns true");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GetBytesInt16
+// ---------------------------------------------------------------------------
+fn test_int16() {
+    Console.WriteLine("== Int16 ==");
+
+    checkBytes(BitConverter.GetBytesInt16(0x0102, nil),    [0x02, 0x01], "Int16 0x0102 LE");
+    checkBytes(BitConverter.GetBytesInt16(0x0102, true),   [0x01, 0x02], "Int16 0x0102 BE");
+    checkBytes(BitConverter.GetBytesInt16(0, nil),         [0x00, 0x00], "Int16 zero");
+    checkBytes(BitConverter.GetBytesInt16(-1, nil),        [0xFF, 0xFF], "Int16 -1");
+    checkBytes(BitConverter.GetBytesInt16(255, nil),       [0xFF, 0x00], "Int16 255");
+    checkBytes(BitConverter.GetBytesInt16(-32768, nil),    [0x00, 0x80], "Int16 min");
+    checkBytes(BitConverter.GetBytesInt16(32767, nil),     [0xFF, 0x7F], "Int16 max");
+
+    // Round-trip
+    let blk = BitConverter.GetBytesInt16(1234, nil);
+    checkEq(BitConverter.ToInt16(blk, 0, nil), 1234, "Int16 round-trip 1234");
+
+    let neg = BitConverter.GetBytesInt16(-500, nil);
+    checkEq(BitConverter.ToInt16(neg, 0, nil), -500, "Int16 round-trip -500");
+
+    let be = BitConverter.GetBytesInt16(0x1234, true);
+    checkEq(BitConverter.ToInt16(be, 0, true), 0x1234, "Int16 BE round-trip");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GetBytesInt32
+// ---------------------------------------------------------------------------
+fn test_int32() {
+    Console.WriteLine("== Int32 ==");
+
+    checkBytes(BitConverter.GetBytesInt32(0x12345678, nil),  [0x78, 0x56, 0x34, 0x12], "Int32 0x12345678 LE");
+    checkBytes(BitConverter.GetBytesInt32(0x12345678, true), [0x12, 0x34, 0x56, 0x78], "Int32 0x12345678 BE");
+    checkBytes(BitConverter.GetBytesInt32(0, nil),           [0x00, 0x00, 0x00, 0x00], "Int32 zero");
+    checkBytes(BitConverter.GetBytesInt32(-1, nil),          [0xFF, 0xFF, 0xFF, 0xFF], "Int32 -1");
+    checkBytes(BitConverter.GetBytesInt32(1, nil),           [0x01, 0x00, 0x00, 0x00], "Int32 one");
+    checkBytes(BitConverter.GetBytesInt32(256, nil),         [0x00, 0x01, 0x00, 0x00], "Int32 256");
+
+    // Round-trips
+    let blk = BitConverter.GetBytesInt32(305419896, nil);
+    checkEq(BitConverter.ToInt32(blk, 0, nil), 305419896, "Int32 round-trip positive");
+
+    let neg = BitConverter.GetBytesInt32(-100000, nil);
+    checkEq(BitConverter.ToInt32(neg, 0, nil), -100000, "Int32 round-trip negative");
+
+    let max32 = BitConverter.GetBytesInt32(2147483647, nil);
+    checkEq(BitConverter.ToInt32(max32, 0, nil), 2147483647, "Int32 max round-trip");
+
+    let min32 = BitConverter.GetBytesInt32(-2147483648, nil);
+    checkEq(BitConverter.ToInt32(min32, 0, nil), -2147483648, "Int32 min round-trip");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// UInt16 / UInt32
+// ---------------------------------------------------------------------------
+fn test_uint() {
+    Console.WriteLine("== UInt16 / UInt32 ==");
+
+    // UInt16
+    let b16 = BitConverter.GetBytesInt16(65535, nil);  // 0xFFFF
+    checkEq(BitConverter.ToUInt16(b16, 0, nil), 65535, "UInt16 max = 65535");
+
+    let b16b = BitConverter.GetBytesInt16(-1, nil);    // all bytes 0xFF
+    checkEq(BitConverter.ToUInt16(b16b, 0, nil), 65535, "UInt16 from -1 bytes = 65535");
+
+    checkEq(BitConverter.ToInt16(b16b, 0, nil), -1, "Int16 same bytes = -1");
+
+    // UInt32
+    let b32 = BitConverter.GetBytesInt32(-1, nil);     // all bytes 0xFF
+    checkEq(BitConverter.ToUInt32(b32, 0, nil), 4294967295, "UInt32 from -1 bytes = 4294967295");
+    checkEq(BitConverter.ToInt32(b32, 0, nil),  -1,         "Int32 same bytes = -1");
+
+    let b32b = BitConverter.GetBytesInt32(2147483648, nil);  // 0x80000000 (stored as int64)
+    checkEq(BitConverter.ToUInt32(b32b, 0, nil), 2147483648, "UInt32 2147483648");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GetBytesInt64
+// ---------------------------------------------------------------------------
+fn test_int64() {
+    Console.WriteLine("== Int64 ==");
+
+    checkBytes(BitConverter.GetBytesInt64(1, nil),
+        [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "Int64 one LE");
+
+    checkBytes(BitConverter.GetBytesInt64(-1, nil),
+        [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], "Int64 -1");
+
+    checkBytes(BitConverter.GetBytesInt64(0, nil),
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "Int64 zero");
+
+    // BE
+    checkBytes(BitConverter.GetBytesInt64(1, true),
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01], "Int64 one BE");
+
+    // Round-trips
+    let blk = BitConverter.GetBytesInt64(9007199254740992, nil);  // 2^53
+    checkEq(BitConverter.ToInt64(blk, 0, nil), 9007199254740992, "Int64 2^53 round-trip");
+
+    let neg = BitConverter.GetBytesInt64(-9007199254740992, nil);
+    checkEq(BitConverter.ToInt64(neg, 0, nil), -9007199254740992, "Int64 -2^53 round-trip");
+
+    let be = BitConverter.GetBytesInt64(0x0102030405060708, true);
+    checkEq(BitConverter.ToInt64(be, 0, true), 0x0102030405060708, "Int64 BE round-trip");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GetBytesBool / ToBool
+// ---------------------------------------------------------------------------
+fn test_bool() {
+    Console.WriteLine("== Bool ==");
+
+    checkBytes(BitConverter.GetBytesBool(true),  [0x01], "GetBytesBool true");
+    checkBytes(BitConverter.GetBytesBool(false), [0x00], "GetBytesBool false");
+
+    let bt = BitConverter.GetBytesBool(true);
+    check(BitConverter.ToBool(bt, 0) == true, "ToBool true round-trip");
+
+    let bf = BitConverter.GetBytesBool(false);
+    check(BitConverter.ToBool(bf, 0) == false, "ToBool false round-trip");
+
+    // Any non-zero byte is true
+    let blk = BitConverter.GetBytesInt16(0x0100, nil);
+    check(BitConverter.ToBool(blk, 0) == false, "ToBool byte 0 = false");
+    check(BitConverter.ToBool(blk, 1) == true,  "ToBool byte 1 = true");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Float64
+// ---------------------------------------------------------------------------
+fn test_float64() {
+    Console.WriteLine("== Float64 ==");
+
+    // Known IEEE 754 representations
+    checkBytes(BitConverter.GetBytesFloat64(0.0, nil),
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "Float64 0.0");
+
+    checkBytes(BitConverter.GetBytesFloat64(1.0, nil),
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F], "Float64 1.0");
+
+    checkBytes(BitConverter.GetBytesFloat64(-1.0, nil),
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xBF], "Float64 -1.0");
+
+    checkBytes(BitConverter.GetBytesFloat64(0.5, nil),
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x3F], "Float64 0.5");
+
+    checkBytes(BitConverter.GetBytesFloat64(2.0, nil),
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40], "Float64 2.0");
+
+    // BE
+    checkBytes(BitConverter.GetBytesFloat64(1.0, true),
+        [0x3F, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "Float64 1.0 BE");
+
+    // Round-trips
+    let vals = [0.1, 3.14, -273.15, 1e100, -1e-100, 1234567.89];
+    iter (i from 0 to len(vals) - 1) {
+        let v   = vals[i];
+        let blk = BitConverter.GetBytesFloat64(v, nil);
+        let back = BitConverter.ToFloat64(blk, 0, nil);
+        checkApprox(back, v, String.Format("Float64 round-trip {0}", [v]));
+    }
+
+    // Special values
+    let inf_blk = BitConverter.GetBytesFloat64(Math.Infinity, nil);
+    check(Math.IsFinite(BitConverter.ToFloat64(inf_blk, 0, nil)) == false, "Float64 +Inf round-trip");
+
+    let nan_blk = BitConverter.GetBytesFloat64(Math.NaN, nil);
+    check(Math.IsNaN(BitConverter.ToFloat64(nan_blk, 0, nil)), "Float64 NaN round-trip");
+
+    // ToFloat64 from known bytes
+    checkApprox(BitConverter.ToFloat64(BitConverter.GetBytesFloat64(1.0, nil), 0, nil), 1.0, "ToFloat64 1.0");
+    checkApprox(BitConverter.ToFloat64(BitConverter.GetBytesFloat64(-1.0, nil), 0, nil), -1.0, "ToFloat64 -1.0");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Float32
+// ---------------------------------------------------------------------------
+fn test_float32() {
+    Console.WriteLine("== Float32 ==");
+
+    // Known IEEE 754 single representations
+    checkBytes(BitConverter.GetBytesFloat32(0.0, nil),  [0x00, 0x00, 0x00, 0x00], "Float32 0.0");
+    checkBytes(BitConverter.GetBytesFloat32(1.0, nil),  [0x00, 0x00, 0x80, 0x3F], "Float32 1.0");
+    checkBytes(BitConverter.GetBytesFloat32(-1.0, nil), [0x00, 0x00, 0x80, 0xBF], "Float32 -1.0");
+    checkBytes(BitConverter.GetBytesFloat32(2.0, nil),  [0x00, 0x00, 0x00, 0x40], "Float32 2.0");
+    checkBytes(BitConverter.GetBytesFloat32(0.5, nil),  [0x00, 0x00, 0x00, 0x3F], "Float32 0.5");
+
+    // BE
+    checkBytes(BitConverter.GetBytesFloat32(1.0, true), [0x3F, 0x80, 0x00, 0x00], "Float32 1.0 BE");
+
+    // Round-trips (float32 has less precision, so use approx)
+    let vals = [1.0, -1.0, 0.5, 2.0, 100.0, -273.0];
+    iter (i from 0 to len(vals) - 1) {
+        let v    = vals[i];
+        let blk  = BitConverter.GetBytesFloat32(v, nil);
+        let back = BitConverter.ToFloat32(blk, 0, nil);
+        checkApprox(back, v, String.Format("Float32 round-trip {0}", [v]));
+    }
+
+    // Special values
+    let inf_blk = BitConverter.GetBytesFloat32(Math.Infinity, nil);
+    check(Math.IsFinite(BitConverter.ToFloat32(inf_blk, 0, nil)) == false, "Float32 +Inf");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ToString (hex with dashes)
+// ---------------------------------------------------------------------------
+fn test_to_string() {
+    Console.WriteLine("== ToString ==");
+
+    let blk = BitConverter.GetBytesInt32(0x12345678, nil);  // LE: 78 56 34 12
+    checkEq(BitConverter.ToString(blk), "78-56-34-12", "ToString LE int32");
+
+    let blk_be = BitConverter.GetBytesInt32(0x12345678, true);
+    checkEq(BitConverter.ToString(blk_be), "12-34-56-78", "ToString BE int32");
+
+    // Single byte
+    let one = BitConverter.GetBytesBool(true);
+    checkEq(BitConverter.ToString(one), "01", "ToString single byte");
+
+    // Zero
+    let zero = BitConverter.GetBytesInt16(0, nil);
+    checkEq(BitConverter.ToString(zero), "00-00", "ToString two zero bytes");
+
+    // All 0xFF
+    let ff = BitConverter.GetBytesInt16(-1, nil);
+    checkEq(BitConverter.ToString(ff), "FF-FF", "ToString 0xFFFF");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GetBytesUInt16 / GetBytesUInt32 (dedicated unsigned constructors)
+// ---------------------------------------------------------------------------
+fn test_uint_getbytes() {
+    Console.WriteLine("== GetBytesUInt16 / GetBytesUInt32 ==");
+
+    // GetBytesUInt16 - LE
+    checkBytes(BitConverter.GetBytesUInt16(0, nil),     [0x00, 0x00], "GetBytesUInt16 zero");
+    checkBytes(BitConverter.GetBytesUInt16(1, nil),     [0x01, 0x00], "GetBytesUInt16 one");
+    checkBytes(BitConverter.GetBytesUInt16(256, nil),   [0x00, 0x01], "GetBytesUInt16 256");
+    checkBytes(BitConverter.GetBytesUInt16(65535, nil), [0xFF, 0xFF], "GetBytesUInt16 max");
+
+    // GetBytesUInt16 - BE
+    checkBytes(BitConverter.GetBytesUInt16(0x0102, true), [0x01, 0x02], "GetBytesUInt16 0x0102 BE");
+    checkBytes(BitConverter.GetBytesUInt16(65535, true),  [0xFF, 0xFF], "GetBytesUInt16 max BE");
+
+    // Round-trip via ToUInt16
+    let u16 = BitConverter.GetBytesUInt16(40000, nil);
+    checkEq(BitConverter.ToUInt16(u16, 0, nil), 40000, "GetBytesUInt16 round-trip 40000");
+
+    let u16be = BitConverter.GetBytesUInt16(0xABCD, true);
+    checkEq(BitConverter.ToUInt16(u16be, 0, true), 0xABCD, "GetBytesUInt16 BE round-trip");
+
+    // GetBytesUInt32 - LE
+    checkBytes(BitConverter.GetBytesUInt32(0, nil),          [0x00, 0x00, 0x00, 0x00], "GetBytesUInt32 zero");
+    checkBytes(BitConverter.GetBytesUInt32(1, nil),          [0x01, 0x00, 0x00, 0x00], "GetBytesUInt32 one");
+    checkBytes(BitConverter.GetBytesUInt32(4294967295, nil),  [0xFF, 0xFF, 0xFF, 0xFF], "GetBytesUInt32 max");
+    checkBytes(BitConverter.GetBytesUInt32(0x12345678, nil),  [0x78, 0x56, 0x34, 0x12], "GetBytesUInt32 0x12345678 LE");
+
+    // GetBytesUInt32 - BE
+    checkBytes(BitConverter.GetBytesUInt32(0x12345678, true), [0x12, 0x34, 0x56, 0x78], "GetBytesUInt32 0x12345678 BE");
+
+    // Round-trip via ToUInt32
+    let u32 = BitConverter.GetBytesUInt32(3000000000, nil);
+    checkEq(BitConverter.ToUInt32(u32, 0, nil), 3000000000, "GetBytesUInt32 round-trip 3000000000");
+
+    let u32be = BitConverter.GetBytesUInt32(0xDEADBEEF, true);
+    checkEq(BitConverter.ToUInt32(u32be, 0, true), 0xDEADBEEF, "GetBytesUInt32 BE round-trip");
+
+    // UInt16 big-endian decode
+    let be16 = BitConverter.GetBytesUInt16(1000, true);
+    checkEq(BitConverter.ToUInt16(be16, 0, true), 1000, "ToUInt16 BE round-trip 1000");
+
+    // UInt32 big-endian decode
+    let be32 = BitConverter.GetBytesUInt32(123456789, true);
+    checkEq(BitConverter.ToUInt32(be32, 0, true), 123456789, "ToUInt32 BE round-trip 123456789");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ToHex / FromHex
+// ---------------------------------------------------------------------------
+fn test_hex() {
+    Console.WriteLine("== ToHex / FromHex ==");
+
+    // ToHex - no separator
+    let blk = BitConverter.GetBytesInt32(0x12345678, nil);  // LE: 78 56 34 12
+    checkEq(BitConverter.ToHex(blk), "78563412", "ToHex LE int32");
+
+    let blk_be = BitConverter.GetBytesInt32(0x12345678, true);
+    checkEq(BitConverter.ToHex(blk_be), "12345678", "ToHex BE int32");
+
+    let one = BitConverter.GetBytesBool(true);
+    checkEq(BitConverter.ToHex(one), "01", "ToHex single byte");
+
+    let zero = BitConverter.GetBytesInt16(0, nil);
+    checkEq(BitConverter.ToHex(zero), "0000", "ToHex two zero bytes");
+
+    let ff = BitConverter.GetBytesInt16(-1, nil);
+    checkEq(BitConverter.ToHex(ff), "FFFF", "ToHex 0xFFFF");
+
+    // FromHex - round-trips with ToHex
+    let hexStr = "78563412";
+    let fromHexBlk = BitConverter.FromHex(hexStr);
+    checkEq(BitConverter.ToHex(fromHexBlk), hexStr, "FromHex -> ToHex round-trip no-sep");
+
+    // FromHex accepts dashes (same format as ToString)
+    let dashStr = "12-34-56-78";
+    let fromDash = BitConverter.FromHex(dashStr);
+    checkEq(BitConverter.ToHex(fromDash), "12345678", "FromHex with dashes");
+
+    // FromHex accepts spaces
+    let spaceStr = "AB CD EF";
+    let fromSpace = BitConverter.FromHex(spaceStr);
+    checkEq(BitConverter.ToHex(fromSpace), "ABCDEF", "FromHex with spaces");
+
+    // FromHex lowercase input
+    let lower = BitConverter.FromHex("deadbeef");
+    checkEq(BitConverter.ToHex(lower), "DEADBEEF", "FromHex lowercase");
+
+    // FromHex -> ToInt32 numerical round-trip
+    let intBlk = BitConverter.FromHex("78563412");   // LE bytes of 0x12345678
+    checkEq(BitConverter.ToInt32(intBlk, 0, nil), 0x12345678, "FromHex -> ToInt32");
+
+    // ToString then FromHex round-trip
+    let src = BitConverter.GetBytesFloat32(3.14, nil);
+    let hex1 = BitConverter.ToString(src);           // "XX-XX-XX-XX" with dashes
+    let back = BitConverter.FromHex(hex1);
+    checkEq(BitConverter.ToString(back), hex1, "ToString -> FromHex -> ToString round-trip");
+
+    // FromHex on empty string
+    let emptyBlk = BitConverter.FromHex("");
+    let emptyArr = Buffer.ToArray(emptyBlk);
+    checkEq(len(emptyArr), 0, "FromHex empty string returns empty block");
+
+    // FromHex on invalid hex (odd length)
+    let oddBlk = BitConverter.FromHex("ABC");
+    let oddArr = Buffer.ToArray(oddBlk);
+    checkEq(len(oddArr), 0, "FromHex odd-length returns empty block");
+
+    // FromHex on invalid characters
+    let badBlk = BitConverter.FromHex("GG");
+    let badArr = Buffer.ToArray(badBlk);
+    checkEq(len(badArr), 0, "FromHex invalid chars returns empty block");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Float32 NaN round-trip (NaN was missing from test_float32)
+// ---------------------------------------------------------------------------
+fn test_float32_nan() {
+    Console.WriteLine("== Float32 NaN ==");
+
+    let nan_blk = BitConverter.GetBytesFloat32(Math.NaN, nil);
+    check(Math.IsNaN(BitConverter.ToFloat32(nan_blk, 0, nil)), "Float32 NaN round-trip");
+
+    // Negative Inf
+    let ninf_blk = BitConverter.GetBytesFloat32(-Math.Infinity, nil);
+    let ninf_back = BitConverter.ToFloat32(ninf_blk, 0, nil);
+    check(!Math.IsFinite(ninf_back) && ninf_back < 0.0, "Float32 -Inf round-trip");
+
+    // Float32 BE NaN
+    let nan_be = BitConverter.GetBytesFloat32(Math.NaN, true);
+    check(Math.IsNaN(BitConverter.ToFloat32(nan_be, 0, true)), "Float32 NaN BE round-trip");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Float64 big-endian round-trip (BE decode was untested)
+// ---------------------------------------------------------------------------
+fn test_float64_be() {
+    Console.WriteLine("== Float64 BE round-trips ==");
+
+    let vals = [0.1, 3.14159265358979, -273.15, 1e50];
+    iter (i from 0 to len(vals) - 1) {
+        let v   = vals[i];
+        let blk = BitConverter.GetBytesFloat64(v, true);
+        let back = BitConverter.ToFloat64(blk, 0, true);
+        checkApprox(back, v, String.Format("Float64 BE round-trip {0}", [v]));
+    }
+
+    // Known BE layout: 1.0 = 3FF0000000000000
+    let one_be = BitConverter.GetBytesFloat64(1.0, true);
+    checkApprox(BitConverter.ToFloat64(one_be, 0, true), 1.0, "ToFloat64 BE from known 1.0 bytes");
+
+    // Negative Inf BE
+    let ninf_be = BitConverter.GetBytesFloat64(-Math.Infinity, true);
+    let ninf_back = BitConverter.ToFloat64(ninf_be, 0, true);
+    check(!Math.IsFinite(ninf_back) && ninf_back < 0.0, "Float64 -Inf BE round-trip");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Offset reads - multiple values packed in one block
+// ---------------------------------------------------------------------------
+fn test_offsets() {
+    Console.WriteLine("== Offset reads ==");
+
+    // Pack int32 + int16 into a 6-byte block manually using an array
+    let bytes = [0x01, 0x00, 0x00, 0x00,   // int32 = 1 at offset 0
+                 0xFF, 0x7F];               // int16 = 32767 at offset 4
+    let blk = Buffer.Create(6, 1);
+    Buffer.FromArray(blk, bytes);
+
+    checkEq(BitConverter.ToInt32(blk, 0, nil), 1,     "Offset int32 at 0");
+    checkEq(BitConverter.ToInt16(blk, 4, nil), 32767, "Offset int16 at 4");
+
+    // Two float32 values back-to-back
+    let f1 = BitConverter.GetBytesFloat32(1.0, nil);
+    let f2 = BitConverter.GetBytesFloat32(2.0, nil);
+    let combined = Buffer.Create(8, 1);
+    let arr1 = Buffer.ToArray(f1);
+    let arr2 = Buffer.ToArray(f2);
+    let combined_arr = [];
+    iter (i from 0 to 3) { Array.Append(combined_arr, arr1[i]); }
+    iter (i from 0 to 3) { Array.Append(combined_arr, arr2[i]); }
+    Buffer.FromArray(combined, combined_arr);
+
+    checkApprox(BitConverter.ToFloat32(combined, 0, nil), 1.0, "Packed float32[0]");
+    checkApprox(BitConverter.ToFloat32(combined, 4, nil), 2.0, "Packed float32[1]");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+fn async Main() {
+    Console.WriteLine("=== BitConverter tests ===");
+
+    test_endianness();
+    test_int16();
+    test_int32();
+    test_uint();
+    test_int64();
+    test_bool();
+    test_float64();
+    test_float32();
+    test_to_string();
+    test_offsets();
+    test_uint_getbytes();
+    test_hex();
+    test_float32_nan();
+    test_float64_be();
+
+    Console.WriteLine("==========================");
+    Console.WriteLine("Tests run: ", testsRun, " failed: ", testsFailed);
+
+    Debug.Assert(testsFailed, 0);
+    Console.Ok("All BitConverter tests passed!");
+    if (testsFailed > 0) { return testsFailed; }
+
+    let buf32  = BitConverter.GetBytesInt32(305419896, nil);
+    let buf64  = BitConverter.GetBytesInt64(9007199254740992, nil);
+    let bufF64 = BitConverter.GetBytesFloat64(3.14159265358979, nil);
+    let bufF32 = BitConverter.GetBytesFloat32(1.5, nil);
+
+    Console.WriteLine("\n\n=== BitConverter Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Int32 ]");
+    bench("GetBytesInt32  - block", fn() {
+        let b = BitConverter.GetBytesInt32(305419896, nil); _sink = _sink + 1;
+    }, 20000);
+    bench("ToInt32        block - int", fn() {
+        let v = BitConverter.ToInt32(buf32, 0, nil); _sink = _sink + v;
+    }, 20000);
+    bench("Round-trip Int32  GetBytes + ToInt32", fn() {
+        let b = BitConverter.GetBytesInt32(_sink, nil);
+        let v = BitConverter.ToInt32(b, 0, nil);
+        _sink = _sink + 1;
+    }, 20000);
+
+    Console.WriteLine("\n[ Int64 ]");
+    bench("GetBytesInt64  - block", fn() {
+        let b = BitConverter.GetBytesInt64(9007199254740992, nil); _sink = _sink + 1;
+    }, 20000);
+    bench("ToInt64        block - int", fn() {
+        let v = BitConverter.ToInt64(buf64, 0, nil); _sink = _sink + 1;
+    }, 20000);
+
+    Console.WriteLine("\n[ Float64 ]");
+    bench("GetBytesFloat64  - block", fn() {
+        let b = BitConverter.GetBytesFloat64(3.14159265358979, nil); _sink = _sink + 1;
+    }, 20000);
+    bench("ToFloat64        block - float", fn() {
+        let v = BitConverter.ToFloat64(bufF64, 0, nil); _sink = _sink + 1;
+    }, 20000);
+
+    Console.WriteLine("\n[ Float32 ]");
+    bench("GetBytesFloat32  - block", fn() {
+        let b = BitConverter.GetBytesFloat32(1.5, nil); _sink = _sink + 1;
+    }, 20000);
+    bench("ToFloat32        block - float", fn() {
+        let v = BitConverter.ToFloat32(bufF32, 0, nil); _sink = _sink + 1;
+    }, 20000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

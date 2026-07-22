@@ -1,0 +1,629 @@
+// test_httpserver.fls - Tests for HttpServer.fls
+// Run: flarisvm tests/test_httpserver.fls --libs='./libs'
+//
+// The server runs on a background fiber inside this same VM and every request
+// is made over a raw Stream socket, so the test needs no external client and no
+// -u flag. Client reads park via Stream.WaitReadable so the server fiber can run
+// - a plain blocking read would deadlock the cooperative scheduler.
+
+import { HttpServer, HttpStatus } from library("HttpServer", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+global gPort       = 0;    // main test server
+global gLimitPort  = 0;    // server with tight limits
+global gStaticDir  = "";
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expected, " got=", actual);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Raw HTTP client
+// ---------------------------------------------------------------------------
+
+fn openConn(port: int) {
+    let c = Stream.Connect("tcp", "127.0.0.1", port);
+    if (c != nil) { Stream.SetTimeout(c, 4000); }
+    return c;
+}
+
+// Read one response off an open connection. headOnly skips the body (HEAD).
+fn readResponse(c, headOnly: bool) {
+    if (Stream.WaitReadable(c, 4000) == nil) { return nil; }
+
+    let statusLine = Stream.ReadLine(c);
+    if (statusLine == nil || statusLine == "") { return nil; }
+
+    let sp   = String.Split(statusLine, " ");
+    let code = (len(sp) > 1) ? (Convert.ParseInt(sp[1]) ?? 0) : 0;
+
+    let raw = [];
+    let h   = Stream.ReadLine(c);
+    while (h != nil && h != "") { Array.Append(raw, h); h = Stream.ReadLine(c); }
+    let ho = {};
+    if (len(raw) > 0) { ho = HttpUtil.ParseHeaders(String.Join(raw, "\r\n") + "\r\n") ?? {}; }
+
+    let body = "";
+    if (!headOnly) {
+        let te = String.ToLower(Object.TryGet(ho, "transfer-encoding", "") ?? "");
+        if (String.Contains(te, "chunked")) {
+            let more = true;
+            while (more) {
+                let line = Stream.ReadLine(c);
+                let n = (line == nil) ? nil : Convert.ParseInt("0x" + String.Trim(line));
+                if (n == nil || n <= 0) {
+                    let t = Stream.ReadLine(c);
+                    while (t != nil && t != "") { t = Stream.ReadLine(c); }
+                    more = false;
+                } else {
+                    body = body + Stream.ReadString(c, n);
+                    Stream.ReadLine(c);
+                }
+            }
+        } else {
+            let n = Convert.ParseInt(Object.TryGet(ho, "content-length", "0") ?? "0") ?? 0;
+            if (n > 0) { body = Stream.ReadString(c, n); }
+        }
+    }
+    return { code: code, status: statusLine, headers: ho, body: body };
+}
+
+// One request on a fresh connection.
+fn request(port: int, raw: string, headOnly: bool) {
+    let c = openConn(port);
+    if (c == nil) { return nil; }
+    Stream.WriteString(c, raw);
+    let r = readResponse(c, headOnly);
+    Stream.Close(c);
+    return r;
+}
+
+// Build a request with Connection: close so the server hangs up after replying.
+fn req1(port: int, method: string, path: string) {
+    return request(port, method + " " + path + " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false);
+}
+
+fn reqBody(port: int, method: string, path: string, ctype: string, body: string) {
+    return request(port,
+        method + " " + path + " HTTP/1.1\r\nHost: t\r\nContent-Type: " + ctype
+        + "\r\nContent-Length: " + str(String.Length(body))
+        + "\r\nConnection: close\r\n\r\n" + body, false);
+}
+
+// Fetch a response whose body is binary, read as a block so NUL bytes survive.
+fn requestBytes(port: int, path: string) {
+    let c = openConn(port);
+    if (c == nil) { return nil; }
+    Stream.WriteString(c, "GET " + path + " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    if (Stream.WaitReadable(c, 4000) == nil) { Stream.Close(c); return nil; }
+
+    let sp   = String.Split(Stream.ReadLine(c), " ");
+    let code = (len(sp) > 1) ? (Convert.ParseInt(sp[1]) ?? 0) : 0;
+
+    let raw = [];
+    let h   = Stream.ReadLine(c);
+    while (h != nil && h != "") { Array.Append(raw, h); h = Stream.ReadLine(c); }
+    let ho = {};
+    if (len(raw) > 0) { ho = HttpUtil.ParseHeaders(String.Join(raw, "\r\n") + "\r\n") ?? {}; }
+
+    let n    = Convert.ParseInt(Object.TryGet(ho, "content-length", "0") ?? "0") ?? 0;
+    let body = nil;
+    if (n > 0) { body = Stream.ReadBytes(c, n); }
+    Stream.Close(c);
+    return { code: code, headers: ho, body: body };
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+fn test_routing() {
+    Console.WriteLine("== routing ==");
+
+    let r = req1(gPort, "GET", "/");
+    checkEq(r.code, 200, "GET / status");
+    checkEq(r.body, "Hello", "GET / body");
+    checkEq(Object.TryGet(r.headers, "content-type", ""), "text/plain; charset=utf-8",
+            "text response content-type");
+
+    let r2 = req1(gPort, "GET", "/users/42");
+    checkEq(r2.code, 200, "path param status");
+    checkEq(Json.Parse(r2.body).id, "42", "path param captured");
+
+    let r3 = req1(gPort, "GET", "/users/42?x=hi+there&n=3");
+    let j3 = Json.Parse(r3.body);
+    checkEq(j3.x, "hi there", "query decoded (+ as space)");
+    checkEq(j3.n, "3", "second query param");
+
+    // A trailing * captures the remainder of the path.
+    let r4 = req1(gPort, "GET", "/files/a/b/c.txt");
+    checkEq(Json.Parse(r4.body).rest, "a/b/c.txt", "catch-all captures the tail");
+
+    // Percent-encoded path segments are decoded.
+    let r5 = req1(gPort, "GET", "/users/a%20b");
+    checkEq(Json.Parse(r5.body).id, "a b", "percent-decoded path segment");
+
+    checkEq(req1(gPort, "GET", "/nope").code, 404, "unknown path is 404");
+    checkEq(Json.Parse(req1(gPort, "GET", "/nope").body).error, "not found", "404 body");
+
+    // Registered path, wrong method.
+    checkEq(req1(gPort, "DELETE", "/only-get").code, 405, "method mismatch is 405");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Methods and bodies
+// ---------------------------------------------------------------------------
+fn test_methods_and_bodies() {
+    Console.WriteLine("== methods / bodies ==");
+
+    let r = reqBody(gPort, "POST", "/echo", "application/json", "{\"a\":1,\"b\":\"x\"}");
+    checkEq(r.code, 200, "POST status");
+    let j = Json.Parse(r.body);
+    checkEq(j.a, 1,   "POST JSON body round-trip (int)");
+    checkEq(j.b, "x", "POST JSON body round-trip (string)");
+
+    checkEq(reqBody(gPort, "PUT",   "/verb", "text/plain", "p").body, "PUT",   "PUT dispatched");
+    checkEq(reqBody(gPort, "PATCH", "/verb", "text/plain", "p").body, "PATCH", "PATCH dispatched");
+    checkEq(req1(gPort, "DELETE", "/verb").body, "DELETE", "DELETE dispatched");
+
+    // Raw text body is readable as-is.
+    let r2 = reqBody(gPort, "POST", "/raw", "text/plain", "hello raw");
+    checkEq(r2.body, "hello raw", "text body echoed verbatim");
+
+    // An empty body is fine and reports length 0.
+    let r3 = reqBody(gPort, "POST", "/len", "text/plain", "");
+    checkEq(r3.body, "0", "empty body has length 0");
+
+    // A body with a NUL-free binary-ish payload keeps its exact length.
+    let payload = String.Repeat("z", 5000);
+    let r4 = reqBody(gPort, "POST", "/len", "text/plain", payload);
+    checkEq(r4.body, "5000", "5000-byte body arrives complete");
+
+    // HEAD returns headers and Content-Length but no body.
+    let r5 = request(gPort, "HEAD / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", true);
+    checkEq(r5.code, 200, "HEAD status");
+    checkEq(Object.TryGet(r5.headers, "content-length", ""), "5", "HEAD reports the entity length");
+    checkEq(r5.body, "", "HEAD sends no body");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Response builders
+// ---------------------------------------------------------------------------
+fn test_response_builders() {
+    Console.WriteLine("== response builders ==");
+
+    let r = req1(gPort, "GET", "/html");
+    checkEq(Object.TryGet(r.headers, "content-type", ""), "text/html; charset=utf-8", "Html content-type");
+    checkEq(r.body, "<h1>hi</h1>", "Html body");
+
+    let r2 = req1(gPort, "GET", "/created");
+    checkEq(r2.code, 201, "explicit status code");
+
+    let r3 = req1(gPort, "GET", "/nocontent");
+    checkEq(r3.code, 204, "NoContent status");
+    checkEq(Object.TryGet(r3.headers, "content-length", ""), "0", "204 has zero length");
+    checkEq(r3.body, "", "204 has no body");
+
+    let r4 = req1(gPort, "GET", "/redirect");
+    checkEq(r4.code, 302, "Redirect status");
+    checkEq(Object.TryGet(r4.headers, "location", ""), "/target", "Redirect Location header");
+
+    let r5 = req1(gPort, "GET", "/custom-header");
+    checkEq(Object.TryGet(r5.headers, "x-custom", ""), "abc", "custom header sent");
+    checkEq(Object.TryGet(r5.headers, "server", ""), "Flaris", "default Server header");
+
+    // Binary body: exact byte count, and a NUL byte survives the round trip.
+    let r6 = requestBytes(gPort, "/bytes");
+    checkEq(Object.TryGet(r6.headers, "content-length", ""), "256", "binary body length");
+    checkEq(len(r6.body), 256, "binary body fully received");
+    checkEq(Buffer.ReadU8At(r6.body, 0),   0,   "binary body keeps a leading NUL");
+    checkEq(Buffer.ReadU8At(r6.body, 255), 255, "binary body keeps the last byte");
+
+    // A handler that raises still produces a 500 rather than killing the fiber.
+    let r7 = req1(gPort, "GET", "/boom");
+    checkEq(r7.code, 500, "raising handler yields 500");
+
+    // A handler that writes nothing still gets a response.
+    let r8 = req1(gPort, "GET", "/silent");
+    checkEq(r8.code, 500, "silent handler yields 500");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Chunked transfer, both directions
+// ---------------------------------------------------------------------------
+fn test_chunked() {
+    Console.WriteLine("== chunked ==");
+
+    // Streamed response.
+    let r = req1(gPort, "GET", "/stream");
+    checkEq(r.code, 200, "chunked response status");
+    checkEq(Object.TryGet(r.headers, "transfer-encoding", ""), "chunked", "chunked header set");
+    check(!Object.HasKey(r.headers, "content-length"), "chunked response has no Content-Length");
+    checkEq(r.body, "part1part2part3", "chunked body reassembled");
+
+    // Chunked request body.
+    let raw = "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            + "5\r\nhello\r\n" + "1\r\n \r\n" + "5\r\nworld\r\n" + "0\r\n\r\n";
+    let r2 = request(gPort, raw, false);
+    checkEq(r2.code, 200, "chunked request status");
+    checkEq(r2.body, "hello world", "chunked request body decoded");
+
+    // Chunk extensions are ignored.
+    let raw2 = "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+             + "3;ext=1\r\nabc\r\n" + "0\r\n\r\n";
+    checkEq(request(gPort, raw2, false).body, "abc", "chunk extension ignored");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Keep-alive
+// ---------------------------------------------------------------------------
+fn test_keep_alive() {
+    Console.WriteLine("== keep-alive ==");
+
+    // Three requests down one connection.
+    let c = openConn(gPort);
+    check(c != nil, "connection opened");
+
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let a = readResponse(c, false);
+    checkEq(a.code, 200, "keep-alive request 1 status");
+    checkEq(a.body, "Hello", "keep-alive request 1 body");
+    checkEq(Object.TryGet(a.headers, "connection", ""), "keep-alive", "connection kept alive");
+
+    Stream.WriteString(c, "GET /users/7 HTTP/1.1\r\nHost: t\r\n\r\n");
+    let b = readResponse(c, false);
+    checkEq(b.code, 200, "keep-alive request 2 status");
+    checkEq(Json.Parse(b.body).id, "7", "keep-alive request 2 body");
+
+    // Last one asks to close.
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let d = readResponse(c, false);
+    checkEq(d.code, 200, "keep-alive request 3 status");
+    checkEq(Object.TryGet(d.headers, "connection", ""), "close", "Connection: close honoured");
+    Stream.Close(c);
+
+    // HTTP/1.0 closes unless it asks to stay open.
+    let r = request(gPort, "GET / HTTP/1.0\r\nHost: t\r\n\r\n", false);
+    checkEq(Object.TryGet(r.headers, "connection", ""), "close", "HTTP/1.0 defaults to close");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Limits and malformed input
+// ---------------------------------------------------------------------------
+fn test_limits() {
+    Console.WriteLine("== limits ==");
+
+    // Body larger than the configured cap.
+    let big = String.Repeat("x", 3000);
+    let r = request(gLimitPort,
+        "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: " + str(String.Length(big))
+        + "\r\nConnection: close\r\n\r\n" + big, false);
+    checkEq(r.code, 413, "oversized body rejected with 413");
+
+    // Too many headers.
+    let hdrs = "";
+    iter (i from 0 to 40) { hdrs = hdrs + "X-H" + str(i) + ": v\r\n"; }
+    let r2 = request(gLimitPort, "GET / HTTP/1.1\r\nHost: t\r\n" + hdrs + "\r\n", false);
+    checkEq(r2.code, 431, "too many headers rejected with 431");
+
+    // Malformed request line.
+    let r3 = request(gLimitPort, "NOTAREQUEST\r\n\r\n", false);
+    checkEq(r3.code, 400, "malformed request line rejected with 400");
+
+    // Non-numeric Content-Length.
+    let r4 = request(gLimitPort,
+        "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: abc\r\nConnection: close\r\n\r\n", false);
+    checkEq(r4.code, 400, "bad Content-Length rejected with 400");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Static files
+// ---------------------------------------------------------------------------
+fn test_static() {
+    Console.WriteLine("== static files ==");
+
+    let r = req1(gPort, "GET", "/pub/hello.txt");
+    checkEq(r.code, 200, "static file served");
+    checkEq(r.body, "static-content", "static file body");
+    checkEq(Object.TryGet(r.headers, "content-type", ""), "text/plain; charset=utf-8",
+            "static MIME from extension");
+
+    let r2 = req1(gPort, "GET", "/pub/page.html");
+    checkEq(Object.TryGet(r2.headers, "content-type", ""), "text/html; charset=utf-8",
+            "html MIME from extension");
+    checkEq(Object.TryGet(r2.headers, "cache-control", ""), "max-age=60", "cacheControl applied");
+
+    // Directory root serves the index file.
+    checkEq(req1(gPort, "GET", "/pub/").body, "<p>index</p>", "index file served for a directory");
+
+    // Traversal attempts never escape the mount root.
+    checkEq(req1(gPort, "GET", "/pub/../../etc/passwd").code, 403, "traversal rejected");
+    checkEq(req1(gPort, "GET", "/pub/missing.txt").code, 404, "missing static file is 404");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Header safety
+// ---------------------------------------------------------------------------
+fn test_header_safety() {
+    Console.WriteLine("== header safety ==");
+
+    // A handler trying to inject CRLF raises, so the 500 path runs instead of
+    // the response being split.
+    let r = req1(gPort, "GET", "/inject");
+    checkEq(r.code, 500, "CRLF header injection refused");
+    check(!Object.HasKey(r.headers, "x-evil"), "injected header not emitted");
+
+    // Content-Length from a handler never overrides the real body length.
+    let r2 = req1(gPort, "GET", "/fake-length");
+    checkEq(Object.TryGet(r2.headers, "content-length", ""), "4", "server owns Content-Length");
+    checkEq(r2.body, "real", "body matches the real length");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Request introspection
+// ---------------------------------------------------------------------------
+fn test_request_object() {
+    Console.WriteLine("== request object ==");
+
+    let r = request(gPort,
+        "GET /introspect?a=1 HTTP/1.1\r\nHost: t\r\nX-Test: hi\r\nConnection: close\r\n\r\n", false);
+    let j = Json.Parse(r.body);
+    checkEq(j.method,  "GET",             "req.method");
+    checkEq(j.path,    "/introspect",     "req.path excludes the query");
+    checkEq(j.rawPath, "/introspect?a=1", "req.rawPath keeps the query");
+    checkEq(j.version, "HTTP/1.1",        "req.version");
+    checkEq(j.xtest,   "hi",              "case-insensitive header lookup");
+    checkEq(j.missing, "dflt",            "header default when absent");
+    check(String.Contains(j.peer, "127.0.0.1"), "peer address recorded");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// HttpStatus helpers
+// ---------------------------------------------------------------------------
+fn test_status_helpers() {
+    Console.WriteLine("== status helpers ==");
+
+    checkEq(HttpStatus.Reason(200), "OK",                    "reason 200");
+    checkEq(HttpStatus.Reason(404), "Not Found",             "reason 404");
+    checkEq(HttpStatus.Reason(500), "Internal Server Error", "reason 500");
+    checkEq(HttpStatus.Reason(299), "Success",               "unknown 2xx falls back");
+    checkEq(HttpStatus.Reason(599), "Server Error",          "unknown 5xx falls back");
+
+    checkEq(HttpStatus.MimeFor("a.html"), "text/html; charset=utf-8", "mime html");
+    checkEq(HttpStatus.MimeFor("a.png"),  "image/png",                "mime png");
+    checkEq(HttpStatus.MimeFor("a.json"), "application/json",         "mime json");
+    checkEq(HttpStatus.MimeFor("a.zzz"),  "application/octet-stream", "mime fallback");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Server setup
+// ---------------------------------------------------------------------------
+
+fn buildServer() {
+    let srv = new HttpServer({ port: 0, idleTimeoutMs: 700, readTimeoutMs: 3000,
+                               maxRequestsPerConn: 5000 });
+
+    srv.Get("/",          fn(_req, res) { res.Text("Hello"); });
+    srv.Get("/only-get",  fn(_req, res) { res.Text("get"); });
+    srv.Get("/users/:id", fn(req, res) {
+        res.Json({ id: req.Param("id"), x: req.Query("x"), n: req.Query("n") });
+    });
+    srv.Get("/files/*",   fn(req, res) { res.Json({ rest: req.Param("*") }); });
+
+    srv.Post("/echo",   fn(req, res) { res.Json(req.Json()); });
+    srv.Post("/raw",    fn(req, res) { res.Text(req.Text()); });
+    srv.Post("/len",    fn(req, res) { res.Text(str(req.ContentLength())); });
+    srv.Put("/verb",    fn(_req, res) { res.Text("PUT"); });
+    srv.Patch("/verb",  fn(_req, res) { res.Text("PATCH"); });
+    srv.Delete("/verb", fn(_req, res) { res.Text("DELETE"); });
+
+    srv.Get("/html",      fn(_req, res) { res.Html("<h1>hi</h1>"); });
+    srv.Get("/created",   fn(_req, res) { res.Json({ ok: true }, 201); });
+    srv.Get("/nocontent", fn(_req, res) { res.NoContent(); });
+    srv.Get("/redirect",  fn(_req, res) { res.Redirect("/target"); });
+    srv.Get("/custom-header", fn(_req, res) {
+        res.Header("X-Custom", "abc").Text("h");
+    });
+    srv.Get("/bytes", fn(_req, res) {
+        let b = Buffer.Create(256, 1);
+        iter (i from 0 to 255) { Buffer.WriteU8At(b, i, i); }
+        res.Bytes(b);
+    });
+    srv.Get("/boom",   fn(_req, _res) { throw(1, "handler exploded"); });
+    srv.Get("/silent", fn(_req, _res) { _sink = _sink + 1; });
+
+    srv.Get("/stream", fn(_req, res) {
+        res.StartChunked("text/plain; charset=utf-8");
+        res.WriteChunk("part1");
+        res.WriteChunk("part2");
+        res.WriteChunk("part3");
+        res.EndChunked();
+    });
+
+    srv.Get("/inject", fn(_req, res) {
+        res.Header("X-Evil", "a\r\nX-Injected: yes");
+        res.Text("never");
+    });
+    srv.Get("/fake-length", fn(_req, res) {
+        res.Header("Content-Length", "9999");
+        res.Text("real");
+    });
+
+    srv.Get("/introspect", fn(req, res) {
+        res.Json({
+            method:  req.method,
+            path:    req.path,
+            rawPath: req.rawPath,
+            version: req.version,
+            xtest:   req.Header("x-TEST"),
+            missing: req.Header("X-Absent", "dflt"),
+            peer:    req.peer
+        });
+    });
+
+    srv.Static("/pub", gStaticDir, { index: "index.html", cacheControl: "max-age=60" });
+    return srv;
+}
+
+fn buildLimitServer() {
+    let srv = new HttpServer({
+        port: 0, idleTimeoutMs: 700, readTimeoutMs: 3000,
+        maxBodyBytes: 1024, maxHeaders: 20, maxHeaderBytes: 2048
+    });
+    srv.Get("/",     fn(_req, res) { res.Text("ok"); });
+    srv.Post("/raw", fn(req, res) { res.Text(req.Text()); });
+    return srv;
+}
+
+fn setupStaticDir() {
+    let dir = Path.Combine(Os.TempDir(), "flaris_httpserver_test");
+    Os.Execute("mkdir -p '" + dir + "'");
+    File.WriteText(Path.Combine(dir, "hello.txt"),  "static-content");
+    File.WriteText(Path.Combine(dir, "page.html"),  "<p>page</p>");
+    File.WriteText(Path.Combine(dir, "index.html"), "<p>index</p>");
+    return dir;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+fn async Main() {
+    Console.WriteLine("=== HttpServer tests ===");
+
+    gStaticDir = setupStaticDir();
+
+    let srv   = buildServer();
+    let lim   = buildLimitServer();
+    gPort      = srv.ListenAsync();
+    gLimitPort = lim.ListenAsync();
+    Console.WriteLine("server on port", gPort, " limits server on port", gLimitPort);
+
+    test_routing();
+    test_methods_and_bodies();
+    test_response_builders();
+    test_chunked();
+    test_keep_alive();
+    test_limits();
+    test_static();
+    test_header_safety();
+    test_request_object();
+    test_status_helpers();
+
+    Console.WriteLine("===========================");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+
+    if (testsFailed > 0) {
+        srv.Stop();
+        lim.Stop();
+        Console.Error("Some HttpServer tests FAILED.");
+        return testsFailed;
+    }
+    Console.Ok("All HttpServer tests passed!");
+
+    // -----------------------------------------------------------------------
+    // Benchmarks
+    // -----------------------------------------------------------------------
+    Console.WriteLine("\n\n=== HttpServer Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Request/response round-trip  (new connection each time) ]");
+    bench("GET /            text, 5-byte body", fn() {
+        let r = req1(gPort, "GET", "/"); _sink = _sink + r.code;
+    }, 300);
+    bench("GET /users/:id   JSON + path param", fn() {
+        let r = req1(gPort, "GET", "/users/9"); _sink = _sink + r.code;
+    }, 300);
+    bench("POST /echo       JSON round-trip", fn() {
+        let r = reqBody(gPort, "POST", "/echo", "application/json", "{\"a\":1}");
+        _sink = _sink + r.code;
+    }, 300);
+    bench("GET /nope        404 path", fn() {
+        let r = req1(gPort, "GET", "/nope"); _sink = _sink + r.code;
+    }, 300);
+
+    Console.WriteLine("\n[ Keep-alive  (connection reused) ]");
+    let kc = openConn(gPort);
+    bench("GET /            on a reused connection", fn() {
+        Stream.WriteString(kc, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        let r = readResponse(kc, false);
+        if (r == nil) { Console.WriteLine("FAIL: keep-alive benchmark lost the connection"); }
+        else { _sink = _sink + r.code; }
+    }, 500);
+    Stream.Close(kc);
+
+    Console.WriteLine("\n[ Body sizes ]");
+    let mid = String.Repeat("y", 4096);
+    bench("POST /len        4 KB body", fn() {
+        let r = reqBody(gPort, "POST", "/len", "text/plain", mid); _sink = _sink + r.code;
+    }, 200);
+    bench("GET /bytes       256-byte binary", fn() {
+        let r = requestBytes(gPort, "/bytes"); _sink = _sink + r.code;
+    }, 300);
+    bench("GET /stream      3-chunk streamed", fn() {
+        let r = req1(gPort, "GET", "/stream"); _sink = _sink + r.code;
+    }, 300);
+
+    Console.WriteLine("\n[ Static files ]");
+    bench("GET /pub/hello.txt", fn() {
+        let r = req1(gPort, "GET", "/pub/hello.txt"); _sink = _sink + r.code;
+    }, 200);
+
+    Console.WriteLine("\n[ Pure helpers ]");
+    bench("HttpStatus.Reason(404)", fn() {
+        _sink = _sink + String.Length(HttpStatus.Reason(404));
+    }, 20000);
+    bench("HttpStatus.MimeFor('a.html')", fn() {
+        _sink = _sink + String.Length(HttpStatus.MimeFor("a.html"));
+    }, 20000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+
+    srv.Stop();
+    lim.Stop();
+    // Give both accept loops a tick to notice and release their ports.
+    Fiber.Sleep(700);
+    return 0;
+}

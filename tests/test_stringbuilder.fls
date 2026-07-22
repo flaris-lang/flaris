@@ -1,0 +1,559 @@
+// test_stringbuilder.fls - Tests for StringBuilder
+// Run: flarisvm test_stringbuilder.fls
+
+import { StringBuilder } from library("./StringBuilder", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expected, " got=", actual);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+fn test_construction() {
+    Console.WriteLine("== Construction ==");
+
+    // Empty constructor
+    let sb = new StringBuilder(nil);
+    checkEq(sb.ToString(), "", "empty ctor ToString");
+    checkEq(sb.GetLength(), 0, "empty ctor GetLength");
+    check(sb.IsEmpty(), "empty ctor IsEmpty");
+
+    // Constructor with initial string
+    let sb2 = new StringBuilder("Hello");
+    checkEq(sb2.ToString(), "Hello", "initial string ctor");
+    checkEq(sb2.GetLength(), 5, "initial string GetLength");
+    check(!sb2.IsEmpty(), "non-empty IsEmpty false");
+
+    // Constructor with non-string (int coerced)
+    let sb3 = new StringBuilder(42);
+    checkEq(sb3.ToString(), "42", "initial int coerced");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Append
+// ---------------------------------------------------------------------------
+fn test_append() {
+    Console.WriteLine("== Append ==");
+
+    let sb = new StringBuilder(nil);
+
+    // Basic string append
+    sb.Append("foo");
+    checkEq(sb.ToString(), "foo", "single Append");
+
+    // Chaining
+    sb.Append("bar").Append("baz");
+    checkEq(sb.ToString(), "foobarbaz", "chained Append");
+
+    // Append int
+    sb.Append(99);
+    checkEq(sb.ToString(), "foobarbaz99", "Append int");
+
+    // Append bool
+    sb.Append(true);
+    checkEq(sb.ToString(), "foobarbaz99true", "Append bool");
+
+    // GetLength tracks correctly
+    checkEq(sb.GetLength(), 15, "GetLength after appends");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// AppendLine
+// ---------------------------------------------------------------------------
+fn test_append_line() {
+    Console.WriteLine("== AppendLine ==");
+
+    let sb = new StringBuilder(nil);
+
+    sb.AppendLine("Hello");
+    checkEq(sb.ToString(), "Hello\n", "AppendLine basic");
+
+    sb.AppendLine("World");
+    checkEq(sb.ToString(), "Hello\nWorld\n", "two AppendLines");
+
+    // AppendLine with nil = bare newline
+    sb.AppendLine(nil);
+    checkEq(sb.ToString(), "Hello\nWorld\n\n", "AppendLine nil = bare newline");
+
+    // GetLength
+    checkEq(sb.GetLength(), 13, "GetLength after AppendLines");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// AppendRepeat
+// ---------------------------------------------------------------------------
+fn test_append_repeat() {
+    Console.WriteLine("== AppendRepeat ==");
+
+    let sb = new StringBuilder(nil);
+    sb.AppendRepeat("-", 5);
+    checkEq(sb.ToString(), "-----", "AppendRepeat 5 dashes");
+
+    sb.AppendRepeat("ab", 3);
+    checkEq(sb.ToString(), "-----ababab", "AppendRepeat 3x ab");
+
+    // n=0 is a no-op
+    sb.AppendRepeat("x", 0);
+    checkEq(sb.ToString(), "-----ababab", "AppendRepeat n=0 no-op");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// AppendFormat
+// ---------------------------------------------------------------------------
+fn test_append_format() {
+    Console.WriteLine("== AppendFormat ==");
+
+    let sb = new StringBuilder(nil);
+    sb.AppendFormat("Name: {0}, Age: {1}", ["Alice", 30]);
+    checkEq(sb.ToString(), "Name: Alice, Age: 30", "AppendFormat basic");
+
+    sb.Clear();
+    sb.AppendFormat("Pi ≈ {0}", [3.14]);
+    check(String.StartsWith(sb.ToString(), "Pi"), "AppendFormat with float");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// AppendJoin
+// ---------------------------------------------------------------------------
+fn test_append_join() {
+    Console.WriteLine("== AppendJoin ==");
+
+    let sb = new StringBuilder(nil);
+    sb.AppendJoin(["a", "b", "c"], ", ");
+    checkEq(sb.ToString(), "a, b, c", "AppendJoin comma-space");
+
+    sb.Clear();
+    sb.AppendJoin([1, 2, 3], "-");
+    checkEq(sb.ToString(), "1-2-3", "AppendJoin ints with dash");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Insert
+// ---------------------------------------------------------------------------
+fn test_insert() {
+    Console.WriteLine("== Insert ==");
+
+    let sb = new StringBuilder("Hello World");
+    sb.Insert(5, ",");
+    checkEq(sb.ToString(), "Hello, World", "Insert comma");
+
+    let sb2 = new StringBuilder("ac");
+    sb2.Insert(1, "b");
+    checkEq(sb2.ToString(), "abc", "Insert middle char");
+
+    // Insert at start
+    let sb3 = new StringBuilder("World");
+    sb3.Insert(0, "Hello ");
+    checkEq(sb3.ToString(), "Hello World", "Insert at start");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Remove
+// ---------------------------------------------------------------------------
+fn test_remove() {
+    Console.WriteLine("== Remove ==");
+
+    let sb = new StringBuilder("Hello, World");
+    sb.Remove(5, 1);   // remove the comma
+    checkEq(sb.ToString(), "Hello World", "Remove comma");
+
+    let sb2 = new StringBuilder("abcdef");
+    sb2.Remove(2, 3);  // remove "cde"
+    checkEq(sb2.ToString(), "abf", "Remove middle chars");
+
+    // Remove from start
+    let sb3 = new StringBuilder("XXXHello");
+    sb3.Remove(0, 3);
+    checkEq(sb3.ToString(), "Hello", "Remove from start");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Replace
+// ---------------------------------------------------------------------------
+fn test_replace() {
+    Console.WriteLine("== Replace ==");
+
+    let sb = new StringBuilder("foo bar foo");
+    sb.Replace("foo", "baz");
+    checkEq(sb.ToString(), "baz bar baz", "Replace all occurrences");
+
+    let sb2 = new StringBuilder("aabbcc");
+    sb2.Replace("bb", "XX");
+    checkEq(sb2.ToString(), "aaXXcc", "Replace middle substring");
+
+    // Replace with empty string (deletion)
+    let sb3 = new StringBuilder("Hello World");
+    sb3.Replace(" World", "");
+    checkEq(sb3.ToString(), "Hello", "Replace with empty = delete");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Trim / ToUpper / ToLower
+// ---------------------------------------------------------------------------
+fn test_case_trim() {
+    Console.WriteLine("== Trim / ToUpper / ToLower ==");
+
+    let sb = new StringBuilder("  hello  ");
+    sb.Trim();
+    checkEq(sb.ToString(), "hello", "Trim whitespace");
+
+    let sb2 = new StringBuilder("hello");
+    sb2.ToUpper();
+    checkEq(sb2.ToString(), "HELLO", "ToUpper");
+
+    let sb3 = new StringBuilder("HELLO");
+    sb3.ToLower();
+    checkEq(sb3.ToString(), "hello", "ToLower");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Clear
+// ---------------------------------------------------------------------------
+fn test_clear() {
+    Console.WriteLine("== Clear ==");
+
+    let sb = new StringBuilder("some content");
+    sb.Clear();
+    checkEq(sb.ToString(), "", "Clear resets to empty string");
+    checkEq(sb.GetLength(), 0, "Clear resets length to 0");
+    check(sb.IsEmpty(), "Clear makes IsEmpty true");
+
+    // Can append after clear
+    sb.Append("fresh");
+    checkEq(sb.ToString(), "fresh", "Append after Clear");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GetLength tracks without materialising
+// ---------------------------------------------------------------------------
+fn test_length_tracking() {
+    Console.WriteLine("== Length tracking ==");
+
+    let sb = new StringBuilder(nil);
+    checkEq(sb.GetLength(), 0, "start at 0");
+
+    sb.Append("abc");           // +3
+    checkEq(sb.GetLength(), 3, "after 'abc'");
+
+    sb.Append("de");            // +2
+    checkEq(sb.GetLength(), 5, "after 'de'");
+
+    sb.AppendLine("fg");        // +2 + 1 newline
+    checkEq(sb.GetLength(), 8, "after AppendLine 'fg'");
+
+    sb.AppendRepeat("x", 4);   // +4
+    checkEq(sb.GetLength(), 12, "after AppendRepeat x4");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Chaining across multiple methods
+// ---------------------------------------------------------------------------
+fn test_chaining() {
+    Console.WriteLine("== Chaining ==");
+
+    let result = new StringBuilder(nil)
+        .Append("The")
+        .Append(" quick")
+        .Append(" brown")
+        .Append(" fox")
+        .ToString();
+
+    checkEq(result, "The quick brown fox", "full chain ToString");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Reuse after ToString (no side-effects on backing store)
+// ---------------------------------------------------------------------------
+fn test_reuse_after_tostring() {
+    Console.WriteLine("== Reuse after ToString ==");
+
+    let sb = new StringBuilder("Hello");
+    let s1 = sb.ToString();
+    sb.Append(" World");
+    let s2 = sb.ToString();
+
+    checkEq(s1, "Hello", "first ToString not mutated");
+    checkEq(s2, "Hello World", "second ToString correct");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// AppendChar
+// ---------------------------------------------------------------------------
+fn test_append_char() {
+    Console.WriteLine("== AppendChar ==");
+
+    let sb = new StringBuilder(nil);
+    sb.AppendChar('A');
+    sb.AppendChar('B');
+    sb.AppendChar('C');
+    checkEq(sb.ToString(), "ABC", "AppendChar three chars");
+    checkEq(sb.GetLength(), 3, "AppendChar GetLength");
+
+    // Chaining
+    let sb2 = new StringBuilder(nil);
+    sb2.AppendChar('x').AppendChar('y');
+    checkEq(sb2.ToString(), "xy", "AppendChar chaining");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// AppendPadLeft / AppendPadRight
+// ---------------------------------------------------------------------------
+fn test_append_pad() {
+    Console.WriteLine("== AppendPadLeft / AppendPadRight ==");
+
+    let sb = new StringBuilder(nil);
+    sb.AppendPadLeft("42", 5, "0");
+    checkEq(sb.ToString(), "00042", "AppendPadLeft pads with zeros");
+
+    sb.Clear();
+    sb.AppendPadLeft("hi", 2, " ");
+    checkEq(sb.ToString(), "hi", "AppendPadLeft no-op when already wide enough");
+
+    sb.Clear();
+    sb.AppendPadRight("ok", 5, "-");
+    checkEq(sb.ToString(), "ok---", "AppendPadRight pads with dashes");
+
+    sb.Clear();
+    sb.AppendPadRight("hello", 3, ".");
+    checkEq(sb.ToString(), "hello", "AppendPadRight no-op when already wide enough");
+
+    // Chaining pad ops
+    let result = new StringBuilder(nil)
+        .AppendPadLeft("1", 3, "0")
+        .Append("/")
+        .AppendPadRight("end", 6, ".")
+        .ToString();
+    checkEq(result, "001/end...", "AppendPadLeft + AppendPadRight chained");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// EnsureCapacity (no-op - just must not throw)
+// ---------------------------------------------------------------------------
+fn test_ensure_capacity() {
+    Console.WriteLine("== EnsureCapacity ==");
+
+    let sb = new StringBuilder("hello");
+    let threw = false;
+    try {
+        sb.EnsureCapacity(1000);
+    } catch (e) {
+        threw = true;
+    }
+    check(!threw, "EnsureCapacity does not throw");
+
+    // Content must be unchanged
+    checkEq(sb.ToString(), "hello", "EnsureCapacity does not mutate content");
+
+    // Chaining
+    let sb2 = new StringBuilder(nil);
+    sb2.EnsureCapacity(64).Append("x");
+    checkEq(sb2.ToString(), "x", "EnsureCapacity returns this for chaining");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Contains / IndexOf
+// ---------------------------------------------------------------------------
+fn test_contains_indexof() {
+    Console.WriteLine("== Contains / IndexOf ==");
+
+    let sb = new StringBuilder("Hello, World!");
+
+    check(sb.Contains("World"),  "Contains found substring");
+    check(!sb.Contains("xyz"),   "Contains not found");
+    check(sb.Contains("Hello"),  "Contains start of string");
+    check(sb.Contains("!"),      "Contains end of string");
+
+    checkEq(sb.IndexOf("World"), 7, "IndexOf found at correct position");
+    checkEq(sb.IndexOf(","),     5, "IndexOf comma");
+    checkEq(sb.IndexOf("xyz"),  -1, "IndexOf not found returns -1");
+
+    // Works after appends (before materialise)
+    let sb2 = new StringBuilder("foo");
+    sb2.Append("bar").Append("baz");
+    check(sb2.Contains("barbaz"), "Contains works on un-materialised buffer");
+    checkEq(sb2.IndexOf("baz"), 6, "IndexOf works on un-materialised buffer");
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+fn async Main() {
+    Console.WriteLine("=== StringBuilder tests ===");
+
+    test_construction();
+    test_append();
+    test_append_line();
+    test_append_repeat();
+    test_append_format();
+    test_append_join();
+    test_insert();
+    test_remove();
+    test_replace();
+    test_case_trim();
+    test_clear();
+    test_length_tracking();
+    test_chaining();
+    test_reuse_after_tostring();
+    test_append_char();
+    test_append_pad();
+    test_ensure_capacity();
+    test_contains_indexof();
+
+    Console.WriteLine("===========================");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+
+    if (testsFailed > 0) {
+        Console.Error("Some StringBuilder tests FAILED.");
+        return testsFailed;
+    }
+    Console.Ok("All StringBuilder tests passed!");
+
+    Console.WriteLine("\n\n=== StringBuilder Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Append - single op ]");
+    bench("Append  short string (5 chars)", fn() {
+        let sb = new StringBuilder(nil);
+        sb.Append("hello"); _sink = _sink + 1;
+    }, 10000);
+    bench("Append  long string  (200 chars)", fn() {
+        let sb = new StringBuilder(nil);
+        sb.Append(String.Repeat("x", 200)); _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ Append - chain 100 parts, then ToString ]");
+    bench("100× Append short + ToString", fn() {
+        let sb = new StringBuilder(nil);
+        iter (i from 0 to 99) { sb.Append("ab"); }
+        let s = sb.ToString(); _sink = String.Length(s);
+    }, 1000);
+
+    Console.WriteLine("\n[ AppendLine / AppendRepeat ]");
+    bench("AppendLine  10 lines + ToString", fn() {
+        let sb = new StringBuilder(nil);
+        iter (i from 0 to 9) { sb.AppendLine("line"); }
+        let s = sb.ToString(); _sink = String.Length(s);
+    }, 5000);
+    bench("AppendRepeat  'x' × 50 + ToString", fn() {
+        let sb = new StringBuilder(nil);
+        sb.AppendRepeat("x", 50);
+        let s = sb.ToString(); _sink = String.Length(s);
+    }, 5000);
+
+    Console.WriteLine("\n[ AppendFormat / AppendJoin ]");
+    bench("AppendFormat  '{0} {1}'  + ToString", fn() {
+        let sb = new StringBuilder(nil);
+        sb.AppendFormat("{0} {1}", ["hello", 42]);
+        let s = sb.ToString(); _sink = String.Length(s);
+    }, 5000);
+    bench("AppendJoin  10-elem array + ToString", fn() {
+        let sb = new StringBuilder(nil);
+        sb.AppendJoin(["a","b","c","d","e","f","g","h","i","j"], ",");
+        let s = sb.ToString(); _sink = String.Length(s);
+    }, 5000);
+
+    Console.WriteLine("\n[ Mutating ops (Insert / Remove / Replace) ]");
+    bench("Insert  mid of 100-char string", fn() {
+        let sb = new StringBuilder(String.Repeat("x", 100));
+        sb.Insert(50, "!!"); _sink = sb.GetLength();
+    }, 2000);
+    bench("Remove  20 chars from 100-char string", fn() {
+        let sb = new StringBuilder(String.Repeat("x", 100));
+        sb.Remove(10, 20); _sink = sb.GetLength();
+    }, 2000);
+    bench("Replace  'ab' - 'AB'  in 100-char string", fn() {
+        let sb = new StringBuilder(String.Repeat("ab", 50));
+        sb.Replace("ab", "AB"); _sink = sb.GetLength();
+    }, 2000);
+
+    Console.WriteLine("\n[ Trim / Case / Clear ]");
+    bench("Trim  both ends (10 spaces each side)", fn() {
+        let sb = new StringBuilder("          hello          ");
+        sb.Trim(); _sink = sb.GetLength();
+    }, 10000);
+    bench("ToUpper  50-char string", fn() {
+        let sb = new StringBuilder(String.Repeat("abcde", 10));
+        sb.ToUpper(); _sink = sb.GetLength();
+    }, 5000);
+    bench("Clear  after 100-part builder", fn() {
+        let sb = new StringBuilder(nil);
+        iter (i from 0 to 99) { sb.Append("x"); }
+        sb.Clear(); _sink = _sink + 1;
+    }, 5000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

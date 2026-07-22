@@ -1,0 +1,598 @@
+// Linq.fls - Chainable array query library for Flaris.
+// Version: 1.0
+//
+// Linq.From(array) returns a Query object. Chain filter/transform/sort
+// methods and terminate with a materialising call (ToArray, Count, First, …).
+// Each chain method returns a new Query - the original array is never modified.
+//
+// Usage:
+//   import { Linq } from library("Linq", "1.0");
+//
+//   // Filter, transform, sort
+//   let result = Linq.From([3, 1, 4, 1, 5, 9, 2, 6])
+//       .Where(fn(x)  { return x > 2; })
+//       .Select(fn(x) { return x * 10; })
+//       .OrderBy(nil)         // nil = natural order
+//       .ToArray();           // [30, 40, 50, 60, 90]
+//
+//   // Aggregation
+//   let total = Linq.From(orders).Sum(fn(o) { return o.amount; });
+//   let avg   = Linq.From(scores).Average(nil);   // nil = identity
+//
+//   // Grouping
+//   let byDept = Linq.From(employees)
+//       .GroupBy(fn(e) { return e.dept; });   // object: dept -> array
+//
+// Entry point:
+//   Linq.From(array)   →  Query
+//
+// Filtering / slicing:
+//   .Where(predicate)        - keep elements where predicate returns true
+//   .Take(n)                 - first n elements
+//   .Skip(n)                 - drop first n elements
+//   .TakeWhile(predicate)    - take while predicate holds, then stop
+//   .SkipWhile(predicate)    - skip while predicate holds, then take rest
+//   .Distinct()              - remove duplicates (by value equality)
+//   .DistinctBy(keyFn)       - remove duplicates by a key selector (keeps first)
+//
+// Transformation:
+//   .Select(transform)       - map each element
+//   .Flatten()               - one level of nested arrays into flat sequence
+//   .SelectMany(transform)   - map then flatten (transform returns array)
+//   .Chunk(size)             - split into chunks of size n (array of arrays)
+//   .Reverse()               - reverse order
+//   .Zip(other)              - pair elements: [{first, second}, …]
+//
+// Sorting:
+//   .OrderBy(comparator)     - ascending; nil = natural (<) comparison
+//   .OrderByDesc(comparator) - descending
+//
+// Set operations:
+//   .Concat(other)           - append another array or Query
+//   .Append(item)            - append a single item
+//   .Prepend(item)           - prepend a single item
+//   .Intersect(other)        - elements in both sequences
+//   .Except(other)           - elements in this but not other
+//   .Union(other)            - Concat + Distinct
+//
+// Scanning / folding:
+//   .Scan(accumulator, seed) - running aggregate (returns Query of intermediates)
+//   .Aggregate(fn, seed)     - fold to a single value; fn(acc, item) → acc
+//   .ForEach(action)         - call action(item) for each element; no return
+//
+// Terminating (materialise):
+//   .ToArray()               →  array
+//   .GroupBy(keyFn)          →  object mapping key → array
+//   .ToHashMap(keyFn, valFn) →  Collections.HashMap
+//   .Partition(predicate)    →  { yes:array, no:array }
+//
+// Aggregates (terminate):
+//   .Count(predicate?)       →  int    - total, or count where predicate is true
+//   .Sum(transform?)         →  number - nil transform = identity
+//   .Min(transform?)         →  value
+//   .Max(transform?)         →  value
+//   .Average(transform?)     →  float
+//   .MinBy(keyFn)            →  element with the smallest selector key (nil if empty)
+//   .MaxBy(keyFn)            →  element with the largest selector key (nil if empty)
+//   .CountBy(keyFn)          →  object mapping key → count
+//
+// Statistics (terminate; optional transform, nil = identity):
+//   .Median(transform?)        →  float - median value
+//   .Variance(transform?)      →  float - population variance
+//   .StdDev(transform?)        →  float - population standard deviation
+//   .Percentile(p, transform?) →  float - p in [0,100], linear interpolation
+//
+// Search (terminate):
+//   .First(predicate?)       →  first element (or nil if none matches)
+//   .Last(predicate?)        →  last element
+//   .ElementAt(index)        →  element at 0-based index
+//   .IndexOf(value)          →  int  (-1 if not found)
+//   .Contains(value)         →  bool
+//   .Any(predicate)          →  bool  - true if any element matches
+//   .All(predicate)          →  bool  - true if all elements match
+//
+// Constraint: lambdas must only reference their own parameters and globals,
+// not enclosing local variables - this is a Flaris language limitation.
+
+// ---------------------------------------------------------------------------
+// Query - internal chaining object
+// ---------------------------------------------------------------------------
+
+class Query {
+    let _data: array = nil; 
+
+    fn Constructor(arr:array) {
+        this._data = Array.Concat(arr, []);   // defensive copy
+    }
+
+    // -----------------------------------------------------------------------
+    // Filtering
+    // -----------------------------------------------------------------------
+
+    fn Where(predicate:fn): instance {
+        this._data = Array.Where(this._data, predicate);
+        return this;
+    }
+
+    // -----------------------------------------------------------------------
+    // Projection
+    // -----------------------------------------------------------------------
+
+    fn Select(transform:fn): instance {
+        this._data = Array.Select(this._data, transform);
+        return this;
+    }
+
+    fn Flatten(): instance {
+        this._data = Array.Flatten(this._data);
+        return this;
+    }
+
+    fn SelectMany(transform:fn): instance {
+        this._data = Array.Flatten(Array.Select(this._data, transform));
+        return this;
+    }
+
+    // -----------------------------------------------------------------------
+    // Ordering
+    // -----------------------------------------------------------------------
+
+    fn OrderBy(comparator): instance {
+        if (comparator == nil) {
+            Array.Sort(this._data);
+        } else {
+            Array.Sort(this._data, comparator);
+        }
+        return this;
+    }
+
+    fn OrderByDesc(comparator): instance {
+        if (comparator == nil) {
+            Array.Sort(this._data);
+        } else {
+            Array.Sort(this._data, comparator);
+        }
+        Array.Reverse(this._data);
+        return this;
+    }
+
+    fn Reverse(): instance {
+        Array.Reverse(this._data);
+        return this;
+    }
+
+    // -----------------------------------------------------------------------
+    // Set operations
+    // -----------------------------------------------------------------------
+
+    fn Distinct(): instance {
+        this._data = Array.Distinct(this._data);
+        return this;
+    }
+
+    fn Concat(other): instance {
+        if (type(other) == Type.Array) {
+            this._data = Array.Concat(this._data, other);
+        } else {
+            this._data = Array.Concat(this._data, other.ToArray());
+        }
+        return this;
+    }
+
+    fn Zip(other): instance {
+        var otherArr = other;
+        if (type(other) == Type.Instance) {
+            otherArr = other.ToArray();
+        }
+        this._data = Array.Zip(this._data, otherArr);
+        return this;
+    }
+
+    // Elements present in both this and other (intersection, distinct).
+    fn Intersect(other): instance {
+        var otherArr = (type(other) == Type.Instance) ? other.ToArray() : other;
+        var result = [];
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            if (Array.Contains(otherArr, this._data[i])) {
+                Array.Append(result, this._data[i]);
+            }
+        }
+        this._data = Array.Distinct(result);
+        return this;
+    }
+
+    // Elements in this but not in other (set difference, distinct).
+    fn Except(other): instance {
+        var otherArr = (type(other) == Type.Instance) ? other.ToArray() : other;
+        var result = [];
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            if (!Array.Contains(otherArr, this._data[i])) {
+                Array.Append(result, this._data[i]);
+            }
+        }
+        this._data = Array.Distinct(result);
+        return this;
+    }
+
+    // Unique elements from both sequences (Concat + Distinct).
+    fn Union(other): instance {
+        var otherArr = (type(other) == Type.Instance) ? other.ToArray() : other;
+        this._data = Array.Distinct(Array.Concat(this._data, otherArr));
+        return this;
+    }
+
+    // -----------------------------------------------------------------------
+    // Slicing
+    // -----------------------------------------------------------------------
+
+    fn Take(n:int): instance {
+        this._data = Array.Take(this._data, n);
+        return this;
+    }
+
+    fn Skip(n:int): instance {
+        this._data = Array.Skip(this._data, n);
+        return this;
+    }
+
+    fn TakeWhile(predicate:fn): instance {
+        var result = [];
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            if (!predicate(this._data[i])) break;
+            Array.Append(result, this._data[i]);
+        }
+        this._data = result;
+        return this;
+    }
+
+    fn SkipWhile(predicate:fn): instance {
+        var n = len(this._data);
+        var cutoff = n;
+        iter (i from 0 to n - 1) {
+            if (!predicate(this._data[i])) { cutoff = i; break; }
+        }
+        this._data = Array.Skip(this._data, cutoff);
+        return this;
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-element add
+    // -----------------------------------------------------------------------
+
+    // Add one item to the end.
+    fn Append(item): instance {
+        Array.Append(this._data, item);
+        return this;
+    }
+
+    // Add one item to the start.
+    fn Prepend(item): instance {
+        this._data = Array.Concat([item], this._data);
+        return this;
+    }
+
+    // Split into sub-arrays of at most size elements.
+    fn Chunk(size:int): instance {
+        if (size <= 0) { size = 1; }
+        var result = [];
+        var n = len(this._data);
+        var i = 0;
+        while (i < n) {
+            Array.Append(result, Array.Take(Array.Skip(this._data, i), size));
+            i += size;
+        }
+        this._data = result;
+        return this;
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal - aggregation
+    // -----------------------------------------------------------------------
+
+    fn Count(predicate) {
+        if (predicate == nil) return len(this._data);
+        return len(Array.Where(this._data, predicate));
+    }
+
+    fn Sum(transform) {
+        if (transform == nil) return Math.Sum(this._data);
+        return Math.Sum(Array.Select(this._data, transform));
+    }
+
+    fn Min(transform) {
+        if (transform == nil) return Math.MinOf(this._data);
+        return Math.MinOf(Array.Select(this._data, transform));
+    }
+
+    fn Max(transform) {
+        if (transform == nil) return Math.MaxOf(this._data);
+        return Math.MaxOf(Array.Select(this._data, transform));
+    }
+
+    fn Average(transform) {
+        if (transform == nil) return Array.Average(this._data);
+        return Array.Average(Array.Select(this._data, transform));
+    }
+
+    fn Aggregate(accumulator:fn, seed) {
+        var acc = seed;
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            acc = accumulator(acc, this._data[i]);
+        }
+        return acc;
+    }
+
+    // -----------------------------------------------------------------------
+    // Key-based reducers and statistics
+    // -----------------------------------------------------------------------
+
+    // MinBy/MaxBy return the ELEMENT whose selector(element) is smallest/largest
+    // (unlike Min/Max which return the value). nil on empty.
+    fn MinBy(selector:fn) {
+        let n = len(this._data);
+        if (n == 0) return nil;
+        var best    = this._data[0];
+        var bestKey = selector(best);
+        var i = 1;
+        while (i < n) {
+            let k = selector(this._data[i]);
+            if (k < bestKey) { best = this._data[i]; bestKey = k; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    fn MaxBy(selector:fn) {
+        let n = len(this._data);
+        if (n == 0) return nil;
+        var best    = this._data[0];
+        var bestKey = selector(best);
+        var i = 1;
+        while (i < n) {
+            let k = selector(this._data[i]);
+            if (k > bestKey) { best = this._data[i]; bestKey = k; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    // DistinctBy keeps the first element for each distinct selector key. Chainable.
+    fn DistinctBy(selector:fn): instance {
+        let seen   = {};
+        let result = [];
+        let n = len(this._data);
+        var i = 0;
+        while (i < n) {
+            let key = str(selector(this._data[i]));
+            if (!Object.HasKey(seen, key)) {
+                seen[key] = true;
+                Array.Append(result, this._data[i]);
+            }
+            i = i + 1;
+        }
+        this._data = result;
+        return this;
+    }
+
+    // CountBy returns { keyString: count } grouped by selector(element). Terminal.
+    fn CountBy(selector:fn): object {
+        let counts = {};
+        let n = len(this._data);
+        var i = 0;
+        while (i < n) {
+            let key = str(selector(this._data[i]));
+            if (Object.HasKey(counts, key)) { counts[key] = counts[key] + 1; }
+            else                            { counts[key] = 1; }
+            i = i + 1;
+        }
+        return counts;
+    }
+
+    // Statistics (numeric data, or via optional selector). Delegate to the native
+    // Math module's vectorized reducers where available.
+    fn Median(transform) {
+        if (transform == nil) return Math.Median(this._data);
+        return Math.Median(Array.Select(this._data, transform));
+    }
+
+    fn Variance(transform) {
+        if (transform == nil) return Math.Variance(this._data);
+        return Math.Variance(Array.Select(this._data, transform));
+    }
+
+    fn StdDev(transform) {
+        if (transform == nil) return Math.Stddev(this._data);
+        return Math.Stddev(Array.Select(this._data, transform));
+    }
+
+    // Percentile(p) for 0..100, linear interpolation between closest ranks.
+    fn Percentile(p:float, transform) {
+        var vals = this._data;
+        if (transform != nil) { vals = Array.Select(vals, transform); }
+        let n = len(vals);
+        if (n == 0) return nil;
+        let sorted = Array.Concat(vals, []);
+        Array.Sort(sorted);
+        if (p <= 0)   { return sorted[0]; }
+        if (p >= 100) { return sorted[n - 1]; }
+        let rank = (p / 100.0) * (n - 1);
+        let lo   = Convert.ToInt(rank);
+        if (lo >= n - 1) { return sorted[n - 1]; }
+        let frac = rank - lo;
+        return sorted[lo] + (sorted[lo + 1] - sorted[lo]) * frac;
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal - element access
+    // -----------------------------------------------------------------------
+
+    fn First(predicate) {
+        if (predicate == nil) return Array.First(this._data);
+        return Array.First(Array.Where(this._data, predicate));
+    }
+
+    fn Last(predicate) {
+        if (predicate == nil) return Array.Last(this._data);
+        return Array.Last(Array.Where(this._data, predicate));
+    }
+
+    fn ElementAt(index:int) {
+        if (index < 0 || index >= len(this._data)) return nil;
+        return this._data[index];
+    }
+
+    // Index of first occurrence of value, or -1 if not found.
+    fn IndexOf(value): int {
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            if (this._data[i] == value) return i;
+        }
+        return -1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal - existence checks
+    // -----------------------------------------------------------------------
+
+    fn Any(predicate): bool {
+        if (predicate == nil) return len(this._data) > 0;
+        return Array.Any(this._data, predicate);
+    }
+
+    fn All(predicate:fn): bool {
+        return Array.All(this._data, predicate);
+    }
+
+    fn Contains(value): bool {
+        return Array.Contains(this._data, value);
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal - side effects
+    // -----------------------------------------------------------------------
+
+    fn ForEach(action:fn) {
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            action(this._data[i]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal - materializers
+    // -----------------------------------------------------------------------
+
+    fn ToArray(): array {
+        return this._data;
+    }
+
+    fn GroupBy(keyFn:fn) {
+        var map = Collections.HashMap();
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            var item = this._data[i];
+            var key = keyFn(item);
+            if (!map.Has(key)) {
+                map.Set(key, []);
+            }
+            Array.Append(map.Get(key), item);
+        }
+        return map;
+    }
+
+    fn ToHashMap(keyFn:fn, valFn:fn) {
+        var map = Collections.HashMap();
+        var n = len(this._data);
+        iter (i from 0 to n - 1) {
+            var item = this._data[i];
+            map.Set(keyFn(item), valFn(item));
+        }
+        return map;
+    }
+
+    // -----------------------------------------------------------------------
+    // New methods
+    // -----------------------------------------------------------------------
+
+    // Split into two arrays in one pass.
+    // Returns { matching: [...], rest: [...] }.
+    fn Partition(predicate:fn) : object {
+        let matching = [];
+        let rest     = [];
+        iter (i from 0 to len(this._data) - 1) {
+            let item = this._data[i];
+            if (predicate(item)) { Array.Append(matching, item); }
+            else                 { Array.Append(rest, item); }
+        }
+        return { matching: matching, rest: rest };
+    }
+
+    // Running aggregate - returns a new Query with the running values.
+    fn Scan(accumulator:fn, seed) : instance {
+        let result = [];
+        var acc = seed;
+        iter (i from 0 to len(this._data) - 1) {
+            acc = accumulator(acc, this._data[i]);
+            Array.Append(result, acc);
+        }
+        return Linq.From(result);
+    }
+
+    // Return self if non-empty, else a Query containing just val.
+    fn DefaultIfEmpty(val) : instance {
+        if (len(this._data) > 0) return this;
+        return Linq.From([val]);
+    }
+
+    // Like ToHashMap but throws on duplicate keys.
+    fn ToHashMapStrict(keyFn:fn) : object {
+        let result = {};
+        iter (i from 0 to len(this._data) - 1) {
+            let item = this._data[i];
+            let k    = str(keyFn(item));
+            if (result[k] != nil) { throw(1, "ToHashMapStrict: duplicate key '" + k + "'"); }
+            result[k] = item;
+        }
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // Utility
+    // -----------------------------------------------------------------------
+
+    fn Size(): int    { return len(this._data); }
+    fn IsEmpty(): bool { return len(this._data) == 0; }
+}
+
+// ---------------------------------------------------------------------------
+// Linq - public factory namespace
+// ---------------------------------------------------------------------------
+
+class Linq {
+
+    fn static From(arr:array): instance    { return new Query(arr); }
+    fn static Empty(): instance            { return new Query([]); }
+
+    fn static Range(start:int, end:int, step:int): instance {
+        var arr = [];
+        var i = start;
+        if (step == 0) step = 1;
+        if (step > 0) {
+            while (i < end) { Array.Append(arr, i); i += step; }
+        } else {
+            while (i > end) { Array.Append(arr, i); i += step; }
+        }
+        return new Query(arr);
+    }
+
+    fn static Repeat(value, n:int): instance {
+        var arr = Array.Fill(Array.Create(n), value);
+        return new Query(arr);
+    }
+}
+
+export { Linq };

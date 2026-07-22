@@ -1,0 +1,592 @@
+// QRCode.fls - Pure-Flaris QR code generator. No native dependencies.
+// Version: 1.0
+//
+// Implements QR versions 1–10 in byte mode. Version 10 is the upper limit
+// of this implementation (full QR goes to v40 / ~3 KB, but that requires
+// significantly more code). Practical limits per EC level at version 10:
+//
+//   QRCode.QR_M (default, 15% recovery):  ~212 bytes
+//   QRCode.QR_L (7%  recovery, most data): ~270 bytes
+//   QRCode.QR_Q (25% recovery):            ~150 bytes
+//   QRCode.QR_H (30% recovery, fewest data): ~118 bytes
+//
+// If the input exceeds the capacity for the chosen EC level, ToPixels/ToLines/ToSVG
+// return an empty result. Use a lower EC level or shorter text to fit.
+//
+// Usage:
+//   import { QRCode } from library("QRCode", "1.0");
+//
+//   // Print to terminal as block characters (UTF-8 █/space)
+//   foreach (line in QRCode.ToLines("https://flaris.dev")) {
+//       Console.WriteLine(line);
+//   }
+//
+//   // Generate SVG file
+//   let svg = QRCode.ToSVG("https://flaris.dev", 4);
+//   File.WriteText("qr.svg", svg);
+//
+//   // Draw onto a Graphics canvas - Blit is a single fast call
+//   import { Graphics } from library("Graphics", "1.0");
+//   let g      = new Graphics(600, 400);
+//   let url    = "https://example.com";
+//   let scale  = 3;
+//   let qrPx   = QRCode.ToPixels(url, scale, QRCode.QR_M, true);
+//   let qrSide = QRCode.PixelSize(url, scale, QRCode.QR_M);
+//   g.Blit(300, 0, qrSide, qrSide, qrPx);   // place QR at x=300, y=0
+//   g.Save("banner.png");
+//
+// EC level constants (pass to any method as the ecLevel argument):
+//   QRCode.QR_M  - Medium  15% error recovery  (default when nil is passed)
+//   QRCode.QR_L  - Low      7% error recovery  (maximum data capacity)
+//   QRCode.QR_Q  - Quartile 25% error recovery
+//   QRCode.QR_H  - High    30% error recovery  (minimum data capacity)
+//
+// API (all methods are static):
+//   QRCode.ToLines(text, ecLevel?, fast?)  →  array of strings
+//     - one string per row, using █ (U+2588) for dark modules and space for light
+//     - ecLevel: one of QRCode.QR_M / QR_L / QR_Q / QR_H (default: QR_M)
+//     - fast: true = skip best-mask search; slightly lower quality, noticeably faster
+//
+//   QRCode.ToPixels(text, scale?, ecLevel?, fast?)  →  flat ARGB int array
+//     - ready for Graphics.Blit(); includes the 4-module quiet zone border
+//     - each pixel is 0xFF000000 (dark) or 0xFFFFFFFF (light)
+//     - scale: pixels per module, default 4; returns [] if text exceeds capacity
+//
+//   QRCode.PixelSize(text, scale?, ecLevel?)  →  int
+//     - pixel width (= height) of the ToPixels result; pass same args as ToPixels
+//
+//   QRCode.ToSVG(text, scale?, ecLevel?, fast?, darkColor?, lightColor?)  →  string
+//     - darkColor / lightColor: CSS color strings, defaults "#000000" / "#FFFFFF"
+//
+
+// ── Version/EC capacity table ──────────────────────────────────────────────
+// 6 values per row: [total_data_cw, ec_cw_per_block, g1_blocks, g1_dcw, g2_blocks, g2_dcw]
+// Rows in order: v1-M, v1-L, v1-H, v1-Q, v2-M, v2-L, ...
+const _VC = [
+    16,10, 1,16, 0, 0,   19, 7, 1,19, 0, 0,   9,17, 1, 9, 0, 0,  13,13, 1,13, 0, 0,
+    28,16, 1,28, 0, 0,   34,10, 1,34, 0, 0,  16,28, 1,16, 0, 0,  22,22, 1,22, 0, 0,
+    44,26, 1,44, 0, 0,   55,15, 1,55, 0, 0,  26,22, 2,13, 0, 0,  34,18, 2,17, 0, 0,
+    64,18, 2,32, 0, 0,   80,20, 1,80, 0, 0,  36,16, 4, 9, 0, 0,  48,26, 2,24, 0, 0,
+    86,24, 2,43, 0, 0,  108,26, 1,108,0, 0,  46,22, 2,11, 2,12,  62,18, 2,15, 2,16,
+   108,16, 4,27, 0, 0,  136,18, 2,68, 0, 0,  60,28, 4,15, 0, 0,  76,24, 4,19, 0, 0,
+   124,18, 4,31, 0, 0,  156,20, 2,78, 0, 0,  66,26, 4,13, 1,14,  88,18, 2,14, 4,15,
+   154,22, 2,38, 2,39,  194,24, 2,97, 0, 0,  86,26, 4,14, 2,15, 110,22, 4,18, 2,19,
+   182,22, 3,36, 2,37,  232,30, 2,116,0, 0, 100,24, 4,12, 4,13, 132,20, 4,16, 4,17,
+   216,26, 4,43, 1,44,  274,18, 2,68, 2,69, 122,28, 6,15, 2,16, 154,24, 6,19, 2,20
+];
+
+// Alignment pattern centre positions per version (versions 1-10)
+const _AP = [
+    [],
+    [6,18], [6,22], [6,26], [6,30], [6,34],
+    [6,22,38], [6,24,42], [6,26,46], [6,28,50]
+];
+
+// Format info words [ecLevel * 8 + mask]
+const _FI = [
+    0x5412,0x5125,0x5E7C,0x5B4B,0x45F9,0x40CE,0x4F97,0x4AA0,
+    0x77C4,0x72F3,0x7DAA,0x789D,0x662F,0x6318,0x6C41,0x6976,
+    0x1689,0x13BE,0x1CE7,0x19D0,0x0762,0x0255,0x0D0C,0x083B,
+    0x355F,0x3068,0x3F31,0x3A06,0x24B4,0x2183,0x2EDA,0x2BED
+];
+
+// Version info words for versions 7-10
+const _VI = [0x07C94, 0x085BC, 0x09A99, 0x0A4D3];
+
+// ── Module-level GF(256) tables - shared across all instances ────────────
+// Initialised lazily on first encode; Array.Create called inside _ensureGf.
+global _GF_EXP  = [];
+global _GF_LOG  = [];
+global _GF_OK   = false;
+global _GF_POLYS = {};
+
+fn _ensureGf() {
+    if (_GF_OK) return;
+    _GF_OK  = true;
+    _GF_EXP = Array.Create(512, Type.Int);
+    _GF_LOG = Array.Create(256, Type.Int);
+    var x = 1;
+    iter (i from 0 to 254) {
+        _GF_EXP[i]       = x;
+        _GF_EXP[i + 255] = x;
+        _GF_LOG[x]       = i;
+        x = x * 2;
+        if (x >= 256) x = (x ^ 0x11D) & 0xFF;
+    }
+    _GF_EXP[255] = 1;  _GF_EXP[510] = 1;  _GF_LOG[1] = 0;
+}
+
+class QRCode {
+
+    // Error correction levels as class constants - access as QRCode.QR_M etc.
+    const QR_M = 0;
+    const QR_L = 1;
+    const QR_H = 2;
+    const QR_Q = 3;
+
+    fn _mul(a: int, b: int) : int {
+        if (a == 0 || b == 0) return 0;
+        return _GF_EXP[(_GF_LOG[a] + _GF_LOG[b]) % 255];
+    }
+
+    fn _genPoly(nsym: int) {
+        let key    = str(nsym);
+        let cached = Object.TryGet(_GF_POLYS, key, nil);
+        if (cached != nil) return cached;
+        var g = [1];
+        iter (i from 0 to nsym - 1) {
+            let ai = _GF_EXP[i];
+            let ng = Array.Create(len(g) + 1, Type.Int);
+            iter (j from 0 to len(g) - 1) {
+                ng[j]     = ng[j]     ^ g[j];
+                ng[j + 1] = ng[j + 1] ^ this._mul(g[j], ai);
+            }
+            g = ng;
+        }
+        _GF_POLYS[key] = g;
+        return g;
+    }
+
+    fn _rsEncode(data: array, nsym: int) : array {
+        let gen = this._genPoly(nsym);
+        let n   = len(data);
+        let msg = Array.Create(n + nsym, Type.Int);
+        iter (i from 0 to n - 1) { msg[i] = data[i]; }
+        iter (i from 0 to n - 1) {
+            let coef = msg[i];
+            if (coef != 0) {
+                iter (j from 1 to nsym) {
+                    msg[i + j] = msg[i + j] ^ this._mul(gen[j], coef);
+                }
+            }
+        }
+        let ec = Array.Create(nsym, Type.Int);
+        iter (i from 0 to nsym - 1) { ec[i] = msg[n + i]; }
+        return ec;
+    }
+
+    fn _set(m: array, sz: int, r: int, c: int, v: int) {
+        if (r >= 0 && r < sz && c >= 0 && c < sz) m[r*sz+c] = v;
+    }
+
+    fn _get(m: array, sz: int, r: int, c: int) : int {
+        if (r < 0 || r >= sz || c < 0 || c >= sz) return -2;
+        return m[r*sz+c];
+    }
+
+    fn _finder(m: array, sz: int, tr: int, tc: int) {
+        iter (dr from -1 to 7) {
+            iter (dc from -1 to 7) {
+                let dark = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6 &&
+                           (dr == 0 || dr == 6 || dc == 0 || dc == 6 ||
+                            (dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4));
+                this._set(m, sz, tr+dr, tc+dc, dark ? 1 : 0);
+            }
+        }
+    }
+
+    fn _timing(m: array, sz: int) {
+        iter (i from 8 to sz - 9) {
+            let d = (i % 2 == 0) ? 1 : 0;
+            if (m[6*sz+i] == -1) m[6*sz+i] = d;
+            if (m[i*sz+6] == -1) m[i*sz+6] = d;
+        }
+    }
+
+    fn _alignPat(m: array, sz: int, ver: int) {
+        let pos = _AP[ver - 1];
+        let np  = len(pos);
+        iter (ai from 0 to np - 1) {
+            iter (bi from 0 to np - 1) {
+                let r = pos[ai];
+                let c = pos[bi];
+                if (m[r*sz+c] != -1) continue;
+                iter (dr from -2 to 2) {
+                    iter (dc from -2 to 2) {
+                        let dark = (dr == -2 || dr == 2 || dc == -2 || dc == 2 ||
+                                    (dr == 0 && dc == 0));
+                        this._set(m, sz, r+dr, c+dc, dark ? 1 : 0);
+                    }
+                }
+            }
+        }
+    }
+
+    fn _reserveFmt(m: array, sz: int) {
+        iter (i from 0 to 5) { m[8*sz+i] = 2;  m[i*sz+8] = 2; }
+        m[8*sz+7] = 2;  m[7*sz+8] = 2;  m[8*sz+8] = 2;
+        m[(sz-8)*sz+8] = 1;
+        iter (i from 0 to 7) {
+            m[8*sz+(sz-1-i)] = 2;
+            m[(sz-1-i)*sz+8] = 2;
+        }
+    }
+
+    fn _versionInfo(m: array, sz: int, ver: int) {
+        if (ver < 7) return;
+        let bits = _VI[ver - 7];
+        iter (i from 0 to 17) {
+            let bit = (bits >> i) & 1;
+            let r   = i / 3;
+            let c   = i % 3;
+            this._set(m, sz, r,       sz-11+c, bit);
+            this._set(m, sz, sz-11+c, r,       bit);
+        }
+    }
+
+    fn _placeData(m: array, sz: int, bits: array) {
+        var bi  = 0;
+        var dir = -1;
+        var r   = sz - 1;
+        var col = sz - 1;
+        while (col >= 1) {
+            if (col == 6) col = col - 1;
+            var done = false;
+            while (!done) {
+                iter (dc from 0 to 1) {
+                    let cc = col - dc;
+                    if (cc >= 0 && r >= 0 && r < sz && m[r*sz+cc] == -1) {
+                        m[r*sz+cc] = (bi < len(bits)) ? bits[bi] : 0;
+                        bi = bi + 1;
+                    }
+                }
+                r = r + dir;
+                if (r < 0 || r >= sz) {
+                    r    = r - dir;
+                    dir  = 0 - dir;
+                    done = true;
+                }
+            }
+            col = col - 2;
+        }
+    }
+
+    fn _writeFmt(m: array, sz: int, fi: int) {
+        let seq_r = [8,8,8,8,8,8,8,8,7,5,4,3,2,1,0];
+        let seq_c = [0,1,2,3,4,5,7,8,8,8,8,8,8,8,8];
+        iter (i from 0 to 14) {
+            let bit = (fi >> i) & 1;
+            m[seq_r[i]*sz + seq_c[i]] = bit;
+        }
+        iter (i from 0 to 6) { m[(sz-1-i)*sz+8] = (fi >> i) & 1; }
+        iter (i from 7 to 14) { m[8*sz+(sz-15+i)] = (fi >> i) & 1; }
+    }
+
+    fn _maskBit(mask: int, r: int, c: int) : int {
+        if (mask == 0) return ((r + c) % 2 == 0) ? 1 : 0;
+        if (mask == 1) return (r % 2 == 0) ? 1 : 0;
+        if (mask == 2) return (c % 3 == 0) ? 1 : 0;
+        if (mask == 3) return ((r + c) % 3 == 0) ? 1 : 0;
+        if (mask == 4) return ((r/2 + c/3) % 2 == 0) ? 1 : 0;
+        if (mask == 5) return ((r*c)%2 + (r*c)%3 == 0) ? 1 : 0;
+        if (mask == 6) return (((r*c)%2 + (r*c)%3) % 2 == 0) ? 1 : 0;
+        return (((r+c)%2 + (r*c)%3) % 2 == 0) ? 1 : 0;
+    }
+
+    fn _penalty(m: array, sz: int) : int {
+        var p = 0;
+        iter (row from 0 to sz-1) {
+            var run = 1;
+            iter (col from 1 to sz-1) {
+                if (m[row*sz+col] == m[row*sz+col-1]) {
+                    run = run + 1;
+                    if (run == 5) p = p + 3;
+                    else if (run > 5) p = p + 1;
+                } else { run = 1; }
+            }
+        }
+        iter (col from 0 to sz-1) {
+            var run = 1;
+            iter (row from 1 to sz-1) {
+                if (m[row*sz+col] == m[(row-1)*sz+col]) {
+                    run = run + 1;
+                    if (run == 5) p = p + 3;
+                    else if (run > 5) p = p + 1;
+                } else { run = 1; }
+            }
+        }
+        iter (row from 0 to sz-2) {
+            iter (col from 0 to sz-2) {
+                let v = m[row*sz+col];
+                if (v == m[row*sz+col+1] && v == m[(row+1)*sz+col] &&
+                    v == m[(row+1)*sz+col+1]) p = p + 3;
+            }
+        }
+        let f1 = [1,0,1,1,1,0,1,0,0,0,0];
+        let f2 = [0,0,0,0,1,0,1,1,1,0,1];
+        iter (row from 0 to sz-1) {
+            iter (col from 0 to sz-12) {
+                var m1 = true;  var m2 = true;
+                iter (k from 0 to 10) {
+                    if (m[row*sz+col+k] != f1[k]) m1 = false;
+                    if (m[row*sz+col+k] != f2[k]) m2 = false;
+                }
+                if (m1 || m2) p = p + 40;
+            }
+        }
+        iter (col from 0 to sz-1) {
+            iter (row from 0 to sz-12) {
+                var m1 = true;  var m2 = true;
+                iter (k from 0 to 10) {
+                    if (m[(row+k)*sz+col] != f1[k]) m1 = false;
+                    if (m[(row+k)*sz+col] != f2[k]) m2 = false;
+                }
+                if (m1 || m2) p = p + 40;
+            }
+        }
+        var dark = 0;
+        iter (i from 0 to sz*sz-1) { if (m[i] == 1) dark = dark + 1; }
+        let pct = dark * 100 / (sz * sz);
+        let d1  = (pct < 50) ? (50 - pct) / 5 : (pct - 50) / 5;
+        let d2  = (pct < 49) ? (49 - pct) / 5 : (pct - 49) / 5;
+        p = p + ((d1 < d2) ? d1 : d2) * 10;
+        return p;
+    }
+
+    fn _encode(text: string, ecLevel: int, fast: bool) : object {
+        _ensureGf();
+
+        let blen = String.Length(text);
+        var ver  = -1;
+        iter (v from 1 to 10) {
+            if (ver < 0 && _VC[(v-1)*4*6 + ecLevel*6] >= blen + 4) ver = v;
+        }
+        if (ver < 0) return nil;
+
+        let base   = (ver-1)*4*6 + ecLevel*6;
+        let totDcw = _VC[base];
+        let ecCwPB = _VC[base+1];
+        let g1Blk  = _VC[base+2];
+        let g1Dcw  = _VC[base+3];
+        let g2Blk  = _VC[base+4];
+        let g2Dcw  = _VC[base+5];
+        let totBlk = g1Blk + g2Blk;
+        let sz     = 4 * ver + 17;
+
+        let maxBits = totDcw * 8;
+        let bitBuf  = Array.Create(maxBits + 32, Type.Int);
+        var nb      = 0;
+
+        bitBuf[0]=0; bitBuf[1]=1; bitBuf[2]=0; bitBuf[3]=0; nb=4;
+        iter (b from 0 to 7) { bitBuf[nb] = (blen >> (7 - b)) & 1; nb = nb + 1; }
+        iter (i from 0 to blen-1) {
+            let ch = String.CharAt(text, i);
+            iter (b from 0 to 7) { bitBuf[nb] = (ch >> (7 - b)) & 1; nb = nb + 1; }
+        }
+        let term = ((maxBits - nb) < 4) ? (maxBits - nb) : 4;
+        iter (i from 0 to term-1) { bitBuf[nb] = 0;  nb = nb + 1; }
+        while (nb % 8 != 0) { bitBuf[nb] = 0;  nb = nb + 1; }
+        let padSeq = [0xEC, 0x11];
+        var pi = 0;
+        while (nb < maxBits) {
+            let pv = padSeq[pi % 2];
+            iter (b from 0 to 7) { bitBuf[nb] = (pv >> (7 - b)) & 1; nb = nb + 1; }
+            pi = pi + 1;
+        }
+
+        let codewords = Array.Create(totDcw, Type.Int);
+        iter (i from 0 to totDcw-1) {
+            var byte = 0;
+            iter (b from 0 to 7) { byte = (byte << 1) | bitBuf[i*8+b]; }
+            codewords[i] = byte;
+        }
+
+        let allD = Array.Create(totBlk);
+        let allE = Array.Create(totBlk);
+        var cwi  = 0;
+        iter (blk from 0 to totBlk-1) {
+            let dcw = (blk < g1Blk) ? g1Dcw : g2Dcw;
+            let d   = Array.Create(dcw, Type.Int);
+            iter (j from 0 to dcw-1) { d[j] = codewords[cwi];  cwi = cwi + 1; }
+            allD[blk] = d;
+            allE[blk] = this._rsEncode(d, ecCwPB);
+        }
+
+        let maxDcw = (g2Blk > 0) ? g2Dcw : g1Dcw;
+        var interl  = [];
+        iter (j from 0 to maxDcw-1) {
+            iter (blk from 0 to totBlk-1) {
+                let d = allD[blk];
+                if (j < len(d)) interl = Array.Append(interl, d[j]);
+            }
+        }
+        iter (j from 0 to ecCwPB-1) {
+            iter (blk from 0 to totBlk-1) {
+                interl = Array.Append(interl, allE[blk][j]);
+            }
+        }
+
+        let dataBits = Array.Create(len(interl) * 8, Type.Int);
+        iter (i from 0 to len(interl)-1) {
+            iter (b from 0 to 7) {
+                dataBits[i*8+b] = (interl[i] >> (7-b)) & 1;
+            }
+        }
+
+        let fmat = Array.Create(sz * sz);
+        Array.Fill(fmat, -1);
+        this._finder(fmat, sz, 0,    0);
+        this._finder(fmat, sz, sz-7, 0);
+        this._finder(fmat, sz, 0,    sz-7);
+        this._reserveFmt(fmat, sz);
+        this._timing(fmat, sz);
+        this._alignPat(fmat, sz, ver);
+        this._versionInfo(fmat, sz, ver);
+
+        let isFn = Array.Create(sz * sz);
+        iter (i from 0 to sz*sz-1) { isFn[i] = (fmat[i] != -1) ? 1 : 0; }
+
+        this._placeData(fmat, sz, dataBits);
+
+        var bestMask = 0;
+        var bestPen  = 2147483647;
+        var bestMat  = fmat;
+
+        let maskStart = fast ? 2 : 0;
+        let maskEnd   = fast ? 2 : 7;
+
+        iter (mask from maskStart to maskEnd) {
+            let cand = Array.Create(sz * sz);
+            iter (i from 0 to sz*sz-1) { cand[i] = fmat[i]; }
+            iter (r from 0 to sz-1) {
+                iter (c from 0 to sz-1) {
+                    let i = r*sz+c;
+                    if (!isFn[i]) {
+                        cand[i] = cand[i] ^ this._maskBit(mask, r, c);
+                    }
+                }
+            }
+            this._writeFmt(cand, sz, _FI[ecLevel*8 + mask]);
+            iter (i from 0 to sz*sz-1) { if (cand[i] == 2) cand[i] = 0; }
+            let pen = fast ? 0 : this._penalty(cand, sz);
+            if (pen < bestPen) {
+                bestPen  = pen;
+                bestMask = mask;
+                bestMat  = cand;
+            }
+        }
+
+        return { matrix: bestMat, size: sz, version: ver, mask: bestMask };
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    // Console output - array of strings, 4-module quiet zone per spec.
+    fn static ToLines(text: string, ecLevel, fast) : array {
+        let ec   = (ecLevel == nil) ? 0 : int(ecLevel);
+        let fst  = (fast == true);
+        let q    = new QRCode();
+        let res  = q._encode(text, ec, fst);
+        if (res == nil) return [];
+        let mat  = res.matrix;
+        let sz   = res.size;
+        let qz   = 4;
+        let full = sz + qz * 2;
+
+        var lines = [];
+        let blank = String.Repeat("  ", full);
+
+        iter (qi from 0 to qz-1) { lines = Array.Append(lines, blank); }
+        iter (row from 0 to sz-1) {
+            var s = String.Repeat("  ", qz);
+            iter (col from 0 to sz-1) {
+                s = s + (mat[row*sz+col] == 1 ? "██" : "  ");
+            }
+            s = s + String.Repeat("  ", qz);
+            lines = Array.Append(lines, s);
+        }
+        iter (qi from 0 to qz-1) { lines = Array.Append(lines, blank); }
+
+        return lines;
+    }
+
+    // Pixel output - flat 32-bit ARGB array, scale pixels per module.
+    fn static ToPixels(text: string, scale, ecLevel, fast) : array {
+        let ec     = (ecLevel == nil) ? 0 : int(ecLevel);
+        let sc     = (scale   == nil) ? 4 : int(scale);
+        let fst    = (fast == true);
+        let q      = new QRCode();
+        let res    = q._encode(text, ec, fst);
+        if (res == nil) return [];
+        let mat    = res.matrix;
+        let sz     = res.size;
+        let qz     = 4;
+        let full   = (sz + qz * 2) * sc;
+        let pixels = Array.Create(full * full);
+        iter (py from 0 to full-1) {
+            let my = int(py / sc) - qz;
+            iter (px from 0 to full-1) {
+                let mx   = int(px / sc) - qz;
+                var dark = false;
+                if (my >= 0 && my < sz && mx >= 0 && mx < sz) {
+                    dark = mat[my*sz+mx] == 1;
+                }
+                pixels[py*full+px] = dark ? 0xFF000000 : 0xFFFFFFFF;
+            }
+        }
+        return pixels;
+    }
+
+    // Pixel width/height of the ToPixels result.
+    fn static PixelSize(text: string, scale, ecLevel) : int {
+        let ec = (ecLevel == nil) ? 0 : int(ecLevel);
+        let sc = (scale   == nil) ? 4 : int(scale);
+        iter (v from 1 to 10) {
+            if (_VC[(v-1)*4*6 + ec*6] >= String.Length(text) + 4) {
+                return (4*v + 17 + 8) * sc;
+            }
+        }
+        return -1;
+    }
+
+    // SVG string - uses horizontal run-length encoding for compact output.
+    // darkColor / lightColor default to "#000" / "#fff".
+    fn static ToSVG(text: string, scale, ecLevel, fast, darkColor, lightColor) : string {
+        let ec   = (ecLevel    == nil) ? 0     : int(ecLevel);
+        let sc   = (scale      == nil) ? 4     : int(scale);
+        let fst  = (fast       == true);
+        let dark = (darkColor  == nil) ? "#000" : str(darkColor);
+        let lite = (lightColor == nil) ? "#fff" : str(lightColor);
+        let q    = new QRCode();
+        let res  = q._encode(text, ec, fst);
+        if (res == nil) return "";
+        let mat  = res.matrix;
+        let sz   = res.size;
+        let qz   = 4;
+        let full = (sz + qz * 2) * sc;
+        let fs   = str(full);
+
+        var parts = [];
+        parts = Array.Append(parts, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + fs + "\" height=\"" + fs + "\" viewBox=\"0 0 " + fs + " " + fs + "\">");
+        parts = Array.Append(parts, "<rect width=\"" + fs + "\" height=\"" + fs + "\" fill=\"" + lite + "\"/>");
+        parts = Array.Append(parts, "<g fill=\"" + dark + "\">");
+
+        iter (row from 0 to sz - 1) {
+            var runStart = -1;
+            iter (col from 0 to sz - 1) {
+                let isDark = mat[row * sz + col] == 1;
+                if (isDark && runStart < 0) {
+                    runStart = col;
+                } else if (!isDark && runStart >= 0) {
+                    let rx = (runStart + qz) * sc;
+                    let ry = (row + qz) * sc;
+                    let rw = (col - runStart) * sc;
+                    parts = Array.Append(parts, "<rect x=\"" + str(rx) + "\" y=\"" + str(ry) + "\" width=\"" + str(rw) + "\" height=\"" + str(sc) + "\"/>");
+                    runStart = -1;
+                }
+            }
+            if (runStart >= 0) {
+                let rx = (runStart + qz) * sc;
+                let ry = (row + qz) * sc;
+                let rw = (sz - runStart) * sc;
+                parts = Array.Append(parts, "<rect x=\"" + str(rx) + "\" y=\"" + str(ry) + "\" width=\"" + str(rw) + "\" height=\"" + str(sc) + "\"/>");
+            }
+        }
+
+        parts = Array.Append(parts, "</g></svg>");
+        return String.Join(parts, "\n");
+    }
+}
+
+export { QRCode };
+// EC level constants are class members: QRCode.QR_M, QRCode.QR_L, QRCode.QR_H, QRCode.QR_Q

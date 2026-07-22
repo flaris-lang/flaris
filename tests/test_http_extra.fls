@@ -1,0 +1,222 @@
+// test_http_extra.fls
+// Offline tests for the Http helpers that do NOT need a network: CookieJar,
+// Multipart form builder, and Http.Retry. (test_http.fls covers the live
+// request path against httpbin and is excluded from the automated suite.)
+//
+//   flarisvm ./tests/test_http_extra.fls --libs='./libs'
+
+import { Http, CookieJar, Multipart } from library("Http", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+// Retry test doubles - drive behaviour through a global call counter.
+global _calls = 0;
+
+fn _flaky() {
+    _calls += 1;
+    if (_calls < 3) return { status: 503, headers: {}, body: "" };
+    return { status: 200, headers: {}, body: "ok" };
+}
+
+fn _always500() {
+    _calls += 1;
+    return { status: 500, headers: {}, body: "" };
+}
+
+fn _ioError() {
+    _calls += 1;
+    return nil;   // transport failure
+}
+
+// ============================================================
+// CookieJar
+// ============================================================
+
+fn test_cookiejar() {
+    Console.WriteLine("-- CookieJar");
+
+    let jar = new CookieJar();
+    let resp = {
+        status: 200, headers: {}, body: "",
+        setCookies: [
+            "sid=abc123; Path=/; HttpOnly",
+            "theme=dark; Path=/; Max-Age=3600",
+            "token=x=y=z; Secure"            // value contains '='
+        ]
+    };
+    jar.StoreFromResponse(resp);
+
+    checkEq(jar.Count(), 3, "jar stores 3 cookies");
+    checkEq(jar.Get("sid"), "abc123", "sid value");
+    checkEq(jar.Get("theme"), "dark", "theme value");
+    checkEq(jar.Get("token"), "x=y=z", "value with '=' rejoined");
+    check(jar.Has("sid"), "Has(sid)");
+    check(!jar.Has("missing"), "!Has(missing)");
+    checkEq(jar.Get("missing"), nil, "Get(missing) is nil");
+
+    jar.Set("manual", "1");
+    let hdr = jar.CookieHeader();
+    check(String.Contains(hdr, "sid=abc123"), "header has sid");
+    check(String.Contains(hdr, "manual=1"), "header has manual");
+    check(String.Contains(hdr, "; "), "header joined with '; '");
+
+    jar.Remove("theme");
+    check(!jar.Has("theme"), "Remove drops theme");
+    checkEq(jar.Count(), 3, "count after remove (sid, token, manual)");
+
+    let applied = jar.ApplyTo({ "X-Test": "1" });
+    checkEq(applied["X-Test"], "1", "ApplyTo preserves existing headers");
+    check(Object.HasKey(applied, "Cookie"), "ApplyTo adds Cookie header");
+
+    // Fallback path: folded single set-cookie header (no setCookies array).
+    let jar2 = new CookieJar();
+    jar2.StoreFromResponse({ status: 200, headers: { "set-cookie": "only=1; Path=/" }, body: "" });
+    checkEq(jar2.Get("only"), "1", "fallback to headers['set-cookie']");
+
+    jar.Clear();
+    checkEq(jar.Count(), 0, "Clear empties the jar");
+
+    // nil / malformed inputs are ignored, not fatal.
+    jar.StoreFromResponse(nil);
+    jar.ParseSetCookie(nil);
+    jar.ParseSetCookie("no-equals-sign");
+    checkEq(jar.Count(), 0, "malformed inputs ignored");
+}
+
+// ============================================================
+// Multipart
+// ============================================================
+
+fn test_multipart() {
+    Console.WriteLine("-- Multipart");
+
+    let form = new Multipart();
+    form.Field("title", "Hello World")
+        .File("doc", "notes.txt", "file body line", "text/plain");
+
+    let ct = form.ContentTypeHeader();
+    check(String.StartsWith(ct, "multipart/form-data; boundary="), "content-type header");
+    check(String.Contains(ct, form.Boundary()), "content-type carries boundary");
+
+    let body = form.Body();
+    check(String.Contains(body, "Content-Disposition: form-data; name=\"title\""), "field disposition");
+    check(String.Contains(body, "Hello World"), "field value present");
+    check(String.Contains(body, "name=\"doc\"; filename=\"notes.txt\""), "file disposition");
+    check(String.Contains(body, "Content-Type: text/plain"), "file content-type");
+    check(String.Contains(body, "file body line"), "file body present");
+    check(String.Contains(body, "--" + form.Boundary() + "--"), "closing boundary");
+
+    // default file content-type
+    let f2 = new Multipart();
+    f2.File("blob", "data.bin", "xyz", nil);
+    check(String.Contains(f2.Body(), "Content-Type: application/octet-stream"), "default file content-type");
+
+    // sanitisation: CR/LF and quotes in a field name must not break the part.
+    let f3 = new Multipart();
+    f3.Field("evil\r\nX-Injected: 1", "v");
+    let b3 = f3.Body();
+    check(!String.Contains(b3, "\r\nX-Injected: 1\r\n"), "CRLF stripped from field name");
+    check(!String.Contains(f3.Body(), "name=\"a\"b"), "quotes escaped (no raw quote in name)");
+}
+
+// ============================================================
+// Http.Retry
+// ============================================================
+
+fn test_retry() {
+    Console.WriteLine("-- Http.Retry");
+
+    _calls = 0;
+    let r = Http.Retry(fn() { return _flaky(); }, { attempts: 5, delayMs: 1 });
+    checkEq(r.status, 200, "retry eventually succeeds");
+    checkEq(_calls, 3, "retry stopped on first success");
+
+    _calls = 0;
+    let r2 = Http.Retry(fn() { return _always500(); }, { attempts: 3, delayMs: 1 });
+    checkEq(r2.status, 500, "retry returns last response when exhausted");
+    checkEq(_calls, 3, "retry honoured attempt count");
+
+    _calls = 0;
+    let r3 = Http.Retry(fn() { return _ioError(); }, { attempts: 2, delayMs: 1 });
+    checkEq(r3, nil, "nil response after exhausting retries on I/O error");
+    checkEq(_calls, 2, "I/O error retried up to attempts");
+
+    // custom retryOn: treat 404 as retryable, succeed on 2nd try
+    _calls = 0;
+    let r4 = Http.Retry(
+        fn() { _calls += 1; if (_calls < 2) return { status: 404, headers: {}, body: "" };
+               return { status: 200, headers: {}, body: "" }; },
+        { attempts: 4, delayMs: 1, retryOn: fn(resp) { return resp != nil and resp.status == 404; } });
+    checkEq(r4.status, 200, "custom retryOn drives retries");
+    checkEq(_calls, 2, "custom retryOn stopped at success");
+
+    // a 2xx is not retried by default
+    _calls = 0;
+    let r5 = Http.Retry(fn() { _calls += 1; return { status: 200, headers: {}, body: "" }; },
+                        { attempts: 3, delayMs: 1 });
+    checkEq(_calls, 1, "successful response not retried");
+}
+
+// ============================================================
+// Benchmarks
+// ============================================================
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Http helper benchmarks ===");
+
+    let iters = 5000;
+
+    let t0 = Time.Ticks();
+    iter (i from 0 to iters - 1) {
+        let jar = new CookieJar();
+        jar.StoreFromResponse({ status: 200, headers: {}, body: "",
+                                setCookies: ["a=1; Path=/", "b=2; Path=/", "c=3"] });
+        let _h = jar.CookieHeader();
+    }
+    Console.WriteLine("CookieJar store+header (", iters, " iters): ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    let t1 = Time.Ticks();
+    iter (i from 0 to iters - 1) {
+        let form = new Multipart();
+        form.Field("a", "1").Field("b", "2").File("f", "x.txt", "hello", "text/plain");
+        let _b = form.Body();
+    }
+    Console.WriteLine("Multipart build (", iters, " iters):       ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t1)]), " ms");
+
+    Console.WriteLine("=== benchmarks done ===");
+}
+
+fn Main() {
+    Console.WriteLine("=== Http extra (offline) test suite ===");
+
+    test_cookiejar();
+    test_multipart();
+    test_retry();
+    test_benchmarks();
+
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    if (testsFailed == 0) {
+        Console.WriteLine("✅ All Http extra tests passed!");
+    } else {
+        Console.WriteLine("❌ Some Http extra tests failed");
+    }
+}

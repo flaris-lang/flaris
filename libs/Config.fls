@@ -1,0 +1,1044 @@
+// Config.fls - TOML and YAML configuration file parser for Flaris.
+// Version: 1.0
+//
+// Parses TOML (primary) and a YAML subset. Supports: string, int, float, bool,
+// array, inline table, [sections], [[array of tables]], dotted keys,
+// multi-line strings, hex/octal/binary integer literals.
+//
+// Usage:
+//   import { Config } from library("Config", "1.0");
+//
+//   let c = new Config();
+//   c.LoadFile("app.toml");
+//
+//   let host = c.GetString("database.host", "localhost");
+//   let port  = c.GetInt("database.port", 5432);
+//   let debug = c.GetBool("app.debug", false);
+//   c.Set("app.version", "2.0");
+//   c.Save("app.toml");
+//
+// Loading:
+//   Load(text)           - parse TOML string; returns this
+//   LoadFile(path)       - read and parse TOML file; returns this
+//   LoadYaml(text)       - parse YAML string; returns this
+//   LoadYamlFile(path)   - read and parse YAML file; returns this
+//   LoadEnv(text, interpolate?)     - parse dotenv text (KEY=VALUE); returns this
+//   LoadEnvFile(path, interpolate?) - read and parse a .env file; returns this
+//       - supports: comments (#), `export KEY=...`, "double"/'single' quotes,
+//         inline comments. Interpolation (default on) expands ${VAR},
+//         ${VAR:-default} and $VAR against earlier keys + the OS environment;
+//         single-quoted values are literal. "\$" is a literal dollar sign.
+//   Interpolate(extraVars?)         - expand ${VAR}/$VAR in all top-level string
+//                                     values (config keys, then extraVars, then env)
+//   static FromObject(obj)  →  Config instance from a plain object
+//
+// Reading (keys support dot notation: "section.key"):
+//   Get(key)                          →  any or nil
+//   GetString(key, default?)          →  string
+//   GetInt(key, default?)             →  int
+//   GetFloat(key, default?)           →  float
+//   GetBool(key, default?)            →  bool
+//   GetArray(key)                     →  array (or [] if missing)
+//   Has(key)                          →  bool
+//   Sections()                        →  array of top-level section names
+//   GetSection(name)                  →  object with all keys in section
+//   Keys(section?)                    →  array of key names (in section, or all top-level)
+//
+// Writing:
+//   Set(key, value)                   - set or update a value; returns this
+//   Remove(key)                       →  bool
+//   Merge(other:Config)               - copy all keys from other; returns this
+//   Defaults(obj)                     - set keys only if not already present; returns this
+//
+// Serialization:
+//   ToString()                        →  TOML string representation
+//   Save(path)                        - write TOML to file; returns this
+
+class Config {
+    let p = nil; 
+    let _data: object = nil; 
+
+    fn Constructor() {
+        this._data = {};
+    }
+
+    // =========================================================================
+    // Cursor - lightweight position object over a source string
+    // =========================================================================
+
+    fn static _cNew(src:string) {
+        return { s: src, p: 0, n: String.Length(src) };
+    }
+
+    fn static _cCh(c): string {
+        if (c.p >= c.n) return "";
+        return String.Substr(c.s, c.p, 1);
+    }
+
+    fn static _cAhead(c, k:int): string {
+        if (c.p >= c.n) return "";
+        if (c.p + k > c.n) {
+            let rem = c.n - c.p;
+            if (rem <= 0) return "";
+            return String.Substr(c.s, c.p, rem);
+        }
+        return String.Substr(c.s, c.p, k);
+    }
+
+    fn static _cAdv(c): string {
+        if (c.p >= c.n) return "";
+        let ch = String.Substr(c.s, c.p, 1);
+        c.p += 1;
+        return ch;
+    }
+
+    fn static _cSkipIws(c) {
+        while (c.p < c.n) {
+            let ch = Config._cCh(c);
+            if (ch == " " || ch == "\t") c.p += 1;
+            else break;
+        }
+    }
+
+    fn static _cSkipWs(c) {
+        while (c.p < c.n) {
+            let ch = Config._cCh(c);
+            if (ch == " " || ch == "\t" || ch == "\n" || ch == "\r") {
+                c.p += 1;
+            } else if (ch == "#") {
+                while (c.p < c.n && Config._cCh(c) != "\n") c.p += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // =========================================================================
+    // Escape helper
+    // =========================================================================
+
+    fn static _escChar(ch:string): string {
+        if (ch == "n")  return "\n";
+        if (ch == "t")  return "\t";
+        if (ch == "r")  return "\r";
+        if (ch == "\\") return "\\";
+        if (ch == "\"") return "\"";
+        if (ch == "b")  return "\b";
+        if (ch == "f")  return "\f";
+        return ch;
+    }
+
+    // =========================================================================
+    // String parsers
+    // =========================================================================
+
+    fn static _parseBasicStr(c): string {
+        c.p += 1;
+        var s = "";
+        while (c.p < c.n) {
+            let ch = Config._cAdv(c);
+            if (ch == "\"") return s;
+            if (ch == "\\") s += Config._escChar(Config._cAdv(c));
+            else             s += ch;
+        }
+        return s;
+    }
+
+    fn static _parseMlBasicStr(c): string {
+        c.p += 3;
+        if (Config._cAhead(c, 2) == "\r\n") c.p += 2;
+        else if (Config._cCh(c) == "\n")    c.p += 1;
+        var s = "";
+        while (c.p < c.n) {
+            if (Config._cAhead(c, 3) == "\"\"\"") { c.p += 3; return s; }
+            let ch = Config._cAdv(c);
+            if (ch == "\\") {
+                let nxt = Config._cCh(c);
+                if (nxt == "\n" || nxt == "\r" || nxt == " " || nxt == "\t") {
+                    while (c.p < c.n) {
+                        let w = Config._cCh(c);
+                        if (w == " " || w == "\t" || w == "\n" || w == "\r") c.p += 1;
+                        else break;
+                    }
+                } else {
+                    s += Config._escChar(Config._cAdv(c));
+                }
+            } else {
+                s += ch;
+            }
+        }
+        return s;
+    }
+
+    fn static _parseLiteralStr(c): string {
+        c.p += 1;
+        var s = "";
+        while (c.p < c.n) {
+            let ch = Config._cAdv(c);
+            if (ch == "'") return s;
+            s += ch;
+        }
+        return s;
+    }
+
+    fn static _parseMlLiteralStr(c): string {
+        c.p += 3;
+        if (Config._cAhead(c, 2) == "\r\n") c.p += 2;
+        else if (Config._cCh(c) == "\n")    c.p += 1;
+        var s = "";
+        while (c.p < c.n) {
+            if (Config._cAhead(c, 3) == "'''") { c.p += 3; return s; }
+            s += Config._cAdv(c);
+        }
+        return s;
+    }
+
+    // =========================================================================
+    // Number parser
+    // =========================================================================
+
+    fn static _parseNumber(c) {
+        var s = "";
+        let sign = Config._cCh(c);
+        if (sign == "+" || sign == "-") s += Config._cAdv(c);
+
+        let a3 = Config._cAhead(c, 3);
+        if (a3 == "inf") {
+            c.p += 3;
+            if (s == "-") return -Math.Infinity;
+            return Math.Infinity;
+        }
+        if (a3 == "nan") { c.p += 3; return Math.NaN; }
+
+        let a2 = Config._cAhead(c, 2);
+        if (a2 == "0x" || a2 == "0o" || a2 == "0b") {
+            var digits = a2;
+            c.p += 2;
+            while (c.p < c.n) {
+                let d = Config._cCh(c);
+                if (d == "_") { c.p += 1; continue; }
+                if ((d >= "0" && d <= "9") || (d >= "a" && d <= "f") || (d >= "A" && d <= "F")) {
+                    digits += Config._cAdv(c);
+                } else break;
+            }
+            return Convert.ParseInt(digits);
+        }
+
+        var isFloat = false;
+        while (c.p < c.n) {
+            let d = Config._cCh(c);
+            if (d >= "0" && d <= "9") {
+                s += Config._cAdv(c);
+            } else if (d == "_") {
+                c.p += 1;
+            } else if (d == "." || d == "e" || d == "E") {
+                isFloat = true;
+                s += Config._cAdv(c);
+            } else if ((d == "+" || d == "-") &&
+                       (String.EndsWith(s, "e") || String.EndsWith(s, "E"))) {
+                s += Config._cAdv(c);
+            } else {
+                break;
+            }
+        }
+
+        if (isFloat) return Convert.ParseFloat(s);
+        return Convert.ParseInt(s);
+    }
+
+    // =========================================================================
+    // Key parsers
+    // =========================================================================
+
+    fn static _parseBareKey(c): string {
+        var k = "";
+        while (c.p < c.n) {
+            let ch = Config._cCh(c);
+            if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") ||
+                (ch >= "0" && ch <= "9") || ch == "-" || ch == "_") {
+                k += Config._cAdv(c);
+            } else break;
+        }
+        return k;
+    }
+
+    fn static _parseSimpleKey(c): string {
+        if (Config._cAhead(c, 3) == "\"\"\"") return Config._parseMlBasicStr(c);
+        let ch = Config._cCh(c);
+        if (ch == "\"") return Config._parseBasicStr(c);
+        if (ch == "'")  return Config._parseLiteralStr(c);
+        return Config._parseBareKey(c);
+    }
+
+    fn static _parseKeyParts(c) {
+        var parts = [];
+        while (true) {
+            Config._cSkipIws(c);
+
+            let k = Config._parseSimpleKey(c);
+            Array.Append(parts, k);
+            Config._cSkipIws(c);
+            if (Config._cCh(c) == ".") c.p += 1;
+            else break;
+        }
+        return parts;
+    }
+
+
+    // =========================================================================
+    // Object path helpers
+    // =========================================================================
+
+    fn static _setDotted(obj, parts, value) {
+        var o   = obj;
+        var n   = len(parts);
+        var idx = 0;
+        foreach (p in parts) {
+            if (idx == n - 1) {
+                o[p] = value;
+            } else {
+                if (o[p] == nil || !is_object(o[p])) o[p] = {};
+                o = o[p];
+            }
+            idx += 1;
+        }
+    }
+
+    fn static _ensurePath(root, parts) {
+        var o = root;
+        foreach (p in parts) {
+            if (o[p] == nil || !is_object(o[p])) o[p] = {};
+            o = o[p];
+        }
+        return o;
+    }
+
+    // =========================================================================
+    // Value parser - recursive
+    // =========================================================================
+
+    fn static _parseArray(c) {
+        c.p += 1;
+        var arr = [];
+        while (c.p < c.n) {
+            Config._cSkipWs(c);
+            let ch = Config._cCh(c);
+            if (ch == "]") { c.p += 1; return arr; }
+            if (ch == ",") { c.p += 1; continue; }
+            let val = Config._parseValue(c);
+            Array.Append(arr, val);
+        }
+        return arr;
+    }
+
+    fn static _parseInlineTable(c) {
+        c.p += 1;
+        var obj = {};
+        while (c.p < c.n) {
+            Config._cSkipIws(c);
+            let ch = Config._cCh(c);
+            if (ch == "}") { c.p += 1; return obj; }
+            if (ch == ",") { c.p += 1; continue; }
+            let parts = Config._parseKeyParts(c);
+            Config._cSkipIws(c);
+            if (Config._cCh(c) == "=") c.p += 1;
+            Config._cSkipIws(c);
+            let val = Config._parseValue(c);
+            Config._setDotted(obj, parts, val);
+        }
+        return obj;
+    }
+
+    fn static _parseValue(c) {
+        Config._cSkipIws(c);
+        let a3 = Config._cAhead(c, 3);
+        if (a3 == "\"\"\"") return Config._parseMlBasicStr(c);
+        if (a3 == "'''")    return Config._parseMlLiteralStr(c);
+        let ch = Config._cCh(c);
+        if (ch == "\"")     return Config._parseBasicStr(c);
+        if (ch == "'")      return Config._parseLiteralStr(c);
+        if (ch == "[")      return Config._parseArray(c);
+        if (ch == "{")      return Config._parseInlineTable(c);
+        if (Config._cAhead(c, 4) == "true")  { c.p += 4; return true; }
+        if (Config._cAhead(c, 5) == "false") { c.p += 5; return false; }
+        return Config._parseNumber(c);
+    }
+
+    // =========================================================================
+    // Document parser
+    // =========================================================================
+
+    fn static _parseToml(text:string) {
+        var data    = {};
+        var current = data;
+        let c = Config._cNew(text);
+
+        while (c.p < c.n) {
+            Config._cSkipWs(c);
+            if (c.p >= c.n) break;
+            let ch = Config._cCh(c);
+
+            if (Config._cAhead(c, 2) == "[[") {
+                c.p += 2;
+                var name = "";
+                while (c.p < c.n && Config._cAhead(c, 2) != "]]") name += Config._cAdv(c);
+                c.p += 2;
+                let parts  = String.Split(String.Trim(name), ".");
+                var parent = data;
+                var pidx   = 0;
+                var plen   = len(parts);
+                foreach (pseg in parts) {
+                    if (pidx < plen - 1) {
+                        if (parent[pseg] == nil) parent[pseg] = {};
+                        parent = parent[pseg];
+                    }
+                    pidx += 1;
+                }
+                let last = parts[len(parts) - 1];
+                if (!is_array(parent[last])) parent[last] = [];
+                var tbl = {};
+                Array.Append(parent[last], tbl);
+                current = tbl;
+                continue;
+            }
+
+            if (ch == "[") {
+                c.p += 1;
+                var name = "";
+                while (c.p < c.n && Config._cCh(c) != "]") name += Config._cAdv(c);
+                c.p += 1;
+                current = Config._ensurePath(data, String.Split(String.Trim(name), "."));
+                continue;
+            }
+
+            let keyParts = Config._parseKeyParts(c);
+            Config._cSkipIws(c);
+            if (Config._cCh(c) != "=") {
+                while (c.p < c.n && Config._cCh(c) != "\n") c.p += 1;
+                continue;
+            }
+            c.p += 1;
+            Config._setDotted(current, keyParts, Config._parseValue(c));
+            Config._cSkipIws(c);
+            if (Config._cCh(c) == "#") while (c.p < c.n && Config._cCh(c) != "\n") c.p += 1;
+        }
+        return data;
+    }
+
+    // =========================================================================
+    // Serializer
+    // =========================================================================
+
+    fn static _escapeStr(v:string): string {
+        let s  = String.Replace(v,  "\\", "\\\\");
+        let s2 = String.Replace(s,  "\"", "\\\"");
+        let s3 = String.Replace(s2, "\n", "\\n");
+        let s4 = String.Replace(s3, "\t", "\\t");
+        let s5 = String.Replace(s4, "\r", "\\r");
+        return "\"" + s5 + "\"";
+    }
+
+    fn static _scalar(v): string {
+        if (v == nil)               return "\"\"";
+        if (type(v) == Type.Bool)   return v ? "true" : "false";
+        if (type(v) == Type.Int)    return str(v);
+        if (type(v) == Type.Float)  return str(v);
+        if (type(v) == Type.String) return Config._escapeStr(v);
+        return "\"\"";
+    }
+
+    fn static _isAoT(v): bool {
+        if (!is_array(v) || len(v) == 0) return false;
+        return is_object(v[0]);
+    }
+
+    fn static _serializeSection(obj, prefix:string): string {
+        var out = "";
+        // Pass 1: scalars and plain arrays in this object
+        foreach (entry in Object.Entries(obj)) {
+            let k = entry[0];
+            let v = entry[1];
+            if (v == nil || is_object(v) || Config._isAoT(v)) continue;
+            if (is_array(v)) {
+                var parts = [];
+                foreach (item in v) Array.Append(parts, Config._scalar(item));
+                out += k + " = [" + String.Join(parts, ", ") + "]\n";
+            } else {
+                out += k + " = " + Config._scalar(v) + "\n";
+            }
+        }
+        // Pass 2: subsections and array-of-tables
+        foreach (entry in Object.Entries(obj)) {
+            let k = entry[0];
+            let v = entry[1];
+            if (v == nil) continue;
+            let fp = prefix == "" ? k : prefix + "." + k;
+            if (is_object(v)) {
+                out += "\n[" + fp + "]\n";
+                out += Config._serializeSection(v, fp);
+            } else if (Config._isAoT(v)) {
+                foreach (item in v) {
+                    out += "\n[[" + fp + "]]\n";
+                    out += Config._serializeSection(item, "");
+                }
+            }
+        }
+        return out;
+    }
+
+    // =========================================================================
+    // YAML parsing
+    // Supports: scalars, block mappings/sequences, inline flow ({}/[]),
+    //           quoted strings, multiline literal (|) and folded (>) blocks,
+    //           booleans, null, numbers, inline comments.
+    // Not supported: anchors/aliases, multiple documents, complex tags.
+    // =========================================================================
+
+    fn static _yScalar(v:string) {
+        let s = String.Trim(v);
+        if (s == "" || s == "null" || s == "~") { return nil; }
+        if (s == "true"  || s == "yes" || s == "on")  { return true; }
+        if (s == "false" || s == "no"  || s == "off") { return false; }
+        let n = String.Length(s);
+        if (n >= 2) {
+            let f = String.Substr(s, 0, 1);
+            let l = String.Substr(s, n - 1, 1);
+            if ((f == "\"" && l == "\"") || (f == "'" && l == "'")) {
+                return String.Substr(s, 1, n - 2);
+            }
+        }
+        let iv = Convert.TryParseInt(s);
+        if (iv != nil) { return iv; }
+        let fv = Convert.TryParseFloat(s);
+        if (fv != nil) { return fv; }
+        return s;
+    }
+
+    fn static _yIndent(line:string):int {
+        let n = 0;
+        let m = String.Length(line);
+        while (n < m && String.Substr(line, n, 1) == " ") { n += 1; }
+        return n;
+    }
+
+    fn static _yStripComment(s:string):string {
+        let dq = false; let sq = false;
+        let n = String.Length(s); let i = 0;
+        while (i < n) {
+            let ch = String.Substr(s, i, 1);
+            if      (ch == "\"" && !sq) { dq = !dq; }
+            else if (ch == "'"  && !dq) { sq = !sq; }
+            else if (ch == "#"  && !dq && !sq) { return String.Substr(s, 0, i); }
+            i += 1;
+        }
+        return s;
+    }
+
+    fn static _yFindColon(s:string):int {
+        let dq = false; let sq = false;
+        let n = String.Length(s); let i = 0;
+        while (i < n) {
+            let ch = String.Substr(s, i, 1);
+            if      (ch == "\"" && !sq) { dq = !dq; }
+            else if (ch == "'"  && !dq) { sq = !sq; }
+            else if (ch == ":"  && !dq && !sq) {
+                if (i + 1 >= n || String.Substr(s, i + 1, 1) == " ") { return i; }
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    fn static _yFlow(s:string, pos:int, end_ch:string) {
+        let n = String.Length(s);
+        let is_arr = (end_ch == "]");
+        let result = is_arr ? [] : {};
+        let cur_key = nil; let cur_val = "";
+        let dq = false; let sq = false;
+        while (pos < n) {
+            let ch = String.Substr(s, pos, 1); pos += 1;
+            if (dq) { cur_val += ch; if (ch == "\"") { dq = false; } continue; }
+            if (sq) { cur_val += ch; if (ch == "'")  { sq = false; } continue; }
+            if (ch == "\"") { dq = true;  cur_val += ch; continue; }
+            if (ch == "'")  { sq = true;  cur_val += ch; continue; }
+            if (ch == "[") {
+                let r = Config._yFlow(s, pos, "]"); pos = r.end;
+                if (is_arr) { Array.Append(result, r.val); }
+                else if (cur_key != nil) { result[cur_key] = r.val; cur_key = nil; }
+                continue;
+            }
+            if (ch == "{") {
+                let r = Config._yFlow(s, pos, "}"); pos = r.end;
+                if (is_arr) { Array.Append(result, r.val); }
+                else if (cur_key != nil) { result[cur_key] = r.val; cur_key = nil; }
+                continue;
+            }
+            if (ch == end_ch) {
+                let v = String.Trim(cur_val);
+                if (is_arr) { if (v != "") { Array.Append(result, Config._yScalar(v)); } }
+                else if (cur_key != nil) { result[cur_key] = Config._yScalar(v); }
+                return { val: result, end: pos };
+            }
+            if (ch == ",") {
+                let v = String.Trim(cur_val);
+                if (is_arr) { if (v != "") { Array.Append(result, Config._yScalar(v)); } }
+                else if (cur_key != nil) { result[cur_key] = Config._yScalar(v); cur_key = nil; }
+                cur_val = ""; continue;
+            }
+            if (!is_arr && ch == ":") {
+                if (pos < n && String.Substr(s, pos, 1) == " ") { pos += 1; }
+                cur_key = String.Trim(cur_val); cur_val = ""; continue;
+            }
+            cur_val += ch;
+        }
+        return { val: result, end: pos };
+    }
+
+    fn static _parseYaml(src:string) {
+        let lines = String.SplitLines(src);
+        let nlines = len(lines);
+        let root = {};
+        // Stack frame: {indent, obj, stype, pending, pind}
+        //   indent:  min indent of items in this container (-1 = root)
+        //   stype:   "map" or "seq"
+        //   pending: pending map key seen as "key:" with no inline value
+        //   pind:    indent of the pending key line (-1 = none)
+        let stack = [{indent: -1, obj: root, stype: "map", pending: nil, pind: -1}];
+        let i = 0;
+        while (i < nlines) {
+            let line = lines[i]; i += 1;
+            let ind = Config._yIndent(line);
+            let s   = String.Trim(Config._yStripComment(line));
+            // Skip blanks, comments, and document markers
+            if (s != "" && s != "---" && s != "...") {
+                // Pop frames whose items live at a deeper indent than current line
+                while (len(stack) > 1 && stack[len(stack) - 1].indent > ind) {
+                    Array.RemoveAt(stack, len(stack) - 1);
+                }
+                var top = stack[len(stack) - 1];
+
+                // Resolve pending key: is this line the start of its value?
+                if (top.pending != nil) {
+                    if (ind > top.pind) {
+                        let is_seq = (String.StartsWith(s, "- ") || s == "-");
+                        let child  = is_seq ? [] : {};
+                        top.obj[top.pending] = child;
+                        top.pending = nil; top.pind = -1;
+                        let frame = {indent: ind, obj: child, stype: is_seq ? "seq" : "map", pending: nil, pind: -1};
+                        Array.Append(stack, frame);
+                        top = frame;
+                    } else {
+                        top.pending = nil; top.pind = -1;
+                    }
+                }
+
+                // ── Sequence item ─────────────────────────────────────────
+                if (top.stype == "seq" || String.StartsWith(s, "- ") || s == "-") {
+                    if (is_array(top.obj) && (String.StartsWith(s, "- ") || s == "-")) {
+                        let val_s = s == "-" ? "" : String.Trim(String.Substr(s, 2, String.Length(s) - 2));
+                        if (val_s == "") {
+                            let child = {};
+                            Array.Append(top.obj, child);
+                            Array.Append(stack, {indent: ind + 2, obj: child, stype: "map", pending: nil, pind: -1});
+                        } else if (String.StartsWith(val_s, "[")) {
+                            let r = Config._yFlow(val_s, 1, "]"); Array.Append(top.obj, r.val);
+                        } else if (String.StartsWith(val_s, "{")) {
+                            let r = Config._yFlow(val_s, 1, "}"); Array.Append(top.obj, r.val);
+                        } else {
+                            let ci = Config._yFindColon(val_s);
+                            if (ci >= 0) {
+                                let vlen = String.Length(val_s);
+                                let k = String.Trim(String.Substr(val_s, 0, ci));
+                                let v = ci + 2 <= vlen ? String.Trim(String.Substr(val_s, ci + 2, vlen - ci - 2)) : "";
+                                let child = {};
+                                if (v != "") { child[k] = Config._yScalar(v); }
+                                Array.Append(top.obj, child);
+                                Array.Append(stack, {indent: ind + 2, obj: child, stype: "map",
+                                                     pending: (v == "" ? k : nil), pind: (v == "" ? ind : -1)});
+                            } else {
+                                Array.Append(top.obj, Config._yScalar(val_s));
+                            }
+                        }
+                    }
+                } else {
+                    // ── Mapping entry ─────────────────────────────────────
+                    let ci = Config._yFindColon(s);
+                    if (ci >= 0) {
+                        let slen  = String.Length(s);
+                        let key   = String.Trim(String.Substr(s, 0, ci));
+                        let val_s = ci + 2 <= slen ? String.Trim(String.Substr(s, ci + 2, slen - ci - 2)) : "";
+
+                        if (val_s == "") {
+                            top.obj[key] = nil;
+                            top.pending = key; top.pind = ind;
+                        } else if (val_s == "|" || val_s == ">") {
+                            let is_lit = (val_s == "|");
+                            let ml = []; let base = -1;
+                            while (i < nlines) {
+                                let nl = lines[i];
+                                let ni = Config._yIndent(nl);
+                                let ns = String.Trim(nl);
+                                if (ns == "") {
+                                    Array.Append(ml, ""); i += 1;
+                                } else if (base < 0) {
+                                    base = ni;
+                                    Array.Append(ml, String.Substr(nl, base, String.Length(nl) - base));
+                                    i += 1;
+                                } else if (ni >= base) {
+                                    Array.Append(ml, String.Substr(nl, base, String.Length(nl) - base));
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if (is_lit) {
+                                top.obj[key] = String.Join(ml, "\n");
+                            } else {
+                                var folded = "";
+                                foreach (ml_line in ml) {
+                                    if (ml_line == "") { folded += "\n"; }
+                                    else if (folded == "" || String.EndsWith(folded, "\n")) { folded += ml_line; }
+                                    else { folded += " " + ml_line; }
+                                }
+                                top.obj[key] = folded;
+                            }
+                        } else if (String.StartsWith(val_s, "[")) {
+                            let r = Config._yFlow(val_s, 1, "]"); top.obj[key] = r.val;
+                        } else if (String.StartsWith(val_s, "{")) {
+                            let r = Config._yFlow(val_s, 1, "}"); top.obj[key] = r.val;
+                        } else {
+                            top.obj[key] = Config._yScalar(val_s);
+                        }
+                    }
+                }
+            }
+        }
+        return root;
+    }
+
+    // =========================================================================
+    // Public API - loading
+    // =========================================================================
+
+    // =========================================================================
+    // .env (dotenv) loading and ${VAR} interpolation
+    // =========================================================================
+
+    fn static _isIdentStart(c:string): bool {
+        if (c == "") return false;
+        return String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", c);
+    }
+
+    fn static _isIdentChar(c:string): bool {
+        if (c == "") return false;
+        return String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", c);
+    }
+
+    // Resolve a variable name: already-loaded data, then caller extras, then OS
+    // environment. Returns nil if undefined anywhere.
+    fn static _lookupVar(name:string, dataObj, extraVars) {
+        if (dataObj != nil && Object.HasKey(dataObj, name))   { return dataObj[name]; }
+        if (extraVars != nil && Object.HasKey(extraVars, name)) { return extraVars[name]; }
+        return Os.Getenv(name);
+    }
+
+    // Expand ${VAR}, ${VAR:-default} and $VAR references in a string. "\$" is a
+    // literal dollar sign. Undefined variables become "" (or their default).
+    fn static _expandVars(s:string, dataObj, extraVars): string {
+        var out:string = "";
+        var i:int      = 0;
+        let n:int      = String.Length(s);
+        while (i < n) {
+            let ch = String.Substr(s, i, 1);
+            let nx = (i + 1 < n) ? String.Substr(s, i + 1, 1) : "";
+            if (ch == "\\" && nx == "$") {
+                out = out + "$";
+                i = i + 2;
+            } else if (ch == "$" && nx == "{") {
+                let close = String.IndexOfFrom(s, "}", i + 2);
+                if (close < 0) {
+                    out = out + ch;
+                    i = i + 1;
+                } else {
+                    let inner = String.Substr(s, i + 2, close - (i + 2));
+                    var name = inner;
+                    var def  = nil;
+                    let dd = String.IndexOf(inner, ":-");
+                    if (dd >= 0) {
+                        name = String.Substr(inner, 0, dd);
+                        def  = String.Substr(inner, dd + 2, String.Length(inner) - (dd + 2));
+                    }
+                    var val = Config._lookupVar(name, dataObj, extraVars);
+                    if (val == nil) { val = (def != nil) ? def : ""; }
+                    out = out + Convert.ToString(val);
+                    i = close + 1;
+                }
+            } else if (ch == "$" && Config._isIdentStart(nx)) {
+                var j:int    = i + 1;
+                var name:string = "";
+                while (j < n && Config._isIdentChar(String.Substr(s, j, 1))) {
+                    name = name + String.Substr(s, j, 1);
+                    j = j + 1;
+                }
+                let val = Config._lookupVar(name, dataObj, extraVars);
+                out = out + ((val == nil) ? "" : Convert.ToString(val));
+                i = j;
+            } else {
+                out = out + ch;
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+
+    // Unescape common sequences inside a double-quoted .env value.
+    fn static _envUnescape(s:string): string {
+        var r = String.Replace(s, "\\n", "\n");
+        r = String.Replace(r, "\\t", "\t");
+        r = String.Replace(r, "\\r", "\r");
+        r = String.Replace(r, "\\\"", "\"");
+        return r;
+    }
+
+    // Drop an inline " # comment" from an unquoted value.
+    fn static _stripInlineComment(s:string): string {
+        let idx = String.IndexOf(s, " #");
+        if (idx >= 0) { return String.Substr(s, 0, idx); }
+        return s;
+    }
+
+    // Parse dotenv text into a flat key->value object. Single-quoted values are
+    // taken literally; double-quoted and bare values are interpolated when
+    // `interpolate` is true (referencing earlier keys + OS env).
+    fn static _parseEnv(text:string, interpolate:bool): object {
+        let result = {};
+        let lines = String.Split(text, "\n");
+        foreach (rawLine in lines) {
+            var line = String.Trim(rawLine);
+            if (line != "" && !String.StartsWith(line, "#")) {
+                if (String.StartsWith(line, "export ")) {
+                    line = String.Trim(String.Substr(line, 7, String.Length(line) - 7));
+                }
+                let eq = String.IndexOf(line, "=");
+                if (eq > 0) {
+                    let key = String.Trim(String.Substr(line, 0, eq));
+                    let tv  = String.Trim(String.Substr(line, eq + 1, String.Length(line) - eq - 1));
+                    var val:string  = "";
+                    var doInterp    = interpolate;
+                    let tvLen = String.Length(tv);
+                    if (tvLen >= 2 && String.StartsWith(tv, "\"") && String.EndsWith(tv, "\"")) {
+                        val = Config._envUnescape(String.Substr(tv, 1, tvLen - 2));
+                    } else if (tvLen >= 2 && String.StartsWith(tv, "'") && String.EndsWith(tv, "'")) {
+                        val = String.Substr(tv, 1, tvLen - 2);
+                        doInterp = false;                       // literal, no interpolation
+                    } else {
+                        val = String.Trim(Config._stripInlineComment(tv));
+                    }
+                    if (doInterp) { val = Config._expandVars(val, result, nil); }
+                    if (key != "") { result[key] = val; }
+                }
+            }
+        }
+        return result;
+    }
+
+    // Load dotenv-format text. Keys are merged (flat) into the config. When
+    // `interpolate` is omitted or true, ${VAR}/$VAR references are expanded
+    // against earlier keys and the OS environment.
+    fn LoadEnv(text:string, interpolate?: bool): instance {
+        let interp = (interpolate == nil) ? true : interpolate;
+        let parsed = Config._parseEnv(text, interp);
+        foreach (v, k in parsed) { this._data[k] = v; }
+        return this;
+    }
+
+    fn LoadEnvFile(path:string, interpolate?: bool): instance {
+        return this.LoadEnv(File.ReadText(path), interpolate);
+    }
+
+    // Re-expand ${VAR}/$VAR references in all top-level string values, resolving
+    // against the config itself, optional extraVars, then the OS environment.
+    fn Interpolate(extraVars?): instance {
+        let keys = Object.Keys(this._data);
+        foreach (k in keys) {
+            let v = this._data[k];
+            if (Type.Is(v, Type.String)) {
+                this._data[k] = Config._expandVars(v, this._data, extraVars ?? nil);
+            }
+        }
+        return this;
+    }
+
+    fn Load(text:string): instance {
+        this._data = Config._parseToml(text);
+        return this;
+    }
+
+    fn LoadFile(path:string): instance {
+        return this.Load(File.ReadText(path));
+    }
+
+    fn LoadYaml(text:string): instance {
+        this._data = Config._parseYaml(text);
+        return this;
+    }
+
+    fn LoadYamlFile(path:string): instance {
+        return this.LoadYaml(File.ReadText(path));
+    }
+
+    // =========================================================================
+    // Public API - reading
+    //
+    // All typed getters take an explicit default_val.
+    // Pass nil if you want nil returned when key is missing.
+    // =========================================================================
+
+    fn Get(key:string) {
+        let parts = String.Split(key, ".");
+        var o = this._data;
+        foreach (p in parts) {
+            if (o == nil || !is_object(o)) return nil;
+            o = o[p];
+        }
+        return o;
+    }
+
+    fn GetString(key:string, default_val?) {
+        let v = this.Get(key);
+        if (v == nil) return default_val ?? nil;
+        return str(v);
+    }
+
+    fn GetInt(key:string, default_val?) {
+        let v = this.Get(key);
+        if (v == nil) return default_val ?? nil;
+        return Convert.ToInt(v);
+    }
+
+    fn GetFloat(key:string, default_val?) {
+        let v = this.Get(key);
+        if (v == nil) return default_val ?? nil;
+        return Convert.ToFloat(v);
+    }
+
+    fn GetBool(key:string, default_val?) {
+        let v = this.Get(key);
+        if (v == nil) return default_val ?? nil;
+        return v == true || v == 1;
+    }
+
+    fn GetArray(key:string): array {
+        let v = this.Get(key);
+        if (!is_array(v)) return [];
+        return v;
+    }
+
+    fn Has(key:string): bool {
+        return this.Get(key) != nil;
+    }
+
+    // =========================================================================
+    // Public API - writing
+    // =========================================================================
+
+    fn Set(key:string, value): instance {
+        Config._setDotted(this._data, String.Split(key, "."), value);
+        return this;
+    }
+
+    fn Remove(key:string): bool {
+        let parts = String.Split(key, ".");
+        var o   = this._data;
+        var n   = len(parts);
+        var idx = 0;
+        foreach (p in parts) {
+            if (idx == n - 1) break;
+            o = o[p];
+            if (o == nil) return false;
+            idx += 1;
+        }
+        let last = parts[n - 1];
+        if (!Object.HasKey(o, last)) return false;
+        Object.Delete(o, last);
+        return true;
+    }
+
+    // =========================================================================
+    // Public API - sections
+    // =========================================================================
+
+    fn Sections(): array {
+        var result = [];
+        foreach (entry in Object.Entries(this._data)) {
+            if (is_object(entry[1])) Array.Append(result, entry[0]);
+        }
+        return result;
+    }
+
+    fn GetSection(name:string): object {
+        let v = this.Get(name);
+        if (v == nil) return {};
+        return v;
+    }
+
+    // Keys in a section (or top-level if section is nil / "")
+    fn Keys(section:string|nil): array {
+        var obj = this._data;
+        if (section != nil && section != "") {
+            obj = this.GetSection(section);
+        }
+        var result = [];
+        foreach (entry in Object.Entries(obj)) {
+            Array.Append(result, entry[0]);
+        }
+        return result;
+    }
+
+    // Merge all keys from another Config into this one (other wins on conflict)
+    fn Merge(other:instance): instance {
+        foreach (entry in Object.Entries(other._data)) {
+            this._data[entry[0]] = entry[1];
+        }
+        return this;
+    }
+
+    // For each key in obj that is NOT already set in this._data, set it.
+    // Existing (non-nil) top-level keys are left untouched. Returns this.
+    fn Defaults(obj): instance {
+        foreach (entry in Object.Entries(obj)) {
+            let k = entry[0];
+            if (!Object.HasKey(this._data, k) || this._data[k] == nil) {
+                this._data[k] = entry[1];
+            }
+        }
+        return this;
+    }
+
+    // Create a Config instance wrapping an existing object.
+    fn static FromObject(obj): instance {
+        let c = new Config();
+        c._data = obj;
+        return c;
+    }
+
+    // =========================================================================
+    // Public API - serializing
+    // =========================================================================
+
+    fn ToString(): string {
+        var s = Config._serializeSection(this._data, "");
+        // trim any leading newline that appears when first key is a section
+        if (String.StartsWith(s, "\n")) {
+            s = String.Substr(s, 1, String.Length(s) - 1);
+        }
+        return s;
+    }
+
+    fn Save(path:string): instance {
+        File.WriteText(path, this.ToString());
+        return this;
+    }
+}
+
+export { Config };

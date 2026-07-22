@@ -1,0 +1,1030 @@
+// Http.fls - HTTP/1.1 client for Flaris.
+// Version: 1.0
+//
+// Plain HTTP over TCP. For HTTPS, import the Https library - it injects a
+// TLS byte-transport (built-in Tls module, OS TLS stack) into this same engine
+// (see Http.Request), so all HTTP/1.1 framing, chunked decoding, redirects,
+// and cookies are shared.
+// Http.Curl / Http.WGet remain available as curl(1)/wget(1) fallbacks.
+// All methods are static - no instance needed.
+//
+// Usage:
+//   import { Http, Status, ContentType } from library("Http", "1.0");
+//
+//   // Simple GET
+//   let res = Http.Get("http://api.example.com/data");
+//   if (res.status == Status.OK) {
+//       Console.WriteLine(res.body);
+//   }
+//
+//   // POST JSON
+//   let body = Json.Stringify({ name: "Alice", age: 30 });
+//   Http.Post("http://api.example.com/users", body, { "Authorization": "Bearer token" });
+//
+//   // Download file
+//   Http.WGet("http://example.com/file.zip", "local.zip");
+//
+//   // Async (fiber-based, non-blocking)
+//   let p1 = Http.GetAsync("http://a.com");
+//   let p2 = Http.GetAsync("http://b.com");
+//   let r1 = Fiber.Await(p1);
+//   let r2 = Fiber.Await(p2);
+//
+// Response object: { status:int, headers:object, body:string|block }
+// Returns nil on connection failure or unrecoverable I/O error.
+//
+// Synchronous methods (all return response object or nil):
+//   Http.Get(url, headers?)
+//   Http.Post(url, body, headers?)       - body: string sent as-is, or object/array
+//                                          auto-JSON-encoded; default Content-Type: JSON
+//   Http.Put(url, body, headers?)
+//   Http.Patch(url, body, headers?)
+//   Http.Query(url, body, headers?)      - safe/idempotent request WITH a body
+//                                          (HTTP QUERY method); default Content-Type: JSON
+//   Http.Delete(url, headers?)
+//   Http.Head(url, headers?)             - returns headers only, body is nil
+//   Http.Curl(url, options?)             - full-control request; options: { method, headers, body, timeout }
+//   Http.WGet(url, destPath?)            - download to file; returns block if destPath is nil
+//   Http.StreamPost(url, body, onLine, headers?) - NDJSON streaming POST; calls onLine(line) per JSON line received
+//
+// Async variants (fiber-based; call Fiber.Await() to get the result):
+//   Http.GetAsync(url, headers?)
+//   Http.PostAsync(url, body, headers?)
+//   Http.PutAsync(url, body, headers?)
+//   Http.PatchAsync(url, body, headers?)
+//   Http.QueryAsync(url, body, headers?)
+//   Http.DeleteAsync(url, headers?)
+//   Http.HeadAsync(url, headers?)
+//
+// Retry (with exponential backoff):
+//   Http.Retry(requestFn, opts?)  - requestFn: fn() → response; returns the last
+//       response. opts: { attempts:3, delayMs:200, backoff:2.0, retryOn:fn(resp)→bool }
+//       Default retryOn: nil response, status >= 500, or 429.
+//
+// CookieJar (carry cookies across requests):
+//   let jar = new CookieJar();
+//   jar.StoreFromResponse(resp)   - ingest Set-Cookie header(s) from a response
+//   jar.Set/Get/Has/Remove(name); jar.Clear(); jar.Names(); jar.Count()
+//   jar.CookieHeader()            →  "a=b; c=d"
+//   jar.ApplyTo(headers?)         →  headers object with Cookie merged in
+//   (response objects carry res.setCookies: array of raw Set-Cookie values)
+//
+// Multipart (multipart/form-data body builder):
+//   let form = new Multipart();
+//   form.Field(name, value).File(name, filename, content, contentType?);
+//   form.Body() →  string body;  form.ContentTypeHeader() →  Content-Type value
+//   Http.Post(url, form.Body(), { "Content-Type": form.ContentTypeHeader() });
+//
+// Constants:
+//   Status.OK(200)  Created(201)  NoContent(204)  BadRequest(400)
+//   Status.Unauthorized(401)  Forbidden(403)  NotFound(404)
+//   Status.InternalServerError(500)  BadGateway(502)  … and more
+//
+//   ContentType.JSON  ContentType.Form  ContentType.Text  ContentType.HTML
+//   ContentType.XML   ContentType.Multipart  ContentType.OctetStream
+
+// --------------------------------------------------------
+//  Status codes
+// --------------------------------------------------------
+
+global Status = {
+    OK:                 200,
+    Created:            201,
+    NoContent:          204,
+    BadRequest:         400,
+    Unauthorized:       401,
+    Forbidden:          403,
+    NotFound:           404,
+    Conflict:           409,
+    InternalError:      500,
+    NotImplemented:     501,
+    BadGateway:         502,
+    ServiceUnavailable: 503,
+};
+
+// --------------------------------------------------------
+//  Content-Type strings
+// --------------------------------------------------------
+
+global ContentType = {
+    JSON:          "application/json",
+    HTML:          "text/html",
+    Text:          "text/plain",
+    FormEncoded:   "application/x-www-form-urlencoded",
+    MultipartForm: "multipart/form-data",
+    XML:           "application/xml",
+    Binary:        "application/octet-stream",
+    Javascript:    "application/javascript",
+    CSV:           "text/csv",
+};
+
+// --------------------------------------------------------
+//  Pluggable transport
+// --------------------------------------------------------
+// A "transport" is an object of closures over an opaque connection handle. It
+// lets the same HTTP/1.1 engine run over plain TCP (the default below) or over
+// TLS (the Https library builds one on the built-in Tls module and passes it
+// to Http.Request). Shape:
+//   { secure:bool,
+//     connect(host,port) -> conn|nil,
+//     write(conn,data),
+//     readLine(conn)      -> string|nil,   // CRLF stripped, nil at EOF
+//     readN(conn,n)       -> string|nil,   // exactly n bytes
+//     readAll(conn)       -> string,       // until peer closes
+//     close(conn) }
+global _httpPlainTransport = nil;
+
+// --------------------------------------------------------
+//  Exception types
+//
+//  Errors raised by Http are Exception subclasses, so callers can dispatch on
+//  type: `catch (e) { switch (e) { case HttpUnsupportedError: ...; case HttpError: ... } }`
+//  or `if (e is HttpError) { ... }`. They still carry .Code / .Error like any
+//  Exception.
+// --------------------------------------------------------
+
+class HttpError : Exception {}              // base for all Http errors
+class HttpUnsupportedError : HttpError {}   // an operation/scheme this library can't do
+
+// --------------------------------------------------------
+//  Http class
+// --------------------------------------------------------
+
+class Http {
+
+    // --------------------------------------------------------
+    //  Internal: read response body - tolerates I/O errors
+    // --------------------------------------------------------
+
+    // Parse a hex chunk-size line (e.g. "1a" -> 26). Returns 0 on invalid input.
+    // Uses s[i] byte indexing (returns int) to avoid char/string type issues.
+    fn static _parseHexSize(line: string) {
+        let n = 0;
+        let i = 0;
+        while (i < len(line)) {
+            let b = line[i];
+            let d = -1;
+            if (b >= 48 && b <= 57)  { d = b - 48; }   // '0'-'9'
+            else if (b >= 97 && b <= 102) { d = b - 87; }  // 'a'-'f'
+            else if (b >= 65 && b <= 70)  { d = b - 55; }  // 'A'-'F'
+            if (d < 0) { break; }
+            n = n * 16 + d;
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // Default plain-TCP transport (cached). Backs all http:// requests and is
+    // the building block the Https library mirrors over TLS.
+    fn static _plainTransport() {
+        if (_httpPlainTransport != nil) { return _httpPlainTransport; }
+        _httpPlainTransport = {
+            secure:   false,
+            connect:  fn(host, port) { return Stream.Connect("tcp", host, port); },
+            write:    fn(c, d)       { Stream.WriteAll(c, d); },
+            readLine: fn(c)          { return Stream.ReadLine(c); },
+            readN:    fn(c, n)       { return Stream.ReadString(c, n); },
+            readAll:  fn(c)          { return Buffer.ToString(Stream.ReadAll(c)); },
+            close:    fn(c)          { Stream.Close(c); }
+        };
+        return _httpPlainTransport;
+    }
+
+    // Build the full request text (headers + body), or nil if any component
+    // carries a CR/LF that would inject a header or split the request. Shared by
+    // the sync and async engines so the injection check lives in one place.
+    fn static _buildRequestStr(method, path, host, body, contentType, userHeaders) {
+        if (String.Contains(path, "\r") || String.Contains(path, "\n") ||
+            String.Contains(host, "\r") || String.Contains(host, "\n")) {
+            return nil;
+        }
+        if (userHeaders != nil) {
+            foreach (val, key in userHeaders) {
+                let vs = Convert.ToString(val);
+                if (String.Contains(key, "\r") || String.Contains(key, "\n") ||
+                    String.Contains(vs, "\r")  || String.Contains(vs, "\n")) {
+                    return nil;
+                }
+            }
+        }
+
+        let req = method + " " + path + " HTTP/1.1\r\n";
+        req = req + "Host: " + host + "\r\n";
+        req = req + "Connection: close\r\n";
+        req = req + "User-Agent: Flaris/1.0\r\n";
+        req = req + "Accept: */*\r\n";
+        if (userHeaders != nil) {
+            foreach (val, key in userHeaders) {
+                req = req + key + ": " + Convert.ToString(val) + "\r\n";
+            }
+        }
+        if (body != nil && len(body) > 0) {
+            let ct = contentType;
+            if (ct == nil) { ct = ContentType.Binary; }
+            req = req + "Content-Type: " + ct + "\r\n";
+            req = req + "Content-Length: " + Convert.ToString(len(body)) + "\r\n";
+        }
+        req = req + "\r\n";
+        if (body != nil && len(body) > 0) { req = req + body; }
+        return req;
+    }
+
+    // Resolve a Location header against the current origin. Absolute URLs pass
+    // through; relative ones are anchored to scheme://host[:port]. Shared by both
+    // engines.
+    fn static _resolveRedirectUrl(loc, scheme, host, port) {
+        if (String.StartsWith(loc, "http://") || String.StartsWith(loc, "https://")) {
+            return loc;
+        }
+        let origin = scheme + "://" + host;
+        if ((scheme == "http" && port != 80) || (scheme == "https" && port != 443)) {
+            origin = origin + ":" + Convert.ToString(port);
+        }
+        if (!String.StartsWith(loc, "/")) { loc = "/" + loc; }
+        return origin + loc;
+    }
+
+    fn static _readBody(s, hdrs, tr) {
+        let te = "";
+        let cl = "";
+
+        if ("transfer-encoding" in hdrs) { te = hdrs["transfer-encoding"]; }
+        if ("content-length"    in hdrs) { cl = hdrs["content-length"];    }
+
+        try {
+            if (String.Contains(te, "chunked")) {
+                // Pure-string chunked decoder - avoids block allocations that can
+                // confuse the GC when mixed with later string-only operations.
+                let result = "";
+                let sizeLine = tr.readLine(s);
+                while (sizeLine != nil) {
+                    let n = Http._parseHexSize(sizeLine);
+                    if (n == 0) { break; }
+                    let chunk = tr.readN(s, n);
+                    if (chunk != nil) { result = result + chunk; }
+                    tr.readLine(s);   // consume trailing CRLF after chunk data
+                    sizeLine = tr.readLine(s);
+                }
+                return result;
+            }
+
+            if (len(cl) > 0) {
+                let n = Convert.ParseInt(cl);
+                if (n > 0) {
+                    return tr.readN(s, n);
+                }
+                return "";
+            }
+
+            // No length hint - read until connection closes
+            return tr.readAll(s);
+
+        } catch (e) {
+            return nil;
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Internal: core request + redirect loop
+    // --------------------------------------------------------
+
+    fn static _request(method, url, body, contentType, userHeaders, tlsTransport?) {
+        let curUrl    = url;
+        let curMethod = method;
+        let curBody   = body;
+        let redirects = 0;
+
+        // Normalize a structured body (object/array) to a JSON string. Without
+        // this, an object body would be written via the default value->string
+        // repr (unquoted keys = invalid JSON) and Content-Length would be set to
+        // len(object) = the key count, not the byte length. Strings, blocks, and
+        // pre-encoded bodies pass through untouched, so callers can still send
+        // form-encoded or multipart strings as-is.
+        if (curBody != nil &&
+            (Type.Is(curBody, Type.Object) || Type.Is(curBody, Type.Array))) {
+            curBody = Json.Stringify(curBody);
+        }
+
+        while (redirects <= 5) {
+            let parsed = HttpUtil.ParseUrl(curUrl);
+            if (parsed == nil) { return nil; }
+
+            let host  = parsed.host;
+            let port  = parsed.port;
+            let path  = parsed.path;
+            let query = parsed.query;
+
+            if (len(query) > 0) {
+                path = path + "?" + query;
+            }
+
+            // Pick the transport per hop so cross-scheme redirects work: https://
+            // hops need the TLS transport supplied by the Https library; http://
+            // hops always use plain TCP. Callers that did not pass a TLS transport
+            // (i.e. plain Http.Get) get a clear error on an https:// URL.
+            let tr = nil;
+            if (parsed.scheme == "https") {
+                if (tlsTransport == nil) {
+                    throw new HttpUnsupportedError(100, "Http: HTTPS requires the Https library. " +
+                               "Use: import { Https } from library(\"Https\", \"1.0\"); Https.Get(url).");
+                }
+                tr = tlsTransport;
+            } else {
+                tr = Http._plainTransport();
+            }
+
+            let s = tr.connect(host, port);
+            if (s == nil) { return nil; }
+
+            // Set outside try so redirect loop back happens after try exits cleanly.
+            let redirectUrl = nil;
+            let response    = nil;
+
+            try {
+                // Assemble the request; nil means a CR/LF injection was detected
+                // in the path/host/headers - drop the connection and fail.
+                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, userHeaders);
+                if (req == nil) { tr.close(s); return nil; }
+                tr.write(s, req);
+
+                // --- status line: "HTTP/1.1 200 OK" ---
+                let statusLine = tr.readLine(s);
+                if (statusLine == nil || len(statusLine) == 0) {
+                    tr.close(s);
+                    return nil;
+                }
+
+                let parts  = String.Split(statusLine, " ");
+                let status = Convert.ParseInt(parts[1]);
+
+                // --- accumulate header block ---
+                let headerStr = "";
+                // Collect Set-Cookie lines separately: ParseHeaders folds
+                // duplicate header keys into one, but a response may set several
+                // cookies. CookieJar.StoreFromResponse() reads this array.
+                let setCookies = [];
+                let line = tr.readLine(s);
+                while (line != nil && len(line) > 0) {
+                    headerStr = headerStr + line + "\r\n";
+                    if (String.StartsWith(String.ToLower(line), "set-cookie:")) {
+                        Array.Append(setCookies, String.Trim(String.Substr(line, 11, len(line) - 11)));
+                    }
+                    line = tr.readLine(s);
+                }
+
+                let hdrs = HttpUtil.ParseHeaders(headerStr);
+
+                // --- redirect: store target URL, handle loop back outside try ---
+                if ((status == 301 || status == 302 || status == 303 ||
+                     status == 307 || status == 308) && ("location" in hdrs)) {
+                    tr.close(s);
+                    redirectUrl = Http._resolveRedirectUrl(hdrs["location"], parsed.scheme, host, parsed.port);
+                    if (status == 303 || ((status == 301 || status == 302) && curMethod != "GET")) {
+                        curMethod = "GET";
+                        curBody   = nil;
+                    }
+                } else {
+                    // --- normal response ---
+                    let responseBody = Http._readBody(s, hdrs, tr);
+                    tr.close(s);
+                    response = {
+                        status:     status,
+                        headers:    hdrs,
+                        body:       responseBody,
+                        setCookies: setCookies
+                    };
+                }
+
+            } catch (e) {
+                tr.close(s);
+            }
+
+            // Act on redirect OUTSIDE the try block
+            if (redirectUrl != nil) {
+                curUrl = redirectUrl;
+                redirects = redirects + 1;
+            } else {
+                return response; // nil on I/O error, object on success
+            }
+        }
+
+        return nil; // too many redirects
+    }
+
+    // --------------------------------------------------------
+    //  Internal: async engine (mirrors _request; awaits the transport)
+    // --------------------------------------------------------
+
+    // Read the response body over an async transport (awaits readLine/readN/
+    // readAll). Same framing as _readBody; tolerates I/O errors (returns nil).
+    fn static async _readBodyAsync(s, hdrs, tr) {
+        let te = "";
+        let cl = "";
+        if ("transfer-encoding" in hdrs) { te = hdrs["transfer-encoding"]; }
+        if ("content-length"    in hdrs) { cl = hdrs["content-length"];    }
+        try {
+            if (String.Contains(te, "chunked")) {
+                let result = "";
+                let sizeLine = await tr.readLineAsync(s);
+                while (sizeLine != nil) {
+                    let n = Http._parseHexSize(sizeLine);
+                    if (n == 0) { break; }
+                    let chunk = await tr.readNAsync(s, n);
+                    if (chunk != nil) { result = result + chunk; }
+                    await tr.readLineAsync(s);   // consume trailing CRLF
+                    sizeLine = await tr.readLineAsync(s);
+                }
+                return result;
+            }
+            if (len(cl) > 0) {
+                let n = Convert.ParseInt(cl);
+                if (n > 0) { return await tr.readNAsync(s, n); }
+                return "";
+            }
+            return await tr.readAllAsync(s);
+        } catch (e) {
+            return nil;
+        }
+    }
+
+    // Async twin of _request. Suspends the calling fiber (instead of blocking the
+    // whole scheduler) at each connect/write/read by awaiting the transport's
+    // *Async closures - so several requests overlap. Only https:// hops run async;
+    // a downgrade redirect to http:// finishes on the sync engine (rare, and the
+    // plain transport has no async reads).
+    fn static async _requestAsync(method, url, body, contentType, userHeaders, tlsTransport) {
+        let curUrl    = url;
+        let curMethod = method;
+        let curBody   = body;
+        let redirects = 0;
+
+        if (curBody != nil &&
+            (Type.Is(curBody, Type.Object) || Type.Is(curBody, Type.Array))) {
+            curBody = Json.Stringify(curBody);
+        }
+
+        while (redirects <= 5) {
+            let parsed = HttpUtil.ParseUrl(curUrl);
+            if (parsed == nil) { return nil; }
+
+            // Plain-http hop (e.g. an https->http downgrade redirect): the plain
+            // transport has no async reads, so finish on the sync engine.
+            if (parsed.scheme != "https" || tlsTransport == nil) {
+                return Http._request(curMethod, curUrl, curBody, contentType, userHeaders, nil);
+            }
+
+            let host  = parsed.host;
+            let port  = parsed.port;
+            let path  = parsed.path;
+            let query = parsed.query;
+            if (len(query) > 0) { path = path + "?" + query; }
+
+            let tr = tlsTransport;
+            let s  = await tr.connectAsync(host, port);
+            if (s == nil || s == 0) { return nil; }
+
+            let redirectUrl = nil;
+            let response    = nil;
+
+            try {
+                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, userHeaders);
+                if (req == nil) { tr.close(s); return nil; }
+                await tr.writeAsync(s, req);
+
+                let statusLine = await tr.readLineAsync(s);
+                if (statusLine == nil || len(statusLine) == 0) {
+                    tr.close(s);
+                    return nil;
+                }
+                let parts  = String.Split(statusLine, " ");
+                let status = Convert.ParseInt(parts[1]);
+
+                let headerStr  = "";
+                let setCookies = [];
+                let line = await tr.readLineAsync(s);
+                while (line != nil && len(line) > 0) {
+                    headerStr = headerStr + line + "\r\n";
+                    if (String.StartsWith(String.ToLower(line), "set-cookie:")) {
+                        Array.Append(setCookies, String.Trim(String.Substr(line, 11, len(line) - 11)));
+                    }
+                    line = await tr.readLineAsync(s);
+                }
+                let hdrs = HttpUtil.ParseHeaders(headerStr);
+
+                if ((status == 301 || status == 302 || status == 303 ||
+                     status == 307 || status == 308) && ("location" in hdrs)) {
+                    tr.close(s);
+                    redirectUrl = Http._resolveRedirectUrl(hdrs["location"], parsed.scheme, host, parsed.port);
+                    if (status == 303 || ((status == 301 || status == 302) && curMethod != "GET")) {
+                        curMethod = "GET";
+                        curBody   = nil;
+                    }
+                } else {
+                    let responseBody = await Http._readBodyAsync(s, hdrs, tr);
+                    tr.close(s);
+                    response = {
+                        status:     status,
+                        headers:    hdrs,
+                        body:       responseBody,
+                        setCookies: setCookies
+                    };
+                }
+            } catch (e) {
+                tr.close(s);
+            }
+
+            if (redirectUrl != nil) {
+                curUrl = redirectUrl;
+                redirects = redirects + 1;
+            } else {
+                return response;
+            }
+        }
+        return nil; // too many redirects
+    }
+
+    // --------------------------------------------------------
+    //  Http.Retry(requestFn, options) - run a request with retries.
+    //
+    //  requestFn : fn() -> response   (e.g. fn() { return Http.Get(url); })
+    //  options (all optional):
+    //    attempts : int    - total tries, including the first (default 3)
+    //    delayMs  : int    - delay before the first retry (default 200)
+    //    backoff  : float  - delay multiplier per retry (default 2.0)
+    //    retryOn  : fn(resp) -> bool  - decide if a response is retryable.
+    //                         Default: nil/no-status response, status >= 500, or 429.
+    //
+    //  Returns the last response (which may still be a failure after all tries).
+    // --------------------------------------------------------
+    fn static Retry(requestFn:fn, options?) {
+        var attempts:int = 3;
+        var delayMs:int  = 200;
+        var backoff      = 2.0;
+        var retryOn      = nil;
+        if (options != nil) {
+            if (Object.HasKey(options, "attempts")) attempts = options.attempts;
+            if (Object.HasKey(options, "delayMs"))  delayMs  = options.delayMs;
+            if (Object.HasKey(options, "backoff"))  backoff  = options.backoff;
+            if (Object.HasKey(options, "retryOn"))  retryOn  = options.retryOn;
+        }
+        if (attempts < 1) attempts = 1;
+
+        var attempt:int = 0;
+        var wait:int    = delayMs;
+        var resp        = nil;
+        while (attempt < attempts) {
+            resp = requestFn();
+            let retry = (retryOn != nil) ? retryOn(resp) : Http._defaultRetryable(resp);
+            if (!retry) {
+                return resp;
+            }
+            attempt = attempt + 1;
+            if (attempt < attempts) {
+                Fiber.Sleep(wait);
+                wait = Convert.ToInt(float(wait) * backoff);
+            }
+        }
+        return resp;
+    }
+
+    // Default retry predicate: transport failures and transient server errors.
+    fn static _defaultRetryable(resp) {
+        if (resp == nil) return true;
+        if (resp.status == nil) return true;
+        if (resp.status >= 500) return true;
+        if (resp.status == 429) return true;
+        return false;
+    }
+
+    // --------------------------------------------------------
+    //  Http.Curl(url, options) - shells out to curl(1)
+    //
+    //  options (all optional):
+    //    method   : string  - HTTP method (default "GET")
+    //    headers  : object  - key/value request headers
+    //    body     : string  - request body
+    //    output   : string  - save response body to file path (skips body in return)
+    //    timeout  : int     - seconds (default 30)
+    //    follow   : bool    - follow redirects (default true)
+    //    insecure : bool    - skip TLS verification (default false)
+    //
+    //  Returns: { status: int, body: string } or nil if curl not found / failed.
+    // --------------------------------------------------------
+
+    fn static Curl(url:string, options?) {
+        let method  = "GET";
+        let timeout = 30;
+        let follow  = true;
+        let insecure = false;
+        let output  = nil;
+        let body    = nil;
+        let headers = nil;
+
+        if (options != nil) {
+            if ("method"   in options) { method   = options["method"];   }
+            if ("timeout"  in options) { timeout  = options["timeout"];  }
+            if ("follow"   in options) { follow   = options["follow"];   }
+            if ("insecure" in options) { insecure = options["insecure"]; }
+            if ("output"   in options) { output   = options["output"];   }
+            if ("body"     in options) { body     = options["body"];     }
+            if ("headers"  in options) { headers  = options["headers"];  }
+        }
+
+        let cmd = "curl -s -w '\\n%{http_code}'";
+        cmd = cmd + " -X " + method;
+        cmd = cmd + " --max-time " + Convert.ToString(timeout);
+        if (follow)   { cmd = cmd + " -L"; }
+        if (insecure) { cmd = cmd + " -k"; }
+
+        if (headers != nil) {
+            foreach (val, key in headers) {
+                cmd = cmd + " -H '" + key + ": " + Convert.ToString(val) + "'";
+            }
+        }
+
+        if (body != nil && len(body) > 0) {
+            cmd = cmd + " -d '" + body + "'";
+        }
+
+        if (output != nil) {
+            cmd = cmd + " -o '" + output + "'";
+        }
+
+        cmd = cmd + " '" + url + "'";
+
+        let raw = Os.Execute(cmd);
+        if (raw == nil) { return nil; }
+
+        // Last line is the status code written by -w '%{http_code}'
+        let lines = String.SplitLines(raw);
+        let n     = len(lines);
+        if (n < 1) { return nil; }
+
+        let statusStr = lines[n - 1];
+        let status    = Convert.ParseInt(statusStr);
+        if (status == nil) { return nil; }
+
+        // Body is everything before the last line
+        let responseBody = "";
+        if (output == nil) {
+            iter( i from 0 to n - 2 ) {
+                if (i > 0) { responseBody = responseBody + "\n"; }
+                responseBody = responseBody + lines[i];
+            }
+        }
+
+        return { status: status, body: responseBody };
+    }
+
+    // --------------------------------------------------------
+    //  Http.WGet(url, dest) - shells out to wget(1)
+    //
+    //  Downloads url and saves to dest path (or current dir if nil).
+    //  Returns: { status: int, path: string } or nil if wget not found / failed.
+    // --------------------------------------------------------
+
+    fn static WGet(url:string, dest:string|nil) {
+        let cmd = "wget -q --server-response";
+
+        if (dest != nil && len(dest) > 0) {
+            cmd = cmd + " -O '" + dest + "'";
+        }
+
+        cmd = cmd + " '" + url + "' 2>&1";
+
+        let raw = Os.Execute(cmd);
+        if (raw == nil) { return nil; }
+
+        // wget writes status line to stderr, captured via 2>&1
+        // Look for "  HTTP/1.x NNN" in output
+        let status = 0;
+        let lines  = String.SplitLines(raw);
+        foreach (line in lines) {
+            if (String.Contains(line, "HTTP/")) {
+                let parts = String.Split(String.Trim(line), " ");
+                if (len(parts) >= 2) {
+                    let s = Convert.ParseInt(parts[1]);
+                    if (s != nil) { status = s; }
+                }
+            }
+        }
+
+        let path = dest;
+        if (path == nil) {
+            // Derive filename from URL (last segment)
+            let segs = String.Split(url, "/");
+            path = segs[len(segs) - 1];
+            if (len(path) == 0) { path = "index.html"; }
+        }
+
+        return { status: status, path: path };
+    }
+
+    // --------------------------------------------------------
+    //  Http.StreamPost(url, body, onLine, headers?)
+    //
+    //  POST url with a JSON body and call onLine(rawLine) for each
+    //  NDJSON line received. Designed for Ollama / OpenAI-compatible
+    //  streaming endpoints (plain HTTP only).
+    //
+    //  Returns the HTTP status code, or nil on connection failure.
+    // --------------------------------------------------------
+
+    fn static StreamPost(url: string, body: string, onLine: fn, headers?) {
+        if (String.StartsWith(url, "https://")) {
+            throw new HttpUnsupportedError(100, "Http: HTTPS not supported for streaming.");
+        }
+        let parsed = HttpUtil.ParseUrl(url);
+        if (parsed == nil) { return nil; }
+
+        let host  = parsed.host;
+        let port  = parsed.port;
+        let path  = parsed.path;
+        let query = parsed.query;
+        if (len(query) > 0) { path = path + "?" + query; }
+
+        let s = Stream.Connect("tcp", host, port);
+        if (s == nil) { return nil; }
+
+        let status = nil;
+        try {
+            let req = "POST " + path + " HTTP/1.1\r\n";
+            req = req + "Host: " + host + "\r\n";
+            req = req + "Connection: close\r\n";
+            req = req + "User-Agent: Flaris/1.0\r\n";
+            req = req + "Accept: */*\r\n";
+            req = req + "Content-Type: application/json\r\n";
+            req = req + "Content-Length: " + Convert.ToString(len(body)) + "\r\n";
+            if (headers != nil) {
+                foreach (val, key in headers) {
+                    req = req + key + ": " + Convert.ToString(val) + "\r\n";
+                }
+            }
+            req = req + "\r\n" + body;
+            Stream.WriteAll(s, req);
+
+            let statusLine = Stream.ReadLine(s);
+            if (statusLine != nil && len(statusLine) > 0) {
+                let parts = String.Split(statusLine, " ");
+                if (len(parts) >= 2) { status = Convert.ParseInt(parts[1]); }
+            }
+
+            // Consume response headers (blank line terminates)
+            let hline = Stream.ReadLine(s);
+            while (hline != nil && len(hline) > 0) { hline = Stream.ReadLine(s); }
+
+            // Read body line-by-line; skip chunked-TE size markers and blank lines.
+            // Ollama NDJSON lines always start with '{'.
+            let line = Stream.ReadLine(s);
+            while (line != nil) {
+                if (len(line) > 0 && String.StartsWith(line, "{")) {
+                    onLine(line);
+                }
+                line = Stream.ReadLine(s);
+            }
+        } catch (e) {
+            // A read error mid-stream just ends the line loop: report whatever
+            // status was parsed and let the caller decide. 0 = no status seen.
+            status = status ?? 0;
+        }
+
+        Stream.Close(s);
+        return status;
+    }
+
+    // --------------------------------------------------------
+    //  Http.Request(method, url, body, contentType, headers?, tlsTransport?)
+    //
+    //  Transport-aware request core. Pass a TLS transport (see the Https
+    //  library) to enable https:// URLs; omit it for plain http://. Returns the
+    //  response object { status, headers, body, setCookies } or nil on failure.
+    //  This is the seam the Https library uses to reuse the whole HTTP engine.
+    // --------------------------------------------------------
+    fn static Request(method:string, url:string, body, contentType, headers?, tlsTransport?) {
+        return Http._request(method, url, body, contentType, headers ?? nil, tlsTransport ?? nil);
+    }
+
+    // Async twin of Request: returns a fiber - `await` it for the response. The
+    // supplied transport must expose the *Async closures (the Https library's
+    // does); requests driven this way suspend only the caller, so several run
+    // concurrently. https:// only - see _requestAsync.
+    fn static RequestAsync(method:string, url:string, body, contentType, headers?, tlsTransport?) {
+        return Http._requestAsync(method, url, body, contentType, headers ?? nil, tlsTransport ?? nil);
+    }
+
+    fn static Get(url:string, headers?)    { return Http._request("GET",    url, nil,  nil,              headers ?? nil); }
+    fn static Post(url:string, body, headers?)   { return Http._request("POST",   url, body, ContentType.JSON, headers ?? nil); }
+    fn static Put(url:string, body, headers?)    { return Http._request("PUT",    url, body, ContentType.JSON, headers ?? nil); }
+    fn static Patch(url:string, body, headers?)  { return Http._request("PATCH",  url, body, ContentType.JSON, headers ?? nil); }
+    fn static Query(url:string, body, headers?)  { return Http._request("QUERY",  url, body, ContentType.JSON, headers ?? nil); }
+    fn static Delete(url:string, headers?) { return Http._request("DELETE", url, nil,  nil,              headers ?? nil); }
+
+    // Returns only response headers, no body (HEAD method).
+    fn static Head(url:string, headers?) {
+        let res = Http._request("HEAD", url, nil, nil, headers ?? nil);
+        if (res == nil) { return nil; }
+        return { status: res.status, headers: res.headers };
+    }
+
+    // --------------------------------------------------------
+    //  Async API
+    // --------------------------------------------------------
+
+    fn static async GetAsync(url:string, headers?)    { return Http._request("GET",    url, nil,  nil,              headers ?? nil); }
+    fn static async PostAsync(url:string, body, headers?)   { return Http._request("POST",   url, body, ContentType.JSON, headers ?? nil); }
+    fn static async PutAsync(url:string, body, headers?)    { return Http._request("PUT",    url, body, ContentType.JSON, headers ?? nil); }
+    fn static async PatchAsync(url:string, body, headers?)  { return Http._request("PATCH",  url, body, ContentType.JSON, headers ?? nil); }
+    fn static async QueryAsync(url:string, body, headers?)   { return Http._request("QUERY",  url, body, ContentType.JSON, headers ?? nil); }
+    fn static async DeleteAsync(url:string, headers?) { return Http._request("DELETE", url, nil,  nil,              headers ?? nil); }
+
+    fn static async HeadAsync(url:string, headers?) {
+        let res = Http._request("HEAD", url, nil, nil, headers ?? nil);
+        if (res == nil) { return nil; }
+        return { status: res.status, headers: res.headers };
+    }
+}
+
+// =============================================================================
+// CookieJar - stores cookies across requests and produces the Cookie header.
+//
+//   let jar = new CookieJar();
+//   let r1  = Http.Post("http://host/login", body);
+//   jar.StoreFromResponse(r1);
+//   let r2  = Http.Get("http://host/me", jar.ApplyTo({ }));
+//
+// Only the name=value pair is kept; cookie attributes (Path, Domain, Expires,
+// HttpOnly, ...) are ignored - this is a simple session jar, not a full
+// RFC 6265 store. Cookies set on a redirect response are not auto-captured.
+// =============================================================================
+
+class CookieJar
+{
+    let _cookies = nil;   // Collections.HashMap: name -> value
+
+    fn Constructor() {
+        _cookies = Collections.HashMap();
+    }
+
+    fn Set(name:string, value): instance {
+        _cookies.Set(name, Convert.ToString(value));
+        return this;
+    }
+
+    fn Get(name:string) {
+        if (_cookies.Has(name)) return _cookies.Get(name);
+        return nil;
+    }
+
+    fn Has(name:string): bool { return _cookies.Has(name); }
+
+    fn Remove(name:string): instance {
+        _cookies.Delete(name);
+        return this;
+    }
+
+    fn Clear(): instance {
+        _cookies = Collections.HashMap();
+        return this;
+    }
+
+    fn Names(): array { return _cookies.Keys(); }
+    fn Count(): int   { return _cookies.Size(); }
+
+    // Parse a single Set-Cookie value ("name=value; Path=/; HttpOnly") and store
+    // the name=value pair (attributes are dropped).
+    fn ParseSetCookie(setCookie): instance {
+        if (setCookie == nil) return this;
+        let segs = String.Split(setCookie, ";");
+        if (len(segs) == 0) return this;
+
+        let pair = String.Trim(segs[0]);
+        let kv   = String.Split(pair, "=");
+        if (len(kv) < 2) return this;
+
+        let name = String.Trim(kv[0]);
+        if (len(name) == 0) return this;
+
+        // Re-join the value in case it itself contained '='.
+        var value:string = "";
+        var j:int = 1;
+        while (j < len(kv)) {
+            if (j > 1) value = value + "=";
+            value = value + kv[j];
+            j = j + 1;
+        }
+        _cookies.Set(name, String.Trim(value));
+        return this;
+    }
+
+    // Ingest all cookies from a response. Prefers the resp.setCookies array
+    // (captures multiple Set-Cookie headers); falls back to the folded
+    // resp.headers["set-cookie"] value.
+    fn StoreFromResponse(resp): instance {
+        if (resp == nil) return this;
+        if (Object.HasKey(resp, "setCookies") and resp.setCookies != nil) {
+            foreach (sc in resp.setCookies) { this.ParseSetCookie(sc); }
+        } else if (resp.headers != nil and Object.HasKey(resp.headers, "set-cookie")) {
+            this.ParseSetCookie(resp.headers["set-cookie"]);
+        }
+        return this;
+    }
+
+    // Build the "Cookie:" header value, e.g. "a=b; c=d".
+    fn CookieHeader(): string {
+        let names = _cookies.Keys();
+        let parts:array = [];
+        var i:int = 0;
+        while (i < len(names)) {
+            Array.Append(parts, names[i] + "=" + Convert.ToString(_cookies.Get(names[i])));
+            i = i + 1;
+        }
+        return String.Join(parts, "; ");
+    }
+
+    // Return a headers object with the Cookie header merged in. Pass an existing
+    // headers object to extend it, or nil for a fresh one.
+    fn ApplyTo(headers) {
+        let h = (headers == nil) ? { } : headers;
+        if (this.Count() > 0) {
+            h["Cookie"] = this.CookieHeader();
+        }
+        return h;
+    }
+}
+
+// =============================================================================
+// Multipart - multipart/form-data request body builder.
+//
+//   let form = new Multipart();
+//   form.Field("title", "Hello")
+//       .File("doc", "notes.txt", "file contents here", "text/plain");
+//   let r = Http.Post(url, form.Body(), { "Content-Type": form.ContentTypeHeader() });
+//
+// The body is built as a string, so text fields and text file content work
+// directly. Field/file names are sanitised to keep the part structure intact.
+// =============================================================================
+
+class Multipart
+{
+    let _parts    = nil;   // array of { name, filename, contentType, value }
+    let _boundary = "";
+
+    fn Constructor() {
+        _parts    = [];
+        _boundary = "----FlarisFormBoundary" + Convert.ToString(Time.Ticks()) +
+                    Convert.ToString(Convert.ToInt(Math.Random() * 1000000.0));
+    }
+
+    fn Field(name:string, value): instance {
+        Array.Append(_parts, {
+            name:        Multipart._san(name),
+            filename:    nil,
+            contentType: nil,
+            value:       Convert.ToString(value)
+        });
+        return this;
+    }
+
+    fn File(name:string, filename:string, content, contentType?): instance {
+        Array.Append(_parts, {
+            name:        Multipart._san(name),
+            filename:    Multipart._san(filename),
+            contentType: (contentType == nil) ? "application/octet-stream" : contentType,
+            value:       content
+        });
+        return this;
+    }
+
+    fn Boundary(): string          { return _boundary; }
+    fn ContentTypeHeader(): string { return "multipart/form-data; boundary=" + _boundary; }
+
+    fn Body(): string {
+        var out:string = "";
+        var i:int = 0;
+        while (i < len(_parts)) {
+            let p = _parts[i];
+            out = out + "--" + _boundary + "\r\n";
+            if (p.filename != nil) {
+                out = out + "Content-Disposition: form-data; name=\"" + p.name +
+                            "\"; filename=\"" + p.filename + "\"\r\n";
+                out = out + "Content-Type: " + p.contentType + "\r\n\r\n";
+            } else {
+                out = out + "Content-Disposition: form-data; name=\"" + p.name + "\"\r\n\r\n";
+            }
+            out = out + p.value + "\r\n";
+            i = i + 1;
+        }
+        out = out + "--" + _boundary + "--\r\n";
+        return out;
+    }
+
+    // Strip CR/LF and escape double quotes so a field/file name cannot break out
+    // of the Content-Disposition header.
+    fn static _san(s) {
+        let str1 = String.Replace(Convert.ToString(s), "\r", "");
+        let str2 = String.Replace(str1, "\n", "");
+        return String.Replace(str2, "\"", "'");
+    }
+}
+
+export { Http, Status, ContentType, CookieJar, Multipart, HttpError, HttpUnsupportedError };

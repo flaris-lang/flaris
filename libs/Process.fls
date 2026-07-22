@@ -1,0 +1,207 @@
+// ============================================================
+//  Process.fls - Subprocess management for Flaris
+//  Version: 1.0
+// ============================================================
+//
+// Runs external programs, captures their output, and streams
+// data to/from them. Built on top of Os.Spawn / Os.RunEx,
+// no -u flag required.
+//
+// QUICK START
+// -----------
+//   import { Process, Run, Shell, Spawn } from library("Process", "1.0");
+//
+//   // Blocking run - capture exit code + stdout + stderr
+//   let r = Run("git", ["log", "--oneline", "-5"]);
+//   Console.WriteLine(r.Exit, r.Stdout);
+//
+//   // Shell string (sh -c on Unix, cmd /c on Windows)
+//   let r = Shell("ls -la | grep .fls");
+//
+//   // Spawned process - interact while running
+//   let p = Spawn("tail", ["-f", "/var/log/system.log"]);
+//   if (p == nil) { Console.Error("spawn failed"); return 1; }
+//
+//   while (true) {
+//       let line = p.ReadLine();
+//       if (line == nil) break;
+//       Console.WriteLine(line);
+//   }
+//   p.Close();
+//
+//   // Writing to stdin
+//   let p = Spawn("cat");
+//   p.Write("hello\n");
+//   p.Write("world\n");
+//   p.CloseStdin();
+//   Console.WriteLine(p.ReadLine());  // "hello"
+//   Console.WriteLine(p.ReadLine());  // "world"
+//   p.Wait();
+//   p.Close();
+//
+// API
+// ---
+//   Run(cmd, args?)       → {Exit:int, Stdout:string, Stderr:string} | nil
+//   Shell(cmd)            → {Exit:int, Stdout:string, Stderr:string} | nil
+//   Spawn(cmd, args?)     → Process | nil
+//
+//   p.Pid                 int - process id
+//   p.ReadLine()          → string | nil - next stdout line (blocks fiber, not VM)
+//   p.ReadLineErr()       → string | nil - next stderr line
+//   p.Write(data)         - write string to stdin
+//   p.CloseStdin()        - signal EOF to child's stdin
+//   p.Wait()              → int - exit code; blocks fiber until child exits
+//   p.Kill(signal?)       - send signal (default SIGTERM = 15)
+//   p.IsAlive()           → bool
+//   p.Close()             - close all pipe fds
+
+class Process {
+
+    let _pid:int     = 0;
+    let _stdin:int   = -1;
+    let _stdout:int  = -1;
+    let _stderr:int  = -1;
+    let _outBuf      = "";
+    let _errBuf      = "";
+    let _exited      = false;
+    let _exitCode    = 0;
+
+    fn _init(handle) {
+        this._pid    = handle.Pid;
+        this._stdin  = handle.Stdin;
+        this._stdout = handle.Stdout;
+        this._stderr = handle.Stderr;
+    }
+
+    fn _poll() {
+        if (this._exited) return;
+        let s = Os.TryWait(this._pid);
+        if (!s.Alive) {
+            this._exited   = true;
+            this._exitCode = s.Exit;
+        }
+    }
+
+    fn Pid() {
+        return this._pid;
+    }
+
+    fn IsAlive() {
+        this._poll();
+        return !this._exited;
+    }
+
+    fn Kill(signal?) {
+        Os.KillChild(this._pid, signal ?? 15);
+    }
+
+    fn Wait() {
+        while (true) {
+            this._poll();
+            if (this._exited) return this._exitCode;
+            Fiber.Sleep(1);
+        }
+    }
+
+    fn Write(data) {
+        Os.WritePipe(this._stdin, data);
+    }
+
+    fn CloseStdin() {
+        Os.ClosePipe(this._stdin);
+        this._stdin = -1;
+    }
+
+    fn ReadLine() {
+        while (true) {
+            let nl = String.IndexOf(this._outBuf, "\n");
+            if (nl >= 0) {
+                let line = String.Substr(this._outBuf, 0, nl);
+                this._outBuf = String.Substr(this._outBuf, nl + 1);
+                return line;
+            }
+            var chunk = Os.ReadPipe(this._stdout);
+            if (chunk == nil && !this._exited) {
+                this._poll();
+                // Exit detected right after a nil read: the child may have
+                // written its output and exited inside that window, so drain
+                // once more before treating nil as EOF (data written before
+                // exit stays readable in the pipe buffer).
+                if (this._exited) {
+                    chunk = Os.ReadPipe(this._stdout);
+                }
+            }
+            if (chunk != nil) {
+                this._outBuf = this._outBuf + chunk;
+            } else if (this._exited) {
+                if (String.Length(this._outBuf) > 0) {
+                    let line = this._outBuf;
+                    this._outBuf = "";
+                    return line;
+                }
+                return nil;
+            } else {
+                Fiber.Sleep(1);
+            }
+        }
+    }
+
+    fn ReadLineErr() {
+        while (true) {
+            let nl = String.IndexOf(this._errBuf, "\n");
+            if (nl >= 0) {
+                let line = String.Substr(this._errBuf, 0, nl);
+                this._errBuf = String.Substr(this._errBuf, nl + 1);
+                return line;
+            }
+            var chunk = Os.ReadPipe(this._stderr);
+            if (chunk == nil && !this._exited) {
+                this._poll();
+                // Same drain-on-fresh-exit as ReadLine: never declare EOF on a
+                // nil read that raced with the child's exit.
+                if (this._exited) {
+                    chunk = Os.ReadPipe(this._stderr);
+                }
+            }
+            if (chunk != nil) {
+                this._errBuf = this._errBuf + chunk;
+            } else if (this._exited) {
+                if (String.Length(this._errBuf) > 0) {
+                    let line = this._errBuf;
+                    this._errBuf = "";
+                    return line;
+                }
+                return nil;
+            } else {
+                Fiber.Sleep(1);
+            }
+        }
+    }
+
+    fn Close() {
+        if (this._stdin  >= 0) { Os.ClosePipe(this._stdin);  this._stdin  = -1; }
+        if (this._stdout >= 0) { Os.ClosePipe(this._stdout); this._stdout = -1; }
+        if (this._stderr >= 0) { Os.ClosePipe(this._stderr); this._stderr = -1; }
+    }
+}
+
+fn Spawn(cmd, args?) {
+    let handle = Os.Spawn(cmd, args ?? []);
+    if (handle == nil) return nil;
+    let p = new Process();
+    p._init(handle);
+    return p;
+}
+
+fn Run(cmd, args?) {
+    return Os.RunEx(cmd, args ?? []);
+}
+
+fn Shell(cmd) {
+    let isWin = Os.Name() == "Windows";
+    let shell = isWin ? "cmd" : "sh";
+    let flag  = isWin ? "/c"  : "-c";
+    return Os.RunEx(shell, [flag, cmd]);
+}
+
+export { Process, Spawn, Run, Shell };

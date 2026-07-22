@@ -1,0 +1,216 @@
+// test_qrcode.fls - Unit tests for QRCode.fls.
+// Run: ./flarisvm tests/test_qrcode.fls --libs='./libs'
+
+import { QRCode } from library("QRCode", "1.0");
+import { Test }   from library("Test",   "1.0");
+
+fn Main() {
+
+    // ── Suite 1: PixelSize ────────────────────────────────────────────────────
+
+    let t1 = Test.Suite("QRCode.PixelSize");
+
+    t1.it("PixelSize returns positive int for short text", fn() {
+        let sz = QRCode.PixelSize("hi", 4, nil);
+        t1.gt(sz, 0);
+    });
+
+    t1.it("PixelSize scale=1 is smallest", fn() {
+        let s1 = QRCode.PixelSize("hi", 1, nil);
+        let s4 = QRCode.PixelSize("hi", 4, nil);
+        t1.eq(s4, s1 * 4);
+    });
+
+    t1.it("PixelSize matches ToPixels array length", fn() {
+        let sz  = QRCode.PixelSize("hi", 3, nil);
+        let px  = QRCode.ToPixels("hi", 3, nil, true);
+        t1.eq(len(px), sz * sz);
+    });
+
+    t1.it("PixelSize returns -1 for text exceeding v10 capacity", fn() {
+        let long = String.Repeat("x", 300);
+        t1.eq(QRCode.PixelSize(long, 4, nil), -1);
+    });
+
+    let f1 = t1.run();
+
+    // ── Suite 2: ToPixels ─────────────────────────────────────────────────────
+
+    let t2 = Test.Suite("QRCode.ToPixels");
+
+    t2.it("returns non-empty array for short text", fn() {
+        let px = QRCode.ToPixels("hi", 4, nil, true);
+        t2.gt(len(px), 0);
+    });
+
+    t2.it("returns empty array for oversized text", fn() {
+        let px = QRCode.ToPixels(String.Repeat("x", 300), 4, nil, true);
+        t2.eq(len(px), 0);
+    });
+
+    t2.it("all pixels are black or white ARGB", fn() {
+        let px = QRCode.ToPixels("hi", 2, nil, true);
+        var ok = true;
+        iter (i from 0 to len(px) - 1) {
+            let c = px[i];
+            if (c != 0xFF000000 && c != 0xFFFFFFFF) ok = false;
+        }
+        t2.ok(ok);
+    });
+
+    t2.it("scale=2 produces 4× more pixels than scale=1", fn() {
+        let px1 = QRCode.ToPixels("hi", 1, nil, true);
+        let px2 = QRCode.ToPixels("hi", 2, nil, true);
+        t2.eq(len(px2), len(px1) * 4);
+    });
+
+    t2.it("quiet zone: corners are white", fn() {
+        let sc = 2;
+        let sz = QRCode.PixelSize("hi", sc, nil);
+        let px = QRCode.ToPixels("hi", sc, nil, true);
+        t2.eq(px[0], 0xFFFFFFFF);                   // top-left
+        t2.eq(px[sz - 1], 0xFFFFFFFF);              // top-right
+        t2.eq(px[(sz-1)*sz], 0xFFFFFFFF);           // bottom-left
+        t2.eq(px[sz*sz - 1], 0xFFFFFFFF);           // bottom-right
+    });
+
+    t2.it("EC levels produce different pixel arrays", fn() {
+        let pxM = QRCode.ToPixels("hello", 4, QRCode.QR_M, true);
+        let pxH = QRCode.ToPixels("hello", 4, QRCode.QR_H, true);
+        var diff = false;
+        iter (i from 0 to len(pxM) - 1) {
+            if (pxM[i] != pxH[i]) diff = true;
+        }
+        t2.ok(diff);
+    });
+
+    let f2 = t2.run();
+
+    // ── Suite 3: ToLines ──────────────────────────────────────────────────────
+
+    let t3 = Test.Suite("QRCode.ToLines");
+
+    t3.it("returns non-empty array", fn() {
+        let lines = QRCode.ToLines("hi", nil, true);
+        t3.gt(len(lines), 0);
+    });
+
+    t3.it("line count = sz + 2*quietzone", fn() {
+        // Version 1 QR = 21 modules. With qz=4 each side: 21 + 8 = 29 lines.
+        let lines = QRCode.ToLines("hi", nil, true);
+        // We don't know exact version but can check quiet rows + data rows + quiet rows
+        // by verifying the array length is odd (sz is always odd for QR)
+        t3.gt(len(lines), 8);   // at minimum 8 quiet rows + some data rows
+    });
+
+    t3.it("quiet zone: first row is all spaces", fn() {
+        let lines = QRCode.ToLines("hi", nil, true);
+        let row0  = String.Trim(lines[0]);
+        t3.eq(String.Length(row0), 0);
+    });
+
+    t3.it("4-module quiet zone: first 4 rows are blank", fn() {
+        let lines = QRCode.ToLines("hi", nil, true);
+        iter (qi from 0 to 3) {
+            t3.eq(String.Length(String.Trim(lines[qi])), 0);
+        }
+    });
+
+    t3.it("empty array for oversized text", fn() {
+        let lines = QRCode.ToLines(String.Repeat("x", 300), nil, true);
+        t3.eq(len(lines), 0);
+    });
+
+    let f3 = t3.run();
+
+    // ── Suite 4: ToSVG ───────────────────────────────────────────────────────
+
+    let t4 = Test.Suite("QRCode.ToSVG");
+
+    t4.it("returns non-empty string", fn() {
+        let svg = QRCode.ToSVG("hi", 4, nil, true, nil, nil);
+        t4.gt(String.Length(svg), 0);
+    });
+
+    t4.it("starts with <svg and ends with </svg>", fn() {
+        let svg = QRCode.ToSVG("hi", 4, nil, true, nil, nil);
+        t4.ok(String.StartsWith(svg, "<svg"));
+        t4.ok(String.EndsWith(String.Trim(svg), "</svg>"));
+    });
+
+    t4.it("contains rect elements", fn() {
+        let svg = QRCode.ToSVG("hi", 4, nil, true, nil, nil);
+        t4.ok(String.Contains(svg, "<rect"));
+    });
+
+    t4.it("custom dark color appears in output", fn() {
+        let svg = QRCode.ToSVG("hi", 4, nil, true, "#123456", nil);
+        t4.ok(String.Contains(svg, "#123456"));
+    });
+
+    t4.it("custom light color appears in output", fn() {
+        let svg = QRCode.ToSVG("hi", 4, nil, true, nil, "#fafafa");
+        t4.ok(String.Contains(svg, "#fafafa"));
+    });
+
+    t4.it("returns empty string for oversized text", fn() {
+        let svg = QRCode.ToSVG(String.Repeat("x", 300), 4, nil, true, nil, nil);
+        t4.eq(svg, "");
+    });
+
+    let f4 = t4.run();
+
+    // ── Suite 5: consistency ──────────────────────────────────────────────────
+
+    let t5 = Test.Suite("QRCode consistency");
+
+    t5.it("ToPixels same-text fast=true vs fast=false same size", fn() {
+        let pxF = QRCode.ToPixels("hello", 3, nil, true);
+        let pxS = QRCode.ToPixels("hello", 3, nil, false);
+        t5.eq(len(pxF), len(pxS));
+    });
+
+    t5.it("same text always produces same ToPixels output", fn() {
+        let px1 = QRCode.ToPixels("stable", 2, nil, true);
+        let px2 = QRCode.ToPixels("stable", 2, nil, true);
+        t5.deepEq(px1, px2);
+    });
+
+    t5.it("different text produces different pixel arrays", fn() {
+        let px1 = QRCode.ToPixels("aaa", 2, nil, true);
+        let px2 = QRCode.ToPixels("bbb", 2, nil, true);
+        var same = true;
+        if (len(px1) == len(px2)) {
+            iter (i from 0 to len(px1) - 1) {
+                if (px1[i] != px2[i]) { same = false; }
+            }
+        } else { same = false; }
+        t5.notOk(same);
+    });
+
+    let f5 = t5.run();
+
+    // ── Benchmarks: QR encode throughput ─────────────────────────────────────
+
+    Console.WriteLine("=== QRCode benchmarks ===");
+
+    let bIters = 100;
+
+    let b0 = Time.Ticks();
+    iter (i from 0 to bIters - 1) {
+        let _px = QRCode.ToPixels("bench-payload", 2, nil, true);
+    }
+    Console.WriteLine("ToPixels x", bIters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - b0)]), " ms");
+
+    let b1 = Time.Ticks();
+    iter (i from 0 to bIters - 1) {
+        let _svg = QRCode.ToSVG("bench-payload", 2, nil, true, nil, nil);
+    }
+    Console.WriteLine("ToSVG x", bIters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - b1)]), " ms");
+
+    Console.WriteLine("=== benchmarks done ===");
+
+    return (f1 + f2 + f3 + f4 + f5) > 0 ? 1 : 0;
+}

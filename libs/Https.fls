@@ -1,0 +1,218 @@
+// ============================================================
+//  Https.fls - HTTPS client for Flaris
+//  Version: 1.0
+// ============================================================
+//
+// Https does NOT reimplement HTTP. It builds a TLS byte-transport and injects it
+// into the pure-Flaris HTTP/1.1 engine in Http.fls (Http.Request), so all framing,
+// chunked decoding, redirects, cookies, retries, and multipart support are shared
+// with Http - only the bytes on the wire are encrypted.
+//
+// SETUP
+// -----
+// None. TLS is provided by the built-in `Tls` module, which uses the operating
+// system's own TLS stack - no -u flag, no plugin, no OpenSSL install:
+//
+//      macOS    -> Secure Transport   (trust: Keychain)
+//      Linux    -> OpenSSL via dlopen (trust: system CA bundle)
+//      Windows  -> SChannel / SSPI    (trust: Windows certificate store)
+//
+//   import { Https } from library("Https", "1.0");
+//   let res = Https.Get("https://api.github.com/");   // just works
+//
+// Certificates and hostnames are verified by default (TLS >= 1.2). On Linux set
+// SSL_CERT_FILE / SSL_CERT_DIR if the default CA bundle is not where libssl looks.
+//
+// QUICK START
+// -----------
+//   import { Https, Status } from library("Https", "1.0");
+//
+//   let res = Https.Get("https://api.github.com/repos/openssl/openssl");
+//   if (res != nil && res.status == Status.OK) {
+//       let repo = Json.Parse(res.body);
+//       Console.WriteLine(repo.full_name);
+//   }
+//
+//   // An object/array body is JSON-encoded automatically (Content-Type: JSON);
+//   // pass a pre-built string to send it verbatim (form-encoded, multipart, ...).
+//   Https.Post("https://httpbin.org/post",
+//              { name: "Alice" },
+//              { "Authorization": "Bearer token" });
+//
+// API (mirrors Http; all return a response object or nil):
+//   Https.Get(url, headers?)
+//   Https.Post(url, body, headers?)      - object/array auto-JSON-encoded;
+//                                          string sent as-is; default Content-Type: JSON
+//   Https.Put(url, body, headers?)
+//   Https.Patch(url, body, headers?)
+//   Https.Delete(url, headers?)
+//   Https.Head(url, headers?)            - headers only, body is nil
+//   Https.Request(method, url, body, contentType, headers?)  - full control
+//
+// Self-signed / internal endpoints (skips certificate + hostname verification):
+//   Https.GetInsecure(url, headers?)
+//   Https.RequestInsecure(method, url, body, contentType, headers?)
+//
+// Async variants (genuinely non-blocking):
+//   Https.GetAsync / PostAsync / PutAsync / PatchAsync / QueryAsync / DeleteAsync
+//   Each returns a fiber and offloads the blocking TLS connect/read/write to the
+//   I/O thread pool, suspending only the calling fiber - so requests started
+//   together actually overlap. `await` the result (or Scheduler.Schedule several,
+//   then await each). https:// only.
+//
+// CROSS-SCHEME REDIRECTS
+// ----------------------
+// Https requests follow redirects to http:// as well; the engine downgrades to
+// the plain transport for those hops automatically.
+//
+// SECURITY
+// --------
+// Certificates and hostnames are verified by default (TLS >= 1.2). The OS trust
+// store is used; override the CA bundle with the SSL_CERT_FILE / SSL_CERT_DIR
+// environment variables. Use the *Insecure variants only against trusted hosts.
+//
+// TROUBLESHOOTING
+// ---------------
+//   throws "HTTPS requires ..."  - import Https (not Http) for https:// URLs
+//   throws "no TLS backend ..."  - built-in TLS unavailable on this build; on
+//                                  Linux this means libssl could not be loaded -
+//                                  install it (e.g. apt install libssl3)
+//   nil response                 - connection refused, TLS handshake failed, or
+//                                  cert verification failed; try GetInsecure to
+//                                  confirm it's a certificate issue
+// ============================================================
+
+import { Http, Status, ContentType, CookieJar, Multipart } from library("Http", "1.0");
+
+// Cached default (verifying) transport.
+global _httpsTransportSecure = nil;
+
+// Default TLS connect/read timeout in milliseconds. The built-in Tls module
+// defaults to 30s, which is too short for slow upstreams - notably LLM
+// completion APIs that routinely take 20-60s. Default to 2 minutes and let
+// callers raise it per-request (opts.timeoutMs) or globally (Https.SetTimeout).
+global _httpsTimeoutMs = 120000;
+
+class Https {
+
+    // Build a TLS transport bound to the given connect options.
+    //   opts: { insecure:bool, timeoutMs:int } (or nil for defaults)
+    //
+    // Uses the built-in Tls module (OS-native TLS: Secure Transport / OpenSSL /
+    // SChannel). It exposes a 6-closure transport shape the HTTP engine drives
+    // exactly like the plain-TCP one - only the bytes on the wire are encrypted.
+    fn static _buildTransport(opts) {
+        if (!Tls.Available()) {
+            throw(100, "Https: no TLS backend available on this build - the built-in " +
+                       "Tls module is unusable. On Linux this usually means libssl " +
+                       "could not be loaded; install it (e.g. apt install libssl3).");
+        }
+        let insecure  = (opts != nil && Object.HasKey(opts, "insecure"))  ? opts.insecure  : false;
+        let timeoutMs = (opts != nil && Object.HasKey(opts, "timeoutMs")) ? opts.timeoutMs : _httpsTimeoutMs;
+        return {
+            secure:   true,
+            connect:  fn(host, port) { let h = Tls.Connect(host, port, insecure, timeoutMs); return (h == 0) ? nil : h; },
+            write:    fn(c, d)       { Tls.Write(c, d); },
+            readLine: fn(c)          { return Tls.ReadLine(c); },
+            readN:    fn(c, n)       { return Tls.ReadN(c, n); },
+            readAll:  fn(c)          { return Tls.ReadAll(c); },
+            close:    fn(c)          { Tls.Close(c); },
+            // Async closures return fibers the HTTP engine awaits, so several
+            // requests overlap instead of blocking the scheduler one at a time.
+            connectAsync:  fn(host, port) { return Tls.ConnectAsync(host, port, insecure, timeoutMs); },
+            writeAsync:    fn(c, d)       { return Tls.WriteAsync(c, d); },
+            readLineAsync: fn(c)          { return Tls.ReadLineAsync(c); },
+            readNAsync:    fn(c, n)       { return Tls.ReadNAsync(c, n); },
+            readAllAsync:  fn(c)          { return Tls.ReadAllAsync(c); }
+        };
+    }
+
+    // Default verifying transport, cached for reuse across requests.
+    fn static _transport() {
+        if (_httpsTransportSecure != nil) { return _httpsTransportSecure; }
+        _httpsTransportSecure = Https._buildTransport(nil);
+        return _httpsTransportSecure;
+    }
+
+    // --------------------------------------------------------
+    //  Timeout configuration
+    // --------------------------------------------------------
+
+    // Set the default TLS connect/read timeout (ms) for all subsequent requests.
+    // Raise this for slow upstreams, e.g. long LLM generations:
+    //   Https.SetTimeout(300000);   // 5 minutes
+    fn static SetTimeout(ms:int) {
+        _httpsTimeoutMs = ms;
+        _httpsTransportSecure = nil;   // rebuild the cached transport with the new timeout
+    }
+
+    // Current default TLS connect/read timeout in milliseconds.
+    fn static GetTimeout() { return _httpsTimeoutMs; }
+
+    // Build a one-off verifying transport with custom options without changing
+    // the global default. Pass the result as the trailing transport argument to
+    // Http.Request for a per-request override:
+    //   Http.Request("POST", url, body, ContentType.JSON, headers,
+    //                Https.Transport({ timeoutMs: 300000 }));
+    //   opts: { insecure?:bool, timeoutMs?:int }
+    fn static Transport(opts) { return Https._buildTransport(opts); }
+
+    // --------------------------------------------------------
+    //  Public API (certificate-verifying)
+    // --------------------------------------------------------
+
+    fn static Request(method:string, url:string, body, contentType, headers?) {
+        return Http.Request(method, url, body, contentType, headers ?? nil, Https._transport());
+    }
+
+    fn static Get(url:string, headers?)           { return Http.Request("GET",    url, nil,  nil,              headers ?? nil, Https._transport()); }
+    fn static Post(url:string, body, headers?)    { return Http.Request("POST",   url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static Put(url:string, body, headers?)     { return Http.Request("PUT",    url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static Patch(url:string, body, headers?)   { return Http.Request("PATCH",  url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static Query(url:string, body, headers?)   { return Http.Request("QUERY",  url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static Delete(url:string, headers?)        { return Http.Request("DELETE", url, nil,  nil,              headers ?? nil, Https._transport()); }
+
+    fn static Head(url:string, headers?) {
+        let res = Http.Request("HEAD", url, nil, nil, headers ?? nil, Https._transport());
+        if (res == nil) { return nil; }
+        return { status: res.status, headers: res.headers };
+    }
+
+    // --------------------------------------------------------
+    //  Insecure variants - skip certificate / hostname verification.
+    //  Use only against hosts you trust (self-signed dev servers etc.).
+    // --------------------------------------------------------
+
+    fn static RequestInsecure(method:string, url:string, body, contentType, headers?) {
+        return Http.Request(method, url, body, contentType, headers ?? nil,
+                            Https._buildTransport({ insecure: true }));
+    }
+
+    fn static GetInsecure(url:string, headers?) {
+        return Http.Request("GET", url, nil, nil, headers ?? nil,
+                            Https._buildTransport({ insecure: true }));
+    }
+
+    // --------------------------------------------------------
+    //  Async variants - genuinely non-blocking.
+    //
+    //  Each returns a fiber that suspends only the calling fiber at every TLS
+    //  connect/read/write (via the transport's *Async closures over Tls.*Async),
+    //  so requests started together overlap. `await` the result, or schedule
+    //  several and await them all:
+    //      let a = Https.GetAsync(u1);
+    //      let b = Https.GetAsync(u2);
+    //      Scheduler.Schedule(a); Scheduler.Schedule(b);
+    //      let ra = await a; let rb = await b;   // ran concurrently
+    // --------------------------------------------------------
+
+    fn static GetAsync(url:string, headers?)         { return Http.RequestAsync("GET",    url, nil,  nil,              headers ?? nil, Https._transport()); }
+    fn static PostAsync(url:string, body, headers?)  { return Http.RequestAsync("POST",   url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static PutAsync(url:string, body, headers?)   { return Http.RequestAsync("PUT",    url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static PatchAsync(url:string, body, headers?) { return Http.RequestAsync("PATCH",  url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static QueryAsync(url:string, body, headers?) { return Http.RequestAsync("QUERY",  url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
+    fn static DeleteAsync(url:string, headers?)      { return Http.RequestAsync("DELETE", url, nil,  nil,              headers ?? nil, Https._transport()); }
+}
+
+// Re-export Http's helpers so callers can `import { Https, Status, CookieJar } from library("Https","1.0")`.
+export { Https, Status, ContentType, CookieJar, Multipart };

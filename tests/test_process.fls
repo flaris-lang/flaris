@@ -1,0 +1,178 @@
+// test_process.fls - Test suite for Process.fls
+// Run: flarisvm tests/test_process.fls --libs='./libs'
+
+import { Run, Shell, Spawn } from library("Process", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn check(label: string, cond: bool) {
+    if (cond) {
+        passed = passed + 1;
+    } else {
+        failed = failed + 1;
+        Console.WriteLine("[FAIL] " + label);
+    }
+}
+
+// ============================================================
+
+fn test_run_basic() {
+    Console.WriteLine("--- 1. Run basic ---");
+    let r = Run("echo", ["hello"]);
+    check("Run returns object",       r != nil);
+    check("Run exit 0",               r.Exit == 0);
+    check("Run stdout has text",      String.IndexOf(r.Stdout, "hello") >= 0);
+    check("Run stderr empty",         r.Stderr == "");
+}
+
+fn test_run_nonzero() {
+    Console.WriteLine("--- 2. Run non-zero exit ---");
+    let r = Run("ls", ["/path_that_does_not_exist_xyz"]);
+    check("Run non-zero exit != 0",   r.Exit != 0);
+    check("Run stderr not empty",     String.Length(r.Stderr) > 0);
+    check("Run stdout empty",         r.Stdout == "");
+}
+
+fn test_run_not_found() {
+    Console.WriteLine("--- 3. Run command not found ---");
+    let r = Run("__cmd_that_does_not_exist__");
+    check("Run no-cmd exit 127",      r.Exit == 127);
+}
+
+fn test_shell_basic() {
+    Console.WriteLine("--- 4. Shell basic ---");
+    let r = Shell("echo shelltest");
+    check("Shell exit 0",             r.Exit == 0);
+    check("Shell stdout has output",  String.IndexOf(r.Stdout, "shelltest") >= 0);
+}
+
+fn test_shell_pipeline() {
+    Console.WriteLine("--- 5. Shell pipeline ---");
+    let r = Shell("printf 'a\\nb\\nc\\n' | wc -l");
+    check("Shell pipeline exit 0",    r.Exit == 0);
+    check("Shell pipeline count 3",   String.IndexOf(r.Stdout, "3") >= 0);
+}
+
+fn test_spawn_readline() {
+    Console.WriteLine("--- 6. Spawn ReadLine ---");
+    let p = Spawn("printf", ["line1\\nline2\\nline3\\n"]);
+    check("Spawn returns Process",    p != nil);
+    let l1 = p.ReadLine();
+    let l2 = p.ReadLine();
+    let l3 = p.ReadLine();
+    let l4 = p.ReadLine();
+    check("ReadLine l1",              l1 == "line1");
+    check("ReadLine l2",              l2 == "line2");
+    check("ReadLine l3",              l3 == "line3");
+    check("ReadLine EOF is nil",      l4 == nil);
+    p.Close();
+}
+
+fn test_spawn_stdin() {
+    Console.WriteLine("--- 7. Spawn stdin/stdout ---");
+    let p = Spawn("cat");
+    p.Write("alpha\n");
+    p.Write("beta\n");
+    p.CloseStdin();
+    let a = p.ReadLine();
+    let b = p.ReadLine();
+    let c = p.ReadLine();
+    check("Write+ReadLine a",         a == "alpha");
+    check("Write+ReadLine b",         b == "beta");
+    check("Write+ReadLine EOF nil",   c == nil);
+    p.Close();
+}
+
+fn test_spawn_wait() {
+    Console.WriteLine("--- 8. Spawn Wait + exit code ---");
+    let p = Spawn("sh", ["-c", "exit 42"]);
+    let code = p.Wait();
+    check("Wait exit code 42",        code == 42);
+    check("IsAlive false after Wait", !p.IsAlive());
+    p.Close();
+}
+
+fn test_spawn_kill() {
+    Console.WriteLine("--- 9. Spawn Kill + IsAlive ---");
+    let p = Spawn("sleep", ["5"]);
+    check("IsAlive true initially",   p.IsAlive());
+    p.Kill();
+    Os.Wait(p.Pid());
+    check("IsAlive false after Kill", !p.IsAlive());
+    p.Close();
+}
+
+fn test_spawn_stderr() {
+    Console.WriteLine("--- 10. Spawn stderr ---");
+    let p = Spawn("sh", ["-c", "echo err_msg >&2"]);
+    p.Wait();
+    let line = p.ReadLineErr();
+    check("ReadLineErr captures stderr", line == "err_msg");
+    p.Close();
+}
+
+fn test_getenv_all() {
+    Console.WriteLine("--- 11. Os.GetEnvAll ---");
+    let env = Os.GetEnvAll();
+    check("GetEnvAll not nil",       env != nil);
+    check("GetEnvAll has PATH",      env.PATH != nil);
+    check("GetEnvAll has HOME",      env.HOME != nil);
+    check("HOME matches Getenv",     env.HOME == Os.Getenv("HOME"));
+}
+
+fn test_run_multiline() {
+    Console.WriteLine("--- 12. Run multiline stdout ---");
+    let r = Run("printf", ["a\\nb\\nc\\n"]);
+    check("Multiline exit 0",        r.Exit == 0);
+    let lines = String.Split(r.Stdout, "\n");
+    check("Multiline line 0",        lines[0] == "a");
+    check("Multiline line 1",        lines[1] == "b");
+    check("Multiline line 2",        lines[2] == "c");
+}
+
+// ============================================================
+// Benchmarks (subprocess spawn cost - keep iteration count low)
+// ============================================================
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Process benchmarks ===");
+
+    let iters = 10;
+
+    let t0 = Time.Ticks();
+    iter (i from 0 to iters - 1) {
+        let _r = Run("echo", ["hi"]);
+    }
+    Console.WriteLine("Run echo x", iters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    let t1 = Time.Ticks();
+    iter (i from 0 to iters - 1) {
+        let _r = Shell("echo hi");
+    }
+    Console.WriteLine("Shell echo x", iters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t1)]), " ms");
+
+    Console.WriteLine("=== benchmarks done ===");
+}
+
+fn Main() {
+    test_run_basic();
+    test_run_nonzero();
+    test_run_not_found();
+    test_shell_basic();
+    test_shell_pipeline();
+    test_spawn_readline();
+    test_spawn_stdin();
+    test_spawn_wait();
+    test_spawn_kill();
+    test_spawn_stderr();
+    test_getenv_all();
+    test_run_multiline();
+    test_benchmarks();
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + passed + " passed, " + failed + " failed.");
+    if (failed > 0) { return 1; }
+}

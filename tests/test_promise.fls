@@ -1,0 +1,539 @@
+// promise_test.fls - Expanded test suite for Promise.fls
+// Run: flarisvm promise_test.fls --libs='./libs'
+
+import {Promise} from library("Promise", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global finallyHits = 0;
+global _sink       = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + " expected=" + str(expected) + " got=" + str(actual));
+    }
+}
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+// Shared callbacks
+fn double(v) { return v * 2; }
+fn addTen(v) { return v + 10; }
+fn toString(v) { return str(v); }
+fn recoverWith99(_v) { return 99; }
+fn triple(v) { return v * 3; }
+fn recoverZero(_v) { return 0; }
+fn markFinally() { finallyHits = finallyHits + 1; }
+
+// Fiber workers
+fn workerBench() {
+    let pid = Promise.ReceiveId();
+    Promise.Notify(pid, 42);
+}
+
+fn workerResolve() {
+    let pid = Promise.ReceiveId();
+    Fiber.Sleep(10);
+    Promise.Notify(pid, 1234);
+}
+
+fn workerReject() {
+    let pid = Promise.ReceiveId();
+    Fiber.Sleep(10);
+    Promise.Fail(pid, "fiber-error");
+}
+
+fn workerSlow2() {
+    let pid = Promise.ReceiveId();
+    Fiber.Sleep(200);
+    Promise.Notify(pid, "late");
+}
+
+fn workerA() { let pid = Promise.ReceiveId(); Fiber.Sleep(5);  Promise.Notify(pid, "a"); }
+fn workerB() { let pid = Promise.ReceiveId(); Fiber.Sleep(10); Promise.Notify(pid, "b"); }
+fn workerC() { let pid = Promise.ReceiveId(); Fiber.Sleep(2);  Promise.Notify(pid, "c"); }
+
+fn workerFast() { let pid = Promise.ReceiveId(); Fiber.Sleep(2);  Promise.Notify(pid, "fast"); }
+fn workerSlow() { let pid = Promise.ReceiveId(); Fiber.Sleep(50); Promise.Notify(pid, "slow"); }
+
+fn workerCancelId() {
+    let pid = Promise.ReceiveId();
+    Fiber.Sleep(5);
+    Promise.CancelId(pid, "cancel-from-worker");
+}
+
+fn workerRetryFail() {
+    throw(1, "always fails");
+}
+
+global _retryAttempts = 0;
+fn workerRetrySucceedOnThird() {
+    _retryAttempts = _retryAttempts + 1;
+    if (_retryAttempts < 3) { throw(1, "not yet"); }
+    return "ok-on-third";
+}
+
+fn workerAnyFast()   { let pid = Promise.ReceiveId(); Fiber.Sleep(5);  Promise.Notify(pid, "fast-ok"); }
+fn workerAnyReject() { let pid = Promise.ReceiveId(); Fiber.Sleep(2);  Promise.Fail(pid, "rejected"); }
+fn workerAnySlow()   { let pid = Promise.ReceiveId(); Fiber.Sleep(20); Promise.Notify(pid, "slow-ok"); }
+
+// 1. Basic
+fn test_basic() {
+    Console.WriteLine("== Basic resolve/reject ==");
+
+    let p1 = new Promise();
+    p1.Resolve(42);
+    check(p1.IsResolved(), "p1 resolved");
+    checkEq(p1.Value(), 42, "p1 value");
+    checkEq(p1.State(), "resolved", "p1 state");
+
+    let p2 = new Promise();
+    p2.Reject("oops");
+    check(p2.IsRejected(), "p2 rejected");
+    checkEq(p2.Value(), "oops", "p2 value");
+
+    let p3 = new Promise();
+    check(p3.IsPending(), "p3 pending");
+    check(!p3.IsSettled(), "p3 not settled");
+
+    p1.Resolve(99);
+    checkEq(p1.Value(), 42, "double resolve ignored");
+}
+
+// 2. Static ctors
+fn test_static_ctors() {
+    Console.WriteLine("== Static constructors ==");
+
+    let pr = Promise.Resolved("hello");
+    check(pr.IsResolved(), "Resolved() resolved");
+    checkEq(pr.Value(), "hello", "Resolved() value");
+
+    let pj = Promise.Rejected("fail");
+    check(pj.IsRejected(), "Rejected() rejected");
+    checkEq(pj.Value(), "fail", "Rejected() value");
+
+    let pc = Promise.Canceled("stop");
+    check(pc.IsCanceled(), "Canceled() canceled");
+    checkEq(pc.Value(), "stop", "Canceled() value");
+
+    let pf = Promise.From(88);
+    check(pf.IsResolved(), "From() resolved");
+    checkEq(pf.Value(), 88, "From() value");
+}
+
+// 3. Then
+fn test_then_presettled() {
+    Console.WriteLine("== Then ==");
+
+    let p  = Promise.Resolved(5);
+    let p2 = p.Then(double);
+    checkEq(p2.Value(), 10, "Then double");
+
+    let p3 = p.Then(double).Then(addTen);
+    checkEq(p3.Value(), 20, "Then chain");
+
+    let p4 = Promise.Resolved(7).Then(double).Then(toString);
+    checkEq(p4.Value(), "14", "Then to string");
+}
+
+// 4. Catch
+fn test_catch_presettled() {
+    Console.WriteLine("== Catch ==");
+
+    let p  = Promise.Rejected("err");
+    let p2 = p.Catch(recoverWith99);
+    check(p2.IsResolved(), "Catch recovers");
+    checkEq(p2.Value(), 99, "Catch value");
+
+    let p3 = Promise.Canceled("bye");
+    let p4 = p3.Catch(recoverWith99);
+    check(p4.IsResolved(), "Catch also recovers canceled");
+    checkEq(p4.Value(), 99, "Catch canceled value");
+
+    let p5 = Promise.Rejected("passthru");
+    let p6 = p5.Then(double);
+    check(p6.IsRejected(), "rejection propagates through Then");
+    checkEq(p6.Value(), "passthru", "propagated rejection value");
+}
+
+// 5. Then async dispatch
+fn test_then_async_dispatch() {
+    Console.WriteLine("== Then async dispatch ==");
+
+    let p  = new Promise();
+    let p2 = p.Then(double);
+    check(p2.IsPending(), "p2 pending before resolve");
+
+    p.Resolve(6);
+
+    checkEq(p2.Value(), 12, "Then dispatched");
+    check(p2.IsResolved(), "p2 resolved");
+}
+
+// 6. ThenCatch
+fn test_then_catch() {
+    Console.WriteLine("== ThenCatch ==");
+
+    let p1 = Promise.Resolved(4).ThenCatch(triple, recoverZero);
+    check(p1.IsResolved(), "ThenCatch fulfilled path");
+    checkEq(p1.Value(), 12, "ThenCatch fulfilled value");
+
+    let p2 = Promise.Rejected("err").ThenCatch(triple, recoverZero);
+    check(p2.IsResolved(), "ThenCatch rejected path");
+    checkEq(p2.Value(), 0, "ThenCatch recovery");
+
+    let pa  = new Promise();
+    let pa2 = pa.ThenCatch(double, recoverZero);
+    check(pa2.IsPending(), "ThenCatch pending");
+    pa.Resolve(5);
+    checkEq(pa2.Value(), 10, "ThenCatch async resolved");
+
+    let pb  = new Promise();
+    let pb2 = pb.ThenCatch(double, recoverZero);
+    pb.Reject("fail");
+    checkEq(pb2.Value(), 0, "ThenCatch async rejected");
+}
+
+// 7. Finally
+fn test_finally() {
+    Console.WriteLine("== Finally ==");
+
+    finallyHits = 0;
+
+    let p1 = Promise.Resolved(1).Finally(markFinally);
+    check(p1.IsResolved(), "Finally preserves resolved");
+    checkEq(p1.Value(), 1, "Finally resolved value");
+    checkEq(finallyHits, 1, "Finally hit once");
+
+    let p2 = Promise.Rejected("x").Finally(markFinally);
+    check(p2.IsRejected(), "Finally preserves rejected");
+    checkEq(p2.Value(), "x", "Finally rejected value");
+    checkEq(finallyHits, 2, "Finally hit twice");
+
+    let p3 = Promise.Canceled("stop").Finally(markFinally);
+    check(p3.IsCanceled(), "Finally preserves canceled");
+    checkEq(p3.Value(), "stop", "Finally canceled value");
+    checkEq(finallyHits, 3, "Finally hit thrice");
+}
+
+// 8. Timeout / CancelAfter
+fn test_timeout_cancel() {
+    Console.WriteLine("== Timeout / CancelAfter ==");
+
+    let p = Promise.Run(workerSlow2);
+    p.Timeout(20);
+
+    let caught = false;
+    let msg = "";
+    try {
+        p.Await();
+    } catch (e) {
+        caught = true;
+        msg = str(e.Error);
+    }
+    check(caught, "Timeout rejects");
+    check(String.Contains(msg, "timeout"), "Timeout message");
+
+    let p2 = Promise.Run(workerResolve);
+    p2.Timeout(500);
+    let v = p2.Await();
+    checkEq(v, 1234, "Timeout does not fire when resolved first");
+
+    let p3 = Promise.Delay(200, "never");
+    p3.CancelAfter(20);
+    let caught3 = false;
+    let msg3 = "";
+    try {
+        p3.Await();
+    } catch (e) {
+        caught3 = true;
+        msg3 = str(e.Error);
+    }
+    check(caught3, "CancelAfter throws");
+    check(String.Contains(msg3, "canceled"), "CancelAfter message");
+}
+
+// 9. Await / TryAwait / AwaitResult
+fn test_waiters() {
+    Console.WriteLine("== Await / TryAwait / AwaitResult ==");
+
+    let p = Promise.Run(workerResolve);
+    let v = p.Await();
+    checkEq(v, 1234, "Await resolved");
+
+    let p2 = Promise.Run(workerReject);
+    let caught = false;
+    try { p2.Await(); } catch (e) { caught = true; }
+    check(caught, "Await throws on rejection");
+
+    let p3 = Promise.Rejected("x");
+    checkEq(p3.TryAwait(77), 77, "TryAwait default on reject");
+
+    let p4 = Promise.Resolved(55);
+    checkEq(p4.TryAwait(77), 55, "TryAwait resolved");
+
+    let r1 = Promise.Resolved(9).AwaitResult();
+    check(r1.ok, "AwaitResult ok true");
+    checkEq(r1.state, "resolved", "AwaitResult resolved state");
+    checkEq(r1.value, 9, "AwaitResult resolved value");
+
+    let r2 = Promise.Canceled("stop").AwaitResult();
+    check(!r2.ok, "AwaitResult ok false on canceled");
+    checkEq(r2.state, "canceled", "AwaitResult canceled state");
+    checkEq(r2.value, "stop", "AwaitResult canceled value");
+}
+
+// 10. Delay / RejectAfter / CancelAfterNew
+fn test_delayed_factories() {
+    Console.WriteLine("== Delayed factories ==");
+
+    let p1 = Promise.Delay(10, "done");
+    checkEq(p1.Await(), "done", "Delay resolves");
+
+    let p2 = Promise.RejectAfter(10, "no");
+    let caught2 = false;
+    try { p2.Await(); } catch (e) { caught2 = true; }
+    check(caught2, "RejectAfter rejects");
+
+    let p3 = Promise.CancelAfterNew(10, "stop");
+    let caught3 = false;
+    try { p3.Await(); } catch (e) { caught3 = true; }
+    check(caught3, "CancelAfterNew cancels");
+}
+
+// 11. All
+fn test_all() {
+    Console.WriteLine("== Promise.All ==");
+
+    let results = Promise.All([Promise.Run(workerA), Promise.Run(workerB), Promise.Run(workerC)]);
+    checkEq(len(results), 3, "All length");
+    checkEq(results[0], "a", "All[0]");
+    checkEq(results[1], "b", "All[1]");
+    checkEq(results[2], "c", "All[2]");
+
+    let r2 = Promise.All([Promise.Resolved(10), Promise.Resolved(20), Promise.Resolved(30)]);
+    checkEq(r2[0], 10, "All pre-resolved[0]");
+    checkEq(r2[1], 20, "All pre-resolved[1]");
+    checkEq(r2[2], 30, "All pre-resolved[2]");
+
+    checkEq(len(Promise.All([])), 0, "All empty");
+
+    let failed = false;
+    try { Promise.All([Promise.Resolved(1), Promise.Rejected("nope")]); } catch (e) { failed = true; }
+    check(failed, "All throws on rejection");
+
+    let canceled = false;
+    try { Promise.All([Promise.Resolved(1), Promise.Canceled("stop")]); } catch (e) { canceled = true; }
+    check(canceled, "All throws on cancellation");
+}
+
+// 12. Race / FirstSettled
+fn test_race_first_settled() {
+    Console.WriteLine("== Race / FirstSettled ==");
+
+    checkEq(Promise.Race([Promise.Run(workerFast), Promise.Run(workerSlow)]), "fast", "Race fastest");
+    checkEq(Promise.Race([Promise.Resolved("first"), Promise.Resolved("second")]), "first", "Race first pre-settled");
+
+    let raceFailed = false;
+    try { Promise.Race([Promise.Rejected("bad"), Promise.Resolved("ok")]); } catch (e) { raceFailed = true; }
+    check(raceFailed, "Race throws on rejection");
+
+    let fs = Promise.FirstSettled([Promise.RejectAfter(5, "x"), Promise.Delay(20, "y")]);
+    checkEq(fs.state, "rejected", "FirstSettled state");
+    checkEq(fs.value, "x", "FirstSettled value");
+}
+
+// 13. AllSettled
+fn test_all_settled() {
+    Console.WriteLine("== AllSettled ==");
+
+    let results = Promise.AllSettled([
+        Promise.Resolved(1),
+        Promise.Rejected("err"),
+        Promise.Canceled("stop"),
+        Promise.Resolved(3)
+    ]);
+
+    checkEq(len(results), 4, "AllSettled length");
+    checkEq(results[0].state, "resolved", "AllSettled[0].state");
+    checkEq(results[1].state, "rejected", "AllSettled[1].state");
+    checkEq(results[2].state, "canceled", "AllSettled[2].state");
+    checkEq(results[3].state, "resolved", "AllSettled[3].state");
+
+    checkEq(results[2].value, "stop", "AllSettled canceled value");
+}
+
+// 14. Retry
+fn test_retry() {
+    Console.WriteLine("== Retry ==");
+
+    // Function that always succeeds on first call
+    let retryOk = Promise.Retry(fn() { return "success"; }, 3, 0);
+    checkEq(retryOk.Await(), "success", "Retry: succeeds immediately");
+
+    // Function that always fails - Retry exhausts all attempts and rejects
+    let retryAlwaysFail = Promise.Retry(fn() { throw(1, "permanent"); }, 3, 0);
+    let failCaught = false;
+    try {
+        retryAlwaysFail.Await();
+    } catch (e) {
+        failCaught = true;
+    }
+    check(failCaught, "Retry: always-failing fn rejects after max attempts");
+    check(retryAlwaysFail.IsRejected(), "Retry: promise is rejected after exhaustion");
+
+    // Global counter for fail-then-succeed scenario
+    _retryAttempts = 0;
+    let retryEventual = Promise.Retry(workerRetrySucceedOnThird, 5, 0);
+    checkEq(retryEventual.Await(), "ok-on-third", "Retry: succeeds on third attempt");
+    checkEq(_retryAttempts, 3, "Retry: fn was called exactly 3 times");
+}
+
+// 15. Any
+fn test_any() {
+    Console.WriteLine("== Promise.Any ==");
+
+    let v = Promise.Any([
+        Promise.Rejected("x"),
+        Promise.Resolved("winner"),
+        Promise.Resolved("third")
+    ]);
+    checkEq(v, "winner", "Any first resolved wins");
+
+    let failed = false;
+    try { Promise.Any([Promise.Rejected("a"), Promise.Canceled("b")]); } catch (e) { failed = true; }
+    check(failed, "Any all failed throws");
+
+    let emptyFailed = false;
+    try { Promise.Any([]); } catch (e) { emptyFailed = true; }
+    check(emptyFailed, "Any empty throws");
+
+    let result = Promise.Any([Promise.Run(workerAnyReject), Promise.Run(workerAnyFast)]);
+    checkEq(result, "fast-ok", "Any ignores rejection");
+
+    let r2 = Promise.Any([Promise.Run(workerAnySlow), Promise.Run(workerAnyFast)]);
+    checkEq(r2, "fast-ok", "Any fastest resolve");
+}
+
+fn bench_promises() {
+    Console.WriteLine("\n\n=== Promise Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ Construction & settlement ]");
+    bench("Promise.Resolved(v)", fn() {
+        let p = Promise.Resolved(42); _sink = _sink + 1;
+    }, 5000);
+    bench("new Promise + Resolve", fn() {
+        let p = new Promise(); p.Resolve(42); _sink = _sink + 1;
+    }, 5000);
+    bench("new Promise + Reject", fn() {
+        let p = new Promise(); p.Reject("err"); _sink = _sink + 1;
+    }, 5000);
+    bench("Promise.Resolved + Await", fn() {
+        let v = Promise.Resolved(42).Await(); _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ Then chains (pre-settled) ]");
+    bench("Then depth 1", fn() {
+        let p = Promise.Resolved(5).Then(double); _sink = _sink + 1;
+    }, 5000);
+    bench("Then depth 3", fn() {
+        let p = Promise.Resolved(5).Then(double).Then(addTen).Then(double); _sink = _sink + 1;
+    }, 3000);
+    bench("ThenCatch (fulfilled path)", fn() {
+        let p = Promise.Resolved(5).ThenCatch(double, recoverZero); _sink = _sink + 1;
+    }, 5000);
+    bench("Catch on rejected", fn() {
+        let p = Promise.Rejected("x").Catch(recoverWith99); _sink = _sink + 1;
+    }, 5000);
+    bench("Finally on resolved", fn() {
+        let p = Promise.Resolved(5).Finally(markFinally); _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ Combinators (pre-settled) ]");
+    bench("All([5 resolved])", fn() {
+        let r = Promise.All([
+            Promise.Resolved(1), Promise.Resolved(2), Promise.Resolved(3),
+            Promise.Resolved(4), Promise.Resolved(5)
+        ]); _sink = _sink + 1;
+    }, 2000);
+    bench("AllSettled([5 mixed])", fn() {
+        let r = Promise.AllSettled([
+            Promise.Resolved(1), Promise.Rejected("x"), Promise.Resolved(3),
+            Promise.Canceled("c"), Promise.Resolved(5)
+        ]); _sink = _sink + 1;
+    }, 2000);
+    bench("Any([rejected, resolved])", fn() {
+        let v = Promise.Any([Promise.Rejected("x"), Promise.Resolved("ok")]); _sink = _sink + 1;
+    }, 2000);
+    bench("Race([2 pre-settled])", fn() {
+        let v = Promise.Race([Promise.Resolved("a"), Promise.Resolved("b")]); _sink = _sink + 1;
+    }, 2000);
+
+    Console.WriteLine("\n[ Fiber round-trip ]");
+    bench("Promise.Run(instant worker) + Await", fn() {
+        let v = Promise.Run(workerBench).Await(); _sink = _sink + 1;
+    }, 200);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+}
+
+// Main
+fn async Main() {
+    Console.WriteLine("=== Promise.fls test start ===");
+
+    test_basic();
+    test_static_ctors();
+    test_then_presettled();
+    test_catch_presettled();
+    test_then_async_dispatch();
+    test_then_catch();
+    test_finally();
+    test_timeout_cancel();
+    test_waiters();
+    test_delayed_factories();
+    test_all();
+    test_race_first_settled();
+    test_all_settled();
+    test_retry();
+    test_any();
+
+    Console.WriteLine("=== Promise.fls test done ===");
+    Console.WriteLine("Tests run: " + str(testsRun) + "  failed: " + str(testsFailed));
+
+    if (testsFailed == 0) {
+        Console.Ok("All tests passed!");
+    } else {
+        Console.Error("Some tests FAILED.");
+    }
+
+    bench_promises();
+
+    return testsFailed;
+}

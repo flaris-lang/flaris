@@ -1,0 +1,670 @@
+// test_argparse.fls - Tests for Argparse.fls
+// Run: flarisvm tests/test_argparse.fls --libs='./libs'
+
+import { ArgumentParser } from library("Argparse", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expected, " got=", actual);
+    }
+    return 0;
+}
+
+// Compare an array result by its JSON form so element order and type both count.
+fn checkArr(actual, expectedJson: string, msg) {
+    testsRun = testsRun + 1;
+    let got = Json.Stringify(actual);
+    if (got != expectedJson) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expectedJson, " got=", got);
+    }
+    return 0;
+}
+
+// A parser that raises instead of exiting, so error paths are testable.
+fn strictParser(prog: string) {
+    return new ArgumentParser({ prog: prog, exitOnError: false, addHelp: false });
+}
+
+// Run ParseArgs expecting a usage error; returns the message, or "" if none.
+fn expectError(p, argv: array): string {
+    try {
+        p.ParseArgs(argv);
+    } catch (e) {
+        return e.Error;
+    }
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// Basic store + defaults
+// ---------------------------------------------------------------------------
+fn test_store_and_defaults() {
+    Console.WriteLine("== store / defaults ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--name", { help: "a name" });
+    p.AddArgument("--count", { type: "int", defaultValue: 7, help: "count" });
+
+    let a = p.ParseArgs(["--name", "alice"]);
+    checkEq(a.name, "alice", "--name value");
+    checkEq(a.count, 7, "default applied when absent");
+
+    let b = p.ParseArgs(["--name=bob", "--count=3"]);
+    checkEq(b.name, "bob", "--name=value form");
+    checkEq(b.count, 3, "--count=value converted to int");
+
+    // Absent argument with no declared default is nil, but the key still exists.
+    let c = p.ParseArgs([]);
+    checkEq(c.name, nil, "absent option is nil");
+    check(Object.HasKey(c, "name"), "namespace always has the key");
+
+    // Parsers are reusable: a second parse must not see the first one's state.
+    let d = p.ParseArgs([]);
+    checkEq(d.count, 7, "reused parser resets to defaults");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Flag actions: store_true / store_false / store_const / count
+// ---------------------------------------------------------------------------
+fn test_flag_actions() {
+    Console.WriteLine("== flag actions ==");
+
+    let p = strictParser("t");
+    p.AddArgument(["-v", "--verbose"], { action: "store_true",  help: "on" });
+    p.AddArgument("--no-cache",        { action: "store_false", help: "off" });
+    p.AddArgument("--level",           { action: "store_const", constValue: 42, help: "const" });
+    p.AddArgument(["-d", "--debug"],   { action: "count",       help: "repeatable" });
+
+    let a = p.ParseArgs([]);
+    checkEq(a.verbose,  false, "store_true default false");
+    checkEq(a.no_cache, true,  "store_false default true");
+    checkEq(a.level,    nil,   "store_const default nil");
+    checkEq(a.debug,    0,     "count default 0");
+
+    let b = p.ParseArgs(["-v", "--no-cache", "--level"]);
+    checkEq(b.verbose,  true,  "store_true sets true");
+    checkEq(b.no_cache, false, "store_false sets false");
+    checkEq(b.level,    42,    "store_const stores const");
+
+    let c = p.ParseArgs(["-d", "-d", "-d"]);
+    checkEq(c.debug, 3, "count accumulates");
+
+    // dest derives from the long flag with '-' folded to '_'.
+    check(Object.HasKey(b, "no_cache"), "dest derived as no_cache");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// append
+// ---------------------------------------------------------------------------
+fn test_append() {
+    Console.WriteLine("== append ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--tag", { action: "append", help: "tag" });
+    p.AddArgument("--num", { action: "append", type: "int", help: "num" });
+
+    let a = p.ParseArgs([]);
+    checkEq(a.tag, nil, "append default nil when never given");
+
+    let b = p.ParseArgs(["--tag", "x", "--tag", "y", "--tag=z"]);
+    checkArr(b.tag, "[\"x\",\"y\",\"z\"]", "append collects in order");
+
+    let c = p.ParseArgs(["--num", "1", "--num", "2"]);
+    checkArr(c.num, "[1,2]", "append converts each value");
+
+    // A fresh parse must start from an empty list, not extend the previous one.
+    let d = p.ParseArgs(["--tag", "only"]);
+    checkArr(d.tag, "[\"only\"]", "append list is per-parse");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Type conversion
+// ---------------------------------------------------------------------------
+fn test_types() {
+    Console.WriteLine("== types ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--i", { type: "int",   help: "i" });
+    p.AddArgument("--f", { type: "float", help: "f" });
+    p.AddArgument("--b", { type: "bool",  help: "b" });
+
+    let a = p.ParseArgs(["--i", "-5", "--f", "2.5", "--b", "yes"]);
+    checkEq(a.i, -5,   "int accepts a negative value");
+    checkEq(a.f, 2.5,  "float parsed");
+    checkEq(a.b, true, "bool 'yes' is true");
+
+    checkEq(p.ParseArgs(["--b", "off"]).b,   false, "bool 'off' is false");
+    checkEq(p.ParseArgs(["--b", "1"]).b,     true,  "bool '1' is true");
+    checkEq(p.ParseArgs(["--b", "FALSE"]).b, false, "bool is case-insensitive");
+
+    let e1 = expectError(strictIntParser(), ["--i", "notanint"]);
+    check(String.Contains(e1, "invalid int value"), "bad int reports invalid int value");
+
+    let e2 = expectError(strictFloatParser(), ["--f", "abc"]);
+    check(String.Contains(e2, "invalid float value"), "bad float reports invalid float value");
+    return 0;
+}
+
+fn strictIntParser() {
+    let p = strictParser("t");
+    p.AddArgument("--i", { type: "int", help: "i" });
+    return p;
+}
+
+fn strictFloatParser() {
+    let p = strictParser("t");
+    p.AddArgument("--f", { type: "float", help: "f" });
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// choices
+// ---------------------------------------------------------------------------
+fn test_choices() {
+    Console.WriteLine("== choices ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--mode", { choices: ["fast", "slow"], defaultValue: "fast", help: "mode" });
+
+    checkEq(p.ParseArgs([]).mode,               "fast", "choices default");
+    checkEq(p.ParseArgs(["--mode", "slow"]).mode, "slow", "valid choice accepted");
+
+    let p2 = strictParser("t");
+    p2.AddArgument("--mode", { choices: ["fast", "slow"], help: "mode" });
+    let e = expectError(p2, ["--mode", "sideways"]);
+    check(String.Contains(e, "invalid choice"), "invalid choice rejected");
+
+    // Choices are compared after type conversion, so ints match ints.
+    let p3 = strictParser("t");
+    p3.AddArgument("--n", { type: "int", choices: [1, 2, 3], help: "n" });
+    checkEq(p3.ParseArgs(["--n", "2"]).n, 2, "int choice accepted after conversion");
+    check(String.Contains(expectError(p3, ["--n", "9"]), "invalid choice"),
+          "out-of-set int choice rejected");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// nargs on options
+// ---------------------------------------------------------------------------
+fn test_nargs_options() {
+    Console.WriteLine("== nargs (options) ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--pair", { nargs: 2, help: "two" });
+    p.AddArgument("--many", { nargs: "*", help: "any" });
+    p.AddArgument("--some", { nargs: "+", help: "one or more" });
+    p.AddArgument("--opt",  { nargs: "?", constValue: "C", defaultValue: "D", help: "optional" });
+
+    checkArr(p.ParseArgs(["--pair", "a", "b"]).pair, "[\"a\",\"b\"]", "nargs=2 collects two");
+    checkArr(p.ParseArgs(["--many"]).many,           "[]",            "nargs=* accepts zero");
+    checkArr(p.ParseArgs(["--many", "a", "b", "c"]).many,
+             "[\"a\",\"b\",\"c\"]", "nargs=* collects greedily");
+    checkArr(p.ParseArgs(["--some", "a"]).some, "[\"a\"]", "nargs=+ accepts one");
+
+    checkEq(p.ParseArgs([]).opt,             "D", "nargs=? absent uses default");
+    checkEq(p.ParseArgs(["--opt"]).opt,      "C", "nargs=? bare flag uses const");
+    checkEq(p.ParseArgs(["--opt", "v"]).opt, "v", "nargs=? with value uses value");
+
+    // A following option terminates greedy collection.
+    let a = p.ParseArgs(["--many", "x", "y", "--pair", "p", "q"]);
+    checkArr(a.many, "[\"x\",\"y\"]",   "nargs=* stops at the next option");
+    checkArr(a.pair, "[\"p\",\"q\"]",   "option after nargs=* still parses");
+
+    let e = expectError(p, ["--pair", "onlyone"]);
+    check(String.Contains(e, "expected 2"), "nargs=2 with one value errors");
+
+    let p2 = strictParser("t");
+    p2.AddArgument("--some", { nargs: "+", help: "one or more" });
+    check(String.Contains(expectError(p2, ["--some"]), "at least one"),
+          "nargs=+ with zero values errors");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Positionals
+// ---------------------------------------------------------------------------
+fn test_positionals() {
+    Console.WriteLine("== positionals ==");
+
+    let p = strictParser("t");
+    p.AddArgument("src",  { help: "source" });
+    p.AddArgument("dest", { help: "destination" });
+
+    let a = p.ParseArgs(["in.txt", "out.txt"]);
+    checkEq(a.src,  "in.txt",  "first positional");
+    checkEq(a.dest, "out.txt", "second positional");
+
+    check(String.Contains(expectError(p, ["only"]), "required"),
+          "missing positional errors");
+
+    // A variadic positional soaks up the surplus, fixed ones keep their slots.
+    let p2 = strictParser("t");
+    p2.AddArgument("cmd",   { help: "command" });
+    p2.AddArgument("files", { nargs: "*", help: "files" });
+    let b = p2.ParseArgs(["run", "a", "b", "c"]);
+    checkEq(b.cmd, "run", "leading fixed positional");
+    checkArr(b.files, "[\"a\",\"b\",\"c\"]", "trailing nargs=* takes the rest");
+    checkArr(p2.ParseArgs(["run"]).files, "[]", "nargs=* positional may be empty");
+
+    // Typed positionals convert too.
+    let p3 = strictParser("t");
+    p3.AddArgument("n", { type: "int", help: "n" });
+    checkEq(p3.ParseArgs(["12"]).n, 12, "positional type conversion");
+
+    // nargs=+ positional requires at least one.
+    let p4 = strictParser("t");
+    p4.AddArgument("files", { nargs: "+", help: "files" });
+    checkArr(p4.ParseArgs(["x"]).files, "[\"x\"]", "nargs=+ positional with one");
+    check(String.Contains(expectError(p4, []), "required"),
+          "nargs=+ positional with none errors");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Token forms: clusters, attached values, "--", negative numbers
+// ---------------------------------------------------------------------------
+fn test_token_forms() {
+    Console.WriteLine("== token forms ==");
+
+    let p = strictParser("t");
+    p.AddArgument(["-a"], { action: "store_true", help: "a" });
+    p.AddArgument(["-b"], { action: "store_true", help: "b" });
+    p.AddArgument(["-n"], { type: "int", help: "n" });
+
+    let a = p.ParseArgs(["-ab"]);
+    check(a.a && a.b, "combined short flags -ab");
+
+    checkEq(p.ParseArgs(["-n5"]).n,      5, "attached short value -n5");
+    checkEq(p.ParseArgs(["-n", "5"]).n,  5, "separated short value -n 5");
+
+    let b = p.ParseArgs(["-abn7"]);
+    check(b.a && b.b, "cluster flags before a value-taking short");
+    checkEq(b.n, 7, "value-taking short at the end of a cluster");
+
+    // "--" forces everything after it to be a positional.
+    let p2 = strictParser("t");
+    p2.AddArgument(["-v"], { action: "store_true", help: "v" });
+    p2.AddArgument("rest", { nargs: "*", help: "rest" });
+    let c = p2.ParseArgs(["-v", "--", "-v", "--not-a-flag"]);
+    checkEq(c.v, true, "flag before -- is parsed");
+    checkArr(c.rest, "[\"-v\",\"--not-a-flag\"]", "tokens after -- are positional");
+
+    // A negative number is a value, not an option, when no numeric flag exists.
+    let p3 = strictParser("t");
+    p3.AddArgument("--n", { type: "int", help: "n" });
+    checkEq(p3.ParseArgs(["--n", "-3"]).n, -3, "negative number is a value");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Long-option abbreviation
+// ---------------------------------------------------------------------------
+fn test_abbrev() {
+    Console.WriteLine("== abbreviation ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--verbose", { action: "store_true", help: "v" });
+    p.AddArgument("--output",  { help: "o" });
+
+    checkEq(p.ParseArgs(["--verb"]).verbose, true,  "unambiguous prefix accepted");
+    checkEq(p.ParseArgs(["--out", "f"]).output, "f", "prefix with a value");
+
+    // Ambiguous prefixes are refused.
+    let p2 = new ArgumentParser({ prog: "t", exitOnError: false, addHelp: false });
+    p2.AddArgument("--verbose", { action: "store_true", help: "v" });
+    p2.AddArgument("--version-info", { action: "store_true", help: "vi" });
+    check(String.Contains(expectError(p2, ["--ver"]), "ambiguous"),
+          "ambiguous prefix rejected");
+
+    // allowAbbrev:false turns prefixes back into unknown options.
+    let p3 = new ArgumentParser({ prog: "t", exitOnError: false, addHelp: false, allowAbbrev: false });
+    p3.AddArgument("--verbose", { action: "store_true", help: "v" });
+    check(String.Contains(expectError(p3, ["--verb"]), "unrecognized"),
+          "allowAbbrev:false rejects a prefix");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// required / mutually exclusive
+// ---------------------------------------------------------------------------
+fn test_required_and_mutex() {
+    Console.WriteLine("== required / mutex ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--must", { required: true, help: "required" });
+    checkEq(p.ParseArgs(["--must", "v"]).must, "v", "required option supplied");
+    check(String.Contains(expectError(p, []), "required"), "missing required option errors");
+
+    let p2 = strictParser("t");
+    let g  = p2.AddMutuallyExclusiveGroup();
+    g.AddArgument("--json", { action: "store_true", help: "json" });
+    g.AddArgument("--xml",  { action: "store_true", help: "xml" });
+    checkEq(p2.ParseArgs(["--json"]).json, true, "one of a mutex group is fine");
+    checkEq(p2.ParseArgs([]).json, false, "neither of an optional mutex group is fine");
+    check(String.Contains(expectError(p2, ["--json", "--xml"]), "not allowed with"),
+          "both of a mutex group errors");
+
+    let p3 = strictParser("t");
+    let g2 = p3.AddMutuallyExclusiveGroup({ required: true });
+    g2.AddArgument("--a", { action: "store_true", help: "a" });
+    g2.AddArgument("--b", { action: "store_true", help: "b" });
+    check(String.Contains(expectError(p3, []), "is required"),
+          "required mutex group with neither errors");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Subcommands
+// ---------------------------------------------------------------------------
+fn test_subcommands() {
+    Console.WriteLine("== subcommands ==");
+
+    let p   = strictParser("tool");
+    let sub = p.AddSubparsers({ dest: "command", required: true });
+
+    let build = sub.AddParser("build", { help: "build it" });
+    build.AddArgument("--release", { action: "store_true", help: "release mode" });
+    build.AddArgument("target", { nargs: "?", defaultValue: "all", help: "target" });
+
+    let clean = sub.AddParser("clean", { help: "clean it" });
+    clean.AddArgument("--deep", { action: "store_true", help: "deep clean" });
+
+    let a = p.ParseArgs(["build", "--release"]);
+    checkEq(a.command, "build", "subcommand recorded in dest");
+    checkEq(a.release, true,    "subcommand option parsed");
+    checkEq(a.target,  "all",   "subcommand positional default");
+
+    let b = p.ParseArgs(["build", "app"]);
+    checkEq(b.target, "app", "subcommand positional supplied");
+
+    let c = p.ParseArgs(["clean", "--deep"]);
+    checkEq(c.command, "clean", "second subcommand");
+    checkEq(c.deep,    true,    "second subcommand option");
+
+    check(String.Contains(expectError(p, []), "command is required"),
+          "required subcommand missing errors");
+
+    // The subparser's prog is namespaced under the parent for help output.
+    checkEq(sub.Get("build").ProgName(), "tool build", "subparser prog is prefixed");
+
+    // A parent option still parses before the subcommand.
+    let p2  = strictParser("tool");
+    p2.AddArgument("--trace", { action: "store_true", help: "g" });
+    let s2  = p2.AddSubparsers({ dest: "cmd" });
+    let run = s2.AddParser("run", { help: "run" });
+    run.AddArgument("--fast", { action: "store_true", help: "f" });
+    let d = p2.ParseArgs(["--trace", "run", "--fast"]);
+    checkEq(d.trace, true, "parent option before subcommand");
+    checkEq(d.cmd,   "run", "subcommand after a parent option");
+    checkEq(d.fast,  true,  "subcommand option after parent option");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ParseKnownArgs / SetDefaults / dest / metavar
+// ---------------------------------------------------------------------------
+fn test_known_args_and_misc() {
+    Console.WriteLine("== known args / defaults / dest ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--keep", { action: "store_true", help: "keep" });
+    let r = p.ParseKnownArgs(["--keep", "--unknown", "leftover"]);
+    let ns    = r[0];
+    let extra = r[1];
+    checkEq(ns.keep, true, "known option parsed by ParseKnownArgs");
+    check(Array.Contains(extra, "--unknown"), "unknown option lands in extras");
+    check(Array.Contains(extra, "leftover"),  "surplus positional lands in extras");
+
+    // ParseArgs rejects what ParseKnownArgs tolerates.
+    check(String.Contains(expectError(p, ["--nope"]), "unrecognized"),
+          "ParseArgs rejects unknown options");
+
+    // SetDefaults seeds keys no argument writes.
+    let p2 = strictParser("t");
+    p2.AddArgument("--x", { help: "x" });
+    p2.SetDefaults({ handler: "run", version: 2 });
+    let a = p2.ParseArgs([]);
+    checkEq(a.handler, "run", "SetDefaults string seeded");
+    checkEq(a.version, 2,     "SetDefaults int seeded");
+
+    // Explicit dest overrides the derived name.
+    let p3 = strictParser("t");
+    p3.AddArgument("--input-file", { dest: "path", help: "in" });
+    let b = p3.ParseArgs(["--input-file", "f.txt"]);
+    checkEq(b.path, "f.txt", "explicit dest honoured");
+    check(!Object.HasKey(b, "input_file"), "derived dest not also written");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Usage / help formatting
+// ---------------------------------------------------------------------------
+fn test_help_output() {
+    Console.WriteLine("== help output ==");
+
+    let p = new ArgumentParser({
+        prog: "mytool", description: "Do a thing.", epilog: "See the docs.",
+        exitOnError: false
+    });
+    p.AddArgument(["-v", "--verbose"], { action: "store_true", help: "chatty output" });
+    p.AddArgument("--count", { type: "int", defaultValue: 1, help: "repeat count" });
+    p.AddArgument("--mode",  { choices: ["fast", "slow"], help: "speed" });
+    p.AddArgument("--secret", { help: "" });
+    p.AddArgument("src", { nargs: "+", help: "source files" });
+
+    let usage = p.FormatUsage();
+    check(String.StartsWith(usage, "usage: mytool"), "usage starts with prog");
+    check(String.Contains(usage, "[-h]"),            "usage lists -h");
+    check(String.Contains(usage, "[--count COUNT]"), "usage shows the metavar");
+    check(String.Contains(usage, "src [src ...]"),   "usage shows nargs=+ positional");
+    check(!String.Contains(usage, "--secret"),       "help:'' hides from usage");
+
+    let help = p.FormatHelp();
+    check(String.Contains(help, "Do a thing."),      "help includes the description");
+    check(String.Contains(help, "See the docs."),    "help includes the epilog");
+    check(String.Contains(help, "positional arguments:"), "help has a positional section");
+    check(String.Contains(help, "options:"),         "help has an options section");
+    check(String.Contains(help, "(default: 1)"),     "help shows the default");
+    check(String.Contains(help, "(choices: fast, slow)"), "help shows the choices");
+    check(!String.Contains(help, "--secret"),        "help:'' hides from help");
+
+    // metavar replaces the derived placeholder.
+    let p2 = strictParser("t");
+    p2.AddArgument("--out", { metavar: "FILE", help: "output" });
+    check(String.Contains(p2.FormatUsage(), "--out FILE"), "metavar used in usage");
+
+    // Subcommands get their own help section.
+    let p3 = new ArgumentParser({ prog: "tool", exitOnError: false });
+    let s3 = p3.AddSubparsers({ dest: "command", title: "commands" });
+    s3.AddParser("build", { help: "build it" });
+    s3.AddParser("clean", { help: "clean it" });
+    let h3 = p3.FormatHelp();
+    check(String.Contains(h3, "commands:"), "subcommand section title");
+    check(String.Contains(h3, "build"),     "subcommand listed");
+    check(String.Contains(h3, "build it"),  "subcommand help listed");
+
+    // Argument groups render as their own titled section.
+    let p4 = new ArgumentParser({ prog: "t", exitOnError: false });
+    let g4 = p4.AddArgumentGroup("network options", "tuning knobs");
+    g4.AddArgument("--port", { type: "int", help: "port" });
+    let h4 = p4.FormatHelp();
+    check(String.Contains(h4, "network options:"), "group title rendered");
+    check(String.Contains(h4, "tuning knobs"),     "group description rendered");
+    check(String.Contains(h4, "--port PORT"),      "group argument rendered");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Declaration-time errors
+// ---------------------------------------------------------------------------
+fn test_declaration_errors() {
+    Console.WriteLine("== declaration errors ==");
+
+    let p = strictParser("t");
+    p.AddArgument("--dup", { help: "d" });
+    let dupCaught = false;
+    try { p.AddArgument("--dup", { help: "again" }); }
+    catch (e) { dupCaught = true; }
+    check(dupCaught, "duplicate flag rejected");
+
+    let emptyCaught = false;
+    try { p.AddArgument([], { help: "x" }); }
+    catch (e) { emptyCaught = true; }
+    check(emptyCaught, "empty flag list rejected");
+
+    let twoPosCaught = false;
+    try { p.AddArgument(["a", "b"], { help: "x" }); }
+    catch (e) { twoPosCaught = true; }
+    check(twoPosCaught, "positional with two names rejected");
+
+    let subCaught = false;
+    let p2 = strictParser("t");
+    p2.AddSubparsers({ dest: "c" });
+    try { p2.AddSubparsers({ dest: "d" }); }
+    catch (e) { subCaught = true; }
+    check(subCaught, "second AddSubparsers rejected");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+fn async Main() {
+    Console.WriteLine("=== Argparse tests ===");
+
+    test_store_and_defaults();
+    test_flag_actions();
+    test_append();
+    test_types();
+    test_choices();
+    test_nargs_options();
+    test_positionals();
+    test_token_forms();
+    test_abbrev();
+    test_required_and_mutex();
+    test_subcommands();
+    test_known_args_and_misc();
+    test_help_output();
+    test_declaration_errors();
+
+    Console.WriteLine("===========================");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+
+    if (testsFailed > 0) {
+        Console.Error("Some Argparse tests FAILED.");
+        return testsFailed;
+    }
+    Console.Ok("All Argparse tests passed!");
+
+    // -----------------------------------------------------------------------
+    // Benchmarks
+    // -----------------------------------------------------------------------
+    Console.WriteLine("\n\n=== Argparse Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    // A parser built once and parsed many times - the realistic hot path.
+    let hot = new ArgumentParser({ prog: "bench", exitOnError: false });
+    hot.AddArgument(["-v", "--verbose"], { action: "store_true", help: "v" });
+    hot.AddArgument("--count", { type: "int", defaultValue: 1, help: "c" });
+    hot.AddArgument("--mode",  { choices: ["fast", "slow"], defaultValue: "fast", help: "m" });
+    hot.AddArgument("--tag",   { action: "append", help: "t" });
+    hot.AddArgument("src",     { nargs: "*", help: "s" });
+
+    Console.WriteLine("\n[ Construction ]");
+    bench("new ArgumentParser  (no arguments)", fn() {
+        let _p = new ArgumentParser({ prog: "b", exitOnError: false });
+        _sink = _sink + 1;
+    }, 20000);
+    bench("new ArgumentParser  + 5 AddArgument", fn() {
+        let p = new ArgumentParser({ prog: "b", exitOnError: false });
+        p.AddArgument(["-v", "--verbose"], { action: "store_true", help: "v" });
+        p.AddArgument("--count", { type: "int", defaultValue: 1, help: "c" });
+        p.AddArgument("--mode",  { choices: ["fast", "slow"], help: "m" });
+        p.AddArgument("--tag",   { action: "append", help: "t" });
+        p.AddArgument("src",     { nargs: "*", help: "s" });
+        _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ Parsing  (parser reused) ]");
+    bench("ParseArgs  empty argv", fn() {
+        let _a = hot.ParseArgs([]); _sink = _sink + 1;
+    }, 20000);
+    bench("ParseArgs  1 flag", fn() {
+        let _a = hot.ParseArgs(["-v"]); _sink = _sink + 1;
+    }, 20000);
+    bench("ParseArgs  4 options + 2 positionals", fn() {
+        let _a = hot.ParseArgs(["-v", "--count=3", "--mode", "slow", "a.txt", "b.txt"]);
+        _sink = _sink + 1;
+    }, 10000);
+    bench("ParseArgs  --opt=value form", fn() {
+        let _a = hot.ParseArgs(["--count=9"]); _sink = _sink + 1;
+    }, 20000);
+    bench("ParseArgs  short cluster -vn", fn() {
+        let _a = hot.ParseArgs(["-v"]); _sink = _sink + 1;
+    }, 20000);
+    bench("ParseArgs  10 positionals (nargs=*)", fn() {
+        let _a = hot.ParseArgs(["1","2","3","4","5","6","7","8","9","10"]);
+        _sink = _sink + 1;
+    }, 5000);
+    bench("ParseArgs  3× append", fn() {
+        let _a = hot.ParseArgs(["--tag", "x", "--tag", "y", "--tag", "z"]);
+        _sink = _sink + 1;
+    }, 10000);
+
+    Console.WriteLine("\n[ Subcommands ]");
+    let subP = new ArgumentParser({ prog: "bench", exitOnError: false });
+    let subS = subP.AddSubparsers({ dest: "command" });
+    let subB = subS.AddParser("build", { help: "b" });
+    subB.AddArgument("--release", { action: "store_true", help: "r" });
+    bench("ParseArgs  subcommand + option", fn() {
+        let _a = subP.ParseArgs(["build", "--release"]); _sink = _sink + 1;
+    }, 10000);
+
+    Console.WriteLine("\n[ Help rendering ]");
+    bench("FormatUsage()", fn() {
+        let s = hot.FormatUsage(); _sink = _sink + String.Length(s);
+    }, 10000);
+    bench("FormatHelp()", fn() {
+        let s = hot.FormatHelp(); _sink = _sink + String.Length(s);
+    }, 5000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return 0;
+}

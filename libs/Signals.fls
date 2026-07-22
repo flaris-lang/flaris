@@ -1,0 +1,1090 @@
+// Signals.fls - Digital signal processing library for Flaris.
+// Version: 1.0
+//
+// All signals are float arrays (sample values typically in [-1.0, 1.0]).
+// Signals is the base class; Audio extends it with WAV I/O and audio effects.
+//
+// Usage:
+//   import { Signals } from library("Signals", "1.0");
+//   let s = new Signals();
+//
+//   let tone  = s.Sine(44100, 440.0, 44100.0, 1.0, 0.0);
+//   let win   = s.Hann(44100);
+//   let spec  = s.FFT(s.ApplyWindow(tone, win));
+//   let freqs = s.Magnitude(spec);
+//
+// Generation:
+//   Sine(n, freq, sampleRate, amplitude, phase)    - sine wave
+//   Cosine(n, freq, sampleRate, amplitude, phase)
+//   Square(n, freq, sampleRate, amplitude)
+//   Sawtooth(n, freq, sampleRate, amplitude)
+//   Triangle(n, freq, sampleRate, amplitude)
+//   Noise(n, amplitude)                             - uniform random
+//   Chirp(n, freqStart, freqEnd, sampleRate, amplitude) - linear sweep
+//   Silence(n)                                      - n zero samples
+//   Linspace(n, start, stop)                        - evenly-spaced values
+//
+// Construction / editing:
+//   Concat(a, b)                  - join two signals
+//   Repeat(signal, times)         - tile signal n times
+//   Mix(a, b, wa, wb)             - weighted sum
+//   Decimate(signal, factor)      - downsample by integer factor
+//   Interpolate(signal, factor)   - upsample by integer factor
+//
+// Windowing:
+//   Rect(n)  Hann(n)  Hamming(n)  Blackman(n)  Bartlett(n)
+//   ApplyWindow(signal, window)
+//   WindowedFft(signal, window)   →  { re, im }
+//   FFTPad(signal)                - zero-pad to next power of 2
+//
+// Spectral analysis (FFT/DFT return { re:array, im:array }):
+//   FFT(signal)   IFFT(spectrum)
+//   DFT(signal)   IDFT(spectrum)
+//   Magnitude(spectrum)           - |X[k]|
+//   Phase(spectrum)               - atan2(im, re)
+//   PowerSpectrum(spectrum)       - |X[k]|^2
+//   ToDb(magnitude)               - 20*log10(|x|)
+//   BinToHz(bin, n, sampleRate)
+//   Autocorrelate(signal, maxLag)
+//   CrossCorrelate(a, b, maxLag)
+//   DominantFrequency(signal, sampleRate)
+//
+// Statistics:
+//   RMS(signal)  Peak(signal)  PeakToPeak(signal)  Energy(signal)
+//   Mean(signal)  Variance(signal)  StdDev(signal)
+//   ArgMax(signal)   - index of maximum value
+//   ZeroCrossings(signal)
+//   FindPeaks(signal, minHeight, minDistance)
+//
+// Processing:
+//   Normalize(signal)             - scale to peak == 1.0
+//   PeakNormalize(signal)         - alias for Normalize
+//   ZScore(signal)                - subtract mean, divide by StdDev
+//   DCRemove(signal)              - subtract mean
+//   Clip(signal, min, max)
+//   Rescale(signal, newMin, newMax)
+//   Threshold(signal, level)      - hard threshold
+//   MovingAverage(signal, w)
+//   MedianFilter(signal, w)
+//   LowPass(signal, cutoff, sampleRate, order?)   - IIR Butterworth
+//
+// Utilities:
+//   IsPowerOfTwo(n)  NextPowerOfTwo(n)
+//   static NextPow2(n)
+
+class Signals {
+
+    const TWO_PI = 6.28318531;
+
+    // ============================================================
+    //  Internal helpers
+    // ============================================================
+
+    fn _zeros(n:int): array {
+        if (n <= 0) return [];
+        let a:array = Array.Create(n);
+        Array.Fill(a, 0.0);
+        return a;
+    }
+
+    fn _filled(n:int, val:float): array {
+        if (n <= 0) return [];
+        let a:array = Array.Create(n);
+        Array.Fill(a, val);
+        return a;
+    }
+
+    fn _log2n(n:int): int {
+        let bits:int = 0;
+        let m:int = n >> 1;
+        while (m > 0) {
+            bits += 1;
+            m = m >> 1;
+        }
+        return bits;
+    }
+
+    fn _bitRev(x:int, bits:int): int {
+        let rev:int = 0;
+        let cur:int = x;
+        iter(i from 0 to bits-1) {
+            rev = (rev << 1) | (cur & 1);
+            cur = cur >> 1;
+        }
+        return rev;
+    }
+
+    // ============================================================
+    //  JIT-compiled kernels (no class method calls)
+    // ============================================================
+
+    fn _sig_energy(a: [float], n: int): float {
+        let sum: float = 0.0;
+        iter(i from 0 to n-1) {
+            sum += a[i] * a[i];
+        }
+        return sum;
+    }
+
+    fn _sig_ma_kernel(sig: [float], out: [float], n: int, w: int): int {
+        let sum: float = 0.0;
+        iter(i from 0 to n-1) {
+            sum += sig[i];
+            if (i >= w) { sum -= sig[i - w]; }
+            out[i] = sum / w;
+        }
+        return 0;
+    }
+
+    fn _sig_autocorr(sig: [float], out: [float], n: int, maxlag: int): int {
+        iter(lag from 0 to maxlag) {
+            let sum: float = 0.0;
+            iter(i from 0 to (n - lag) - 1) {
+                sum += sig[i] * sig[i + lag];
+            }
+            out[lag] = sum / n;
+        }
+        return 0;
+    }
+
+    fn _sig_peak_kernel(sig: [float], n: int): float {
+        let m: float = Math.AbsF(sig[0]);
+        iter(i from 1 to n-1) {
+            let v: float = Math.AbsF(sig[i]);
+            if (v > m) m = v;
+        }
+        return m;
+    }
+
+    fn _sig_argmax_kernel(sig: [float], n: int): int {
+        let best: int = 0;
+        let bestVal: float = sig[0];
+        iter(i from 1 to n-1) {
+            if (sig[i] > bestVal) { bestVal = sig[i]; best = i; }
+        }
+        return best;
+    }
+
+    fn _sig_zcr_kernel(sig: [float], n: int): int {
+        let count: int = 0;
+        iter(i from 1 to n-1) {
+            if ((sig[i-1] >= 0.0 && sig[i] < 0.0) ||
+                (sig[i-1] < 0.0  && sig[i] >= 0.0)) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn _sig_variance_kernel(sig: [float], n: int, m: float): float {
+        let sum: float = 0.0;
+        iter(i from 0 to n-1) {
+            let d: float = sig[i] - m;
+            sum += d * d;
+        }
+        return sum / n;
+    }
+
+    fn _sig_normalize_kernel(sig: [float], out: [float], n: int, pk: float): int {
+        iter(i from 0 to n-1) { out[i] = sig[i] / pk; }
+        return 0;
+    }
+
+    fn _sig_dcremove_kernel(sig: [float], out: [float], n: int, dc: float): int {
+        iter(i from 0 to n-1) { out[i] = sig[i] - dc; }
+        return 0;
+    }
+
+    fn _sig_zscore_kernel(sig: [float], out: [float], n: int, m: float, sd: float): int {
+        iter(i from 0 to n-1) { out[i] = (sig[i] - m) / sd; }
+        return 0;
+    }
+
+    fn _sig_clip_kernel(sig: [float], out: [float], n: int, lo: float, hi: float): int {
+        iter(i from 0 to n-1) {
+            let v: float = sig[i];
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            out[i] = v;
+        }
+        return 0;
+    }
+
+    fn _sig_rescale_kernel(sig: [float], out: [float], n: int,
+                                oldMin: float, scale: float, newMin: float): int {
+        iter(i from 0 to n-1) {
+            out[i] = newMin + (sig[i] - oldMin) * scale;
+        }
+        return 0;
+    }
+
+    fn _sig_linspace_kernel(out: [float], n: int, start: float, step: float): int {
+        iter(i from 0 to n-1) { out[i] = start + step * i; }
+        return 0;
+    }
+
+    fn _sig_apply_window_kernel(sig: [float], win: [float], out: [float], n: int): int {
+        iter(i from 0 to n-1) { out[i] = sig[i] * win[i]; }
+        return 0;
+    }
+
+    fn _sig_mix_kernel(a: [float], b: [float], out: [float], n: int, wa: float, wb: float): int {
+        iter(i from 0 to n-1) { out[i] = a[i] * wa + b[i] * wb; }
+        return 0;
+    }
+
+    fn _sig_convolve_tap(out: [float], sig: [float], n: int, kj: float, j: int): int {
+        iter(i from 0 to n-1) { out[i + j] = out[i + j] + sig[i] * kj; }
+        return 0;
+    }
+
+    fn _sig_iir_kernel(sig: [float], out: [float], n: int,
+                            b0: float, b1: float, b2: float,
+                            a1: float, a2: float): int {
+        let x1: float = 0.0;
+        let x2: float = 0.0;
+        let y1: float = 0.0;
+        let y2: float = 0.0;
+        iter(i from 0 to n-1) {
+            let x0: float = sig[i];
+            let y0: float = b0*x0 + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+            out[i] = y0;
+            x2 = x1; x1 = x0;
+            y2 = y1; y1 = y0;
+        }
+        return 0;
+    }
+
+    fn IsPowerOfTwo(n:int): bool {
+        return n > 0 && ((n & (n - 1)) == 0);
+    }
+
+    fn NextPowerOfTwo(n:int): int {
+        if (n <= 1) return 1;
+        let p:int = 1;
+        while (p < n) {
+            p = p << 1;
+        }
+        return p;
+    }
+
+    fn _FFTComplex(inRe:array, inIm:array): object {
+        let n:int = len(inRe);
+        if (n == 0) return { real: [], imag: [] };
+        if (n != len(inIm)) return { real: [], imag: [] };
+        if (!IsPowerOfTwo(n)) return { real: [], imag: [] };
+
+        let re:array = Array.Create(n);
+        let im:array = Array.Create(n);
+        let bits:int = _log2n(n);
+
+        iter(i from 0 to n-1) {
+            let j:int = _bitRev(i, bits);
+            re[j] = inRe[i];
+            im[j] = inIm[i];
+        }
+
+        let s:int = 1;
+        while (s <= bits) {
+            let m:int = 1 << s;
+            let half:int = m >> 1;
+
+            let wRe:float = Math.Cos(-TWO_PI / m);
+            let wIm:float = Math.Sin(-TWO_PI / m);
+
+            let k:int = 0;
+            while (k < n) {
+                let curRe:float = 1.0;
+                let curIm:float = 0.0;
+
+                iter(j from 0 to half-1) {
+                    let u:int = k + j;
+                    let v:int = k + j + half;
+
+                    let tRe:float = curRe * re[v] - curIm * im[v];
+                    let tIm:float = curRe * im[v] + curIm * re[v];
+
+                    re[v] = re[u] - tRe;
+                    im[v] = im[u] - tIm;
+                    re[u] = re[u] + tRe;
+                    im[u] = im[u] + tIm;
+
+                    let nextRe:float = curRe * wRe - curIm * wIm;
+                    let nextIm:float = curRe * wIm + curIm * wRe;
+                    curRe = nextRe;
+                    curIm = nextIm;
+                }
+
+                k += m;
+            }
+
+            s += 1;
+        }
+
+        return { real: re, imag: im };
+    }
+
+    // ============================================================
+    //  Window functions
+    // ============================================================
+
+    fn Rect(n:int): array {
+        return _filled(n, 1.0);
+    }
+
+    fn Hann(n:int): array {
+        if (n <= 0) return [];
+        if (n == 1) return [1.0];
+        let w:array = Array.Create(n);
+        let step:float = TWO_PI / (n - 1);
+        iter(i from 0 to n-1) {
+            w[i] = 0.5 * (1.0 - Math.Cos(step * i));
+        }
+        return w;
+    }
+
+    fn Hamming(n:int): array {
+        if (n <= 0) return [];
+        if (n == 1) return [1.0];
+        let w:array = Array.Create(n);
+        let step:float = TWO_PI / (n - 1);
+        iter(i from 0 to n-1) {
+            w[i] = 0.54 - 0.46 * Math.Cos(step * i);
+        }
+        return w;
+    }
+
+    fn Blackman(n:int): array {
+        if (n <= 0) return [];
+        if (n == 1) return [1.0];
+        let w:array = Array.Create(n);
+        let step:float = TWO_PI / (n - 1);
+        iter(i from 0 to n-1) {
+            let a:float = step * i;
+            w[i] = 0.42 - 0.5 * Math.Cos(a) + 0.08 * Math.Cos(2.0 * a);
+        }
+        return w;
+    }
+
+    fn Bartlett(n:int): array {
+        if (n <= 0) return [];
+        if (n == 1) return [1.0];
+        let w:array = Array.Create(n);
+        let half:float = (n - 1) / 2.0;
+        iter(i from 0 to n-1) {
+            w[i] = 1.0 - Math.AbsF(i - half) / half;
+        }
+        return w;
+    }
+
+    fn ApplyWindow(signal:array, window:array): array {
+        let n:int = int(Math.Min(len(signal), len(window)));
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_apply_window_kernel(signal, window, out, n);
+        return out;
+    }
+
+    fn WindowedFft(signal:array, window:array): object {
+        return FFT(ApplyWindow(signal, window));
+    }
+
+    // ============================================================
+    //  Statistics
+    // ============================================================
+
+    fn RMS(signal:array): float {
+        let n:int = len(signal);
+        if (n == 0) return 0.0;
+        return Math.Sqrt(_sig_energy(signal, n) / n);
+    }
+
+    fn Peak(signal:array): float {
+        let n:int = len(signal);
+        if (n == 0) return 0.0;
+        return _sig_peak_kernel(signal, n);
+    }
+
+    fn PeakToPeak(signal:array): float {
+        let n:int = len(signal);
+        if (n == 0) return 0.0;
+        let mn:float = signal[0];
+        let mx:float = signal[0];
+        iter(i from 1 to n-1) {
+            if (signal[i] < mn) mn = signal[i];
+            if (signal[i] > mx) mx = signal[i];
+        }
+        return mx - mn;
+    }
+
+    fn Energy(signal:array): float {
+        return _sig_energy(signal, len(signal));
+    }
+
+    fn Mean(signal:array): float {
+        let n:int = len(signal);
+        if (n == 0) return 0.0;
+        return Math.Sum(signal) / n;
+    }
+
+    fn Variance(signal:array): float {
+        let n:int = len(signal);
+        if (n < 2) return 0.0;
+        let m:float = Mean(signal);
+        return _sig_variance_kernel(signal, n, m);
+    }
+
+    fn StdDev(signal:array): float {
+        return Math.Sqrt(Variance(signal));
+    }
+
+    fn ZScore(signal:array): array {
+        let n:int = len(signal);
+        let m:float = Mean(signal);
+        let sd:float = StdDev(signal);
+        if (sd == 0) return _zeros(n);
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_zscore_kernel(signal, out, n, m, sd);
+        return out;
+    }
+
+    fn DCRemove(signal:array): array {
+        let n:int = len(signal);
+        let dc:float = Mean(signal);
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_dcremove_kernel(signal, out, n, dc);
+        return out;
+    }
+
+    fn Normalize(signal:array): array {
+        let n:int = len(signal);
+        let pk:float = Peak(signal);
+        if (pk == 0) return _zeros(n);
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_normalize_kernel(signal, out, n, pk);
+        return out;
+    }
+
+    fn ArgMax(signal:array): int {
+        let n:int = len(signal);
+        if (n == 0) return -1;
+        return _sig_argmax_kernel(signal, n);
+    }
+
+    fn Clip(signal:array, minValue:float, maxValue:float): array {
+        let n:int = len(signal);
+        let lo:float = minValue;
+        let hi:float = maxValue;
+        if (lo > hi) { lo = maxValue; hi = minValue; }
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_clip_kernel(signal, out, n, lo, hi);
+        return out;
+    }
+
+    fn Rescale(signal:array, newMin:float, newMax:float): array {
+        let n:int = len(signal);
+        if (n == 0) return [];
+        let oldMin:float = signal[0];
+        let oldMax:float = signal[0];
+        iter(i from 1 to n-1) {
+            if (signal[i] < oldMin) oldMin = signal[i];
+            if (signal[i] > oldMax) oldMax = signal[i];
+        }
+        if (oldMax <= oldMin) return _filled(n, newMin);
+        let scale:float = (newMax - newMin) / (oldMax - oldMin);
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_rescale_kernel(signal, out, n, oldMin, scale, newMin);
+        return out;
+    }
+
+    fn Linspace(n:int, start:float, stop:float): array {
+        if (n <= 0) return [];
+        if (n == 1) return [start];
+        let out: [float] = Array.Create(n, Type.Float);
+        let step:float = (stop - start) / (n - 1);
+        _sig_linspace_kernel(out, n, start, step);
+        return out;
+    }
+
+    // ============================================================
+    //  Analysis
+    // ============================================================
+
+    fn ZeroCrossings(signal:array): int {
+        let n:int = len(signal);
+        if (n < 2) return 0;
+        return _sig_zcr_kernel(signal, n);
+    }
+
+    fn FindPeaks(signal:array, minHeight:float, minDistance:int): array {
+        let peaks = [];
+        let n:int = len(signal);
+        let gap:int = minDistance;
+        if (gap < 1) gap = 1;
+        let lastPeak:int = -gap - 1;
+        if (n < 3) return peaks;
+        iter(i from 1 to n-2) {
+            if (signal[i] > minHeight &&
+                signal[i] > signal[i-1] &&
+                signal[i] >= signal[i+1] &&
+                i - lastPeak >= gap) {
+                Array.Append(peaks, i);
+                lastPeak = i;
+            }
+        }
+        return peaks;
+    }
+
+    fn Threshold(signal:array, level:float): array {
+        let n:int = len(signal);
+        let out:array = Array.Create(n);
+        iter(i from 0 to n-1) {
+            out[i] = signal[i] >= level;
+        }
+        return out;
+    }
+
+    fn DominantFrequency(signal:array, sampleRate:float): float {
+        let n:int = len(signal);
+        if (n == 0) return 0.0;
+
+        let size:int = IsPowerOfTwo(n) ? n : NextPowerOfTwo(n);
+        let padded:array = _zeros(size);
+        iter(i from 0 to n-1) {
+            padded[i] = signal[i];
+        }
+
+        let spec:object = FFT(padded);
+        let mag:array = Magnitude(spec);
+        let count:int = len(mag);
+        if (count < 2) return 0.0;
+
+        let half:int = int(count / 2);
+        let best:int = 1;
+        let bestVal:float = mag[1];
+
+        iter(i from 2 to half-1) {
+            if (mag[i] > bestVal) {
+                bestVal = mag[i];
+                best = i;
+            }
+        }
+
+        return BinToHz(best, count, sampleRate);
+    }
+
+    // ============================================================
+    //  Time-domain filters
+    // ============================================================
+
+    fn MovingAverage(signal:array, w:int): array {
+        let n:int = len(signal);
+        if (n == 0) return [];
+        if (w <= 0) return [];
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_ma_kernel(signal, out, n, w);
+        return out;
+    }
+
+    fn Convolve(signal:array, kernel:array): array {
+        let n:int = len(signal);
+        let m:int = len(kernel);
+        if (n == 0 || m == 0) return [];
+
+        // Fast path: identity kernel
+        if (m == 1) {
+            let out: [float] = Array.Create(n, Type.Float);
+            let k0:float = kernel[0];
+            iter(i from 0 to n-1) { out[i] = signal[i] * k0; }
+            return out;
+        }
+
+        let out: [float] = Array.Create(n + m - 1, Type.Float);
+
+        iter(j from 0 to m-1) {
+            let kj:float = kernel[j];
+            if (kj == 0) continue;
+            _sig_convolve_tap(out, signal, n, kj, j);
+        }
+
+        return out;
+    }
+
+    fn FIR(signal:array, coeffs:array): array {
+        if (len(coeffs) == 0) return [];
+        let full:array = Convolve(signal, coeffs);
+        return Array.Subset(full, 0, len(signal));
+    }
+
+    fn IIR(signal:array, coeffs:array): array {
+        if (len(coeffs) < 5) return [];
+        let n:int = len(signal);
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_iir_kernel(signal, out, n,
+            coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4]);
+        return out;
+    }
+
+    // ============================================================
+    //  Biquad filter coefficient design
+    // ============================================================
+
+    fn LowPassCoeffs(cutoff:float, sampleRate:float, q:float): array {
+        if (sampleRate <= 0.0 || cutoff <= 0.0 || q <= 0.0) return [];
+        let w0:float = TWO_PI * cutoff / sampleRate;
+        let cosw0:float = Math.Cos(w0);
+        let sinw0:float = Math.Sin(w0);
+        let alpha:float = sinw0 / (2.0 * q);
+        let b0:float = (1.0 - cosw0) / 2.0;
+        let b1:float =  1.0 - cosw0;
+        let b2:float = (1.0 - cosw0) / 2.0;
+        let a0:float =  1.0 + alpha;
+        let a1:float = -2.0 * cosw0;
+        let a2:float =  1.0 - alpha;
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0];
+    }
+
+    fn HighPassCoeffs(cutoff:float, sampleRate:float, q:float): array {
+        if (sampleRate <= 0.0 || cutoff <= 0.0 || q <= 0.0) return [];
+        let w0:float = TWO_PI * cutoff / sampleRate;
+        let cosw0:float = Math.Cos(w0);
+        let sinw0:float = Math.Sin(w0);
+        let alpha:float = sinw0 / (2.0 * q);
+        let b0:float =  (1.0 + cosw0) / 2.0;
+        let b1:float = -(1.0 + cosw0);
+        let b2:float =  (1.0 + cosw0) / 2.0;
+        let a0:float =   1.0 + alpha;
+        let a1:float =  -2.0 * cosw0;
+        let a2:float =   1.0 - alpha;
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0];
+    }
+
+    fn BandPassCoeffs(centerFreq:float, sampleRate:float, q:float): array {
+        if (sampleRate <= 0.0 || centerFreq <= 0.0 || q <= 0.0) return [];
+        let w0:float = TWO_PI * centerFreq / sampleRate;
+        let cosw0:float = Math.Cos(w0);
+        let sinw0:float = Math.Sin(w0);
+        let alpha:float = sinw0 / (2.0 * q);
+        let b0:float =  sinw0 / 2.0;
+        let b1:float =  0.0;
+        let b2:float = -sinw0 / 2.0;
+        let a0:float =  1.0 + alpha;
+        let a1:float = -2.0 * cosw0;
+        let a2:float =  1.0 - alpha;
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0];
+    }
+
+    fn NotchCoeffs(centerFreq:float, sampleRate:float, q:float): array {
+        if (sampleRate <= 0.0 || centerFreq <= 0.0 || q <= 0.0) return [];
+        let w0:float = TWO_PI * centerFreq / sampleRate;
+        let cosw0:float = Math.Cos(w0);
+        let sinw0:float = Math.Sin(w0);
+        let alpha:float = sinw0 / (2.0 * q);
+        let b0:float =  1.0;
+        let b1:float = -2.0 * cosw0;
+        let b2:float =  1.0;
+        let a0:float =  1.0 + alpha;
+        let a1:float = -2.0 * cosw0;
+        let a2:float =  1.0 - alpha;
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0];
+    }
+
+    // ============================================================
+    //  Convenience filters
+    // ============================================================
+
+    fn LowPass(signal:array, cutoff:float, sampleRate:float, q:float): array {
+        let coeffs:array = LowPassCoeffs(cutoff, sampleRate, q);
+        if (len(coeffs) < 5) return [];
+        return IIR(signal, coeffs);
+    }
+
+    fn HighPass(signal:array, cutoff:float, sampleRate:float, q:float): array {
+        let coeffs:array = HighPassCoeffs(cutoff, sampleRate, q);
+        if (len(coeffs) < 5) return [];
+        return IIR(signal, coeffs);
+    }
+
+    fn BandPass(signal:array, centerFreq:float, sampleRate:float, q:float): array {
+        let coeffs:array = BandPassCoeffs(centerFreq, sampleRate, q);
+        if (len(coeffs) < 5) return [];
+        return IIR(signal, coeffs);
+    }
+
+    fn Notch(signal:array, centerFreq:float, sampleRate:float, q:float): array {
+        let coeffs:array = NotchCoeffs(centerFreq, sampleRate, q);
+        if (len(coeffs) < 5) return [];
+        return IIR(signal, coeffs);
+    }
+
+    fn MedianFilter(signal:array, w:int): array {
+        let n:int = len(signal);
+        if (n == 0) return [];
+        if (w <= 0) return [];
+        let out:array = Array.Create(n);
+        let half:int = w / 2;
+
+        iter(i from 0 to n-1) {
+            let win:array = Array.Create(w);
+            iter(j from 0 to w-1) {
+                let idx:int = i - j;
+                if (idx >= 0) {
+                    win[j] = signal[idx];
+                } else {
+                    win[j] = 0.0;
+                }
+            }
+
+            iter(k from 1 to len(win)-1) {
+                let key:float = win[k];
+                let m:int = k - 1;
+                while (m >= 0 && win[m] > key) {
+                    win[m + 1] = win[m];
+                    m -= 1;
+                }
+                win[m + 1] = key;
+            }
+
+            out[i] = win[half];
+        }
+
+        return out;
+    }
+
+    // ============================================================
+    //  Frequency domain
+    // ============================================================
+
+    fn FFT(signal:array): object {
+        let n:int = len(signal);
+        if (n == 0) return { real: [], imag: [] };
+        if (!IsPowerOfTwo(n)) return { real: [], imag: [] };
+        let im:array = _zeros(n);
+        return _FFTComplex(signal, im);
+    }
+
+    fn IFFT(spectrum:object): array {
+        if (spectrum == nil || spectrum.real == nil || spectrum.imag == nil) return [];
+        let n:int = len(spectrum.real);
+        if (n == 0 || n != len(spectrum.imag)) return [];
+        if (!IsPowerOfTwo(n)) return [];
+
+        let conjIm:array = _zeros(n);
+        iter(i from 0 to n-1) {
+            conjIm[i] = -spectrum.imag[i];
+        }
+
+        let result:object = _FFTComplex(spectrum.real, conjIm);
+        let out:array = _zeros(n);
+        iter(i from 0 to n-1) {
+            out[i] = result.real[i] / n;
+        }
+        return out;
+    }
+
+    fn DFT(signal:array): object {
+        let n:int = len(signal);
+        let re:array = _zeros(n);
+        let im:array = _zeros(n);
+        iter(k from 0 to n-1) {
+            let sumR:float = 0.0;
+            let sumI:float = 0.0;
+            iter(t from 0 to n-1) {
+                let angle:float = TWO_PI * k * t / n;
+                sumR += signal[t] * Math.Cos(angle);
+                sumI -= signal[t] * Math.Sin(angle);
+            }
+            re[k] = sumR;
+            im[k] = sumI;
+        }
+        return { real: re, imag: im };
+    }
+
+    fn IDFT(spectrum:object): array {
+        if (spectrum == nil || spectrum.real == nil || spectrum.imag == nil) return [];
+        let re:array = spectrum.real;
+        let im:array = spectrum.imag;
+        let n:int = len(re);
+        if (n == 0 || n != len(im)) return [];
+        let out:array = _zeros(n);
+        iter(t from 0 to n-1) {
+            let sumR:float = 0.0;
+            iter(k from 0 to n-1) {
+                let angle:float = TWO_PI * k * t / n;
+                sumR += re[k] * Math.Cos(angle) - im[k] * Math.Sin(angle);
+            }
+            out[t] = sumR / n;
+        }
+        return out;
+    }
+
+    fn Magnitude(spectrum:object): array {
+        let re:array = spectrum.real;
+        let im:array = spectrum.imag;
+        let n:int = len(re);
+        let mag:array = Array.Create(n);
+        iter(i from 0 to n-1) {
+            mag[i] = Math.Sqrt(re[i]*re[i] + im[i]*im[i]);
+        }
+        return mag;
+    }
+
+    fn Phase(spectrum:object): array {
+        let re:array = spectrum.real;
+        let im:array = spectrum.imag;
+        let n:int = len(re);
+        let ph:array = Array.Create(n);
+        iter(i from 0 to n-1) {
+            ph[i] = Math.Atan2(im[i], re[i]);
+        }
+        return ph;
+    }
+
+    fn PowerSpectrum(spectrum:object): array {
+        let mag:array = Magnitude(spectrum);
+        let n:int = len(mag);
+        let out:array = Array.Create(n);
+        iter(i from 0 to n-1) {
+            let m:float = mag[i];
+            out[i] = m * m;
+        }
+        return out;
+    }
+
+    fn ToDb(magnitude:array): array {
+        let n:int = len(magnitude);
+        let out:array = Array.Create(n);
+        iter(i from 0 to n-1) {
+            let m:float = magnitude[i];
+            if (m <= 0.0) {
+                out[i] = -120.0;
+            } else {
+                out[i] = 20.0 * Math.Log10(m);
+            }
+        }
+        return out;
+    }
+
+    fn BinToHz(bin:int, n:int, sampleRate:float): float {
+        if (n <= 0) return 0.0;
+        return bin * sampleRate / n;
+    }
+
+    // ============================================================
+    //  Correlation
+    // ============================================================
+
+    fn Autocorrelate(signal:array, maxLag:int): array {
+        let n:int = len(signal);
+        if (n == 0 || maxLag < 0) return [];
+        let lagMax:int = maxLag;
+        if (lagMax >= n) lagMax = n - 1;
+        let out: [float] = Array.Create(lagMax + 1, Type.Float);
+        _sig_autocorr(signal, out, n, lagMax);
+        return out;
+    }
+
+    fn CrossCorrelate(a:array, b:array, maxLag:int): array {
+        let n:int = int(Math.Min(len(a), len(b)));
+        if (n == 0 || maxLag < 0) return [];
+        let lagMax:int = maxLag;
+        if (lagMax >= n) lagMax = n - 1;
+        let out:array = Array.Create(lagMax + 1);
+        iter(lag from 0 to lagMax) {
+            let sum:float = 0.0;
+            iter(i from 0 to (n - lag) - 1) {
+                sum += a[i] * b[i + lag];
+            }
+            out[lag] = sum / n;
+        }
+        return out;
+    }
+
+    // ============================================================
+    //  Signal generation
+    // ============================================================
+
+    fn static _sig_sine_kernel(out: [float], n: int, step: float, amplitude: float, phase: float): int {
+        iter(i from 0 to n-1) {
+            let fi: float = i;
+            out[i] = amplitude * Math.Sin(step * fi + phase);
+        }
+        return 0;
+    }
+
+    fn static _sig_cosine_kernel(out: [float], n: int, step: float, amplitude: float, phase: float): int {
+        iter(i from 0 to n-1) {
+            let fi: float = i;
+            out[i] = amplitude * Math.Cos(step * fi + phase);
+        }
+        return 0;
+    }
+
+    fn Sine(n:int, freq:float, sampleRate:float, amplitude:float, phase:float): array {
+        if (n <= 0) return [];
+        let out: [float] = Array.Create(n, Type.Float);
+        let step: float = TWO_PI * freq / sampleRate;
+        _sig_sine_kernel(out, n, step, amplitude, phase);
+        return out;
+    }
+
+    fn Cosine(n:int, freq:float, sampleRate:float, amplitude:float, phase:float): array {
+        if (n <= 0) return [];
+        let out: [float] = Array.Create(n, Type.Float);
+        let step: float = TWO_PI * freq / sampleRate;
+        _sig_cosine_kernel(out, n, step, amplitude, phase);
+        return out;
+    }
+
+    fn Square(n:int, freq:float, sampleRate:float, amplitude:float): array {
+        let out:array = _zeros(n);
+        iter(i from 0 to n-1) {
+            out[i] = amplitude * Math.Sign(Math.Sin(TWO_PI * freq * i / sampleRate));
+        }
+        return out;
+    }
+
+    fn Sawtooth(n:int, freq:float, sampleRate:float, amplitude:float): array {
+        let out:array = _zeros(n);
+        let period:float = sampleRate / freq;
+        iter(i from 0 to n-1) {
+            let phase:float = Math.Fract(i / period);
+            out[i] = amplitude * (2.0 * phase - 1.0);
+        }
+        return out;
+    }
+
+    fn Triangle(n:int, freq:float, sampleRate:float, amplitude:float): array {
+        let out:array = _zeros(n);
+        let period:float = sampleRate / freq;
+        iter(i from 0 to n-1) {
+            let phase:float = Math.Fract(i / period);
+            let v:float = 0.0;
+            if (phase < 0.5) {
+                v = 4.0 * phase - 1.0;
+            } else {
+                v = 3.0 - 4.0 * phase;
+            }
+            out[i] = amplitude * v;
+        }
+        return out;
+    }
+
+    fn Noise(n:int, amplitude:float): array {
+        let out:array = _zeros(n);
+        iter(i from 0 to n-1) {
+            out[i] = amplitude * (Math.Random() * 2.0 - 1.0);
+        }
+        return out;
+    }
+
+    fn Chirp(n:int, freqStart:float, freqEnd:float, sampleRate:float, amplitude:float): array {
+        let out:array = _zeros(n);
+        let invSR:float  = 1.0 / sampleRate;
+        let k:float      = (freqEnd - freqStart) * invSR * 0.5;
+        let twoPiFs:float = TWO_PI * freqStart;
+        let twoPiK:float  = TWO_PI * k;
+        iter(i from 0 to n-1) {
+            let t:float = i * invSR;
+            out[i] = amplitude * Math.Sin(twoPiFs * t + twoPiK * t * t);
+        }
+        return out;
+    }
+
+    fn Mix(a:array, b:array, wa:float, wb:float): array {
+        let n:int = int(Math.Min(len(a), len(b)));
+        let out: [float] = Array.Create(n, Type.Float);
+        _sig_mix_kernel(a, b, out, n, wa, wb);
+        return out;
+    }
+
+    // ============================================================
+    //  Resampling
+    // ============================================================
+
+    fn Decimate(signal:array, factor:int): array {
+        if (factor <= 0) return [];
+        let filtered:array = MovingAverage(signal, factor);
+        let outLen:int = int((len(filtered) + factor - 1) / factor);
+        let out:array = Array.Create(outLen);
+        let j:int = 0;
+        let i:int = 0;
+        while (i < len(filtered)) {
+            out[j] = filtered[i];
+            j += 1;
+            i += factor;
+        }
+        return out;
+    }
+
+    fn Interpolate(signal:array, factor:int): array {
+        if (factor <= 0) return [];
+        let n:int = len(signal);
+        let expanded:array = _zeros(n * factor);
+        iter(i from 0 to n-1) {
+            expanded[i * factor] = signal[i] * factor;
+        }
+        return MovingAverage(expanded, factor);
+    }
+
+    // ============================================================
+    //  Utility - generation and manipulation
+    // ============================================================
+
+    fn Silence(n:int): array {
+        return _zeros(n);
+    }
+
+    fn Concat(a:array, b:array): array {
+        let na:int = len(a);
+        let nb:int = len(b);
+        let out:array = Array.Create(na + nb);
+        iter(i from 0 to na-1) { out[i] = a[i]; }
+        iter(i from 0 to nb-1) { out[na + i] = b[i]; }
+        return out;
+    }
+
+    fn Repeat(signal:array, times:int): array {
+        let n:int = len(signal);
+        if (n == 0 || times <= 0) return [];
+        let out:array = Array.Create(n * times);
+        iter(t from 0 to times-1) {
+            iter(i from 0 to n-1) { out[t * n + i] = signal[i]; }
+        }
+        return out;
+    }
+
+    // ============================================================
+    //  Normalization and padding
+    // ============================================================
+
+    fn PeakNormalize(signal:array): array {
+        let n = len(signal);
+        var peak: float = 0.0;
+        iter(i from 0 to n-1) {
+            let a: float = Math.AbsF(signal[i]);
+            if (a > peak) peak = a;
+        }
+        if (peak == 0) return signal;
+        let out: [float] = Array.Create(n, Type.Float);
+        iter(i from 0 to n-1) { out[i] = signal[i] / peak; }
+        return out;
+    }
+
+    fn FFTPad(signal:array): array {
+        let n = len(signal);
+        var p = 1;
+        while (p < n) p = p * 2;
+        if (p == n) return signal;
+        let out: [float] = Array.Create(p, Type.Float);
+        iter(i from 0 to n-1) { out[i] = signal[i]; }
+        return out;
+    }
+
+    fn static NextPow2(n:int): int {
+        var p = 1;
+        while (p < n) p = p * 2;
+        return p;
+    }
+}
+
+export { Signals };

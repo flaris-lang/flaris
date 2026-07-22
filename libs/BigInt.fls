@@ -1,0 +1,718 @@
+// BigInt.fls - Arbitrary-precision integers for Flaris.
+// Version: 1.0
+//
+// Handles integers of any size without overflow. All values are immutable
+// objects. All methods are static - use BigInt.Xxx().
+//
+// Usage:
+//   import { BigInt } from library("BigInt", "1.0");
+//
+//   let a = BigInt.From(123456789012345678);
+//   let b = BigInt.From("999999999999999999999");
+//   Console.WriteLine(BigInt.ToString(BigInt.Mul(a, b)));
+//
+//   Console.WriteLine(BigInt.ToString(BigInt.Factorial(100)));
+//   Console.WriteLine(BigInt.ToString(BigInt.Fibonacci(200)));
+//
+//   // Modular arithmetic (useful for cryptography)
+//   let p = BigInt.From("17");
+//   Console.WriteLine(BigInt.ToString(BigInt.ModPow(BigInt.From(2), BigInt.From(10), p)));
+//
+// Creating:
+//   BigInt.From(value)       - from int or string (decimal or "0x..." hex)
+//   BigInt.FromHex(s)        - from hex string (with or without "0x" prefix)
+//   BigInt.Zero()            - 0
+//   BigInt.One()             - 1
+//
+// Arithmetic:
+//   BigInt.Add(a, b)         →  BigInt
+//   BigInt.Sub(a, b)         →  BigInt
+//   BigInt.Mul(a, b)         →  BigInt
+//   BigInt.Div(a, b)         →  BigInt  - truncating integer division
+//   BigInt.Mod(a, b)         →  BigInt  - always non-negative
+//   BigInt.DivMod(a, b)      →  { quotient, remainder }
+//   BigInt.Pow(base, exp)    →  BigInt  - exp must be a non-negative int or BigInt
+//   BigInt.Neg(n)            →  BigInt  - unary negation
+//   BigInt.Abs(n)            →  BigInt
+//
+// Number theory:
+//   BigInt.Gcd(a, b)                 →  BigInt
+//   BigInt.Lcm(a, b)                 →  BigInt
+//   BigInt.ModPow(base, exp, mod)    →  BigInt  - fast modular exponentiation
+//   BigInt.ModInverse(a, mod)        →  BigInt  - modular multiplicative inverse
+//   BigInt.IsPrime(n)                →  bool    - Miller-Rabin probabilistic test
+//   BigInt.Sqrt(n)                   →  BigInt  - integer square root (floor)
+//   BigInt.BitLength(n)              →  int     - number of bits in |n|
+//
+// Combinatorics:
+//   BigInt.Factorial(n:int)  →  BigInt
+//   BigInt.Fibonacci(n:int)  →  BigInt
+//
+// Bitwise (And/Or/Xor operate on magnitudes; Not is ~n = -(n+1)):
+//   BigInt.And(a, b)         →  BigInt
+//   BigInt.Or(a, b)          →  BigInt
+//   BigInt.Xor(a, b)         →  BigInt
+//   BigInt.Not(n)            →  BigInt
+//   BigInt.Shl(n, bits:int)  →  BigInt  - n * 2^bits (nil if bits < 0)
+//   BigInt.Shr(n, bits:int)  →  BigInt  - floor(n / 2^bits) (nil if bits < 0)
+//   BigInt.TestBit(n, i:int) →  bool    - bit i of |n|
+//
+// Comparison:
+//   BigInt.Cmp(a, b)   →  int    - -1, 0, or 1
+//   BigInt.Eq(a, b)    →  bool
+//   BigInt.Lt(a, b)    →  bool
+//   BigInt.Lte(a, b)   →  bool
+//   BigInt.Gt(a, b)    →  bool
+//   BigInt.Gte(a, b)   →  bool
+//   BigInt.IsZero(n)   →  bool
+//   BigInt.IsNeg(n)    →  bool
+//   BigInt.IsPos(n)    →  bool
+//   BigInt.IsEven(n)   →  bool
+//   BigInt.IsOdd(n)    →  bool
+//
+// Conversion:
+//   BigInt.ToString(n) →  string  - decimal string
+//   BigInt.ToHex(n)    →  string  - lowercase hex, no prefix
+//   BigInt.ToInt(n)    →  int     - truncates if value exceeds int64 range
+//   BigInt.ToBytes(n, littleEndian?)   →  array of byte ints (big-endian default)
+//   BigInt.FromBytes(bytes, littleEndian?) →  BigInt  - magnitude only (sign not encoded)
+//
+// Internal representation (for reference):
+//   { sign:int, limbs:array }  - sign=1 (non-negative) or -1;
+//   limbs: little-endian base-10⁶ digits, no leading zeros
+
+class BigInt {
+
+    const _BASE     = 1000000;
+    const _HALFBASE = 500000;
+
+    // ----------------------------------------------------------------
+    // Internal helpers
+    // ----------------------------------------------------------------
+
+    // Flaris `/` always returns float; use this for integer division.
+    fn static _idiv(a, b): int { return Convert.ToInt(a / b); }
+
+    fn static _make(sign, limbs) { return { sign: sign, limbs: limbs }; }
+    fn static _zero()            { return { sign: 1,    limbs: [0] }; }
+    fn static _one()             { return { sign: 1,    limbs: [1] }; }
+    fn static _isZeroL(ls): bool       { return len(ls) == 1 && ls[0] == 0; }
+
+    fn static _trim(ls) {
+        var n = len(ls);
+        while (n > 1 && ls[n - 1] == 0) { Array.RemoveAt(ls, n - 1); n -= 1; }
+        return ls;
+    }
+
+    fn static _copyL(ls) { return Array.Subset(ls, 0, len(ls)); }
+
+    fn static _cmpL(a, b): int {
+        var na = len(a); var nb = len(b);
+        if (na != nb) { return na < nb ? -1 : 1; }
+        var i = na - 1;
+        while (i >= 0) {
+            if (a[i] != b[i]) { return a[i] < b[i] ? -1 : 1; }
+            i -= 1;
+        }
+        return 0;
+    }
+
+    fn static _addL(a, b) {
+        var na = len(a); var nb = len(b);
+        var n = na > nb ? na : nb;
+        var r = []; var carry = 0;
+        iter (i from 0 to n - 1) {
+            var s = (i < na ? a[i] : 0) + (i < nb ? b[i] : 0) + carry;
+            Array.Append(r, s % BigInt._BASE);
+            carry = BigInt._idiv(s, BigInt._BASE);
+        }
+        if (carry > 0) Array.Append(r, carry);
+        return r;
+    }
+
+    fn static _subL(a, b) {    // precondition: a >= b (absolute)
+        var na = len(a); var nb = len(b);
+        var r = []; var borrow = 0;
+        iter (i from 0 to na - 1) {
+            var d = a[i] - (i < nb ? b[i] : 0) - borrow;
+            if (d < 0) { d = d + BigInt._BASE; borrow = 1; } else { borrow = 0; }
+            Array.Append(r, d);
+        }
+        return BigInt._trim(r);
+    }
+
+    fn static _mulL(a, b) {
+        var na = len(a); var nb = len(b);
+        var r = Array.Create(na + nb);
+        Array.Fill(r, 0);
+        iter (i from 0 to na - 1) {
+            iter (j from 0 to nb - 1) {
+                r[i + j] = r[i + j] + a[i] * b[j];
+            }
+        }
+        iter (i from 0 to na + nb - 2) {
+            r[i + 1] = r[i + 1] + BigInt._idiv(r[i], BigInt._BASE);
+            r[i] = r[i] % BigInt._BASE;
+        }
+        return BigInt._trim(r);
+    }
+
+    // Binary-lifting division. Returns { q, r } as raw limb arrays.
+    fn static _divmodL(a, b) {
+        var c = BigInt._cmpL(a, b);
+        if (c < 0) { return { q: [0], r: BigInt._copyL(a) }; }
+        if (c == 0) { return { q: [1], r: [0] }; }
+
+        // Build powers-of-two multiples of b until one exceeds a.
+        var ms = [ BigInt._copyL(b) ];
+        var fs = [ [1] ];
+        while (BigInt._cmpL(ms[len(ms) - 1], a) <= 0) {
+            var last  = ms[len(ms) - 1];
+            var lastf = fs[len(fs) - 1];
+            Array.Append(ms, BigInt._addL(last,  last));
+            Array.Append(fs, BigInt._addL(lastf, lastf));
+        }
+
+        var q = [0]; var r = BigInt._copyL(a);
+        var idx = len(ms) - 1;
+        while (idx >= 0) {
+            if (BigInt._cmpL(r, ms[idx]) >= 0) {
+                r = BigInt._subL(r, ms[idx]);
+                q = BigInt._addL(q, fs[idx]);
+            }
+            idx -= 1;
+        }
+        return { q: q, r: r };
+    }
+
+    // Right-shift by 1 bit (integer divide by 2). n must be non-negative.
+    fn static _shr1(n) {
+        var ls = BigInt._copyL(n.limbs);
+        var carry = 0;
+        var i = len(ls) - 1;
+        while (i >= 0) {
+            var orig = ls[i];
+            ls[i] = BigInt._idiv(orig, 2) + carry * BigInt._HALFBASE;
+            carry = orig % 2;
+            i -= 1;
+        }
+        return BigInt._make(n.sign, BigInt._trim(ls));
+    }
+
+    // ----------------------------------------------------------------
+    // Construction
+    // ----------------------------------------------------------------
+
+    fn static From(value) {
+        if (Type.Is(value, Type.Int))    { return BigInt._fromInt(value); }
+        if (Type.Is(value, Type.String)) { return BigInt._parseStr(value); }
+        return BigInt._zero();
+    }
+
+    fn static _fromInt(v: int) {
+        if (v == 0) { return BigInt._zero(); }
+        var sign = v < 0 ? -1 : 1;
+        var u = v < 0 ? -v : v;
+        var ls = [];
+        while (u > 0) { Array.Append(ls, u % BigInt._BASE); u = BigInt._idiv(u, BigInt._BASE); }
+        return { sign: sign, limbs: ls };
+    }
+
+    fn static _parseStr(s: string) {
+        if (s == nil || len(s) == 0) { return BigInt._zero(); }
+        var sign = 1;
+        if (String.StartsWith(s, "-")) { sign = -1; s = String.Substr(s, 1); }
+        else if (String.StartsWith(s, "+")) { s = String.Substr(s, 1); }
+
+        // Strip leading zeros (keep at least one digit).
+        while (len(s) > 1 && String.Left(s, 1) == "0") { s = String.Substr(s, 1); }
+
+        if (len(s) == 0 || s == "0") { return BigInt._zero(); }
+
+        // Parse right-to-left in groups of 6 decimal digits.
+        var n = len(s); var ls = []; var j = n;
+        while (j > 0) {
+            var start = j - 6; if (start < 0) start = 0;
+            var v = Convert.ParseInt(String.Substr(s, start, j - start));
+            if (v == nil) { return BigInt._zero(); }
+            Array.Append(ls, v);
+            j = start;
+        }
+        BigInt._trim(ls);
+        if (BigInt._isZeroL(ls)) { sign = 1; }
+        return { sign: sign, limbs: ls };
+    }
+
+    fn static Zero() { return BigInt._zero(); }
+    fn static One()  { return BigInt._one(); }
+
+    // ----------------------------------------------------------------
+    // Output
+    // ----------------------------------------------------------------
+
+    fn static ToString(n): string {
+        var ls = n.limbs; var k = len(ls);
+        var s = Convert.ToString(ls[k - 1]);    // most-significant limb, no padding
+        var i = k - 2;
+        while (i >= 0) {
+            s = s + String.PadLeft(Convert.ToString(ls[i]), 6, '0');
+            i -= 1;
+        }
+        return (n.sign == -1 && s != "0") ? "-" + s : s;
+    }
+
+    // Returns a Flaris int, or nil if the BigInt does not fit in int64.
+    fn static ToInt(n) {
+        if (len(n.limbs) > 3) { return nil; }  // > ~18 decimal digits
+        var ls = n.limbs; var res = 0; var base = 1;
+        iter (i from 0 to len(ls) - 1) {
+            res = res + ls[i] * base;
+            base = base * BigInt._BASE;
+        }
+        return n.sign == -1 ? -res : res;
+    }
+
+    // ----------------------------------------------------------------
+    // Comparison
+    // ----------------------------------------------------------------
+
+    fn static Cmp(a, b): int {
+        if (a.sign != b.sign) { return a.sign > b.sign ? 1 : -1; }
+        var c = BigInt._cmpL(a.limbs, b.limbs);
+        return a.sign == 1 ? c : -c;
+    }
+
+    fn static Eq(a, b): bool  { return BigInt.Cmp(a, b) == 0; }
+    fn static Lt(a, b): bool  { return BigInt.Cmp(a, b) <  0; }
+    fn static Lte(a, b): bool { return BigInt.Cmp(a, b) <= 0; }
+    fn static Gt(a, b): bool  { return BigInt.Cmp(a, b) >  0; }
+    fn static Gte(a, b): bool { return BigInt.Cmp(a, b) >= 0; }
+
+    fn static IsZero(n): bool { return BigInt._isZeroL(n.limbs); }
+    fn static IsNeg(n): bool  { return n.sign == -1; }
+    fn static IsPos(n): bool  { return n.sign == 1 && !BigInt._isZeroL(n.limbs); }
+    fn static IsEven(n): bool { return n.limbs[0] % 2 == 0; }
+    fn static IsOdd(n): bool  { return n.limbs[0] % 2 == 1; }
+
+    // ----------------------------------------------------------------
+    // Arithmetic
+    // ----------------------------------------------------------------
+
+    fn static Neg(n) {
+        if (BigInt.IsZero(n)) { return BigInt._zero(); }
+        return { sign: -n.sign, limbs: BigInt._copyL(n.limbs) };
+    }
+
+    fn static Abs(n) { return { sign: 1, limbs: BigInt._copyL(n.limbs) }; }
+
+    fn static Add(a, b) {
+        if (a.sign == b.sign) {
+            return BigInt._make(a.sign, BigInt._addL(a.limbs, b.limbs));
+        }
+        var c = BigInt._cmpL(a.limbs, b.limbs);
+        if (c == 0) { return BigInt._zero(); }
+        if (c  > 0) { return BigInt._make(a.sign, BigInt._subL(a.limbs, b.limbs)); }
+        return BigInt._make(b.sign, BigInt._subL(b.limbs, a.limbs));
+    }
+
+    fn static Sub(a, b)  { return BigInt.Add(a, BigInt.Neg(b)); }
+
+    fn static Mul(a, b) {
+        if (BigInt.IsZero(a) || BigInt.IsZero(b)) { return BigInt._zero(); }
+        return BigInt._make(a.sign == b.sign ? 1 : -1, BigInt._mulL(a.limbs, b.limbs));
+    }
+
+    // Integer division, truncates toward zero. Returns nil for division by zero.
+    fn static Div(a, b) {
+        if (BigInt.IsZero(b)) { return nil; }
+        var dm = BigInt._divmodL(a.limbs, b.limbs);
+        if (BigInt._isZeroL(dm.q)) { return BigInt._zero(); }
+        return BigInt._make(a.sign == b.sign ? 1 : -1, dm.q);
+    }
+
+    // Remainder with same sign as dividend. Returns nil for division by zero.
+    fn static Mod(a, b) {
+        if (BigInt.IsZero(b)) { return nil; }
+        var dm = BigInt._divmodL(a.limbs, b.limbs);
+        if (BigInt._isZeroL(dm.r)) { return BigInt._zero(); }
+        return BigInt._make(a.sign, dm.r);
+    }
+
+    // Returns { q, r } as BigInts. Returns nil for division by zero.
+    fn static DivMod(a, b) {
+        if (BigInt.IsZero(b)) { return nil; }
+        var dm = BigInt._divmodL(a.limbs, b.limbs);
+        var qs = a.sign == b.sign ? 1 : -1;
+        return {
+            q: BigInt._isZeroL(dm.q) ? BigInt._zero() : BigInt._make(qs,      dm.q),
+            r: BigInt._isZeroL(dm.r) ? BigInt._zero() : BigInt._make(a.sign,  dm.r)
+        };
+    }
+
+    // exp must be a non-negative Flaris int. Returns nil for negative exp.
+    fn static Pow(base, exp: int) {
+        if (exp < 0) { return nil; }
+        var result = BigInt._one(); var cur = base;
+        while (exp > 0) {
+            if (exp % 2 == 1) { result = BigInt.Mul(result, cur); }
+            cur = BigInt.Mul(cur, cur);
+            exp = BigInt._idiv(exp, 2);
+        }
+        return result;
+    }
+
+    fn static Gcd(a, b) {
+        a = BigInt.Abs(a); b = BigInt.Abs(b);
+        while (!BigInt.IsZero(b)) { var t = BigInt.Mod(a, b); a = b; b = t; }
+        return a;
+    }
+
+    // ----------------------------------------------------------------
+    // Number theory
+    // ----------------------------------------------------------------
+
+    // Modular exponentiation: base^exp mod m. exp must be a non-negative BigInt.
+    // Returns nil for m = 0 or negative exp.
+    fn static ModPow(base, exp, m) {
+        if (BigInt.IsZero(m))  { return nil; }
+        if (BigInt.IsNeg(exp)) { return nil; }
+        var result = BigInt._one();
+        var b = BigInt.Mod(base, m);
+        if (BigInt.IsNeg(b)) { b = BigInt.Add(b, BigInt.Abs(m)); }
+        var e = BigInt.Abs(exp);
+        while (!BigInt.IsZero(e)) {
+            if (BigInt.IsOdd(e)) {
+                result = BigInt.Mod(BigInt.Mul(result, b), m);
+            }
+            b = BigInt.Mod(BigInt.Mul(b, b), m);
+            e = BigInt._shr1(e);
+        }
+        return result;
+    }
+
+    // Modular inverse: returns x such that a*x ≡ 1 (mod m), or nil if it doesn't exist.
+    fn static ModInverse(a, m) {
+        if (BigInt.IsZero(m)) { return nil; }
+        var absM  = BigInt.Abs(m);
+        var old_r = BigInt.Mod(a, absM);
+        if (BigInt.IsNeg(old_r)) { old_r = BigInt.Add(old_r, absM); }
+        var r     = absM;
+        var old_s = BigInt._one();
+        var s     = BigInt._zero();
+        while (!BigInt.IsZero(r)) {
+            var q     = BigInt.Div(old_r, r);
+            var tmp_r = BigInt.Sub(old_r, BigInt.Mul(q, r));
+            old_r = r; r = tmp_r;
+            var tmp_s = BigInt.Sub(old_s, BigInt.Mul(q, s));
+            old_s = s; s = tmp_s;
+        }
+        if (!BigInt.Eq(old_r, BigInt._one())) { return nil; }
+        if (BigInt.IsNeg(old_s)) { old_s = BigInt.Add(old_s, absM); }
+        return old_s;
+    }
+
+    // Miller-Rabin witness test. Returns false if n is definitely composite.
+    fn static _millerTest(n, a_int, d, r: int): bool {
+        var a = BigInt.From(a_int);
+        if (BigInt.Gte(a, n)) { return true; }
+        var nm1 = BigInt.Sub(n, BigInt._one());
+        var x   = BigInt.ModPow(a, d, n);
+        if (BigInt.Eq(x, BigInt._one()) || BigInt.Eq(x, nm1)) { return true; }
+        var i = 0;
+        while (i < r - 1) {
+            x = BigInt.Mod(BigInt.Mul(x, x), n);
+            if (BigInt.Eq(x, nm1)) { return true; }
+            i += 1;
+        }
+        return false;
+    }
+
+    // Deterministic primality test for n < 3.3×10²⁴; probabilistically correct beyond that.
+    fn static IsPrime(n): bool {
+        if (BigInt.Lt(n, BigInt.From(2)))  { return false; }
+        if (BigInt.Eq(n, BigInt.From(2)))  { return true; }
+        if (BigInt.Eq(n, BigInt.From(3)))  { return true; }
+        if (BigInt.IsEven(n))              { return false; }
+        if (BigInt.Lt(n, BigInt.From(9)))  { return true; }
+
+        // Factor n-1 = 2^r * d, d odd.
+        var d  = BigInt.Sub(n, BigInt._one());
+        var r  = 0;
+        while (BigInt.IsEven(d)) { d = BigInt._shr1(d); r += 1; }
+
+        var witnesses = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+        iter (i from 0 to len(witnesses) - 1) {
+            if (!BigInt._millerTest(n, witnesses[i], d, r)) { return false; }
+        }
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Combinatorics
+    // ----------------------------------------------------------------
+
+    // n must be a non-negative Flaris int. Returns nil for n < 0.
+    fn static Factorial(n: int) {
+        if (n < 0) { return nil; }
+        if (n < 2)  { return BigInt._one(); }
+        var r = BigInt._one();
+        iter (i from 2 to n) { r = BigInt.Mul(r, BigInt._fromInt(i)); }
+        return r;
+    }
+
+    // Returns F(n) for n >= 0 (0-indexed: F(0)=0, F(1)=1, F(2)=1, ...).
+    fn static Fibonacci(n: int) {
+        if (n < 0) { return nil; }
+        if (n == 0) { return BigInt._zero(); }
+        var a = BigInt._zero(); var b = BigInt._one();
+        iter (i from 1 to n) { var t = BigInt.Add(a, b); a = b; b = t; }
+        return a;
+    }
+
+    // ----------------------------------------------------------------
+    // Extended operations
+    // ----------------------------------------------------------------
+
+    // Least Common Multiple: |a*b| / gcd(a,b). Returns Zero if either is zero.
+    fn static Lcm(a, b) {
+        if (BigInt.IsZero(a) || BigInt.IsZero(b)) { return BigInt._zero(); }
+        var g = BigInt.Gcd(a, b);
+        return BigInt.Abs(BigInt.Mul(a, BigInt.Div(b, g)));
+    }
+
+    // Number of bits needed to represent the absolute value of n.
+    // Returns 0 for zero.
+    fn static BitLength(n): int {
+        if (BigInt.IsZero(n)) { return 0; }
+        var count = 0;
+        var x = BigInt.Abs(n);
+        while (!BigInt.IsZero(x)) { x = BigInt._shr1(x); count += 1; }
+        return count;
+    }
+
+    // Integer square root of a non-negative BigInt (Newton / binary search).
+    // Returns nil for negative n.
+    fn static Sqrt(n) {
+        if (BigInt.IsNeg(n)) { return nil; }
+        if (BigInt.IsZero(n)) { return BigInt._zero(); }
+        if (BigInt.Eq(n, BigInt._one())) { return BigInt._one(); }
+
+        // Find x = smallest power of 2 such that x*x > n.
+        var x = BigInt._one();
+        while (BigInt.Lte(BigInt.Mul(x, x), n)) {
+            x = BigInt.Add(x, x);
+        }
+        // Binary search between x/2 (inclusive) and x (exclusive).
+        var lo = BigInt._shr1(x);
+        var hi = x;
+        while (true) {
+            // mid = (lo + hi) / 2
+            var mid = BigInt._shr1(BigInt.Add(lo, hi));
+            if (BigInt.Lte(hi, BigInt.Add(lo, BigInt._one()))) {
+                // Range collapsed - lo is the answer.
+                return lo;
+            }
+            var sq = BigInt.Mul(mid, mid);
+            var c  = BigInt.Cmp(sq, n);
+            if (c == 0) { return mid; }
+            if (c < 0) { lo = mid; } else { hi = mid; }
+        }
+    }
+
+    // Convert absolute value of n to hexadecimal string.
+    // Negative n gets a leading '-'. Zero returns "0".
+    fn static ToHex(n): string {
+        if (BigInt.IsZero(n)) { return "0"; }
+        var hexDigits = "0123456789abcdef";
+        var abs = BigInt.Abs(n);
+        var sixteen = BigInt.From(16);
+        var digits = [];
+        var cur = abs;
+        while (!BigInt.IsZero(cur)) {
+            var dm  = BigInt.DivMod(cur, sixteen);
+            var idx = BigInt.ToInt(dm.r);
+            Array.Append(digits, String.Substr(hexDigits, idx, 1));
+            cur = dm.q;
+        }
+        // digits is in reverse order (least significant first) - reverse it.
+        var result = "";
+        var i = len(digits) - 1;
+        while (i >= 0) {
+            result = result + digits[i];
+            i -= 1;
+        }
+        if (n.sign == -1) { result = "-" + result; }
+        return result;
+    }
+
+    // Parse a hex string into a BigInt. Accepts optional "0x"/"0X" prefix and
+    // leading "-". Returns Zero for empty or invalid input.
+    fn static FromHex(s: string) {
+        if (s == nil || len(s) == 0) { return BigInt._zero(); }
+        var sign = 1;
+        if (String.StartsWith(s, "-")) { sign = -1; s = String.Substr(s, 1); }
+        if (String.StartsWith(s, "0x") || String.StartsWith(s, "0X")) {
+            s = String.Substr(s, 2);
+        }
+        if (len(s) == 0) { return BigInt._zero(); }
+
+        var hexDigits = "0123456789abcdef";
+        var result = BigInt._zero();
+        var sixteen = BigInt.From(16);
+        var i = 0;
+        var n = len(s);
+        while (i < n) {
+            var ch  = String.ToLower(String.Substr(s, i, 1));
+            var idx = String.IndexOf(hexDigits, ch);
+            if (idx < 0) { return BigInt._zero(); }
+            result = BigInt.Add(BigInt.Mul(result, sixteen), BigInt.From(idx));
+            i += 1;
+        }
+        if (sign == -1 && !BigInt.IsZero(result)) { result = BigInt.Neg(result); }
+        return result;
+    }
+
+    // ----------------------------------------------------------------
+    // Bitwise operations
+    //
+    // And/Or/Xor operate on the magnitudes (absolute values) of their operands
+    // and return a non-negative result - they are intended for non-negative
+    // integers (bit masks, crypto). Shl/Shr shift by a Flaris int count. Not(n)
+    // is the two's-complement identity ~n = -(n+1), valid for any sign.
+    // ----------------------------------------------------------------
+
+    // |n| as a least-significant-first bit array (empty for zero).
+    fn static _toBits(n) {
+        var bits = [];
+        var cur  = BigInt.Abs(n);
+        while (!BigInt.IsZero(cur)) {
+            Array.Append(bits, BigInt.IsOdd(cur) ? 1 : 0);
+            cur = BigInt._shr1(cur);
+        }
+        return bits;
+    }
+
+    // Build a non-negative BigInt from a least-significant-first bit array.
+    fn static _fromBits(bits) {
+        var r   = BigInt._zero();
+        var two = BigInt._fromInt(2);
+        var i   = len(bits) - 1;
+        while (i >= 0) {
+            r = BigInt.Add(BigInt.Mul(r, two), BigInt._fromInt(bits[i]));
+            i -= 1;
+        }
+        return r;
+    }
+
+    fn static And(a, b) {
+        var ba = BigInt._toBits(a);
+        var bb = BigInt._toBits(b);
+        var n  = len(ba) < len(bb) ? len(ba) : len(bb);   // AND past the min is 0
+        var bits = [];
+        var i = 0;
+        while (i < n) {
+            Array.Append(bits, (ba[i] == 1 && bb[i] == 1) ? 1 : 0);
+            i += 1;
+        }
+        return BigInt._fromBits(bits);
+    }
+
+    fn static Or(a, b) {
+        var ba = BigInt._toBits(a);
+        var bb = BigInt._toBits(b);
+        var n  = len(ba) > len(bb) ? len(ba) : len(bb);
+        var bits = [];
+        var i = 0;
+        while (i < n) {
+            var x = (i < len(ba)) ? ba[i] : 0;
+            var y = (i < len(bb)) ? bb[i] : 0;
+            Array.Append(bits, (x == 1 || y == 1) ? 1 : 0);
+            i += 1;
+        }
+        return BigInt._fromBits(bits);
+    }
+
+    fn static Xor(a, b) {
+        var ba = BigInt._toBits(a);
+        var bb = BigInt._toBits(b);
+        var n  = len(ba) > len(bb) ? len(ba) : len(bb);
+        var bits = [];
+        var i = 0;
+        while (i < n) {
+            var x = (i < len(ba)) ? ba[i] : 0;
+            var y = (i < len(bb)) ? bb[i] : 0;
+            Array.Append(bits, (x != y) ? 1 : 0);
+            i += 1;
+        }
+        return BigInt._fromBits(bits);
+    }
+
+    // Bitwise NOT via the two's-complement identity ~n = -(n + 1).
+    fn static Not(n) {
+        return BigInt.Neg(BigInt.Add(n, BigInt._one()));
+    }
+
+    // Shift left by `bits` (>= 0): n * 2^bits. Sign preserved. nil if bits < 0.
+    fn static Shl(n, bits: int) {
+        if (bits < 0)  { return nil; }
+        if (bits == 0) { return BigInt._make(n.sign, BigInt._copyL(n.limbs)); }
+        return BigInt.Mul(n, BigInt.Pow(BigInt._fromInt(2), bits));
+    }
+
+    // Shift right by `bits` (>= 0): floor(|n| / 2^bits) carrying n's sign
+    // (truncates toward zero, like Div). Intended for non-negative integers.
+    // nil if bits < 0.
+    fn static Shr(n, bits: int) {
+        if (bits < 0)  { return nil; }
+        if (bits == 0) { return BigInt._make(n.sign, BigInt._copyL(n.limbs)); }
+        return BigInt.Div(n, BigInt.Pow(BigInt._fromInt(2), bits));
+    }
+
+    // Test bit `i` (>= 0) of |n|; returns true if set.
+    fn static TestBit(n, i: int): bool {
+        if (i < 0) { return false; }
+        return BigInt.IsOdd(BigInt.Shr(BigInt.Abs(n), i));
+    }
+
+    // ----------------------------------------------------------------
+    // Byte conversion
+    //
+    // Big-endian by default (most-significant byte first). Only the magnitude is
+    // encoded - the sign is not represented in the byte form.
+    // ----------------------------------------------------------------
+
+    // ToBytes(n, littleEndian?) -> array of byte ints (0-255). Zero -> [0].
+    fn static ToBytes(n, littleEndian?: bool) {
+        var le  = (littleEndian == nil) ? false : littleEndian;
+        var cur = BigInt.Abs(n);
+        if (BigInt.IsZero(cur)) { return [0]; }
+
+        var b256 = BigInt._fromInt(256);
+        var out  = [];                     // least-significant byte first
+        while (!BigInt.IsZero(cur)) {
+            var dm = BigInt.DivMod(cur, b256);
+            Array.Append(out, BigInt.ToInt(dm.r));
+            cur = dm.q;
+        }
+        if (le) { return out; }
+        return Array.Reverse(out);         // big-endian
+    }
+
+    // FromBytes(bytes, littleEndian?) -> non-negative BigInt. `bytes` is an array
+    // of ints (0-255) or a byte block. Big-endian unless littleEndian is true.
+    fn static FromBytes(bytes, littleEndian?: bool) {
+        var le   = (littleEndian == nil) ? false : littleEndian;
+        var n    = len(bytes);
+        var r    = BigInt._zero();
+        var b256 = BigInt._fromInt(256);
+        if (le) {
+            var i = n - 1;
+            while (i >= 0) { r = BigInt.Add(BigInt.Mul(r, b256), BigInt._fromInt(bytes[i] % 256)); i -= 1; }
+        } else {
+            var i = 0;
+            while (i < n) { r = BigInt.Add(BigInt.Mul(r, b256), BigInt._fromInt(bytes[i] % 256)); i += 1; }
+        }
+        return r;
+    }
+}
+export { BigInt };

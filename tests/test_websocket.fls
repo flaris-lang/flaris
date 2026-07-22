@@ -1,0 +1,240 @@
+// test_websocket.fls
+//
+// Prerequisite:
+//   docker run --rm -p 8080:8080 jmalloc/echo-server
+//
+// Run:
+//   flarisvm --unsafe test_websocket.fls
+
+import { WebSocket, Ws } from library("WebSocket", "1.0");
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+
+fn check(label:string, cond:bool) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + label);
+        failed += 1;
+    }
+}
+
+fn checkEq(label:string, actual, expected) {
+    if (actual == expected) {
+        Console.WriteLine("[PASS] " + label);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + label + " expected=" + str(expected) + " got=" + str(actual));
+        failed += 1;
+    }
+}
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 52),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 78)); }
+
+fn test_connect_and_echo_text() {
+    Console.WriteLine("== Connect + text echo ==");
+
+    let ws = WebSocket.Connect("127.0.0.1", 8080, "/.ws", nil);
+    check("IsOpen after connect", ws.IsOpen());
+
+    check("SendText returns true", ws.SendText("hello from flaris"));
+    let msg = ws.Receive();
+    Console.WriteLine("text=", msg.Text);
+    checkEq("text opcode", msg.Opcode, 1);
+    check("text payload exists", msg.Text != nil);
+   
+    check("text not empty", msg.Text != nil && len(msg.Text) > 0);
+
+    ws.Close(1000, "bye");
+    check("closed after Close()", !ws.IsOpen());
+}
+
+fn test_send_binary() {
+    Console.WriteLine("== Binary send ==");
+
+    let ws = WebSocket.Connect("127.0.0.1", 8080, "/.ws", nil);
+
+    let buf = Buffer.Create(4, 1);
+    Memory.Write8(buf, 65, 0);
+    Memory.Write8(buf, 66, 1);
+    Memory.Write8(buf, 67, 2);
+    Memory.Write8(buf, 68, 3);
+
+    check("SendBinary returns true", ws.SendBinary(buf));
+
+    // echo server may respond with text, so only assert no crash and some frame comes back
+    let msg = ws.Receive();
+    check("binary receive frame object", msg != nil);
+    check("binary receive opcode valid", msg.Opcode == 1 || msg.Opcode == 2);
+
+    ws.Close(1000, "bye");
+}
+
+fn test_ping() {
+    Console.WriteLine("== Ping ==");
+
+    let ws = WebSocket.Connect("127.0.0.1", 8080, "/", nil);
+    check("Ping returns true", ws.Ping("ping-data"));
+
+    // some servers may ignore ping payload at app level, so just verify socket still open
+    check("still open after ping", ws.IsOpen());
+
+    ws.Close(1000, "bye");
+}
+
+fn test_receive_text_helper() {
+    Console.WriteLine("== ReceiveText helper ==");
+
+    let ws = WebSocket.Connect("127.0.0.1", 8080, "/.ws", nil);
+    let text = ws.ReceiveText();
+
+    check("ReceiveText not empty", text != nil && len(text) > 0);
+    ws.Close(1000, "bye");
+}
+
+fn test_custom_headers() {
+    Console.WriteLine("== Custom headers ==");
+
+    let ws = WebSocket.Connect("127.0.0.1", 8080, "/", {
+        "X-Test": "yes",
+        "User-Agent": "FlarisWS"
+    });
+
+    check("connected with custom headers", ws.IsOpen());
+    ws.Close(1000, "bye");
+}
+
+fn Main() {
+    Console.WriteLine("=== WebSocket test suite ===");
+
+    test_connect_and_echo_text();
+    test_send_binary();
+    test_ping();
+    test_receive_text_helper();
+    test_custom_headers();
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed.");
+
+    if (failed == 0) {
+        Console.Ok("All tests passed!");
+    } else {
+        Console.Error("Some tests FAILED.");
+    }
+
+    // ============================================================
+    //  Benchmarks
+    //  In-memory sections always run.
+    //  Network section is guarded by try/catch.
+    // ============================================================
+
+    let bSmallStr = "hello, WebSocket!";
+    let bLargeStr = String.Repeat("x", 1024);
+    let bSmallBlk = Ws.StringToBlock(bSmallStr);
+    let bLargeBlk = Ws.StringToBlock(bLargeStr);
+    let bMask     = Buffer.Create(4, 1);
+    Memory.Write8(bMask, 0xDE, 0);
+    Memory.Write8(bMask, 0xAD, 1);
+    Memory.Write8(bMask, 0xBE, 2);
+    Memory.Write8(bMask, 0xEF, 3);
+    let bXorBuf17 = Ws.StringToBlock(bSmallStr);
+    let bXorBuf1K = Ws.StringToBlock(bLargeStr);
+    let bXorBuf8K = Buffer.Create(8192, 1);
+    let bXorRange = Buffer.Create(1124, 1);
+    let bKey      = "dGhlIHNhbXBsZSBub25jZQ==";
+    let bHost     = "echo.example.com";
+
+    Console.WriteLine("\n\n=== WebSocket Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 52), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Console.WriteLine("\n[ String ↔ block conversion ]");
+    bench("StringToBlock  (17-char string)", fn() {
+        let _b = Ws.StringToBlock(bSmallStr); _sink = _sink + 1;
+    }, 10000);
+    bench("StringToBlock  (1 KB string)", fn() {
+        let _b = Ws.StringToBlock(bLargeStr); _sink = _sink + 1;
+    }, 5000);
+    bench("BlockToString  (17-byte block)", fn() {
+        let _s = Ws.BlockToString(bSmallBlk); _sink = _sink + 1;
+    }, 10000);
+    bench("BlockToString  (1 KB block)", fn() {
+        let _s = Ws.BlockToString(bLargeBlk); _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ XOR masking ]");
+    bench("XorMaskInPlace  (17 bytes)", fn() {
+        Ws.XorMaskInPlace(bXorBuf17, bMask, 17); _sink = _sink + 1;
+    }, 20000);
+    bench("XorMaskInPlace  (1 KB)", fn() {
+        Ws.XorMaskInPlace(bXorBuf1K, bMask, 1024); _sink = _sink + 1;
+    }, 5000);
+    bench("XorMaskInPlace  (8 KB)", fn() {
+        Ws.XorMaskInPlace(bXorBuf8K, bMask, 8192); _sink = _sink + 1;
+    }, 1000);
+    bench("XorMaskRangeInPlace  (1 KB at offset 76)", fn() {
+        Ws.XorMaskRangeInPlace(bXorRange, 76, bMask, 1024); _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ Handshake helpers ]");
+    bench("ParseHeaderLine  (typical header)", fn() {
+        let _kv = Ws.ParseHeaderLine("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        _sink = _sink + 1;
+    }, 20000);
+    bench("MakeAccept  (SHA1 + Base64)", fn() {
+        let _a = Ws.MakeAccept(bKey); _sink = _sink + 1;
+    }, 2000);
+    bench("BuildRequest  (no extra headers)", fn() {
+        let _r = Ws.BuildRequest(bHost, "/chat", bKey, nil); _sink = _sink + 1;
+    }, 10000);
+    bench("BuildRequest  (3 extra headers)", fn() {
+        let _r = Ws.BuildRequest(bHost, "/chat", bKey, {
+            "X-App-Id": "flaris",
+            "X-Request-Id": "abc-123",
+            "User-Agent": "FlarisWS/1.0"
+        }); _sink = _sink + 1;
+    }, 5000);
+
+    Console.WriteLine("\n[ Network round-trip (requires Docker echo server on :8080) ]");
+    try {
+        let bWs    = WebSocket.Connect("127.0.0.1", 8080, "/.ws", nil);
+        let bMsg16 = "hello, benchmark!";
+        let bMsg1K = bLargeStr;
+        bench("SendText+Receive  (17-char, loopback)", fn() {
+            bWs.SendText(bMsg16);
+            bWs.Receive();
+            _sink = _sink + 1;
+        }, 50);
+        bench("SendText+Receive  (1 KB, loopback)", fn() {
+            bWs.SendText(bMsg1K);
+            bWs.Receive();
+            _sink = _sink + 1;
+        }, 20);
+        bWs.Close(1000, "bench done");
+    } catch (e) {
+        Console.WriteLine("  (skipped - echo server not reachable)");
+    }
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+
+    if (failed > 0) { return 1; }
+    return 0;
+}

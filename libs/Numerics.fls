@@ -1,0 +1,1344 @@
+// Numerics.fls - Numerical methods for Flaris (root finding, calculus,
+// Version: 1.0
+// interpolation, and optional plotting).
+//
+// Where Math.* covers scalar functions and small fixed-size Vec*/Mat* algebra,
+// this library covers "function-as-data" numerical methods: solving for roots,
+// integrating and differentiating, interpolating tables, statistics, dense
+// linear algebra, and plotting results.
+//
+// Exported classes (import any subset):
+//   Numerics - polynomials, root finding, quadrature, differentiation, interp
+//   Stats    - descriptive stats, distributions (pdf/cdf/quantile), regression, tests
+//   LinAlg   - flat row-major [float] matrices: solve, det, inverse, Cholesky, norms
+//   Chart    - multi-series line/scatter plots on the built-in Gfx rasterizer
+//
+// Distribution CDFs build on the Math.* special functions (Erf/GammaP/BetaInc,
+// which are builtins in math.c).
+//
+// Why the hot loops are top-level `_*` kernels:
+//   Every hot loop lives in a module-level, fully typed kernel (no member
+//   access, no allocation); the class methods just validate/allocate and
+//   delegate. Kept top-level for portability: a JIT kernel compiled as a
+//   top-level function runs natively on any build. (This VM also JIT-compiles
+//   eligible class methods now, but top-level keeps the .flx portable.) Run
+//   with `-j` for the native path - measured 13-45x on these workloads.
+//
+// Two ways a "function" is represented as data so kernels stay JIT-able (no
+// callbacks - a callback is dynamic dispatch the JIT cannot lower):
+//   * A polynomial as a [float] of coefficients in ASCENDING order:
+//       [c0, c1, c2]  ==  c0 + c1*x + c2*x^2
+//   * A function sampled on a uniform grid as a [float] of y-values, spacing h.
+//
+// For methods that take a user function `f`, the sampling loop that calls `f`
+// is interpreted, but the numerical work over the resulting samples still runs
+// through the JIT kernels. Feed kernels float arrays (Array.Create(n, Type.Float)
+// or float literals); a raw int array would be reinterpreted as doubles.
+//
+// Usage:
+//   import { Numerics } from library("Numerics", "1.0");
+//   let nm = new Numerics();
+//
+//   // Polynomial (coeffs ascending): x^2 - 2  ->  root sqrt(2)
+//   let r = nm.NewtonRoot([-2.0, 0.0, 1.0], 1.0, 1e-12, 100);
+//
+//   // User function
+//   fn f(x: float): float { return Math.Cos(x) - x; }
+//   let root = nm.BisectFn(f, 0.0, 1.0, 1e-12, 200);   // Dottie number
+//   let area = nm.IntegrateFn(f, 0.0, 1.0, 1000);
+//
+//   // Plot (opt-in; uses the built-in Gfx rasterizer)
+//   nm.PlotFunction(f, -6.0, 6.0, "cos_minus_x.png", 640, 400);
+//
+// Polynomials (coeffs ascending):
+//   EvalPoly(coeffs, x)              -> float   Horner evaluation
+//   EvalDeriv(coeffs, x)             -> float   p'(x)
+//   NewtonRoot(coeffs, x0, tol, it)  -> float   Newton-Raphson (exact p')
+//   Root(coeffs, x0)                 -> float   Newton with sane defaults
+//   Bisect(coeffs, a, b, tol, it)    -> float   bracketing bisection
+//   Secant(coeffs, x0, x1, tol, it)  -> float   secant method
+//   SolveQuadratic(a, b, c)          -> array   real roots of a*x^2+b*x+c
+//   FindRootsPoly(coeffs, a, b, n, tol) -> array  all roots in [a,b] (JIT scan)
+//
+// User-function methods (f: fn taking/returning float):
+//   NewtonFn(f, df, x0, tol, it)     -> float   Newton with supplied derivative
+//   BisectFn(f, a, b, tol, it)       -> float   bisection on a sign change
+//   SecantFn(f, x0, x1, tol, it)     -> float   secant (derivative-free)
+//   FindRoots(f, a, b, n, tol)       -> array   all roots of f in [a, b]
+//   GoldenMin(f, a, b, tol, it)      -> float   minimum of a unimodal f
+//   IntegrateFn(f, a, b, n)          -> float   Simpson over n intervals
+//   DerivativeFn(f, x, h)            -> float   central-difference f'(x)
+//   SampleFn(f, a, b, n)             -> array   n+1 samples of f as [float]
+//
+// Calculus on uniformly sampled data (spacing h):
+//   IntegrateTrapz(y, h)             -> float   composite trapezoid
+//   IntegrateSimpson(y, h)           -> float   composite Simpson (trapz tail if even)
+//   CumTrapz(y, h)                   -> array   cumulative integral, same length
+//   Derivative(y, h)                 -> array   central difference
+//   MinValue(y) / MaxValue(y)        -> float   array extrema
+//
+// Interpolation:
+//   Interp(xs, ys, x)                -> float   linear interp; xs ascending
+//
+// Plotting (opt-in, requires the built-in Gfx module):
+//   Plot(ys, path, width, height)                 -> bool  line plot of samples
+//   PlotFunction(f, xmin, xmax, path, w, h)       -> bool  sample f and plot
+
+// ============================================================
+//  Top-level JIT kernels (native-compiled under -j).
+//  No class-method calls, no allocation, fully typed.
+// ============================================================
+
+// p(x) via Horner, coefficients ascending.
+fn _horner(c: [float], nc: int, x: float): float {
+    let r: float = 0.0;
+    let i: int = nc - 1;
+    while (i >= 0) {
+        r = r * x + c[i];
+        i = i - 1;
+    }
+    return r;
+}
+
+// p'(x): sum over i>=1 of i*c[i]*x^(i-1), all float to stay JIT-typed.
+fn _horner_deriv(c: [float], nc: int, x: float): float {
+    let d: float = 0.0;
+    let xp: float = 1.0;   // x^(i-1)
+    let fi: float = 1.0;   // float value of i
+    let i: int = 1;
+    while (i < nc) {
+        d = d + fi * c[i] * xp;
+        xp = xp * x;
+        fi = fi + 1.0;
+        i = i + 1;
+    }
+    return d;
+}
+
+// Newton-Raphson on a polynomial. Synthetic-division Horner computes p(x) and
+// p'(x) in one pass (dp updated before p).
+fn _newton(c: [float], nc: int, x0: float, tol: float, maxit: int): float {
+    let x: float = x0;
+    let it: int = 0;
+    while (it < maxit) {
+        let p: float = 0.0;
+        let dp: float = 0.0;
+        let i: int = nc - 1;
+        while (i >= 0) {
+            dp = dp * x + p;
+            p = p * x + c[i];
+            i = i - 1;
+        }
+        if (Math.AbsF(dp) < 1e-300) {
+            it = maxit;                 // derivative ~0: bail, return current x
+        } else {
+            let step: float = p / dp;
+            x = x - step;
+            if (Math.AbsF(step) < tol) { it = maxit; }
+            else { it = it + 1; }
+        }
+    }
+    return x;
+}
+
+// Bisection on a sign-changing bracket [a, b].
+fn _bisect(c: [float], nc: int, a: float, b: float, tol: float, maxit: int): float {
+    let lo: float = a;
+    let hi: float = b;
+    let flo: float = 0.0;
+    let i: int = nc - 1;
+    while (i >= 0) { flo = flo * lo + c[i]; i = i - 1; }
+    let mid: float = lo;
+    let it: int = 0;
+    while (it < maxit) {
+        mid = (lo + hi) * 0.5;
+        let fm: float = 0.0;
+        let j: int = nc - 1;
+        while (j >= 0) { fm = fm * mid + c[j]; j = j - 1; }
+        if (Math.AbsF(fm) < tol) {
+            it = maxit;
+        } else {
+            if (fm * flo < 0.0) { hi = mid; }
+            else { lo = mid; flo = fm; }
+            it = it + 1;
+        }
+    }
+    return mid;
+}
+
+// Secant method on a polynomial (derivative-free).
+fn _secant(c: [float], nc: int, x0: float, x1: float, tol: float, maxit: int): float {
+    let a: float = x0;
+    let b: float = x1;
+    let fa: float = 0.0;
+    let i: int = nc - 1;
+    while (i >= 0) { fa = fa * a + c[i]; i = i - 1; }
+    let it: int = 0;
+    while (it < maxit) {
+        let fb: float = 0.0;
+        let j: int = nc - 1;
+        while (j >= 0) { fb = fb * b + c[j]; j = j - 1; }
+        let denom: float = fb - fa;
+        if (Math.AbsF(denom) < 1e-300) {
+            it = maxit;
+        } else {
+            let nx: float = b - fb * (b - a) / denom;
+            a = b;
+            fa = fb;
+            b = nx;
+            if (Math.AbsF(b - a) < tol) { it = maxit; }
+            else { it = it + 1; }
+        }
+    }
+    return b;
+}
+
+// Composite trapezoid rule over n samples with spacing h.
+fn _trapz(y: [float], n: int, h: float): float {
+    if (n < 2) return 0.0;
+    let sum: float = 0.0;
+    let i: int = 1;
+    while (i < n - 1) {
+        sum = sum + y[i];
+        i = i + 1;
+    }
+    let total: float = (y[0] + y[n - 1]) * 0.5 + sum;
+    return total * h;
+}
+
+// Composite Simpson rule; requires odd n (>= 3, even interval count).
+fn _simpson(y: [float], n: int, h: float): float {
+    if (n < 3) return 0.0;
+    let s: float = y[0] + y[n - 1];
+    let i: int = 1;
+    while (i < n - 1) {
+        if (i % 2 == 1) { s = s + 4.0 * y[i]; }
+        else { s = s + 2.0 * y[i]; }
+        i = i + 1;
+    }
+    return s * h / 3.0;
+}
+
+// Cumulative trapezoid integral into out (out[0] = 0).
+fn _cumtrapz(y: [float], out: [float], n: int, h: float): int {
+    if (n <= 0) return 0;
+    out[0] = 0.0;
+    let i: int = 1;
+    while (i < n) {
+        out[i] = out[i - 1] + (y[i] + y[i - 1]) * 0.5 * h;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Central-difference derivative into out; forward/backward at the ends.
+fn _diff(y: [float], out: [float], n: int, h: float): int {
+    if (n <= 1) return 0;
+    out[0] = (y[1] - y[0]) / h;
+    out[n - 1] = (y[n - 1] - y[n - 2]) / h;
+    let i: int = 1;
+    while (i < n - 1) {
+        out[i] = (y[i + 1] - y[i - 1]) / (2.0 * h);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Linear interpolation of (xs, ys) at x; xs ascending. Clamps to endpoints.
+fn _interp_linear(xs: [float], ys: [float], n: int, x: float): float {
+    if (n <= 0) return 0.0;
+    if (x <= xs[0]) return ys[0];
+    if (x >= xs[n - 1]) return ys[n - 1];
+    let lo: int = 0;
+    let hi: int = n - 1;
+    while (hi - lo > 1) {
+        let mid: int = (lo + hi) >> 1;
+        if (xs[mid] <= x) { lo = mid; }
+        else { hi = mid; }
+    }
+    let x0: float = xs[lo];
+    let x1: float = xs[hi];
+    let t: float = (x - x0) / (x1 - x0);
+    return ys[lo] + t * (ys[hi] - ys[lo]);
+}
+
+// Evaluate a polynomial (Horner) at cnt points a, a+h, ... into out.
+fn _poly_fill(c: [float], nc: int, out: [float], cnt: int, a: float, h: float): int {
+    let i: int = 0;
+    while (i < cnt) {
+        let x: float = a + h * (i + 0.0);
+        let r: float = 0.0;
+        let j: int = nc - 1;
+        while (j >= 0) {
+            r = r * x + c[j];
+            j = j - 1;
+        }
+        out[i] = r;
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _arr_min(a: [float], n: int): float {
+    let m: float = a[0];
+    let i: int = 1;
+    while (i < n) {
+        if (a[i] < m) { m = a[i]; }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn _arr_max(a: [float], n: int): float {
+    let m: float = a[0];
+    let i: int = 1;
+    while (i < n) {
+        if (a[i] > m) { m = a[i]; }
+        i = i + 1;
+    }
+    return m;
+}
+
+class Numerics {
+
+    // ============================================================
+    //  Polynomials (coeffs ascending) - JIT kernels
+    // ============================================================
+
+    fn EvalPoly(coeffs: array, x: float): float {
+        let nc: int = len(coeffs);
+        if (nc == 0) return 0.0;
+        return _horner(coeffs, nc, x);
+    }
+
+    fn EvalDeriv(coeffs: array, x: float): float {
+        let nc: int = len(coeffs);
+        if (nc == 0) return 0.0;
+        return _horner_deriv(coeffs, nc, x);
+    }
+
+    fn NewtonRoot(coeffs: array, x0: float, tol: float, maxIter: int): float {
+        let nc: int = len(coeffs);
+        if (nc == 0) return x0;
+        return _newton(coeffs, nc, x0, tol, maxIter);
+    }
+
+    // Newton with defaults (tol 1e-10, 100 iterations).
+    fn Root(coeffs: array, x0: float): float {
+        return NewtonRoot(coeffs, x0, 0.0000000001, 100);
+    }
+
+    fn Bisect(coeffs: array, a: float, b: float, tol: float, maxIter: int): float {
+        let nc: int = len(coeffs);
+        if (nc == 0) return a;
+        return _bisect(coeffs, nc, a, b, tol, maxIter);
+    }
+
+    fn Secant(coeffs: array, x0: float, x1: float, tol: float, maxIter: int): float {
+        let nc: int = len(coeffs);
+        if (nc == 0) return x0;
+        return _secant(coeffs, nc, x0, x1, tol, maxIter);
+    }
+
+    // Find all roots of a polynomial (coeffs ascending) in [a, b]. Both the
+    // scan (_poly_fill) and the per-bracket refinement (_bisect) run as JIT
+    // kernels, so this stays fast for high-degree polynomials.
+    fn FindRootsPoly(coeffs: array, a: float, b: float, samples: int, tol: float): array {
+        let roots = [];
+        let nc: int = len(coeffs);
+        if (nc == 0 || samples < 1 || b <= a) return roots;
+        let cnt: int = samples + 1;
+        let vals: [float] = Array.Create(cnt, Type.Float);
+        let h: float = (b - a) / samples;
+        _poly_fill(coeffs, nc, vals, cnt, a, h);      // JIT
+        if (Math.AbsF(vals[0]) < tol) { Array.Append(roots, a); }
+        let i: int = 1;
+        while (i < cnt) {
+            let f0: float = vals[i - 1];
+            let f1: float = vals[i];
+            if (f0 * f1 < 0.0) {
+                let x0: float = a + h * ((i - 1) + 0.0);
+                let x1: float = a + h * (i + 0.0);
+                Array.Append(roots, _bisect(coeffs, nc, x0, x1, tol, 100));   // JIT
+            } else if (i < samples && Math.AbsF(f1) < tol) {
+                Array.Append(roots, a + h * (i + 0.0));
+            }
+            i = i + 1;
+        }
+        return roots;
+    }
+
+    // Real roots of a*x^2 + b*x + c: [] , [r] , or [r1, r2] (r1 <= r2).
+    fn SolveQuadratic(a: float, b: float, c: float): array {
+        if (Math.AbsF(a) < 1e-15) {
+            if (Math.AbsF(b) < 1e-15) return [];
+            return [ -c / b ];
+        }
+        let disc: float = b * b - 4.0 * a * c;
+        if (disc < 0.0) return [];
+        if (Math.AbsF(disc) < 1e-15) return [ -b / (2.0 * a) ];
+        let s: float = Math.Sqrt(disc);
+        let r1: float = (-b - s) / (2.0 * a);
+        let r2: float = (-b + s) / (2.0 * a);
+        return [ r1, r2 ];
+    }
+
+    // ============================================================
+    //  User-function methods (f, df: fn of one float -> float)
+    //  The f-calls are interpreted; sampled work still hits the kernels.
+    // ============================================================
+
+    fn NewtonFn(f: fn, df: fn, x0: float, tol: float, maxIter: int): float {
+        let x: float = x0;
+        let i: int = 0;
+        while (i < maxIter) {
+            let dfx: float = df(x);
+            if (Math.AbsF(dfx) < 1e-15) { return x; }
+            let step: float = f(x) / dfx;
+            x = x - step;
+            if (Math.AbsF(step) < tol) { return x; }
+            i = i + 1;
+        }
+        return x;
+    }
+
+    fn BisectFn(f: fn, a: float, b: float, tol: float, maxIter: int): float {
+        let lo: float = a;
+        let hi: float = b;
+        let flo: float = f(lo);
+        let mid: float = lo;
+        let i: int = 0;
+        while (i < maxIter) {
+            mid = (lo + hi) * 0.5;
+            let fm: float = f(mid);
+            if (Math.AbsF(fm) < tol) { return mid; }
+            if (fm * flo < 0.0) { hi = mid; }
+            else { lo = mid; flo = fm; }
+            i = i + 1;
+        }
+        return mid;
+    }
+
+    fn SecantFn(f: fn, x0: float, x1: float, tol: float, maxIter: int): float {
+        let a: float = x0;
+        let b: float = x1;
+        let fa: float = f(a);
+        let i: int = 0;
+        while (i < maxIter) {
+            let fb: float = f(b);
+            let denom: float = fb - fa;
+            if (Math.AbsF(denom) < 1e-15) { return b; }
+            let nx: float = b - fb * (b - a) / denom;
+            a = b;
+            fa = fb;
+            b = nx;
+            if (Math.AbsF(b - a) < tol) { return b; }
+            i = i + 1;
+        }
+        return b;
+    }
+
+    // Golden-section search for the minimum of a unimodal f on [a, b].
+    fn GoldenMin(f: fn, a: float, b: float, tol: float, maxIter: int): float {
+        let gr: float = 0.6180339887498949;   // 1/phi
+        let lo: float = a;
+        let hi: float = b;
+        let c: float = hi - gr * (hi - lo);
+        let d: float = lo + gr * (hi - lo);
+        let fc: float = f(c);
+        let fd: float = f(d);
+        let i: int = 0;
+        while (i < maxIter) {
+            if (Math.AbsF(hi - lo) < tol) {
+                i = maxIter;
+            } else {
+                if (fc < fd) {
+                    hi = d; d = c; fd = fc;
+                    c = hi - gr * (hi - lo);
+                    fc = f(c);
+                } else {
+                    lo = c; c = d; fc = fd;
+                    d = lo + gr * (hi - lo);
+                    fd = f(d);
+                }
+                i = i + 1;
+            }
+        }
+        return (lo + hi) * 0.5;
+    }
+
+    // Sample f at n+1 evenly spaced points on [a, b] into a flat float array.
+    fn SampleFn(f: fn, a: float, b: float, n: int): array {
+        if (n < 1) return [];
+        let cnt: int = n + 1;
+        let ys: [float] = Array.Create(cnt, Type.Float);
+        let h: float = (b - a) / n;
+        iter(i from 0 to n) {
+            let x: float = a + h * (i + 0.0);
+            ys[i] = f(x) + 0.0;
+        }
+        return ys;
+    }
+
+    // Definite integral of f over [a, b] via composite Simpson (n intervals).
+    fn IntegrateFn(f: fn, a: float, b: float, n: int): float {
+        let m: int = n;
+        if (m < 2) m = 2;
+        if (m % 2 == 1) { m = m + 1; }        // Simpson needs an even interval count
+        let ys = SampleFn(f, a, b, m);
+        let h: float = (b - a) / m;
+        return _simpson(ys, m + 1, h);
+    }
+
+    fn DerivativeFn(f: fn, x: float, h: float): float {
+        return (f(x + h) - f(x - h)) / (2.0 * h);
+    }
+
+    // Find ALL roots of f in [a, b] by scanning `samples` sub-intervals for a
+    // sign change (or a grid point that lands on zero) and refining each bracket
+    // with bisection. Returns the roots ascending. Roots closer together than
+    // (b-a)/samples may be missed, so raise `samples` for dense/oscillatory f.
+    fn FindRoots(f: fn, a: float, b: float, samples: int, tol: float): array {
+        let roots = [];
+        if (samples < 1 || b <= a) return roots;
+        let h: float = (b - a) / samples;
+        let xprev: float = a;
+        let fprev: float = f(a);
+        if (Math.AbsF(fprev) < tol) { Array.Append(roots, a); }
+        iter(i from 1 to samples) {
+            let xcur: float = a + h * (i + 0.0);
+            let fcur: float = f(xcur);
+            if (fprev * fcur < 0.0) {
+                Array.Append(roots, BisectFn(f, xprev, xcur, tol, 100));
+            } else if (i < samples && Math.AbsF(fcur) < tol) {
+                Array.Append(roots, xcur);   // interior grid point on a root
+            }
+            xprev = xcur;
+            fprev = fcur;
+        }
+        return roots;
+    }
+
+    // ============================================================
+    //  Calculus on uniformly sampled data (spacing h) - JIT kernels
+    // ============================================================
+
+    fn IntegrateTrapz(y: array, h: float): float {
+        let n: int = len(y);
+        return _trapz(y, n, h);
+    }
+
+    fn IntegrateSimpson(y: array, h: float): float {
+        let n: int = len(y);
+        if (n < 3) return _trapz(y, n, h);
+        if (n % 2 == 1) return _simpson(y, n, h);
+        // Even sample count: Simpson on first n-1 samples + trapz for the tail.
+        let head: float = _simpson(y, n - 1, h);
+        let tail: float = (y[n - 2] + y[n - 1]) * 0.5 * h;
+        return head + tail;
+    }
+
+    fn CumTrapz(y: array, h: float): array {
+        let n: int = len(y);
+        if (n <= 0) return [];
+        let out: [float] = Array.Create(n, Type.Float);
+        _cumtrapz(y, out, n, h);
+        return out;
+    }
+
+    fn Derivative(y: array, h: float): array {
+        let n: int = len(y);
+        if (n <= 1) return [];
+        let out: [float] = Array.Create(n, Type.Float);
+        _diff(y, out, n, h);
+        return out;
+    }
+
+    fn MinValue(y: array): float {
+        let n: int = len(y);
+        if (n <= 0) return 0.0;
+        return _arr_min(y, n);
+    }
+
+    fn MaxValue(y: array): float {
+        let n: int = len(y);
+        if (n <= 0) return 0.0;
+        return _arr_max(y, n);
+    }
+
+    // ============================================================
+    //  Interpolation - JIT kernel
+    // ============================================================
+
+    fn Interp(xs: array, ys: array, x: float): float {
+        let n: int = len(xs);
+        if (n == 0) return 0.0;
+        return _interp_linear(xs, ys, n, x);
+    }
+
+    // ============================================================
+    //  Plotting (opt-in) - uses the built-in Gfx rasterizer.
+    //  Produces a simple line plot of sampled y-values and writes a PNG.
+    // ============================================================
+
+    // Line plot of ys (indices map to x). Returns true if the PNG was written.
+    fn Plot(ys: array, path: string, width: int, height: int): bool {
+        let n: int = len(ys);
+        if (n < 2) return false;
+        if (width < 40 || height < 40) return false;
+
+        let ymin: float = _arr_min(ys, n);
+        let ymax: float = _arr_max(ys, n);
+        if (ymax - ymin < 1e-12) { ymax = ymin + 1.0; }
+
+        let pad: int = 24;
+        let plotW: float = (width - 2 * pad) + 0.0;
+        let plotH: float = (height - 2 * pad) + 0.0;
+        let range: float = ymax - ymin;
+        let denom: float = (n - 1) + 0.0;
+
+        let img = Gfx.Create(width, height);
+        img.Clear(Gfx.RGB(255, 255, 255));
+
+        let axis = Gfx.RGB(210, 210, 210);
+        img.DrawRect(pad, pad, width - 2 * pad, height - 2 * pad, axis);
+
+        // Zero line, if y = 0 is within range.
+        if (ymin < 0.0 && ymax > 0.0) {
+            let zy: int = pad + int((ymax - 0.0) / range * plotH);
+            img.DrawLine(pad, zy, width - pad, zy, Gfx.RGB(170, 170, 170));
+        }
+
+        let line = Gfx.RGB(30, 90, 200);
+        let x0: int = pad;
+        let y0: int = pad + int((ymax - ys[0]) / range * plotH);
+        let i: int = 1;
+        while (i < n) {
+            let fx: float = i + 0.0;
+            let x1: int = pad + int(fx / denom * plotW);
+            let y1: int = pad + int((ymax - ys[i]) / range * plotH);
+            img.DrawLine(x0, y0, x1, y1, line);
+            x0 = x1;
+            y0 = y1;
+            i = i + 1;
+        }
+
+        return img.SaveToFile(path);
+    }
+
+    // Sample f over [xmin, xmax] (one sample per horizontal pixel) and plot it.
+    fn PlotFunction(f: fn, xmin: float, xmax: float, path: string,
+                    width: int, height: int): bool {
+        let samples: int = width - 48;
+        if (samples < 2) { samples = 2; }
+        let ys = SampleFn(f, xmin, xmax, samples);
+        return Plot(ys, path, width, height);
+    }
+}
+
+// ============================================================
+//  Statistics kernels (top-level, JIT-compiled)
+// ============================================================
+
+fn _st_sum(a: [float], n: int): float {
+    let s: float = 0.0;
+    let i: int = 0;
+    while (i < n) { s = s + a[i]; i = i + 1; }
+    return s;
+}
+
+// One-pass central moments about `mean`: out[0]=Σd², out[1]=Σd³, out[2]=Σd⁴.
+fn _st_moments(a: [float], n: int, mean: float, out: [float]): int {
+    let s2: float = 0.0;
+    let s3: float = 0.0;
+    let s4: float = 0.0;
+    let i: int = 0;
+    while (i < n) {
+        let d: float = a[i] - mean;
+        let d2: float = d * d;
+        s2 = s2 + d2;
+        s3 = s3 + d2 * d;
+        s4 = s4 + d2 * d2;
+        i = i + 1;
+    }
+    out[0] = s2;
+    out[1] = s3;
+    out[2] = s4;
+    return 0;
+}
+
+// Σ (a[i]-ma)*(b[i]-mb) - the covariance numerator.
+fn _st_covsum(a: [float], b: [float], n: int, ma: float, mb: float): float {
+    let s: float = 0.0;
+    let i: int = 0;
+    while (i < n) {
+        s = s + (a[i] - ma) * (b[i] - mb);
+        i = i + 1;
+    }
+    return s;
+}
+
+class Stats {
+
+    // -- helpers -------------------------------------------------------------
+    fn _mean(xs: array, n: int): float {
+        return _st_sum(xs, n) / (n + 0.0);
+    }
+
+    // Flat float copy, ascending-sorted (leaves the caller's array untouched).
+    fn _sortedCopy(xs: array, n: int): array {
+        let c: [float] = Array.Create(n, Type.Float);
+        iter(i from 0 to n - 1) { c[i] = xs[i] + 0.0; }
+        Array.Sort(c);
+        return c;
+    }
+
+    // -- descriptive ---------------------------------------------------------
+    fn Mean(xs: array): float {
+        let n: int = len(xs);
+        if (n == 0) return 0.0;
+        return _st_sum(xs, n) / (n + 0.0);
+    }
+
+    // Sample variance (divides by n-1).
+    fn Variance(xs: array): float {
+        let n: int = len(xs);
+        if (n < 2) return 0.0;
+        let m: float = _st_sum(xs, n) / (n + 0.0);
+        let out: [float] = Array.Create(3, Type.Float);
+        _st_moments(xs, n, m, out);
+        return out[0] / ((n - 1) + 0.0);
+    }
+
+    fn Stddev(xs: array): float {
+        return Math.Sqrt(Variance(xs));
+    }
+
+    // Population skewness (Fisher).
+    fn Skewness(xs: array): float {
+        let n: int = len(xs);
+        if (n < 3) return 0.0;
+        let m: float = _st_sum(xs, n) / (n + 0.0);
+        let out: [float] = Array.Create(3, Type.Float);
+        _st_moments(xs, n, m, out);
+        let variance: float = out[0] / (n + 0.0);
+        let sd: float = Math.Sqrt(variance);
+        if (sd <= 0.0) return 0.0;
+        let m3: float = out[1] / (n + 0.0);
+        return m3 / (sd * sd * sd);
+    }
+
+    // Excess kurtosis (0 for a normal distribution).
+    fn Kurtosis(xs: array): float {
+        let n: int = len(xs);
+        if (n < 4) return 0.0;
+        let m: float = _st_sum(xs, n) / (n + 0.0);
+        let out: [float] = Array.Create(3, Type.Float);
+        _st_moments(xs, n, m, out);
+        let variance: float = out[0] / (n + 0.0);
+        if (variance <= 0.0) return 0.0;
+        let m4: float = out[2] / (n + 0.0);
+        return m4 / (variance * variance) - 3.0;
+    }
+
+    // Sample covariance (n-1).
+    fn Covariance(xs: array, ys: array): float {
+        let n: int = len(xs);
+        if (n < 2 || len(ys) < n) return 0.0;
+        let mx: float = _st_sum(xs, n) / (n + 0.0);
+        let my: float = _st_sum(ys, n) / (n + 0.0);
+        return _st_covsum(xs, ys, n, mx, my) / ((n - 1) + 0.0);
+    }
+
+    // Pearson correlation coefficient in [-1, 1].
+    fn Correlation(xs: array, ys: array): float {
+        let n: int = len(xs);
+        if (n < 2 || len(ys) < n) return 0.0;
+        let mx: float = _st_sum(xs, n) / (n + 0.0);
+        let my: float = _st_sum(ys, n) / (n + 0.0);
+        let sxy: float = _st_covsum(xs, ys, n, mx, my);
+        let sxx: float = _st_covsum(xs, xs, n, mx, mx);
+        let syy: float = _st_covsum(ys, ys, n, my, my);
+        let den: float = Math.Sqrt(sxx * syy);
+        if (den <= 0.0) return 0.0;
+        return sxy / den;
+    }
+
+    fn Median(xs: array): float {
+        let n: int = len(xs);
+        if (n == 0) return 0.0;
+        let s = _sortedCopy(xs, n);
+        if (n % 2 == 1) return s[(n - 1) / 2];
+        return (s[n / 2 - 1] + s[n / 2]) * 0.5;
+    }
+
+    // Linear-interpolated percentile, p in [0, 100].
+    fn Percentile(xs: array, p: float): float {
+        let n: int = len(xs);
+        if (n == 0) return 0.0;
+        if (n == 1) return xs[0] + 0.0;
+        let s = _sortedCopy(xs, n);
+        let rank: float = (p / 100.0) * ((n - 1) + 0.0);
+        if (rank <= 0.0) return s[0];
+        if (rank >= (n - 1) + 0.0) return s[n - 1];
+        let lo: int = int(rank);
+        let frac: float = rank - (lo + 0.0);
+        return s[lo] + frac * (s[lo + 1] - s[lo]);
+    }
+
+    // -- distributions -------------------------------------------------------
+    fn NormalPdf(x: float, mu: float, sigma: float): float {
+        let z: float = (x - mu) / sigma;
+        return Math.Exp(-0.5 * z * z) / (sigma * Math.Sqrt(Math.TAU));
+    }
+
+    fn NormalCdf(x: float, mu: float, sigma: float): float {
+        return 0.5 * Math.Erfc(-(x - mu) / (sigma * Math.Sqrt(2.0)));
+    }
+
+    // Inverse normal CDF (Acklam's rational approximation, ~1e-9 accurate).
+    fn NormalQuantile(p: float, mu: float, sigma: float): float {
+        if (p <= 0.0) return mu - 1.0e300;
+        if (p >= 1.0) return mu + 1.0e300;
+        let a1 = -39.69683028665376;   let a2 = 220.9460984245205;
+        let a3 = -275.9285104469687;   let a4 = 138.3577518672690;
+        let a5 = -30.66479806614716;   let a6 = 2.506628277459239;
+        let b1 = -54.47609879822406;   let b2 = 161.5858368580409;
+        let b3 = -155.6989798598866;   let b4 = 66.80131188771972;
+        let b5 = -13.28068155288572;
+        let c1 = -0.007784894002430293; let c2 = -0.3223964580411365;
+        let c3 = -2.400758277161838;   let c4 = -2.549732539343734;
+        let c5 = 4.374664141464968;    let c6 = 2.938163982698783;
+        let d1 = 0.007784695709041462; let d2 = 0.3224671290700398;
+        let d3 = 2.445134137142996;    let d4 = 3.754408661907416;
+        let plow = 0.02425;
+        let phigh = 1.0 - plow;
+        let z: float = 0.0;
+        if (p < plow) {
+            let q: float = Math.Sqrt(-2.0 * Math.Log(p));
+            z = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+                ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+        } else if (p <= phigh) {
+            let q: float = p - 0.5;
+            let r: float = q * q;
+            z = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q /
+                (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0);
+        } else {
+            let q: float = Math.Sqrt(-2.0 * Math.Log(1.0 - p));
+            z = -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) /
+                 ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0);
+        }
+        return mu + sigma * z;
+    }
+
+    fn ChiSqCdf(x: float, df: float): float {
+        if (x <= 0.0) return 0.0;
+        return Math.GammaP(df * 0.5, x * 0.5);
+    }
+
+    fn ChiSqPdf(x: float, df: float): float {
+        if (x <= 0.0) return 0.0;
+        let k: float = df * 0.5;
+        return Math.Exp((k - 1.0) * Math.Log(x) - x * 0.5 -
+                        k * Math.Log(2.0) - Math.LnGamma(k));
+    }
+
+    // Student-t CDF (two-sided via the regularized incomplete beta).
+    fn StudentTCdf(t: float, df: float): float {
+        let xb: float = df / (df + t * t);
+        let p: float = 0.5 * Math.BetaInc(df * 0.5, 0.5, xb);
+        if (t > 0.0) return 1.0 - p;
+        return p;
+    }
+
+    fn FCdf(x: float, d1: float, d2: float): float {
+        if (x <= 0.0) return 0.0;
+        let xb: float = d1 * x / (d1 * x + d2);
+        return Math.BetaInc(d1 * 0.5, d2 * 0.5, xb);
+    }
+
+    fn ExponentialCdf(x: float, rate: float): float {
+        if (x < 0.0) return 0.0;
+        return 1.0 - Math.Exp(-rate * x);
+    }
+
+    fn PoissonPmf(k: int, lambda: float): float {
+        if (k < 0) return 0.0;
+        return Math.Exp((k + 0.0) * Math.Log(lambda) - lambda -
+                        Math.LnGamma((k + 1) + 0.0));
+    }
+
+    fn BinomialPmf(k: int, n: int, p: float): float {
+        if (k < 0 || k > n) return 0.0;
+        let ln: float = Math.LnGamma((n + 1) + 0.0) - Math.LnGamma((k + 1) + 0.0) -
+                        Math.LnGamma((n - k + 1) + 0.0);
+        return Math.Exp(ln + (k + 0.0) * Math.Log(p) + ((n - k) + 0.0) * Math.Log(1.0 - p));
+    }
+
+    // Quantiles for monotone CDFs via bisection.
+    fn ChiSqQuantile(prob: float, df: float): float {
+        if (prob <= 0.0) return 0.0;
+        let lo: float = 0.0;
+        let hi: float = df * 10.0 + 100.0;
+        let i: int = 0;
+        while (i < 200) {
+            let mid: float = (lo + hi) * 0.5;
+            if (ChiSqCdf(mid, df) < prob) { lo = mid; } else { hi = mid; }
+            i = i + 1;
+        }
+        return (lo + hi) * 0.5;
+    }
+
+    fn StudentTQuantile(prob: float, df: float): float {
+        let lo: float = -1000.0;
+        let hi: float = 1000.0;
+        let i: int = 0;
+        while (i < 200) {
+            let mid: float = (lo + hi) * 0.5;
+            if (StudentTCdf(mid, df) < prob) { lo = mid; } else { hi = mid; }
+            i = i + 1;
+        }
+        return (lo + hi) * 0.5;
+    }
+
+    // -- regression & tests --------------------------------------------------
+    // Ordinary least squares y = slope*x + intercept. Returns { slope, intercept, r2 }.
+    fn LinearRegression(xs: array, ys: array): object {
+        let n: int = len(xs);
+        if (n < 2 || len(ys) < n) return { slope: 0.0, intercept: 0.0, r2: 0.0 };
+        let mx: float = _st_sum(xs, n) / (n + 0.0);
+        let my: float = _st_sum(ys, n) / (n + 0.0);
+        let sxx: float = _st_covsum(xs, xs, n, mx, mx);
+        let sxy: float = _st_covsum(xs, ys, n, mx, my);
+        let syy: float = _st_covsum(ys, ys, n, my, my);
+        if (sxx <= 0.0) return { slope: 0.0, intercept: my, r2: 0.0 };
+        let slope: float = sxy / sxx;
+        let intercept: float = my - slope * mx;
+        let r2: float = 0.0;
+        if (syy > 0.0) { r2 = (sxy * sxy) / (sxx * syy); }
+        return { slope: slope, intercept: intercept, r2: r2 };
+    }
+
+    // One-sample two-tailed t-test against mu0. Returns { t, df, p }.
+    fn TTest1(xs: array, mu0: float): object {
+        let n: int = len(xs);
+        if (n < 2) return { t: 0.0, df: 0.0, p: 1.0 };
+        let m: float = Mean(xs);
+        let sd: float = Stddev(xs);
+        let df: float = (n - 1) + 0.0;
+        if (sd <= 0.0) return { t: 0.0, df: df, p: 1.0 };
+        let se: float = sd / Math.Sqrt(n + 0.0);
+        let t: float = (m - mu0) / se;
+        let p: float = 2.0 * (1.0 - StudentTCdf(Math.AbsF(t), df));
+        return { t: t, df: df, p: p };
+    }
+}
+
+// ============================================================
+//  Linear-algebra kernels (top-level, JIT-compiled).
+//  Matrices are flat row-major [float]; dimensions passed explicitly.
+// ============================================================
+
+// C(n×p) = A(n×m) · B(m×p)
+fn _la_matmul(a: [float], b: [float], out: [float], n: int, m: int, p: int): int {
+    let i: int = 0;
+    while (i < n) {
+        let j: int = 0;
+        while (j < p) {
+            let s: float = 0.0;
+            let k: int = 0;
+            while (k < m) {
+                s = s + a[i * m + k] * b[k * p + j];
+                k = k + 1;
+            }
+            out[i * p + j] = s;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// y(n) = A(n×m) · x(m)
+fn _la_matvec(a: [float], x: [float], out: [float], n: int, m: int): int {
+    let i: int = 0;
+    while (i < n) {
+        let s: float = 0.0;
+        let k: int = 0;
+        while (k < m) { s = s + a[i * m + k] * x[k]; k = k + 1; }
+        out[i] = s;
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _la_dot(a: [float], b: [float], n: int): float {
+    let s: float = 0.0;
+    let i: int = 0;
+    while (i < n) { s = s + a[i] * b[i]; i = i + 1; }
+    return s;
+}
+
+fn _la_norm2(a: [float], n: int): float {
+    let s: float = 0.0;
+    let i: int = 0;
+    while (i < n) { s = s + a[i] * a[i]; i = i + 1; }
+    return Math.Sqrt(s);
+}
+
+// In-place LU factorization with partial pivoting (Doolittle). `a` is n×n
+// row-major; on return it holds L (unit diagonal, below) and U (on/above).
+// piv[k] receives the pivot row chosen at step k. Returns 1, or 0 if singular.
+fn _la_lu(a: [float], n: int, piv: [float]): int {
+    let k: int = 0;
+    while (k < n) {
+        let pmax: float = Math.AbsF(a[k * n + k]);
+        let prow: int = k;
+        let i: int = k + 1;
+        while (i < n) {
+            let v: float = Math.AbsF(a[i * n + k]);
+            if (v > pmax) { pmax = v; prow = i; }
+            i = i + 1;
+        }
+        piv[k] = prow + 0.0;
+        if (pmax < 1e-300) { return 0; }
+        if (prow != k) {
+            let j: int = 0;
+            while (j < n) {
+                let t: float = a[k * n + j];
+                a[k * n + j] = a[prow * n + j];
+                a[prow * n + j] = t;
+                j = j + 1;
+            }
+        }
+        let ik: int = k + 1;
+        while (ik < n) {
+            let f: float = a[ik * n + k] / a[k * n + k];
+            a[ik * n + k] = f;
+            let j: int = k + 1;
+            while (j < n) {
+                a[ik * n + j] = a[ik * n + j] - f * a[k * n + j];
+                j = j + 1;
+            }
+            ik = ik + 1;
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
+// Solve L·U·x = y in place, given LU in `a` and `y` already row-permuted.
+fn _la_fbsolve(a: [float], y: [float], n: int): int {
+    let i: int = 0;
+    while (i < n) {                       // forward: unit-lower L
+        let s: float = y[i];
+        let j: int = 0;
+        while (j < i) { s = s - a[i * n + j] * y[j]; j = j + 1; }
+        y[i] = s;
+        i = i + 1;
+    }
+    i = n - 1;
+    while (i >= 0) {                       // back: upper U
+        let s: float = y[i];
+        let j: int = i + 1;
+        while (j < n) { s = s - a[i * n + j] * y[j]; j = j + 1; }
+        y[i] = s / a[i * n + i];
+        i = i - 1;
+    }
+    return 0;
+}
+
+// In-place Cholesky: overwrite the lower triangle of SPD `a` with L (a = L·Lᵀ).
+// Returns 1, or 0 if `a` is not positive-definite.
+fn _la_chol(a: [float], n: int): int {
+    let j: int = 0;
+    while (j < n) {
+        let s: float = a[j * n + j];
+        let k: int = 0;
+        while (k < j) { s = s - a[j * n + k] * a[j * n + k]; k = k + 1; }
+        if (s <= 0.0) { return 0; }
+        let d: float = Math.Sqrt(s);
+        a[j * n + j] = d;
+        let i: int = j + 1;
+        while (i < n) {
+            let s2: float = a[i * n + j];
+            let k2: int = 0;
+            while (k2 < j) { s2 = s2 - a[i * n + k2] * a[j * n + k2]; k2 = k2 + 1; }
+            a[i * n + j] = s2 / d;
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    return 1;
+}
+
+class LinAlg {
+
+    // Flat row-major copy of a matrix/vector (never mutate the caller's data).
+    fn _copy(a: array, count: int): array {
+        let c: [float] = Array.Create(count, Type.Float);
+        iter(i from 0 to count - 1) { c[i] = a[i] + 0.0; }
+        return c;
+    }
+
+    // C = A(n×m) · B(m×p), returned as a flat n*p array.
+    fn MatMul(a: array, b: array, n: int, m: int, p: int): array {
+        let out: [float] = Array.Create(n * p, Type.Float);
+        _la_matmul(a, b, out, n, m, p);
+        return out;
+    }
+
+    // y = A(n×m) · x(m).
+    fn MatVec(a: array, x: array, n: int, m: int): array {
+        let out: [float] = Array.Create(n, Type.Float);
+        _la_matvec(a, x, out, n, m);
+        return out;
+    }
+
+    fn Dot(a: array, b: array): float {
+        let n: int = len(a);
+        if (n == 0 || len(b) < n) return 0.0;
+        return _la_dot(a, b, n);
+    }
+
+    // Euclidean (L2) norm of a vector.
+    fn Norm(a: array): float {
+        let n: int = len(a);
+        if (n == 0) return 0.0;
+        return _la_norm2(a, n);
+    }
+
+    // Solve A·x = b for an n×n system. Returns x, or [] if A is singular.
+    fn Solve(a: array, b: array, n: int): array {
+        let lu = _copy(a, n * n);
+        let piv: [float] = Array.Create(n, Type.Float);
+        if (_la_lu(lu, n, piv) == 0) return [];
+        // Row-permute b into y per the pivot record.
+        let y: [float] = Array.Create(n, Type.Float);
+        iter(i from 0 to n - 1) { y[i] = b[i] + 0.0; }
+        iter(k from 0 to n - 1) {
+            let pr: int = int(piv[k]);
+            if (pr != k) { let t: float = y[k]; y[k] = y[pr]; y[pr] = t; }
+        }
+        _la_fbsolve(lu, y, n);
+        return y;
+    }
+
+    // Determinant of an n×n matrix (0.0 if singular).
+    fn Det(a: array, n: int): float {
+        let lu = _copy(a, n * n);
+        let piv: [float] = Array.Create(n, Type.Float);
+        if (_la_lu(lu, n, piv) == 0) return 0.0;
+        let det: float = 1.0;
+        iter(k from 0 to n - 1) {
+            det = det * lu[k * n + k];
+            if (int(piv[k]) != k) { det = -det; }   // each swap flips the sign
+        }
+        return det;
+    }
+
+    // Inverse of an n×n matrix as a flat n*n array, or [] if singular.
+    fn Inverse(a: array, n: int): array {
+        let lu = _copy(a, n * n);
+        let piv: [float] = Array.Create(n, Type.Float);
+        if (_la_lu(lu, n, piv) == 0) return [];
+        let inv: [float] = Array.Create(n * n, Type.Float);
+        let y: [float] = Array.Create(n, Type.Float);
+        iter(c from 0 to n - 1) {
+            iter(r from 0 to n - 1) { y[r] = 0.0; }
+            y[c] = 1.0;
+            iter(k from 0 to n - 1) {
+                let pr: int = int(piv[k]);
+                if (pr != k) { let t: float = y[k]; y[k] = y[pr]; y[pr] = t; }
+            }
+            _la_fbsolve(lu, y, n);
+            iter(r from 0 to n - 1) { inv[r * n + c] = y[r]; }
+        }
+        return inv;
+    }
+
+    // Cholesky factor L (lower, L·Lᵀ = A) of an SPD matrix, or [] if not SPD.
+    fn Cholesky(a: array, n: int): array {
+        let l = _copy(a, n * n);
+        if (_la_chol(l, n) == 0) return [];
+        // Zero the strict upper triangle (kernel only wrote the lower part).
+        iter(i from 0 to n - 1) {
+            iter(j from i + 1 to n - 1) { l[i * n + j] = 0.0; }
+        }
+        return l;
+    }
+}
+
+// ============================================================
+//  Chart - line/scatter plotting on the built-in Gfx rasterizer.
+//  A stateful, chainable builder: add series, then Save() a PNG.
+//
+//    let ch = new Chart(640, 400);
+//    ch.Title("demo").AddLine(xs, ys, Gfx.RGB(30,90,200))
+//                     .AddScatter(px, py, Gfx.RGB(200,40,40))
+//                     .Save("chart.png");
+// ============================================================
+
+class Chart {
+    let axisColor = nil; 
+    let bg = nil; 
+    let gridColor = nil; 
+    let h = 0;
+    let pad = 0;
+    let series = nil; 
+    let textColor = nil; 
+    let titleText = nil; 
+    let w = 0;
+    let xlabel = nil; 
+    let ylabel = nil; 
+
+    fn Constructor(width: int, height: int) {
+        this.w = width;
+        this.h = height;
+        this.pad = 52;
+        this.series = [];
+        this.titleText = "";
+        this.xlabel = "";
+        this.ylabel = "";
+        this.bg = Gfx.RGB(255, 255, 255);
+        this.axisColor = Gfx.RGB(60, 60, 60);
+        this.gridColor = Gfx.RGB(228, 228, 228);
+        this.textColor = Gfx.RGB(40, 40, 40);
+    }
+
+    fn Title(t: string): instance { this.titleText = t; return this; }
+    fn XLabel(t: string): instance { this.xlabel = t; return this; }
+    fn YLabel(t: string): instance { this.ylabel = t; return this; }
+
+    // kind: 0 = polyline, 1 = scatter (markers).
+    fn AddLine(xs: array, ys: array, color: int): instance {
+        Array.Append(this.series, { kind: 0, xs: xs, ys: ys, color: color });
+        return this;
+    }
+
+    fn AddScatter(xs: array, ys: array, color: int): instance {
+        Array.Append(this.series, { kind: 1, xs: xs, ys: ys, color: color });
+        return this;
+    }
+
+    fn _fmt(v: float): string {
+        return str(Math.RoundTo(v, 3));
+    }
+
+    // Compute [xmin, xmax, ymin, ymax] across all series.
+    fn _bounds(): array {
+        let xmin: float = 1e300;
+        let xmax: float = -1e300;
+        let ymin: float = 1e300;
+        let ymax: float = -1e300;
+        let si: int = 0;
+        while (si < len(this.series)) {
+            let s = this.series[si];
+            let xs = s.xs;
+            let ys = s.ys;
+            let n: int = len(xs);
+            let i: int = 0;
+            while (i < n) {
+                let xv: float = xs[i] + 0.0;
+                let yv: float = ys[i] + 0.0;
+                if (xv < xmin) { xmin = xv; }
+                if (xv > xmax) { xmax = xv; }
+                if (yv < ymin) { ymin = yv; }
+                if (yv > ymax) { ymax = yv; }
+                i = i + 1;
+            }
+            si = si + 1;
+        }
+        if (xmax <= xmin) { xmax = xmin + 1.0; }
+        if (ymax <= ymin) { ymax = ymin + 1.0; }
+        return [xmin, xmax, ymin, ymax];
+    }
+
+    // Render all series with axes, grid, ticks and labels; write a PNG.
+    fn Save(path: string): bool {
+        if (len(this.series) == 0) return false;
+
+        let b = this._bounds();
+        let xmin: float = b[0];
+        let xmax: float = b[1];
+        let ymin: float = b[2];
+        let ymax: float = b[3];
+        let xr: float = xmax - xmin;
+        let yr: float = ymax - ymin;
+
+        let pad: int = this.pad;
+        let plotW: float = (this.w - 2 * pad) + 0.0;
+        let plotH: float = (this.h - 2 * pad) + 0.0;
+        let left: int = pad;
+        let top: int = pad;
+        let right: int = this.w - pad;
+        let bottom: int = this.h - pad;
+
+        let img = Gfx.Create(this.w, this.h);
+        img.Clear(this.bg);
+
+        // Grid + tick labels (5 divisions per axis).
+        let ticks: int = 5;
+        let gi: int = 0;
+        while (gi <= ticks) {
+            let frac: float = gi / (ticks + 0.0);
+            // vertical grid line at x-tick
+            let gx: int = left + int(frac * plotW);
+            img.DrawLine(gx, top, gx, bottom, this.gridColor);
+            let xval: float = xmin + frac * xr;
+            img.DrawText(gx - 12, bottom + 8, this._fmt(xval), this.textColor, 1);
+            // horizontal grid line at y-tick
+            let gy: int = bottom - int(frac * plotH);
+            img.DrawLine(left, gy, right, gy, this.gridColor);
+            let yval: float = ymin + frac * yr;
+            img.DrawText(4, gy - 4, this._fmt(yval), this.textColor, 1);
+            gi = gi + 1;
+        }
+
+        // Axes box.
+        img.DrawRect(left, top, this.w - 2 * pad, this.h - 2 * pad, this.axisColor);
+
+        // Title and axis labels.
+        if (len(this.titleText) > 0) {
+            img.DrawText(left, 16, this.titleText, this.textColor, 2);
+        }
+        if (len(this.xlabel) > 0) {
+            img.DrawText(right - 8 * len(this.xlabel), bottom + 26, this.xlabel, this.textColor, 1);
+        }
+        if (len(this.ylabel) > 0) {
+            img.DrawText(4, top - 16, this.ylabel, this.textColor, 1);
+        }
+
+        // Each series.
+        let si: int = 0;
+        while (si < len(this.series)) {
+            let s = this.series[si];
+            let xs = s.xs;
+            let ys = s.ys;
+            let color: int = s.color;
+            let n: int = len(xs);
+            let px0: int = 0;
+            let py0: int = 0;
+            let i: int = 0;
+            while (i < n) {
+                let xv: float = xs[i] + 0.0;
+                let yv: float = ys[i] + 0.0;
+                let px: int = left + int((xv - xmin) / xr * plotW);
+                let py: int = bottom - int((yv - ymin) / yr * plotH);
+                if (s.kind == 1) {
+                    img.DrawCircle(px, py, 2, color, 0);   // thickness 0 = filled dot
+                } else {
+                    if (i > 0) { img.DrawLine(px0, py0, px, py, color); }
+                }
+                px0 = px;
+                py0 = py;
+                i = i + 1;
+            }
+            si = si + 1;
+        }
+
+        return img.SaveToFile(path);
+    }
+}
+
+export { Numerics, Stats, LinAlg, Chart };

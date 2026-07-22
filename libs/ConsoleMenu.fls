@@ -1,0 +1,543 @@
+// ConsoleMenu.fls - Interactive console UI widgets for Flaris.
+// Version: 1.0
+//
+// Draws keyboard-navigable menus, confirmation dialogs, text input fields,
+// and multi-select pickers inside the terminal using ANSI escape codes.
+// Arrow keys + Enter navigate; Escape cancels where applicable.
+//
+// Usage:
+//   import { ConsoleMenu } from library("ConsoleMenu", "1.0");
+//
+//   let cm = new ConsoleMenu();
+//
+//   // Single-choice menu - returns 0-based index, or -1 if cancelled
+//   let idx = cm.Menu(["New file", "Open…", "Quit"], { title: "File" });
+//
+//   // Yes/No dialog - returns true for Yes, false for No/Escape
+//   let ok = cm.Confirm("Delete?", "Remove 'report.pdf'?");
+//
+//   // Text input - returns the entered string, or nil if cancelled
+//   let name = cm.Input("Setup", "Your name:", nil);
+//   let pwd  = cm.Input("Login", "Password:", { masked: true });
+//
+//   // Multi-select - returns array of selected indices (space to toggle, Enter to confirm)
+//   let chosen = cm.Select(["Alpha", "Beta", "Gamma"], { title: "Pick features" });
+//
+//   // Non-interactive message box
+//   cm.Alert("Done", "File saved successfully.");
+//
+// Widgets:
+//   Menu(items:array, opts?)     →  int     - single choice (0-based), -1 on cancel
+//   Confirm(title, msg)          →  bool    - Yes/No dialog
+//   Input(title, prompt, opts?)  →  string  - text field; nil on cancel
+//     opts: { masked:bool, default:string }
+//   Select(items:array, opts?)   →  array   - multi-select; array of chosen indices
+//   Alert(title, msg)            - informational box with OK button
+//
+// Theme (set fields before calling widgets; use ANSI color codes 30-37, 0 = default):
+//   cm.border   = 36   - box border color (default: Cyan)
+//   cm.titleClr = 33   - title bar color  (default: Yellow)
+//   cm.selBg    = 36   - selected-item background
+//   cm.item     = 0    - normal item foreground
+//   cm.btnFg    = 33   - button foreground (Confirm dialog)
+//
+// ANSI color codes: 30 Black  31 Red  32 Green  33 Yellow
+//                   34 Blue   35 Magenta  36 Cyan  37 White  0 Default
+
+class ConsoleMenu {
+
+    // ── Theme fields  (use Console.ConsoleColor.* constants or ANSI codes 30-37)
+    //    Default=0  Red=31  Green=32  Yellow=33  Blue=34  Cyan=36
+
+    let border:int   = 36;  // Cyan
+    let titleClr:int = 33;  // Yellow
+    let item:int     = 0;
+    let itemBg:int   = 0;
+    let selFg:int    = 0;
+    let selBg:int    = 36;  // Cyan background
+    let btnFg:int    = 33;  // Yellow
+    let btnSelFg:int = 0;
+    let btnSelBg:int = 36;  // Cyan background
+    let inputFg:int  = 0;
+    let inputBg:int  = 34;  // Blue background
+    let msgFg:int    = 0;
+
+    // ── Low-level primitives ─────────────────────────────────────────────────
+
+    fn _rep(ch: string, n: int): string {
+        if (n <= 0) return "";
+        return String.Repeat(ch, n);
+    }
+
+    fn _fit(text: string, width: int): string {
+        let len = String.Length(text);
+        if (len == width) return text;
+        if (len > width)  return String.Substr(text, 0, width);
+        return String.PadRight(text, width);
+    }
+
+    fn _center(text: string, width: int): string {
+        let len = String.Length(text);
+        if (len >= width) return this._fit(text, width);
+        let lpad = (width - len) / 2;
+        let rpad = width - len - lpad;
+        return this._rep(" ", lpad) + text + this._rep(" ", rpad);
+    }
+
+    fn _cBorder() { Console.SetColor(this.border);   Console.SetBackground(0); }
+    fn _cTitle()  { Console.SetColor(this.titleClr); Console.SetBackground(0); }
+    fn _cReset()  { Console.SetColor(0); Console.SetBackground(0); }
+
+    fn _centerPos(w:int, h:int) {
+        let sz  = Console.Size();   // [cols, rows]
+        let col = int((int(sz[0]) - w) / 2);
+        let row = int((int(sz[1]) - h) / 2);
+        if (col < 1) col = 1;
+        if (row < 1) row = 1;
+        return { row: row, col: col };
+    }
+
+    fn _eraseBox(row:int, col:int, _w:int, h:int) {
+        iter (i from 0 to h - 1) {
+            Console.SetCursor(row + i, col);
+            Console.ClearLine();
+        }
+    }
+
+    fn _drawHRule(row:int, col:int, w:int, kind: string, title) {
+        Console.SetCursor(row, col);
+        this._cBorder();
+        let lc = "┌"; let rc = "┐";
+        if (kind == "mid") { lc = "├"; rc = "┤"; }
+        if (kind == "bot") { lc = "└"; rc = "┘"; }
+        let inner = w - 2;
+        if (kind == "top" && title != nil && String.Length(title) > 0) {
+            let tlabel = " " + title + " ";
+            let tlen   = String.Length(tlabel);
+            if (tlen >= inner) { tlabel = this._fit(tlabel, inner); tlen = inner; }
+            let left  = (inner - tlen) / 2;
+            let right = inner - tlen - left;
+            Console.Write(lc);
+            Console.Write(this._rep("─", left));
+            this._cTitle();
+            Console.Write(tlabel);
+            this._cBorder();
+            Console.Write(this._rep("─", right));
+            Console.Write(rc);
+        } else {
+            Console.Write(lc + this._rep("─", inner) + rc);
+        }
+        this._cReset();
+    }
+
+    fn _drawEmpty(row:int, col:int, w:int) {
+        Console.SetCursor(row, col);
+        this._cBorder(); Console.Write("│");
+        this._cReset();  Console.Write(this._rep(" ", w - 2));
+        this._cBorder(); Console.Write("│");
+        this._cReset();
+    }
+
+    fn _drawRow(row:int, col:int, w:int, text: string, fg:int, bg:int) {
+        Console.SetCursor(row, col);
+        this._cBorder(); Console.Write("│");
+        Console.SetColor(fg); Console.SetBackground(bg);
+        Console.Write(this._fit(text, w - 2));
+        this._cReset();
+        this._cBorder(); Console.Write("│");
+        this._cReset();
+    }
+
+    // ── Menu redraw ──────────────────────────────────────────────────────────
+
+    fn _redrawMenu(r:int, c:int, boxW:int, items, sel:int, title) {
+        this._drawHRule(r, c, boxW, "top", title);
+        this._drawEmpty(r + 1, c, boxW);
+        iter (i from 0 to len(items) - 1) {
+            let text = (i == sel ? " > " : "   ") + items[i];
+            let fg   = (i == sel ? this.selFg : this.item);
+            let bg   = (i == sel ? this.selBg : this.itemBg);
+            this._drawRow(r + 2 + i, c, boxW, text, fg, bg);
+        }
+        this._drawEmpty(r + 2 + len(items),     c, boxW);
+        this._drawHRule(r + 2 + len(items) + 1, c, boxW, "bot", nil);
+    }
+
+    // ── Alert redraw ─────────────────────────────────────────────────────────
+
+    fn _redrawAlert(r:int, c:int, boxW:int, innerW:int, lines, title) {
+        this._drawHRule(r, c, boxW, "top", title);
+        this._drawEmpty(r + 1, c, boxW);
+        iter (i from 0 to len(lines) - 1) {
+            this._drawRow(r + 2 + i, c, boxW, "  " + lines[i], this.msgFg, 0);
+        }
+        let after = r + 2 + len(lines);
+        this._drawEmpty(after, c, boxW);
+        Console.SetCursor(after + 1, c);
+        this._cBorder(); Console.Write("│");
+        Console.SetColor(this.btnFg); Console.SetBackground(0);
+        Console.Write(this._center("[ OK ]", innerW));
+        this._cReset();
+        this._cBorder(); Console.Write("│"); this._cReset();
+        this._drawEmpty(after + 2, c, boxW);
+        this._drawHRule(after + 3, c, boxW, "bot", nil);
+    }
+
+    // ── Confirm redraw ───────────────────────────────────────────────────────
+
+    fn _drawConfirmBtns(row:int, c:int, innerW:int, yesSel: bool) {
+        // Selected button uses < > brackets; unselected uses [ ]
+        let yesLabel = (yesSel  ? "< Yes >" : "[ Yes ]");
+        let noLabel  = (!yesSel ? "< No >"  : "[ No ]");
+        let yesLen   = String.Length(yesLabel);
+        let noLen    = String.Length(noLabel);
+        let spacer   = 3;
+        let outerPad = innerW - yesLen - noLen - spacer;
+        let lpad     = outerPad / 2;
+        let rpad     = outerPad - lpad;
+
+        Console.SetCursor(row, c);
+        this._cBorder(); Console.Write("│");
+        Console.Write(this._rep(" ", lpad));
+        if (yesSel) { Console.SetColor(this.btnSelFg); Console.SetBackground(this.btnSelBg); }
+        else        { Console.SetColor(this.btnFg);    Console.SetBackground(0); }
+        Console.Write(yesLabel);
+        this._cReset();
+        Console.Write(this._rep(" ", spacer));
+        if (!yesSel) { Console.SetColor(this.btnSelFg); Console.SetBackground(this.btnSelBg); }
+        else         { Console.SetColor(this.btnFg);    Console.SetBackground(0); }
+        Console.Write(noLabel);
+        this._cReset();
+        Console.Write(this._rep(" ", rpad));
+        this._cBorder(); Console.Write("│"); this._cReset();
+    }
+
+    fn _redrawConfirm(r:int, c:int, boxW:int, innerW:int, lines, title, yesSel: bool) {
+        this._drawHRule(r, c, boxW, "top", title);
+        this._drawEmpty(r + 1, c, boxW);
+        iter (i from 0 to len(lines) - 1) {
+            this._drawRow(r + 2 + i, c, boxW, "  " + lines[i], this.msgFg, 0);
+        }
+        let after = r + 2 + len(lines);
+        this._drawEmpty(after, c, boxW);
+        this._drawConfirmBtns(after + 1, c, innerW, yesSel);
+        this._drawEmpty(after + 2, c, boxW);
+        this._drawHRule(after + 3, c, boxW, "bot", nil);
+    }
+
+    // ── Input redraw ─────────────────────────────────────────────────────────
+
+    fn _drawInputField(row:int, c:int, fieldW:int, buf: string, masked: bool) {
+        let display = buf;
+        if (masked) { display = this._rep("*", String.Length(buf)); }
+        let dlen = String.Length(display);
+        if (dlen > fieldW) { display = String.Right(display, fieldW); }
+        Console.SetCursor(row, c);
+        this._cBorder(); Console.Write("│");
+        Console.Write("  ");
+        Console.SetColor(this.inputFg); Console.SetBackground(this.inputBg);
+        Console.Write(this._fit(display, fieldW));
+        this._cReset();
+        Console.Write("  ");
+        this._cBorder(); Console.Write("│"); this._cReset();
+    }
+
+    fn _redrawInput(r:int, c:int, boxW:int, innerW:int, fieldW:int, title, prompt, buf: string, masked: bool) {
+        this._drawHRule(r,     c, boxW, "top", title);
+        this._drawEmpty(r + 1, c, boxW);
+        this._drawRow(  r + 2, c, boxW, "  " + prompt, this.msgFg, 0);
+        this._drawInputField(r + 3, c, fieldW, buf, masked);
+        this._drawEmpty(r + 4, c, boxW);
+        Console.SetCursor(r + 5, c);
+        this._cBorder(); Console.Write("│");
+        Console.SetColor(this.btnFg); Console.SetBackground(0);
+        Console.Write(this._center("[ OK ]   [ Esc ]", innerW));
+        this._cReset();
+        this._cBorder(); Console.Write("│"); this._cReset();
+        this._drawEmpty(r + 6, c, boxW);
+        this._drawHRule(r + 7, c, boxW, "bot", nil);
+    }
+
+    // ── Public API ───────────────────────────────────────────────────────────
+
+    fn Menu(items, opts): int {
+        if (items == nil || len(items) == 0) return -1;
+
+        let title  = (opts != nil ? Object.TryGet(opts, "title",   nil) : nil);
+        var minW   = int(opts != nil ? Object.TryGet(opts, "width",   20)  : 20);
+        var sel    = int(opts != nil ? Object.TryGet(opts, "initial", 0)   : 0);
+        let nItems = len(items);
+
+        var innerW = minW;
+        iter (i from 0 to nItems - 1) {
+            let l = String.Length(str(items[i])) + 4;
+            if (l > innerW) innerW = l;
+        }
+        if (title != nil) {
+            let tl = String.Length(str(title)) + 4;
+            if (tl > innerW) innerW = tl;
+        }
+
+        let boxW = int(innerW) + 2;
+        let boxH = nItems + 4;
+        let pos  = this._centerPos(boxW, boxH);
+        let r    = int(pos.row);
+        let c    = int(pos.col);
+
+        Console.SetRaw(true);
+        Console.SaveCursor();
+        this._eraseBox(r, c, boxW, boxH);
+        this._redrawMenu(r, c, boxW, items, sel, title);
+
+        let wrap = (opts != nil ? Object.TryGet(opts, "wrap", false) : false);
+
+        var result = -1;
+        while (true) {
+            let k = Console.ReadKey();
+            if (k.Key == "Up") {
+                if (sel > 0) { sel -= 1; }
+                else if (wrap) { sel = nItems - 1; }
+                this._redrawMenu(r, c, boxW, items, sel, title);
+            } else if (k.Key == "Down") {
+                if (sel < nItems - 1) { sel += 1; }
+                else if (wrap) { sel = 0; }
+                this._redrawMenu(r, c, boxW, items, sel, title);
+            } else if (k.Key == "Enter") {
+                result = sel;
+                break;
+            } else if (k.Key == "Escape") {
+                result = -1;
+                break;
+            }
+        }
+
+        this._eraseBox(r, c, boxW, boxH);
+        Console.RestoreCursor();
+        Console.SetRaw(false);
+        return result;
+    }
+
+    fn Alert(title, msg) {
+        let raw    = (msg != nil ? msg : "");
+        let lines  = String.SplitLines(raw);
+        if (len(lines) == 0) lines = [""];
+        let nLines = len(lines);
+
+        var innerW = String.Length(str(title)) + 4;
+        iter (i from 0 to nLines - 1) {
+            let l = String.Length(lines[i]) + 4;
+            if (l > innerW) innerW = l;
+        }
+        if (innerW < 24) innerW = 24;
+
+        let boxW = int(innerW) + 2;
+        let boxH = nLines + 6;
+        let pos  = this._centerPos(boxW, boxH);
+        let r    = int(pos.row);
+        let c    = int(pos.col);
+
+        Console.SetRaw(true);
+        Console.SaveCursor();
+        this._eraseBox(r, c, boxW, boxH);
+        this._redrawAlert(r, c, boxW, innerW, lines, title);
+
+        while (true) {
+            let k = Console.ReadKey();
+            if (k.Key == "Enter" || k.Key == "Escape") break;
+        }
+
+        this._eraseBox(r, c, boxW, boxH);
+        Console.RestoreCursor();
+        Console.SetRaw(false);
+    }
+
+    fn Confirm(title, msg): bool {
+        let raw    = (msg != nil ? msg : "");
+        let lines  = String.SplitLines(raw);
+        if (len(lines) == 0) lines = [""];
+        let nLines = len(lines);
+
+        var innerW = String.Length(str(title)) + 4;
+        iter (i from 0 to nLines - 1) {
+            let l = String.Length(lines[i]) + 4;
+            if (l > innerW) innerW = l;
+        }
+        let btnNeeded = String.Length("[ Yes ]") + String.Length("[ No ]") + 6;
+        if (btnNeeded > innerW) innerW = btnNeeded;
+        if (innerW < 26) innerW = 26;
+
+        let boxW = int(innerW) + 2;
+        let boxH = nLines + 6;
+        let pos  = this._centerPos(boxW, boxH);
+        let r    = int(pos.row);
+        let c    = int(pos.col);
+
+        var yesSel = true;
+
+        Console.SetRaw(true);
+        Console.SaveCursor();
+        this._eraseBox(r, c, boxW, boxH);
+        this._redrawConfirm(r, c, boxW, innerW, lines, title, yesSel);
+
+        let btnRow = r + 2 + nLines + 1;
+
+        var result = false;
+        while (true) {
+            let k = Console.ReadKey();
+            if (k.Key == "Left" || k.Key == "Right" || k.Key == "Tab") {
+                yesSel = !yesSel;
+                this._drawConfirmBtns(btnRow, c, innerW, yesSel);
+            } else if (k.Key == "Enter") {
+                result = yesSel;
+                break;
+            } else if (k.Key == "Escape") {
+                result = false;
+                break;
+            } else if (!k.IsSpecial) {
+                let ch = String.ToLower(k.Key);
+                if (ch == "y") { result = true;  break; }
+                if (ch == "n") { result = false; break; }
+            }
+        }
+
+        this._eraseBox(r, c, boxW, boxH);
+        Console.RestoreCursor();
+        Console.SetRaw(false);
+        return result;
+    }
+
+    // ── Select redraw ─────────────────────────────────────────────────────────
+
+    fn _redrawSelect(r:int, c:int, boxW:int, items, sel:int, selected, title) {
+        this._drawHRule(r, c, boxW, "top", title);
+        this._drawEmpty(r + 1, c, boxW);
+        iter (i from 0 to len(items) - 1) {
+            let prefix = (selected[i] ? "[x] " : "[ ] ");
+            let text   = (i == sel ? " > " : "   ") + prefix + items[i];
+            let fg     = (i == sel ? this.selFg : this.item);
+            let bg     = (i == sel ? this.selBg : this.itemBg);
+            this._drawRow(r + 2 + i, c, boxW, text, fg, bg);
+        }
+        this._drawEmpty(r + 2 + len(items),     c, boxW);
+        this._drawHRule(r + 2 + len(items) + 1, c, boxW, "bot", nil);
+    }
+
+    // ── Select (multi-select) ────────────────────────────────────────────────
+
+    fn Select(items, opts) : array {
+        if (items == nil || len(items) == 0) return [];
+
+        let title  = (opts != nil ? Object.TryGet(opts, "title", nil) : nil);
+        var minW   = int(opts != nil ? Object.TryGet(opts, "width", 20) : 20);
+        var sel    = 0;
+        let nItems = len(items);
+        let selected = Array.Create(nItems, Type.Bool);
+
+        var innerW = minW;
+        iter (i from 0 to nItems - 1) {
+            let l = String.Length(str(items[i])) + 7;  // extra for "[x] " + " > "
+            if (l > innerW) innerW = l;
+        }
+        if (title != nil) {
+            let tl = String.Length(str(title)) + 4;
+            if (tl > innerW) innerW = tl;
+        }
+
+        let boxW = int(innerW) + 2;
+        let boxH = nItems + 4;
+        let pos  = this._centerPos(boxW, boxH);
+        let r    = int(pos.row);
+        let c    = int(pos.col);
+
+        Console.SetRaw(true);
+        Console.SaveCursor();
+        this._eraseBox(r, c, boxW, boxH);
+        this._redrawSelect(r, c, boxW, items, sel, selected, title);
+
+        var cancelled = false;
+        while (true) {
+            let k = Console.ReadKey();
+            if (k.Key == "Up") {
+                if (sel > 0) { sel -= 1; }
+                this._redrawSelect(r, c, boxW, items, sel, selected, title);
+            } else if (k.Key == "Down") {
+                if (sel < nItems - 1) { sel += 1; }
+                this._redrawSelect(r, c, boxW, items, sel, selected, title);
+            } else if (!k.IsSpecial && k.Key == " ") {
+                selected[sel] = !selected[sel];
+                this._redrawSelect(r, c, boxW, items, sel, selected, title);
+            } else if (k.Key == "Enter") {
+                break;
+            } else if (k.Key == "Escape") {
+                cancelled = true;
+                break;
+            }
+        }
+
+        this._eraseBox(r, c, boxW, boxH);
+        Console.RestoreCursor();
+        Console.SetRaw(false);
+
+        if (cancelled) return [];
+
+        let result = [];
+        iter (i from 0 to nItems - 1) {
+            if (selected[i]) Array.Append(result, i);
+        }
+        return result;
+    }
+
+    fn Input(title, prompt, opts) {
+        let defaultVal = str(opts != nil ? Object.TryGet(opts, "default", "") : "");
+        var fieldW     = int(opts != nil ? Object.TryGet(opts, "width",   28) : 28);
+        let masked     = (opts != nil ? Object.TryGet(opts, "mask", false) : false);
+
+        var innerW = fieldW + 4;
+        let tlen   = String.Length(str(title));
+        let plen   = String.Length(str(prompt));
+        if (tlen + 4 > innerW) innerW = tlen + 4;
+        if (plen + 4 > innerW) innerW = plen + 4;
+        fieldW = int(innerW) - 4;
+
+        let boxW = int(innerW) + 2;
+        let boxH = 8;
+        let pos  = this._centerPos(boxW, boxH);
+        let r    = int(pos.row);
+        let c    = int(pos.col);
+
+        var buf = str(defaultVal);
+
+        Console.SetRaw(true);
+        Console.SaveCursor();
+        this._eraseBox(r, c, boxW, boxH);
+        this._redrawInput(r, c, boxW, innerW, fieldW, title, prompt, buf, masked);
+
+        var result = nil;
+        while (true) {
+            let k = Console.ReadKey();
+            if (k.Key == "Enter") {
+                result = buf;
+                break;
+            } else if (k.Key == "Escape") {
+                result = nil;
+                break;
+            } else if (k.Key == "Backspace") {
+                let blen = String.Length(buf);
+                if (blen > 0) {
+                    buf = String.Substr(buf, 0, blen - 1);
+                    this._drawInputField(r + 3, c, fieldW, buf, masked);
+                }
+            } else if (!k.IsSpecial && k.Key != "Tab") {
+                buf = buf + k.Key;
+                this._drawInputField(r + 3, c, fieldW, buf, masked);
+            }
+        }
+
+        this._eraseBox(r, c, boxW, boxH);
+        Console.RestoreCursor();
+        Console.SetRaw(false);
+        return result;
+    }
+}
+
+export { ConsoleMenu };
