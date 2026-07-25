@@ -1,7 +1,7 @@
 # Flaris Language Reference
 
-Version: 1.0.0.7
-Spec Revision: 2026-06-29
+Version: 1.0.0.9
+Spec Revision: 2026-07-25
 
 This document is the authoritative technical reference for the Flaris language and runtime.
 For a narrative introduction and guided tour, see the **Guide**.
@@ -59,6 +59,7 @@ The Flaris VM binary is `flarisvm`.
 |------|--------------------------------------------------|
 | `--no-opt` | Disable compiler optimizations                   |
 | `--strip` | Disable debug symbols (smaller, faster bytecode) |
+| `--small` | Extra size optimizations for compiled `.flx`; also removes string symbol names |
 | `--no-verify` | Disable FFI library (Ffi.Load) SHA-256 checks    |
 
 ### Flags - Enablers (default OFF)
@@ -67,13 +68,34 @@ The Flaris VM binary is `flarisvm`.
 |------|--------|
 | `--unsafe` | Enable unsafe code and FFI |
 | `--mem` | Memory report at shutdown: peak RSS, slab footprint, peak/total object counts, heap bytes, block regions, and leak count. Exits non-zero if leaks are detected. |
-| `--stats` | Print VM statistics after execution |
+| `--stats` | Print VM statistics after execution (implies `--time`) |
 | `--time` | Print timing report |
-| `--verbose` | Verbose output |
+| `--verbose` | Verbose output (also enables the timing report) |
+| `--list-keys` | Print the built-in and trusted signing keys, then exit |
 | `--trace` | Very verbose / print disassembled bytecode before execution |
 | `--jit` | Enable JIT: automatically compiles every eligible function - embeds JIT code at compile time and runs it natively at run time (ARM64 and x86-64) |
 | `--debug` | Stop at the start of `Main` and open the debugger prompt; disables `--jit` (see [R9](#r9---debug-reference)) |
 | `--dap=<port>` | Serve the Debug Adapter Protocol on loopback for an editor; implies `--debug` |
+
+Diagnostics are colored only when stderr is a VT-capable TTY; setting the
+`NO_COLOR` environment variable (non-empty, [no-color.org](https://no-color.org)
+convention) forces plain output.
+
+### Exit Codes
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Success |
+| `fn Main` return | A numeric return value from `Main` becomes the process exit code |
+| exception code | An uncaught exception exits with the exception's numeric code |
+| 1 | Tokenizer error |
+| 2 | Compile error (bad source on the CLI or in a compiled unit) |
+| 3 | Assert failure (`Assert`/`AssertEq` or an internal invariant) |
+| 4 | File error (missing or unreadable source/bytecode) |
+| 5 | Debugger quit (`q`) |
+| 6 | Reserved (analyzer failures currently surface as code 2) |
+| 7 | Fingerprint/pin mismatch on a signed or pinned import |
+| 8 | Reserved |
 
 ### VM Tuning Flags
 
@@ -86,12 +108,13 @@ These override the compiled-in defaults. Values must be within min/max ranges li
 | `--slabs=<int>` | Override slab allocator count |
 | `--fibers=<int>` | Override maximum fiber count |
 | `--frames=<int>` | Override maximum call-frames |
+| `--io-threads=<int>` | Worker threads for the I/O pool (1-16). Default: half the logical CPUs, minimum 4. Raise it if `--stats` reports jobs run inline. |
 
 ### Imports
 
 | Flag | Effect |
 | ------ | -------- |
-| `--version=<M.m.p.b>` | Set library version in compiled `.flx` output. Compile mode only; silently ignored at runtime. Examples: `--version=1.0`, `--version=2.1.3`. Default: `1.0.0.0` |
+| `--min-version=<M.m.p.b>` | Set the minimum runtime version stamped into compiled `.flx` output. Compile mode only; silently ignored at runtime. Examples: `--min-version=1.0`, `--min-version=2.1.3`. Default: `1.0.0.0` |
 | `--libs=<path>` | Set default library loading-path (otherwise `.`) for VM to load libraries for later resolving imports |
 | `--sign=<hex\|keyfile>` | Compile mode only. Embed an Ed25519 signature in the `.flx`. Accepts the 128-hex-char secret key inline or a path to a file containing it. See *Package signing*. |
 | `--require-signed` | Runtime. Refuse to load any `.flx` that is unsigned, has an invalid signature, or is signed by a key not in `~/.flaris/trusted_keys`. |
@@ -446,7 +469,7 @@ These are the actual types values carry at runtime.
 | Type | Description |
 |------|-------------|
 | `array` | Dynamic, zero-indexed array. Max 10,000,000 elements. |
-| `object` | Hash-based key/value dictionary. Max 10,000,000 properties. Property iteration order is not stable across processes (see `Json.Canonicalize` for a deterministic ordering). |
+| `object` | Hash-based dictionary with **string keys** (property names). Indexing with a non-string key (`o[42] = x`) raises. For int/char/float or other value keys use `Collections.HashMap` / `Collections.OrderedMap`. Max 10,000,000 properties. Property iteration order is not stable across processes (see `Json.Canonicalize` for a deterministic ordering). |
 | `exception` | Exception with code and message. |
 
 #### Structured Types
@@ -514,6 +537,13 @@ exponent); they are stripped before the value is parsed.
 | **Minimum positive** | 2.2250738585072014e−308 |
 | **Maximum** | 1.7976931348623157e+308 |
 | **Special values** | `Infinity`, `-Infinity`, `NaN` |
+
+**Display vs. round-trip:** `str()` and `Console.WriteLine`/`Print` use a
+**compact** form - an integral value prints with no decimal point or exponent
+(`5000.0` shows as `5000`), and a fractional value uses `%g` (up to ~6
+significant digits, so `0.1 + 0.2` shows as `0.3`). For a **precise,
+round-trippable** string (full `%.17g`) use `Convert.ToString` /
+`String.ToString` instead.
 
 Float literals:
 
@@ -689,7 +719,7 @@ greet();         // Hello stranger
 | `let name = expr` | Local (block / function) | Cannot be used at module top level |
 | `var name = expr` | Local (block / function) | Identical to `let` |
 | `const name = expr` | Local or global | Immutable binding |
-| `global name = expr` | Module (global) | Warns if name already defined; accessible from all scopes in the file |
+| `global name = expr` | Module (global) | Accessible from all scopes in the file. Redeclaring in the same file is a compile error; redefining from another compile unit (`VM.Eval`, another module) warns and rebinds |
 | `global name:type = expr` | Module (global) | Type-annotated global |
 
 ---
@@ -1064,7 +1094,7 @@ Exposed as **static members of the `Exception` class** (`Exception.RuntimeError`
 
 - Exceptions 16, 20 indicate corrupted or hostile bytecode - treated as hard failures.
 - `OutOfMemory` (8) and `ExecOutOfMemory` (17) are separate to enable more precise diagnostics.
-- When an exception fires, the current fiber aborts and unwinds to the nearest error boundary. Other fibers continue. The VM itself stays alive.
+- When an exception fires, the current fiber unwinds to the nearest enclosing error boundary (`try`/`catch`). If a boundary catches it, the fiber resumes there, other fibers continue, and the VM stays alive. If the exception escapes the top of the fiber with no handler, the VM prints the trace and exits the whole process with the exception's code (see R9).
 
 ---
 
@@ -1090,13 +1120,38 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 **Key rules:**
 
 - `&&` binds tighter than `||` - `a || b && c` means `a || (b && c)`. `and`/`or` are tokenizer aliases with identical precedence.
+- `&&` / `||` short-circuit and yield a **value, not always a bool**: `a && b` evaluates to `b`'s value when `a` is truthy, otherwise `false`; `a || b` evaluates to `true` when `a` is truthy, otherwise `b`'s value. (`nil` and `0` are falsy.)
+- Shifts operate on `int64` and mask the shift count to `& 63`, so a count `>= 64` wraps into range. `<<` is a logical left shift; `>>` is an **arithmetic** right shift (the sign bit is replicated), so `-8 >> 1` = -4.
 - `??` (null coalescing) is lower than all arithmetic - `x + y ?? z` means `(x + y) ?? z`.
 - Division `/` and power `^^` produce `int` when both operands are `int` (division truncates toward zero; a negative power truncates too, so `2 ^^ -1` = 0), and `float` when either operand is `float`. Force a float result with a float operand: `a / (b * 1.0)` or `float(a) / b`.
 - `^^` is exponentiation (`x ^^ y` = x raised to y).
+- `+` is **overloaded by operand type** and never a type error (see also
+  [Operator operand checking](#operator-operand-checking)):
+  - `number + number` - arithmetic (int lane unless an operand is `float`).
+  - `char + char` / `char + string` - concatenate into a `string`; `char + int`
+    is arithmetic on the code point (`'a' + 1` is `98`).
+  - `array + array` - a **new** array with the elements of both (neither operand
+    is mutated); `array + value` appends `value` to a copy.
+  - `object + object` - a **new** merged object (right operand's keys win).
+  - anything else - the operands are coerced to their string forms and
+    concatenated (`nil` renders as `"null"`, `true`/`false` as themselves), so
+    `nil + 5` is `"null5"`.
+- Comparison (`<` `<=` `>` `>=`) and equality (`==` `!=`) on **containers** are
+  structural and recursive (bounded by the comparison-depth limit below):
+  - `array`/`array` and `block`/`block` compare **lexicographically** for
+    ordering (first differing element decides; a prefix is "less"), and
+    element-by-element for equality. `!=` is the negation of `==`.
+  - `object`/`object` and `exception`/`exception` compare equal when they hold
+    the same keys mapping to equal values (order-independent).
+  - `instance`/`instance` compare **structurally** (same class, field-by-field);
+    `class`/`class` compare by **identity**.
+  - Mixed numeric kinds compare by value across `int`/`float`/`char`/`bool`
+    (`'A' == 65` is `true`; `1 == 1.0` is `true`). Two values of otherwise
+    unrelated types are never equal.
 - Unary `+x` is an identity operator (yields `x` unchanged); `await expr` is a
   prefix operator usable in expression position, whereas `yield` is a
   **statement** only and cannot appear inside a larger expression.
-- `≈` (approximate equality) uses `APPROX_REL_EPS = 1e-6` and `APPROX_ABS_EPS = 1e-3`.
+- `≈` (approximate equality) uses `APPROX_REL_EPS = 1e-2` and `APPROX_ABS_EPS = 1e-9`.
 
 ---
 
@@ -1134,6 +1189,7 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | Parser nesting depth | 256 | |
 | Literal nesting depth | 64 | Max container nesting when building array/object literals (raises `Exception.NestingError`) |
 | Comparison depth | 1,024 | Max nesting for structural `==`/ordering of containers (raises `Exception.NestingError`; above the JSON depth cap, so parsed documents always compare) |
+| Clone depth | 512 | Max nesting for `Object.Clone`/`Array.Clone`; a deeper or **cyclic** value raises `Exception.NestingError` instead of overflowing the stack (above the JSON depth cap, so parsed documents always clone) |
 | Print depth | 64 | Console value printing descends this deep, then elides deeper values with `...` |
 | `VM.Eval()` / `VM.Compile()` source | 10 KB | Max source length |
 
@@ -1180,14 +1236,14 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | Method | Called when | Notes |
 | --- | --- | --- |
 | `Constructor(...)` | `new ClassName(...)` | Optional. Return value is ignored; `new` always returns the instance. |
-| `Destructor()` | Last reference to the instance is released | Optional. `this` is the dying instance. Exceptions are swallowed. Not inherited. |
+| `Destructor()` | Last reference to the instance is released | Optional. `this` is the dying instance. Exceptions are swallowed. Not inherited. **Not run for instances still alive at process exit** - teardown tears down the fiber that would execute it, so release anything that must be cleaned up (or do it explicitly) before returning from `Main`. **Do not let `this` escape** (store it in a global, array, or another object's field): the instance is already being freed, so a captured reference dangles - copy out the field values you need instead. |
 
 ### Float Approximation Thresholds
 
 | Threshold | Value | Description |
 | --- | --- | --- |
-| Relative epsilon (`≈`) | `1e-6` | Relative tolerance for the `≈` operator |
-| Absolute epsilon (`≈`) | `1e-3` | Absolute tolerance for the `≈` operator |
+| Relative epsilon (`≈`) | `1e-2` | Relative tolerance for the `≈` operator |
+| Absolute epsilon (`≈`) | `1e-9` | Absolute tolerance for the `≈` operator |
 
 ### Platform Portability
 
@@ -1750,7 +1806,7 @@ Factory functions for Stack, Queue, HashMap, PriorityQueue, MaxPriorityQueue, Li
 
 #### HashMap - `Collections.HashMap(capacity?:int) - object`
 
-Keys may be any hashable value (int, char, string, ...); equality follows `get_hash` (ints/chars/strings by value, floats and other heap objects by identity). Pass an optional `capacity` to pre-size the map when the final key count is known, avoiding intermediate regrows. Iteration order (`Keys`/`Values`) is **not** stable across processes.
+Keys may be any hashable value (int, char, string, float, ...); lookup matches by hash, which is **by value** for numbers (int, char, bool, and float - equal values, however computed, hit the same entry) and for strings. Other heap objects (arrays, instances, ...) hash by identity, so only the same object matches. Pass an optional `capacity` to pre-size the map when the final key count is known, avoiding intermediate regrows. Iteration order (`Keys`/`Values`) is **not** stable across processes.
 
 | Method | Description |
 | -------- | ------------- |
@@ -2118,7 +2174,7 @@ Authenticated encryption (XChaCha20-Poly1305), Ed25519 signatures, X25519 key ex
 | **HmacSha1** | `HmacSha1(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA1 (40-hex). Legacy/interop: TOTP/HOTP 2FA, OAuth1, AWS SigV2. | ✓ owned¹ |
 | **HmacSha256** | `HmacSha256(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA256 (64-hex). | ✓ owned¹ |
 | **HmacSha512** | `HmacSha512(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA512 (128-hex). E.g. JWT HS512. | ✓ owned¹ |
-| **RandomBytes** | `RandomBytes(count:int) - block` | Generate `count` cryptographically random bytes (CSPRNG). | — |
+| **RandomBytes** | `RandomBytes(count:int) - block` | Generate `count` cryptographically random bytes (CSPRNG). Raises if `count` is not in `1..67108864`. | — |
 | **X25519KeyPair** | `X25519KeyPair() - object` | Generate an X25519 key-exchange key pair. Returns `{PublicKey:string(64 hex), SecretKey:string(64 hex)}`. | — |
 | **X25519Shared** | `X25519Shared(secretKey:string, peerPublicKey:string) - string` | X25519 ECDH; returns the 64-hex raw shared secret. Hash it (e.g. `Hash.Blake2b`) before using it as a key. | ✓ owned¹ |
 
@@ -2290,6 +2346,7 @@ Cooperative green-thread creation, communication, and lifecycle management.
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Cancel** | `Cancel(f:fiber) - bool` | Request cancellation of a running fiber. | — |
+| **CancelIo** | `CancelIo(f:fiber) - bool` | Abandon `f`'s pending async I/O **without** killing the fiber: it wakes from its `await` with `nil` and `Stream.LastError()` reporting `7` (cancelled), then carries on running. Use it to drop a stalled read while still answering the client — `Cancel` by contrast stops the fiber for good. `false` if `f` was not waiting on I/O. | — |
 | **FromId** | `FromId(id:int) - fiber` | Returns fiber handle from its integer ID. | — |
 | **GetMessage** | `GetMessage(f:fiber) - any` | Consume and return the oldest queued message (FIFO), or `nil` if the mailbox is empty. | — |
 | **HasMessage** | `HasMessage(f:fiber) - bool` | `true` if at least one message is queued for `f`. | — |
@@ -2881,31 +2938,46 @@ Network utility functions: DNS resolution, IP parsing/conversion, address classi
 
 Namespace: **`Object`**
 
-Introspection and manipulation of `object`, `instance`, or `class` values.
+Introspection and manipulation of `object` values, plus read-only reflection over
+`instance` and `class` values.
+
+`Keys`, `Values`, `Count` and `Entries` accept an `instance` or `class` and
+reflect its declared **fields** (base-first, in declaration order): the field
+names, an instance's current field values (a class's field defaults), and the
+field count. The mutating and higher-order helpers (`Merge`, `Delete`, `Clear`,
+`Select`, `Where`, `Pick`, `MapKeys`, `Invert`, `Reduce`, `Any`, `All`) are
+**object-only** — a class's schema is sealed.
+
+Property iteration order follows the hashmap's bucket order, which is salted per
+process (hash-flood defense) and therefore **not stable across runs**; use
+`Collections.OrderedMap` when insertion order matters. Field reflection order is
+the class's declaration order.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
-| **Clear** | `Clear(obj:object\|instance\|class) - bool` | Remove all properties from `obj`. Mutates. | — |
-| **Clone** | `Clone(obj:object) - object` | Deep clone of object. Primitives copied; functions shared. | — |
-| **Count** | `Count(obj:object\|instance\|class) - int` | Number of properties/fields. | ✓ |
-| **Delete** | `Delete(obj:object, key:string) - bool` | Delete property `key`. Returns `true` if existed. | — |
-| **Entries** | `Entries(obj:object\|instance\|class) - array` | Array of `[key, value]` pairs. | — |
-| **Freeze** | `Freeze(obj:object) - bool` | Makes `obj` read-only. Any subsequent write throws. Shallow only. | — |
+| **Clear** | `Clear(obj:object) - bool` | Remove all properties from `obj`. Mutates. Raises if `obj` is frozen. | — |
+| **Clone** | `Clone(value:any) - any` | Deep clone: scalars, strings, arrays (including flat `[float]`), objects, classes and instances are copied recursively; functions, builtins, modules and exceptions are shared (ref-counted, not copied). A **cyclic** value (or nesting past the clone-depth limit) raises `Exception.NestingError` rather than looping forever. | — |
+| **Count** | `Count(obj:object\|instance\|class) - int` | Number of properties (object) or declared fields (instance/class). | ✓ |
+| **Delete** | `Delete(obj:object, key:string) - bool` | Delete property `key`. Returns `true` if existed. Raises if `obj` is frozen. | — |
+| **Entries** | `Entries(obj:object\|instance\|class) - array` | Array of `[key, value]` pairs (object properties, or field name → value). | — |
+| **Freeze** | `Freeze(obj:object) - bool` | Makes `obj` read-only. Any subsequent write throws — including via `Merge`/`Delete`/`Clear`. Shallow only. Returns `false` for a non-object. Query with `IsFrozen`. | — |
+| **FromEntries** | `FromEntries(pairs:array) - object` | Inverse of `Entries`: builds an object from an array of `[key, value]` pairs (string keys). A later duplicate key overwrites the earlier. `nil` for a malformed entry. | — |
 | **FromKeys** | `FromKeys(arr:array, value:any) - object` | Creates new object from string key array, all set to `value`. | — |
 | **All** | `All(obj:object, func:fn) - bool` | Returns `true` if `fn(key, value)` is truthy for every entry. Returns `true` for an empty object. | — |
 | **Any** | `Any(obj:object, func:fn) - bool` | Returns `true` if `fn(key, value)` is truthy for at least one entry. Returns `false` for an empty object. | — |
 | **HasKey** | `HasKey(obj:object, key:string) - bool` | `true` if property `key` exists. | ✓ |
 | **Invert** | `Invert(obj:object) - object` | Returns a new object with keys and values swapped. Values are coerced to string to become keys. | — |
+| **IsFrozen** | `IsFrozen(obj:object) - bool` | `true` if `obj` was frozen by `Freeze`. `false` for an unfrozen object or a non-object. | ✓ |
 | **IsNil** | `IsNil(val:any) - bool` | `true` if `val` is `nil`. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Any`, `Array.GroupBy`, etc. | ✓ |
-| **Keys** | `Keys(obj:object\|instance\|class) - array` | Array of property names. | — |
+| **Keys** | `Keys(obj:object\|instance\|class) - array` | Array of property names (object) or field names (instance/class). | — |
 | **MapKeys** | `MapKeys(obj:object, func:fn) - object` | Returns a new object with keys transformed by `fn(key)`. Values are kept; new keys are coerced to string. Builtin functions (e.g. `String.ToUpper`) use the fast path. | — |
-| **Merge** | `Merge(dst:object, src:object) - bool` | Copy all `src` properties into `dst`. Mutates `dst`. Shallow. | — |
+| **Merge** | `Merge(dst:object, src:object) - bool` | Copy all `src` properties into `dst`. Mutates `dst`. Shallow. Raises if `dst` is frozen. | — |
 | **NotNil** | `NotNil(val:any) - bool` | `true` if `val` is not `nil`. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Any`, `Array.GroupBy`, etc. | ✓ |
 | **Pick** | `Pick(obj:object, keys:array) - object` | Returns new object with only the listed keys. | — |
 | **Reduce** | `Reduce(obj:object, func:fn, initial:any) - any` | Folds over entries: `acc = fn(acc, key, value)` starting from `initial`. | — |
 | **Select** | `Select(obj:object, func:fn ) - object` | Returns new object with values transformed by `fn(key, value)`. | — |
 | **TryGet** | `TryGet(obj:object, key:string, default:any) - any` | Returns `obj[key]` if present, otherwise `default`. | — |
-| **Values** | `Values(obj:object\|instance\|class) - array` | Array of property values. | — |
+| **Values** | `Values(obj:object\|instance\|class) - array` | Array of property values (object) or field values (instance/class). | — |
 | **Where** | `Where(obj:object, func:fn ) - object` | Returns new object containing only keys where `fn(key, value)` is truthy. | — |
 
 #### Object instance method syntax
@@ -2924,7 +2996,7 @@ o.Where(fn(k, v) { return v != nil; })
 o.Select(fn(k, v) { return String.ToUpper(v); })
 ```
 
-Functions that do not take an object as first argument (`FromKeys`) are not available as instance methods. Both forms compile to identical bytecode when the variable is typed (`: object` or inferred). Untyped variables fall back to a runtime dispatch.
+Functions that do not take an object as first argument (`FromKeys`, `FromEntries`) are not available as instance methods. Both forms compile to identical bytecode when the variable is typed (`: object` or inferred). Untyped variables fall back to a runtime dispatch.
 
 ---
 
@@ -3296,6 +3368,7 @@ Unified I/O for files, network sockets, pipes, and serial ports. All functions o
 | **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy data from `src` to `dst`. Optional byte limit. | — |
 | **Flush** | `Flush(s:stream) - bool` | Flush write buffer (`fsync` for files, `tcdrain` for serial, no-op for sockets). | — |
 | **IsOpen** | `IsOpen(s:stream) - bool` | `true` if stream is still open. | — |
+| **LastError** | `LastError() - int` | Why the calling fiber's most recent async operation (`ReadAsync`, `WriteAsync`, `WaitReadable`) resolved to `nil`. `0` = it succeeded, so a `nil` with `LastError() == 0` means a clean end-of-file, not a failure. Per-fiber, so concurrent fibers never overwrite each other's reason. Codes: `1` timeout, `2` stream closed/invalid, `3` connection reset, `4` read exceeded the maximum block size, `5` descriptor cannot be multiplexed, `6` other OS error, `7` cancelled by `Fiber.CancelIo`. | — |
 | **Listen** | `Listen(proto:string, port:int, backlog?:int) - stream` | Create a listening socket. `proto`: `"tcp"` or `"udp"`. Binds a dual-stack IPv6 socket (`IPV6_V6ONLY=0`, so IPv4 clients connect too) and falls back to IPv4-only if v6 is unavailable. Sets `SO_REUSEADDR` and `SO_REUSEPORT`. `backlog` defaults to `128`. | — |
 | **LocalAddr** | `LocalAddr(s:stream) - string` | Local endpoint of a socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
 | **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), or `"rw"` (read-write/create). Returns `nil` on failure. | — |
@@ -3304,7 +3377,7 @@ Unified I/O for files, network sockets, pipes, and serial ports. All functions o
 | **PeerAddr** | `PeerAddr(s:stream) - string` | Remote endpoint of a connected socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
 | **Pipe** | `Pipe() - array` | Create a pipe. Returns `[readStream, writeStream]`. | — |
 | **ReadAll** | `ReadAll(s:stream, limit?:int, timeout?:int) - block` | Read until EOF or `limit` bytes and return a `block`. On a file a short read ends the read; on a socket/pipe it reads until the peer closes (EOF) or, for a socket, the `timeout` fires (seconds, default 3) — bytes already read are returned, not discarded. Returns `nil` only on a hard I/O error. | — |
-| **ReadAsync** | `ReadAsync(s:stream, count?:int, timeout?:int, cb?:fn) - fiber` | Async read. `count > 0` completes once exactly `count` bytes have arrived; `count` omitted or `0` reads until EOF. `await` resolves to a `block` (shorter than `count` only if EOF arrives first), or `nil` on timeout/error. `timeout` in ms; `<= 0` (default) = no deadline. With `cb`, `cb(block)` is invoked on completion and the awaited result is `nil`. | — |
+| **ReadAsync** | `ReadAsync(s:stream, count?:int, timeout?:int, cb?:fn) - fiber` | Async read. `count > 0` completes once exactly `count` bytes have arrived; `count` omitted or `0` reads until EOF. `await` resolves to a `block`, or `nil`. A block can be shorter than `count` when EOF arrives first **or when the deadline fires after some bytes have arrived** — a timeout hands over what it already has rather than discarding it, so always check `len()`, and call `Stream.LastError()` (`1` = timed out) to tell a short block from a complete one. `nil` means nothing was received at all, or a hard error. `timeout` in ms; `<= 0` (default) = no deadline. With `cb`, `cb(block)` is invoked on completion and the awaited result is `nil`. | — |
 | **ReadByte** | `ReadByte(s:stream) - int` | Read one byte as integer. | — |
 | **ReadBytes** | `ReadBytes(s:stream, count:int) - block` | Read exactly `count` bytes into block. | — |
 | **ReadLine** | `ReadLine(s:stream) - string` | Read until `\n`, stripping a preceding `\r` (so `\r\n` and `\n` both work). A lone `\r` is kept as data — no speculative read-ahead, so no byte is lost on a socket/pipe. Returns `""` at EOF. | — |
@@ -3323,7 +3396,7 @@ Unified I/O for files, network sockets, pipes, and serial ports. All functions o
 | **Truncate** | `Truncate(s:stream, size:int) - bool` | Grow or shrink the file to exactly `size` bytes (`ftruncate`). Returns `true` on success. | — |
 | **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. | — |
 | **WriteAll** | `WriteAll(s:stream, data:string\|block) - bool` | Write all bytes, retrying on partial writes. | — |
-| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int), or `nil` on timeout/error. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight — do not grow or mutate it until the await resolves. | — |
+| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int), or `nil` on timeout/error. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. Use `Stream.LastError()` to tell a timeout from an I/O error. | — |
 | **WriteByte** | `WriteByte(s:stream, value:int) - bool` | Write single byte. Returns `true` on success, `false` on a write error. | — |
 | **WriteBytes** | `WriteBytes(s:stream, buf:block, count:int) - int` | Write `count` bytes from block; returns bytes written. | — |
 | **WriteString** | `WriteString(s:stream, s:string) - bool` | Write string bytes. | — |
@@ -3476,7 +3549,9 @@ Built-in TLS byte transport - the encrypted counterpart to the TCP side of `Stre
 
 The synchronous calls are **blocking**: because the VM is cooperative single-threaded, a read or write on a slow peer parks every fiber until data arrives or the timeout fires. A recv timeout is reported through `LastError` (the read returns what it has, or `nil`), so on a stalled connection check `LastError` rather than trusting an early EOF. Buffered reads are bounded (`ReadLine` ≤ 1 MB per line, `ReadAll` ≤ 256 MB) so a hostile peer cannot exhaust memory.
 
-For concurrency each call has an `*Async` twin (`ConnectAsync`, `WriteAsync`, `ReadLineAsync`, `ReadNAsync`, `ReadAllAsync`) that offloads the blocking work to the I/O thread pool and suspends only the calling fiber - other fibers keep running. `await` the result. Only one async op may be in flight per handle, and a handle must not be `Close`d or reused until its async op resolves.
+Up to 512 socket/stream operations may be in flight at once (one per parked fiber); past that a further `*Async` call raises `OutOfMemory`. Descriptor numbers are unrestricted — the pump uses `select()` while every descriptor fits its table and switches to `poll()` automatically when one does not, so a process holding thousands of files can still do async I/O.
+
+For concurrency each call has an `*Async` twin (`ConnectAsync`, `WriteAsync`, `ReadLineAsync`, `ReadNAsync`, `ReadAllAsync`) that offloads the blocking work to the I/O thread pool and suspends only the calling fiber - other fibers keep running. The pool queues up to 256 jobs; beyond that a submission runs inline on the VM thread, which still produces the right answer but stalls the scheduler for the duration. `--stats` reports how often that happened, and `--io-threads=<n>` raises the worker count. `await` the result. Only one async op may be in flight per handle, and a handle must not be `Close`d or reused until its async op resolves.
 
 **Certificate pinning** (trust-on-first-use): after `Connect`, compare the peer fingerprint against a known value and drop the connection on mismatch.
 
@@ -3608,13 +3683,13 @@ Virtual machine introspection and control.
 | **Compile** | `Compile(src:string, arity?:int) - function\|nil` | Compile a STATEMENT body into a callable function. `src` becomes the body of a function taking `arity` parameters named `arg0..argN` (use `return` for the result). Max 10 KB; returns `nil` on compile failure. | — |
 | **CompactMemory** | `CompactMemory()` | Run memory compaction pass. | — |
 | **CurrentAllocations** | `CurrentAllocations() - int` | Current live allocation count. | — |
-| **Eval** | `Eval(src:string, ...args) - any` | Compile and immediately evaluate `src`. Tried first as an EXPRESSION (`Eval("40 + 2")` → `42`); if that fails to compile it is retried as a statement body, where an explicit `return` provides the result (`nil` otherwise). Extra call arguments are bound to `arg0..argN`: `Eval("arg0 * arg1", 6, 7)` → `42`. Max 10 KB; returns `nil` on compile failure (the process is never terminated by a bad `src`). | — |
+| **Eval** | `Eval(src:string, ...args) - any` | Compile and immediately evaluate `src`. Tried first as an EXPRESSION (`Eval("40 + 2")` → `42`); if that fails to compile it is retried as a statement body, where an explicit `return` provides the result (`nil` otherwise). Extra call arguments are bound to `arg0..argN`: `Eval("arg0 * arg1", 6, 7)` → `42`. Max 10 KB; returns `nil` on compile failure (the process is never terminated by a bad `src`). Each `Eval` compiles as its own unit: it cannot reference host globals by name, but a `global` declaration in it can rebind an existing host global (warns on stderr). Eval'd code runs with full VM authority - never pass it untrusted input. | — |
 | **Exit** | `Exit(code:int) - nil` | Terminate VM with exit code. | — |
 | **GetFunctionInfo** | `GetFunctionInfo(fn:callable) - object` | Return an object describing a function. Accepts `function`, `builtin`, `ffi`, and bound methods. See field table below. | — |
 | **GetModuleInfo** | `GetModuleInfo(name:string) - object\|nil` | Return an object describing a built-in module. `Members` array contains `{Name, Signature}` per function; `Constants` array contains `{Name, Type, Value}` per constant. Returns `nil` if the module name is not found. | — |
 | **GetStartTimeMs** | `GetStartTimeMs() - int` | VM start time in milliseconds since epoch. | — |
 | **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the VM halts regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
-| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative malloc bytes), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
+| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
 | **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a non-function handler returns `false`. | — |
 | **PatchFunction** | `PatchFunction(original:fn, replacement:fn) - bool` | Replace function at runtime. Requires running unsafe-mode `--unsafe`. The replacement may be a Flaris-function, a builtin-function or a FFI-function. Pass `nil` as replacement to remove the patch. Caveats: call sites the compiler inlined (trivial single-`return` functions) and calls made from inside JIT-compiled functions bypass the patch; self-recursive calls inside the original body also keep calling the original. | — |
 | **PeakAllocations** | `PeakAllocations() - int` | Peak allocation count since VM start. | — |
@@ -5009,8 +5084,11 @@ actually accepts:
 | `~` | `int` |
 | `+` | **anything** - see below |
 
-`+` is never a type error. When no numeric, array or object rule applies it
-falls back to string concatenation, so any operand pair produces a value.
+`+` is never a type error: it is overloaded by operand type (numeric add, char
+and container concatenation/merge), and when no numeric, array or object rule
+applies it falls back to string concatenation, so any operand pair produces a
+value (`nil + 5` is `"null5"`). The full per-type rules are listed under
+[R5 - Operator Precedence](#r5---operator-precedence).
 
 A diagnostic is only reported when an operand's type is fully known and shares
 nothing with the operator's domain. Dynamic values - unannotated parameters,

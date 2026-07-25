@@ -128,7 +128,12 @@ fn test_pixels() {
     checkEq(g.GetPixel(5, 7), RED,   "Pixel writes single pixel");
     checkEq(g.GetPixel(6, 7), WHITE, "neighbour untouched");
 
+    // Pixel() alpha-blends (source-over); it does not raw-write.
+    g.Pixel(9, 9, 0x80000000);
+    checkEq(g.GetPixel(9, 9), 0xFF7F7F7F, "Pixel blends semi-transparent writes");
+
     check(g.GetPixel(-1, 0)  == nil, "GetPixel(-1,0) out of bounds -> nil");
+    check(g.GetPixel(0, -1)  == nil, "GetPixel(0,-1) out of bounds -> nil");
     check(g.GetPixel(64, 0)  == nil, "GetPixel(w,0) out of bounds -> nil");
     check(g.GetPixel(0, 48)  == nil, "GetPixel(0,h) out of bounds -> nil");
 }
@@ -174,6 +179,16 @@ fn test_lines() {
     checkEq(g.GetPixel(12, 55), WHITE, "Polyline horizontal segment");
     checkEq(g.GetPixel(20, 58), WHITE, "Polyline vertical segment");
     checkEq(g.GetPixel(5, 60),  BLACK, "Polyline is open (no closing edge)");
+
+    // Thickness widens an HLine into a band starting at y.
+    let gt = new Graphics(32, 32);
+    gt.Clear(BLACK);
+    gt.SetStroke(RED);
+    gt.SetThickness(4);
+    gt.HLine(4, 10, 27);
+    checkEq(gt.GetPixel(15, 10), RED,   "thick HLine first row");
+    checkEq(gt.GetPixel(15, 13), RED,   "thick HLine last row");
+    checkEq(gt.GetPixel(15, 14), BLACK, "thick HLine band ends after 4 rows");
 }
 
 // ============================================================
@@ -331,6 +346,15 @@ fn test_arcs_polys() {
     g3.Pie(32, 24, 10, 0, 90);
     checkEq(g3.GetPixel(37, 24), GREEN, "Pie radial edge stroked");
 
+    // ArcButt: same path as Arc with butt caps - endpoints still stroked.
+    let g6 = new Graphics(64, 64);
+    g6.Clear(BLACK);
+    g6.SetStroke(WHITE);
+    g6.ArcButt(32, 24, 10, 0, 90);
+    checkEq(g6.GetPixel(42, 24), WHITE, "ArcButt start point (0 deg)");
+    checkEq(g6.GetPixel(32, 34), WHITE, "ArcButt end point (90 deg)");
+    checkEq(g6.GetPixel(22, 24), BLACK, "ArcButt opposite side untouched");
+
     // Polygon outline: point on the top edge.
     let g4 = new Graphics(64, 64);
     g4.Clear(BLACK);
@@ -454,6 +478,17 @@ fn test_compositing() {
     g3.Clear(BLACK);
     g3.BlendRect(src, 4, 4, 0);
     checkEq(g3.GetPixel(4, 4), BLACK, "BlendRect alpha=0 is invisible");
+
+    // BlendRect alpha=128: white over black lands exactly on mid gray
+    // ((255*128+127)/255 = 128 for the modulated alpha and each channel).
+    let g4 = new Graphics(32, 32);
+    g4.Clear(BLACK);
+    let wsrc = new Graphics(8, 8);
+    wsrc.Clear(WHITE);
+    g4.BlendRect(wsrc, 4, 4, 128);
+    checkEq(g4.GetPixel(4, 4),   0xFF808080, "BlendRect alpha=128 mid gray");
+    checkEq(g4.GetPixel(11, 11), 0xFF808080, "BlendRect alpha=128 covers src rect");
+    checkEq(g4.GetPixel(12, 12), BLACK,      "BlendRect outside src untouched");
 }
 
 // ============================================================
@@ -532,6 +567,21 @@ fn test_transforms() {
     checkEq(g.Width(),  16, "Rescale halves width");
     checkEq(g.Height(), 16, "Rescale halves height");
     checkEq(g.GetPixel(0, 0), RED, "Rescale keeps solid color");
+
+    // Non-uniform scale and downscale.
+    let g2 = new Graphics(16, 8);
+    g2.Clear(GREEN);
+    g2.Rescale(2.0, 0.5);
+    checkEq(g2.Width(),  32, "Rescale sx=2 width");
+    checkEq(g2.Height(), 4,  "Rescale sy=0.5 height");
+    checkEq(g2.GetPixel(31, 3), GREEN, "non-uniform Rescale keeps color");
+
+    let g3 = new Graphics(16, 16);
+    g3.Clear(BLUE);
+    g3.Resize(4, 4);
+    checkEq(g3.Width(),  4, "Resize downscale width");
+    checkEq(g3.Height(), 4, "Resize downscale height");
+    checkEq(g3.GetPixel(3, 3), BLUE, "Resize downscale keeps color");
 }
 
 // ============================================================
@@ -547,6 +597,9 @@ fn test_png_roundtrip() {
     g.Clear(BLUE);
     g.Pixel(3, 4, RED);
     g.Pixel(19, 11, GREEN);
+    // Semi-transparent probe: Pixel() alpha-blends, so raw-store via Filter -
+    // the codec must round-trip a stored alpha < 255 exactly.
+    g.Filter(fn(_p) { return 0x80112233; }, 7, 2, 1, 1);
 
     check(g.Save(path) == true, "Save returns true");
     check(File.Exists(path),    "PNG file exists on disk");
@@ -559,6 +612,15 @@ fn test_png_roundtrip() {
         checkEq(loaded.GetPixel(0, 0),   BLUE,  "loaded background pixel");
         checkEq(loaded.GetPixel(3, 4),   RED,   "loaded marker pixel");
         checkEq(loaded.GetPixel(19, 11), GREEN, "loaded corner pixel");
+        checkEq(loaded.GetPixel(7, 2),   0x80112233, "loaded semi-transparent pixel");
+
+        let bad = 0;
+        iter (y from 0 to 11) {
+            iter (x from 0 to 19) {
+                if (loaded.GetPixel(x, y) != g.GetPixel(x, y)) bad += 1;
+            }
+        }
+        checkEq(bad, 0, "every pixel identical after reload");
     }
 
     let img = Graphics.LoadImage(path);
@@ -567,12 +629,7 @@ fn test_png_roundtrip() {
         checkEq(img.GetPixel(3, 4), RED, "LoadImage pixel matches");
     }
 
-    File.Delete(path);
-    check(!File.Exists(path), "temp PNG deleted");
-
-    check(Graphics.FromFile(path) == nil, "FromFile on missing file -> nil");
-
-    // In-memory PNG: block starts with the PNG signature.
+    // In-memory PNG: signature + IHDR dims, same bytes as Save, and decodable.
     let blk = g.ToBlock();
     check(blk != nil,    "ToBlock returns a block");
     check(len(blk) > 8,  "ToBlock has content");
@@ -580,6 +637,144 @@ fn test_png_roundtrip() {
     checkEq(blk[1] & 0xFF, 0x50, "PNG signature byte 1 ('P')");
     checkEq(blk[2] & 0xFF, 0x4E, "PNG signature byte 2 ('N')");
     checkEq(blk[3] & 0xFF, 0x47, "PNG signature byte 3 ('G')");
+    checkEq(((blk[18] & 0xFF) << 8) | (blk[19] & 0xFF), 20, "IHDR width");
+    checkEq(((blk[22] & 0xFF) << 8) | (blk[23] & 0xFF), 12, "IHDR height");
+    checkEq(len(blk), File.Size(path), "ToBlock length equals saved file");
+
+    let blkPath = path + ".blk.png";
+    File.WriteAllBytes(blkPath, blk);
+    let fromBlk = Graphics.FromFile(blkPath);
+    check(fromBlk != nil, "ToBlock bytes decode as a PNG");
+    if (fromBlk != nil) {
+        checkEq(fromBlk.Width(),  20, "decoded block width");
+        checkEq(fromBlk.Height(), 12, "decoded block height");
+        let bad2 = 0;
+        iter (y from 0 to 11) {
+            iter (x from 0 to 19) {
+                if (fromBlk.GetPixel(x, y) != g.GetPixel(x, y)) bad2 += 1;
+            }
+        }
+        checkEq(bad2, 0, "decoded block pixels identical to canvas");
+    }
+    File.Delete(blkPath);
+
+    // Failure path: Save into a missing directory reports nil, no raise.
+    check(g.Save(Path.Combine(path + "_nodir", "x.png")) == nil, "Save to bad path -> nil");
+
+    File.Delete(path);
+    check(!File.Exists(path), "temp PNG deleted");
+    check(Graphics.FromFile(path) == nil, "FromFile on missing file -> nil");
+}
+
+// ============================================================
+// DrawImage (file-based blit with scaling)
+// ============================================================
+
+fn test_draw_image() {
+    Console.WriteLine("-- DrawImage");
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_gfx_img_" + str(Time.Millis()) + ".png");
+    let src = new Graphics(8, 8);
+    src.Clear(BLUE);
+    src.Pixel(0, 0, RED);
+    check(src.Save(path) == true, "DrawImage source PNG saved");
+
+    // Nearest, 2x: dest-relative (0,0)-(1,1) sample source (0,0).
+    let g = new Graphics(32, 32);
+    g.Clear(BLACK);
+    g.DrawImageNearest(path, 4, 4, 16, 16);
+    checkEq(g.GetPixel(4, 4),   RED,   "DrawImageNearest marker top-left");
+    checkEq(g.GetPixel(5, 5),   RED,   "DrawImageNearest marker covers 2x2");
+    checkEq(g.GetPixel(12, 12), BLUE,  "DrawImageNearest solid interior");
+    checkEq(g.GetPixel(19, 19), BLUE,  "DrawImageNearest bottom-right inside");
+    checkEq(g.GetPixel(3, 3),   BLACK, "DrawImageNearest above dest untouched");
+    checkEq(g.GetPixel(20, 20), BLACK, "DrawImageNearest past dest untouched");
+
+    // Bilinear: interior far from the marker is still the exact solid color.
+    let g2 = new Graphics(32, 32);
+    g2.Clear(BLACK);
+    g2.DrawImage(path, 4, 4, 16, 16);
+    checkEq(g2.GetPixel(12, 12), BLUE, "DrawImage bilinear solid interior");
+    check(g2.GetPixel(4, 4) != BLACK,  "DrawImage paints dest origin");
+    checkEq(g2.GetPixel(3, 3), BLACK,  "DrawImage above dest untouched");
+
+    File.Delete(path);
+}
+
+// ============================================================
+// Async filter offload (FilterCallback / FilterEvent)
+// ============================================================
+
+// Region kernel: force RGB to white over [x,x+w) x [y,y+h) of a stride-wide
+// ARGB block; returns the pixel count. Leaf + non-allocating, so it is
+// JIT-threadsafe and runs on an io_pool worker under -j (inline otherwise).
+fn gfxWhiteKernel(px: block, x: int, y: int, w: int, h: int, stride: int): int {
+    var count = 0;
+    var dy = 0;
+    while (dy < h) {
+        var dx = 0;
+        while (dx < w) {
+            var i = (y + dy) * stride + (x + dx);
+            px[i] = px[i] | 0x00FFFFFF;
+            count += 1;
+            dx += 1;
+        }
+        dy += 1;
+    }
+    return count;
+}
+
+global filterDone   = 0;
+global filterResult = -1;
+
+fn gfxFilterCb(_surface, r: int) {
+    filterResult = r;
+    filterDone += 1;
+}
+
+fn test_filter_offload() {
+    Console.WriteLine("-- async filter offload");
+
+    // FilterCallback on a sub-region.
+    let g = new Graphics(8, 8);
+    g.Clear(BLACK);
+    filterDone = 0;
+    filterResult = -1;
+    g.FilterCallback(gfxWhiteKernel, 2, 2, 4, 4, gfxFilterCb);
+    while (filterDone < 1) { Fiber.Sleep(1); }
+    checkEq(filterResult, 16, "FilterCallback 4x4 region = 16 pixels");
+    checkEq(g.GetPixel(3, 3), WHITE, "FilterCallback in-region pixel filtered");
+    checkEq(g.GetPixel(0, 0), BLACK, "FilterCallback out-of-region untouched");
+
+    // FilterCallbackAll covers the whole canvas.
+    let g2 = new Graphics(8, 8);
+    g2.Clear(BLACK);
+    filterDone = 0;
+    filterResult = -1;
+    g2.FilterCallbackAll(gfxWhiteKernel, gfxFilterCb);
+    while (filterDone < 1) { Fiber.Sleep(1); }
+    checkEq(filterResult, 64, "FilterCallbackAll = 64 pixels");
+    checkEq(g2.GetPixel(0, 0), WHITE, "FilterCallbackAll corner filtered");
+    checkEq(g2.GetPixel(7, 7), WHITE, "FilterCallbackAll far corner filtered");
+
+    // FilterEvent delivers the result into an event.
+    let g3 = new Graphics(8, 8);
+    g3.Clear(BLACK);
+    let id = Event.Create();
+    g3.FilterEvent(gfxWhiteKernel, 0, 0, 4, 8, id);
+    let r = Event.WaitFor([id]);
+    checkEq(r[0], 32, "FilterEvent left half = 32 pixels");
+    checkEq(g3.GetPixel(0, 0), WHITE, "FilterEvent left half filtered");
+    checkEq(g3.GetPixel(7, 0), BLACK, "FilterEvent right half untouched");
+
+    // FilterEventAll full canvas.
+    let g4 = new Graphics(8, 8);
+    g4.Clear(BLACK);
+    let id2 = Event.Create();
+    g4.FilterEventAll(gfxWhiteKernel, id2);
+    let r2 = Event.WaitFor([id2]);
+    checkEq(r2[0], 64, "FilterEventAll = 64 pixels");
+    checkEq(g4.GetPixel(7, 7), WHITE, "FilterEventAll filtered");
 }
 
 // ============================================================
@@ -648,6 +843,8 @@ fn Main() {
     test_filters();
     test_transforms();
     test_png_roundtrip();
+    test_draw_image();
+    test_filter_offload();
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

@@ -1,7 +1,7 @@
 # Flaris Language Guide
 
-Version: 1.0.0.7
-Spec Revision: 2026-06-29
+Version: 1.0.0.9
+Spec Revision: 2026-07-25
 
 > **About this document**  
 > This is the *Guide* - meant to be read top-to-bottom. It teaches you how to write Flaris programs.  

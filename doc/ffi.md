@@ -1,5 +1,8 @@
 # Flaris FFI - Foreign Function Interface
 
+Version: 1.0.0.9
+Spec Revision: 2026-07-25
+
 > **About this document**  
 > This is the complete reference for writing, compiling, and calling native C plugins from Flaris.  
 > Prerequisites: basic C, ability to compile shared libraries.
