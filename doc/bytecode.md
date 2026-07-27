@@ -22,7 +22,7 @@ The specification covers:
 
 - the `.flx` binary container: header, signature, string pool, chunks, bundles
 - the serialization of constants, functions and classes
-- the instruction encoding and the semantics of all 173 opcodes
+- the instruction encoding and the semantics of all 174 opcodes
 - the abstract machine: value system, operand stack, call frames, fibers,
   exception handling
 - the validation rules a conforming loader must apply before execution
@@ -55,7 +55,8 @@ first within the 32-bit value (e.g. `0x01000008` = 1.0.0.8).
 renumbers every following opcode, and `MIN_SUPPORTED_BYTECODE_VERSION` is bumped
 in the same change. New opcodes **appended before `OP_LAST`** keep all prior
 numbers stable and only bump `SYS_VERSION` (older VMs reject the newer files via
-the version ceiling; 1.0.0.9 appended `OP_CONCAT_N` this way). A loader MUST
+the version ceiling; 1.0.0.9 appended `OP_CONCAT_N` and `OP_NIL_LOCAL` this
+way). A loader MUST
 reject a chunk whose version is below the floor or above its own `SYS_VERSION`.
 
 ---
@@ -106,7 +107,7 @@ after `FIBER_QUANTUM` = 10000 checkpoints, or immediately at explicit
 involved; bytecode never observes preemption in the middle of an instruction.
 
 Implementation note (dispatch): the reference VM uses computed-goto dispatch
-over an `OP_LAST`-sized table (173 entries), caches
+over an `OP_LAST`-sized table (174 entries), caches
 `frame`/`constants`/`locals`/`code`/`ip` in locals, and re-derives them after
 any operation that can change the frame. The
 frame's stored `ip` is only guaranteed current at frame switches, raises and
@@ -660,7 +661,7 @@ over code; a decoder MUST treat a truncated instruction (operands running past
 | Len | Instructions |
 | --- | --- |
 | 1 | all operand-less opcodes: `NOP`, `NIL`, `TRUE`, `FALSE`, `ONE`, `NEG_ONE`, `POP`, `DUP`, unary/binary arithmetic and comparisons (`NEGATE` … `CMP_IS`), `NULL_COALESCING`, `GET_LOCAL0-3`, `SET_LOCAL0-3`, `GET_INDEX`, `SET_INDEX`, `MAKE_CONST`, `RETURN`, `RETURN_NONE`, `RETURN_NIL`, `YIELD`, `AWAIT`, `BIND_THIS`, `TRY_END`, `CATCH_BEGIN`, `CATCH_END`, `FINALLY_BEGIN`, `FINALLY_END`, `THROW`, `LEN`, `TYPE`, `IS_ARRAY`, `IS_OBJECT`, `HAS_KEY`, `TO_*` (all ten), `SUPER`, `GUARD`, `CONCAT` |
-| 2 | `IMM8`, `GET_LOCAL`, `SET_LOCAL`, `INC_LOCAL`, `DEC_LOCAL`, `GET_ARR_LI`, `GET_INDEX_LOCAL`, `SET_INDEX_LOCAL`, `RETURN_L`, `CALL`, `CALL_TYPED`, `CALL_SELF`, `TAIL_SELF`, `TAIL_CALL`, `NEW`, `CONCAT_N` |
+| 2 | `IMM8`, `GET_LOCAL`, `SET_LOCAL`, `INC_LOCAL`, `DEC_LOCAL`, `NIL_LOCAL`, `GET_ARR_LI`, `GET_INDEX_LOCAL`, `SET_INDEX_LOCAL`, `RETURN_L`, `CALL`, `CALL_TYPED`, `CALL_SELF`, `TAIL_SELF`, `TAIL_CALL`, `NEW`, `CONCAT_N` |
 | 3 | `IMM16`, `CONSTANT`, `DEFINE_GLOBAL`, `GET_GLOBAL`, `SET_GLOBAL`, `FN`, `GET_PROPERTY`, `SET_PROPERTY`, `GET_THIS_PROP`, `SET_THIS_PROP`, `GET_THIS_SLOT`, `SET_THIS_SLOT`, `GET_THIS_CONST`, `JUMP`, `JUMP_IF_FALSE`, `JUMP_IF_TRUE`, `LOOP`, `ARITH_IMM8`, `ARITH_L`, `GET_ARR_LC`, `GET_ARR_LL`, `SET_ARR_LC`, `SET_ARR_LL`, `GET_BLK_LC`, `GET_BLK_LL`, `SET_BLK_LC`, `SET_BLK_LL`, `BUILD_OBJECT`, `PUSH_BUILTIN`, `CALL0_BUILTIN` … `CALL5_BUILTIN`, `DBG_LINE`, `DBG_FUNC_NAME`, `DBG_FILE_NAME`, `DBG_BREAK` |
 | 4 | `INVOKE`, `THIS_INVOKE`, `THIS_INVOKE_SLOT`, `SUPER_INVOKE`, `CALL_GLOBAL`, `GET_THIS_ARR_L`, `GET_THIS_ARR_SLOT_L`, `GET_LOCAL_PROP`, `ARITH_LC`, `ARITH_LL`, `SET_ARR_LLC`, `SET_ARR_LLL`, `LOCAL_ARR_LC`, `LOCAL_ARR_LL`, `SET_OBJ_L`, `SET_BLK_LLC`, `SET_BLK_LLL`, `LOCAL_BLK_LC`, `LOCAL_BLK_LL` |
 | 5 | `IMM32`, `IMM_F32`, `IMM_CHAR` (u32 codepoint), `ARITH_ELC`, `ARITH_ELL`, `SET_OBJ_LL`, `THIS_ARITH_L`, `THIS_ARITH_C`, `THIS_ARITH_SLOT_L`, `THIS_ARITH_SLOT_C`, `BUILD_ARRAY` (count:u16 + elemType:u16), `ITER_BEGIN`, `ITER_NEXT`, `TRY_LEAVE`, `ARITH_FMA_LLL` |
@@ -866,6 +867,15 @@ live-local count extends the count. Traps: —
 **`OP_INC_LOCAL` / `OP_DEC_LOCAL`** `<slot:u8>` — 2 bytes. Stack `→`.
 `local[slot] ± 1` in place. Heap-boxed ints and floats mutate their payload
 without allocating; small ints re-tag. Traps: `InvalidArgs` on non-numeric.
+
+**`OP_NIL_LOCAL`** `<slot:u8>` — 2 bytes. Stack `→`. Releases `local[slot]`
+and clears it; a slot already empty is left alone. Emitted at a loop back-edge
+for locals the body declared, so iteration N does not construct its value while
+iteration N-1 is still referenced from the slot — `OP_SET_LOCAL` releases the
+outgoing value only once the incoming one exists, which otherwise keeps two
+generations of a per-iteration structure live at the same time. Clearing is not
+observable: reading a body local before its declaration yields nil regardless.
+Traps: —
 
 ### 7.6 Local compound arithmetic
 
@@ -1500,7 +1510,7 @@ Per-instruction depth deltas (net effect; branch seeds in parentheses):
 | Delta | Instructions |
 | --- | --- |
 | +1 | `NIL` `TRUE` `FALSE` `ONE` `NEG_ONE` `DUP` `SUPER` `CONSTANT` `IMM8/16/32` `IMM_F32` `IMM_CHAR` `GET_LOCAL` `GET_LOCAL0-3` `GET_GLOBAL` `GET_THIS_PROP` `GET_THIS_SLOT` `GET_THIS_CONST` `GET_THIS_ARR_L` `GET_THIS_ARR_SLOT_L` `FN` `FN_CAPTURE` `GET_ARR_LC/LL` `GET_LOCAL_PROP` `GET_BLK_LC/LL` `PUSH_BUILTIN` `CALL0_BUILTIN` |
-| 0 | unary ops, `TO_*` converters, `GET_PROPERTY` `GET_ARR_LI` `GET_INDEX_LOCAL` `ARITH_IMM8/LC/LL/ELC/ELL` `INC/DEC_LOCAL` `SET_ARR_LLC/LLL` `SET_OBJ_LL` `THIS_ARITH_*` `LOCAL_ARR_*` `SET_BLK_LLC/LLL` `LOCAL_BLK_*` `DBG_*` `EXPORT` `CALL1_BUILTIN` `ARITH_FMA_LLL` `CATCH_END` `FINALLY_BEGIN/END` `TRY_END` `MAKE_CONST` `GUARD` `BIND_THIS` `YIELD` `AWAIT` `NOP` |
+| 0 | unary ops, `TO_*` converters, `GET_PROPERTY` `GET_ARR_LI` `GET_INDEX_LOCAL` `ARITH_IMM8/LC/LL/ELC/ELL` `INC/DEC_LOCAL` `NIL_LOCAL` `SET_ARR_LLC/LLL` `SET_OBJ_LL` `THIS_ARITH_*` `LOCAL_ARR_*` `SET_BLK_LLC/LLL` `LOCAL_BLK_*` `DBG_*` `EXPORT` `CALL1_BUILTIN` `ARITH_FMA_LLL` `CATCH_END` `FINALLY_BEGIN/END` `TRY_END` `MAKE_CONST` `GUARD` `BIND_THIS` `YIELD` `AWAIT` `NOP` |
 | −1 | `POP`, binary arithmetic and comparisons, `NULL_COALESCING` `HAS_KEY` `GET_INDEX` `CONCAT` `SET_LOCAL` `SET_LOCAL0-3` `SET_GLOBAL` `DEFINE_GLOBAL` `SET_ARR_LC/LL` `SET_OBJ_L` `SET_THIS_PROP` `SET_THIS_SLOT` `SET_BLK_LC/LL` `CALL2_BUILTIN` `ARITH_L` `CATCH_BEGIN` |
 | −2 | `SET_PROPERTY` `SET_INDEX_LOCAL` `CALL3_BUILTIN` |
 | −3 | `SET_INDEX` `CALL4_BUILTIN` |
@@ -1522,8 +1532,8 @@ terminates; `TRY_LEAVE` seeds its target at `d` and terminates;
 
 ## Appendix A. Opcode map
 
-Dense numbering for bytecode version 1.0.0.9. `OP_LAST` = 173 (not a real
-instruction). Any opcode ≥ 173 MUST be rejected.
+Dense numbering for bytecode version 1.0.0.9. `OP_LAST` = 174 (not a real
+instruction). Any opcode ≥ 174 MUST be rejected.
 
 | # | Hex | Mnemonic | # | Hex | Mnemonic |
 | --- | --- | --- | --- | --- | --- |
@@ -1614,6 +1624,7 @@ instruction). Any opcode ≥ 173 MUST be rejected.
 | 84 | 0x54 | `OP_THIS_ARITH_L` | 170 | 0xAA | `OP_SUPER_INVOKE` |
 | 85 | 0x55 | `OP_THIS_ARITH_C` | 171 | 0xAB | `OP_CALL_GLOBAL` |
 | — | — | — | 172 | 0xAC | `OP_CONCAT_N` |
+| — | — | — | 173 | 0xAD | `OP_NIL_LOCAL` |
 
 ## Appendix B. Machine limits and named constants
 

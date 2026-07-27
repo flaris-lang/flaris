@@ -167,9 +167,13 @@ flarisvm --embed app.flx myapp
 ```
 
 `--embed <input> <output>` accepts the same `--bundle`, `--sign`, `--no-opt`, and `--strip`
-options as `--compile`, and needs the `flaris` runtime stub next to `flarisvm` or on
-`PATH` (the official installer places both). The stub has no compiler and no
-`eval`, so a bundled binary ships only the bytecode you built. Runs on Linux,
+options as `--compile`. Runtime behavior is also decided here: pass `--jit`,
+`--unsafe`, or VM limits (`--stack=`, `--frames=`, ...) alongside `--embed` and
+they are baked into the binary and applied on every start - a standalone binary
+hands all its CLI arguments to the script, so embedding is the only place to set
+them (nothing is enabled by default). It needs the `flaris` runtime stub next to
+`flarisvm` or on `PATH` (the official installer places both). The stub has no
+compiler and no `eval`, so a bundled binary ships only the bytecode you built. Runs on Linux,
 macOS (including Apple Silicon), and Windows - the payload rides in trailing space
 every executable format tolerates; see **Reference R1** for platform and signing
 notes.

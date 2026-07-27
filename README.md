@@ -1,6 +1,6 @@
 # Flaris standard libraries
 
-The standard libraries, examples and documentation for
+The standard libraries, examples, documentation and benchmarks for
 **[Flaris](https://www.flaris-lang.org)** — a lightweight, fiber-based scripting
 language that compiles to portable bytecode and runs on an embeddable C11 VM.
 
@@ -111,6 +111,39 @@ gcc -shared -fPIC -I ffi -o sqlite_ffi.so ffi/sqlite_ffi.c -lsqlite3
 `ffi/ffi_object.h` is the only header a plugin needs to include - see the
 [FFI guide](doc/ffi.md) for the marshalling rules and for writing your own.
 
+## Performance
+
+`bench/` holds a reproducible cross-language benchmark suite. Run `./run_bench.sh`
+there; every language other than Flaris itself is optional and simply omitted if
+it is not installed.
+
+On integer kernels (fib, sieve, collatz) Flaris lands in two different tiers
+depending on whether the JIT is on — averaged against C on an Apple M2,
+VM 1.0.0.9:
+
+| Runtime | avg ×C |
+| ------- | -----: |
+| C (clang -O2) | 1.0x |
+| Go | 1.4x |
+| Nim | 2.1x |
+| **Flaris `--jit`** | **2.7x** |
+| LuaJIT 2.1 | 5.4x |
+| **Flaris** (bytecode VM) | **24.2x** |
+| Lua 5.4 | 26.5x |
+| Python 3 | 43.7x |
+| QuickJS | 65.7x |
+
+On workloads that spend their time in the C builtins the picture shifts up a
+tier: parsing an 18 MB JSON document, Flaris is 1.3× behind Node/V8 and ahead of
+CPython, Go and Nim. Regex is the weak spot, roughly on par with CPython and 6×
+behind V8. Peak memory is measured too: best in the field on buffers and
+strings, and mid-field on large object graphs — 208 MB parsing that JSON
+document, against Node's 231 MB and Go's 100 MB.
+
+Full numbers, methodology and the caveats that matter are in
+[bench/README.md](bench/README.md), with dated snapshots in
+[bench/results/](bench/results/).
+
 ## Documentation
 
 - [Language guide](doc/guide.md) — tutorial: syntax, types, classes, fibers,
@@ -122,7 +155,8 @@ gcc -shared -fPIC -I ffi -o sqlite_ffi.so ffi/sqlite_ffi.c -lsqlite3
 ## Contributing
 
 Bug reports and library contributions are welcome. Good first contributions are
-new libraries, or tests and documentation for existing ones.
+new libraries, tests and documentation for existing ones, or a benchmark result
+from hardware we do not have.
 
 Note that `doc/` is **published from the upstream repository**, not authored
 here - it is overwritten on each release, so documentation fixes are best raised

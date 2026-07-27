@@ -295,11 +295,12 @@ flarisvm --embed app.flx myapp
 
 **How it works.** The full `flarisvm` compiles the input (or reads the `.flx`
 directly), then appends the bytecode to the compiler-free `flaris` runtime,
-followed by a fixed 24-byte trailer recording the payload's offset and length. On
-startup any Flaris binary reads that trailer out of its own image; if a payload is
-present it runs the embedded program and passes all CLI arguments to the script,
-otherwise it behaves as the normal VM. The payload rides *after* the executable
-image, so the OS loader ignores it and a plain file copy still works.
+followed by a 32-byte settings block and a fixed 24-byte trailer recording the
+payload's offset and length. On startup any Flaris binary reads that trailer out
+of its own image; if a payload is present it applies the recorded settings, runs
+the embedded program, and passes all CLI arguments to the script, otherwise it
+behaves as the normal VM. The payload rides *after* the executable image, so the
+OS loader ignores it and a plain file copy still works.
 
 **Details:**
 
@@ -307,6 +308,17 @@ image, so the OS loader ignores it and a plain file copy still works.
   is compiled first, a `.flx` is embedded as-is.
 - The same compile-time options as `--compile` apply to a `.fls` input: `--bundle`,
   `--sign`, `--no-opt`, `--strip`.
+- **Runtime settings are chosen at embed time.** A self-contained binary hands
+  every CLI argument to the script, so flags meant for the VM are recorded in the
+  settings block instead: give `--jit`, `--unsafe`, or any VM limit (`--stack=`,
+  `--slabs=`, `--fibers=`, `--frames=`, `--fifo=`, `--io-threads=`) alongside
+  `--embed` and the binary applies them on every start. Nothing is on by
+  default - an embedded program gets JIT or unsafe/FFI mode only if you opted in
+  when building it. Limits are validated at startup against the same ranges as
+  the CLI flags; a tampered or out-of-range value refuses to run rather than
+  clamping. Settings live in the binary, not the bytecode: `--compile` never
+  records them, and the `.flx` payload stays byte-identical whatever settings
+  you choose.
 - **Requires the `flaris` runtime stub.** It is resolved next to `flarisvm` first,
   then on `PATH` (the official installer places both). Only the full `flarisvm`
   can build embeds; `flaris` itself has no compiler and no `--embed`.
