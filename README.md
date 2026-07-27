@@ -125,20 +125,20 @@ VM 1.0.0.9:
 | ------- | -----: |
 | C (clang -O2) | 1.0x |
 | Go | 1.4x |
-| Nim | 2.1x |
-| **Flaris `--jit`** | **2.7x** |
-| LuaJIT 2.1 | 5.4x |
-| **Flaris** (bytecode VM) | **24.2x** |
-| Lua 5.4 | 26.5x |
-| Python 3 | 43.7x |
-| QuickJS | 65.7x |
+| Nim | 2.0x |
+| **Flaris `--jit`** | **2.6x** |
+| LuaJIT 2.1 | 4.8x |
+| **Flaris** (bytecode VM) | **23.5x** |
+| Lua 5.4 | 24.5x |
+| Python 3 | 43.5x |
+| QuickJS | 60.4x |
 
 On workloads that spend their time in the C builtins the picture shifts up a
 tier: parsing an 18 MB JSON document, Flaris is 1.3× behind Node/V8 and ahead of
-CPython, Go and Nim. Regex is the weak spot, roughly on par with CPython and 6×
-behind V8. Peak memory is measured too: best in the field on buffers and
-strings, and mid-field on large object graphs — 208 MB parsing that JSON
-document, against Node's 231 MB and Go's 100 MB.
+CPython, Go and Nim; scanning 9.8 MB for dates with a regex it is second only to
+V8, ahead of Nim and CPython. Peak memory is measured too: best in the field on
+buffers and strings, and mid-field on large object graphs — 208 MB parsing that
+JSON document, against Node's 231 MB and Go's 100 MB.
 
 Full numbers, methodology and the caveats that matter are in
 [bench/README.md](bench/README.md), with dated snapshots in

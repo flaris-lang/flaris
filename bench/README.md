@@ -122,10 +122,10 @@ Numbers below are from
 figures move.
 
 **On integer kernels there are two very different answers.** With the JIT
-enabled Flaris averages 2.7× C across the three kernels, which puts it between
-Nim (2.1×) and LuaJIT (5.4×) - the native-compiled tier. The plain bytecode VM
-averages 24.2× C, which is the Lua 5.4 tier (26.5×), ahead of CPython (43.7×)
-and QuickJS (65.7×). The honest summary is that Flaris's interpreter is a
+enabled Flaris averages 2.6× C across the three kernels, which puts it between
+Nim (2.0×) and LuaJIT (4.8×) - the native-compiled tier. The plain bytecode VM
+averages 23.5× C, which is the Lua 5.4 tier (24.5×), ahead of CPython (43.5×)
+and QuickJS (60.4×). The honest summary is that Flaris's interpreter is a
 competent bytecode VM and its JIT is genuinely competitive with compiled
 languages, and you should know which one you are running.
 
@@ -134,11 +134,12 @@ run, and C's own numbers move a few percent between runs, which moves every
 ratio with them. The absolute millisecond columns are the stable figures.
 
 **On builtin-heavy work Flaris moves up a tier**, because that work happens in
-C rather than in the dispatch loop. Parsing 18 MB of JSON it is 1.4× behind
+C rather than in the dispatch loop. Parsing 18 MB of JSON it is 1.3× behind
 Node/V8 and ahead of Go's `encoding/json`, CPython and Nim's `std/json`. The
 naive `s += piece` loop runs linearly rather than quadratically, so it lands
-with the managed-runtime builders instead of blowing up. Regex is the weak
-spot: on par with CPython, and 6× behind V8's JIT-compiled patterns.
+with the managed-runtime builders instead of blowing up. Scanning 9.8 MB for
+dates it is second only to V8, ahead of Nim and CPython - though still 4.3×
+behind V8, whose patterns are JIT-compiled to native code.
 
 **Memory splits the same way, but along a different seam.** Where the workload
 is buffers or strings, Flaris is at or near the best in the field: 16 MB for
