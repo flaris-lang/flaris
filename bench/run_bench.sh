@@ -51,14 +51,14 @@ fi
 LANGS=(c go nim py lua luajit js fls flsj)
 
 run_lang() {  # run_lang <bench> <lang>
-    local b="$1" l="$2"
+    local b="$1" l="$2" f
     case "$l" in
-      c)      [[ -x "./bench_${b}_c$EXEEXT"   ]] && run_one "$b" c   "./bench_${b}_c$EXEEXT" ;;
-      go)     [[ -x "./bench_${b}_go$EXEEXT"  ]] && run_one "$b" go  "./bench_${b}_go$EXEEXT" ;;
-      nim)    [[ -x "./bench_${b}_nim$EXEEXT" ]] && run_one "$b" nim "./bench_${b}_nim$EXEEXT" ;;
+      c)      f=$(bin_path "bench_${b}_c");   [[ -n "$f" ]] && run_one "$b" c   "$f" ;;
+      go)     f=$(bin_path "bench_${b}_go");  [[ -n "$f" ]] && run_one "$b" go  "$f" ;;
+      nim)    f=$(bin_path "bench_${b}_nim"); [[ -n "$f" ]] && run_one "$b" nim "$f" ;;
       py)     run_one "$b" py     "$PYTHON" "bench_${b}.py" ;;
       lua)    run_one "$b" lua    "$LUA"    "bench_${b}.lua" ;;
-      luajit) local f="bench_${b}.lua"; [[ -f "bench_${b}_jit.lua" ]] && f="bench_${b}_jit.lua"
+      luajit) f="bench_${b}.lua"; [[ -f "bench_${b}_jit.lua" ]] && f="bench_${b}_jit.lua"
               run_one "$b" luajit "$LUAJIT" "$f" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
       fls)    run_one "$b" fls    "$FLARISVM" --strip "bench_${b}.fls" ;;

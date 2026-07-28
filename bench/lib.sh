@@ -18,13 +18,17 @@ export LC_ALL=C
 
 RUNS="${RUNS:-3}"
 
-# Windows toolchains append .exe to a suffixless -o target, POSIX ones do not.
-# The compiled lanes must look for the name the compiler actually produced, or
-# they silently skip themselves and the whole comparison loses its baseline.
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) EXEEXT=".exe" ;;
-    *)                    EXEEXT="" ;;
-esac
+# Resolve a compiled lane's binary. Toolchains disagree about whether a
+# suffixless -o target gains a .exe on Windows - and they disagree with each
+# other - so accept whichever name actually landed instead of predicting it. A
+# lane that cannot be resolved skips itself silently, which costs the whole
+# comparison its baseline, so the miss is reported.
+bin_path() {   # bin_path <basename> -> prints the runnable path, or nothing
+    if   [[ -x "./$1"     ]]; then printf '%s' "./$1"
+    elif [[ -x "./$1.exe" ]]; then printf '%s' "./$1.exe"
+    else warn "$1: built binary not found (lane skipped)"
+    fi
+}
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[bench]${NC} $*"; }

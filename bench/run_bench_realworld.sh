@@ -55,15 +55,15 @@ fi
 
 # ── run ──────────────────────────────────────────────────────────────────────
 run_lang() {  # run_lang <bench> <lang>
-    local b="$1" l="$2"
+    local b="$1" l="$2" f
     case "$l" in
       py)     run_one "$b" py     "$PYTHON" "bench_${b}.py" ;;
       node)   run_one "$b" node   "$NODE"   "bench_${b}_node.js" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
       lua)    run_one "$b" lua    "$LUA"    "bench_${b}.lua" ;;
       luajit) run_one "$b" luajit "$LUAJIT" "bench_${b}.lua" ;;
-      go)     [[ -x "./bench_${b}_go$EXEEXT"  ]] && run_one "$b" go  "./bench_${b}_go$EXEEXT" ;;
-      nim)    [[ -x "./bench_${b}_nim$EXEEXT" ]] && run_one "$b" nim "./bench_${b}_nim$EXEEXT" ;;
+      go)     f=$(bin_path "bench_${b}_go");  [[ -n "$f" ]] && run_one "$b" go  "$f" ;;
+      nim)    f=$(bin_path "bench_${b}_nim"); [[ -n "$f" ]] && run_one "$b" nim "$f" ;;
       fls)    run_one "$b" fls    "$FLARISVM" --strip "bench_${b}.fls" ;;
       flsj)   run_one "$b" flsj   "$FLARISVM" --strip --jit "bench_${b}.fls" ;;
     esac
