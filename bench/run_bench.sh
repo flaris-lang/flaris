@@ -53,9 +53,9 @@ LANGS=(c go nim py lua luajit js fls flsj)
 run_lang() {  # run_lang <bench> <lang>
     local b="$1" l="$2"
     case "$l" in
-      c)      [[ -x "./bench_${b}_c"   ]] && run_one "$b" c   "./bench_${b}_c" ;;
-      go)     [[ -x "./bench_${b}_go"  ]] && run_one "$b" go  "./bench_${b}_go" ;;
-      nim)    [[ -x "./bench_${b}_nim" ]] && run_one "$b" nim "./bench_${b}_nim" ;;
+      c)      [[ -x "./bench_${b}_c$EXEEXT"   ]] && run_one "$b" c   "./bench_${b}_c$EXEEXT" ;;
+      go)     [[ -x "./bench_${b}_go$EXEEXT"  ]] && run_one "$b" go  "./bench_${b}_go$EXEEXT" ;;
+      nim)    [[ -x "./bench_${b}_nim$EXEEXT" ]] && run_one "$b" nim "./bench_${b}_nim$EXEEXT" ;;
       py)     run_one "$b" py     "$PYTHON" "bench_${b}.py" ;;
       lua)    run_one "$b" lua    "$LUA"    "bench_${b}.lua" ;;
       luajit) local f="bench_${b}.lua"; [[ -f "bench_${b}_jit.lua" ]] && f="bench_${b}_jit.lua"

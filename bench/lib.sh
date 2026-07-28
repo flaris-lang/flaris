@@ -18,6 +18,14 @@ export LC_ALL=C
 
 RUNS="${RUNS:-3}"
 
+# Windows toolchains append .exe to a suffixless -o target, POSIX ones do not.
+# The compiled lanes must look for the name the compiler actually produced, or
+# they silently skip themselves and the whole comparison loses its baseline.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) EXEEXT=".exe" ;;
+    *)                    EXEEXT="" ;;
+esac
+
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[bench]${NC} $*"; }
 warn() { echo -e "${YELLOW}[warn]${NC}  $*" >&2; }
