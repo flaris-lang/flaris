@@ -1305,15 +1305,19 @@ through into the loop body.
 
 **`OP_ITER_BEGIN`** `<slot:u8> <endSlot:u8> <exit:addr:u16>` — 5 bytes.
 Stack `→`. Runs once per counted `iter` loop. Both `local[slot]` (start)
-and `local[endSlot]` (end) MUST be small ints (magnitude < 2⁶⁰), else
-`InvalidArgs` — this check is what lets `OP_ITER_NEXT` run unchecked. If
-`start > end`, jumps to `exit` (empty range).
+and `local[endSlot]` (end) MUST be ints, else `InvalidArgs`; either may be
+heap-boxed, so the endpoints are not limited to the tagged-int range. If
+`start > end`, jumps to `exit` (empty range). Otherwise, a span wider than
+`MAX_ITER_SPAN` (2⁶⁰ steps) raises `InvalidArgs` — the *width* is refused,
+never the magnitude, so a short range at any magnitude is legal.
 
 **`OP_ITER_NEXT`** `<slot:u8> <endSlot:u8> <body:addr:u16>` — 5 bytes.
 Stack `→`. If `local[slot] < local[endSlot]`: increments the slot and
 jumps to the absolute `body` address (quantum-checked back-edge);
 otherwise falls through. Net effect: the loop variable takes every value
-from start to end **inclusive**. Traps: —
+from start to end **inclusive**. When both bounds are tagged ints the
+increment is a pure immediate rewrite; if either is boxed, the step goes
+through a boxed lane that releases the outgoing counter. Traps: —
 
 ### 7.17 Type operations
 

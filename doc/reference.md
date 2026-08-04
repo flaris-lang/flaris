@@ -2232,7 +2232,7 @@ Filesystem directory operations.
 | **List** | `List(path:string) - array` | Returns array of all entry names (files + dirs) in `path`. | — |
 | **Move** | `Move(src:string, dst:string) - bool` | Rename a directory (atomic within one filesystem; fails across filesystems with no copy+delete fallback). | — |
 | **ListDirs** | `ListDirs(path:string) - array` | Returns array of subdirectory names only. | — |
-| **ListFiles** | `ListFiles(path:string, filters?:string) - array` | Returns array of entry names, optionally filtered by a comma-separated glob list (`"*.txt, *.md"` - full `*`/`?`/`[set]` wildcards, case-insensitive). Empty array if the directory can't be opened (same as `List`). | — |
+| **ListFiles** | `ListFiles(path:string, filters?:string) - array` | Returns array of immediate **non-directory** entry names (`stat`'d to exclude subdirectories - the complement of `ListDirs`; use `List` for every entry regardless of kind). Optionally filtered by a comma-separated glob list (`"*.txt, *.md"` - full `*`/`?`/`[set]` wildcards, case-insensitive). Empty array if the directory can't be opened. Non-recursive. | — |
 
 ---
 
@@ -4833,7 +4833,7 @@ When a JIT-compiled function is passed as a callback to one of the builtins belo
 | Method | Callback signature |
 | --- | --- |
 | `Memory.Process(addr, count, size, fn)` | `fn(val: int, idx: int): int` - rewrites each element |
-| `Gfx.Filter(x, y, w, h, fn)` | `fn(pixel: int): int` - rewrites each ARGB pixel |
+| `Gfx.Filter(fn, x, y, w, h)` | `fn(pixel: int): int` - rewrites each ARGB pixel |
 
 The fast path is selected automatically at runtime when `--jit` is active and the passed function is JIT-eligible. Otherwise (e.g. `--jit` is absent, or the function isn't eligible) the builtin falls back to the normal interpreter path transparently.
 
@@ -4852,7 +4852,7 @@ fn double_pixel(px: int): int {
 
 let img = Gfx.Create(800, 600);
 // ...draw something...
-img.Filter(0, 0, 800, 600, double_pixel);  // native ARM64 per-pixel loop
+img.Filter(double_pixel, 0, 0, 800, 600);  // native ARM64 per-pixel loop
 ```
 
 ### Calling convention and memory
