@@ -1969,7 +1969,8 @@ Other fibers continue to run while one is sleeping.
 
 ### Error Handling
 
-Exceptions from fibers propagate to the awaiting caller:
+An exception that is not caught inside a fiber is delivered to whoever is
+blocked on it - `await f`, or an attached `Fiber.Resume(f)`:
 
 ```js
 fn async fail() {
@@ -1980,6 +1981,42 @@ try {
     await fail();
 } catch (e) {
     Console.WriteLine(e.Error);  // "something went wrong"
+    Console.WriteLine(e.Code);   // 42
+}
+```
+
+The instance arrives intact - subclass, `Code`, `Error`, and the `StackTrace`
+captured at the throw site inside the fiber - so a type `switch` dispatches on
+it exactly as it would on a local `throw`:
+
+```js
+class NetworkError : Exception {}
+
+fn async request() { throw new NetworkError(503, "service unavailable"); }
+
+try {
+    await request();
+} catch (e) {
+    switch (e) {
+        case NetworkError: reconnect();       break;
+        case Exception:    log(e.ToString()); break;
+    }
+}
+```
+
+Delivery chains: if the awaiting fiber has no handler either, the exception
+keeps propagating outward to whoever is awaiting *it*.
+
+**A fiber nobody is waiting on cannot deliver to anyone.** An uncaught exception
+in a detached fiber (`Fiber.Resume(f, true)`, `Fiber.Run(...)`), or one that
+reaches the top of the main fiber, terminates the VM with a stack trace and an
+exit code taken from the exception. If a detached fiber can fail, catch it
+inside the fiber:
+
+```js
+fn async worker() {
+    try   { doWork(); }
+    catch (e) { Log.Error(e.Error); }   // nobody upstream to receive it
 }
 ```
 
@@ -2024,7 +2061,8 @@ Console.WriteLine(await outer(5));  // 11
 
 - `await` returns the final `return` value - not `yield` values
 - Fibers don't run until resumed - create + schedule explicitly
-- Detached fiber exceptions abort that fiber (and then the VM if uncaught)
+- Detached fibers have no one to deliver an exception to - an uncaught one ends
+  the VM. Catch inside the fiber (an awaited fiber can hand it to its awaiter)
 - There is no preemption - `yield` in tight loops affects all fibers
 - `yield` outside a fiber context is an error
 

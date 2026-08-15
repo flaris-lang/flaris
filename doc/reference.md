@@ -4109,14 +4109,16 @@ Dispatch count is the most direct proxy for loop speed.
 
 ```js
 // Best - 2 dispatches/iteration overhead
-iter (i from 0 to n) {
+iter (i from 0 to n - 1) {
     sum += arr[i];
 }
 ```
 
 Equivalent `while` costs at least 3 dispatches overhead (compare-jump + increment + loop-back). Use `iter` whenever the range is a fixed integer expression known at the loop head.
 
-`iter` allocates no iterator object. `i` is a local slot that starts at `from` and stops just before `to`.
+`iter` allocates no iterator object. `i` is a local slot that starts at `from` and runs while `i <= to`.
+
+**Both bounds are inclusive.** `iter (i from 0 to 3)` runs four times, with `i` taking 0, 1, 2 and 3 - so walking a collection is `from 0 to len(x) - 1`, not `from 0 to len(x)`. A range whose start exceeds its end (`from 0 to -1`, which is what an empty collection produces) runs zero times.
 
 ---
 
@@ -4248,13 +4250,13 @@ The VM fast-paths for arithmetic and comparison check the type tag on every oper
 ```js
 // Good - tag-int fast path throughout
 let sum: int = 0;
-iter (i from 0 to n) {
+iter (i from 0 to n - 1) {
     sum += values[i];   // stays int the whole way
 }
 
 // Risky - if any values[i] is a float, sum flips type mid-loop
 let sum = 0;
-iter (i from 0 to n) {
+iter (i from 0 to n - 1) {
     sum += values[i];
 }
 ```
