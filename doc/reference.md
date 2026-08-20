@@ -2741,33 +2741,18 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | **LeadingZeros** | `LeadingZeros(n:int) - int` | Number of leading zero bits in the 64-bit representation (64 when n=0). | ✓ |
 | **TrailingZeros** | `TrailingZeros(n:int) - int` | Number of trailing zero bits in the 64-bit representation (64 when n=0). | ✓ |
 
-**Matrix operations** (operate on 2D arrays of numbers):
+**Matrix and vector algebra** lives in the `Numerics` library, as the `Matrix`
+and `Vec` classes. `Matrix` stores a matrix as a flat row-major `[float]`, which
+the JIT compiles; a nested array-of-arrays is not a JIT type. `FromRows`/`ToRows`
+convert at the boundary.
 
-| Function | Signature | Description | JIT |
-| ---------- | ----------- | ------------- | --- |
-| **MatAdd** | `MatAdd(a:array, b:array) - array` | Element-wise matrix addition. | — |
-| **MatApply** | `MatApply(mat:array, vec:array) - array` | Multiply matrix by vector. | — |
-| **MatDet** | `MatDet(mat:array) - float` | Matrix determinant. | ✓ |
-| **MatIdentity** | `MatIdentity(n:int\|float) - array` | Create n×n identity matrix. | — |
-| **MatInverse** | `MatInverse(mat:array) - array` | Matrix inverse. | — |
-| **MatMul** | `MatMul(a:array, b:array) - array` | Matrix multiplication. | — |
-| **MatRotate2D** | `MatRotate2D(angle:int\|float) - array` | 2D rotation matrix for `angle` radians. | — |
-| **MatScale2D** | `MatScale2D(sx:int\|float, sy:int\|float) - array` | 2D scale matrix. | — |
-| **MatSub** | `MatSub(a:array, b:array) - array` | Element-wise matrix subtraction. | — |
-| **MatTranslate2D** | `MatTranslate2D(tx:int\|float, ty:int\|float) - array` | 2D translation matrix. | — |
-| **MatTranspose** | `MatTranspose(mat:array) - array` | Transpose matrix. | — |
+```
+import { Matrix, Vec } from library("Numerics", "1.0");
 
-**Vector operations** (operate on flat arrays of numbers):
-
-| Function | Signature | Description | JIT |
-| ---------- | ----------- | ------------- | --- |
-| **VecAdd** | `VecAdd(a:array, b:array) - array` | Element-wise addition. | — |
-| **VecDistance** | `VecDistance(a:array, b:array) - float` | Euclidean distance between two vectors. | ✓ |
-| **VecDot** | `VecDot(a:array, b:array) - float` | Dot product. | ✓ |
-| **VecLength** | `VecLength(v:array) - float` | Vector magnitude. | ✓ |
-| **VecNormalize** | `VecNormalize(v:array) - array` | Unit vector. | — |
-| **VecScale** | `VecScale(v:array, s:int\|float) - array` | Scale vector by scalar. | — |
-| **VecSub** | `VecSub(a:array, b:array) - array` | Element-wise subtraction. | — |
+let a = Matrix.FromRows([[1.0, 2.0], [3.0, 4.0]]);
+let c = a.Mul(Matrix.Identity(2)).Transpose();   // -> Matrix
+let d = Vec.Dot([1.0, 2.0], [3.0, 4.0]);         // -> 11.0
+```
 
 **Constants:**
 
@@ -4927,6 +4912,7 @@ diagnostics.
 | 1013 | `invalid-assign` | `INVALID_ASSIGN` | Assignment used where a value is required (e.g. `if (x = 1)`) |
 | 1014 | `undeclared-field` | `UNDECLARED_FIELD` | Member is not declared on a sealed instance - unknown field or method |
 | 1015 | `circular-inheritance` | `CIRCULAR_INHERITANCE` | A class extends itself through its base chain |
+| 1016 | `missing-receiver` | `MISSING_RECEIVER` | An instance method is called through the class name - call it on an instance, or declare it `fn static` |
 
 ### Warning codes (2000+)
 

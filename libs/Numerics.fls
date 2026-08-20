@@ -2,8 +2,8 @@
 // Version: 1.0
 // interpolation, and optional plotting).
 //
-// Where Math.* covers scalar functions and small fixed-size Vec*/Mat* algebra,
-// this library covers "function-as-data" numerical methods: solving for roots,
+// Math.* covers scalar functions; vector and matrix algebra lives here.
+// Beyond that, this library covers "function-as-data" numerical methods: roots,
 // integrating and differentiating, interpolating tables, statistics, dense
 // linear algebra, and plotting results.
 //
@@ -11,6 +11,9 @@
 //   Numerics - polynomials, root finding, quadrature, differentiation, interp
 //   Stats    - descriptive stats, distributions (pdf/cdf/quantile), regression, tests
 //   LinAlg   - flat row-major [float] matrices: solve, det, inverse, Cholesky, norms
+//   Matrix   - dense 2-D matrix object over flat storage: add/sub/mul/transpose,
+//              det, inverse, 2D affine constructors
+//   Vec      - flat [float] vector algebra: add/sub/scale/dot/norm/normalize
 //   Chart    - multi-series line/scatter plots on the built-in Gfx rasterizer
 //
 // Distribution CDFs build on the Math.* special functions (Erf/GammaP/BetaInc,
@@ -79,6 +82,28 @@
 //
 // Interpolation:
 //   Interp(xs, ys, x)                -> float   linear interp; xs ascending
+//
+// Matrix (flat row-major storage; nil on a shape mismatch):
+//   Matrix.FromRows(rows) / FromFlat(d, r, c) / Zeros(r, c) / Identity(n)
+//   Matrix.Rotate2D(a) / Scale2D(sx, sy) / Translate2D(tx, ty)
+//   m.Add(o) / Sub(o) / Mul(o) / Scale(s) / Transpose() / Copy()
+//   m.Apply(v)      -> [float]   matrix times vector
+//   m.Det()         -> float     LU-based; any square size
+//   m.Inverse()     -> Matrix    nil if singular
+//   m.Get(i,j) / Set(i,j,v) / Rows() / Cols() / Count() / Flat() / ToRows()
+//   m.Equals(o, tol)-> bool
+//
+// Vec (nil on a length mismatch):
+//   Vec.Add(a,b) / Sub(a,b) / Scale(v,s) / Normalize(v)   -> [float]
+//   Vec.Dot(a,b) / Norm(v) / Distance(a,b)                -> float
+//   Vec.ToFloat(a)                                        -> [float]
+//
+// Numeric input: every Vec and Matrix entry point takes [int], [float] or a
+// mixed array. A float array is used directly; anything else is converted once
+// per call. Converting is interpreted, so for repeated operations on the same
+// int array convert once with Vec.ToFloat and pass the result.
+//
+// Matrix methods return a Matrix; call .ToRows() for an array-of-rows.
 //
 // Plotting (opt-in, requires the built-in Gfx module):
 //   Plot(ys, path, width, height)                 -> bool  line plot of samples
@@ -1077,44 +1102,123 @@ fn _la_chol(a: [float], n: int): int {
     return 1;
 }
 
+
+// ------------------------------------------------------------
+//  Element-wise and shape kernels shared by Matrix and Vec.
+//  `n` is the total element count (rows*cols for a matrix), so the
+//  element-wise three double as vector kernels.
+// ------------------------------------------------------------
+
+fn _mx_add(a: [float], b: [float], out: [float], n: int): int {
+    let i: int = 0;
+    while (i < n) { out[i] = a[i] + b[i]; i = i + 1; }
+    return 0;
+}
+
+fn _mx_sub(a: [float], b: [float], out: [float], n: int): int {
+    let i: int = 0;
+    while (i < n) { out[i] = a[i] - b[i]; i = i + 1; }
+    return 0;
+}
+
+fn _mx_scale(a: [float], out: [float], n: int, s: float): int {
+    let i: int = 0;
+    while (i < n) { out[i] = a[i] * s; i = i + 1; }
+    return 0;
+}
+
+// out(c×r) = transpose of a(r×c); both row-major.
+fn _mx_transpose(a: [float], out: [float], r: int, c: int): int {
+    let i: int = 0;
+    while (i < r) {
+        let j: int = 0;
+        while (j < c) { out[j * r + i] = a[i * c + j]; j = j + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Writes the unit diagonal into an already-zeroed n×n buffer.
+fn _mx_identity(out: [float], n: int): int {
+    let i: int = 0;
+    while (i < n) { out[i * n + i] = 1.0; i = i + 1; }
+    return 0;
+}
+
+// out[off .. off+n-1] = a[0 .. n-1]
+fn _mx_copy_at(a: [float], out: [float], off: int, n: int): int {
+    let i: int = 0;
+    while (i < n) { out[off + i] = a[i]; i = i + 1; }
+    return 0;
+}
+
+fn _mx_copy(a: [float], out: [float], n: int): int {
+    let i: int = 0;
+    while (i < n) { out[i] = a[i]; i = i + 1; }
+    return 0;
+}
+
+// Any numeric array as flat [float] storage the kernels can read.
+// A float array is returned AS IS (no copy) - Array.IsAllFloat is O(1) on flat
+// float storage - so the common case allocates nothing. An int or mixed array
+// is converted once; that loop is interpreted (the source is untyped), so hoist
+// the call out of a hot loop when feeding the same array repeatedly.
+// nil in, nil out.
+fn _to_float(a: array): array {
+    if (a == nil) return nil;
+    if (Array.IsAllFloat(a)) return a;
+    let n: int = len(a);
+    let out: [float] = Array.Create(n, Type.Float);
+    iter(i from 0 to n - 1) { out[i] = a[i] + 0.0; }
+    return out;
+}
+
+// |a - b|² - Vec.Distance without the square root.
+fn _vc_dist2(a: [float], b: [float], n: int): float {
+    let s: float = 0.0;
+    let i: int = 0;
+    while (i < n) { let d: float = a[i] - b[i]; s = s + d * d; i = i + 1; }
+    return s;
+}
+
 class LinAlg {
 
     // Flat row-major copy of a matrix/vector (never mutate the caller's data).
-    fn _copy(a: array, count: int): array {
+    fn static _copy(a: array, count: int): array {
         let c: [float] = Array.Create(count, Type.Float);
         iter(i from 0 to count - 1) { c[i] = a[i] + 0.0; }
         return c;
     }
 
     // C = A(n×m) · B(m×p), returned as a flat n*p array.
-    fn MatMul(a: array, b: array, n: int, m: int, p: int): array {
+    fn static MatMul(a: array, b: array, n: int, m: int, p: int): array {
         let out: [float] = Array.Create(n * p, Type.Float);
         _la_matmul(a, b, out, n, m, p);
         return out;
     }
 
     // y = A(n×m) · x(m).
-    fn MatVec(a: array, x: array, n: int, m: int): array {
+    fn static MatVec(a: array, x: array, n: int, m: int): array {
         let out: [float] = Array.Create(n, Type.Float);
         _la_matvec(a, x, out, n, m);
         return out;
     }
 
-    fn Dot(a: array, b: array): float {
+    fn static Dot(a: array, b: array): float {
         let n: int = len(a);
         if (n == 0 || len(b) < n) return 0.0;
         return _la_dot(a, b, n);
     }
 
     // Euclidean (L2) norm of a vector.
-    fn Norm(a: array): float {
+    fn static Norm(a: array): float {
         let n: int = len(a);
         if (n == 0) return 0.0;
         return _la_norm2(a, n);
     }
 
     // Solve A·x = b for an n×n system. Returns x, or [] if A is singular.
-    fn Solve(a: array, b: array, n: int): array {
+    fn static Solve(a: array, b: array, n: int): array {
         let lu = _copy(a, n * n);
         let piv: [float] = Array.Create(n, Type.Float);
         if (_la_lu(lu, n, piv) == 0) return [];
@@ -1130,7 +1234,7 @@ class LinAlg {
     }
 
     // Determinant of an n×n matrix (0.0 if singular).
-    fn Det(a: array, n: int): float {
+    fn static Det(a: array, n: int): float {
         let lu = _copy(a, n * n);
         let piv: [float] = Array.Create(n, Type.Float);
         if (_la_lu(lu, n, piv) == 0) return 0.0;
@@ -1143,7 +1247,7 @@ class LinAlg {
     }
 
     // Inverse of an n×n matrix as a flat n*n array, or [] if singular.
-    fn Inverse(a: array, n: int): array {
+    fn static Inverse(a: array, n: int): array {
         let lu = _copy(a, n * n);
         let piv: [float] = Array.Create(n, Type.Float);
         if (_la_lu(lu, n, piv) == 0) return [];
@@ -1163,7 +1267,7 @@ class LinAlg {
     }
 
     // Cholesky factor L (lower, L·Lᵀ = A) of an SPD matrix, or [] if not SPD.
-    fn Cholesky(a: array, n: int): array {
+    fn static Cholesky(a: array, n: int): array {
         let l = _copy(a, n * n);
         if (_la_chol(l, n) == 0) return [];
         // Zero the strict upper triangle (kernel only wrote the lower part).
@@ -1171,6 +1275,324 @@ class LinAlg {
             iter(j from i + 1 to n - 1) { l[i * n + j] = 0.0; }
         }
         return l;
+    }
+}
+
+// ============================================================
+//  Matrix - dense 2-D matrix with flat row-major storage.
+//
+//  Storage is a single [float], so every hot loop is a typed kernel the JIT
+//  can lower; an array-of-arrays cannot be JIT-compiled at all (a nested
+//  `array` is not a JIT type, as a parameter or a return). FromRows/ToRows
+//  convert at the boundary, so nested data stays usable at the edges without
+//  costing anything in the inner loops.
+//
+//  Run with --jit for the native path; interpreted, these kernels are one to
+//  two orders of magnitude slower.
+//
+//    let a = Matrix.FromRows([[1.0, 2.0], [3.0, 4.0]]);
+//    let b = Matrix.Identity(2);
+//    let c = a.Mul(b).Transpose();
+//    Console.WriteLine(str(c.ToRows()));
+//
+//  Shape errors return nil rather than raising: Add/Sub on differing shapes,
+//  Mul on a dimension mismatch, Inverse of a singular matrix.
+//
+//  Rows may be [int], [float] or mixed - FromRows/FromFlat convert to float
+//  storage as they build.
+// ============================================================
+
+class Matrix {
+    let _c = 0;
+    let _d = nil;
+    let _r = 0;
+
+    // `data` is adopted, not copied: rows*cols flat row-major floats. Use the
+    // FromRows / FromFlat / Identity / Zeros factories instead of calling this
+    // directly - they own the validation.
+    fn Constructor(data: array, rows: int, cols: int) {
+        this._d = data;
+        this._r = rows;
+        this._c = cols;
+    }
+
+    // Build from an array-of-rows: [[1.0, 2.0], [3.0, 4.0]].
+    // nil if empty or not rectangular.
+    fn static FromRows(rows: array): Matrix {
+        let r: int = len(rows);
+        if (r == 0) return nil;
+        let c: int = len(rows[0]);
+        if (c == 0) return nil;
+        iter(i from 1 to r - 1) {
+            if (len(rows[i]) != c) return nil;
+        }
+        let d: [float] = Array.Create(r * c, Type.Float);
+        iter(i from 0 to r - 1) {
+            let row = _to_float(rows[i]);
+            _mx_copy_at(row, d, i * c, c);
+        }
+        return new Matrix(d, r, c);
+    }
+
+    // Wrap an existing flat row-major array. The data is copied, so later
+    // writes to `data` do not alias the matrix.
+    fn static FromFlat(data: array, rows: int, cols: int): Matrix {
+        if (rows <= 0 || cols <= 0) return nil;
+        let n: int = rows * cols;
+        if (len(data) < n) return nil;
+        let d: [float] = Array.Create(n, Type.Float);
+        _mx_copy(_to_float(data), d, n);
+        return new Matrix(d, rows, cols);
+    }
+
+    fn static Zeros(rows: int, cols: int): Matrix {
+        if (rows <= 0 || cols <= 0) return nil;
+        return new Matrix(Array.Create(rows * cols, Type.Float), rows, cols);
+    }
+
+    fn static Identity(n: int): Matrix {
+        if (n <= 0) return nil;
+        let d: [float] = Array.Create(n * n, Type.Float);
+        _mx_identity(d, n);
+        return new Matrix(d, n, n);
+    }
+
+    // 2×2 rotation by `angle` radians.
+    fn static Rotate2D(angle: float): Matrix {
+        let co: float = Math.Cos(angle);
+        let si: float = Math.Sin(angle);
+        let d: [float] = Array.Create(4, Type.Float);
+        d[0] = co;  d[1] = 0.0 - si;
+        d[2] = si;  d[3] = co;
+        return new Matrix(d, 2, 2);
+    }
+
+    // 2×2 scale.
+    fn static Scale2D(sx: float, sy: float): Matrix {
+        let d: [float] = Array.Create(4, Type.Float);
+        d[0] = sx; d[3] = sy;
+        return new Matrix(d, 2, 2);
+    }
+
+    // 3×3 homogeneous translation.
+    fn static Translate2D(tx: float, ty: float): Matrix {
+        let d: [float] = Array.Create(9, Type.Float);
+        d[0] = 1.0; d[2] = tx;
+        d[4] = 1.0; d[5] = ty;
+        d[8] = 1.0;
+        return new Matrix(d, 3, 3);
+    }
+
+    fn Rows(): int { return this._r; }
+    fn Cols(): int { return this._c; }
+    fn Count(): int { return this._r * this._c; }
+
+    // The backing store itself, not a copy - for handing straight to LinAlg.
+    fn Flat(): array { return this._d; }
+
+    fn Get(i: int, j: int): float {
+        if (i < 0 || j < 0 || i >= this._r || j >= this._c) return 0.0;
+        return this._d[i * this._c + j];
+    }
+
+    fn Set(i: int, j: int, v: float): bool {
+        if (i < 0 || j < 0 || i >= this._r || j >= this._c) return false;
+        this._d[i * this._c + j] = v;
+        return true;
+    }
+
+    // Back to an array-of-rows, each row its own [float].
+    fn ToRows(): array {
+        let outer = [];
+        iter(i from 0 to this._r - 1) {
+            let row: [float] = Array.Create(this._c, Type.Float);
+            iter(j from 0 to this._c - 1) { row[j] = this._d[i * this._c + j]; }
+            Array.Append(outer, row);
+        }
+        return outer;
+    }
+
+    fn Copy(): Matrix {
+        let n: int = this._r * this._c;
+        let d: [float] = Array.Create(n, Type.Float);
+        iter(i from 0 to n - 1) { d[i] = this._d[i]; }
+        return new Matrix(d, this._r, this._c);
+    }
+
+    fn Add(o: Matrix): Matrix {
+        if (o == nil || o._r != this._r || o._c != this._c) return nil;
+        let n: int = this._r * this._c;
+        let d: [float] = Array.Create(n, Type.Float);
+        _mx_add(this._d, o._d, d, n);
+        return new Matrix(d, this._r, this._c);
+    }
+
+    fn Sub(o: Matrix): Matrix {
+        if (o == nil || o._r != this._r || o._c != this._c) return nil;
+        let n: int = this._r * this._c;
+        let d: [float] = Array.Create(n, Type.Float);
+        _mx_sub(this._d, o._d, d, n);
+        return new Matrix(d, this._r, this._c);
+    }
+
+    fn Scale(s: float): Matrix {
+        let n: int = this._r * this._c;
+        let d: [float] = Array.Create(n, Type.Float);
+        _mx_scale(this._d, d, n, s);
+        return new Matrix(d, this._r, this._c);
+    }
+
+    // this(n×m) · o(m×p); nil if this.Cols() != o.Rows().
+    fn Mul(o: Matrix): Matrix {
+        if (o == nil || o._r != this._c) return nil;
+        let d: [float] = Array.Create(this._r * o._c, Type.Float);
+        _la_matmul(this._d, o._d, d, this._r, this._c, o._c);
+        return new Matrix(d, this._r, o._c);
+    }
+
+    fn Transpose(): Matrix {
+        let d: [float] = Array.Create(this._r * this._c, Type.Float);
+        _mx_transpose(this._d, d, this._r, this._c);
+        return new Matrix(d, this._c, this._r);
+    }
+
+    // this · v, where v has Cols() entries. Returns a [float] of Rows()
+    // entries, or nil on a length mismatch.
+    fn Apply(v: array): array {
+        if (v == nil || len(v) != this._c) return nil;
+        let out: [float] = Array.Create(this._r, Type.Float);
+        _la_matvec(this._d, _to_float(v), out, this._r, this._c);
+        return out;
+    }
+
+    // Determinant via LU factorization; any square size. 0.0 if singular.
+    //
+    // Drives the top-level _la_* kernels directly rather than delegating to
+    // LinAlg.Det: LinAlg reaches its sibling _copy unqualified, which the
+    // interpreter mis-resolves when the method is reached statically rather
+    // than through an instance.
+    fn Det(): float {
+        let n: int = this._r;
+        if (n != this._c || n == 0) return 0.0;
+        let lu: [float] = Array.Create(n * n, Type.Float);
+        _mx_copy(this._d, lu, n * n);
+        let piv: [float] = Array.Create(n, Type.Float);
+        if (_la_lu(lu, n, piv) == 0) return 0.0;
+        let det: float = 1.0;
+        iter(k from 0 to n - 1) {
+            det = det * lu[k * n + k];
+            if (int(piv[k]) != k) { det = 0.0 - det; }   // each swap flips the sign
+        }
+        return det;
+    }
+
+    // nil if not square or singular.
+    fn Inverse(): Matrix {
+        let n: int = this._r;
+        if (n != this._c || n == 0) return nil;
+        let lu: [float] = Array.Create(n * n, Type.Float);
+        _mx_copy(this._d, lu, n * n);
+        let piv: [float] = Array.Create(n, Type.Float);
+        if (_la_lu(lu, n, piv) == 0) return nil;
+        let inv: [float] = Array.Create(n * n, Type.Float);
+        let y: [float] = Array.Create(n, Type.Float);
+        iter(c from 0 to n - 1) {
+            iter(r from 0 to n - 1) { y[r] = 0.0; }
+            y[c] = 1.0;
+            iter(k from 0 to n - 1) {
+                let pr: int = int(piv[k]);
+                if (pr != k) { let t: float = y[k]; y[k] = y[pr]; y[pr] = t; }
+            }
+            _la_fbsolve(lu, y, n);
+            iter(r from 0 to n - 1) { inv[r * n + c] = y[r]; }
+        }
+        return new Matrix(inv, n, n);
+    }
+
+    // Element-wise comparison within `tol`.
+    fn Equals(o: Matrix, tol: float): bool {
+        if (o == nil || o._r != this._r || o._c != this._c) return false;
+        let n: int = this._r * this._c;
+        iter(i from 0 to n - 1) {
+            if (Math.AbsF(this._d[i] - o._d[i]) > tol) return false;
+        }
+        return true;
+    }
+}
+
+// ============================================================
+//  Vec - flat [float] vector algebra.
+//
+//  Operates on flat numeric arrays and returns a fresh [float]; a length
+//  mismatch yields nil rather than raising. The kernels underneath are
+//  JIT-eligible.
+//
+//    let d = Vec.Dot([1.0, 2.0], [3.0, 4.0]);      // 11.0
+//    let u = Vec.Normalize([3.0, 4.0]);            // [0.6, 0.8]
+// ============================================================
+
+class Vec {
+
+    // Any numeric array ([int], [float] or mixed) as a [float]. Returns the
+    // input unchanged when it is already a float array. Every Vec and Matrix
+    // entry point applies this to its inputs; call it directly to convert once
+    // and reuse across many operations.
+    fn static ToFloat(a: array): array { return _to_float(a); }
+
+    fn static Add(a: array, b: array): array {
+        let n: int = len(a);
+        if (n == 0 || len(b) != n) return nil;
+        let out: [float] = Array.Create(n, Type.Float);
+        _mx_add(_to_float(a), _to_float(b), out, n);
+        return out;
+    }
+
+    fn static Sub(a: array, b: array): array {
+        let n: int = len(a);
+        if (n == 0 || len(b) != n) return nil;
+        let out: [float] = Array.Create(n, Type.Float);
+        _mx_sub(_to_float(a), _to_float(b), out, n);
+        return out;
+    }
+
+    fn static Scale(v: array, s: float): array {
+        let n: int = len(v);
+        if (n == 0) return nil;
+        let out: [float] = Array.Create(n, Type.Float);
+        _mx_scale(_to_float(v), out, n, s);
+        return out;
+    }
+
+    fn static Dot(a: array, b: array): float {
+        let n: int = len(a);
+        if (n == 0 || len(b) != n) return 0.0;
+        return _la_dot(_to_float(a), _to_float(b), n);
+    }
+
+    // Magnitude. Named Norm, not Length: `Length` shadows the built-in
+    // array property and would never be callable on an instance.
+    fn static Norm(v: array): float {
+        let n: int = len(v);
+        if (n == 0) return 0.0;
+        return _la_norm2(_to_float(v), n);
+    }
+
+    // Unit vector, or nil for an empty or zero-length vector.
+    fn static Normalize(v: array): array {
+        let n: int = len(v);
+        if (n == 0) return nil;
+        let f = _to_float(v);
+        let mag: float = _la_norm2(f, n);
+        if (mag <= 0.0) return nil;
+        let out: [float] = Array.Create(n, Type.Float);
+        _mx_scale(f, out, n, 1.0 / mag);
+        return out;
+    }
+
+    fn static Distance(a: array, b: array): float {
+        let n: int = len(a);
+        if (n == 0 || len(b) != n) return 0.0;
+        return Math.Sqrt(_vc_dist2(_to_float(a), _to_float(b), n));
     }
 }
 
@@ -1355,4 +1777,4 @@ class Chart {
     }
 }
 
-export { Numerics, Stats, LinAlg, Chart };
+export { Numerics, Stats, LinAlg, Matrix, Vec, Chart };

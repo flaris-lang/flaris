@@ -608,25 +608,47 @@ class Raster {
         let ne = len(eYmin);
         if (ne == 0) { return; }
 
-        var y = 0;
-        while (y < s.h) {
-            let xs:array = [];
-            var k = 0;
+        // Scan only the band the edges cover, not the whole canvas.
+        var yTop = s.h;
+        var yBot = 0;
+        var k = 0;
+        while (k < ne) {
+            if (eYmin[k] < yTop) { yTop = eYmin[k]; }
+            if (eYmax[k] > yBot) { yBot = eYmax[k]; }
+            k = k + 1;
+        }
+        if (yTop < 0) { yTop = 0; }
+        if (yBot > s.h) { yBot = s.h; }
+        if (yTop >= yBot) { return; }
+
+        // At most one crossing per edge, so one buffer sized to the edge list
+        // serves every scanline - the crossings are inserted in order into the
+        // first nx entries rather than into a fresh array per row.
+        let xs:array = [];
+        k = 0;
+        while (k < ne) { Array.Append(xs, 0.0); k = k + 1; }
+
+        var y = yTop;
+        while (y < yBot) {
+            var nx = 0;
+            k = 0;
             while (k < ne) {
-                if (eYmin[k] <= y && y < eYmax[k]) { Array.SortedInsert(xs, eX[k]); }
+                if (eYmin[k] <= y && y < eYmax[k]) {
+                    let v = eX[k];
+                    var q = nx;
+                    while (q > 0 && xs[q - 1] > v) { xs[q] = xs[q - 1]; q = q - 1; }
+                    xs[q] = v;
+                    nx = nx + 1;
+                    eX[k] = v + eInv[k];   // advance while the edge is in hand
+                }
                 k = k + 1;
             }
             var c = 0;
-            while (c + 1 < len(xs)) {
+            while (c + 1 < nx) {
                 let a = int(Math.Floor(xs[c] + 0.5));
                 let b = int(Math.Floor(xs[c + 1] + 0.5));
                 if (b > a) { this._hspan(s, a, b, y, col); }
                 c = c + 2;
-            }
-            k = 0;
-            while (k < ne) {
-                if (eYmin[k] <= y && y < eYmax[k]) { eX[k] = eX[k] + eInv[k]; }
-                k = k + 1;
             }
             y = y + 1;
         }
@@ -1001,11 +1023,23 @@ class Raster {
         let mark = this.Mark();
         let tmp = this.NewSurface(w, h);
         if (tmp == nil) { return; }
-        var i = 0;
         let n = w * h;
-        while (i < n) {
-            _arena[tmp.off + i] = pixels[i];
-            i = i + 1;
+        // Stage the source through a scratch buffer: FromArray + Copy move the
+        // whole rectangle in two native passes, where the element-by-element
+        // loop below costs one bytecode iteration per pixel. The loop stays as
+        // the fallback for a source that cannot be transferred wholesale.
+        var bulk = false;
+        let src = (len(pixels) == n) ? pixels : Array.Slice(pixels, 0, n);
+        let stage = Buffer.Create(n, 4);
+        if (stage != nil && Buffer.FromArray(stage, src)) {
+            bulk = Buffer.Copy(stage, 0, _arena, tmp.off * 4, n * 4);
+        }
+        if (!bulk) {
+            var i = 0;
+            while (i < n) {
+                _arena[tmp.off + i] = pixels[i];
+                i = i + 1;
+            }
         }
         this.BlendSurface(s, tmp, dx, dy, 255);
         this.Flush();
@@ -1983,17 +2017,17 @@ class Graphics {
     }
 
     // lspace: extra pixels between characters (default 0, matches DrawText).
-    fn TextWidth(text:string, scale:int, lspace) : int {
+    fn static TextWidth(text:string, scale:int, lspace) : int {
         let l = (lspace == nil || lspace < 0) ? 0 : int(lspace);
         return len(text) * (8 * scale + l);
     }
 
-    fn TextHeight(scale:int) : int {
+    fn static TextHeight(scale:int) : int {
         return 8 * scale;
     }
 
     // Returns { width, height } for layout calculations.
-    fn TextMetrics(text:string, scale:int, lspace) : object {
+    fn static TextMetrics(text:string, scale:int, lspace) : object {
         let l = (lspace == nil || lspace < 0) ? 0 : int(lspace);
         return { width: len(text) * (8 * scale + l), height: 8 * scale };
     }

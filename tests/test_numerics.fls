@@ -1,7 +1,7 @@
 // test_numerics.fls
 // Tests for libs/Numerics.fls  (run with --jit to exercise the JIT kernels).
 
-import { Numerics, Stats, LinAlg, Chart } from library("Numerics", "1.0");
+import { Numerics, Stats, LinAlg, Matrix, Vec, Chart } from library("Numerics", "1.0");
 import { Graphics } from library("Graphics", "1.0");
 
 global passed = 0;
@@ -385,6 +385,191 @@ fn test_benchmarks_extra(st: Stats, la: LinAlg) {
     Console.WriteLine("LinAlg Solve " + str(n) + "x" + str(n) + " x200      : " + str(t1 - t0) + " ms  (x0=" + str(checksum) + ")");
 }
 
+
+// ============================================================
+//  Matrix / Vec
+// ============================================================
+
+fn assertRows(name: string, got: array, want: array, tol: float) {
+    if (got == nil) { assert(name + " (nil)", false); return; }
+    if (len(got) != len(want)) { assert(name + " (rows)", false); return; }
+    iter(i from 0 to len(got) - 1) {
+        if (len(got[i]) != len(want[i])) { assert(name + " (cols)", false); return; }
+        iter(j from 0 to len(got[i]) - 1) {
+            if (Math.AbsF(got[i][j] - want[i][j]) > tol) { assert(name, false); return; }
+        }
+    }
+    assert(name, true);
+}
+
+fn assertVec(name: string, got: array, want: array, tol: float) {
+    if (got == nil) { assert(name + " (nil)", false); return; }
+    if (len(got) != len(want)) { assert(name + " (len)", false); return; }
+    iter(i from 0 to len(got) - 1) {
+        if (Math.AbsF(got[i] - want[i]) > tol) { assert(name, false); return; }
+    }
+    assert(name, true);
+}
+
+fn test_matrix() {
+    let a = Matrix.FromRows([[1.0, 2.0], [3.0, 4.0]]);
+    let b = Matrix.FromRows([[5.0, 6.0], [7.0, 8.0]]);
+
+    assert("Matrix.FromRows shape", a.Rows() == 2 && a.Cols() == 2 && a.Count() == 4);
+    assertRows("Matrix.Add",       a.Add(b).ToRows(),      [[6.0, 8.0], [10.0, 12.0]], 1e-12);
+    assertRows("Matrix.Sub",       b.Sub(a).ToRows(),      [[4.0, 4.0], [4.0, 4.0]], 1e-12);
+    assertRows("Matrix.Mul",       a.Mul(b).ToRows(),      [[19.0, 22.0], [43.0, 50.0]], 1e-12);
+    assertRows("Matrix.Scale",     a.Scale(2.0).ToRows(),  [[2.0, 4.0], [6.0, 8.0]], 1e-12);
+    assertRows("Matrix.Transpose", a.Transpose().ToRows(), [[1.0, 3.0], [2.0, 4.0]], 1e-12);
+    assertRows("Matrix.Identity",  Matrix.Identity(3).ToRows(),
+               [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], 1e-12);
+    assertRows("Matrix.Zeros",     Matrix.Zeros(2, 2).ToRows(), [[0.0, 0.0], [0.0, 0.0]], 1e-12);
+
+    assertClose("Matrix.Det 2x2", a.Det(), -2.0, 1e-12);
+    assertVec("Matrix.Apply", a.Apply([1.0, 1.0]), [3.0, 7.0], 1e-12);
+
+    // A · A⁻¹ = I
+    let inv = a.Inverse();
+    assert("Matrix.Inverse identity", a.Mul(inv).Equals(Matrix.Identity(2), 1e-9));
+
+    // Non-square multiply: (2x3)·(3x2) -> 2x2
+    let r = Matrix.FromRows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+    let c = Matrix.FromRows([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]);
+    assertRows("Matrix.Mul 2x3*3x2", r.Mul(c).ToRows(), [[58.0, 64.0], [139.0, 154.0]], 1e-12);
+    assert("Matrix.Transpose 2x3", r.Transpose().Rows() == 3 && r.Transpose().Cols() == 2);
+
+    // 3x3 det/inverse
+    let m3 = Matrix.FromRows([[4.0, 7.0, 2.0], [3.0, 6.0, 1.0], [2.0, 5.0, 3.0]]);
+    assertClose("Matrix.Det 3x3", m3.Det(), 9.0, 1e-9);
+    assert("Matrix.Inverse 3x3", m3.Mul(m3.Inverse()).Equals(Matrix.Identity(3), 1e-9));
+
+    // 5x5 via flat construction
+    let n5 = 5;
+    let flat: array = Array.Create(n5 * n5, Type.Float);
+    iter(i from 0 to n5 - 1) {
+        iter(j from 0 to n5 - 1) {
+            if (i == j) { flat[i * n5 + j] = 10.0; } else { flat[i * n5 + j] = 1.0 / ((i + j) + 1.0); }
+        }
+    }
+    let m5 = Matrix.FromFlat(flat, n5, n5);
+    assert("Matrix 5x5 inverse", m5.Mul(m5.Inverse()).Equals(Matrix.Identity(n5), 1e-9));
+
+    // 2D affine constructors
+    assertRows("Matrix.Rotate2D(0)", Matrix.Rotate2D(0.0).ToRows(), [[1.0, 0.0], [0.0, 1.0]], 1e-12);
+    assertRows("Matrix.Scale2D", Matrix.Scale2D(2.0, 3.0).ToRows(), [[2.0, 0.0], [0.0, 3.0]], 1e-12);
+    assertRows("Matrix.Translate2D", Matrix.Translate2D(5.0, 6.0).ToRows(),
+               [[1.0, 0.0, 5.0], [0.0, 1.0, 6.0], [0.0, 0.0, 1.0]], 1e-12);
+
+    // Get/Set/Copy do not alias
+    let cp = a.Copy();
+    cp.Set(0, 0, 99.0);
+    assert("Matrix.Copy is deep", a.Get(0, 0) == 1.0 && cp.Get(0, 0) == 99.0);
+    assert("Matrix.Get out of range", a.Get(5, 5) == 0.0);
+    assert("Matrix.Set out of range", a.Set(5, 5, 1.0) == false);
+
+    // nil on shape errors
+    assert("Matrix.Add mismatch",     a.Add(Matrix.FromRows([[1.0]])) == nil);
+    assert("Matrix.Mul mismatch",     a.Mul(Matrix.FromRows([[1.0, 2.0, 3.0]])) == nil);
+    assert("Matrix.FromRows ragged",  Matrix.FromRows([[1.0, 2.0], [3.0]]) == nil);
+    assert("Matrix.FromRows empty",   Matrix.FromRows([]) == nil);
+    assert("Matrix.Inverse singular", Matrix.FromRows([[1.0, 2.0], [2.0, 4.0]]).Inverse() == nil);
+    assert("Matrix.Apply mismatch",   a.Apply([1.0, 2.0, 3.0]) == nil);
+    assert("Matrix.Zeros invalid",    Matrix.Zeros(0, 2) == nil);
+}
+
+fn test_numeric_inputs() {
+    // [int], [float] and mixed arrays are all accepted.
+    assertClose("Vec.Dot int",        Vec.Dot([1, 2, 3], [4, 5, 6]), 32.0, 1e-12);
+    assertClose("Vec.Dot mixed",      Vec.Dot([1, 2.5, 3], [1, 1, 1]), 6.5, 1e-12);
+    assertClose("Vec.Norm int",       Vec.Norm([3, 4]), 5.0, 1e-12);
+    assertClose("Vec.Distance int",   Vec.Distance([0, 0], [3, 4]), 5.0, 1e-12);
+    assertVec("Vec.Add int",          Vec.Add([1, 2], [3, 4]), [4.0, 6.0], 1e-12);
+    assertVec("Vec.Add mixed",        Vec.Add([1, 2.5], [3, 4]), [4.0, 6.5], 1e-12);
+    assertVec("Vec.Sub int",          Vec.Sub([3, 4], [1, 2]), [2.0, 2.0], 1e-12);
+    assertVec("Vec.Scale int",        Vec.Scale([1, 2], 3.0), [3.0, 6.0], 1e-12);
+    assertVec("Vec.Normalize int",    Vec.Normalize([3, 4]), [0.6, 0.8], 1e-12);
+
+    assertClose("Matrix int rows det",   Matrix.FromRows([[1, 2], [3, 4]]).Det(), -2.0, 1e-12);
+    assertClose("Matrix mixed rows det", Matrix.FromRows([[1.0, 2], [3, 4.0]]).Det(), -2.0, 1e-12);
+    assertClose("Matrix.FromFlat int",   Matrix.FromFlat([1, 2, 3, 4], 2, 2).Det(), -2.0, 1e-12);
+    assertVec("Matrix.Apply int vec",    Matrix.FromRows([[1, 2], [3, 4]]).Apply([1, 1]), [3.0, 7.0], 1e-12);
+    assertRows("Matrix int Mul",         Matrix.FromRows([[1, 2], [3, 4]]).Mul(Matrix.FromRows([[5, 6], [7, 8]])).ToRows(),
+               [[19.0, 22.0], [43.0, 50.0]], 1e-12);
+
+    // A float array is passed straight through - no copy.
+    let f: [float] = Array.Create(2, Type.Float);
+    f[0] = 1.5; f[1] = 2.5;
+    assert("Vec.ToFloat passthrough", Vec.ToFloat(f) == f);
+    assertVec("Vec.ToFloat converts", Vec.ToFloat([1, 2]), [1.0, 2.0], 1e-12);
+}
+
+fn test_vec() {
+    let v1 = [1.0, 2.0, 3.0];
+    let v2 = [4.0, 5.0, 6.0];
+
+    assertVec("Vec.Add",       Vec.Add(v1, v2),    [5.0, 7.0, 9.0], 1e-12);
+    assertVec("Vec.Sub",       Vec.Sub(v2, v1),    [3.0, 3.0, 3.0], 1e-12);
+    assertVec("Vec.Scale",     Vec.Scale(v1, 3.0), [3.0, 6.0, 9.0], 1e-12);
+    assertClose("Vec.Dot",     Vec.Dot(v1, v2),    32.0, 1e-12);
+    assertClose("Vec.Norm",    Vec.Norm([3.0, 4.0]), 5.0, 1e-12);
+    assertVec("Vec.Normalize", Vec.Normalize([3.0, 4.0]), [0.6, 0.8], 1e-12);
+    assertClose("Vec.Distance", Vec.Distance([0.0, 0.0], [3.0, 4.0]), 5.0, 1e-12);
+
+    assert("Vec.Add mismatch",    Vec.Add(v1, [1.0, 2.0]) == nil);
+    assert("Vec.Sub mismatch",    Vec.Sub(v1, [1.0, 2.0]) == nil);
+    assert("Vec.Normalize zero",  Vec.Normalize([0.0, 0.0]) == nil);
+    assert("Vec.Scale empty",     Vec.Scale([], 2.0) == nil);
+    assert("Vec.Dot mismatch",    Vec.Dot(v1, [1.0]) == 0.0);
+}
+
+
+fn test_benchmarks_matrix() {
+    let t0 = 0;
+    let t1 = 0;
+
+    // Dense matmul through the _la_matmul kernel.
+    let n = 120;
+    let d: array = Array.Create(n * n, Type.Float);
+    iter(i from 0 to n * n - 1) { d[i] = (i % 17) + 0.5; }
+    let m = Matrix.FromFlat(d, n, n);
+
+    t0 = Time.Millis();
+    let acc = 0.0;
+    iter(k from 0 to 19) { acc += m.Mul(m).Get(0, 0); }
+    t1 = Time.Millis();
+    Console.WriteLine("Matrix Mul " + str(n) + "x" + str(n) + " x20        : " + str(t1 - t0) + " ms  (c00=" + str(acc) + ")");
+
+    // Element-wise + transpose kernels.
+    t0 = Time.Millis();
+    let chk = 0.0;
+    iter(k from 0 to 199) { chk = m.Add(m).Transpose().Get(1, 0); }
+    t1 = Time.Millis();
+    Console.WriteLine("Matrix Add+Transpose x200    : " + str(t1 - t0) + " ms  (v=" + str(chk) + ")");
+
+    // Inverse (LU) on a diagonally dominant system.
+    let n2 = 60;
+    let d2: array = Array.Create(n2 * n2, Type.Float);
+    iter(i from 0 to n2 - 1) {
+        iter(j from 0 to n2 - 1) {
+            if (i == j) { d2[i * n2 + j] = (n2 + 0.0); } else { d2[i * n2 + j] = 1.0 / ((i + j) + 1.0); }
+        }
+    }
+    let m2 = Matrix.FromFlat(d2, n2, n2);
+    t0 = Time.Millis();
+    let iv = 0.0;
+    iter(k from 0 to 49) { iv = m2.Inverse().Get(0, 0); }
+    t1 = Time.Millis();
+    Console.WriteLine("Matrix Inverse " + str(n2) + "x" + str(n2) + " x50    : " + str(t1 - t0) + " ms  (i00=" + str(iv) + ")");
+
+    // Vector kernels over a long vector.
+    let big = sampleSquare(1000000);
+    t0 = Time.Millis();
+    let vs = 0.0;
+    iter(k from 0 to 49) { vs += Vec.Dot(big, big) + Vec.Norm(big); }
+    t1 = Time.Millis();
+    Console.WriteLine("Vec Dot+Norm n=1M x50        : " + str(t1 - t0) + " ms  (s=" + str(vs) + ")");
+}
+
 fn Main() {
     let nm = new Numerics();
     let st = new Stats();
@@ -397,10 +582,14 @@ fn Main() {
     test_special();
     test_stats(st);
     test_linalg(la);
+    test_matrix();
+    test_vec();
+    test_numeric_inputs();
     test_chart();
     test_plotting(nm);
     test_benchmarks(nm);
     test_benchmarks_extra(st, la);
+    test_benchmarks_matrix();
 
     Console.WriteLine("");
     Console.WriteLine("Passed: " + str(passed) + "  Failed: " + str(failed));
