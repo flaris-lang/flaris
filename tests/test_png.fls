@@ -1,0 +1,165 @@
+// Test suite for Png.fls
+//
+// Encode/decode round-trips, both filter strategies, and rejection of
+// malformed input. Pixels are 32-bit 0xAARRGGBB elements, so a w*h image is a
+// block of w*h elements of size 4.
+//
+// Run: ./flarisvm ./tests/test_png.fls --unsafe
+
+import { Png } from library("Png", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + "  expected=" + str(expected) + " got=" + str(actual));
+    }
+}
+
+fn mkImage(w: int, h: int, mode: int): block {
+    let px = Buffer.Create(w * h, 4);
+    iter (i from 0 to w * h - 1) {
+        let x = i % w;
+        let y = i / w;
+        let v = 0;
+        if (mode == 0)      { v = 0xFF000000 | (x & 255) << 16 | (y & 255) << 8 | 120; }   // gradient
+        else if (mode == 1) { v = 0xFF808080; }                                            // flat
+        else                { v = 0xFF000000 | ((x * 2654435761 + y * 40503) & 0xFFFFFF); } // noisy
+        px[i] = v;
+    }
+    return px;
+}
+
+fn samePixels(a: block, b: block, n: int): bool {
+    if (a == nil || b == nil) return false;
+    if (len(a) < n || len(b) < n) return false;
+    iter (i from 0 to n - 1) { if (a[i] != b[i]) return false; }
+    return true;
+}
+
+fn roundtrip(name: string, w: int, h: int, mode: int, opts) {
+    let px = mkImage(w, h, mode);
+    let bytes = Png.Encode(px, w, h, opts);
+    check(bytes != nil, name + " encodes");
+    if (bytes == nil) return 0;
+
+    // PNG signature and IHDR must be present.
+    check(len(bytes) > 33, name + " has a plausible length");
+    check((bytes[0] & 255) == 137 && (bytes[1] & 255) == 80
+       && (bytes[2] & 255) == 78  && (bytes[3] & 255) == 71, name + " signature");
+
+    let img = Png.Decode(bytes);
+    check(img != nil, name + " decodes");
+    if (img == nil) return 0;
+    checkEq(img.Width,  w, name + " width");
+    checkEq(img.Height, h, name + " height");
+    check(samePixels(img.Pixels, px, w * h), name + " pixels survive the round-trip");
+    return 0;
+}
+
+fn test_roundtrips() {
+    roundtrip("gradient 64x64", 64, 64, 0, nil);
+    roundtrip("flat 32x16",     32, 16, 1, nil);
+    roundtrip("noisy 40x40",    40, 40, 2, nil);
+    roundtrip("1x1",             1,  1, 0, nil);
+    roundtrip("1xN column",      1, 97, 0, nil);
+    roundtrip("Nx1 row",        97,  1, 0, nil);
+}
+
+fn test_filter_modes() {
+    let w = 48; let h = 48;
+    let px = mkImage(w, h, 0);
+    let adaptive = Png.Encode(px, w, h, { filter: Png.FILTER_ADAPTIVE });
+    let none     = Png.Encode(px, w, h, { filter: Png.FILTER_NONE });
+    check(adaptive != nil && none != nil, "both filter strategies encode");
+    if (adaptive == nil || none == nil) return 0;
+
+    // Both must decode to the original, whatever the filter choice.
+    let a = Png.Decode(adaptive);
+    let n = Png.Decode(none);
+    check(samePixels(a.Pixels, px, w * h), "adaptive round-trips");
+    check(samePixels(n.Pixels, px, w * h), "filter-none round-trips");
+    // Adaptive exists to compress better on gradients; it must not lose to none.
+    check(len(adaptive) <= len(none), "adaptive is no larger than filter-none");
+    return 0;
+}
+
+fn test_malformed() {
+    check(Png.Decode(nil) == nil,                              "Decode(nil) -> nil");
+    check(Png.Decode(Buffer.FromString("")) == nil,            "Decode(empty) -> nil");
+    check(Png.Decode(Buffer.FromString("not a png at all")) == nil, "Decode(garbage) -> nil");
+
+    let px = mkImage(16, 16, 0);
+    let good = Png.Encode(px, 16, 16, nil);
+    check(Png.Decode(Buffer.Slice(good, 0, 20)) == nil,        "truncated header -> nil");
+    // Cutting only the trailing IEND leaves a complete IDAT, which a decoder
+    // may legitimately accept - truncate into the compressed data instead.
+    check(Png.Decode(Buffer.Slice(good, 0, len(good) / 2)) == nil, "truncated payload -> nil");
+
+    // A corrupted IDAT byte must be caught, not silently decoded.
+    let bad = Buffer.Slice(good, 0, len(good));
+    bad[60] = (bad[60] + 1) & 255;
+    let img = Png.Decode(bad);
+    check(img == nil || img.Width == 16, "corrupted stream fails or stays consistent");
+
+    check(Png.Encode(nil, 8, 8, nil) == nil,                   "Encode(nil) -> nil");
+    check(Png.Encode(px, 0, 8, nil) == nil,                    "Encode(zero width) -> nil");
+    check(Png.Encode(px, 8, 0, nil) == nil,                    "Encode(zero height) -> nil");
+    check(Png.Encode(px, Png.MAX_DIM + 1, 8, nil) == nil,      "Encode(over MAX_DIM) -> nil");
+    check(Png.Encode(px, 4096, 4096, nil) == nil,              "Encode(pixels too few for w*h) -> nil");
+    return 0;
+}
+
+fn test_disk() {
+    let path = "/tmp/flaris_test_png.png";
+    let w = 24; let h = 18;
+    let px = mkImage(w, h, 0);
+    check(Png.Save(path, px, w, h, nil), "Save writes a file");
+    let img = Png.Load(path);
+    check(img != nil, "Load reads it back");
+    if (img != nil) {
+        checkEq(img.Width, w, "Load width");
+        check(samePixels(img.Pixels, px, w * h), "Load pixels match");
+    }
+    check(Png.Load("/tmp/definitely_missing_image.png") == nil, "Load missing -> nil");
+    File.Delete(path);
+    return 0;
+}
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Png benchmarks ===");
+    let w = 512; let h = 512;
+    let px = mkImage(w, h, 0);
+    let t = Time.Millis();
+    let bytes = Png.Encode(px, w, h, nil);
+    let enc = Time.Millis() - t;
+    t = Time.Millis();
+    let img = Png.Decode(bytes);
+    let dec = Time.Millis() - t;
+    Console.WriteLine("  " + str(w) + "x" + str(h) + " RGBA -> " + str(len(bytes)) + " B"
+                      + "   encode " + str(enc) + " ms   decode " + str(dec) + " ms");
+    check(samePixels(img.Pixels, px, w * h), "benchmark image round-trips");
+    return 0;
+}
+
+fn Main() {
+    Console.WriteLine("=== Png tests ===");
+    test_roundtrips();
+    test_filter_modes();
+    test_malformed();
+    test_disk();
+    test_benchmarks();
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All Png tests passed!");
+    return 0;
+}

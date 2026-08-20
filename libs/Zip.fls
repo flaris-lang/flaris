@@ -1,0 +1,370 @@
+// Zip.fls - ZIP archive reading and writing.
+// Version: 1.0
+//
+// The ZIP container - local headers, the central directory and the end-of-
+// central-directory record - is parsed and built here in Flaris, and entry
+// payloads go through the `Deflate` library, so nothing about ZIP depends on
+// the VM. A ZIP entry stores a bare DEFLATE stream, which is exactly what
+// `Deflate.Raw` produces.
+//
+// Exported classes:
+//   Archive   - factories: Open / OpenFile / Create
+//   ZipReader - List / Read / Extract / ExtractAll
+//   ZipWriter - Add / AddFile / Build / Save
+//
+// Usage:
+//   import { Archive } from library("Zip", "1.0");
+//
+//   let w = Archive.Create();
+//   w.Add("hello.txt", "hello world");
+//   let bytes = w.Build();
+//
+//   let r = Archive.Open(bytes);
+//   foreach (e in r.List()) { Console.WriteLine(e.Name + " " + str(e.Size)); }
+//   let data = r.Read("hello.txt");
+//
+// Entries whose name ends in "/" are directories: zero-length, stored, and
+// reported with IsDir true.
+//
+// Limits: classic ZIP only - no ZIP64, no encryption, no multi-disk. An
+// archive is capped at 4 GiB and 65535 entries, and a single entry at 4 GiB.
+// Methods 0 (stored) and 8 (deflate) are read; writing picks whichever of the
+// two is smaller per entry.
+
+import { BinaryWriter, BinaryReader } from library("BinaryIO", "1.0");
+import { Inflate, Deflate } from library("Deflate", "1.0");
+
+const SIG_LOCAL   = 0x04034B50;
+const SIG_CENTRAL = 0x02014B50;
+const SIG_EOCD    = 0x06054B50;
+
+const METHOD_STORE   = 0;
+const METHOD_DEFLATE = 8;
+
+const MAX_U32     = 4294967295;
+const MAX_ENTRIES = 65535;
+const EOCD_MIN    = 22;
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+
+// Raw DEFLATE stream for `data`, or nil when deflating does not pay off.
+// Compress.Zip emits zlib framing; a ZIP entry wants the bare stream.
+fn _zipDeflateRaw(data: block): block {
+    if (len(data) == 0) return nil;
+    let raw = Deflate.Raw(data, 32);
+    if (raw == nil || len(raw) >= len(data)) return nil;
+    return raw;
+}
+
+// DOS date/time pair for the current wall clock (ZIP stores 2-second
+// resolution, and its epoch is 1980).
+fn _zipDosStamp(): array {
+    // Time.* date parts take seconds; NowMillis is milliseconds.
+    let ms = Time.FromMillis(Time.NowMillis());
+    let y = Time.Year(ms);
+    if (y < 1980) { y = 1980; }
+    let dosDate = ((y - 1980) << 9) | (Time.Month(ms) << 5) | Time.Day(ms);
+    let dosTime = (Time.Hour(ms) << 11) | (Time.Minute(ms) << 5) | (Time.Second(ms) >> 1);
+    return [dosDate & 0xFFFF, dosTime & 0xFFFF];
+}
+
+// Offset of the end-of-central-directory record, or -1.
+// Scans backwards because the record carries a variable-length comment.
+fn _zipFindEocd(buf: block): int {
+    let n = len(buf);
+    if (n < EOCD_MIN) return -1;
+    let limit = n - EOCD_MIN - 65535;
+    if (limit < 0) { limit = 0; }
+    let i = n - EOCD_MIN;
+    while (i >= limit) {
+        if (buf[i] == 0x50 && buf[i + 1] == 0x4B && buf[i + 2] == 0x05 && buf[i + 3] == 0x06) {
+            return i;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Central directory -> array of entry records. Empty array for an archive with
+// no entries; nil when the bytes are not a readable ZIP.
+fn _zipParse(buf: block): array {
+    let eocd = _zipFindEocd(buf);
+    if (eocd < 0) return nil;
+
+    let r = new BinaryReader(buf, false);
+    r.Seek(eocd + 10);
+    let count  = r.ReadU16();
+    let cdSize = r.ReadU32();
+    let cdOff  = r.ReadU32();
+    if (cdOff + cdSize > len(buf)) return nil;
+
+    let out = [];
+    let p = cdOff;
+    iter (k from 0 to count - 1) {
+        if (p + 46 > len(buf)) return nil;
+        r.Seek(p);
+        if (r.ReadU32() != SIG_CENTRAL) return nil;
+        r.Seek(p + 10);
+        let method = r.ReadU16();
+        r.Seek(p + 16);
+        let crc    = r.ReadU32();
+        let csize  = r.ReadU32();
+        let usize  = r.ReadU32();
+        let nameLen  = r.ReadU16();
+        let extraLen = r.ReadU16();
+        let cmtLen   = r.ReadU16();
+        r.Seek(p + 42);
+        let localOff = r.ReadU32();
+        r.Seek(p + 46);
+        let name = r.ReadStringFixed(nameLen);
+        Array.Append(out, {
+            Name: name, Size: usize, CompressedSize: csize,
+            IsDir: String.EndsWith(name, "/"),
+            _method: method, _crc: crc, _off: localOff
+        });
+        p = p + 46 + nameLen + extraLen + cmtLen;
+    }
+    return out;
+}
+
+// Payload bytes for one parsed entry, or nil if the archive is inconsistent.
+fn _zipReadEntry(buf: block, e: object): block {
+    let off = e._off;
+    if (off + 30 > len(buf)) return nil;
+    let r = new BinaryReader(buf, false);
+    r.Seek(off);
+    if (r.ReadU32() != SIG_LOCAL) return nil;
+    // The local header repeats the name/extra lengths, and its extra field may
+    // differ in length from the central one - always trust the local copy.
+    r.Seek(off + 26);
+    let nameLen  = r.ReadU16();
+    let extraLen = r.ReadU16();
+    let dataOff  = off + 30 + nameLen + extraLen;
+    if (dataOff + e.CompressedSize > len(buf)) return nil;
+    if (e.CompressedSize == 0) return Buffer.FromString("");
+
+    let raw = Buffer.Slice(buf, dataOff, e.CompressedSize);
+    if (e._method == METHOD_STORE) return raw;
+    if (e._method != METHOD_DEFLATE) return nil;
+    return Inflate.Raw(raw, e.Size);
+}
+
+// Create every directory on the way to `path`'s parent.
+fn _zipEnsureParent(path: string): int {
+    let dir = Path.GetDirectoryName(path);
+    if (dir != nil && len(dir) > 0 && !Directory.Exists(dir)) {
+        Directory.Create(dir);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+//  ZipReader
+// ---------------------------------------------------------------------------
+
+class ZipReader {
+    let _buf = nil;
+    let _entries = nil;
+
+    fn Constructor(data: block) {
+        this._buf = data;
+        this._entries = nil;
+    }
+
+    // Parsed on first use rather than in the constructor: the central
+    // directory of a large archive is a long loop, and running it inside a
+    // constructor frame trips a VM stack-accounting bug (see the note in
+    // tests/test_zip.fls).
+    fn _ensure(): int {
+        if (this._entries == nil) {
+            let e = _zipParse(this._buf);
+            this._entries = e == nil ? [] : e;
+        }
+        return 0;
+    }
+
+    // [{Name, Size, CompressedSize, IsDir}] in central-directory order.
+    fn List(): array {
+        this._ensure();
+        let out = [];
+        foreach (e in this._entries) {
+            Array.Append(out, { Name: e.Name, Size: e.Size,
+                                 CompressedSize: e.CompressedSize, IsDir: e.IsDir });
+        }
+        return out;
+    }
+
+    fn Count(): int {
+        this._ensure(); return len(this._entries); }
+
+    // Payload of one entry by exact name; nil when absent or unreadable.
+    fn Read(name: string): block {
+        this._ensure();
+        foreach (e in this._entries) {
+            if (e.Name == name) { return _zipReadEntry(this._buf, e); }
+        }
+        return nil;
+    }
+
+    // Write one entry to `dest`, creating intermediate directories.
+    fn Extract(name: string, dest: string): bool {
+        let data = this.Read(name);
+        if (data == nil) return false;
+        _zipEnsureParent(dest);
+        return File.WriteAllBytes(dest, data);
+    }
+
+    // Extract every non-directory entry under `dir`. Returns the count written.
+    fn ExtractAll(dir: string): int {
+        this._ensure();
+        let n = 0;
+        foreach (e in this._entries) {
+            if (e.IsDir) { continue; }
+            let dest = Path.Combine(dir, e.Name);
+            if (this.Extract(e.Name, dest)) { n = n + 1; }
+        }
+        return n;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  ZipWriter
+// ---------------------------------------------------------------------------
+
+class ZipWriter {
+    let _items = nil;
+
+    fn Constructor() { this._items = []; }
+
+    // Add one entry. `data` may be a string or a block; a name ending in "/"
+    // is written as a zero-length directory entry.
+    fn Add(name: string, data): int {
+        if (name == nil || len(name) == 0) return 0;
+        let payload = nil;
+        if (String.EndsWith(name, "/")) { payload = Buffer.FromString(""); }
+        else if (Type.Of(data) == Type.String) { payload = Buffer.FromString(data); }
+        else { payload = data; }
+        if (payload == nil) { payload = Buffer.FromString(""); }
+        Array.Append(this._items, { name: name, data: payload });
+        return 0;
+    }
+
+    fn AddFile(name: string, path: string): int {
+        let data = File.ReadAllBytes(path);
+        if (data == nil) return 0;
+        return this.Add(name, data);
+    }
+
+    fn Count(): int { return len(this._items); }
+
+    // Serialise to ZIP bytes. nil if the archive would exceed classic-ZIP
+    // limits (65535 entries, 4 GiB total, 4 GiB per entry).
+    fn Build(): block {
+        if (len(this._items) > MAX_ENTRIES) return nil;
+
+        let stamp = _zipDosStamp();
+        let dosDate = stamp[0];
+        let dosTime = stamp[1];
+
+        let w = new BinaryWriter(false);
+        let central = [];
+
+        foreach (it in this._items) {
+            let raw = it.data;
+            let usize = len(raw);
+            if (usize > MAX_U32) return nil;
+            let isDir = String.EndsWith(it.name, "/");
+
+            let method = METHOD_STORE;
+            let body = raw;
+            if (!isDir) {
+                let def = _zipDeflateRaw(raw);
+                if (def != nil) { method = METHOD_DEFLATE; body = def; }
+            }
+            let crc = usize == 0 ? 0 : (Hash.Crc32(raw) & MAX_U32);
+            let off = w.Size();
+            if (off > MAX_U32) return nil;
+
+            w.WriteU32(SIG_LOCAL);
+            w.WriteU16(20);            // version needed
+            w.WriteU16(0);             // flags
+            w.WriteU16(method);
+            w.WriteU16(dosTime);
+            w.WriteU16(dosDate);
+            w.WriteU32(crc);
+            w.WriteU32(len(body));
+            w.WriteU32(usize);
+            w.WriteU16(len(it.name));
+            w.WriteU16(0);             // extra len
+            w.WriteStringFixed(it.name, len(it.name));
+            if (len(body) > 0) { w.WriteBytes(body); }
+
+            Array.Append(central, { name: it.name, method: method, crc: crc,
+                                     csize: len(body), usize: usize,
+                                     off: off, isDir: isDir });
+        }
+
+        let cdStart = w.Size();
+        foreach (c in central) {
+            w.WriteU32(SIG_CENTRAL);
+            w.WriteU16(20);            // version made by
+            w.WriteU16(20);            // version needed
+            w.WriteU16(0);             // flags
+            w.WriteU16(c.method);
+            w.WriteU16(dosTime);
+            w.WriteU16(dosDate);
+            w.WriteU32(c.crc);
+            w.WriteU32(c.csize);
+            w.WriteU32(c.usize);
+            w.WriteU16(len(c.name));
+            w.WriteU16(0);             // extra len
+            w.WriteU16(0);             // comment len
+            w.WriteU16(0);             // disk start
+            w.WriteU16(0);             // internal attrs
+            w.WriteU32(c.isDir ? 16 : 0);   // external attrs: MS-DOS directory bit
+            w.WriteU32(c.off);
+            w.WriteStringFixed(c.name, len(c.name));
+        }
+        let cdSize = w.Size() - cdStart;
+
+        w.WriteU32(SIG_EOCD);
+        w.WriteU16(0);                 // this disk
+        w.WriteU16(0);                 // disk with central dir
+        w.WriteU16(len(central));
+        w.WriteU16(len(central));
+        w.WriteU32(cdSize);
+        w.WriteU32(cdStart);
+        w.WriteU16(0);                 // comment len
+        return w.ToBuffer();
+    }
+
+    fn Save(path: string): bool {
+        let bytes = this.Build();
+        if (bytes == nil) return false;
+        _zipEnsureParent(path);
+        return File.WriteAllBytes(path, bytes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Archive - factories
+// ---------------------------------------------------------------------------
+
+class Archive {
+    fn static Open(data: block): ZipReader {
+        if (data == nil) return nil;
+        return new ZipReader(data);
+    }
+
+    fn static OpenFile(path: string): ZipReader {
+        let data = File.ReadAllBytes(path);
+        if (data == nil) return nil;
+        return new ZipReader(data);
+    }
+
+    fn static Create(): ZipWriter { return new ZipWriter(); }
+}
+
+export { Archive, ZipReader, ZipWriter };

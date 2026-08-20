@@ -73,8 +73,8 @@ The Flaris VM binary is `flarisvm`.
 | `--verbose` | Verbose output (also enables the timing report) |
 | `--list-keys` | Print the built-in and trusted signing keys, then exit |
 | `--trace` | Very verbose / print disassembled bytecode before execution |
-| `--jit` | Enable JIT: automatically compiles every eligible function - embeds JIT code at compile time and runs it natively at run time (ARM64 and x86-64) |
-| `--debug` | Stop at the start of `Main` and open the debugger prompt; disables `--jit` (see [R9](#r9---debug-reference)) |
+| `--jit-disable` | Turn the JIT off. It is ON by default: eligible functions get JIT IR at compile time and native code at run time (ARM64 and x86-64) |
+| `--debug` | Stop at the start of `Main` and open the debugger prompt; disables the JIT (see [R9](#r9---debug-reference)) |
 | `--dap=<port>` | Serve the Debug Adapter Protocol on loopback for an editor; implies `--debug` |
 
 Diagnostics are colored only when stderr is a VT-capable TTY; setting the
@@ -219,10 +219,10 @@ a security sandbox for *malicious* input.
   the artifact you vetted, and/or require a trusted Ed25519 signature
   (`--require-signed`, see *Package signing*) to authenticate the publisher. These
   are the primary defenses.
-- **`--jit` (JIT) widens the trust surface.** JIT-compiled functions omit the runtime
-  type checks the interpreter performs, so a *tampered* `.flx` run with `--jit` can
+- **The JIT widens the trust surface.** JIT-compiled functions omit the runtime
+  type checks the interpreter performs, so a *tampered* `.flx` run with the JIT on can
   crash or corrupt memory where the interpreter would raise a clean error. Do not
-  enable `--jit` on untrusted bytecode.
+  run untrusted bytecode with `--jit-disable`.
 - `--unsafe` grants FFI and raw-memory access; never combine it with untrusted code.
 
 #### Bytecode verification
@@ -252,7 +252,7 @@ is bounded):
 Size and count caps also apply: `10 MB` of bytecode and `16,385` constants per
 function (see *Limits*). A chunk that fails any check is refused at load time; an
 invalid instruction encountered at run time raises `Exception.IllegalInstruction`
-(code `16`), a hard failure. These guarantees hold for the interpreter; `--jit`
+(code `16`), a hard failure. These guarantees hold for the interpreter; the JIT
 omits the interpreter's runtime type checks and so widens the trust surface as
 noted above.
 
@@ -310,7 +310,7 @@ OS loader ignores it and a plain file copy still works.
   `--sign`, `--no-opt`, `--strip`.
 - **Runtime settings are chosen at embed time.** A self-contained binary hands
   every CLI argument to the script, so flags meant for the VM are recorded in the
-  settings block instead: give `--jit`, `--unsafe`, or any VM limit (`--stack=`,
+  settings block instead: give `--jit-disable`, `--unsafe`, or any VM limit (`--stack=`,
   `--slabs=`, `--fibers=`, `--frames=`, `--fifo=`, `--io-threads=`) alongside
   `--embed` and the binary applies them on every start. Nothing is on by
   default - an embedded program gets JIT or unsafe/FFI mode only if you opted in
@@ -382,10 +382,10 @@ flarisvm --embed app.fls app --bundle='./data.flx'
 ./app
 
 # Compile with JIT code embedded (for every eligible function)
-flarisvm --compile --jit app.fls app.flx
+flarisvm --compile app.fls app.flx
 
 # Run with JIT active (runs eligible functions as native code)
-flarisvm --jit --exec app.flx
+flarisvm --exec app.flx
 
 # See which functions are JIT-eligible during compilation
 flarisvm --verbose app.fls
@@ -496,7 +496,7 @@ These are the actual types values carry at runtime.
 | Type | Description |
 |------|-------------|
 | `fiber` | Lightweight cooperative coroutine. |
-| `fn` | Callable function value. May be a named function, an anonymous function, or a closure (anonymous function with captured outer variables). |
+| `fn` | Any callable value: a named function, an anonymous function, a closure, a bound method (`obj.method`), a builtin (`String.Length`), or an FFI function. Anything you can call satisfies `fn`. |
 | `module` | Built-in module namespace. |
 
 #### Binary Types
@@ -652,7 +652,7 @@ fn format(template: string, value) { return template + str(value); }
 
 | Keyword | Runtime Type |
 |---------|-------------|
-| `fn` | Callable function |
+| `fn` | Any callable: function, closure, bound method, builtin or FFI function |
 | `fiber` | Cooperative coroutine |
 | `class` | Class definition |
 | `instance` | Class instance |
@@ -1370,7 +1370,7 @@ flarisvm --mem myprogram.fls
 A leak count that is stable across runs but non-zero almost always means a cycle
 rather than a missing release. `Debug.Refs(value)` reports an individual value's
 reference count, and `VM.MemoryStats()` returns the same counters programmatically
-for an in-test check. Note that the project's own suite runs `flarisvm --jit --mem`,
+for an in-test check. Note that the project's own suite runs `flarisvm --mem`,
 so a program that looks clean without the flag can still fail there.
 
 ### Locals vs Property Access
@@ -1498,8 +1498,6 @@ Each function table has a `JIT` column stating whether the function can be calle
 | | `Random` | Seeded, deterministic PCG32 random streams |
 | | `Hash` | Non-cryptographic and cryptographic hashes |
 | | `Crypto` | XChaCha20-Poly1305 encryption and CSPRNG |
-| | `Compress` | zlib/gzip-compatible compression |
-| | `Archive` | ZIP archive creation and extraction |
 | | `Util` | Encoding helpers and value comparison |
 | **I/O & Files** | `File` | File read, write, and metadata |
 | | `Directory` | Filesystem directory operations |
@@ -1512,7 +1510,6 @@ Each function table has a `JIT` column stating whether the function can be calle
 | | `Event` | One-shot fiber synchronization (max 64 events) |
 | | `Scheduler` | Low-level fiber scheduling primitives |
 | | `Timers` | Fiber-based timer scheduling (max 64 timers) |
-| **Graphics** | `Gfx` | Software rasterizer, up to 32768×32768 canvas |
 | **System** | `OS` | Process, environment, and system interface |
 | | `VM` | VM introspection and control |
 | | `Ffi` | Dynamic native library loading ⚠️ |
@@ -1549,8 +1546,6 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
-| **All** | `All(arr:array, func:fn ) - bool` | `true` if all elements satisfy `fn(x)`. Stops early on first falsy. | — |
-| **Any** | `Any(arr:array, func:fn ) - bool` | `true` if any element satisfies `fn(x)`. Stops early. | — |
 | **Append** | `Append(arr:array, value:any) - arr` | Appends `value` to end of `arr`. Mutates. | — |
 | **Average** | `Average(arr:array) - float` | Returns the arithmetic mean of all elements as `float`. Returns `nil` if empty. | ✓ |
 | **BinarySearch** | `BinarySearch(arr:array, value:any, less?:fn) - int` | Binary search over a SORTED array. Returns the index of a match, or `-(insertionPoint) - 1` when absent (so `-(result) - 1` is where it would go). Optional `less(a,b)-bool` must be the same predicate the array was sorted with. O(log n). | — |
@@ -1564,16 +1559,10 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **Count** | `Count(arr:array, pred:fn) - int` | Number of elements for which `pred(x)` is truthy. | — |
 | **Fill** | `Fill(arr:array, value:any, start?:int, end?:int) - array` | Sets elements in `[start, end)` to `value` in-place (whole array by default). Negative `start`/`end` count from the end. Returns same array. Mutates. | — |
 | **Find** | `Find(arr:array, pred:fn) - any` | First element for which `pred(x)` is truthy, or `nil`. | — |
-| **FindIndex** | `FindIndex(arr:array, pred:fn) - int` | First index for which `pred(x)` is truthy, or `-1`. | — |
-| **FindLast** | `FindLast(arr:array, pred:fn) - any` | Last element for which `pred(x)` is truthy, or `nil`. | — |
-| **FindLastIndex** | `FindLastIndex(arr:array, pred:fn) - int` | Last index for which `pred(x)` is truthy, or `-1`. | — |
 | **ForEach** | `ForEach(arr:array, func:fn) - array` | Calls `fn(x)` for every element; callback return value is discarded. Returns the original array. | — |
 | **First** | `First(arr:array) - any` | Returns first element or `nil` if empty. | — |
 | **Flatten** | `Flatten(arr:array) - array` | Returns new array with one level of nested arrays collapsed. Non-array elements are kept as-is. | — |
-| **GroupBy** | `GroupBy(arr:array, func:fn) - object` | Groups elements by key. Calls `fn(x)` for each element; the return value becomes the group key (coerced to string). Returns an object where each key maps to an array of the elements that produced it. Empty array returns `{}`. | — |
 | **Chunk** | `Chunk(arr:array, size:int) - array` | Splits `arr` into sub-arrays of at most `size` elements. The last chunk may be smaller. Returns a new array of arrays. | — |
-| **CountBy** | `CountBy(arr:array, func:fn) - object` | Like `GroupBy` but returns `{key: count}` instead of `{key: [elements]}`. Calls `fn(x)` for each element; result is coerced to string as the key. | — |
-| **FlatMap** | `FlatMap(arr:array, func:fn) - array` | Calls `fn(x)` for each element; if the result is an array its elements are spread into the output, otherwise the result itself is appended. One level of flattening. | — |
 | **IndexOf** | `IndexOf(arr:array, value:any) - int` | Returns first index of `value` or `-1` if not found. | ✓ |
 | **InsertAt** | `InsertAt(arr:array, index:int, value:any) - arr` | Inserts `value` at `index`, shifts remaining right; returns the array (`nil` on out-of-range, or raises on a typed-array element-type mismatch). Mutates. | — |
 | **Last** | `Last(arr:array) - any` | Returns last element or `nil` if empty. | — |
@@ -1584,9 +1573,7 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **ProcessCallback** | `ProcessCallback(fn:function, arr:array, len:int, cb:function) - nil` | Processes a scalar array with your worker function `fn(arr, len)`, then calls `cb(arr, result)` when finished. Runs on another CPU core when `fn` is simple enough (only touches `arr`, plain number math, no calls or allocations) — otherwise runs normally, same result. The array must be all-`int`, `float`, `char`, or `bool`, and match the kernel's parameter type (`fn(arr:[int],…)` needs an int array, `fn(arr:[float],…)` a float array, etc.); anything else (mixed, or holding strings/arrays/objects) returns `nil`. See `Buffer.ProcessCallback`. | ✓ |
 | **ProcessEvent** | `ProcessEvent(fn:function, arr:array, len:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ |
 | **Reduce** | `Reduce(arr:array, func:fn, initial?:any) - any` | Aggregates left-to-right: `acc = fn(acc, x)` starting from `initial`. Without `initial`, seeds with the first element (empty array → `nil`). `acc`/result may be any type the callback returns. | — |
-| **ReduceRight** | `ReduceRight(arr:array, func:fn, initial?:any) - any` | Like `Reduce` but folds right-to-left (last element first). Without `initial`, seeds with the last element (empty array → `nil`). | — |
 | **RemoveAt** | `RemoveAt(arr:array, index:int) - bool` | Removes element at `index`, shifts remaining left. Mutates. | — |
-| **RemoveIf** | `RemoveIf(arr:array, pred:fn) - int` | Removes in place every element for which `pred(x)` is truthy (compacting survivors) and returns the number removed. Mutates. | — |
 | **Reserve** | `Reserve(arr:array, capacity:int) - bool` | Ensures capacity ≥ `capacity`. Does not affect length. Mutates capacity. | — |
 | **Reverse** | `Reverse(arr:array) - array` | Reverses elements in-place. Returns same array. Mutates. | — |
 | **Select** | `Select(arr:array, func:fn ) - array` | Returns new array by applying `fn(x)` to every element (map). | — |
@@ -1595,14 +1582,10 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **Skip** | `Skip(arr:array, count:int) - array` | Returns new array with first `count` elements removed (a non-positive `count` keeps all). | — |
 | **Slice** | `Slice(arr:array, start:int, end?:int) - array` | Returns a new array with elements `[start, end)` (to the end by default). Negative indices count from the end (Python-style); both are clamped, an empty range yields `[]`. | — |
 | **SequenceEqual** | `SequenceEqual(a:array, b:array) - bool` | `true` if `a` and `b` have the same length and equal elements in order (strict value+type equality: `2 ≠ 2.0`). | — |
-| **MaxBy** | `MaxBy(arr:array, func:fn) - any` | Returns the element for which `fn(x)` produces the largest key. Returns `nil` if `arr` is empty. Builtin functions (e.g. `String.Length`) use the fast path. | — |
-| **MinBy** | `MinBy(arr:array, func:fn) - any` | Returns the element for which `fn(x)` produces the smallest key. Returns `nil` if `arr` is empty. Builtin functions use the fast path. | — |
-| **Partition** | `Partition(arr:array, func:fn) - array` | Returns a two-element array `[matches, rest]` where `matches` contains elements for which `fn(x)` is truthy and `rest` contains the remainder. | — |
 | **Sort** | `Sort(arr:array, fn?:fn) - array` | Sorts in-place. Optional comparator `fn(a,b)-bool`. Mutates. | — |
 | **SortedInsert** | `SortedInsert(arr:array, value:any, less?:fn) - int` | Inserts `value` into a SORTED array keeping it sorted (after any equal run). Returns the insertion index, or `nil` on failure. Same optional `less` predicate as `Sort`/`BinarySearch`. Mutates. | — |
 | **SortBy** | `SortBy(arr:array, func:fn) - array` | Sorts in-place by extracted key: calls `fn(x)` once per element and compares the results. Builtin functions (e.g. `String.Length`, `Type.Of`) use the fast path. Mutates. | — |
 | **Tally** | `Tally(arr:array) - object` | Counts occurrences of each element (converted to string). Returns `{value: count}`. | — |
-| **UniqueBy** | `UniqueBy(arr:array, func:fn) - array` | Returns a new array keeping only the first element for each distinct value of `fn(x)`. Preserves order. | — |
 | **Subset** | `Subset(arr:array, from:int, count:int) - array` | Returns new array of `count` elements starting at index `from`. | — |
 | **Swap** | `Swap(arr:array, i:int, j:int) - arr` | Swaps elements at indices `i` and `j`; returns the array (`nil` if either index is out of range). Mutates. | — |
 | **Take** | `Take(arr:array, count:int) - array` | Returns new array of first `count` elements. | — |
@@ -1688,7 +1671,7 @@ Low-level binary memory operations. A buffer is `count` elements × `size` bytes
   - You give it a **worker function** `fn(buf, len, blocksize)` that reads and writes the buffer, plus a **`cb(buf, result)`** that runs when the work is finished. `ProcessCallback` returns right away; `cb` is called later. (`ProcessEvent` is the same but signals an event instead of calling `cb` — see below.)
   - `len` and `blocksize` are just two numbers passed straight through to your worker function for it to use as it likes (typically the element count and the element bit-width, 8/16/32/64). The call does not split or reinterpret the buffer for you.
   - Your worker function returns an `int` or a `float`; that value arrives as the second argument of `cb(buf, result)`. If the work hits an error (e.g. an out-of-range index), `result` is `nil` — it never crashes your program.
-  - **To make it run on another core (with `--jit`), keep the worker function simple:** it must only read/write the buffer you passed and do plain number math — **no** creating strings/arrays/objects and **no** calling other functions from inside it. Its first parameter must be the buffer and any others must be `int`. A function that follows these rules runs in parallel; any other function still works correctly but runs normally (in line), so you get the same result either way.
+  - **To make it run on another core, keep the worker function simple:** it must only read/write the buffer you passed and do plain number math — **no** creating strings/arrays/objects and **no** calling other functions from inside it. Its first parameter must be the buffer and any others must be `int`. A function that follows these rules runs in parallel; any other function still works correctly but runs normally (in line), so you get the same result either way.
   - **`cb` has no such restriction** — it is an ordinary function. Read the finished buffer, allocate, call anything.
   - **To actually run work in parallel, start several calls at once** over *different* buffers. Each returns immediately, so the jobs run side by side. A single call processes one buffer; it does not split one buffer across cores.
   - **`ProcessEvent(fn, buf, len, blocksize, eventId)`** delivers the result into an event instead of calling a callback. Start several jobs, each with its own event id, then wait for them all in one line with `Event.WaitFor([ids])` — it blocks until every job is done and returns the results as an array (see the example). Handy when you want to fan out and then continue once everything finishes.
@@ -1931,70 +1914,6 @@ fn touch(key, value) {
     cache.MoveToEnd(key);              // mark as most-recently-used
     if (cache.Size() > 100) cache.PopFirst();  // drop the oldest
 }
-```
-
----
-
-### Compress
-
-Namespace: **`Compress`**
-
-Raw zlib compression. Max input 4 GB.
-
-| Function | Signature | Description | JIT |
-| -------- | --------- | ----------- | --- |
-| **Zip** | `Zip(data:string\|block, level?:int) - block` | Compress data (raw zlib). Optional level 1–9 (default 6). Returns compressed block. | — |
-| **Unzip** | `Unzip(data:block, maxSize?:int) - block` | Decompress data (raw zlib/gzip). Optional max output size hint. Returns decompressed block. | — |
-
----
-
-### Archive
-
-Namespace: **`Archive`**
-
-ZIP archive creation and extraction. Uses a factory pattern: `Open`/`OpenFile` return reader objects; `Create` returns a writer object.
-
-**Factory functions:**
-
-| Function | Signature | Description | JIT |
-| -------- | --------- | ----------- | --- |
-| **Open** | `Open(data:block) - reader` | Open a ZIP archive from in-memory bytes. Returns a reader object. | — |
-| **OpenFile** | `OpenFile(path:string) - reader` | Open a ZIP archive from disk. Returns a reader object. **Requires unsafe mode.** | — |
-| **Create** | `Create() - writer` | Create a new empty ZIP archive writer. | — |
-
-**Reader methods** (returned by `Open` / `OpenFile`):
-
-| Method | Signature | Description | JIT |
-|--------|-----------|-------------| --- |
-| **List** | `r.List() - array` | List all entries. Each element is `{Name:string, Size:int, CompressedSize:int, IsDir:bool}`. | — |
-| **Read** | `r.Read(name:string) - block\|nil` | Extract one file by name. Returns raw bytes block, or `nil` if not found. | — |
-| **Extract** | `r.Extract(name:string, dest:string) - bool` | Extract one file to a path on disk. Creates intermediate directories. Returns `true` on success. **Requires unsafe mode.** | — |
-| **ExtractAll** | `r.ExtractAll(dir:string) - int` | Extract all files into `dir`. Creates intermediate directories. Returns number of files extracted. **Requires unsafe mode.** | — |
-
-**Writer methods** (returned by `Create`):
-
-| Method | Signature | Description | JIT |
-|--------|-----------|-------------| --- |
-| **Add** | `w.Add(name:string, data:string\|block) - nil` | Add a file entry from a string or block. | — |
-| **AddFile** | `w.AddFile(name:string, path:string) - nil` | Add a file entry by reading from disk. **Requires unsafe mode.** | — |
-| **Build** | `w.Build() - block` | Finalise the archive and return ZIP bytes as a block. | — |
-| **Save** | `w.Save(path:string) - bool` | Finalise the archive and write it to disk. Returns `true` on success. **Requires unsafe mode.** | — |
-
-**Example:**
-
-```js
-// Create
-let w = Archive.Create();
-w.Add("readme.txt", "Hello!");
-w.Add("data/nums.txt", "1\n2\n3");
-let bytes = w.Build();        // returns block
-w.Save("/tmp/out.zip");       // or save directly to disk
-
-// Read
-let r = Archive.Open(bytes);
-let entries = r.List();       // [{Name:"readme.txt", Size:6, ...}, ...]
-let raw = r.Read("readme.txt"); // block -> str(raw) == "Hello!"
-r.ExtractAll("/tmp/extracted");
 ```
 
 ---
@@ -2483,89 +2402,6 @@ FileWatch.Close(id)
 
 ---
 
-### Gfx
-
-Namespace: **`Gfx`**
-
-Software rasterizer. Colors are `0xAARRGGBB` integers. Max canvas 32768×32768.
-
-| Function | Signature | Description | JIT |
-| -------- | --------- | ----------- | --- |
-| **Create** | `Create(width:int, height:int) - instance` | Create blank canvas. | — |
-| **CreateFromFile** | `CreateFromFile(path:string) - instance` | Load PNG from disk into canvas. | — |
-
-**Static color helpers:**
-
-| Function | Signature | Description | JIT |
-| -------- | --------- | ----------- | --- |
-| **RGB** | `RGB(r:int, g:int, b:int) - int` | Pack RGB channels into a fully-opaque `0xFFRRGGBB` color. | ✓ |
-| **RGBA** | `RGBA(r:int, g:int, b:int, a:int) - int` | Pack RGBA channels into `0xAARRGGBB`. | ✓ |
-| **HSL** | `HSL(h:float, s:float, l:float) - int` | Convert HSL to `0xFFRRGGBB`. `h` is 0–360, `s` and `l` are 0.0–1.0. | ✓ |
-
-**`IGfx` instance fields:** `Width:int`, `Height:int`, `Pixels:array`
-
-**`IGfx` instance methods:**
-
-| Method | Signature | Description | JIT |
-| -------- | ----------- | ------------- | --- |
-| Clear | `Clear(color:int)` | Fill entire canvas with `color`. |
-| SetPixel | `SetPixel(x, y, color)` | Set single pixel. |
-| GetPixel | `GetPixel(x, y) - int` | Return pixel color. |
-| DrawLine | `DrawLine(x1, y1, x2, y2, color)` | Bresenham line. |
-| DrawHLine | `DrawHLine(x, y, len, color)` | Horizontal line. |
-| DrawVLine | `DrawVLine(x, y, len, color)` | Vertical line. |
-| DrawRect | `DrawRect(x, y, w, h, color)` | Rectangle outline. |
-| FillRect | `FillRect(x, y, w, h, color)` | Filled rectangle. |
-| DrawCircle | `DrawCircle(cx, cy, r, color)` | Circle outline (Midpoint algorithm). |
-| FillPolygon | `FillPolygon(points, color)` | Fill polygon from array of `{x,y}` objects. |
-| StrokePath | `StrokePath(points, color)` | Stroke open polyline. |
-| DrawChar | `DrawChar(x, y, ch, color, scale?)` | Render a single character. |
-| DrawText | `DrawText(x, y, text, color, scale?)` | Render a string. |
-| DrawTextOpts | `DrawTextOpts(x, y, text, opts?)` | Render a string using an options object. Fields: `color` (int, default opaque white), `scale` (int, default 1), `spacing` (int px between glyphs, default 0), `lineSpacing` (int px between lines, default 0). Absent/unknown fields use their defaults. |
-| Blit | `Blit(x, y, w, h, pixels)` | Copy a flat ARGB array (`QRCode.ToPixels`, custom bitmaps) onto the canvas at `(x, y)`. `pixels` must have at least `w × h` elements. |
-| DrawImage | `DrawImage(x, y, src)` | Blit another `IGfx` canvas onto this one. |
-| SaveToFile | `SaveToFile(path) - bool` | Save canvas as PNG. |
-| SaveToBlock | `SaveToBlock() - block` | Return canvas as PNG bytes. |
-| Draw | `Draw(fn)` | Batch-draw callback: `fn(canvas)`. |
-| CopyRect | `CopyRect(x, y, w, h) - instance` | Copy sub-rectangle into new canvas. |
-| Resize | `Resize(w, h) - instance` | Resize (nearest-neighbor) into new canvas. |
-| Rescale | `Rescale(factor) - instance` | Scale by factor into new canvas. |
-| Filter | `Filter(fn, x, y, w, h)` | Apply per-pixel callback `fn(pixel:int) - int` over region. Return `nil` to leave pixel unchanged. Mutates in place. |
-| FilterCallback | `FilterCallback(fn, x, y, w, h, cb)` | Runs your pixel-processing function `fn(pixels, x, y, w, h, stride)` over the `x,y,w,h` rectangle of the image, then calls `cb(image, result)` when finished. `pixels` is the image's 32-bit ARGB data; reach a pixel with `pixels[(y+dy)*stride + (x+dx)]`. Runs on another CPU core when `fn` is simple enough (only touches `pixels`, plain number math, no calls or allocations) — otherwise runs normally, same result. See `Buffer.ProcessCallback`. |
-| FilterEvent | `FilterEvent(fn, x, y, w, h, eventId:int)` | Like `FilterCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. |
-| Grayscale  | `Grayscale(x, y, w, h)`                          | Convert region to grayscale using BT.601 luminance weights. Alpha channel preserved. Mutates in place. |
-| Brightness | `Brightness(x, y, w, h, factor:float)`            | Multiply RGB channels by `factor` (1.0 = no change, 0.5 = half, 2.0 = double). Values clamped to 0–255. Alpha preserved. Mutates in place. |
-| BlendRect  | `BlendRect(src:instance, dx:int, dy:int, alpha?:int)` | Composite `src` canvas onto this canvas at `(dx, dy)` using source-over alpha blending. Optional `alpha` (0–255) scales the overall opacity of `src`; defaults to 255. Mutates in place. |
-
-#### PNG Compatibility
-
-**Reading** (`CreateFromFile`, `DrawImage`) - decoded to RGBA8:
-
-- Color types: grayscale, RGB, palette (indexed), grayscale+alpha, and RGBA
-- Bit depths: 1/2/4/8/16 as the color type allows (16-bit is reduced to 8-bit; sub-byte depths are unpacked)
-- Palette `tRNS` (per-index transparency) is applied; palette images require a `PLTE` chunk
-- All five filter types supported (None, Sub, Up, Average, Paeth)
-- Not supported: interlaced (Adam7) files, and color-key `tRNS` for grayscale/RGB. These throw `EXCEPTION_IO_ERROR`
-
-**Writing** (`SaveToFile`, `SaveToBlock`):
-
-- Always writes RGBA 32-bit, 8-bit per channel
-- Filter: None (fast, slightly larger files than adaptive filtering)
-- Compression: zlib level 6
-
-#### Color model
-
-- Pixels are 32-bit `0xAARRGGBB` with **straight (non-premultiplied) alpha**.
-- Compositing (`Draw`, `BlendRect`, `DrawImage`, semi-transparent primitives) is
-  source-over in **gamma / sRGB space** (not linearized) - the same default as
-  Skia and Cairo. Linear-light blending is not offered; if added it would arrive
-  as an explicit blend-mode option rather than a global change.
-- **Bilinear** scaling in `DrawImage` interpolates in **premultiplied alpha**, so a
-  fully transparent source pixel contributes no color and cannot bleed its RGB into
-  scaled edges (no halos). Nearest-neighbour scaling is unaffected.
-
----
-
 ### Hash
 
 Namespace: **`Hash`**
@@ -2741,18 +2577,6 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | **LeadingZeros** | `LeadingZeros(n:int) - int` | Number of leading zero bits in the 64-bit representation (64 when n=0). | ✓ |
 | **TrailingZeros** | `TrailingZeros(n:int) - int` | Number of trailing zero bits in the 64-bit representation (64 when n=0). | ✓ |
 
-**Matrix and vector algebra** lives in the `Numerics` library, as the `Matrix`
-and `Vec` classes. `Matrix` stores a matrix as a flat row-major `[float]`, which
-the JIT compiles; a nested array-of-arrays is not a JIT type. `FromRows`/`ToRows`
-convert at the boundary.
-
-```
-import { Matrix, Vec } from library("Numerics", "1.0");
-
-let a = Matrix.FromRows([[1.0, 2.0], [3.0, 4.0]]);
-let c = a.Mul(Matrix.Identity(2)).Transpose();   // -> Matrix
-let d = Vec.Dot([1.0, 2.0], [3.0, 4.0]);         // -> 11.0
-```
 
 **Constants:**
 
@@ -2918,11 +2742,11 @@ the class's declaration order.
 | **HasKey** | `HasKey(obj:object, key:string) - bool` | `true` if property `key` exists. | ✓ |
 | **Invert** | `Invert(obj:object) - object` | Returns a new object with keys and values swapped. Values are coerced to string to become keys. | — |
 | **IsFrozen** | `IsFrozen(obj:object) - bool` | `true` if `obj` was frozen by `Freeze`. `false` for an unfrozen object or a non-object. | ✓ |
-| **IsNil** | `IsNil(val:any) - bool` | `true` if `val` is `nil`. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Any`, `Array.GroupBy`, etc. | ✓ |
+| **IsNil** | `IsNil(val:any) - bool` | `true` if `val` is `nil`. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Find`, `Array.Count`, etc. | ✓ |
 | **Keys** | `Keys(obj:object\|instance\|class) - array` | Array of property names (object) or field names (instance/class). | — |
 | **MapKeys** | `MapKeys(obj:object, func:fn) - object` | Returns a new object with keys transformed by `fn(key)`. Values are kept; new keys are coerced to string. Builtin functions (e.g. `String.ToUpper`) use the fast path. | — |
 | **Merge** | `Merge(dst:object, src:object) - bool` | Copy all `src` properties into `dst`. Mutates `dst`. Shallow. Raises if `dst` is frozen. | — |
-| **NotNil** | `NotNil(val:any) - bool` | `true` if `val` is not `nil`. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Any`, `Array.GroupBy`, etc. | ✓ |
+| **NotNil** | `NotNil(val:any) - bool` | `true` if `val` is not `nil`. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Find`, `Array.Count`, etc. | ✓ |
 | **Pick** | `Pick(obj:object, keys:array) - object` | Returns new object with only the listed keys. | — |
 | **Reduce** | `Reduce(obj:object, func:fn, initial:any) - any` | Folds over entries: `acc = fn(acc, key, value)` starting from `initial`. | — |
 | **Select** | `Select(obj:object, func:fn ) - object` | Returns new object with values transformed by `fn(key, value)`. | — |
@@ -2980,7 +2804,7 @@ Type.Assert(x, Type.Number, "expected a number");
 | ---------- | ----------- | ------------- | --- |
 | **Assert** | `Assert(x:any, mask:int, msg?:string) - bool` | Throws `InvalidArgs` if `type(x)` does not match `mask`. Optional custom message. Returns `true` on success. | ✓ |
 | **Is** | `Is(x:any, mask:int) - bool` | Returns `true` if `type(x)` matches any bit in `mask`. Use with composite constants. | ✓ |
-| **IsArray** | `IsArray(x:any) - bool` | `true` if `x` is an array. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Select`, `Array.GroupBy`, etc. | ✓ |
+| **IsArray** | `IsArray(x:any) - bool` | `true` if `x` is an array. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Select`, `Array.Count`, etc. | ✓ |
 | **IsBlock** | `IsBlock(x:any) - bool` | `true` if `x` is a memory block/typed buffer. | ✓ |
 | **IsBool** | `IsBool(x:any) - bool` | `true` if `x` is a bool. | ✓ |
 | **IsCallable** | `IsCallable(x:any) - bool` | `true` if `x` is any callable: function, builtin, **bound method**, or FFI. Superset of `IsFunction`. | ✓ |
@@ -3000,7 +2824,7 @@ Type.Assert(x, Type.Number, "expected a number");
 | **IsString** | `IsString(x:any) - bool` | `true` if `x` is a string. | ✓ |
 | **Name** | `Name(x:any) - string` | Returns the type as a human-readable string: `"int"`, `"array"`, `"fiber"`, etc. Single-arg; usable as a callback. | ✓ owned¹ |
 | **NameOf** | `NameOf(code:int) - string` | Returns the readable name of a `Type.*` code or a composite mask, e.g. `NameOf(Type.Number)` - `"int\|float"`. The inverse of `Of`. | ✓ owned¹ |
-| **Of** | `Of(x:any) - int` | Returns the type bitmask of `x` - the referenceable equivalent of the `type()` built-in. Single-arg; usable as a callback (e.g. `Array.GroupBy(items, Type.Of)`). | ✓ |
+| **Of** | `Of(x:any) - int` | Returns the type bitmask of `x` - the referenceable equivalent of the `type()` built-in. Single-arg; usable as a callback (e.g. `Array.SortBy(items, Type.Of)`). | ✓ |
 
 
 > The numeric values below are implementation-defined bit flags. Always compare
@@ -3690,6 +3514,7 @@ Virtual machine introspection and control.
 
 Bound methods are automatically unwrapped - passing a bound method returns info about the underlying function.
 
+
 ## R9 - Debug Reference
 
 ### Debug Opcodes
@@ -4370,14 +4195,14 @@ fn fast_sum(n) {
 
 On ARM64 and x86-64, Flaris includes a second execution tier: a function-level JIT compiler that translates eligible functions to native machine code. JIT-compiled functions run much faster than the bytecode interpreter for numeric workloads.
 
-JIT is controlled by a single flag, `--jit`, which gates the pipeline at both ends:
+The JIT is **on by default** and gates the pipeline at both ends. `--jit-disable` turns it off at whichever end you pass it:
 
 | Step | Command | Effect |
 | --- | --- | --- |
-| Compile | `flarisvm --compile --jit app.fls app.flx` | Generates JIT IR and embeds it in the `.flx` alongside standard bytecode |
-| Run | `flarisvm --jit --exec app.flx` | Compiles the embedded JIT IR to native code on first function load |
+| Compile | `flarisvm --compile app.fls app.flx` | Generates JIT IR and embeds it in the `.flx` alongside standard bytecode |
+| Run | `flarisvm --exec app.flx` | Compiles the embedded JIT IR to native code on first function load |
 
-Without `--jit` at compile time, no JIT IR is written - the `.flx` is standard bytecode only. Without `--jit` at run time, any JIT IR in the file is loaded but not compiled; functions run on the bytecode interpreter.
+With `--jit-disable` at compile time, no JIT IR is written - the `.flx` is standard bytecode only. With `--jit-disable` at run time, any JIT IR in the file is loaded but not compiled; functions run on the bytecode interpreter.
 
 The JIT backend is automatically selected at run time based on the CPU: ARM64 on Apple Silicon / Raspberry Pi / etc., and x86-64 on Linux/macOS/Windows PCs. On other platforms the bytecode interpreter is the only execution tier.
 
@@ -4493,7 +4318,7 @@ fn sweep(n: int) : float {
 
 ### Eligibility (automatic)
 
-There is no keyword to mark a function for JIT. When `--jit` is active, **every eligible function is compiled automatically** - just write ordinary functions with typed parameters. A function is **JIT-eligible** when all of the following hold:
+There is no keyword to mark a function for JIT. Unless `--jit-disable` is given, **every eligible function is compiled automatically** - just write ordinary functions with typed parameters. A function is **JIT-eligible** when all of the following hold:
 
 - All parameters have explicit type annotations
 - The return type is explicitly annotated, **or** the analyzer can infer it: when every
@@ -4532,7 +4357,7 @@ fn sum_to(n: int) : int {
 A function that fails the eligibility check simply runs on the bytecode interpreter - no error, no warning. Use `--verbose` to see which functions qualified:
 
 ```sh
-flarisvm --verbose --jit myfile.fls
+flarisvm --verbose myfile.fls
 # [JIT] signature-eligible: sum_to (line 20)
 # [JIT] signature-eligible: normalize (line 35)
 ```
@@ -4548,7 +4373,7 @@ flarisvm --check mymath.fls
 ```
 
 ```text
-JIT eligibility  (✓ native with --jit   · interpreted):
+JIT eligibility  (✓ native   · interpreted):
 
   ✓ sum_to                       (line 12)
   ✓ dot                          (line 20)
@@ -4563,11 +4388,11 @@ The reason on each `·` line names the first disqualifier and its line, so you c
 
 ### JIT IR in compiled .flx files
 
-`--jit` controls the JIT at both ends. When you compile a `.flx` with `--jit`, the JIT code for every eligible function is embedded alongside the regular bytecode; without `--jit` at compile time, none is written:
+The JIT is on by default at both ends. When you compile a `.flx`, the JIT code for every eligible function is embedded alongside the regular bytecode; without `--jit` at compile time, none is written:
 
 ```sh
-flarisvm --compile --jit myfile.fls myfile.flx   # compile - embeds JIT code
-flarisvm --jit --exec myfile.flx              # execute - runs functions natively
+flarisvm --compile myfile.fls myfile.flx   # compile - embeds JIT code
+flarisvm --exec myfile.flx                 # execute - runs functions natively
 flarisvm    --exec myfile.flx              # execute - runs bytecode only (JIT code present but inactive)
 ```
 
@@ -4773,22 +4598,11 @@ When a JIT-compiled function is passed as a callback to one of the builtins belo
 | `Array.Select(arr, fn)` | `fn(elem: T): U` |
 | `Array.Where(arr, fn)` | `fn(elem: T): bool` |
 | `Array.Reduce(arr, fn, init)` | `fn(acc: T, elem: T): T` |
-| `Array.ReduceRight(arr, fn, init)` | `fn(acc: T, elem: T): T` |
-| `Array.Any(arr, fn)` | `fn(elem: T): bool` |
-| `Array.All(arr, fn)` | `fn(elem: T): bool` |
-| `Array.Find(arr, fn)` / `FindIndex` / `FindLast` / `FindLastIndex` | `fn(elem: T): bool` |
+| `Array.Find(arr, fn)` | `fn(elem: T): bool` |
 | `Array.Count(arr, fn)` | `fn(elem: T): bool` |
-| `Array.RemoveIf(arr, fn)` | `fn(elem: T): bool` |
 | `Array.Process(arr, fn)` | `fn(elem: T): T` - mutates in place |
 | `Array.ProcessIdx(arr, fn)` | `fn(elem: T, idx: int): T` - mutates in place |
-| `Array.GroupBy(arr, fn)` | `fn(elem: T): key` |
 | `Array.SortBy(arr, fn)` | `fn(elem: T): key` |
-| `Array.FlatMap(arr, fn)` | `fn(elem: T): array\|T` |
-| `Array.CountBy(arr, fn)` | `fn(elem: T): key` |
-| `Array.Partition(arr, fn)` | `fn(elem: T): bool` |
-| `Array.MinBy(arr, fn)` | `fn(elem: T): key` |
-| `Array.MaxBy(arr, fn)` | `fn(elem: T): key` |
-| `Array.UniqueBy(arr, fn)` | `fn(elem: T): key` |
 | `Array.Sort(arr, fn)` | `fn(a: T, b: T): bool` - comparator; return true if a < b |
 
 **Other builtins:**
@@ -4796,27 +4610,22 @@ When a JIT-compiled function is passed as a callback to one of the builtins belo
 | Method | Callback signature |
 | --- | --- |
 | `Memory.Process(addr, count, size, fn)` | `fn(val: int, idx: int): int` - rewrites each element |
-| `Gfx.Filter(fn, x, y, w, h)` | `fn(pixel: int): int` - rewrites each ARGB pixel |
+| `Buffer.ProcessCallback(fn, buf, len, blocksize, cb)` | `fn(val: int, idx: int): int` - rewrites each element |
 
-The fast path is selected automatically at runtime when `--jit` is active and the passed function is JIT-eligible. Otherwise (e.g. `--jit` is absent, or the function isn't eligible) the builtin falls back to the normal interpreter path transparently.
+The fast path is selected automatically at runtime unless `--jit-disable` is given, when the passed function is JIT-eligible. Otherwise (`--jit-disable`, or the function isn't eligible) the builtin falls back to the normal interpreter path transparently.
 
 ```js
-fn double_pixel(px: int): int {
-    let r: int = (px >> 16) & 0xFF;
-    let g: int = (px >> 8)  & 0xFF;
-    let b: int =  px        & 0xFF;
-    let a: int = (px >> 24) & 0xFF;
-    // Brighten RGB channels, clamp to 255
-    if (r * 2 > 255) { r = 255; } else { r = r * 2; }
-    if (g * 2 > 255) { g = 255; } else { g = g * 2; }
-    if (b * 2 > 255) { b = 255; } else { b = b * 2; }
-    return (a << 24) | (r << 16) | (g << 8) | b;
+fn brighten(v: int, idx: int): int {
+    // Scale a sample and clamp - a typed, allocation-free body, so it lowers.
+    let x: int = v * 2;
+    if (x > 255) { x = 255; }
+    return x;
 }
 
-let img = Gfx.Create(800, 600);
-// ...draw something...
-img.Filter(double_pixel, 0, 0, 800, 600);  // native ARM64 per-pixel loop
+let buf = Buffer.Create(1024, 1);
+Memory.Process(Buffer.GetAddress(buf), 1024, 1, brighten);  // native per-element loop
 ```
+
 
 ### Calling convention and memory
 
@@ -4828,19 +4637,19 @@ Machine code is allocated with `mmap`/`mprotect` (no entitlement required on mac
 
 ```sh
 # 1. Compile with JIT IR embedded
-flarisvm --compile --jit myapp.fls myapp.flx
+flarisvm --compile myapp.fls myapp.flx
 
-# 2. Verify which functions are eligible (structural check, --jit not required here)
+# 2. Verify which functions are eligible (structural check)
 flarisvm --verbose myapp.fls
 
 # 3. Run with JIT active
-flarisvm --jit --exec myapp.flx
+flarisvm --exec myapp.flx
 
 # 4. Run without JIT (fallback to bytecode interpreter, even if JIT IR present)
 flarisvm --exec myapp.flx
 
 # 5. Source file directly: compile+run in one step with JIT
-flarisvm --jit myapp.fls
+flarisvm myapp.fls
 ```
 
 ### Benchmark reference

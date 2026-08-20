@@ -116,7 +116,7 @@ generate_code | flarisvm -       # generate and run on the fly
 flarisvm --disasm script.flx
 ```
 
-**Check JIT eligibility** - compile without running and print, per function, whether it runs as native code under `--jit` and (if not) why:
+**Check JIT eligibility** - compile without running and print, per function, whether it runs as native code and (if not) why:
 
 ```sh
 flarisvm --check script.fls
@@ -124,7 +124,7 @@ flarisvm --check script.fls
 # · label        (line 34) - operator on a non-numeric operand (e.g. string concatenation)
 ```
 
-With `--jit`, every eligible function is JIT-compiled automatically (no annotation needed) - `--check` shows you which ones qualify. See Reference R11.
+Every eligible function is JIT-compiled automatically (no annotation needed; `--jit-disable` turns it off) - `--check` shows you which ones qualify. See Reference R11.
 
 **Run inline code** (quick test):
 
@@ -167,7 +167,7 @@ flarisvm --embed app.flx myapp
 ```
 
 `--embed <input> <output>` accepts the same `--bundle`, `--sign`, `--no-opt`, and `--strip`
-options as `--compile`. Runtime behavior is also decided here: pass `--jit`,
+options as `--compile`. Runtime behavior is also decided here: pass `--jit-disable`,
 `--unsafe`, or VM limits (`--stack=`, `--frames=`, ...) alongside `--embed` and
 they are baked into the binary and applied on every start - a standalone binary
 hands all its CLI arguments to the script, so embedding is the only place to set
@@ -219,7 +219,7 @@ flarisvm --require-signed --exec app.flx
 | `--verbose` | Verbose output (timing, info) |
 | `--trace` | Very verbose (opcode-level trace) |
 | `--time` | Timing report |
-| `--jit` | Enable JIT: auto-compiles every eligible function to native code (use `--check` to see which) |
+| `--jit-disable` | Turn off the JIT. It is on by default and auto-compiles every eligible function to native code (use `--check` to see which) |
 | `--mem` | Memory report at shutdown (peak RSS, slab footprint, leak detection) |
 | `--stats` | Statistics (allocations, counters) |
 | `--unsafe` | Enable FFI / unsafe code |

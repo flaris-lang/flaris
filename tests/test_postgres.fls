@@ -1,0 +1,92 @@
+// Test suite for Postgres.fls
+//
+// The library is a thin FFI wrapper over libpq, so almost every call needs the
+// pg_ffi plugin AND a reachable server. What is always testable - and what most
+// users actually hit first - is that a missing plugin or an unreachable server
+// degrades to nil instead of crashing or raising out of the library.
+//
+// When FLARIS_PG_TEST is set to a connection string, the round-trip against a
+// real server runs too. Otherwise those checks are reported as skipped rather
+// than silently passing.
+//
+// Run: ./flarisvm ./tests/test_postgres.fls --unsafe
+
+import { Postgres } from library("Postgres", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global skipped     = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+fn skip(msg) {
+    skipped = skipped + 1;
+    Console.WriteLine("  SKIP: " + msg);
+}
+
+// Connect must answer nil for an unusable target - never raise, never crash.
+fn test_graceful_failure() {
+    let r = nil;
+    let raised = false;
+    try { r = Postgres.Connect("host=127.0.0.1 port=1 dbname=nope connect_timeout=1"); }
+    catch (e) { raised = true; }
+    check(!raised, "Connect to a dead port does not raise out of the library");
+    check(r == nil, "Connect to a dead port returns nil");
+
+    raised = false;
+    try { r = Postgres.Connect(""); } catch (e) { raised = true; }
+    check(!raised, "Connect with an empty connection string does not raise");
+
+    raised = false;
+    try { r = Postgres.Connect("this is not a connection string"); } catch (e) { raised = true; }
+    check(!raised, "Connect with a malformed connection string does not raise");
+    check(r == nil, "Connect with a malformed connection string returns nil");
+    return 0;
+}
+
+fn test_live_server() {
+    let env = Os.GetEnvAll();
+    let conn = env["FLARIS_PG_TEST"];
+    if (conn == nil || len(conn) == 0) {
+        skip("live server checks - set FLARIS_PG_TEST to a connection string to run them");
+        return 0;
+    }
+    let db = Postgres.Connect(conn);
+    check(db != nil, "Connect to the configured server");
+    if (db == nil) { return 0; }
+
+    let rows = db.Query("SELECT 1 AS one, 'abc' AS word");
+    check(rows != nil && !("error" in rows), "simple SELECT succeeds");
+    if (rows != nil && !("error" in rows)) {
+        check(len(rows) == 1, "SELECT returns one row");
+        check(rows[0].one == 1, "int column maps natively");
+        check(rows[0].word == "abc", "text column maps natively");
+    }
+
+    let one = db.QueryOne("SELECT 42 AS answer");
+    check(one != nil && one.answer == 42, "QueryOne returns the first row");
+    check(db.QueryOne("SELECT 1 WHERE false") == nil, "QueryOne on an empty result -> nil");
+
+    let p = db.QueryParams("SELECT $1::int AS v", [7]);
+    check(p != nil && !("error" in p) && p[0].v == 7, "parameterised query binds values");
+
+    let bad = db.Query("SELECT * FROM a_table_that_does_not_exist");
+    check(bad != nil && ("error" in bad), "a failing query reports an error object");
+
+    db.Close();
+    return 0;
+}
+
+fn Main() {
+    Console.WriteLine("=== Postgres tests ===");
+    test_graceful_failure();
+    test_live_server();
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed) + "  skipped:" + str(skipped));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All Postgres tests passed!");
+    return 0;
+}

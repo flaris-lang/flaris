@@ -1247,6 +1247,137 @@ fn test_empty_aggregations() {
 // Runner
 // ============================================================
 
+
+// ---------------------------------------------------------------------------
+//  Free-function forms: Linq.X(arr, fn) over a plain array.
+//  Contracts match the chainable Query methods; a grouping key is the string
+//  form of the selector result.
+// ---------------------------------------------------------------------------
+
+fn _lf_even(x) { return x % 2 == 0; }
+fn _lf_big(x)  { return x > 100; }
+fn _lf_k3(x)   { return x % 3; }
+fn _lf_dup(x)  { return [x, x]; }
+fn _lf_x10(x)  { return x * 10; }
+fn _lf_join(acc, x) { return str(acc) + "|" + str(x); }
+
+fn test_free_functions() {
+    let a = [5, 2, 9, 2, 7, 4, 1];
+
+    check(Linq.Any(a, _lf_even),        "Linq.Any true");
+    check(!Linq.Any(a, _lf_big),        "Linq.Any false");
+    check(!Linq.Any([], _lf_even),      "Linq.Any empty");
+    check(!Linq.All(a, _lf_even),       "Linq.All false");
+    check(Linq.All([], _lf_even),       "Linq.All empty is vacuously true");
+
+    checkEq(Linq.FindIndex(a, _lf_even),     1,  "Linq.FindIndex");
+    checkEq(Linq.FindIndex(a, _lf_big),     -1,  "Linq.FindIndex none");
+    checkEq(Linq.FindLast(a, _lf_even),      4,  "Linq.FindLast");
+    checkEq(Linq.FindLast(a, _lf_big),     nil,  "Linq.FindLast none");
+    checkEq(Linq.FindLastIndex(a, _lf_even), 5,  "Linq.FindLastIndex");
+    checkEq(Linq.FindLastIndex(a, _lf_big), -1,  "Linq.FindLastIndex none");
+
+    // 5,2,2 -> key 2   9 -> key 0   7,4,1 -> key 1
+    let g = Linq.GroupBy(a, _lf_k3);
+    checkEq(len(Object.Keys(g)), 3,   "Linq.GroupBy key count");
+    checkEq(len(g["2"]), 3,           "Linq.GroupBy bucket 2");
+    checkEq(len(g["0"]), 1,           "Linq.GroupBy bucket 0");
+    checkEq(len(g["1"]), 3,           "Linq.GroupBy bucket 1");
+    checkEq(len(Object.Keys(Linq.GroupBy([], _lf_k3))), 0, "Linq.GroupBy empty");
+
+    let c = Linq.CountBy(a, _lf_k3);
+    checkEq(c["2"], 3, "Linq.CountBy bucket 2");
+    checkEq(c["0"], 1, "Linq.CountBy bucket 0");
+    checkEq(c["1"], 3, "Linq.CountBy bucket 1");
+
+    checkEq(len(Linq.FlatMap(a, _lf_dup)), 14, "Linq.FlatMap spreads arrays");
+    checkEq(len(Linq.FlatMap(a, _lf_x10)),  7, "Linq.FlatMap appends scalars");
+
+    let part = Linq.Partition(a, _lf_even);
+    checkEq(len(part), 2,    "Linq.Partition shape");
+    checkEq(len(part[0]), 3, "Linq.Partition matches");
+    checkEq(len(part[1]), 4, "Linq.Partition rest");
+
+    checkEq(Linq.MinBy(a, _lf_k3), 9,   "Linq.MinBy");
+    checkEq(Linq.MaxBy(a, _lf_k3), 5,   "Linq.MaxBy");
+    checkEq(Linq.MinBy([], _lf_k3), nil,"Linq.MinBy empty");
+    checkEq(Linq.MaxBy([], _lf_k3), nil,"Linq.MaxBy empty");
+
+    checkEq(len(Linq.UniqueBy(a, _lf_k3)), 3, "Linq.UniqueBy keeps first per key");
+
+    checkEq(Linq.ReduceRight(a, _lf_join),      "1|4|7|2|9|2|5",   "Linq.ReduceRight");
+    checkEq(Linq.ReduceRight(a, _lf_join, "S"), "S|1|4|7|2|9|2|5", "Linq.ReduceRight with seed");
+    checkEq(Linq.ReduceRight([], _lf_join),     nil,               "Linq.ReduceRight empty");
+
+    // RemoveIf mutates the caller's array in place.
+    let m = Array.Clone(a);
+    checkEq(Linq.RemoveIf(m, _lf_even), 3, "Linq.RemoveIf count");
+    checkEq(len(m), 4,                     "Linq.RemoveIf compacts in place");
+    checkEq(m[0], 5,                       "Linq.RemoveIf keeps order");
+    let untouched = Array.Clone(a);
+    checkEq(Linq.RemoveIf(untouched, _lf_big), 0, "Linq.RemoveIf no match");
+    checkEq(len(untouched), 7,                    "Linq.RemoveIf leaves array intact");
+}
+
+
+// Ported from the VM regression suite when these moved out of `Array`:
+// key coercion, builtin functions as callbacks, and flat-[float] inputs.
+
+fn _lf_cat(x) { return x.cat; }
+fn _lf_parity(n) { return n % 2 == 0; }
+fn _lf_only(x) { return "only"; }
+fn _lf_id(x) { return x; }
+fn _lf_gt2(x) { return x > 2.0; }
+fn _lf_x10f(x) { return [x, x * 10.0]; }
+
+fn test_free_functions_keys_and_builtins() {
+    // Grouping over object fields.
+    let items = [{ name: "apple", cat: "fruit" }, { name: "banana", cat: "fruit" },
+                 { name: "carrot", cat: "veg" }, { name: "daikon", cat: "veg" },
+                 { name: "elderberry", cat: "fruit" }];
+    let g = Linq.GroupBy(items, _lf_cat);
+    checkEq(len(g["fruit"]), 3, "GroupBy fruit count");
+    checkEq(len(g["veg"]),   2, "GroupBy veg count");
+    checkEq(g["fruit"][0].name, "apple",      "GroupBy fruit[0]");
+    checkEq(g["fruit"][2].name, "elderberry", "GroupBy fruit[2]");
+    checkEq(g["veg"][0].name,   "carrot",     "GroupBy veg[0]");
+
+    // Keys are the string form of the selector result.
+    let byLen = Linq.GroupBy(["cat", "dog", "elephant", "ox", "antelope"], String.Length);
+    checkEq(len(byLen["3"]), 2, "GroupBy int key -> \"3\"");
+    checkEq(len(byLen["8"]), 2, "GroupBy int key -> \"8\"");
+    checkEq(len(byLen["2"]), 1, "GroupBy int key -> \"2\"");
+
+    let parity = Linq.GroupBy([1, 2, 3, 4, 5, 6], _lf_parity);
+    checkEq(len(parity["true"]),  3, "GroupBy bool key -> \"true\"");
+    checkEq(len(parity["false"]), 3, "GroupBy bool key -> \"false\"");
+
+    checkEq(len(Object.Keys(Linq.GroupBy([], _lf_id))), 0, "GroupBy empty -> no keys");
+    let single = Linq.GroupBy([42], _lf_only);
+    checkEq(len(single["only"]), 1, "GroupBy single element");
+    checkEq(single["only"][0],  42, "GroupBy single value");
+
+    // Builtin functions as callbacks (the `fn` annotation would reject these).
+    let mixed = [1, "a", true];
+    checkEq(len(Object.Keys(Linq.GroupBy(mixed, Type.Of))), 3, "GroupBy with Type.Of");
+    check(Linq.Any(mixed, Type.IsString),        "Any with Type.IsString");
+    check(!Linq.All(mixed, Type.IsString),       "not All with Type.IsString");
+    check(Linq.All([1, 2, 3], Type.IsInt),       "All with Type.IsInt");
+    check(Linq.All([nil, nil], Object.IsNil),    "All with Object.IsNil");
+    check(Linq.All([1, "x", true], Object.NotNil), "All with Object.NotNil");
+    checkEq(Linq.MinBy(["banana", "date"], String.Length), "date", "MinBy with String.Length");
+
+    // Flat [float] inputs.
+    check(Linq.Any([1.0, 2.0], _lf_gt2) == false, "flat Any");
+    checkEq(Linq.MinBy([3.0, 1.0, 2.0], _lf_id), 1.0, "flat MinBy");
+    checkEq(Linq.MaxBy([3.0, 1.0, 2.0], _lf_id), 3.0, "flat MaxBy");
+    checkEq(len(Linq.FlatMap([1.0, 2.0], _lf_x10f)), 4, "flat FlatMap");
+    checkEq(len(Linq.UniqueBy([1.0, 1.0, 2.0], _lf_id)), 2, "flat UniqueBy");
+    let fp = Linq.Partition([1.0, 2.0, 3.0, 4.0], _lf_gt2);
+    checkEq(len(fp[0]), 2, "flat Partition matches");
+    checkEq(len(fp[1]), 2, "flat Partition rest");
+}
+
 fn Main() {
     Console.WriteLine("=== Linq test suite ===");
 
@@ -1290,6 +1421,8 @@ fn Main() {
     test_to_hash_map_extra();
     test_chunk_extra();
     test_stats_new();
+    test_free_functions();
+    test_free_functions_keys_and_builtins();
     test_benchmarks();
 
     Console.WriteLine("=== Linq tests done ===");

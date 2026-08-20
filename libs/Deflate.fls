@@ -1,0 +1,1050 @@
+// Deflate.fls - DEFLATE (RFC 1951) compression and decompression in Flaris.
+// Version: 1.0
+//
+// Encodes and decodes raw DEFLATE streams plus the zlib (RFC 1950) and gzip
+// (RFC 1952) framings around them. The encoder is dynamic-Huffman with a
+// hash-chain match finder; the decoder is table-driven.
+//
+// Exported classes:
+//   Inflate - Raw / Zlib / Gzip / Auto / LastError
+//   Deflate - Raw / Stored / Zlib / Gzip
+//
+// Input may be a string or a block. A block with multi-byte elements is read
+// as its raw bytes, so Buffer.Create(8, 4) compresses 32 bytes, not 8.
+//
+// Usage:
+//   import { Inflate, Deflate } from library("Deflate", "1.0");
+//   let z    = Deflate.Zlib(data);              // or .Raw / .Gzip / .Stored
+//   let back = Inflate.Auto(z);                 // sniffs zlib / gzip / raw
+//   let fast = Deflate.Raw(data, 128);          // second arg: match effort
+//
+// Every hot loop is a top-level typed LEAF function. Two backend limits shape
+// that: a JIT-compiled function takes at most 8 non-float arguments, and a
+// call whose callee has no native code yet makes the caller bail to the
+// interpreter. Scalars therefore travel in the state arrays (S, P) rather than
+// as parameters, and no kernel calls another.
+//
+// Block bytes are SIGNED when indexed (b[i] gives -1 for 0xFF), so every read
+// of input or output masks with & 255.
+//
+// Limits: a decoded stream is capped at INFLATE_MAX_OUT unless the caller
+// passes an expected size - a decoder must not inherit decompression bombs
+// from its input. Encoding falls back to stored blocks whenever compressing
+// would not pay, so incompressible input never grows unboundedly.
+
+const INFLATE_MAX_OUT = 268435456;      // 256 MiB safety cap
+
+// Layout of the shared constant array C (built once by _inflateConsts).
+const C_LBASE  = 0;      // 29 length bases
+const C_LEXTRA = 29;     // 29 length extra-bit counts
+const C_DBASE  = 58;     // 30 distance bases
+const C_DEXTRA = 88;     // 30 distance extra-bit counts
+const C_ORDER  = 118;    // 19 code-length code order
+const C_LSYMOF = 137;    // 259: length 0..258 -> length-symbol index 0..28
+const C_DSMALL = 396;    // 257: distance 0..256 -> distance symbol
+const C_DLARGE = 653;    // 256: (distance-1)>>7 -> distance symbol
+const C_SIZE   = 909;
+
+// Layout of the work array W.
+const W_LCOUNT = 0;      // 16
+const W_LSYM   = 16;     // 288
+const W_DCOUNT = 304;    // 16
+const W_DSYM   = 320;    // 32
+const W_CCOUNT = 352;    // 16
+const W_CSYM   = 368;    // 19
+const W_LENS   = 387;    // 320 code lengths (lit/len + dist)
+const W_LTAB   = 707;    // 512-entry root table, literal/length tree
+const W_DTAB   = 1219;   // 512-entry root table, distance tree
+const W_SIZE   = 1731;
+
+
+// Encoder work array E: frequencies, code lengths and codes for the two
+// alphabets, plus the code-length alphabet used to transmit them.
+const E_FREQL  = 0;      // 288 literal/length frequencies
+const E_FREQD  = 288;    // 30  distance frequencies
+const E_LENL   = 318;    // 288 literal/length code lengths
+const E_LEND   = 606;    // 30  distance code lengths
+const E_CODEL  = 636;    // 288 literal/length codes
+const E_CODED  = 924;    // 30  distance codes
+const E_CLFRQ  = 954;    // 19  code-length-alphabet frequencies
+const E_CLLEN  = 973;    // 19  code-length-alphabet lengths
+const E_CLCODE = 992;    // 19  code-length-alphabet codes
+const E_HEAP   = 1011;   // 576 Huffman build: node frequencies (2n-1)
+const E_PAR    = 1587;   // 576 Huffman build: parent links
+const E_DEPTH  = 2163;   // 576 Huffman build: depths
+const E_SIZE   = 2739;
+
+// Layout of the encoder state array P. Scalars live here rather than as
+// parameters: a JIT-compiled function takes at most 8 non-float arguments
+// (they ride in X0-X7), and exceeding that silently drops it to the
+// interpreter.
+const P_BUF   = 0;
+const P_CNT   = 1;
+const P_OUT   = 2;
+const P_CAP   = 3;
+const P_BASE  = 4;
+const P_N     = 5;
+const P_CHAIN = 6;
+const P_NTOK  = 7;
+const P_HLIT  = 8;
+const P_HDIST = 9;
+const P_FINAL = 10;
+const P_SIZE  = 11;
+
+// Layout of the bit-reader state array S.
+const S_BUF = 0;         // bit accumulator
+const S_CNT = 1;         // bits currently in the accumulator
+const S_POS = 2;         // next byte offset in src
+const S_OUT = 3;         // next byte offset in dst
+const S_ERR = 4;         // 0 = ok, negative = error code
+const S_SIZE = 5;
+
+fn _inflateConsts(): array {
+    let c: [int] = Array.Create(C_SIZE, Type.Int);
+    let lb = [3,4,5,6,7,8,9,10, 11,13,15,17, 19,23,27,31, 35,43,51,59, 67,83,99,115, 131,163,195,227, 258];
+    let le = [0,0,0,0,0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3, 4,4,4,4, 5,5,5,5, 0];
+    let db = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+    let de = [0,0,0,0,1,1,2, 2, 3, 3, 4, 4, 5, 5,  6,  6,  7,  7,  8,  8,   9,   9,  10,  10,  11,  11,  12,   12,   13,   13];
+    let od = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+    iter (i from 0 to 28) { c[C_LBASE + i] = lb[i]; c[C_LEXTRA + i] = le[i]; }
+    iter (i from 0 to 29) { c[C_DBASE + i] = db[i]; c[C_DEXTRA + i] = de[i]; }
+    iter (i from 0 to 18) { c[C_ORDER + i] = od[i]; }
+
+    // Reverse maps used when encoding: length -> symbol, distance -> symbol.
+    // Built by walking the base tables so the two directions cannot drift.
+    let li = 0;
+    iter (l from 3 to 258) {
+        while (li < 28 && c[C_LBASE + li + 1] <= l) { li = li + 1; }
+        c[C_LSYMOF + l] = li;
+    }
+    let di = 0;
+    iter (d from 1 to 256) {
+        while (di < 29 && c[C_DBASE + di + 1] <= d) { di = di + 1; }
+        c[C_DSMALL + d] = di;
+    }
+    iter (k from 0 to 255) {
+        let d = (k << 7) + 1;
+        let j = 0;
+        while (j < 29 && c[C_DBASE + j + 1] <= d) { j = j + 1; }
+        c[C_DLARGE + k] = j;
+    }
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+//  Kernels (typed, top-level: JIT-compiled)
+// ---------------------------------------------------------------------------
+
+// Refill the accumulator to at least `need` bits and return the low `need`
+// bits, consuming them. Past end-of-input feeds zero bytes and flags S_ERR.
+fn _bits(src: block, sLen: int, S: [int], need: int): int {
+    let buf: int = S[S_BUF];
+    let cnt: int = S[S_CNT];
+    let pos: int = S[S_POS];
+    while (cnt < need) {
+        if (pos >= sLen) { S[S_ERR] = -1; buf = buf; cnt = cnt + 8; }
+        else { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+    }
+    let v: int = buf & ((1 << need) - 1);
+    S[S_BUF] = (buf >> need) & 0x7FFFFFFFFFFFFF;
+    S[S_CNT] = cnt - need;
+    S[S_POS] = pos;
+    return v;
+}
+
+// Canonical Huffman decode: walk one bit at a time over the count/symbol
+// tables produced by _buildHuff. Returns the symbol, or -1 on a bad code.
+fn _decodeSym(src: block, sLen: int, S: [int], W: [int], cOff: int, sOff: int): int {
+    let code: int = 0;
+    let first: int = 0;
+    let index: int = 0;
+    let l: int = 1;
+    while (l <= 15) {
+        code = code | _bits(src, sLen, S, 1);
+        let count: int = W[cOff + l];
+        if (code - count < first) { return W[sOff + index + (code - first)]; }
+        index = index + count;
+        first = (first + count) << 1;
+        code = code << 1;
+        l = l + 1;
+    }
+    return -1;
+}
+
+// Build canonical count/symbol tables from `n` code lengths at W[lenOff].
+// Returns 0 on success, -1 for an over-subscribed (invalid) code.
+fn _buildHuff(W: [int], cOff: int, sOff: int, lenOff: int, n: int): int {
+    iter (i from 0 to 15) { W[cOff + i] = 0; }
+    iter (i from 0 to n - 1) { W[cOff + W[lenOff + i]] = W[cOff + W[lenOff + i]] + 1; }
+    if (W[cOff] == n) { return 0; }          // no codes at all
+
+    let left: int = 1;
+    let l: int = 1;
+    while (l <= 15) {
+        left = left << 1;
+        left = left - W[cOff + l];
+        if (left < 0) { return -1; }
+        l = l + 1;
+    }
+
+    // offsets[] reuses the tail of the symbol area is not safe, so walk twice.
+    let offs: [int] = Array.Create(16, Type.Int);
+    offs[1] = 0;
+    let j: int = 1;
+    while (j < 15) { offs[j + 1] = offs[j] + W[cOff + j]; j = j + 1; }
+    iter (i from 0 to n - 1) {
+        if (W[lenOff + i] != 0) {
+            W[sOff + offs[W[lenOff + i]]] = i;
+            offs[W[lenOff + i]] = offs[W[lenOff + i]] + 1;
+        }
+    }
+    return 0;
+}
+
+// Build a 9-bit root lookup table for a canonical tree already in
+// count/symbol form. Entry = (symbol << 5) | codeLength, or 0 when the code
+// at that prefix is longer than 9 bits (the caller falls back to _decodeSym).
+// Deflate reads bits LSB-first while Huffman codes are MSB-first, so each code
+// is bit-reversed before it indexes the table.
+fn _buildFast(W: [int], cOff: int, sOff: int, tOff: int): int {
+    iter (i from 0 to 511) { W[tOff + i] = 0; }
+    let code: int = 0;
+    let idx: int = 0;
+    let l: int = 1;
+    while (l <= 9) {
+        let cnt: int = W[cOff + l];
+        let j: int = 0;
+        while (j < cnt) {
+            let sym: int = W[sOff + idx + j];
+            let c: int = code + j;
+            let rev: int = 0;
+            let b: int = 0;
+            while (b < l) { rev = (rev << 1) | ((c >> b) & 1); b = b + 1; }
+            let step: int = 1 << l;
+            let k: int = rev;
+            while (k < 512) { W[tOff + k] = (sym << 5) | l; k = k + step; }
+            j = j + 1;
+        }
+        idx = idx + cnt;
+        code = (code + cnt) << 1;
+        l = l + 1;
+    }
+    return 0;
+}
+
+// Decode one block with the bit accumulator held in locals and symbols taken
+// from the root tables; only a >9-bit code drops back to the shared state.
+fn _inflateFast(src: block, sLen: int, dst: block, dCap: int,
+                 S: [int], W: [int], C: [int]): int {
+    let buf: int = S[S_BUF];
+    let cnt: int = S[S_CNT];
+    let pos: int = S[S_POS];
+    let out: int = S[S_OUT];
+
+    while (true) {
+        while (cnt < 24 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+
+        let e: int = W[W_LTAB + (buf & 511)];
+        let sym: int = 0;
+        if (e != 0) {
+            let nb: int = e & 31;
+            if (nb > cnt) { S[S_BUF] = buf; S[S_CNT] = cnt; S[S_POS] = pos; S[S_OUT] = out; return -1; }
+            sym = e >> 5;
+            buf = buf >> nb;
+            cnt = cnt - nb;
+        } else {
+            // Code longer than the 9-bit root table: walk it here rather than
+            // calling out, so this function stays a leaf and the backend can
+            // compile it (a JIT->JIT call whose callee has no native code yet
+            // makes the whole caller bail).
+            let code: int = 0; let first: int = 0; let index: int = 0; let l: int = 1;
+            sym = -1;
+            while (l <= 15) {
+                while (cnt < 1 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+                if (cnt < 1) { S[S_OUT] = out; return -1; }
+                code = code | (buf & 1); buf = buf >> 1; cnt = cnt - 1;
+                let cl: int = W[W_LCOUNT + l];
+                if (code - cl < first) { sym = W[W_LSYM + index + (code - first)]; l = 16; }
+                else { index = index + cl; first = (first + cl) << 1; code = code << 1; l = l + 1; }
+            }
+            if (sym < 0) { S[S_OUT] = out; return -2; }
+        }
+
+        if (sym < 256) {
+            if (out >= dCap) { S[S_BUF] = buf; S[S_CNT] = cnt; S[S_POS] = pos; S[S_OUT] = out; return -3; }
+            dst[out] = sym;
+            out = out + 1;
+        } else if (sym == 256) {
+            S[S_BUF] = buf; S[S_CNT] = cnt; S[S_POS] = pos; S[S_OUT] = out;
+            return 0;
+        } else {
+            let li: int = sym - 257;
+            if (li >= 29) { S[S_OUT] = out; return -2; }
+            let lex: int = C[C_LEXTRA + li];
+            while (cnt < lex && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+            let length: int = C[C_LBASE + li] + (buf & ((1 << lex) - 1));
+            buf = buf >> lex;
+            cnt = cnt - lex;
+
+            while (cnt < 24 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+            let de: int = W[W_DTAB + (buf & 511)];
+            let dsym: int = 0;
+            if (de != 0) {
+                let db: int = de & 31;
+                if (db > cnt) { S[S_OUT] = out; return -1; }
+                dsym = de >> 5;
+                buf = buf >> db;
+                cnt = cnt - db;
+            } else {
+                let dcode: int = 0; let dfirst: int = 0; let dindex: int = 0; let dl: int = 1;
+                dsym = -1;
+                while (dl <= 15) {
+                    while (cnt < 1 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+                    if (cnt < 1) { S[S_OUT] = out; return -1; }
+                    dcode = dcode | (buf & 1); buf = buf >> 1; cnt = cnt - 1;
+                    let dc: int = W[W_DCOUNT + dl];
+                    if (dcode - dc < dfirst) { dsym = W[W_DSYM + dindex + (dcode - dfirst)]; dl = 16; }
+                    else { dindex = dindex + dc; dfirst = (dfirst + dc) << 1; dcode = dcode << 1; dl = dl + 1; }
+                }
+                if (dsym < 0) { S[S_OUT] = out; return -2; }
+            }
+            if (dsym >= 30) { S[S_OUT] = out; return -2; }
+
+            let dex: int = C[C_DEXTRA + dsym];
+            while (cnt < dex && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+            let dist: int = C[C_DBASE + dsym] + (buf & ((1 << dex) - 1));
+            buf = buf >> dex;
+            cnt = cnt - dex;
+
+            if (dist > out) { S[S_OUT] = out; return -2; }
+            if (out + length > dCap) { S[S_BUF] = buf; S[S_CNT] = cnt; S[S_POS] = pos; S[S_OUT] = out; return -3; }
+            let from2: int = out - dist;
+            let k: int = 0;
+            while (k < length) { dst[out + k] = dst[from2 + k] & 255; k = k + 1; }
+            out = out + length;
+        }
+    }
+}
+
+// Stored-block payload copy. A kernel rather than a loop in the driver: the
+// driver allocates and branches, so it is not JIT-eligible, and an
+// incompressible stream is nothing but this copy.
+fn _copyStored(src: block, sp: int, dst: block, dp: int, n: int): int {
+    let i: int = 0;
+    while (i < n) { dst[dp + i] = src[sp + i] & 255; i = i + 1; }
+    return 0;
+}
+
+// Fill W[W_LENS..] with the fixed (RFC 1951 3.2.6) code lengths.
+fn _fixedLens(W: [int]): int {
+    iter (i from 0 to 143) { W[W_LENS + i] = 8; }
+    iter (i from 144 to 255) { W[W_LENS + i] = 9; }
+    iter (i from 256 to 279) { W[W_LENS + i] = 7; }
+    iter (i from 280 to 287) { W[W_LENS + i] = 8; }
+    return 0;
+}
+
+// Read a dynamic block's two code trees into W. 0 on success, negative on error.
+fn _readDynamic(src: block, sLen: int, S: [int], W: [int], C: [int]): int {
+    let hlit: int  = _bits(src, sLen, S, 5) + 257;
+    let hdist: int = _bits(src, sLen, S, 5) + 1;
+    let hclen: int = _bits(src, sLen, S, 4) + 4;
+    if (hlit > 286 || hdist > 30) { return -2; }
+
+    // Code-length alphabet, in its permuted order.
+    iter (i from 0 to 18) { W[W_LENS + i] = 0; }
+    iter (i from 0 to hclen - 1) { W[W_LENS + C[C_ORDER + i]] = _bits(src, sLen, S, 3); }
+    if (_buildHuff(W, W_CCOUNT, W_CSYM, W_LENS, 19) != 0) { return -2; }
+
+    // Run-length coded lengths for the lit/len and distance alphabets.
+    let n: int = hlit + hdist;
+    let i: int = 0;
+    while (i < n) {
+        let sym: int = _decodeSym(src, sLen, S, W, W_CCOUNT, W_CSYM);
+        if (sym < 0) { return -2; }
+        if (S[S_ERR] != 0) { return -1; }
+        if (sym < 16) { W[W_LENS + i] = sym; i = i + 1; }
+        else {
+            let rep: int = 0;
+            let val: int = 0;
+            if (sym == 16) {
+                if (i == 0) { return -2; }
+                val = W[W_LENS + i - 1];
+                rep = 3 + _bits(src, sLen, S, 2);
+            } else if (sym == 17) { rep = 3 + _bits(src, sLen, S, 3); }
+            else                  { rep = 11 + _bits(src, sLen, S, 7); }
+            if (i + rep > n) { return -2; }
+            let k: int = 0;
+            while (k < rep) { W[W_LENS + i + k] = val; k = k + 1; }
+            i = i + rep;
+        }
+    }
+    if (W[W_LENS + 256] == 0) { return -2; }   // no end-of-block code
+
+    if (_buildHuff(W, W_LCOUNT, W_LSYM, W_LENS, hlit) != 0) { return -2; }
+    // Distance lengths follow the literal ones; shift them to the front.
+    iter (k from 0 to hdist - 1) { W[W_LENS + k] = W[W_LENS + hlit + k]; }
+    if (_buildHuff(W, W_DCOUNT, W_DSYM, W_LENS, hdist) != 0) { return -2; }
+    return 0;
+}
+
+// Distance tree for fixed blocks: 30 codes of 5 bits each.
+fn _fixedDist(W: [int]): int {
+    iter (i from 0 to 29) { W[W_LENS + i] = 5; }
+    return 0;
+}
+
+global _lastErr = 0;
+
+// One decode attempt into a buffer of exactly `cap` bytes. nil on failure,
+// with _lastErr set (-3 means the output buffer was too small).
+fn _inflateOnce(src: block, sLen: int, cap: int): block {
+    _lastErr = 0;
+    let dst = Buffer.Create(cap, 1);
+    let C = _inflateConsts();
+    let W: [int] = Array.Create(W_SIZE, Type.Int);
+    let S: [int] = Array.Create(S_SIZE, Type.Int);
+
+    let done = false;
+    while (!done) {
+        let final = _bits(src, sLen, S, 1);
+        let btype = _bits(src, sLen, S, 2);
+        if (S[S_ERR] != 0) { _lastErr = -1; return nil; }
+
+        if (btype == 0) {
+            S[S_BUF] = 0; S[S_CNT] = 0;
+            let p = S[S_POS];
+            if (p + 4 > sLen) { _lastErr = -1; return nil; }
+            let ln = (src[p] & 255) | ((src[p + 1] & 255) << 8);
+            let nl = (src[p + 2] & 255) | ((src[p + 3] & 255) << 8);
+            if ((ln ^ 0xFFFF) != nl) { _lastErr = -2; return nil; }
+            p = p + 4;
+            if (p + ln > sLen) { _lastErr = -1; return nil; }
+            let o = S[S_OUT];
+            if (o + ln > cap) { _lastErr = -3; return nil; }
+            _copyStored(src, p, dst, o, ln);
+            S[S_OUT] = o + ln;
+            S[S_POS] = p + ln;
+        } else if (btype == 1 || btype == 2) {
+            if (btype == 1) {
+                _fixedLens(W);
+                if (_buildHuff(W, W_LCOUNT, W_LSYM, W_LENS, 288) != 0) { _lastErr = -2; return nil; }
+                _fixedDist(W);
+                if (_buildHuff(W, W_DCOUNT, W_DSYM, W_LENS, 30) != 0) { _lastErr = -2; return nil; }
+            } else {
+                let rd = _readDynamic(src, sLen, S, W, C);
+                if (rd != 0) { _lastErr = rd; return nil; }
+            }
+            let rc = _inflateFast(src, sLen, dst, cap, S, W, C);
+            if (rc != 0) { _lastErr = rc; return nil; }
+        } else {
+            _lastErr = -2; return nil;
+        }
+        if (final == 1) { done = true; }
+    }
+    return Buffer.Slice(dst, 0, S[S_OUT]);
+}
+
+
+// Normalise input to a byte-oriented block.
+//
+// A string is taken as its bytes. A block may have multi-byte elements, and
+// indexing one yields elements, not bytes - so a block whose element size is
+// not 1 is rebuilt as bytes. `Buffer.ToString` is the only way to see a
+// block's true byte length (count * size), and it round-trips binary exactly,
+// so it doubles as the length probe.
+fn _asBlock(x): block {
+    if (x == nil) return nil;
+    if (Type.Of(x) == Type.String) { return Buffer.FromString(x); }
+    let s = Buffer.ToString(x);
+    if (len(s) == len(x)) { return x; }        // already byte-sized
+    return Buffer.FromString(s);
+}
+
+// ---------------------------------------------------------------------------
+//  Encoder
+// ---------------------------------------------------------------------------
+
+// One fixed-Huffman DEFLATE block covering src[0..n).
+//
+// Deliberately a single leaf function: the JIT bails on a call whose callee has
+// no native code yet, so the whole compressor - match search, Huffman emission
+// and bit packing - is inlined here. `head`/`prev` are the hash chains, sized
+// 32768 and n respectively. Returns bytes written to dst, or negative on
+// overflow.
+//
+// Huffman codes go out most-significant-bit first (so each is bit-reversed
+// before packing), while extra bits go out least-significant-bit first.
+fn _deflateFixed(src: block, n: int, dst: block, dCap: int,
+                  head: [int], prev: [int], C: [int], maxChain: int): int {
+    let bitbuf: int = 0;
+    let bitcnt: int = 0;
+    let outp: int = 0;
+
+    // final=1, btype=01 (fixed) - three bits, LSB first.
+    bitbuf = bitbuf | (1 << bitcnt); bitcnt = bitcnt + 1;
+    bitbuf = bitbuf | (1 << bitcnt); bitcnt = bitcnt + 1;
+    bitcnt = bitcnt + 1;
+
+    let i: int = 0;
+    while (i < n) {
+        let mlen: int = 0;
+        let mdist: int = 0;
+
+        if (i + 3 <= n) {
+            let h: int = (((src[i] & 255) << 10) ^ ((src[i + 1] & 255) << 5) ^ (src[i + 2] & 255)) & 32767;
+            let cand: int = head[h] - 1;
+            head[h] = i + 1;
+            prev[i] = cand + 1;
+
+            let tries: int = 0;
+            let best: int = 0;
+            let bestd: int = 0;
+            while (cand >= 0 && tries < maxChain && i - cand <= 32768) {
+                let k: int = 0;
+                let lim: int = n - i;
+                if (lim > 258) { lim = 258; }
+                while (k < lim && (src[cand + k] & 255) == (src[i + k] & 255)) { k = k + 1; }
+                if (k > best) { best = k; bestd = i - cand; if (k >= 258) { cand = -1; } }
+                if (cand >= 0) { cand = prev[cand] - 1; tries = tries + 1; }
+            }
+            if (best >= 3) { mlen = best; mdist = bestd; }
+        }
+
+        if (mlen >= 3) {
+            let lsym: int = C[C_LSYMOF + mlen];
+            let code: int = 257 + lsym;
+            // literal/length code: 256..279 -> 7 bits base 0, 280..287 -> 8 bits base 0xC0
+            let cbits: int = 0;
+            let cval: int = 0;
+            if (code < 280) { cbits = 7; cval = code - 256; }
+            else            { cbits = 8; cval = 192 + (code - 280); }
+            let r: int = 0; let b: int = 0;
+            while (b < cbits) { r = (r << 1) | ((cval >> b) & 1); b = b + 1; }
+            bitbuf = bitbuf | (r << bitcnt); bitcnt = bitcnt + cbits;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+
+            let lex: int = C[C_LEXTRA + lsym];
+            if (lex > 0) {
+                bitbuf = bitbuf | ((mlen - C[C_LBASE + lsym]) << bitcnt); bitcnt = bitcnt + lex;
+                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            }
+
+            let dsym: int = mdist <= 256 ? C[C_DSMALL + mdist] : C[C_DLARGE + ((mdist - 1) >> 7)];
+            let dr: int = 0; let db: int = 0;
+            while (db < 5) { dr = (dr << 1) | ((dsym >> db) & 1); db = db + 1; }
+            bitbuf = bitbuf | (dr << bitcnt); bitcnt = bitcnt + 5;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+
+            let dex: int = C[C_DEXTRA + dsym];
+            if (dex > 0) {
+                bitbuf = bitbuf | ((mdist - C[C_DBASE + dsym]) << bitcnt); bitcnt = bitcnt + dex;
+                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            }
+
+            // Insert the covered positions into the chains so later matches see them.
+            let q: int = 1;
+            while (q < mlen) {
+                if (i + q + 3 <= n) {
+                    let h2: int = (((src[i + q] & 255) << 10) ^ ((src[i + q + 1] & 255) << 5) ^ (src[i + q + 2] & 255)) & 32767;
+                    prev[i + q] = head[h2];
+                    head[h2] = i + q + 1;
+                }
+                q = q + 1;
+            }
+            i = i + mlen;
+        } else {
+            let lit: int = src[i] & 255;
+            let cbits2: int = 0;
+            let cval2: int = 0;
+            if (lit < 144) { cbits2 = 8; cval2 = 48 + lit; }
+            else           { cbits2 = 9; cval2 = 400 + (lit - 144); }
+            let r2: int = 0; let b2: int = 0;
+            while (b2 < cbits2) { r2 = (r2 << 1) | ((cval2 >> b2) & 1); b2 = b2 + 1; }
+            bitbuf = bitbuf | (r2 << bitcnt); bitcnt = bitcnt + cbits2;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            i = i + 1;
+        }
+    }
+
+    // end-of-block: symbol 256 -> 7 bits, value 0
+    bitcnt = bitcnt + 7;
+    while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+    if (bitcnt > 0) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; }
+    return outp;
+}
+
+class Inflate {
+
+    // Raw DEFLATE stream -> block, or nil on malformed input.
+    // `expected` sizes the output buffer when known (0 = grow to the cap).
+    fn static Raw(input, expected?): block {
+        let src = _asBlock(input);
+        if (src == nil) return nil;
+        let sLen = len(src);
+        if (sLen == 0) return nil;
+
+        // A known size needs no growth; otherwise start at a modest multiple of
+        // the input and retry on overflow, since the ratio is unknowable up
+        // front and a wrong guess must not truncate the result.
+        let exp = (expected == nil || expected <= 0) ? 0 : expected;
+        let cap = exp > 0 ? exp : (sLen * 4 + 1024);
+        if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
+
+        while (true) {
+            let got = _inflateOnce(src, sLen, cap);
+            if (got != nil) return got;
+            if (_lastErr != -3 || exp > 0 || cap >= INFLATE_MAX_OUT) return nil;
+            cap = cap * 4;
+            if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
+        }
+    }
+
+    // Reason the last decode returned nil: -1 truncated input, -2 malformed
+    // stream, -3 output exceeded the cap.
+    fn static LastError(): int { return _lastErr; }
+
+    // zlib (RFC 1950) container: 2-byte header, deflate stream, Adler-32.
+    fn static Zlib(input, expected?): block {
+        let src = _asBlock(input);
+        if (src == nil || len(src) < 6) return nil;
+        let cmf = src[0] & 255;
+        let flg = src[1] & 255;
+        if ((cmf & 15) != 8) return nil;                       // not deflate
+        if (((cmf << 8) + flg) % 31 != 0) return nil;          // header check
+        if ((flg & 32) != 0) return nil;                       // preset dictionary
+        let body = Buffer.Slice(src, 2, len(src) - 6);
+        let out = Inflate.Raw(body, expected);
+        if (out == nil) return nil;
+        let p = len(src) - 4;
+        let want = ((src[p] & 255) << 24) | ((src[p+1] & 255) << 16) | ((src[p+2] & 255) << 8) | (src[p+3] & 255);
+        if (Hash.Adler32(out) != want) return nil;
+        return out;
+    }
+
+    // gzip (RFC 1952) container.
+    fn static Gzip(input, expected?): block {
+        let src = _asBlock(input);
+        if (src == nil || len(src) < 18) return nil;
+        if ((src[0] & 255) != 31 || (src[1] & 255) != 139 || (src[2] & 255) != 8) return nil;
+        let flg = src[3] & 255;
+        let p = 10;
+        if ((flg & 4) != 0) {                                   // FEXTRA
+            if (p + 2 > len(src)) return nil;
+            p = p + 2 + ((src[p] & 255) | ((src[p+1] & 255) << 8));
+        }
+        if ((flg & 8) != 0)  { while (p < len(src) && src[p] != 0) { p = p + 1; } p = p + 1; }
+        if ((flg & 16) != 0) { while (p < len(src) && src[p] != 0) { p = p + 1; } p = p + 1; }
+        if ((flg & 2) != 0)  { p = p + 2; }                     // FHCRC
+        if (p >= len(src) - 8) return nil;
+        let body = Buffer.Slice(src, p, len(src) - 8 - p);
+        let out = Inflate.Raw(body, expected);
+        if (out == nil) return nil;
+        let q = len(src) - 8;
+        let want = (src[q] & 255) | ((src[q+1] & 255) << 8) | ((src[q+2] & 255) << 16) | ((src[q+3] & 255) << 24);
+        if ((Hash.Crc32(out) & 0xFFFFFFFF) != (want & 0xFFFFFFFF)) return nil;
+        return out;
+    }
+
+    // Sniff the container and decode accordingly.
+    fn static Auto(input, expected?): block {
+        let src = _asBlock(input);
+        if (src == nil || len(src) < 2) return nil;
+        if ((src[0] & 255) == 31 && (src[1] & 255) == 139) { return Inflate.Gzip(src, expected); }
+        if ((src[0] & 15) == 8 && (((src[0] & 255) << 8) + (src[1] & 255)) % 31 == 0) {
+            let z = Inflate.Zlib(src, expected);
+            if (z != nil) return z;
+        }
+        return Inflate.Raw(src, expected);
+    }
+}
+
+
+class Deflate {
+
+    // Raw DEFLATE stream for `src`, dynamic-Huffman coded. `effort` caps the
+    // hash-chain walk per position (default 32); higher compresses a little
+    // better and costs proportionally more time. Input is processed in chunks
+    // so the token buffers stay bounded; each chunk becomes one block and, for
+    // simplicity, matches never reach across a chunk boundary.
+    // Falls back to stored blocks whenever compressing does not pay.
+    fn static Raw(input, effort?): block {
+        let src = _asBlock(input);
+        if (src == nil) return nil;
+        let n = len(src);
+        if (n == 0) return Deflate.Stored(src);
+        let chain = (effort == nil || effort <= 0) ? 32 : effort;
+
+        let chunkMax = 262144;
+        if (chunkMax > n) { chunkMax = n; }
+
+        let cap = n + (n / 65535 + 1) * 5 + 1024;
+        let dst = Buffer.Create(cap, 1);
+
+        let C = _inflateConsts();
+        let E: [int] = Array.Create(E_SIZE, Type.Int);
+        let head: [int] = Array.Create(32768, Type.Int);
+        let prev: [int] = Array.Create(chunkMax, Type.Int);
+        let tl: [int] = Array.Create(chunkMax + 1, Type.Int);
+        let tv: [int] = Array.Create(chunkMax + 1, Type.Int);
+        let P: [int] = Array.Create(P_SIZE, Type.Int);
+        P[P_CAP] = cap;
+        P[P_CHAIN] = chain;
+
+        let off = 0;
+        let failed = false;
+        while (off < n && !failed) {
+            let chunk = n - off;
+            if (chunk > chunkMax) { chunk = chunkMax; }
+            let isFinal = (off + chunk >= n) ? 1 : 0;
+
+            P[P_BASE] = off; P[P_N] = chunk;
+            let ntok = _lzTokens(src, head, prev, C, E, tl, tv, P);
+
+            // Literal/length alphabet: at least 257 codes, up to the highest used.
+            let hlit = 257;
+            iter (k from 257 to 287) { if (E[E_FREQL + k] > 0) { hlit = k + 1; } }
+            _huffLengths(E, E_FREQL, hlit, E_LENL, 15);
+
+            // Distance alphabet: at least one code, even when nothing matched.
+            let hdist = 1;
+            iter (k from 0 to 29) { if (E[E_FREQD + k] > 0) { hdist = k + 1; } }
+            let anyDist = false;
+            iter (k from 0 to hdist - 1) { if (E[E_FREQD + k] > 0) { anyDist = true; } }
+            _huffLengths(E, E_FREQD, hdist, E_LEND, 15);
+            if (!anyDist) { E[E_LEND] = 1; }
+
+            _huffCodes(E, E_LENL, E_CODEL, hlit);
+            _huffCodes(E, E_LEND, E_CODED, hdist);
+
+            // Code-length alphabet describes the two length vectors.
+            iter (k from 0 to 18) { E[E_CLFRQ + k] = 0; }
+            iter (k from 0 to hlit - 1) { E[E_CLFRQ + E[E_LENL + k]] = E[E_CLFRQ + E[E_LENL + k]] + 1; }
+            iter (k from 0 to hdist - 1) { E[E_CLFRQ + E[E_LEND + k]] = E[E_CLFRQ + E[E_LEND + k]] + 1; }
+            _huffLengths(E, E_CLFRQ, 19, E_CLLEN, 7);
+            _huffCodes(E, E_CLLEN, E_CLCODE, 19);
+
+            P[P_NTOK] = ntok; P[P_HLIT] = hlit; P[P_HDIST] = hdist; P[P_FINAL] = isFinal;
+            if (_emitDynamic(dst, tl, tv, C, E, P) != 0) { failed = true; }
+            off = off + chunk;
+        }
+
+        if (!failed) {
+            // Flush any partial byte.
+            if (P[P_CNT] > 0) {
+                if (P[P_OUT] >= cap) { failed = true; }
+                else { dst[P[P_OUT]] = P[P_BUF] & 255; P[P_OUT] = P[P_OUT] + 1; }
+            }
+            if (!failed && P[P_OUT] < n) { return Buffer.Slice(dst, 0, P[P_OUT]); }
+        }
+        return Deflate.Stored(src);
+    }
+
+    // Uncompressed DEFLATE stream: one or more stored blocks. Always valid,
+    // and the fallback whenever compression does not help.
+    fn static Stored(input): block {
+        let src = _asBlock(input);
+        let n = src == nil ? 0 : len(src);
+        let blocks = n / 65535 + 1;
+        let dst = Buffer.Create(n + blocks * 5 + 5, 1);
+        let p = 0;
+        let off = 0;
+        let first = true;
+        while (off < n || first) {
+            let chunk = n - off;
+            if (chunk > 65535) { chunk = 65535; }
+            let final = (off + chunk >= n) ? 1 : 0;
+            dst[p] = final; p = p + 1;                      // BFINAL, BTYPE=00
+            dst[p] = chunk & 255; p = p + 1;
+            dst[p] = (chunk >> 8) & 255; p = p + 1;
+            dst[p] = (chunk ^ 0xFFFF) & 255; p = p + 1;
+            dst[p] = ((chunk ^ 0xFFFF) >> 8) & 255; p = p + 1;
+            if (chunk > 0) { _copyStored(src, off, dst, p, chunk); p = p + chunk; }
+            off = off + chunk;
+            first = false;
+        }
+        return Buffer.Slice(dst, 0, p);
+    }
+
+    // zlib (RFC 1950) wrapper around Raw.
+    fn static Zlib(input, effort?): block {
+        let src = _asBlock(input);
+        let body = Deflate.Raw(src, effort);
+        if (body == nil) return nil;
+        let out = Buffer.Create(len(body) + 6, 1);
+        out[0] = 120; out[1] = 156;                          // CM=8, CINFO=7, FCHECK
+        _copyStored(body, 0, out, 2, len(body));
+        let ad = Hash.Adler32(src);
+        let p = len(body) + 2;
+        out[p] = (ad >> 24) & 255; out[p+1] = (ad >> 16) & 255;
+        out[p+2] = (ad >> 8) & 255; out[p+3] = ad & 255;
+        return out;
+    }
+
+    // gzip (RFC 1952) wrapper around Raw.
+    fn static Gzip(input, effort?): block {
+        let src = _asBlock(input);
+        let body = Deflate.Raw(src, effort);
+        if (body == nil) return nil;
+        let out = Buffer.Create(len(body) + 18, 1);
+        out[0] = 31; out[1] = 139; out[2] = 8; out[3] = 0;
+        out[4] = 0; out[5] = 0; out[6] = 0; out[7] = 0;       // MTIME 0
+        out[8] = 0; out[9] = 255;                             // XFL, OS unknown
+        _copyStored(body, 0, out, 10, len(body));
+        let p = len(body) + 10;
+        let crc = Hash.Crc32(src) & 0xFFFFFFFF;
+        out[p] = crc & 255; out[p+1] = (crc >> 8) & 255;
+        out[p+2] = (crc >> 16) & 255; out[p+3] = (crc >> 24) & 255;
+        let sz = len(src) & 0xFFFFFFFF;
+        out[p+4] = sz & 255; out[p+5] = (sz >> 8) & 255;
+        out[p+6] = (sz >> 16) & 255; out[p+7] = (sz >> 24) & 255;
+        return out;
+    }
+}
+
+export { Inflate, Deflate };
+
+// ---------------------------------------------------------------------------
+//  Huffman construction (cold: runs once per block)
+// ---------------------------------------------------------------------------
+
+// Code lengths for `n` symbols whose frequencies sit at E[fOff], written to
+// E[lOff]. Lengths are capped at maxBits by halving the frequencies and
+// rebuilding until they fit - a slightly suboptimal but simple and always
+// terminating way to get a length-limited code. Returns the number of symbols
+// with a nonzero length.
+fn _huffLengths(E: [int], fOff: int, n: int, lOff: int, maxBits: int): int {
+    iter (i from 0 to n - 1) { E[E_HEAP + i] = E[fOff + i]; }
+
+    while (true) {
+        iter (i from 0 to n - 1) { E[lOff + i] = 0; }
+        let used = 0;
+        iter (i from 0 to n - 1) { if (E[E_HEAP + i] > 0) { used = used + 1; } }
+        if (used == 0) { return 0; }
+        if (used == 1) {
+            // A single symbol still needs one bit so the code is decodable.
+            iter (i from 0 to n - 1) { if (E[E_HEAP + i] > 0) { E[lOff + i] = 1; } }
+            return 1;
+        }
+
+        // Build the tree by repeatedly joining the two lightest live nodes.
+        let total = n;
+        iter (i from 0 to 2 * n - 2) { E[E_PAR + i] = -1; E[E_DEPTH + i] = 0; }
+        let live: [int] = Array.Create(2 * n, Type.Int);
+        let nlive = 0;
+        iter (i from 0 to n - 1) { if (E[E_HEAP + i] > 0) { live[nlive] = i; nlive = nlive + 1; } }
+
+        while (nlive > 1) {
+            let a = -1; let b = -1;
+            iter (k from 0 to nlive - 1) {
+                let node = live[k];
+                if (a < 0 || E[E_HEAP + node] < E[E_HEAP + a]) { b = a; a = node; }
+                else if (b < 0 || E[E_HEAP + node] < E[E_HEAP + b]) { b = node; }
+            }
+            E[E_HEAP + total] = E[E_HEAP + a] + E[E_HEAP + b];
+            E[E_PAR + a] = total;
+            E[E_PAR + b] = total;
+            let w = 0;
+            iter (k from 0 to nlive - 1) {
+                if (live[k] != a && live[k] != b) { live[w] = live[k]; w = w + 1; }
+            }
+            live[w] = total; w = w + 1;
+            nlive = w;
+            total = total + 1;
+        }
+
+        // Depth of each leaf is its code length.
+        let over = false;
+        iter (i from 0 to n - 1) {
+            if (E[E_HEAP + i] > 0) {
+                let d = 0;
+                let node = i;
+                while (E[E_PAR + node] >= 0) { node = E[E_PAR + node]; d = d + 1; }
+                E[lOff + i] = d;
+                if (d > maxBits) { over = true; }
+            }
+        }
+        if (!over) {
+            let cnt = 0;
+            iter (i from 0 to n - 1) { if (E[lOff + i] > 0) { cnt = cnt + 1; } }
+            return cnt;
+        }
+        // Too deep: flatten the distribution and try again.
+        iter (i from 0 to n - 1) { if (E[E_HEAP + i] > 0) { E[E_HEAP + i] = (E[E_HEAP + i] + 1) / 2; } }
+    }
+}
+
+// Canonical codes for lengths at E[lOff] -> E[cOff]. Codes are MSB-first.
+fn _huffCodes(E: [int], lOff: int, cOff: int, n: int): int {
+    let cnt: [int] = Array.Create(16, Type.Int);
+    iter (i from 0 to n - 1) { cnt[E[lOff + i]] = cnt[E[lOff + i]] + 1; }
+    cnt[0] = 0;
+    let next: [int] = Array.Create(16, Type.Int);
+    let code = 0;
+    iter (b from 1 to 15) { code = (code + cnt[b - 1]) << 1; next[b] = code; }
+    iter (i from 0 to n - 1) {
+        let l = E[lOff + i];
+        if (l > 0) { E[cOff + i] = next[l]; next[l] = next[l] + 1; }
+        else { E[cOff + i] = 0; }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+//  Encoder kernels (leaf functions so the JIT compiles them)
+// ---------------------------------------------------------------------------
+
+// LZ77 pass over src[base..base+n): fills tl/tv with tokens (tl=0 means the
+// token is the literal in tv, otherwise tl is the match length and tv the
+// distance) and accumulates symbol frequencies into E. Returns the token count.
+// The window never reaches before `base`, so each chunk is self-contained.
+fn _lzTokens(src: block, head: [int], prev: [int],
+              C: [int], E: [int], tl: [int], tv: [int], P: [int]): int {
+    let base: int = P[P_BASE];
+    let n: int = P[P_N];
+    let maxChain: int = P[P_CHAIN];
+    iter (i from 0 to 32767) { head[i] = 0; }
+    iter (i from 0 to 287) { E[E_FREQL + i] = 0; }
+    iter (i from 0 to 29) { E[E_FREQD + i] = 0; }
+
+    let ntok: int = 0;
+    let i: int = 0;
+    while (i < n) {
+        let mlen: int = 0;
+        let mdist: int = 0;
+        if (i + 3 <= n) {
+            let h: int = (((src[base + i] & 255) << 10) ^ ((src[base + i + 1] & 255) << 5) ^ (src[base + i + 2] & 255)) & 32767;
+            let cand: int = head[h] - 1;
+            head[h] = i + 1;
+            prev[i] = cand + 1;
+            let tries: int = 0;
+            let best: int = 0;
+            let bestd: int = 0;
+            while (cand >= 0 && tries < maxChain && i - cand <= 32768) {
+                let k: int = 0;
+                let lim: int = n - i;
+                if (lim > 258) { lim = 258; }
+                while (k < lim && (src[base + cand + k] & 255) == (src[base + i + k] & 255)) { k = k + 1; }
+                if (k > best) { best = k; bestd = i - cand; }
+                if (best >= 258) { cand = -1; }
+                else { cand = prev[cand] - 1; tries = tries + 1; }
+            }
+            if (best >= 3) { mlen = best; mdist = bestd; }
+        }
+
+        if (mlen >= 3) {
+            tl[ntok] = mlen; tv[ntok] = mdist; ntok = ntok + 1;
+            let ls: int = C[C_LSYMOF + mlen];
+            E[E_FREQL + 257 + ls] = E[E_FREQL + 257 + ls] + 1;
+            let ds: int = mdist <= 256 ? C[C_DSMALL + mdist] : C[C_DLARGE + ((mdist - 1) >> 7)];
+            E[E_FREQD + ds] = E[E_FREQD + ds] + 1;
+            let q: int = 1;
+            while (q < mlen) {
+                if (i + q + 3 <= n) {
+                    let h2: int = (((src[base + i + q] & 255) << 10) ^ ((src[base + i + q + 1] & 255) << 5) ^ (src[base + i + q + 2] & 255)) & 32767;
+                    prev[i + q] = head[h2];
+                    head[h2] = i + q + 1;
+                }
+                q = q + 1;
+            }
+            i = i + mlen;
+        } else {
+            let lit: int = src[base + i] & 255;
+            tl[ntok] = 0; tv[ntok] = lit; ntok = ntok + 1;
+            E[E_FREQL + lit] = E[E_FREQL + lit] + 1;
+            i = i + 1;
+        }
+    }
+    E[E_FREQL + 256] = E[E_FREQL + 256] + 1;    // end-of-block
+    return ntok;
+}
+
+// Emit one dynamic-Huffman block: header, both code-length tables (sent
+// uncompressed - the optional run-length coding buys a few hundred bytes per
+// block and is not worth the complexity here), then the tokens.
+// P = [bitbuf, bitcnt, outp]; returns 0 or -1 on output overflow.
+fn _emitDynamic(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]): int {
+    let dCap: int = P[P_CAP];
+    let ntok: int = P[P_NTOK];
+    let hlit: int = P[P_HLIT];
+    let hdist: int = P[P_HDIST];
+    let isFinal: int = P[P_FINAL];
+    let bitbuf: int = P[P_BUF];
+    let bitcnt: int = P[P_CNT];
+    let outp: int = P[P_OUT];
+
+    bitbuf = bitbuf | (isFinal << bitcnt); bitcnt = bitcnt + 1;
+    bitbuf = bitbuf | (2 << bitcnt); bitcnt = bitcnt + 2;          // BTYPE=10
+    bitbuf = bitbuf | ((hlit - 257) << bitcnt); bitcnt = bitcnt + 5;
+    bitbuf = bitbuf | ((hdist - 1) << bitcnt); bitcnt = bitcnt + 5;
+    bitbuf = bitbuf | (15 << bitcnt); bitcnt = bitcnt + 4;          // HCLEN-4 = 15 -> 19 codes
+    while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+
+    let i: int = 0;
+    while (i < 19) {
+        bitbuf = bitbuf | (E[E_CLLEN + C[C_ORDER + i]] << bitcnt); bitcnt = bitcnt + 3;
+        while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+        i = i + 1;
+    }
+
+    // The two alphabets' lengths, each as one code-length symbol.
+    let j: int = 0;
+    while (j < hlit + hdist) {
+        let v: int = j < hlit ? E[E_LENL + j] : E[E_LEND + (j - hlit)];
+        let cl: int = E[E_CLLEN + v];
+        let cc: int = E[E_CLCODE + v];
+        let r: int = 0; let b: int = 0;
+        while (b < cl) { r = (r << 1) | ((cc >> b) & 1); b = b + 1; }
+        bitbuf = bitbuf | (r << bitcnt); bitcnt = bitcnt + cl;
+        while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+        j = j + 1;
+    }
+
+    let t: int = 0;
+    while (t < ntok) {
+        if (tl[t] == 0) {
+            let lit: int = tv[t];
+            let l1: int = E[E_LENL + lit]; let c1: int = E[E_CODEL + lit];
+            let r1: int = 0; let b1: int = 0;
+            while (b1 < l1) { r1 = (r1 << 1) | ((c1 >> b1) & 1); b1 = b1 + 1; }
+            bitbuf = bitbuf | (r1 << bitcnt); bitcnt = bitcnt + l1;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+        } else {
+            let mlen: int = tl[t]; let mdist: int = tv[t];
+            let ls: int = C[C_LSYMOF + mlen];
+            let sym: int = 257 + ls;
+            let l2: int = E[E_LENL + sym]; let c2: int = E[E_CODEL + sym];
+            let r2: int = 0; let b2: int = 0;
+            while (b2 < l2) { r2 = (r2 << 1) | ((c2 >> b2) & 1); b2 = b2 + 1; }
+            bitbuf = bitbuf | (r2 << bitcnt); bitcnt = bitcnt + l2;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            let lex: int = C[C_LEXTRA + ls];
+            if (lex > 0) {
+                bitbuf = bitbuf | ((mlen - C[C_LBASE + ls]) << bitcnt); bitcnt = bitcnt + lex;
+                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            }
+            let ds: int = mdist <= 256 ? C[C_DSMALL + mdist] : C[C_DLARGE + ((mdist - 1) >> 7)];
+            let l3: int = E[E_LEND + ds]; let c3: int = E[E_CODED + ds];
+            let r3: int = 0; let b3: int = 0;
+            while (b3 < l3) { r3 = (r3 << 1) | ((c3 >> b3) & 1); b3 = b3 + 1; }
+            bitbuf = bitbuf | (r3 << bitcnt); bitcnt = bitcnt + l3;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            let dex: int = C[C_DEXTRA + ds];
+            if (dex > 0) {
+                bitbuf = bitbuf | ((mdist - C[C_DBASE + ds]) << bitcnt); bitcnt = bitcnt + dex;
+                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            }
+        }
+        t = t + 1;
+    }
+
+    // end-of-block symbol 256
+    let le: int = E[E_LENL + 256]; let ce: int = E[E_CODEL + 256];
+    let re: int = 0; let be: int = 0;
+    while (be < le) { re = (re << 1) | ((ce >> be) & 1); be = be + 1; }
+    bitbuf = bitbuf | (re << bitcnt); bitcnt = bitcnt + le;
+    while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+
+    P[P_BUF] = bitbuf; P[P_CNT] = bitcnt; P[P_OUT] = outp;
+    return 0;
+}

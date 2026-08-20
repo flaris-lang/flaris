@@ -1,0 +1,214 @@
+// Test suite for Zip.fls
+//
+// Run: ./flarisvm ./tests/test_zip.fls --unsafe
+
+import { Archive, ZipReader, ZipWriter } from library("Zip", "1.0");
+import { Inflate, Deflate } from library("Deflate", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + "  expected=" + str(expected) + " got=" + str(actual));
+    }
+}
+
+fn sameBytes(a: block, b: block): bool {
+    if (a == nil || b == nil) return false;
+    if (len(a) != len(b)) return false;
+    for (let i = 0; i < len(a); i += 1) { if (a[i] != b[i]) return false; }
+    return true;
+}
+
+// ============================================================
+//  Round-trip
+// ============================================================
+
+fn test_roundtrip() {
+    let w = Archive.Create();
+    w.Add("hello.txt", "Hello, World!");
+    w.Add("sub/nums.txt", "1\n2\n3");
+    let zipped = w.Build();
+    check(len(zipped) > 0, "Build returns non-empty block");
+
+    let r = Archive.Open(zipped);
+    let listed = r.List();
+    checkEq(len(listed), 2, "List count = 2");
+
+    checkEq(listed[0].Name,  "hello.txt", "List[0].Name");
+    checkEq(listed[0].Size,  13,          "List[0].Size");
+    checkEq(listed[0].IsDir, false,       "List[0].IsDir");
+    checkEq(listed[1].Name,  "sub/nums.txt", "List[1].Name");
+    checkEq(listed[1].Size,  5,              "List[1].Size");
+
+    checkEq(str(r.Read("hello.txt")),    "Hello, World!", "Read hello.txt");
+    checkEq(str(r.Read("sub/nums.txt")), "1\n2\n3",       "Read sub/nums.txt");
+    check(r.Read("nope.txt") == nil, "Read missing -> nil");
+    checkEq(r.Count(), 2, "Count()");
+}
+
+fn test_block_and_empty() {
+    // A pre-compressed (incompressible) block must survive unchanged - this is
+    // the path where deflate loses and the entry is stored instead.
+    let blockData = Deflate.Zlib("binary data here");
+    let w2 = Archive.Create();
+    w2.Add("compressed.bin", blockData);
+    let r2 = Archive.Open(w2.Build());
+    checkEq(len(r2.List()), 1, "block data: 1 entry");
+    checkEq(r2.List()[0].Name, "compressed.bin", "block entry Name");
+    check(sameBytes(r2.Read("compressed.bin"), blockData), "block entry bytes survive");
+
+    let w3 = Archive.Create();
+    let empty = w3.Build();
+    check(len(empty) > 0, "empty Build -> valid bytes");
+    checkEq(len(Archive.Open(empty).List()), 0, "empty archive -> 0 entries");
+
+    // Zero-length entry.
+    let w4 = Archive.Create();
+    w4.Add("zero.bin", Buffer.Create(0, 1));
+    let r4 = Archive.Open(w4.Build());
+    checkEq(r4.List()[0].Size, 0, "zero-length entry Size");
+    checkEq(len(r4.Read("zero.bin")), 0, "zero-length entry Read");
+}
+
+fn test_directories() {
+    let w = Archive.Create();
+    w.Add("d/", "");
+    w.Add("d/f.txt", "x");
+    let r = Archive.Open(w.Build());
+    let l = r.List();
+    checkEq(len(l), 2, "dir + file = 2 entries");
+    check(l[0].IsDir,  "trailing slash -> IsDir true");
+    check(!l[1].IsDir, "regular file -> IsDir false");
+    checkEq(l[0].Size, 0, "directory entry Size = 0");
+}
+
+fn test_large_payload() {
+    // Big enough to exercise real deflate rather than a stored entry. Built
+    // in-process: the suite runs this file from the VM repo, so no path into
+    // the library repo can be assumed.
+    let text = "";
+    iter (i from 0 to 399) {
+        text = text + "line " + str(i) + " of repetitive but not trivial content; deflate should win here.\n";
+    }
+    let src = Buffer.FromString(text);
+    let w = Archive.Create();
+    w.Add("Zip.fls", src);
+    let bytes = w.Build();
+    let r = Archive.Open(bytes);
+    let e = r.List()[0];
+    check(e.CompressedSize < e.Size, "large text entry actually compresses");
+    check(sameBytes(r.Read("Zip.fls"), src), "large entry round-trips byte-exact");
+}
+
+fn test_malformed() {
+    checkEq(len(Archive.Open(Buffer.FromString("not a zip at all")).List()), 0, "garbage -> 0 entries");
+    checkEq(len(Archive.Open(Buffer.Create(4, 1)).List()), 0, "too short -> 0 entries");
+    check(Archive.Open(nil) == nil, "Open(nil) -> nil");
+
+    // A valid archive truncated mid-payload must not hand back bad bytes.
+    let w = Archive.Create();
+    w.Add("a.txt", "some content here");
+    let good = w.Build();
+    let cut = Buffer.Slice(good, 0, len(good) - 10);
+    checkEq(len(Archive.Open(cut).List()), 0, "truncated central dir -> 0 entries");
+}
+
+fn test_disk_io() {
+    let path = "/tmp/flaris_test_zip.zip";
+    let w = Archive.Create();
+    w.Add("a.txt", "disk round trip");
+    w.Add("n/b.txt", "nested");
+    check(w.Save(path), "Save writes the archive");
+
+    let r = Archive.OpenFile(path);
+    check(r != nil, "OpenFile opens it back");
+    checkEq(len(r.List()), 2, "OpenFile entry count");
+    checkEq(str(r.Read("a.txt")), "disk round trip", "OpenFile Read");
+
+    check(r.Extract("n/b.txt", "/tmp/flaris_test_zip_out/b.txt"), "Extract creates dirs and writes");
+    checkEq(File.ReadText("/tmp/flaris_test_zip_out/b.txt"), "nested", "Extract content");
+
+    checkEq(r.ExtractAll("/tmp/flaris_test_zip_all"), 2, "ExtractAll returns file count");
+    checkEq(File.ReadText("/tmp/flaris_test_zip_all/a.txt"), "disk round trip", "ExtractAll content");
+
+    check(Archive.OpenFile("/tmp/definitely_missing_zip.zip") == nil, "OpenFile missing -> nil");
+
+    File.Delete(path);
+    Directory.DeleteAll("/tmp/flaris_test_zip_out");
+    Directory.DeleteAll("/tmp/flaris_test_zip_all");
+}
+
+// ============================================================
+//  Benchmarks
+// ============================================================
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Zip benchmarks ===");
+    let text = "";
+    iter (i from 0 to 4999) {
+        text = text + "benchmark line " + str(i) + " with some filler so the payload compresses realistically.\n";
+    }
+    let src = Buffer.FromString(text);
+    let n = len(src);
+
+    let t = Time.Millis();
+    let w = Archive.Create();
+    w.Add("reference.md", src);
+    let bytes = w.Build();
+    let build = Time.Millis() - t;
+
+    t = Time.Millis();
+    let r = Archive.Open(bytes);
+    let list = r.List();
+    let open = Time.Millis() - t;
+
+    t = Time.Millis();
+    let back = r.Read("reference.md");
+    let read = Time.Millis() - t;
+
+    Console.WriteLine("  Build  " + str(n) + " B -> " + str(len(bytes)) + " B : " + str(build) + " ms");
+    Console.WriteLine("  Open + List                      : " + str(open) + " ms");
+    Console.WriteLine("  Read (inflate)                   : " + str(read) + " ms");
+
+    // Many small entries: exercises central-directory build/parse, not deflate.
+    t = Time.Millis();
+    let mw = Archive.Create();
+    iter (i from 0 to 999) { mw.Add("f" + str(i) + ".txt", "entry number " + str(i)); }
+    let mb = mw.Build();
+    let manyBuild = Time.Millis() - t;
+    t = Time.Millis();
+    let mr = Archive.Open(mb);
+    let cnt = len(mr.List());
+    let manyOpen = Time.Millis() - t;
+    Console.WriteLine("  Build 1000 entries               : " + str(manyBuild) + " ms (" + str(len(mb)) + " B)");
+    Console.WriteLine("  Open + List 1000 entries         : " + str(manyOpen) + " ms (" + str(cnt) + ")");
+
+    check(sameBytes(back, src), "benchmark payload round-trips");
+    checkEq(cnt, 1000, "benchmark 1000 entries listed");
+}
+
+fn Main() {
+    Console.WriteLine("=== Zip tests ===");
+    test_roundtrip();
+    test_block_and_empty();
+    test_directories();
+    test_large_payload();
+    test_malformed();
+    test_disk_io();
+    test_benchmarks();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All Zip tests passed!");
+    return 0;
+}

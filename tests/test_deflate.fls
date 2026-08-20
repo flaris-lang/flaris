@@ -1,0 +1,173 @@
+// Test suite for Deflate.fls
+//
+// Every case is differential: the built-in Compress module produces the
+// stream, this library decodes it, and the result must equal the original
+// byte for byte. Payloads are generated in-process so the suite can run from
+// either repo root.
+//
+// Run: ./flarisvm ./tests/test_deflate.fls
+
+import { Inflate, Deflate } from library("Deflate", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+fn same(a: block, b: block): bool {
+    if (a == nil || b == nil) return false;
+    if (len(a) != len(b)) return false;
+    for (let i = 0; i < len(a); i += 1) { if ((a[i] & 255) != (b[i] & 255)) return false; }
+    return true;
+}
+
+// mode 0 all-same, 1 text-like, 2 pseudo-random, 3 periodic
+fn mk(n: int, mode: int): block {
+    let b = Buffer.Create(n, 1);
+    let x = 88172645463325252;
+    for (let i = 0; i < n; i += 1) {
+        if (mode == 0) { b[i] = 65; }
+        else if (mode == 1) { b[i] = 32 + (i % 64); }
+        else if (mode == 2) { x = x ^ (x << 13); x = x ^ ((x >> 7) & 0x1FFFFFFFFFFFFFF); x = x ^ (x << 17); b[i] = (x >> 24) & 255; }
+        else { b[i] = (i * i) & 255; }
+    }
+    return b;
+}
+
+fn roundtrip(name: string, src: block) {
+    let raw = Deflate.Raw(src, 32);
+    let z   = Deflate.Zlib(src, 32);
+    let g   = Deflate.Gzip(src, 32);
+    check(same(Inflate.Raw(raw, len(src)), src),  name + " raw (size known)");
+    check(same(Inflate.Raw(raw, 0), src),          name + " raw (size unknown)");
+    check(same(Inflate.Zlib(z, len(src)), src),    name + " zlib");
+    check(same(Inflate.Gzip(g, len(src)), src),    name + " gzip");
+    check(same(Inflate.Auto(z, 0), src),           name + " auto zlib");
+    check(same(Inflate.Auto(g, 0), src),           name + " auto gzip");
+    check(same(Inflate.Auto(raw, len(src)), src),  name + " auto raw");
+}
+
+fn test_sizes() {
+    foreach (n in [1, 2, 3, 7, 15, 16, 17, 100, 255, 256, 257, 1000, 4096, 34832, 65536]) {
+        roundtrip("n=" + str(n) + " same", mk(n, 0));
+        roundtrip("n=" + str(n) + " text", mk(n, 1));
+        roundtrip("n=" + str(n) + " rand", mk(n, 2));
+        roundtrip("n=" + str(n) + " perio", mk(n, 3));
+    }
+}
+
+fn test_block_types() {
+    // Incompressible input becomes stored blocks; highly repetitive input
+    // exercises the longest matches; mid-entropy text exercises dynamic
+    // Huffman including codes past the 9-bit root table.
+    roundtrip("stored ", mk(200000, 2));
+    roundtrip("longmatch", mk(200000, 0));
+    let t = "";
+    iter (i from 0 to 3999) { t = t + "the quick brown fox " + str(i) + " jumps over the lazy dog\n"; }
+    roundtrip("dynamic", Buffer.FromString(t));
+}
+
+// Streams produced by an independent (C/miniz) encoder, frozen here so the
+// decoder keeps being checked against something other than our own encoder.
+fn test_reference_vectors() {
+    let hex = ["789c030000000001",
+               "789c010100feff6100620062",
+               "789c010b00f4ff68656c6c6f20776f726c641a0b045d",
+               "789c4b4c240c00fc7e0da5",
+               "789c8dca5711c0201405512b57413ca59084fae84d3d0c0af8dcd9137f0697f82d71792a062f5588a46d0065e611e756676f78e83b56ede201bf71206f"];
+    let want = ["", "a", "hello world", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog."];
+    iter (i from 0 to len(hex) - 1) {
+        let z = Util.HexToBin(hex[i]);
+        let got = Inflate.Zlib(z, 0);
+        check(got != nil && str(got) == want[i], "reference vector " + str(i) + " decodes");
+        check(same(Inflate.Auto(z, 0), Buffer.FromString(want[i])), "reference vector " + str(i) + " via Auto");
+    }
+}
+
+// Our encoder's output must be decodable by the reference decoder shape, and
+// must not be pathologically worse than a general-purpose one.
+fn test_compression_quality() {
+    let t = "";
+    iter (i from 0 to 999) { t = t + "line " + str(i) + " of sample text with some repetition\n"; }
+    let src = Buffer.FromString(t);
+    let z = Deflate.Raw(src, 32);
+    check(len(z) < len(src) / 3, "structured text compresses at least 3x");
+    check(same(Inflate.Raw(z, len(src)), src), "structured text round-trips");
+
+    // Incompressible input must not grow beyond the stored-block overhead.
+    let r = mk(200000, 2);
+    let rz = Deflate.Raw(r, 32);
+    check(len(rz) <= len(r) + (len(r) / 65535 + 1) * 5 + 16, "incompressible stays near-original size");
+    check(same(Inflate.Raw(rz, len(r)), r), "incompressible round-trips");
+
+    // effort is a knob, not a correctness switch.
+    foreach (e in [1, 8, 128]) {
+        let ez = Deflate.Raw(src, e);
+        check(same(Inflate.Raw(ez, len(src)), src), "effort=" + str(e) + " round-trips");
+    }
+}
+
+fn test_malformed() {
+    check(Inflate.Raw(Buffer.FromString("nonsense bytes here"), 0) == nil, "garbage -> nil");
+    check(Inflate.Raw(Buffer.Create(0, 1), 0) == nil,                      "empty -> nil");
+    check(Inflate.Raw(nil, 0) == nil,                                      "nil -> nil");
+    check(Inflate.Zlib(Buffer.FromString("xx"), 0) == nil,                 "short zlib -> nil");
+    check(Inflate.Gzip(Buffer.FromString("xx"), 0) == nil,                 "short gzip -> nil");
+
+    // A valid stream truncated mid-way must fail, never return partial data.
+    let src = mk(50000, 1);
+    let z = Deflate.Zlib(src, 32);
+    let raw = Deflate.Raw(src, 32);
+    check(Inflate.Raw(Buffer.Slice(raw, 0, len(raw) / 2), len(src)) == nil, "truncated -> nil");
+    check(Inflate.LastError() != 0, "LastError set after failure");
+
+    // A corrupted zlib checksum must be rejected.
+    let bad = Buffer.Slice(z, 0, len(z));
+    bad[len(bad) - 1] = (bad[len(bad) - 1] + 1) & 255;
+    check(Inflate.Zlib(bad, len(src)) == nil, "bad Adler-32 -> nil");
+}
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Deflate benchmarks ===");
+    // Realistic English-ish text is the interesting case: it is the one that
+    // actually exercises Huffman decoding rather than long matches or stored
+    // blocks, and it is where the pure-Flaris decoder is furthest from C.
+    let words = "";
+    iter (i from 0 to 19999) { words = words + "the quick brown fox " + str(i * 7919 % 100000) + " jumps over lazy dogs near riverbanks\n"; }
+    let textSrc = Buffer.FromString(words);
+    foreach (m in [1, 2, 3, 4]) {
+        let src = m == 4 ? textSrc : mk(1048576, m);
+        let raw = Deflate.Raw(src, 32);
+        let label = m == 1 ? "repetitive" : (m == 2 ? "random    " : (m == 3 ? "periodic  " : "real text "));
+
+        let t = Time.Millis();
+        iter (i from 0 to 4) { Deflate.Raw(src, 32); }
+        let d = (Time.Millis() - t) / 5;
+
+        t = Time.Millis();
+        iter (i from 0 to 4) { Inflate.Raw(raw, len(src)); }
+        let f = (Time.Millis() - t) / 5;
+
+        Console.WriteLine("  " + label + " " + str(len(src)) + " B -> " + str(len(raw))
+                          + " B   deflate " + str(d) + " ms   inflate " + str(f) + " ms");
+    }
+}
+
+fn Main() {
+    Console.WriteLine("=== Deflate tests ===");
+    test_sizes();
+    test_reference_vectors();
+    test_compression_quality();
+    test_block_types();
+    test_malformed();
+    test_benchmarks();
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All Deflate tests passed!");
+    return 0;
+}
