@@ -1,0 +1,313 @@
+// HttpUtil.fls - HTTP wire parsing: URLs, query strings, headers, chunked
+// bodies and route patterns.
+// Version: 1.0
+//
+// Pure string work with no I/O except DecodeChunked, which reads from a stream.
+// All functions are static; nothing here holds state.
+//
+// Usage:
+//   import { HttpUtil } from library("HttpUtil", "1.0");
+//
+//   let u = HttpUtil.ParseUrl("https://example.com:8443/v1/users?id=7");
+//   u.scheme  // "https"
+//   u.host    // "example.com"
+//   u.port    // 8443        (80/443 by scheme when absent)
+//   u.path    // "/v1/users" ("/" when absent)
+//   u.query   // "id=7"
+//
+//   let q = HttpUtil.ParseQuery("a=1&b=hello+world");   // { a: "1", b: "hello world" }
+//   let h = HttpUtil.ParseHeaders("Host: x\r\nAccept: */*\r\n");
+//   h["host"]   // keys are lowercased for consistent lookup
+//
+// URLs:
+//   ParseUrl(url)              -> { scheme, host, port, path, query, fragment } | nil
+//
+// Query strings:
+//   ParseQuery(s)              -> object   percent-decoded, '+' as space,
+//                                          keys decoding to empty are skipped
+//   EncodeQuery(params)        -> string   form-urlencoded, '+' for space;
+//                                          string/int/float/bool values only
+//   UrlEncode(s)               -> string   percent-encode (RFC 3986, %20 for space)
+//   UrlDecode(s)               -> string   decode, '+' as space; malformed %XX
+//                                          is left literal
+//
+// Headers:
+//   ParseHeaders(block)        -> object   CRLF-delimited, no status line;
+//                                          keys lowercased, values left-trimmed
+//
+// Bodies:
+//   DecodeChunked(s, cap?)     -> block|nil   read HTTP/1.1 chunked encoding from
+//                                          a stream; extensions and trailers are
+//                                          ignored, cap bounds the total size
+//
+// Routing:
+//   RouteMatch(req, method, pattern) -> bool
+//       Match req.method/req.path against a pattern. ':name' captures a segment
+//       into req.params, a terminal '*' captures the remaining path into
+//       params["*"]. A pattern without '*' must consume the whole path.
+//
+//         let req = { method: "GET", path: "/users/42" };
+//         HttpUtil.RouteMatch(req, "GET", "/users/:id");   // true
+//         req.params["id"]                                 // "42"
+
+class HttpUtil
+{
+    // Percent-encode per RFC 3986; unreserved characters pass through.
+    fn static UrlEncode(s: string): string {
+        if (s == nil) { return nil; }
+        let n: int = String.Length(s);
+        let out: string = "";
+        let i: int = 0;
+        while (i < n) {
+            let code: int = Char.Code(String.CharAt(s, i));
+            // RFC 3986 unreserved, tested by byte value: the classifier helpers
+            // accept high bytes as letters, which would leave UTF-8 lead bytes
+            // unencoded and corrupt any non-ASCII input.
+            let safe = (code >= 48 && code <= 57) ||     // 0-9
+                       (code >= 65 && code <= 90) ||     // A-Z
+                       (code >= 97 && code <= 122) ||    // a-z
+                       code == 45 || code == 95 ||       // - _
+                       code == 46 || code == 126;        // . ~
+            if (safe) {
+                out = out + String.Substr(s, i, 1);
+            } else {
+                let hex: string = String.ToUpper(Convert.ToRadixString(code, 16));
+                if (String.Length(hex) < 2) { hex = "0" + hex; }
+                out = out + "%" + hex;
+            }
+            i += 1;
+        }
+        return out;
+    }
+
+    // Percent-decode, '+' as space; a malformed %XX is left literal.
+    fn static UrlDecode(s: string): string {
+        if (s == nil) { return nil; }
+        // Overwhelmingly the common case: nothing to decode, so no allocation.
+        if (!String.Contains(s, "%") && !String.Contains(s, "+")) { return s; }
+
+        let n: int = String.Length(s);
+        // Bytes, not characters: %C3%A4 is one two-byte UTF-8 character, and
+        // writing it through Char.FromInt would encode each half again.
+        // Decoding only ever shrinks, so one buffer of n bytes is enough.
+        let out = Buffer.Create(n, 1);
+        let w: int = 0;
+        let i: int = 0;
+        while (i < n) {
+            let c = String.CharAt(s, i);
+            if (c == '+') {
+                out[w] = 32;
+                w += 1;
+                i += 1;
+            } else if (c == '%' && i + 2 < n) {
+                let v: int = Convert.ParseRadix(String.Substr(s, i + 1, 2), 16) ?? -1;
+                if (v < 0) { out[w] = Char.Code(c); w += 1; i += 1; }
+                else       { out[w] = v;            w += 1; i += 3; }
+            } else {
+                out[w] = Char.Code(c);
+                w += 1;
+                i += 1;
+            }
+        }
+        return String.Left(Buffer.ToString(out), w);
+    }
+
+    // "a=1&b=2" -> { a: "1", b: "2" }; keys that decode to empty are skipped.
+    fn static ParseQuery(s: string): object {
+        let res = {};
+        if (s == nil || String.Length(s) == 0) { return res; }
+        let parts: array = String.Split(s, "&");
+        let i: int = 0;
+        while (i < len(parts)) {
+            let p: string = parts[i];
+            if (String.Length(p) > 0) {
+                let eq: int = String.IndexOf(p, "=");
+                let k: string = "";
+                let v: string = "";
+                if (eq < 0) { k = p; }
+                else {
+                    k = String.Left(p, eq);
+                    v = String.Substr(p, eq + 1, String.Length(p) - eq - 1);
+                }
+                k = HttpUtil.UrlDecode(k);
+                if (String.Length(k) > 0) { res[k] = HttpUtil.UrlDecode(v); }
+            }
+            i = i + 1;
+        }
+        return res;
+    }
+
+    // Object -> form-urlencoded ('+' for space). Non-scalar values are skipped.
+    fn static EncodeQuery(params: object): string {
+        if (params == nil) { return ""; }
+        let keys: array = Object.Keys(params);
+        let out: string = "";
+        let i: int = 0;
+        while (i < len(keys)) {
+            let k = keys[i];
+            let v = params[k];
+            let t = Type.Of(v);
+            if (t == Type.String || t == Type.Int || t == Type.Float || t == Type.Bool) {
+                let sv: string = "";
+                if (t == Type.Bool) { sv = v ? "true" : "false"; }
+                else                { sv = Convert.ToString(v); }
+                if (String.Length(out) > 0) { out = out + "&"; }
+                out = out + String.Replace(HttpUtil.UrlEncode(k), "%20", "+") + "=" +
+                            String.Replace(HttpUtil.UrlEncode(sv), "%20", "+");
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // CRLF header block (no status line) -> object. Keys are lowercased for
+    // consistent lookup; values are left-trimmed.
+    fn static ParseHeaders(s: string): object {
+        let res = {};
+        if (s == nil) { return res; }
+        let lines: array = String.Split(s, "\r\n");
+        let i: int = 0;
+        while (i < len(lines)) {
+            let line: string = lines[i];
+            if (String.Length(line) > 0) {
+                let c: int = String.IndexOf(line, ":");
+                if (c > 0) {
+                    res[String.ToLower(String.Left(line, c))] =
+                        String.TrimLeft(String.Substr(line, c + 1, String.Length(line) - c - 1));
+                }
+            }
+            i = i + 1;
+        }
+        return res;
+    }
+
+    // { scheme, host, port, path, query, fragment }; missing scheme defaults to
+    // http, missing port to 80/443, missing path to "/". IPv6 literals in [].
+    fn static ParseUrl(url: string): object {
+        if (url == nil || String.Length(url) == 0) { return nil; }
+        let scheme: string = "http";
+        let rest: string = url;
+
+        let si: int = String.IndexOf(url, "://");
+        if (si > 0) {
+            scheme = String.ToLower(String.Left(url, si));
+            rest = String.Substr(url, si + 3, String.Length(url) - si - 3);
+        }
+        let fragment: string = "";
+        let hi: int = String.IndexOf(rest, "#");
+        if (hi >= 0) {
+            fragment = String.Substr(rest, hi + 1, String.Length(rest) - hi - 1);
+            rest = String.Left(rest, hi);
+        }
+        let query: string = "";
+        let qi: int = String.IndexOf(rest, "?");
+        if (qi >= 0) {
+            query = String.Substr(rest, qi + 1, String.Length(rest) - qi - 1);
+            rest = String.Left(rest, qi);
+        }
+        let path: string = "/";
+        let pi: int = String.IndexOf(rest, "/");
+        if (pi >= 0) {
+            path = String.Substr(rest, pi, String.Length(rest) - pi);
+            rest = String.Left(rest, pi);
+        }
+
+        let host: string = rest;
+        let port: int = 0;
+        if (String.Length(host) > 0 && String.CharAt(host, 0) == '[') {
+            let close: int = String.IndexOf(host, "]");
+            if (close > 0) {
+                let after: string = String.Substr(host, close + 1, String.Length(host) - close - 1);
+                host = String.Substr(host, 1, close - 1);
+                if (String.Length(after) > 1 && String.CharAt(after, 0) == ':') {
+                    port = Convert.ParseInt(String.Substr(after, 1, String.Length(after) - 1)) ?? 0;
+                }
+            }
+        } else {
+            let ci: int = String.LastIndexOf(host, ":");
+            if (ci > 0) {
+                port = Convert.ParseInt(String.Substr(host, ci + 1, String.Length(host) - ci - 1)) ?? 0;
+                host = String.Left(host, ci);
+            }
+        }
+        if (port == 0) { port = (scheme == "https") ? 443 : 80; }
+
+        return { scheme: scheme, host: host, port: port,
+                 path: path, query: query, fragment: fragment };
+    }
+
+    // Match req.method/req.path against a route pattern. Segments support
+    // ':name' (captured into req.params) and a terminal '*' catch-all. A
+    // non-wildcard pattern must consume every path segment.
+    fn static RouteMatch(req: object, method: string, pattern: string): bool {
+        if (req == nil || req.method == nil || req.path == nil) { return false; }
+        if (req.method != method) { return false; }
+
+        let pat: array  = String.Split(pattern, "/");
+        let path: array = String.Split(req.path, "/");
+        let params = {};
+        let pi: int = 0;
+        let ri: int = 0;
+
+        while (pi < len(pat)) {
+            let pseg: string = pat[pi];
+            if (String.Length(pseg) == 0) { pi = pi + 1; continue; }
+            while (ri < len(path) && String.Length(path[ri]) == 0) { ri = ri + 1; }
+
+            if (pseg == "*") {
+                let rest: string = "";
+                while (ri < len(path)) {
+                    if (String.Length(rest) > 0) { rest = rest + "/"; }
+                    rest = rest + path[ri];
+                    ri = ri + 1;
+                }
+                params["*"] = rest;
+                req.params = params;
+                return true;
+            }
+            if (ri >= len(path)) { return false; }
+            if (String.CharAt(pseg, 0) == ':') {
+                params[String.Substr(pseg, 1, String.Length(pseg) - 1)] = path[ri];
+            } else if (pseg != path[ri]) {
+                return false;
+            }
+            pi = pi + 1;
+            ri = ri + 1;
+        }
+        while (ri < len(path) && String.Length(path[ri]) == 0) { ri = ri + 1; }
+        if (ri < len(path)) { return false; }
+        req.params = params;
+        return true;
+    }
+
+    // Read HTTP/1.1 chunked transfer-encoding from a stream. Chunk extensions
+    // and trailers are ignored. Returns the decoded bytes, or nil on a
+    // malformed frame / past `cap` bytes.
+    fn static DecodeChunked(s: stream, cap?: int): block {
+        if (s == nil) { return nil; }
+        let limit = cap ?? 268435456;
+        let out: string = "";
+        while (true) {
+            let line = Stream.ReadLine(s);
+            if (line == nil) { return nil; }
+            // Strip any ";ext" before parsing the hex size.
+            let semi: int = String.IndexOf(line, ";");
+            if (semi >= 0) { line = String.Left(line, semi); }
+            line = String.Trim(line);
+            if (String.Length(line) == 0) { continue; }
+
+            let n: int = Convert.ParseRadix(line, 16) ?? -1;
+            if (n < 0) { return nil; }
+            if (n == 0) { break; }
+            if (String.Length(out) + n > limit) { return nil; }
+
+            let chunk = Stream.ReadBytes(s, n);
+            if (chunk == nil) { return nil; }
+            out = out + Buffer.ToString(chunk);
+            Stream.ReadLine(s);          // trailing CRLF after the chunk body
+        }
+        return Buffer.FromString(out);
+    }
+}
+
+export { HttpUtil };

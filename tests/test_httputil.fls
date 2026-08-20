@@ -1,0 +1,116 @@
+// test_httputil.fls
+// Run: flarisvm test_httputil.fls
+//
+// Covers URL parsing, percent codecs, query strings, header blocks and route
+// patterns, including UTF-8 round-trips and IPv6 literals.
+
+import { HttpUtil } from library("HttpUtil", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn pk(name: string, cond) {
+    if (cond) { passed = passed + 1; Console.WriteLine("[PASS] ", name); }
+    else      { failed = failed + 1; Console.WriteLine("[FAIL] ", name); }
+}
+fn pkEq(name: string, a, b) {
+    if (a == b) { passed = passed + 1; Console.WriteLine("[PASS] ", name); }
+    else { failed = failed + 1; Console.WriteLine("[FAIL] ", name, " expected=", b, " got=", a); }
+}
+
+fn test_url() {
+    let u = HttpUtil.ParseUrl("https://api.example.com:8443/v1/users/42?active=true#frag");
+    pkEq("scheme",   u.scheme, "https");
+    pkEq("host",     u.host,   "api.example.com");
+    pkEq("port",     u.port,   8443);
+    pkEq("path",     u.path,   "/v1/users/42");
+    pkEq("query",    u.query,  "active=true");
+    pkEq("fragment", u.fragment, "frag");
+
+    // Defaults: no scheme -> http, no port -> 80/443, no path -> "/"
+    pkEq("default scheme", HttpUtil.ParseUrl("example.com/a").scheme, "http");
+    pkEq("default port80", HttpUtil.ParseUrl("http://example.com/a").port, 80);
+    pkEq("default port443", HttpUtil.ParseUrl("https://example.com").port, 443);
+    pkEq("default path",   HttpUtil.ParseUrl("https://example.com").path, "/");
+
+    // IPv6 literals keep their brackets out of the host and parse the port.
+    let v6 = HttpUtil.ParseUrl("http://[::1]:9000/a?b=1");
+    pkEq("ipv6 host", v6.host, "::1");
+    pkEq("ipv6 port", v6.port, 9000);
+    pkEq("ipv6 path", v6.path, "/a");
+
+    pkEq("empty url -> nil", HttpUtil.ParseUrl(""), nil);
+}
+
+fn test_codecs() {
+    pkEq("encode reserved", HttpUtil.UrlEncode("a b/c"), "a%20b%2Fc");
+    pkEq("encode unreserved passthrough", HttpUtil.UrlEncode("Plain-Text_1.0~"), "Plain-Text_1.0~");
+    pkEq("decode percent", HttpUtil.UrlDecode("a%20b"), "a b");
+    pkEq("decode plus",    HttpUtil.UrlDecode("a+b"),   "a b");
+    // A malformed escape is left literal rather than dropped.
+    pkEq("decode bad escape", HttpUtil.UrlDecode("100%ZZ"), "100%ZZ");
+    pkEq("decode empty",   HttpUtil.UrlDecode(""), "");
+    pkEq("decode untouched", HttpUtil.UrlDecode("/plain/path"), "/plain/path");
+
+    // Non-ASCII is percent-encoded per UTF-8 byte, not per character.
+    pkEq("encode utf8 two-byte", HttpUtil.UrlEncode("ä"), "%C3%A4");
+    pkEq("decode utf8 two-byte", HttpUtil.UrlDecode("%C3%A4"), "ä");
+    pkEq("utf8 round trip",   HttpUtil.UrlDecode(HttpUtil.UrlEncode("äöü")), "äöü");
+    pkEq("cjk round trip",    HttpUtil.UrlDecode(HttpUtil.UrlEncode("日本語")), "日本語");
+    pkEq("reserved round trip",
+         HttpUtil.UrlDecode(HttpUtil.UrlEncode(":/?#[]@!$&'()*+,;=")), ":/?#[]@!$&'()*+,;=");
+}
+
+fn test_query() {
+    let q = HttpUtil.ParseQuery("active=true&sort=name&q=hello+world");
+    pkEq("query active", q["active"], "true");
+    pkEq("query plus decoded", q["q"], "hello world");
+    pkEq("query count", len(Object.Keys(q)), 3);
+    pkEq("empty query", len(Object.Keys(HttpUtil.ParseQuery(""))), 0);
+
+    // EncodeQuery round-trips through ParseQuery.
+    let enc = HttpUtil.EncodeQuery({ name: "ada lovelace", n: 42, ok: true });
+    let back = HttpUtil.ParseQuery(enc);
+    pkEq("roundtrip name", back["name"], "ada lovelace");
+    pkEq("roundtrip int",  back["n"],    "42");
+    pkEq("roundtrip bool", back["ok"],   "true");
+}
+
+fn test_headers() {
+    let h = HttpUtil.ParseHeaders("Host: example.com\r\nContent-Type: application/json\r\n" +
+                                  "X-Empty:\r\nCookie: a=1; b=2\r\n");
+    pkEq("header lowercased key", h["host"], "example.com");
+    pkEq("header value trimmed",  h["content-type"], "application/json");
+    pkEq("header with semicolons", h["cookie"], "a=1; b=2");
+    pkEq("empty header block", len(Object.Keys(HttpUtil.ParseHeaders(""))), 0);
+}
+
+fn test_routes() {
+    let r = { method: "GET", path: "/v1/users/42/profile" };
+    pk("route matches", HttpUtil.RouteMatch(r, "GET", "/v1/users/:id/profile"));
+    pkEq("route captured param", r.params["id"], "42");
+
+    let r2 = { method: "GET", path: "/v1/users/42/profile" };
+    pk("route rejects other pattern", !HttpUtil.RouteMatch(r2, "GET", "/v1/orders/:id"));
+
+    let r3 = { method: "POST", path: "/a/b" };
+    pk("route rejects method mismatch", !HttpUtil.RouteMatch(r3, "GET", "/a/b"));
+
+    let r4 = { method: "GET", path: "/a" };
+    pk("route rejects short path", !HttpUtil.RouteMatch(r4, "GET", "/a/:id"));
+
+    let r5 = { method: "GET", path: "/static/css/site.css" };
+    pk("wildcard matches", HttpUtil.RouteMatch(r5, "GET", "/static/*"));
+    pkEq("wildcard captures rest", r5.params["*"], "css/site.css");
+}
+
+fn Main() {
+    test_url();
+    test_codecs();
+    test_query();
+    test_headers();
+    test_routes();
+    Console.WriteLine("Results: ", passed, " passed, ", failed, " failed");
+    if (failed > 0) { return 1; }
+    return 0;
+}

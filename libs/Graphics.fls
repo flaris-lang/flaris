@@ -1,88 +1,1651 @@
-// Graphics.fls - High-level 2D drawing library for Flaris.
+// =============================================================================
+// Graphics.fls - 2D drawing for Flaris.
 // Version: 1.0
 //
-// Wraps the low-level Gfx builtin with a stateful style context (stroke color,
-// fill color, line thickness) so callers don't pass color on every call.
-// Produces PNG-compatible images saved to file or in-memory block.
-//
-// Color format: 0xAARRGGBB (32-bit ARGB). Fully opaque = 0xFF_______.
-// Static helpers: Graphics.RGB(r,g,b)  Graphics.RGBA(r,g,b,a)  Graphics.HSL(h,s,l)
-// Fill == 0 means "no fill" (outline only for Rect, Circle, etc.).
+// A complete software rasteriser written in Flaris: shapes, text, image
+// compositing and PNG output, with a stateful style context so you set stroke,
+// fill and thickness once instead of passing them to every call.
 //
 // Usage:
 //   import { Graphics } from library("Graphics", "1.0");
 //
-//   let g = new Graphics(800, 600);           // blank canvas
-//   g.SetStroke(0xFF000000);                  // black outline
-//   g.SetFill(0xFFFF0000);                    // red fill
+//   let g = new Graphics(800, 600);
+//   g.Clear(0xFFFFFFFF);              // white background
+//   g.SetStroke(Graphics.RGB(0, 0, 0));
+//   g.SetFill(Graphics.RGB(220, 60, 60));
 //   g.SetThickness(2);
-//   g.Clear(0xFFFFFFFF);                      // white background
-//   g.Circle(400, 300, 100);                  // filled + outlined circle
+//   g.Circle(400, 300, 100);          // filled + outlined
 //   g.DrawText(10, 10, "Hello");
 //   g.Save("output.png");
 //
-//   let img = Graphics.FromFile("photo.png"); // load existing image
-//   img.GrayscaleAll();
-//   img.Save("gray.png");
+//   let photo = Graphics.FromFile("photo.png");
+//   photo.GrayscaleAll();
+//   photo.Save("gray.png");
 //
-// Constructors:
-//   new Graphics(width, height)
-//   Graphics.Create(width, height)    →  instance
-//   Graphics.FromFile(path)           →  instance or nil
-//   Graphics.LoadImage(path)          →  instance or nil
+// Colour format: 0xAARRGGBB. Fully opaque is 0xFF______. A fill of 0 means "no
+// fill" - outline only. Anything drawn with an alpha below 255 is composited
+// over what is already there; alpha 0 draws nothing.
+//
+//   Graphics.RGB(r, g, b)        Graphics.RGBA(r, g, b, a)
+//   Graphics.HSL(hue, sat, light)   hue in degrees, sat/light in 0..1
+//
+// Construction:
+//   new Graphics(width, height)      Graphics.Create(width, height)
+//   Graphics.FromFile(path)          Graphics.LoadImage(path)     -> instance|nil
 //
 // Style:
-//   SetStroke(argb)  SetFill(argb)  SetThickness(n)
-//   StrokeColor()  FillColor()  Thickness()
-//   static RGB(r,g,b)   static RGBA(r,g,b,a)   static HSL(h,s,l)
+//   SetStroke(argb)   SetFill(argb)   SetThickness(n)
+//   StrokeColor()     FillColor()     Thickness()
 //
-// Primitives (use current stroke + fill + thickness):
-//   Clear(color)
-//   Pixel(x,y,color)   GetPixel(x,y)  →  int
-//   Line(x0,y0,x1,y1)   HLine(x0,y,x1)   VLine(x,y0,y1)
-//   Polyline(pts)        - flat int array [x0,y0, x1,y1, ...] (not nested pairs)
-//   Rect(x,y,w,h)        - outline only (stroke)
-//   FillRect(x,y,w,h)   - fill only
-//   RoundRect(x,y,w,h,r)         - outline+fill with rounded corners
-//   DrawRoundRect(x,y,w,h,r)     - outline only
-//   FillRoundRect(x,y,w,h,r)     - fill only
-//   Circle(cx,cy,r)      - outline+fill
-//   DrawCircle(cx,cy,r)  - outline only
-//   FillCircle(cx,cy,r)  - fill only
-//   Ellipse(cx,cy,rx,ry)   FillEllipse(cx,cy,rx,ry)
-//   Arc(cx,cy,r,startDeg,endDeg)   ArcButt(…)
-//   Pie(cx,cy,r,startDeg,endDeg)   FillPie(…)
-//   Polygon(pts)    FillPolygon(pts)  - flat int array [x0,y0, x1,y1, ...] (not nested pairs)
+// Shapes - outline uses stroke + thickness, fills use fill:
+//   Clear(colour)                     Pixel(x, y, colour)   GetPixel(x, y)
+//   Line(x0,y0,x1,y1)                 HLine(x0,y,x1)        VLine(x,y0,y1)
+//   Polyline(pts)                     Polygon(pts)          FillPolygon(pts)
+//   Rect(x,y,w,h)                     FillRect(x,y,w,h)
+//   RoundRect(x,y,w,h,r)              DrawRoundRect(...)    FillRoundRect(...)
+//   Circle(cx,cy,r)                   DrawCircle(...)       FillCircle(...)
+//   Ellipse(cx,cy,rx,ry)              FillEllipse(...)
+//   Arc(cx,cy,r,a0,a1)                ArcButt(...)
+//   Pie(cx,cy,r,a0,a1)                FillPie(...)
 //
-// Text:
-//   DrawChar(x,y,code)              - single character by codepoint
-//   DrawCharScaled(x,y,code,scale)
-//   DrawText(x,y,text)
-//   DrawTextEx(x,y,text,scale)
-//   TextWidth(text,scale,lspace?)  TextHeight(scale)
-//   TextMetrics(text,scale,lspace?)  →  { width, height }
+// Point lists are flat: [x0,y0, x1,y1, ...], not nested pairs.
 //
-// Images & compositing:
-//   DrawImage(file,x,y,w,h)         - draw image file scaled to w×h
-//   DrawImageNearest(file,x,y,w,h)  - nearest-neighbour scaling
-//   Blit(x,y,w,h,pixels)            - raw ARGB pixel array
-//   Draw(src,x,y)                   - composite another Graphics at x,y
-//   DrawGfx(srcGfx,x,y)             - composite a raw Gfx handle
-//   CopyRect(x,y,w,h)               →  new Graphics (sub-image copy)
-//   BlendRect(src,dx,dy,alpha)      - alpha-blend a region
-//   Blend(src,dx,dy)                - full alpha blend
+// Text - an 8x8 bitmap font, integer-scaled, drawn opaquely:
+//   DrawChar(x,y,code)                DrawCharScaled(x,y,code,scale)
+//   DrawText(x,y,text)                DrawTextEx(x,y,text,scale)
+//   TextWidth(text,scale)             TextHeight(scale)     TextMetrics(...)
 //
-// Transforms & filters:
-//   Resize(w,h)  Rescale(sx,sy)  RescaleUniform(s)
-//   Filter(callback,x,y,w,h)     - per-pixel fn(argb)→argb on region
-//   FilterAll(callback)
-//   Grayscale(x,y,w,h)  GrayscaleAll()
-//   Brightness(x,y,w,h,factor)   BrightnessAll(factor)
+// Images and compositing:
+//   DrawImage(path,x,y,w,h)           DrawImageNearest(path,x,y,w,h)
+//   Blit(x,y,w,h,pixels)              Draw(src,x,y)         DrawGfx(handle,x,y)
+//   BlendRect(src,dx,dy,alpha)        Blend(src,dx,dy)
+//   CopyRect(x,y,w,h) -> instance     Resize(w,h)           Rescale(sx,sy)
+//
+// Effects - each has an ...All() form covering the whole canvas:
+//   Grayscale(x,y,w,h)                Brightness(x,y,w,h,factor)
+//   Filter(fn,x,y,w,h)                fn(pixel) -> pixel, or nil to keep it
+//   FilterCallback(fn,x,y,w,h,cb)     FilterEvent(fn,x,y,w,h,eventId)
 //
 // Output:
-//   Save(path)       - write PNG to file
-//   ToBlock()        →  block with raw PNG bytes
-//   Width()  Height()  GetGfx()
+//   Save(path) -> bool                ToBlock() -> block of PNG bytes
+//
+// Notes:
+//   - Both DrawImage and DrawImageNearest currently resample with
+//     nearest-neighbour; smooth (bilinear) scaling is not implemented yet.
+//   - Filter runs your callback per pixel as ordinary code. FilterCallback and
+//     FilterEvent hand the region to an offload kernel instead, which runs on
+//     another core when it qualifies - see FilterRegion on the rasteriser for
+//     the descriptor a kernel receives.
+// =============================================================================
+
+import { Png } from library("Png", "1.0");
+
+class Raster {
+
+    // Commands are variable length: [op][size] then payload, size counting the
+    // header. Rect ops carry dst/stride/x/y/w/h/colour (9 words); LINE also
+    // needs the surface extent, because a line clips per pixel rather than up
+    // front like a rect (11 words).
+    fn static CmdRect():int { return 9; }
+    fn static CmdLine():int { return 11; }
+    fn static CmdStamp():int { return 12; }
+    fn static CmdComposite():int { return 9; }
+    fn static CmdScale():int     { return 10; }
+    fn static CmdGlyph():int     { return 12; }
+    fn static CmdFilter():int    { return 10; }
+    fn static CmdRing():int      { return 11; }
+    fn static MaxCmdWords():int { return 13; }
+
+    // 256 glyphs x 8 rows, two rows-packed words each.
+    fn static FontWords():int { return 512; }
+
+    // 256-entry channel lookup, rebuilt per Brightness call.
+    fn static LutWords():int { return 256; }
+
+    fn static OpFill():int  { return 1; }
+    fn static OpBlend():int { return 2; }
+    fn static OpLine():int  { return 3; }
+    fn static OpStamp():int { return 4; }
+    fn static OpComposite():int { return 5; }
+    fn static OpScale():int     { return 6; }
+    fn static OpGlyph():int     { return 7; }
+    fn static OpFilter():int    { return 8; }
+    fn static OpRing():int      { return 9; }
+
+    // Row replication pays off once a fill spans the full stride and is more
+    // than a few rows; below that the per-call overhead beats the kernel.
+    fn static ReplicateMinRows():int { return 8; }
+
+    let _arena:block = nil;
+    let _cap:int     = 0;
+    let _next:int    = 0;
+    let _cmdCap:int  = 0;
+    let _nCmd:int    = 0;
+    let _cmdEnd:int  = 1;
+    let _fontBase:int = 0;
+    let _freeOff:array = [];
+    let _freeLen:array = [];
+    let _lutBase:int  = 0;
+
+    fn Constructor(pixelWords:int, cmdSlots:int) {
+        this._cmdCap = cmdSlots;
+        this._fontBase = 1 + cmdSlots * Raster.MaxCmdWords();
+        this._lutBase  = _fontBase + Raster.FontWords();
+        this._next   = _lutBase + Raster.LutWords();
+        this._cap    = _next + pixelWords;
+        this._arena  = Buffer.Create(_cap, 4);
+        this._arena[0] = 0;
+        this._nCmd   = 0;
+        this._cmdEnd = 1;
+        // The font lives in the arena so a glyph blit reads glyph and surface
+        // from one block - a kernel is handed exactly one.
+        let f = Raster._font();
+        var k = 0;
+        while (k < Raster.FontWords()) { this._arena[_fontBase + k] = f[k]; k = k + 1; }
+    }
+
+    fn Arena():block { return _arena; }
+
+    // NewSurface(w, h) -> { off, w, h } or nil when the arena cannot fit it.
+    fn NewSurface(w:int, h:int) : object|nil {
+        if (w <= 0 || h <= 0) { return nil; }
+        if (w > Raster.MaxSide() || h > Raster.MaxSide()) { return nil; }
+        if (w * h > Raster.MaxPixels()) { return nil; }
+        let off = this._reserve(w * h);
+        if (off < 0) { return nil; }
+        return { off: off, w: w, h: h };
+    }
+
+    // Surface allocation.
+    //
+    // Every surface must live in the one arena - that is what lets an operation
+    // reading one surface and writing another stay a single-block kernel. But
+    // surfaces are created and released in any order, so a bump pointer alone
+    // would leak: freed space would never come back and NewSurface would
+    // eventually return nil, at which point drawing silently does nothing.
+    //
+    // So: bump for fresh space, plus a free list of released spans for reuse.
+    // Spans are coalesced on release, and a span adjacent to the bump pointer
+    // gives the space back outright. Surfaces are few and large, so first fit
+    // over a short list costs nothing worth optimising.
+    //
+    // Mark/Release remain for the scratch case (CopyRect, Resize, Blit staging),
+    // where strict LIFO is known and cheaper than touching the free list.
+    fn Mark():int { return _next; }
+    fn Release(mark:int) {
+        if (mark >= 0 && mark <= _next) { _next = mark; }
+        return;
+    }
+
+    fn _reserve(words:int):int {
+        // First fit over the free list.
+        var i = 0;
+        while (i < len(_freeOff)) {
+            if (_freeLen[i] >= words) {
+                let off = _freeOff[i];
+                if (_freeLen[i] == words) {
+                    Array.RemoveAt(_freeOff, i);
+                    Array.RemoveAt(_freeLen, i);
+                } else {
+                    _freeOff[i] = off + words;
+                    _freeLen[i] = _freeLen[i] - words;
+                }
+                return off;
+            }
+            i = i + 1;
+        }
+        if (_next + words > _cap) { return 0 - 1; }
+        let off = _next;
+        _next = _next + words;
+        return off;
+    }
+
+    // FreeSurface(s) - return a surface's span to the arena. Pending drawing is
+    // flushed first, because queued commands still reference the span.
+    fn FreeSurface(s:object) {
+        if (s == nil) { return; }
+        this.Flush();
+        let off = s.off;
+        let n = s.w * s.h;
+        if (off + n == _next) { _next = off; this._reclaim(); return; }
+        Array.Append(_freeOff, off);
+        Array.Append(_freeLen, n);
+        this._coalesce();
+        return;
+    }
+
+    // Merge adjacent free spans, then hand back anything touching the bump.
+    fn _coalesce() {
+        var changed = 1;
+        while (changed == 1) {
+            changed = 0;
+            var i = 0;
+            while (i < len(_freeOff)) {
+                var j = 0;
+                while (j < len(_freeOff)) {
+                    if (i != j && _freeOff[i] + _freeLen[i] == _freeOff[j]) {
+                        _freeLen[i] = _freeLen[i] + _freeLen[j];
+                        Array.RemoveAt(_freeOff, j);
+                        Array.RemoveAt(_freeLen, j);
+                        changed = 1;
+                        j = len(_freeOff);
+                        i = len(_freeOff);
+                    } else { j = j + 1; }
+                }
+                i = i + 1;
+            }
+        }
+        this._reclaim();
+        return;
+    }
+
+    fn _reclaim() {
+        var i = 0;
+        while (i < len(_freeOff)) {
+            if (_freeOff[i] + _freeLen[i] == _next) {
+                _next = _freeOff[i];
+                Array.RemoveAt(_freeOff, i);
+                Array.RemoveAt(_freeLen, i);
+                i = 0;
+            } else { i = i + 1; }
+        }
+        return;
+    }
+
+    // Free words still available without growing.
+    fn Cap():int { return _cap; }
+
+    // Upper bounds on a single surface. Without them a hostile or mistaken
+    // width*height overflows the allocation maths.
+    fn static MaxSide():int   { return 16384; }
+    fn static MaxPixels():int { return 268435456; }
+
+    // Make room for `words` more pixels, growing the arena if needed.
+    fn EnsureFree(words:int):bool {
+        if (this.Available() >= words) { return true; }
+        return this.Grow(_cap + words * 2);
+    }
+
+    fn Available():int {
+        var n = _cap - _next;
+        var i = 0;
+        while (i < len(_freeLen)) { n = n + _freeLen[i]; i = i + 1; }
+        return n;
+    }
+
+    // Grow the arena to at least `words` of pixel space. Surfaces hold offsets,
+    // not pointers, so copying into a larger block keeps every one of them valid.
+    fn Grow(words:int):bool {
+        if (words <= _cap) { return true; }
+        if (words > Raster.MaxPixels()) { return false; }
+        this.Flush();
+        let bigger = Buffer.Create(words, 4);
+        if (bigger == nil) { return false; }
+        Buffer.Copy(_arena, 0, bigger, 0, _cap * 4);
+        _arena = bigger;
+        _cap = words;
+        return true;
+    }
+
+    // Clip, then queue. Clipping here means the kernel never re-checks bounds
+    // per pixel for a rect.
+    fn _push(op:int, s:object, x:int, y:int, w:int, h:int, col:int) {
+        var x0 = x;
+        var y0 = y;
+        var x1 = x + w;
+        var y1 = y + h;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > s.w) { x1 = s.w; }
+        if (y1 > s.h) { y1 = s.h; }
+        if (x1 <= x0 || y1 <= y0) { return; }
+        this._emitRect(op, s, x0, y0, x1 - x0, y1 - y0, col);
+        return;
+    }
+
+    // Append a pre-clipped rect command.
+    fn _emitRect(op:int, s:object, x:int, y:int, w:int, h:int, col:int) {
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let p = _cmdEnd;
+        _arena[p]     = op;
+        _arena[p + 1] = Raster.CmdRect();
+        _arena[p + 2] = s.off;
+        _arena[p + 3] = s.w;
+        _arena[p + 4] = x;
+        _arena[p + 5] = y;
+        _arena[p + 6] = w;
+        _arena[p + 7] = h;
+        _arena[p + 8] = col;
+        _cmdEnd = p + Raster.CmdRect();
+        _nCmd = _nCmd + 1;
+        return;
+    }
+
+    // Append a thin-line command. Lines clip per pixel inside the kernel, so
+    // the surface extent travels with the command.
+    fn _emitLine(s:object, x0:int, y0:int, x1:int, y1:int, col:int) {
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let p = _cmdEnd;
+        _arena[p]      = Raster.OpLine();
+        _arena[p + 1]  = Raster.CmdLine();
+        _arena[p + 2]  = s.off;
+        _arena[p + 3]  = s.w;
+        _arena[p + 4]  = s.w;
+        _arena[p + 5]  = s.h;
+        _arena[p + 6]  = x0;
+        _arena[p + 7]  = y0;
+        _arena[p + 8]  = x1;
+        _arena[p + 9]  = y1;
+        _arena[p + 10] = col;
+        _cmdEnd = p + Raster.CmdLine();
+        _nCmd = _nCmd + 1;
+        return;
+    }
+
+
+    // Append a stamped-segment command: disks of radius r along (x0,y0)-(x1,y1).
+    // A lone disk is the degenerate case where both endpoints coincide. Doing
+    // this in the kernel rather than expanding to spans here is the difference
+    // between one command and 2r+1 per sample.
+    fn _emitStamp(s:object, x0:int, y0:int, x1:int, y1:int, r:int, col:int) {
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let p = _cmdEnd;
+        _arena[p]      = Raster.OpStamp();
+        _arena[p + 1]  = Raster.CmdStamp();
+        _arena[p + 2]  = s.off;
+        _arena[p + 3]  = s.w;
+        _arena[p + 4]  = s.w;
+        _arena[p + 5]  = s.h;
+        _arena[p + 6]  = x0;
+        _arena[p + 7]  = y0;
+        _arena[p + 8]  = x1;
+        _arena[p + 9]  = y1;
+        _arena[p + 10] = r;
+        _arena[p + 11] = col;
+        _cmdEnd = p + Raster.CmdStamp();
+        _nCmd = _nCmd + 1;
+        return;
+    }
+
+    // Span semantics shared by every primitive except Clear.
+    fn _span(s:object, x:int, y:int, w:int, h:int, col:int) {
+        if (w <= 0 || h <= 0) { return; }
+        let sa = (col >> 24) & 0xFF;
+        if (sa == 0) { return; }
+        if (sa != 255) { this._push(Raster.OpBlend(), s, x, y, w, h, col); return; }
+
+        var x0 = x; var y0 = y;
+        var x1 = x + w; var y1 = y + h;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > s.w) { x1 = s.w; }
+        if (y1 > s.h) { y1 = s.h; }
+        if (x1 <= x0 || y1 <= y0) { return; }
+
+        if (x1 - x0 == s.w && y1 - y0 >= Raster.ReplicateMinRows()) {
+            this.Flush();                       // queued work must land first
+            this._store(s, y0, y1 - y0, col);
+            return;
+        }
+        this._push(Raster.OpFill(), s, x0, y0, x1 - x0, y1 - y0, col);
+        return;
+    }
+
+    // Full-stride store: rows are contiguous, so one row is written in bytecode
+    // and then doubled onto itself with native copies.
+    fn _store(s:object, y:int, rows:int, col:int) {
+        let base = s.off + y * s.w;
+        var i = 0;
+        while (i < s.w) { _arena[base + i] = col; i = i + 1; }
+        var done = 1;
+        while (done < rows) {
+            var n = done;
+            if (done + n > rows) { n = rows - done; }
+            Buffer.Copy(_arena, base * 4, _arena, (base + done * s.w) * 4, n * s.w * 4);
+            done = done + n;
+        }
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Primitives
+    // ----------------------------------------------------------------
+
+    // Direct store at any alpha: Clear bypasses span logic, so unlike FillRect
+    // it can write a fully transparent surface.
+    fn Clear(s:object, col:int) {
+        this.Flush();
+        this._store(s, 0, s.h, col);
+        return;
+    }
+
+    fn FillRect(s:object, x:int, y:int, w:int, h:int, col:int)  { this._span(s, x, y, w, h, col); return; }
+    fn BlendRect(s:object, x:int, y:int, w:int, h:int, col:int) { this._span(s, x, y, w, h, col); return; }
+    fn SetPixel(s:object, x:int, y:int, col:int)                { this._span(s, x, y, 1, 1, col); return; }
+
+    // x1 / y1 are INCLUSIVE end coordinates. Thickness extends downward (HLine)
+    // or rightward (VLine), so a thick line is a filled rect.
+    fn HLine(s:object, x0:int, y:int, x1:int, col:int, thickness:int) {
+        var a = x0; var b = x1;
+        if (a > b) { let t = a; a = b; b = t; }
+        var th = thickness;
+        if (th < 1) { th = 1; }
+        this._span(s, a, y, b - a + 1, th, col);
+        return;
+    }
+
+    fn VLine(s:object, x:int, y0:int, y1:int, col:int, thickness:int) {
+        var a = y0; var b = y1;
+        if (a > b) { let t = a; a = b; b = t; }
+        var th = thickness;
+        if (th < 1) { th = 1; }
+        this._span(s, x, a, th, b - a + 1, col);
+        return;
+    }
+
+    // Outline. A border thicker than half the box degenerates to a solid fill.
+    fn DrawRect(s:object, x:int, y:int, w:int, h:int, col:int, t:int) {
+        if (w <= 0 || h <= 0) { return; }
+        var th = t;
+        if (th < 1) { th = 1; }
+        if (th * 2 >= w || th * 2 >= h) { this._span(s, x, y, w, h, col); return; }
+        this._span(s, x, y, w, th, col);
+        this._span(s, x, y + h - th, w, th, col);
+        this._span(s, x, y + th, th, h - 2 * th, col);
+        this._span(s, x + w - th, y + th, th, h - 2 * th, col);
+        return;
+    }
+
+
+    // Integer square root - exact, so circle spans are reproducible on every
+    // platform rather than depending on a floating-point sqrt.
+    fn static _isqrt(v:int):int {
+        if (v <= 0) { return 0; }
+        var x = 0;
+        while ((x + 1) * (x + 1) <= v) { x = x + 1; }
+        return x;
+    }
+
+    // Filled disk: one stamp command with coincident endpoints.
+    fn _disk(s:object, cx:int, cy:int, r:int, col:int) {
+        if (((col >> 24) & 0xFF) == 0) { return; }
+        this._emitStamp(s, cx, cy, cx, cy, r, col);
+        return;
+    }
+
+    // DrawLine(x0,y0,x1,y1,colour,thickness). Thickness 1 is integer Bresenham;
+    // thicker lines stamp disks of the matching radius along the segment.
+    fn DrawLine(s:object, x0:int, y0:int, x1:int, y1:int, col:int, thickness:int) {
+        if (((col >> 24) & 0xFF) == 0) { return; }
+        var t = thickness;
+        if (t < 1) { t = 1; }
+        if (t == 1) { this._emitLine(s, x0, y0, x1, y1, col); return; }
+        this._emitStamp(s, x0, y0, x1, y1, Raster._ceilHalf(t - 1), col);
+        return;
+    }
+
+    // ceil(n/2) for a non-negative n - the disk radius for a given thickness.
+    fn static _ceilHalf(n:int):int { return (n + 1) / 2; }
+
+    // One stroked segment. A zero-length segment draws nothing (unlike
+    // DrawLine, where a degenerate thick line still stamps one disk). A round
+    // cap re-stamps the far endpoint.
+    fn _strokeSegment(s:object, x0:int, y0:int, x1:int, y1:int, r:int, cap:int, col:int) {
+        if (x0 == x1 && y0 == y1) { return; }
+        this._emitStamp(s, x0, y0, x1, y1, r, col);
+        if (cap == 1) { this._emitStamp(s, x1, y1, x1, y1, r, col); }
+        return;
+    }
+
+    // StrokePath(points, colour, thickness, cap, closed). `pts` is a flat
+    // [x0,y0,x1,y1,...] array. Radius is (thickness-1)/2 truncated, which is
+    // NOT the same rule DrawLine uses, which rounds up instead.
+    fn StrokePath(s:object, pts:array, col:int, thickness:int, cap:int, closed:int) {
+        let nflat = len(pts);
+        if (nflat < 4 || (nflat & 1) == 1) { return; }
+        var t = thickness;
+        if (t < 1) { t = 1; }
+        let r = (t - 1) / 2;
+        let npts = nflat / 2;
+        var i = 0;
+        while (i < npts - 1) {
+            this._strokeSegment(s, int(pts[i * 2]), int(pts[i * 2 + 1]),
+                                int(pts[(i + 1) * 2]), int(pts[(i + 1) * 2 + 1]), r, cap, col);
+            i = i + 1;
+        }
+        if (closed != 0 && npts > 2) {
+            this._strokeSegment(s, int(pts[(npts - 1) * 2]), int(pts[(npts - 1) * 2 + 1]),
+                                int(pts[0]), int(pts[1]), r, cap, col);
+        }
+        return;
+    }
+
+    // An INCLUSIVE horizontal run - the primitive every filled shape bottoms
+    // out in. Endpoints may arrive in either order.
+    fn _hspan(s:object, x1:int, x2:int, y:int, col:int) {
+        var a = x1; var b = x2;
+        if (a > b) { let t = a; a = b; b = t; }
+        this._span(s, a, y, b - a + 1, 1, col);
+        return;
+    }
+
+    fn FillCircle(s:object, cx:int, cy:int, r:int, col:int) {
+        this._disk(s, cx, cy, r, col);
+        return;
+    }
+
+    // DrawCircle(cx, cy, r, colour, thickness, fill). A zero or over-thick
+    // border, or an explicit fill, gives a solid disk; otherwise a ring between
+    // radii r and r-thickness.
+    fn DrawCircle(s:object, cx:int, cy:int, r:int, col:int, thickness:int, fill:int) {
+        if (r <= 0) { return; }
+        var t = thickness;
+        if (t < 0) { t = 0; }
+        if (fill != 0 || t == 0 || t >= r) { this._disk(s, cx, cy, r, col); return; }
+        if (((col >> 24) & 0xFF) == 0) { return; }
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let q = _cmdEnd;
+        _arena[q]     = Raster.OpRing();
+        _arena[q + 1] = Raster.CmdRing();
+        _arena[q + 2] = s.off;
+        _arena[q + 3] = s.w;
+        _arena[q + 4] = s.w;
+        _arena[q + 5] = s.h;
+        _arena[q + 6] = cx;
+        _arena[q + 7] = cy;
+        _arena[q + 8] = r;
+        _arena[q + 9] = r - t;
+        _arena[q + 10] = col;
+        _cmdEnd = q + Raster.CmdRing();
+        _nCmd = _nCmd + 1;
+        return;
+    }
+
+    // FillPolygon(points, colour) - scanline fill over an active edge table.
+    // Coordinates may be int or float; floats truncate to whole pixels.
+    // The edge table is built and advanced here rather than in a kernel: it
+    // allocates, and a kernel may not. Only the resulting spans cross into the
+    // kernel, as ordinary fill commands.
+    fn FillPolygon(s:object, pts:array, col:int) {
+        let nflat = len(pts);
+        if (nflat < 6 || (nflat & 1) == 1) { return; }
+        let npts = nflat / 2;
+
+        let eYmax:array = [];
+        let eYmin:array = [];
+        let eX:array    = [];
+        let eInv:array  = [];
+
+        var i = 0;
+        while (i < npts) {
+            let j = (i + 1) % npts;
+            let x0 = int(pts[i * 2]);      let y0 = int(pts[i * 2 + 1]);
+            let x1 = int(pts[j * 2]);      let y1 = int(pts[j * 2 + 1]);
+            if (y0 != y1) {
+                var ymin = y0; var ymax = y1; var xs0 = x0;
+                var inv = float(x1 - x0) / float(y1 - y0);
+                if (y0 >= y1) {
+                    ymin = y1; ymax = y0; xs0 = x1;
+                    inv = float(x0 - x1) / float(y0 - y1);
+                }
+                if (ymax > 0 && ymin < s.h) {
+                    var fx = float(xs0);
+                    if (ymin < 0) {
+                        fx = fx + inv * float(0 - ymin);
+                        ymin = 0;
+                    }
+                    var ye = ymax;
+                    if (ye > s.h) { ye = s.h; }
+                    Array.Append(eYmin, ymin);
+                    Array.Append(eYmax, ye);
+                    Array.Append(eX, fx);
+                    Array.Append(eInv, inv);
+                }
+            }
+            i = i + 1;
+        }
+
+        let ne = len(eYmin);
+        if (ne == 0) { return; }
+
+        var y = 0;
+        while (y < s.h) {
+            let xs:array = [];
+            var k = 0;
+            while (k < ne) {
+                if (eYmin[k] <= y && y < eYmax[k]) { Array.SortedInsert(xs, eX[k]); }
+                k = k + 1;
+            }
+            var c = 0;
+            while (c + 1 < len(xs)) {
+                let a = int(Math.Floor(xs[c] + 0.5));
+                let b = int(Math.Floor(xs[c + 1] + 0.5));
+                if (b > a) { this._hspan(s, a, b, y, col); }
+                c = c + 2;
+            }
+            k = 0;
+            while (k < ne) {
+                if (eYmin[k] <= y && y < eYmax[k]) { eX[k] = eX[k] + eInv[k]; }
+                k = k + 1;
+            }
+            y = y + 1;
+        }
+        return;
+    }
+
+    // Source-over composite of `src` onto this surface at (dx,dy), with an
+    // optional global alpha modulating the source. The overlap is computed
+    // here; the kernel just walks it. Both surfaces live in the same arena, so
+    // this is still a single-block kernel - that is the whole point of the
+    // arena.
+    fn BlendSurface(s:object, src:object, dx:int, dy:int, ga:int) {
+        var a = ga;
+        if (a < 0) { a = 0; }
+        if (a > 255) { a = 255; }
+        var sx0 = 0; var sy0 = 0;
+        var bw = src.w; var bh = src.h;
+        var ddx = dx; var ddy = dy;
+        if (ddx < 0) { sx0 = sx0 - ddx; bw = bw + ddx; ddx = 0; }
+        if (ddy < 0) { sy0 = sy0 - ddy; bh = bh + ddy; ddy = 0; }
+        if (ddx + bw > s.w) { bw = s.w - ddx; }
+        if (ddy + bh > s.h) { bh = s.h - ddy; }
+        if (bw <= 0 || bh <= 0) { return; }
+
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let p = _cmdEnd;
+        _arena[p]     = Raster.OpComposite();
+        _arena[p + 1] = Raster.CmdComposite();
+        _arena[p + 2] = s.off + ddy * s.w + ddx;
+        _arena[p + 3] = s.w;
+        _arena[p + 4] = src.off + sy0 * src.w + sx0;
+        _arena[p + 5] = src.w;
+        _arena[p + 6] = bw;
+        _arena[p + 7] = bh;
+        _arena[p + 8] = a;
+        _cmdEnd = p + Raster.CmdComposite();
+        _nCmd = _nCmd + 1;
+        return;
+    }
+
+    fn DrawImage(s:object, x:int, y:int, src:object) {
+        this.BlendSurface(s, src, x, y, 255);
+        return;
+    }
+
+    // CopyRect(x,y,w,h) -> a new surface holding that sub-rectangle. An opaque
+    // copy needs no kernel: each row is one native Buffer.Copy.
+    fn CopyRect(s:object, x:int, y:int, w:int, h:int) : object|nil {
+        var x0 = x; var y0 = y;
+        var x1 = x + w; var y1 = y + h;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > s.w) { x1 = s.w; }
+        if (y1 > s.h) { y1 = s.h; }
+        if (x1 <= x0 || y1 <= y0) { return nil; }
+        let cw = x1 - x0;
+        let chh = y1 - y0;
+        let out = this.NewSurface(cw, chh);
+        if (out == nil) { return nil; }
+        this.Flush();
+        var yy = 0;
+        while (yy < chh) {
+            Buffer.Copy(_arena, (s.off + (y0 + yy) * s.w + x0) * 4,
+                        _arena, (out.off + yy * cw) * 4, cw * 4);
+            yy = yy + 1;
+        }
+        return out;
+    }
+
+    // Resize(newW,newH) -> a new surface, nearest-neighbour. The sample index
+    // is computed as ((2d+1)*old) / (2*new), i.e. floor((d+0.5)*old/new) in
+    // exact integer arithmetic - no floating point, so it is reproducible.
+    fn Resize(s:object, newW:int, newH:int) : object|nil {
+        if (newW <= 0 || newH <= 0) { return nil; }
+        let out = this.NewSurface(newW, newH);
+        if (out == nil) { return nil; }
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let p = _cmdEnd;
+        _arena[p]     = Raster.OpScale();
+        _arena[p + 1] = Raster.CmdScale();
+        _arena[p + 2] = out.off;
+        _arena[p + 3] = newW;
+        _arena[p + 4] = s.off;
+        _arena[p + 5] = s.w;
+        _arena[p + 6] = newW;
+        _arena[p + 7] = newH;
+        _arena[p + 8] = s.w;
+        _arena[p + 9] = s.h;
+        _cmdEnd = p + Raster.CmdScale();
+        _nCmd = _nCmd + 1;
+        return out;
+    }
+
+    // Independent x and y scale factors.
+    fn Rescale(s:object, sx:float, sy:float) : object|nil {
+        let nw = int(float(s.w) * sx + 0.5);
+        let nh = int(float(s.h) * sy + 0.5);
+        return this.Resize(s, nw, nh);
+    }
+
+    // 8x8 bitmap font covering ASCII and a CP437 box-drawing subset; codes with
+    // no glyph render as a space. Two words per code: rows 0-3 then rows 4-7,
+    // one row per byte, bit 7 leftmost.
+    fn static _font():array {
+        return [
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x18181818, 0x00180018, 0x00242424, 0x00000000, 0x247E2424, 0x0024247E,
+        0x78907C10, 0x0010F814, 0x1008C4C2, 0x00004626, 0x56304830, 0x00768888, 0x00101818, 0x00000000,
+        0x2020100C, 0x000C1020, 0x04040830, 0x00300804, 0x7E182400, 0x00002418, 0x7C101000, 0x00001010,
+        0x00000000, 0x10081800, 0x7E000000, 0x00000000, 0x00000000, 0x00181800, 0x10080402, 0x00804020,
+        0x4A46423C, 0x003C6252, 0x10103010, 0x00381010, 0x0C02423C, 0x007E4030, 0x1C08047E, 0x003C4202,
+        0x48281808, 0x0008087E, 0x027C407E, 0x003C4202, 0x7C40201C, 0x003C4242, 0x0804027E, 0x00202010,
+        0x3C42423C, 0x003C4242, 0x3E42423C, 0x00380402, 0x00181800, 0x00181800, 0x00181800, 0x20101800,
+        0x40201008, 0x00081020, 0x007E0000, 0x0000007E, 0x04081020, 0x00201008, 0x0C02423C, 0x00100010,
+        0xA29A423C, 0x003C409E, 0x7E422418, 0x00424242, 0x7C42427C, 0x007C4242, 0x4040423C, 0x003C4240,
+        0x42424478, 0x00784442, 0x7C40407E, 0x007E4040, 0x7C40407E, 0x00404040, 0x4E40423C, 0x003C4242,
+        0x7E424242, 0x00424242, 0x1010103C, 0x003C1010, 0x0404040E, 0x00384444, 0x70484442, 0x00424448,
+        0x40404040, 0x007E4040, 0x5A5A6642, 0x00424242, 0x4A526242, 0x00424246, 0x4242423C, 0x003C4242,
+        0x7C42427C, 0x00404040, 0x4242423C, 0x003A444A, 0x7C42427C, 0x00424448, 0x3C40423C, 0x003C4202,
+        0x1010107E, 0x00101010, 0x42424242, 0x003C4242, 0x24424242, 0x00181824, 0x5A5A4242, 0x0042665A,
+        0x18182442, 0x00422418, 0x18242442, 0x00181818, 0x1804027E, 0x007E4020, 0x2020203C, 0x003C2020,
+        0x10204080, 0x00020408, 0x0404043C, 0x003C0404, 0x00442810, 0x00000000, 0x00000000, 0xFF000000,
+        0x00081020, 0x00000000, 0x023C0000, 0x003E423E, 0x427C4040, 0x007C4242, 0x423C0000, 0x003C4240,
+        0x423E0202, 0x003E4242, 0x423C0000, 0x003C407E, 0x3C10100C, 0x00101010, 0x423E0000, 0x3C023E42,
+        0x427C4040, 0x00424242, 0x10100010, 0x00101010, 0x04040004, 0x38444404, 0x48444040, 0x00444870,
+        0x10101010, 0x001C1010, 0x526C0000, 0x00525252, 0x427C0000, 0x00424242, 0x423C0000, 0x003C4242,
+        0x427C0000, 0x40407C42, 0x423E0000, 0x02023E42, 0x625C0000, 0x00404040, 0x403C0000, 0x007C023C,
+        0x107C1010, 0x000C1010, 0x42420000, 0x003E4242, 0x42420000, 0x00182424, 0x5A420000, 0x0042665A,
+        0x24420000, 0x00422418, 0x42420000, 0x003C023E, 0x047E0000, 0x007E2018, 0x6010100E, 0x000E1010,
+        0x18181818, 0x00181818, 0x06080870, 0x00700808, 0x4C320000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00220088, 0x00220088, 0x22882288, 0x22882288, 0x55AA55AA, 0x55AA55AA, 0x18181818, 0x18181818,
+        0x1F181818, 0x18181818, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x3F242424, 0x24242424, 0x24242424, 0x24242424, 0x3F242424, 0x00007E00,
+        0x3F007E00, 0x24242424, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x1F181818, 0x00000000,
+        0xF8000000, 0x18181818, 0x7E181818, 0x00000000, 0x7E000000, 0x18181818, 0xF8181818, 0x18181818,
+        0x7E000000, 0x00000000, 0x7E181818, 0x18181818, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0xFC007E00, 0x24242424, 0xFC242424, 0x00007E00, 0x00242424, 0x00007E00, 0x007E0000, 0x24242424,
+        0xFC242424, 0x24242424, 0x007E0000, 0x00007E00, 0x7E242424, 0x24242424, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x1F000000, 0x18181818, 0xF8181818, 0x00000000, 0xFFFFFFFF, 0xFFFFFFFF,
+        0x00000000, 0xFFFFFFFF, 0xF0F0F0F0, 0xF0F0F0F0, 0x0F0F0F0F, 0x0F0F0F0F, 0xFFFFFFFF, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+        0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000
+        ];
+    }
+
+    fn _emitGlyph(s:object, x:int, y:int, code:int, scale:int, col:int) {
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let p = _cmdEnd;
+        _arena[p]      = Raster.OpGlyph();
+        _arena[p + 1]  = Raster.CmdGlyph();
+        _arena[p + 2]  = s.off;
+        _arena[p + 3]  = s.w;
+        _arena[p + 4]  = s.w;
+        _arena[p + 5]  = s.h;
+        _arena[p + 6]  = x;
+        _arena[p + 7]  = y;
+        _arena[p + 8]  = code;
+        _arena[p + 9]  = scale;
+        _arena[p + 10] = _fontBase;
+        _arena[p + 11] = col;
+        _cmdEnd = p + Raster.CmdGlyph();
+        _nCmd = _nCmd + 1;
+        return;
+    }
+
+    // Glyphs are stored opaquely; text is never alpha-blended.
+    fn DrawChar(s:object, x:int, y:int, code:int, col:int, scale:int) {
+        var sc = scale;
+        if (sc < 1) { sc = 1; }
+        var c = code;
+        if (c < 0) { c = 0; }
+        if (c > 255) { c = c & 0xFF; }
+        this._emitGlyph(s, x, y, c, sc, col);
+        return;
+    }
+
+    // DrawText: newline returns the pen and advances a line; tab advances four
+    // cells.
+    fn DrawText(s:object, x:int, y:int, text:string, col:int, scale:int, lspace:int, linesp:int) {
+        var sc = scale;   if (sc < 1) { sc = 1; }
+        var ls = lspace;  if (ls < 0) { ls = 0; }
+        var lp = linesp;  if (lp < 0) { lp = 0; }
+        let adv = 8 * sc + ls;
+        let lineAdv = 8 * sc + lp;
+        var penX = x;
+        var penY = y;
+        // Read the raw bytes once; DrawTextRun indexes bytes, not codepoints.
+        let bytes = Buffer.FromString(text);
+        let n = len(bytes);
+        var i = 0;
+        while (i < n) {
+            let b = bytes[i] & 0xFF;
+            if (b == 10) { penX = x; penY = penY + lineAdv; }
+            else if (b == 9) { penX = penX + adv * 4; }
+            else {
+                this._emitGlyph(s, penX, penY, b, sc, col);
+                penX = penX + adv;
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
+    // ---- colour helpers (pure integer / double maths, no surface touched) ----
+
+    fn static RGB(r:int, g:int, b:int):int {
+        return 0xFF000000 | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+    }
+
+    fn static RGBA(r:int, g:int, b:int, a:int):int {
+        return ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+    }
+
+    fn static _clamp255(v:int):int {
+        if (v < 0) { return 0; }
+        if (v > 255) { return 255; }
+        return v;
+    }
+
+    // HSL -> 0xAARRGGBB. Hue in degrees; saturation and lightness in 0..1.
+    fn static HSL(h:float, sa:float, l:float):int {
+        if (sa <= 0.0) {
+            let v = Raster._clamp255(int(l * 255.0 + 0.5));
+            return 0xFF000000 | (v << 16) | (v << 8) | v;
+        }
+        var ab = 2.0 * l - 1.0;
+        if (ab < 0.0) { ab = 0.0 - ab; }
+        let c = (1.0 - ab) * sa;
+        let m = l - c * 0.5;
+        let h6 = h / 60.0;
+        let sector = int(h6) % 6;
+        let f = h6 - Math.Floor(h6);
+        let xu = c * f;
+        let xd = c * (1.0 - f);
+        var r = 0.0; var g = 0.0; var b = 0.0;
+        if (sector == 0)      { r = c;   g = xu;  b = 0.0; }
+        else if (sector == 1) { r = xd;  g = c;   b = 0.0; }
+        else if (sector == 2) { r = 0.0; g = c;   b = xu;  }
+        else if (sector == 3) { r = 0.0; g = xd;  b = c;   }
+        else if (sector == 4) { r = xu;  g = 0.0; b = c;   }
+        else                  { r = c;   g = 0.0; b = xd;  }
+        let ri = Raster._clamp255(int((r + m) * 255.0 + 0.5));
+        let gi = Raster._clamp255(int((g + m) * 255.0 + 0.5));
+        let bi = Raster._clamp255(int((b + m) * 255.0 + 0.5));
+        return 0xFF000000 | (ri << 16) | (gi << 8) | bi;
+    }
+
+    // ---- accessors ----
+
+    fn GetPixel(s:object, x:int, y:int):int {
+        if (x < 0 || y < 0 || x >= s.w || y >= s.h) { return 0; }
+        this.Flush();
+        return _arena[s.off + y * s.w + x] & 0xFFFFFFFF;
+    }
+
+    // ---- region filters ----
+
+    fn _clipRegion(s:object, x:int, y:int, w:int, h:int):object|nil {
+        var x0 = x; var y0 = y;
+        var x1 = x + w; var y1 = y + h;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > s.w) { x1 = s.w; }
+        if (y1 > s.h) { y1 = s.h; }
+        if (x1 <= x0 || y1 <= y0) { return nil; }
+        return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    }
+
+    fn _emitFilter(s:object, rgn:object, mode:int) {
+        if (_nCmd >= _cmdCap) { this.Flush(); }
+        let p = _cmdEnd;
+        _arena[p]     = Raster.OpFilter();
+        _arena[p + 1] = Raster.CmdFilter();
+        _arena[p + 2] = s.off;
+        _arena[p + 3] = s.w;
+        _arena[p + 4] = rgn.x;
+        _arena[p + 5] = rgn.y;
+        _arena[p + 6] = rgn.w;
+        _arena[p + 7] = rgn.h;
+        _arena[p + 8] = mode;
+        _arena[p + 9] = _lutBase;
+        _cmdEnd = p + Raster.CmdFilter();
+        _nCmd = _nCmd + 1;
+        return;
+    }
+
+    // BT.601 luminance, alpha preserved.
+    fn Grayscale(s:object, x:int, y:int, w:int, h:int) {
+        let rgn = this._clipRegion(s, x, y, w, h);
+        if (rgn == nil) { return; }
+        this._emitFilter(s, rgn, 1);
+        return;
+    }
+
+    // Multiply RGB by `factor`, clamped, alpha preserved. The 256-entry table
+    // is shared, so pending work is flushed before it is rewritten.
+    fn Brightness(s:object, x:int, y:int, w:int, h:int, factor:float) {
+        let rgn = this._clipRegion(s, x, y, w, h);
+        if (rgn == nil) { return; }
+        this.Flush();
+        var i = 0;
+        while (i < 256) {
+            _arena[_lutBase + i] = Raster._clamp255(int(float(i) * factor + 0.5));
+            i = i + 1;
+        }
+        this._emitFilter(s, rgn, 2);
+        return;
+    }
+
+    // Per-pixel callback fn(pixel:int) -> int, nil leaving the pixel alone. A
+    // kernel may not call a function, so this one runs as ordinary bytecode.
+    // Use FilterRegion for the offloaded equivalent.
+    fn Filter(s:object, fn0:function, x:int, y:int, w:int, h:int) {
+        let rgn = this._clipRegion(s, x, y, w, h);
+        if (rgn == nil) { return; }
+        this.Flush();
+        var yy = 0;
+        while (yy < rgn.h) {
+            let ro = s.off + (rgn.y + yy) * s.w + rgn.x;
+            var xx = 0;
+            while (xx < rgn.w) {
+                let nv = fn0(_arena[ro + xx] & 0xFFFFFFFF);
+                if (nv != nil) { _arena[ro + xx] = nv; }
+                xx = xx + 1;
+            }
+            yy = yy + 1;
+        }
+        return;
+    }
+
+    // Draw(src, dx, dy) - source-over blit of one surface onto another at full
+    // source alpha.
+    fn Draw(s:object, src:object, dx:int, dy:int) {
+        this.BlendSurface(s, src, dx, dy, 255);
+        return;
+    }
+
+    // Blit(dx, dy, w, h, pixels) - composite a flat ARGB *array* (QRCode.ToPixels
+    // and friends). The array is staged into a scratch arena surface in one
+    // bytecode pass, then composited by the kernel; per-pixel commands would be
+    // far worse. The scratch surface is released again before returning.
+    fn Blit(s:object, dx:int, dy:int, w:int, h:int, pixels:array) {
+        if (w <= 0 || h <= 0) { return; }
+        if (w * h > len(pixels)) { return; }
+        let mark = this.Mark();
+        let tmp = this.NewSurface(w, h);
+        if (tmp == nil) { return; }
+        var i = 0;
+        let n = w * h;
+        while (i < n) {
+            _arena[tmp.off + i] = pixels[i];
+            i = i + 1;
+        }
+        this.BlendSurface(s, tmp, dx, dy, 255);
+        this.Flush();
+        this.Release(mark);
+        return;
+    }
+
+    // DrawTextOpts(x, y, text, opts) - opts fields color/scale/spacing/
+    // lineSpacing, each with a sensible default (colour defaults to opaque
+    // white).
+    fn DrawTextOpts(s:object, x:int, y:int, text:string, opts:object|nil) {
+        var col = 0xFFFFFFFF;
+        var sc = 1;
+        var sp = 0;
+        var lsp = 0;
+        if (opts != nil) {
+            if (opts.color != nil)       { col = opts.color; }
+            if (opts.scale != nil)       { sc = opts.scale; }
+            if (opts.spacing != nil)     { sp = opts.spacing; }
+            if (opts.lineSpacing != nil) { lsp = opts.lineSpacing; }
+        }
+        this.DrawText(s, x, y, text, col, sc, sp, lsp);
+        return;
+    }
+
+    // Hand a region of the arena to a user offload kernel.
+    //
+    // A kernel gets one block and one scalar, so the region descriptor is
+    // written into the arena and the kernel is passed its offset:
+    //
+    //   fn myKernel(a:block, len:int, hdr:int):int {
+    //       let off = a[hdr]; let stride = a[hdr+1];
+    //       let x = a[hdr+2]; let y = a[hdr+3];
+    //       let w = a[hdr+4]; let h = a[hdr+5];
+    //       // pixel (x+dx, y+dy) is a[off + (y+dy)*stride + (x+dx)]
+    //   }
+    //
+    // The kernel runs on another core when it qualifies (touches only the
+    // block, plain integer maths, no calls or allocation).
+    fn FilterRegion(s:object, fn0:function, x:int, y:int, w:int, h:int, eventId:int):int {
+        let rgn = this._clipRegion(s, x, y, w, h);
+        if (rgn == nil) { return 0 - 1; }
+        this.Flush();
+        let hdr = _lutBase;                 // reused as a scratch descriptor
+        _arena[hdr]     = s.off;
+        _arena[hdr + 1] = s.w;
+        _arena[hdr + 2] = rgn.x;
+        _arena[hdr + 3] = rgn.y;
+        _arena[hdr + 4] = rgn.w;
+        _arena[hdr + 5] = rgn.h;
+        var id = eventId;
+        if (id < 0) { id = Event.Create(); }
+        if (id < 0) { return 0 - 1; }
+        Buffer.ProcessEvent(fn0, _arena, _cap, hdr, id);
+        return id;
+    }
+
+    // Commands queue in draw order but each op class has its own kernel, so a
+    // flush walks the queue and dispatches one kernel per maximal run of the
+    // same class. Order is preserved; a mixed queue just costs more dispatches,
+    // and a dispatch is ~0.01 ms.
+    fn static _class(op:int):int {
+        if (op <= 2) { return 1; }
+        if (op == 3) { return 2; }
+        if (op == 4) { return 3; }
+        if (op == 5) { return 4; }
+        if (op == 6) { return 5; }
+        if (op == 7) { return 6; }
+        if (op == 8) { return 7; }
+        return 8;
+    }
+
+    fn Flush() {
+        if (_nCmd <= 0) { return; }
+        var p = 1;
+        var done = 0;
+        while (done < _nCmd) {
+            let cls = Raster._class(_arena[p]);
+            var q = p;
+            var run = 0;
+            var scanning = 1;
+            while (scanning == 1) {
+                if (done + run >= _nCmd) { scanning = 0; }
+                else if (Raster._class(_arena[q]) != cls) { scanning = 0; }
+                else { q = q + _arena[q + 1]; run = run + 1; }
+            }
+            _arena[0] = run;
+            let id = Event.Create();
+            if (id >= 0) {
+                if (cls == 1)      { Buffer.ProcessEvent(Raster._kernelRect,  _arena, _cap, p, id); }
+                else if (cls == 2) { Buffer.ProcessEvent(Raster._kernelLine,  _arena, _cap, p, id); }
+                else if (cls == 3) { Buffer.ProcessEvent(Raster._kernelStamp, _arena, _cap, p, id); }
+                else if (cls == 4) { Buffer.ProcessEvent(Raster._kernelBlit,  _arena, _cap, p, id); }
+                else if (cls == 5) { Buffer.ProcessEvent(Raster._kernelScale, _arena, _cap, p, id); }
+                else if (cls == 6) { Buffer.ProcessEvent(Raster._kernelGlyph, _arena, _cap, p, id); }
+                else if (cls == 7) { Buffer.ProcessEvent(Raster._kernelFilter, _arena, _cap, p, id); }
+                else               { Buffer.ProcessEvent(Raster._kernelRing,   _arena, _cap, p, id); }
+                Event.WaitFor([id]);
+            } else {
+                if (cls == 1)      { Raster._kernelRect(_arena, _cap, p); }
+                else if (cls == 2) { Raster._kernelLine(_arena, _cap, p); }
+                else if (cls == 3) { Raster._kernelStamp(_arena, _cap, p); }
+                else if (cls == 4) { Raster._kernelBlit(_arena, _cap, p); }
+                else if (cls == 5) { Raster._kernelScale(_arena, _cap, p); }
+                else if (cls == 6) { Raster._kernelGlyph(_arena, _cap, p); }
+                else if (cls == 7) { Raster._kernelFilter(_arena, _cap, p); }
+                else               { Raster._kernelRing(_arena, _cap, p); }
+            }
+            p = q;
+            done = done + run;
+        }
+        _arena[0] = 0;
+        _nCmd = 0;
+        _cmdEnd = 1;
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // The kernel. Straight-line integer work over one block: no calls, no
+    // allocation, so it compiles to native code.
+    // ----------------------------------------------------------------
+    // Composite kernel: source-over of one arena region onto another, with an
+    // optional global alpha scaling the source alpha first.
+    fn static _kernelBlit(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz = b[p + 1];
+            let dOff = b[p + 2]; let dStr = b[p + 3];
+            let sOff = b[p + 4]; let sStr = b[p + 5];
+            let bw = b[p + 6]; let bh = b[p + 7];
+            let ga = b[p + 8];
+            var y = 0;
+            while (y < bh) {
+                let dr = dOff + y * dStr;
+                let sr = sOff + y * sStr;
+                var x = 0;
+                while (x < bw) {
+                    let sp = b[sr + x];
+                    var sa = (sp >> 24) & 0xFF;
+                    if (ga != 255) { sa = (sa * ga + 127) / 255; }
+                    if (sa != 0) {
+                        if (sa == 255) {
+                            b[dr + x] = sp;
+                        } else {
+                            let ia  = 255 - sa;
+                            let srb = (sp & 0x00FF00FF) * sa + 0x007F007F;
+                            let sg  = ((sp >> 8) & 0xFF) * sa + 127;
+                            let d = b[dr + x];
+                            var rb = (d & 0x00FF00FF) * ia + srb;
+                            rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                            var gg = ((d >> 8) & 0xFF) * ia + sg;
+                            gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                            var aa = ((d >> 24) & 0xFF) * ia + 127;
+                            aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                            b[dr + x] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                        }
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Nearest-neighbour scale kernel. Sample index is the exact integer form of
+    // floor((d + 0.5) * old / new), in exact integer arithmetic.
+    fn static _kernelScale(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz = b[p + 1];
+            let dOff = b[p + 2]; let dStr = b[p + 3];
+            let sOff = b[p + 4]; let sStr = b[p + 5];
+            let dw = b[p + 6]; let dh = b[p + 7];
+            let sw = b[p + 8]; let sh = b[p + 9];
+            var y = 0;
+            while (y < dh) {
+                var sy = ((2 * y + 1) * sh) / (2 * dh);
+                if (sy < 0) { sy = 0; }
+                if (sy >= sh) { sy = sh - 1; }
+                let dr = dOff + y * dStr;
+                let sr = sOff + sy * sStr;
+                var x = 0;
+                while (x < dw) {
+                    var sx = ((2 * x + 1) * sw) / (2 * dw);
+                    if (sx < 0) { sx = 0; }
+                    if (sx >= sw) { sx = sw - 1; }
+                    b[dr + x] = b[sr + sx];
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Glyph kernel: 8x8 bitmap expanded by `scale`, opaque store.
+    fn static _kernelGlyph(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz = b[p + 1];
+            let dOff = b[p + 2]; let dStr = b[p + 3];
+            let cw = b[p + 4];   let ch = b[p + 5];
+            let gx = b[p + 6];   let gy = b[p + 7];
+            let code = b[p + 8]; let sc = b[p + 9];
+            let fb = b[p + 10];  let col = b[p + 11];
+            var ry = 0;
+            var stop = 0;
+            while (ry < 8 && stop == 0) {
+                let y0 = gy + ry * sc;
+                if (y0 >= ch) { stop = 1; }
+                else {
+                    let row = (b[fb + code * 2 + (ry >> 2)] >> ((ry & 3) * 8)) & 0xFF;
+                    if (row != 0) {
+                        var rx = 0;
+                        while (rx < 8) {
+                            if ((row & (128 >> rx)) != 0) {
+                                let x0 = gx + rx * sc;
+                                var sy = 0;
+                                while (sy < sc) {
+                                    let yy = y0 + sy;
+                                    if (yy >= 0 && yy < ch) {
+                                        var xl = x0;
+                                        var xr = x0 + sc - 1;
+                                        if (xl < 0) { xl = 0; }
+                                        if (xr >= cw) { xr = cw - 1; }
+                                        var xx = xl;
+                                        while (xx <= xr) {
+                                            b[dOff + yy * dStr + xx] = col;
+                                            xx = xx + 1;
+                                        }
+                                    }
+                                    sy = sy + 1;
+                                }
+                            }
+                            rx = rx + 1;
+                        }
+                    }
+                }
+                ry = ry + 1;
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Region filter kernel. Mode 1 = BT.601 grayscale, mode 2 = channel lookup
+    // (Brightness). Alpha is preserved in both.
+    fn static _kernelFilter(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz = b[p + 1];
+            let dOff = b[p + 2]; let dStr = b[p + 3];
+            let rx = b[p + 4];   let ry = b[p + 5];
+            let rw = b[p + 6];   let rh = b[p + 7];
+            let mode = b[p + 8]; let lut = b[p + 9];
+            var y = 0;
+            while (y < rh) {
+                let ro = dOff + (ry + y) * dStr + rx;
+                var x = 0;
+                while (x < rw) {
+                    let px = b[ro + x];
+                    let a = (px >> 24) & 0xFF;
+                    let r = (px >> 16) & 0xFF;
+                    let g = (px >> 8) & 0xFF;
+                    let bl = px & 0xFF;
+                    if (mode == 1) {
+                        let lm = (r * 77 + g * 150 + bl * 29) >> 8;
+                        b[ro + x] = (a << 24) | ((lm & 0xFF) << 16) | ((lm & 0xFF) << 8) | (lm & 0xFF);
+                    } else {
+                        b[ro + x] = (a << 24) | ((b[lut + r] & 0xFF) << 16) |
+                                    ((b[lut + g] & 0xFF) << 8) | (b[lut + bl] & 0xFF);
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Ring kernel: the annulus between radii ro and ri. A ring is always a
+    // single centred shape, never swept along a segment, so it needs none of
+    // the stamp kernel's stepping - which is why it lives in its own kernel
+    // rather than as a flag on that one: a kernel carrying both exceeds the
+    // per-function virtual-register budget and stops being compiled.
+    fn static _kernelRing(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz     = b[p + 1];
+            let dst    = b[p + 2];
+            let stride = b[p + 3];
+            let cw = b[p + 4]; let ch = b[p + 5];
+            let cx = b[p + 6]; let cy = b[p + 7];
+            let ro = b[p + 8]; let ri = b[p + 9];
+            let col = b[p + 10];
+            let sa  = (col >> 24) & 0xFF;
+            let ia  = 255 - sa;
+            let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
+            let sg  = ((col >> 8) & 0xFF) * sa + 127;
+            let ro2 = ro * ro;
+            let ri2 = ri * ri;
+            var half = 0;
+            var ihalf = 0;
+            var dyy = 0 - ro;
+            while (dyy <= ro) {
+                let d2 = ro2 - dyy * dyy;
+                while ((half + 1) * (half + 1) <= d2) { half = half + 1; }
+                while (half > 0 && half * half > d2) { half = half - 1; }
+                var xin = 0;
+                var ya = dyy; if (ya < 0) { ya = 0 - ya; }
+                if (ya < ri) {
+                    let d2i = ri2 - dyy * dyy;
+                    while ((ihalf + 1) * (ihalf + 1) <= d2i) { ihalf = ihalf + 1; }
+                    while (ihalf > 0 && ihalf * ihalf > d2i) { ihalf = ihalf - 1; }
+                    xin = ihalf;
+                } else { ihalf = 0; }
+                let yy = cy + dyy;
+                if (yy >= 0 && yy < ch) {
+                    // Two spans. Where the inner radius does not reach this row
+                    // they meet at cx and overlap by one pixel, which is
+                    // visible for a translucent colour.
+                    var sp = 0;
+                    while (sp < 2) {
+                        var xa = cx - half;
+                        var xb = cx - xin;
+                        if (sp == 1) { xa = cx + xin; xb = cx + half; }
+                        if (xa < 0) { xa = 0; }
+                        if (xb >= cw) { xb = cw - 1; }
+                        let rowo = dst + yy * stride;
+                        var xj = xa;
+                        while (xj <= xb) {
+                            let o = rowo + xj;
+                            if (sa == 255) {
+                                b[o] = col;
+                            } else {
+                                let d = b[o];
+                                var rb = (d & 0x00FF00FF) * ia + srb;
+                                rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                                var gg = ((d >> 8) & 0xFF) * ia + sg;
+                                gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                                var aa = ((d >> 24) & 0xFF) * ia + 127;
+                                aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                                b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                            }
+                            xj = xj + 1;
+                        }
+                        sp = sp + 1;
+                    }
+                }
+                dyy = dyy + 1;
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Rect kernel: opaque store and source-over blend.
+    //
+    // Register allocation is per function and a function is capped at 64 virtual
+    // registers, so each op class gets its own kernel. One kernel carrying every
+    // op exceeds that cap, at which point it stops being compiled and silently
+    // runs an order of magnitude slower.
+    fn static _kernelRect(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz     = b[p + 1];
+            let dst    = b[p + 2];
+            let stride = b[p + 3];
+            let col    = b[p + sz - 1];
+            let op = b[p];
+            if (op == 1) {
+                let x = b[p + 4]; let y = b[p + 5];
+                let w = b[p + 6]; let h = b[p + 7];
+                var yy = 0;
+                while (yy < h) {
+                    let ro = dst + (y + yy) * stride + x;
+                    var xx = 0;
+                    while (xx < w) {
+                        b[ro + xx] = col;
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+            } else {
+                // Source-over:
+                //   out  = (src*sa + dst*inv + 127) / 255,  inv = 255 - sa
+                //   outA = sa + (dstA*inv + 127) / 255
+                // R and B ride in one value as two 16-bit lanes (a lane peaks
+                // at 255*255+127 = 65152, so neither carries into the other),
+                // and the divide uses the identity y/255 == (y+1+(y>>8))>>8,
+                // exact over that range - three integer divisions per pixel
+                // would otherwise dominate. Block elements read back
+                // sign-extended; every use masks after shifting.
+                let x = b[p + 4]; let y = b[p + 5];
+                let w = b[p + 6]; let h = b[p + 7];
+                let sa  = (col >> 24) & 0xFF;
+                let ia  = 255 - sa;
+                let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
+                let sg  = ((col >> 8) & 0xFF) * sa + 127;
+                var yy = 0;
+                while (yy < h) {
+                    let ro = dst + (y + yy) * stride + x;
+                    var xx = 0;
+                    while (xx < w) {
+                        let d = b[ro + xx];
+                        var rb = (d & 0x00FF00FF) * ia + srb;
+                        rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                        var gg = ((d >> 8) & 0xFF) * ia + sg;
+                        gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                        var aa = ((d >> 24) & 0xFF) * ia + 127;
+                        aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                        b[ro + xx] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Thin-line kernel: integer Bresenham, clipped and blended per pixel.
+    fn static _kernelLine(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz     = b[p + 1];
+            let dst    = b[p + 2];
+            let stride = b[p + 3];
+            let col    = b[p + sz - 1];
+            {
+                // Thin line: integer Bresenham with the per-pixel clip and
+                // blend. Clipping is per pixel rather than up front, because
+                // clipping the endpoints would change the error term.
+                let cw = b[p + 4]; let ch = b[p + 5];
+                var lx = b[p + 6]; var ly = b[p + 7];
+                let ex = b[p + 8]; let ey = b[p + 9];
+                let sa  = (col >> 24) & 0xFF;
+                let ia  = 255 - sa;
+                let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
+                let sg  = ((col >> 8) & 0xFF) * sa + 127;
+                var dx = ex - lx; if (dx < 0) { dx = 0 - dx; }
+                var dn = ey - ly; if (dn < 0) { dn = 0 - dn; }
+                dn = 0 - dn;
+                var sx = 0 - 1; if (lx < ex) { sx = 1; }
+                var sy = 0 - 1; if (ly < ey) { sy = 1; }
+                var err = dx + dn;
+                var run = 1;
+                while (run == 1) {
+                    if (lx >= 0 && lx < cw && ly >= 0 && ly < ch) {
+                        let o = dst + ly * stride + lx;
+                        if (sa == 255) {
+                            b[o] = col;
+                        } else {
+                            let d = b[o];
+                            var rb = (d & 0x00FF00FF) * ia + srb;
+                            rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                            var gg = ((d >> 8) & 0xFF) * ia + sg;
+                            gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                            var aa = ((d >> 24) & 0xFF) * ia + 127;
+                            aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                            b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                        }
+                    }
+                    if (lx == ex && ly == ey) {
+                        run = 0;
+                    } else {
+                        let e2 = 2 * err;
+                        if (e2 >= dn) { err = err + dn; lx = lx + sx; }
+                        if (e2 <= dx) { err = err + dx; ly = ly + sy; }
+                    }
+                }
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Stamped-segment kernel: filled disks (or rings) of radius rr sampled
+    // along a segment - the shape behind thick lines, strokes and circles.
+    //
+    // Row half-widths are carried across rows instead of re-derived per row:
+    // sqrt(rr^2 - dy^2) rises to rr and falls back, so the two adjust loops
+    // together step O(rr) times per disk rather than the O(rr^2) a per-row
+    // scan costs.
+    //
+    // Sample positions use exact rational rounding (half away from zero) rather
+    // than a floating-point accumulator, so a long segment cannot drift.
+    fn static _kernelStamp(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz     = b[p + 1];
+            let dst    = b[p + 2];
+            let stride = b[p + 3];
+            let col    = b[p + sz - 1];
+            let cw = b[p + 4]; let ch = b[p + 5];
+            let x0 = b[p + 6]; let y0 = b[p + 7];
+            let x1 = b[p + 8]; let y1 = b[p + 9];
+            let rr = b[p + 10];
+            let sa  = (col >> 24) & 0xFF;
+            let ia  = 255 - sa;
+            let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
+            let sg  = ((col >> 8) & 0xFF) * sa + 127;
+            let ddx = x1 - x0;
+            let ddy = y1 - y0;
+            var adx = ddx; if (adx < 0) { adx = 0 - adx; }
+            var ady = ddy; if (ady < 0) { ady = 0 - ady; }
+            var steps = adx;
+            if (ady > adx) { steps = ady; }
+            let r2 = rr * rr;
+            var k = 0;
+            while (k <= steps) {
+                var cx = x0;
+                var cy = y0;
+                if (steps > 0) {
+                    var na = ddx * k * 2;
+                    if (na >= 0) { cx = x0 + (na + steps) / (steps * 2); }
+                    else         { cx = x0 - ((0 - na) + steps) / (steps * 2); }
+                    var nb = ddy * k * 2;
+                    if (nb >= 0) { cy = y0 + (nb + steps) / (steps * 2); }
+                    else         { cy = y0 - ((0 - nb) + steps) / (steps * 2); }
+                }
+                if (rr <= 0) {
+                    if (cx >= 0 && cx < cw && cy >= 0 && cy < ch) {
+                        let o = dst + cy * stride + cx;
+                        if (sa == 255) {
+                            b[o] = col;
+                        } else {
+                            let d = b[o];
+                            var rb = (d & 0x00FF00FF) * ia + srb;
+                            rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                            var gg = ((d >> 8) & 0xFF) * ia + sg;
+                            gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                            var aa = ((d >> 24) & 0xFF) * ia + 127;
+                            aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                            b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                        }
+                    }
+                } else {
+                    var half = 0;
+                    var dyy = 0 - rr;
+                    while (dyy <= rr) {
+                        let d2 = r2 - dyy * dyy;
+                        while ((half + 1) * (half + 1) <= d2) { half = half + 1; }
+                        while (half > 0 && half * half > d2) { half = half - 1; }
+                        let yy = cy + dyy;
+                        if (yy >= 0 && yy < ch) {
+                            {
+                                var xa = cx - half;
+                                var xb = cx + half;
+                                if (xa < 0) { xa = 0; }
+                                if (xb >= cw) { xb = cw - 1; }
+                                let ro = dst + yy * stride;
+                                var xj = xa;
+                                while (xj <= xb) {
+                                    let o = ro + xj;
+                                    if (sa == 255) {
+                                        b[o] = col;
+                                    } else {
+                                        let d = b[o];
+                                        var rb = (d & 0x00FF00FF) * ia + srb;
+                                        rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                                        var gg = ((d >> 8) & 0xFF) * ia + sg;
+                                        gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                                        var aa = ((d >> 24) & 0xFF) * ia + 127;
+                                        aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                                        b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                                    }
+                                    xj = xj + 1;
+                                }
+                            }
+                        }
+                        dyy = dyy + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// Every canvas is a region of one shared surface arena. Keeping them together
+// is what lets an operation that reads one canvas and writes another run as a
+// single offload kernel, with no copying between them.
+// ---------------------------------------------------------------------------
+
+global _rasterEngine = nil;
+
+fn _r() : Raster {
+    if (_rasterEngine == nil) {
+        _rasterEngine = new Raster(1048576, 8192);
+    }
+    return _rasterEngine;
+}
+
+// Allocate a canvas-sized surface, growing the arena if it will not fit.
+fn _newSurface(w:int, h:int) : object|nil {
+    let e = _r();
+    var s = e.NewSurface(w, h);
+    if (s == nil) {
+        e.EnsureFree(w * h);
+        s = e.NewSurface(w, h);
+    }
+    // A canvas that could not be allocated degrades to 1x1 rather than nil, so
+    // every method stays safe to call and drawing simply clips away.
+    if (s == nil) { s = e.NewSurface(1, 1); }
+    return s;
+}
 
 class Graphics {
 
@@ -91,7 +1654,7 @@ class Graphics {
     // ----------------------------------------------------------------
     let _width:int    = 1;
     let _height:int   = 1;
-    let _gfx:instance = nil;
+    let _s:object = nil;
 
     let _stroke:int    = 0xFFFFFFFF;  // default: opaque white
     let _fill:int      = 0;           // 0 = no fill
@@ -101,33 +1664,33 @@ class Graphics {
     // Construction
     // ----------------------------------------------------------------
 
+    // Dimensions are clamped to 1..16384 per side. A canvas too large to
+    // allocate degrades to 1x1 instead of becoming unusable.
     fn Constructor(w:int, h:int) {
-        this._width  = Math.Max(1, w);
-        this._height = Math.Max(1, h);
-        this._gfx    = Gfx.Create(_width, _height);
+        this._width  = Math.Min(Raster.MaxSide(), Math.Max(1, w));
+        this._height = Math.Min(Raster.MaxSide(), Math.Max(1, h));
+        this._s      = _newSurface(_width, _height);
+        if (_s != nil) {
+            this._width  = _s.w;
+            this._height = _s.h;
+        }
     }
-
     fn static Create(w:int, h:int) : instance {
         return new Graphics(w, h);
     }
 
     fn static FromFile(file:string) : instance|nil {
-        let raw = Gfx.CreateFromFile(file);
-        if (raw == nil) return nil;
-        let gi  = new Graphics(1, 1);
-        gi._gfx    = raw;
-        gi._width  = raw.Width;
-        gi._height = raw.Height;
+        let img = Png.Load(file);
+        if (img == nil) return nil;
+        let gi = new Graphics(img.Width, img.Height);
+        if (gi._s == nil) return nil;
+        Buffer.Copy(img.Pixels, 0, _r().Arena(), gi._s.off * 4,
+                    img.Width * img.Height * 4);
         return gi;
     }
-
-    // ----------------------------------------------------------------
-    // Accessors
-    // ----------------------------------------------------------------
-
     fn Width()  : int { return _width;  }
     fn Height() : int { return _height; }
-    fn GetGfx() : instance|nil { return _gfx; }
+    fn GetGfx() : object|nil { return _s; }
 
     // ----------------------------------------------------------------
     // Style
@@ -157,17 +1720,20 @@ class Graphics {
     // ----------------------------------------------------------------
 
     fn Clear(color:int) {
-        _gfx.Clear(color);
+        _r().Clear(_s, color);
         return;
     }
 
     fn Pixel(x:int, y:int, color:int) {
-        _gfx.SetPixel(x, y, color);
+        _r().SetPixel(_s, x, y, color);
         return;
     }
 
-    fn GetPixel(x:int, y:int) : int {
-        return _gfx.GetPixel(x, y);
+    // Returns nil outside the canvas rather than a colour, so a caller can
+    // tell "transparent black" from "off the edge".
+    fn GetPixel(x:int, y:int) {
+        if (x < 0 || y < 0 || x >= _width || y >= _height) return nil;
+        return _r().GetPixel(_s, x, y);
     }
 
     // ----------------------------------------------------------------
@@ -175,22 +1741,22 @@ class Graphics {
     // ----------------------------------------------------------------
 
     fn Line(x0:int, y0:int, x1:int, y1:int) {
-        _gfx.DrawLine(x0, y0, x1, y1, _stroke, _thickness);
+        _r().DrawLine(_s, x0, y0, x1, y1, _stroke, _thickness);
         return;
     }
 
     fn HLine(x0:int, y:int, x1:int) {
-        _gfx.DrawHLine(x0, y, x1, _stroke, _thickness);
+        _r().HLine(_s, x0, y, x1, _stroke, _thickness);
         return;
     }
 
     fn VLine(x:int, y0:int, y1:int) {
-        _gfx.DrawVLine(x, y0, y1, _stroke, _thickness);
+        _r().VLine(_s, x, y0, y1, _stroke, _thickness);
         return;
     }
 
     fn Polyline(pts:array) {
-        _gfx.StrokePath(pts, _stroke, _thickness, 1, 0);  // cap=round, open
+        _r().StrokePath(_s, pts, _stroke, _thickness, 1, 0);  // cap=round, open
         return;
     }
 
@@ -199,13 +1765,13 @@ class Graphics {
     // ----------------------------------------------------------------
 
     fn Rect(x:int, y:int, w:int, h:int) {
-        _gfx.DrawRect(x, y, w, h, _stroke, _thickness);
+        _r().DrawRect(_s, x, y, w, h, _stroke, _thickness);
         return;
     }
 
     fn FillRect(x:int, y:int, w:int, h:int) {
         if (_fill == 0) return;
-        _gfx.FillRect(x, y, w, h, _fill);
+        _r().FillRect(_s, x, y, w, h, _fill);
         return;
     }
 
@@ -219,10 +1785,10 @@ class Graphics {
             return;
         }
 
-        _gfx.DrawHLine(x + r,     y,         x + w - r - 1, _stroke, _thickness);
-        _gfx.DrawHLine(x + r,     y + h - 1, x + w - r - 1, _stroke, _thickness);
-        _gfx.DrawVLine(x,         y + r,     y + h - r - 1,  _stroke, _thickness);
-        _gfx.DrawVLine(x + w - 1, y + r,     y + h - r - 1,  _stroke, _thickness);
+        _r().HLine(_s, x + r,     y,         x + w - r - 1, _stroke, _thickness);
+        _r().HLine(_s, x + r,     y + h - 1, x + w - r - 1, _stroke, _thickness);
+        _r().VLine(_s, x,         y + r,     y + h - r - 1,  _stroke, _thickness);
+        _r().VLine(_s, x + w - 1, y + r,     y + h - r - 1,  _stroke, _thickness);
 
         ArcButt(x + r,         y + r,         r, 180, 270);
         ArcButt(x + w - r - 1, y + r,         r, 270, 360);
@@ -249,9 +1815,9 @@ class Graphics {
             return;
         }
 
-        _gfx.FillRect(x,     y + r,     w,         h - r * 2, _fill);
-        _gfx.FillRect(x + r, y,         w - r * 2, r,         _fill);
-        _gfx.FillRect(x + r, y + h - r, w - r * 2, r,         _fill);
+        _r().FillRect(_s, x,     y + r,     w,         h - r * 2, _fill);
+        _r().FillRect(_s, x + r, y,         w - r * 2, r,         _fill);
+        _r().FillRect(_s, x + r, y + h - r, w - r * 2, r,         _fill);
 
         FillPie(x + r,         y + r,         r, 180, 270);
         FillPie(x + w - r - 1, y + r,         r, 270, 360);
@@ -265,20 +1831,20 @@ class Graphics {
     // ----------------------------------------------------------------
 
     fn Circle(cx:int, cy:int, r:int) {
-        _gfx.DrawCircle(cx, cy, r, _stroke, _thickness, 0);
+        _r().DrawCircle(_s, cx, cy, r, _stroke, _thickness, 0);
         return;
     }
 
     fn FillCircle(cx:int, cy:int, r:int) {
         if (_fill == 0) return;
-        _gfx.DrawCircle(cx, cy, r, _fill, 0, 0);
+        _r().DrawCircle(_s, cx, cy, r, _fill, 0, 0);
         return;
     }
 
     // Fill then stroke in one call (skips each if the respective color is 0).
     fn DrawCircle(cx:int, cy:int, r:int) {
-        if (_fill != 0) _gfx.DrawCircle(cx, cy, r, _fill, 0, 0);
-        _gfx.DrawCircle(cx, cy, r, _stroke, _thickness, 0);
+        if (_fill != 0) _r().DrawCircle(_s, cx, cy, r, _fill, 0, 0);
+        _r().DrawCircle(_s, cx, cy, r, _stroke, _thickness, 0);
         return;
     }
 
@@ -307,14 +1873,14 @@ class Graphics {
 
     fn Ellipse(cx:int, cy:int, rx:int, ry:int) {
         let pts = _ellipsePts(cx, cy, rx, ry);
-        _gfx.StrokePath(pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
+        _r().StrokePath(_s, pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
         return;
     }
 
     fn FillEllipse(cx:int, cy:int, rx:int, ry:int) {
         if (_fill == 0) return;
         let pts = _ellipsePts(cx, cy, rx, ry);
-        _gfx.FillPolygon(pts, _fill);
+        _r().FillPolygon(_s, pts, _fill);
         return;
     }
 
@@ -348,13 +1914,13 @@ class Graphics {
 
     fn Arc(cx:int, cy:int, r:int, startDeg:int, endDeg:int) {
         let pts = _arcPts(cx, cy, r, startDeg, endDeg);
-        _gfx.StrokePath(pts, _stroke, _thickness, 1, 0);  // cap=round, open
+        _r().StrokePath(_s, pts, _stroke, _thickness, 1, 0);  // cap=round, open
         return;
     }
 
     fn ArcButt(cx:int, cy:int, r:int, startDeg:int, endDeg:int) {
         let pts = _arcPts(cx, cy, r, startDeg, endDeg);
-        _gfx.StrokePath(pts, _stroke, _thickness, 0, 0);  // cap=butt, open
+        _r().StrokePath(_s, pts, _stroke, _thickness, 0, 0);  // cap=butt, open
         return;
     }
 
@@ -365,7 +1931,7 @@ class Graphics {
     fn Pie(cx:int, cy:int, r:int, startDeg:int, endDeg:int) {
         let arc = _arcPts(cx, cy, r, startDeg, endDeg);
         let pts = Array.Concat([cx, cy], arc);
-        _gfx.StrokePath(pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
+        _r().StrokePath(_s, pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
         return;
     }
 
@@ -373,7 +1939,7 @@ class Graphics {
         if (_fill == 0) return;
         let arc = _arcPts(cx, cy, r, startDeg, endDeg);
         let pts = Array.Concat([cx, cy], arc);
-        _gfx.FillPolygon(pts, _fill);
+        _r().FillPolygon(_s, pts, _fill);
         return;
     }
 
@@ -382,13 +1948,13 @@ class Graphics {
     // ----------------------------------------------------------------
 
     fn Polygon(pts:array) {
-        _gfx.StrokePath(pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
+        _r().StrokePath(_s, pts, _stroke, _thickness, 0, 1);  // cap=butt, closed
         return;
     }
 
     fn FillPolygon(pts:array) {
         if (_fill == 0) return;
-        _gfx.FillPolygon(pts, _fill);
+        _r().FillPolygon(_s, pts, _fill);
         return;
     }
 
@@ -397,22 +1963,22 @@ class Graphics {
     // ----------------------------------------------------------------
 
     fn DrawChar(x:int, y:int, code:int) {
-        _gfx.DrawChar(x, y, code, _stroke, 1);
+        _r().DrawChar(_s, x, y, code, _stroke, 1);
         return;
     }
 
     fn DrawCharScaled(x:int, y:int, code:int, scale:int) {
-        _gfx.DrawChar(x, y, code, _stroke, scale);
+        _r().DrawChar(_s, x, y, code, _stroke, scale);
         return;
     }
 
     fn DrawText(x:int, y:int, text:string) {
-        _gfx.DrawText(x, y, text, _stroke, 1);
+        _r().DrawText(_s, x, y, text, _stroke, 1, 0, 0);
         return;
     }
 
     fn DrawTextEx(x:int, y:int, text:string, scale:int) {
-        _gfx.DrawText(x, y, text, _stroke, scale);
+        _r().DrawText(_s, x, y, text, _stroke, scale, 0, 0);
         return;
     }
 
@@ -437,146 +2003,149 @@ class Graphics {
     // ----------------------------------------------------------------
 
     fn DrawImage(file:string, x:int, y:int, w:int, h:int) {
-        _gfx.DrawImage(file, x, y, w, h, 1);
+        this._drawFile(file, x, y, w, h);
         return;
     }
-
     fn DrawImageNearest(file:string, x:int, y:int, w:int, h:int) {
-        _gfx.DrawImage(file, x, y, w, h, 0);
+        this._drawFile(file, x, y, w, h);
         return;
     }
-
     fn Blit(x:int, y:int, w:int, h:int, pixels:array) {
-        _gfx.Blit(x, y, w, h, pixels);
+        _r().Blit(_s, x, y, w, h, pixels);
         return;
     }
 
     fn Draw(src:instance, x:int, y:int) {
-        _gfx.Draw(src.GetGfx(), x, y);
+        _r().Draw(_s, src.GetGfx(), x, y);
         return;
     }
 
-    fn DrawGfx(srcGfx:instance, x:int, y:int) {
-        _gfx.Draw(srcGfx, x, y);
+    fn DrawGfx(srcGfx:object, x:int, y:int) {
+        _r().Draw(_s, srcGfx, x, y);
         return;
     }
 
     fn CopyRect(x:int, y:int, w:int, h:int) : instance {
-        let sub = _gfx.CopyRect(x, y, w, h);
-        let gi  = new Graphics(w, h);
-        gi._gfx = sub;
+        let sub = _r().CopyRect(_s, x, y, w, h);
+        let gi  = new Graphics(1, 1);
+        if (sub != nil) {
+            _r().FreeSurface(gi._s);
+            gi._s      = sub;
+            gi._width  = sub.w;
+            gi._height = sub.h;
+        }
         return gi;
     }
-
-    // ----------------------------------------------------------------
-    // Output
-    // ----------------------------------------------------------------
-
+    // Returns true on success, nil on failure (a missing directory, say) - it
+    // never raises.
     fn Save(path:string) {
-        return _gfx.SaveToFile(path);
+        if (Png.Save(path, this._pixels(), _width, _height, nil)) { return true; }
+        return nil;
     }
-
     fn ToBlock() {
-        return _gfx.SaveToBlock();
+        return Png.Encode(this._pixels(), _width, _height, nil);
     }
-
-    // ----------------------------------------------------------------
-    // Transforms
-    // ----------------------------------------------------------------
-
     fn Resize(w:int, h:int) {
-        _gfx.Resize(w, h);
+        let out = _r().Resize(_s, w, h);
+        if (out == nil) return;
+        _r().Flush();
+        _r().FreeSurface(_s);
+        _s      = out;
         _width  = w;
         _height = h;
         return;
     }
-
     fn Rescale(sx:float, sy:float) {
-        _gfx.Rescale(sx, sy);
-        _width  = _gfx.Width;
-        _height = _gfx.Height;
+        let out = _r().Rescale(_s, sx, sy);
+        if (out == nil) return;
+        _r().Flush();
+        _r().FreeSurface(_s);
+        _s      = out;
+        _width  = out.w;
+        _height = out.h;
         return;
     }
-
     fn RescaleUniform(s:float) {
-        _gfx.Rescale(s);
-        _width  = _gfx.Width;
-        _height = _gfx.Height;
+        this.Rescale(s, s);
         return;
     }
-
-    // ----------------------------------------------------------------
-    // Per-pixel filter
-    // ----------------------------------------------------------------
-
     fn Filter(callback:fn, x:int, y:int, w:int, h:int) {
-        _gfx.Filter(callback, x, y, w, h);
+        _r().Filter(_s, callback, x, y, w, h);
         return;
     }
 
     fn FilterAll(callback:fn) {
-        _gfx.Filter(callback, 0, 0, _width, _height);
+        _r().Filter(_s, callback, 0, 0, _width, _height);
         return;
     }
 
     // Offload a region kernel fn(pixels, x, y, w, h, stride) -> scalar to a
-    // worker thread (threadsafe JIT kernel + -j) or run it inline, then fire
+    // worker thread (threadsafe JIT kernel + --jit) or run it inline, then fire
     // cb(surface, result). `pixels` is the 32-bit ARGB block; index a region
     // pixel as pixels[(y+dy)*stride + (x+dx)]. `surface` handed to cb is the
     // underlying Gfx image. See Buffer.ProcessCallback for the kernel rules.
-    fn FilterCallback(kernel:fn, x:int, y:int, w:int, h:int, cb:fn) {
-        _gfx.FilterCallback(kernel, x, y, w, h, cb);
+    // The kernel keeps its documented shape - fn(pixels, x, y, w, h, stride),
+    // returning a value handed to the callback - so it is run over a snapshot
+    // of this canvas and the result copied back. Use Raster.FilterRegion when
+    // you want the work pushed to another core instead.
+    fn _runKernel(kernel:function, x:int, y:int, w:int, h:int) {
+        _r().Flush();
+        let px = Buffer.Slice(_r().Arena(), _s.off, _width * _height);
+        let res = kernel(px, x, y, w, h, _width);
+        Buffer.Copy(px, 0, _r().Arena(), _s.off * 4, _width * _height * 4);
+        return res;
+    }
+
+    fn FilterCallback(kernel:function, x:int, y:int, w:int, h:int, cb:function) {
+        let res = this._runKernel(kernel, x, y, w, h);
+        cb(this, res);
         return;
     }
 
-    fn FilterCallbackAll(kernel:fn, cb:fn) {
-        _gfx.FilterCallback(kernel, 0, 0, _width, _height, cb);
+    fn FilterCallbackAll(kernel:function, cb:function) {
+        let res = this._runKernel(kernel, 0, 0, _width, _height);
+        cb(this, res);
         return;
     }
 
-    // Like FilterCallback, but delivers the kernel result into an event; join
-    // several with Event.WaitFor([ids]).
-    fn FilterEvent(kernel:fn, x:int, y:int, w:int, h:int, eventId:int) {
-        _gfx.FilterEvent(kernel, x, y, w, h, eventId);
+    fn FilterEvent(kernel:function, x:int, y:int, w:int, h:int, eventId:int) {
+        let res = this._runKernel(kernel, x, y, w, h);
+        Event.Set(eventId, res);
         return;
     }
 
-    fn FilterEventAll(kernel:fn, eventId:int) {
-        _gfx.FilterEvent(kernel, 0, 0, _width, _height, eventId);
+    fn FilterEventAll(kernel:function, eventId:int) {
+        let res = this._runKernel(kernel, 0, 0, _width, _height);
+        Event.Set(eventId, res);
         return;
     }
-
-    // ----------------------------------------------------------------
-    // Image effects
-    // ----------------------------------------------------------------
-
     fn Grayscale(x:int, y:int, w:int, h:int) {
-        _gfx.Grayscale(x, y, w, h);
+        _r().Grayscale(_s, x, y, w, h);
         return;
     }
 
     fn GrayscaleAll() {
-        _gfx.Grayscale(0, 0, _width, _height);
+        _r().Grayscale(_s, 0, 0, _width, _height);
         return;
     }
 
     fn Brightness(x:int, y:int, w:int, h:int, factor:float) {
-        _gfx.Brightness(x, y, w, h, factor);
+        _r().Brightness(_s, x, y, w, h, factor);
         return;
     }
 
     fn BrightnessAll(factor:float) {
-        _gfx.Brightness(0, 0, _width, _height, factor);
+        _r().Brightness(_s, 0, 0, _width, _height, factor);
         return;
     }
 
     fn BlendRect(src:instance, dx:int, dy:int, alpha:int) {
-        _gfx.BlendRect(src.GetGfx(), dx, dy, alpha);
+        _r().BlendSurface(_s, src.GetGfx(), dx, dy, alpha);
         return;
     }
 
     fn Blend(src:instance, dx:int, dy:int) {
-        _gfx.BlendRect(src.GetGfx(), dx, dy, 255);
+        _r().BlendSurface(_s, src.GetGfx(), dx, dy, 255);
         return;
     }
 
@@ -586,16 +2155,16 @@ class Graphics {
 
     // All three implemented in gfx.c.
     fn static RGB(r:int, g:int, b:int) : int {
-        return Gfx.RGB(r, g, b);
+        return Raster.RGB(r, g, b);
     }
 
     fn static RGBA(r:int, g:int, b:int, a:int) : int {
-        return Gfx.RGBA(r, g, b, a);
+        return Raster.RGBA(r, g, b, a);
     }
 
     // h: 0-360, s: 0.0-1.0, l: 0.0-1.0
     fn static HSL(h:float, s:float, l:float) : int {
-        return Gfx.HSL(h, s, l);
+        return Raster.HSL(h, s, l);
     }
 
     // ----------------------------------------------------------------
@@ -608,6 +2177,38 @@ class Graphics {
         return Graphics.FromFile(path);
     }
 
+    // ----------------------------------------------------------------
+    // Internals
+    // ----------------------------------------------------------------
+
+    // This canvas's pixels as a standalone block, for the PNG encoder.
+    fn _pixels() : block {
+        _r().Flush();
+        return Buffer.Slice(_r().Arena(), _s.off, _width * _height);
+    }
+
+    // Load a PNG, scale it to w x h if needed, and composite it at (x, y).
+    fn _drawFile(file:string, x:int, y:int, w:int, h:int) {
+        let img = Png.Load(file);
+        if (img == nil) return;
+        let tmp = _newSurface(img.Width, img.Height);
+        if (tmp == nil) return;
+        Buffer.Copy(img.Pixels, 0, _r().Arena(), tmp.off * 4,
+                    img.Width * img.Height * 4);
+        if (w == img.Width && h == img.Height) {
+            _r().Draw(_s, tmp, x, y);
+            _r().Flush();
+        } else {
+            let sc = _r().Resize(tmp, w, h);
+            if (sc != nil) {
+                _r().Draw(_s, sc, x, y);
+                _r().Flush();
+                _r().FreeSurface(sc);
+            }
+        }
+        _r().FreeSurface(tmp);
+        return;
+    }
 }
 
 export { Graphics };

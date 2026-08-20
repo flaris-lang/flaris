@@ -11,7 +11,7 @@
 // SETUP
 // -----
 // None. TLS is provided by the built-in `Tls` module, which uses the operating
-// system's own TLS stack - no -u flag, no plugin, no OpenSSL install:
+// system's own TLS stack - no --unsafe flag, no plugin, no OpenSSL install:
 //
 //      macOS    -> Secure Transport   (trust: Keychain)
 //      Linux    -> OpenSSL via dlopen (trust: system CA bundle)
@@ -87,7 +87,7 @@ import { Http, Status, ContentType, CookieJar, Multipart } from library("Http", 
 // Cached default (verifying) transport.
 global _httpsTransportSecure = nil;
 
-// Default TLS connect/read timeout in milliseconds. The built-in Tls module
+// Default TLS connect/read timeout in milliseconds. Stream.ConnectTls
 // defaults to 30s, which is too short for slow upstreams - notably LLM
 // completion APIs that routinely take 20-60s. Default to 2 minutes and let
 // callers raise it per-request (opts.timeoutMs) or globally (Https.SetTimeout).
@@ -98,33 +98,14 @@ class Https {
     // Build a TLS transport bound to the given connect options.
     //   opts: { insecure:bool, timeoutMs:int } (or nil for defaults)
     //
-    // Uses the built-in Tls module (OS-native TLS: Secure Transport / OpenSSL /
-    // SChannel). It exposes a 6-closure transport shape the HTTP engine drives
-    // exactly like the plain-TCP one - only the bytes on the wire are encrypted.
+    // Uses the OS-native TLS behind Stream.ConnectTls (Secure Transport /
+    // OpenSSL / SChannel). The HTTP engine drives it exactly like the plain-TCP
+    // transport - only the bytes on the wire are encrypted.
     fn static _buildTransport(opts) {
-        if (!Tls.Available()) {
-            throw(100, "Https: no TLS backend available on this build - the built-in " +
-                       "Tls module is unusable. On Linux this usually means libssl " +
-                       "could not be loaded; install it (e.g. apt install libssl3).");
-        }
-        let insecure  = (opts != nil && Object.HasKey(opts, "insecure"))  ? opts.insecure  : false;
-        let timeoutMs = (opts != nil && Object.HasKey(opts, "timeoutMs")) ? opts.timeoutMs : _httpsTimeoutMs;
-        return {
-            secure:   true,
-            connect:  fn(host, port) { let h = Tls.Connect(host, port, insecure, timeoutMs); return (h == 0) ? nil : h; },
-            write:    fn(c, d)       { Tls.Write(c, d); },
-            readLine: fn(c)          { return Tls.ReadLine(c); },
-            readN:    fn(c, n)       { return Tls.ReadN(c, n); },
-            readAll:  fn(c)          { return Tls.ReadAll(c); },
-            close:    fn(c)          { Tls.Close(c); },
-            // Async closures return fibers the HTTP engine awaits, so several
-            // requests overlap instead of blocking the scheduler one at a time.
-            connectAsync:  fn(host, port) { return Tls.ConnectAsync(host, port, insecure, timeoutMs); },
-            writeAsync:    fn(c, d)       { return Tls.WriteAsync(c, d); },
-            readLineAsync: fn(c)          { return Tls.ReadLineAsync(c); },
-            readNAsync:    fn(c, n)       { return Tls.ReadNAsync(c, n); },
-            readAllAsync:  fn(c)          { return Tls.ReadAllAsync(c); }
-        };
+        // The ordinary Stream transport, opened with ConnectTls. A build without
+        // TLS surfaces at connect time via Stream.TlsLastError, which names the
+        // missing dependency.
+        return Http._streamTransport(true, opts);
     }
 
     // Default verifying transport, cached for reuse across requests.
@@ -197,7 +178,7 @@ class Https {
     //  Async variants - genuinely non-blocking.
     //
     //  Each returns a fiber that suspends only the calling fiber at every TLS
-    //  connect/read/write (via the transport's *Async closures over Tls.*Async),
+    //  connect/read/write (via the transport's *Async closures over Stream),
     //  so requests started together overlap. `await` the result, or schedule
     //  several and await them all:
     //      let a = Https.GetAsync(u1);

@@ -1,10 +1,10 @@
 // Http.fls - HTTP/1.1 client for Flaris.
 // Version: 1.0
 //
-// Plain HTTP over TCP. For HTTPS, import the Https library - it injects a
-// TLS byte-transport (built-in Tls module, OS TLS stack) into this same engine
-// (see Http.Request), so all HTTP/1.1 framing, chunked decoding, redirects,
-// and cookies are shared.
+// HTTP/1.1 over TCP and TLS. https:// URLs work directly - the same engine runs
+// over an encrypted stream, so framing, chunked decoding, redirects and cookies
+// are shared between both schemes. The Https library adds connect options
+// (insecure, custom timeouts, SNI) and its own convenience methods.
 // Http.Curl / Http.WGet remain available as curl(1)/wget(1) fallbacks.
 // All methods are static - no instance needed.
 //
@@ -87,6 +87,8 @@
 //  Status codes
 // --------------------------------------------------------
 
+import { HttpUtil } from library("HttpUtil", "1.0");
+
 global Status = {
     OK:                 200,
     Created:            201,
@@ -122,9 +124,8 @@ global ContentType = {
 //  Pluggable transport
 // --------------------------------------------------------
 // A "transport" is an object of closures over an opaque connection handle. It
-// lets the same HTTP/1.1 engine run over plain TCP (the default below) or over
-// TLS (the Https library builds one on the built-in Tls module and passes it
-// to Http.Request). Shape:
+// lets the same HTTP/1.1 engine run over plain TCP or TLS; both are built by
+// _streamTransport, and a caller may pass its own to Http.Request. Shape:
 //   { secure:bool,
 //     connect(host,port) -> conn|nil,
 //     write(conn,data),
@@ -133,6 +134,7 @@ global ContentType = {
 //     readAll(conn)       -> string,       // until peer closes
 //     close(conn) }
 global _httpPlainTransport = nil;
+global _httpSecureTransport = nil;
 
 // --------------------------------------------------------
 //  Exception types
@@ -176,18 +178,57 @@ class Http {
 
     // Default plain-TCP transport (cached). Backs all http:// requests and is
     // the building block the Https library mirrors over TLS.
+    // Normalise an async read result to text: Stream's async reads resolve to a
+    // block, a supplied transport may resolve to a string. Both are accepted.
+    fn static _asText(v) {
+        if (v == nil) { return nil; }
+        if (Type.Is(v, Type.Block)) { return Buffer.ToString(v); }
+        return v;
+    }
+
     fn static _plainTransport() {
         if (_httpPlainTransport != nil) { return _httpPlainTransport; }
-        _httpPlainTransport = {
-            secure:   false,
-            connect:  fn(host, port) { return Stream.Connect("tcp", host, port); },
+        _httpPlainTransport = Http._streamTransport(false, nil);
+        return _httpPlainTransport;
+    }
+
+    // One transport shape over Stream. Plain TCP and TLS differ only in how the
+    // connection is opened; every call after that is identical.
+    //
+    // `opts` (TLS only): { insecure, timeoutMs, sni }.
+    fn static _streamTransport(secure: bool, opts) {
+        return {
+            secure:   secure,
+            connect:  fn(host, port) {
+                          if (secure) { return Stream.ConnectTls(host, port, opts); }
+                          return Stream.Connect("tcp", host, port);
+                      },
             write:    fn(c, d)       { Stream.WriteAll(c, d); },
             readLine: fn(c)          { return Stream.ReadLine(c); },
             readN:    fn(c, n)       { return Stream.ReadString(c, n); },
             readAll:  fn(c)          { return Buffer.ToString(Stream.ReadAll(c)); },
-            close:    fn(c)          { Stream.Close(c); }
+            close:    fn(c)          { Stream.Close(c); },
+
+            // Async closures the engine awaits, so requests overlap instead of
+            // taking the scheduler one at a time.
+            connectAsync:  fn(host, port) {
+                               if (secure) { return Stream.ConnectTlsAsync(host, port, opts); }
+                               return Stream.ConnectAsync("tcp", host, port);
+                           },
+            writeAsync:    fn(c, d)  { return Stream.WriteAsync(c, d); },
+            readLineAsync: fn(c)     { return Stream.ReadLineAsync(c); },
+            // These resolve to a block, which the engine normalises via _asText:
+            // a closure cannot await its own result.
+            readNAsync:    fn(c, n)  { return Stream.ReadAsync(c, n); },
+            readAllAsync:  fn(c)     { return Stream.ReadAsync(c, 0); }
         };
-        return _httpPlainTransport;
+    }
+
+    // Default TLS transport, cached like the plain one.
+    fn static _secureTransport() {
+        if (_httpSecureTransport != nil) { return _httpSecureTransport; }
+        _httpSecureTransport = Http._streamTransport(true, nil);
+        return _httpSecureTransport;
     }
 
     // Build the full request text (headers + body), or nil if any component
@@ -318,17 +359,11 @@ class Http {
                 path = path + "?" + query;
             }
 
-            // Pick the transport per hop so cross-scheme redirects work: https://
-            // hops need the TLS transport supplied by the Https library; http://
-            // hops always use plain TCP. Callers that did not pass a TLS transport
-            // (i.e. plain Http.Get) get a clear error on an https:// URL.
+            // Pick the transport per hop so cross-scheme redirects work. A
+            // caller-supplied TLS transport wins when one is passed.
             let tr = nil;
             if (parsed.scheme == "https") {
-                if (tlsTransport == nil) {
-                    throw new HttpUnsupportedError(100, "Http: HTTPS requires the Https library. " +
-                               "Use: import { Https } from library(\"Https\", \"1.0\"); Https.Get(url).");
-                }
-                tr = tlsTransport;
+                tr = tlsTransport ?? Http._secureTransport();
             } else {
                 tr = Http._plainTransport();
             }
@@ -429,7 +464,7 @@ class Http {
                 while (sizeLine != nil) {
                     let n = Http._parseHexSize(sizeLine);
                     if (n == 0) { break; }
-                    let chunk = await tr.readNAsync(s, n);
+                    let chunk = Http._asText(await tr.readNAsync(s, n));
                     if (chunk != nil) { result = result + chunk; }
                     await tr.readLineAsync(s);   // consume trailing CRLF
                     sizeLine = await tr.readLineAsync(s);
@@ -438,10 +473,10 @@ class Http {
             }
             if (len(cl) > 0) {
                 let n = Convert.ParseInt(cl);
-                if (n > 0) { return await tr.readNAsync(s, n); }
+                if (n > 0) { return Http._asText(await tr.readNAsync(s, n)); }
                 return "";
             }
-            return await tr.readAllAsync(s);
+            return Http._asText(await tr.readAllAsync(s)) ?? "";
         } catch (e) {
             return nil;
         }
@@ -467,11 +502,11 @@ class Http {
             let parsed = HttpUtil.ParseUrl(curUrl);
             if (parsed == nil) { return nil; }
 
-            // Plain-http hop (e.g. an https->http downgrade redirect): the plain
-            // transport has no async reads, so finish on the sync engine.
-            if (parsed.scheme != "https" || tlsTransport == nil) {
-                return Http._request(curMethod, curUrl, curBody, contentType, userHeaders, nil);
-            }
+            // Both schemes provide async closures, so no hop falls back to the
+            // synchronous engine.
+            let tr = (parsed.scheme == "https")
+                         ? (tlsTransport ?? Http._secureTransport())
+                         : Http._plainTransport();
 
             let host  = parsed.host;
             let port  = parsed.port;
@@ -479,7 +514,6 @@ class Http {
             let query = parsed.query;
             if (len(query) > 0) { path = path + "?" + query; }
 
-            let tr = tlsTransport;
             let s  = await tr.connectAsync(host, port);
             if (s == nil || s == 0) { return nil; }
 

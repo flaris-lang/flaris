@@ -1,0 +1,615 @@
+// =============================================================================
+// Png.fls - PNG encoder / decoder for Flaris.
+// Version: 1.0
+//
+// A complete PNG codec written in Flaris. Decoding leans on the native
+// `Compress.Unzip` builtin for the zlib stream and `Hash.Crc32` for chunk
+// integrity, so the expensive half of the format runs at C speed; everything
+// else - chunk parsing, filter reconstruction, sample expansion - is Flaris.
+//
+// Pixels are exchanged as a `block` of 32-bit `0xAARRGGBB` words, one word per
+// pixel, row-major, stride == width. That is the same layout `Gfx` uses for its
+// surfaces, so a decoded image can be handed straight to a canvas with
+// `Buffer.Copy` and no per-pixel marshalling.
+//
+// Usage:
+//   import { Png } from library("Png", "1.0");
+//
+//   let img = Png.Load("photo.png");          // { Width, Height, Pixels }
+//   Console.WriteLine(img.Width, "x", img.Height);
+//
+//   Png.Save("out.png", img.Pixels, img.Width, img.Height);
+//
+//   // In memory, both directions
+//   let bytes = Png.Encode(img.Pixels, img.Width, img.Height);
+//   let again = Png.Decode(bytes);
+//
+// Decode support:
+//   Colour types 0 (grayscale), 2 (RGB), 3 (palette), 4 (gray+alpha) and
+//   6 (RGBA), at every bit depth the spec allows for each: 1/2/4/8/16 for
+//   grayscale, 1/2/4/8 for palette, 8/16 for the rest. All five filter types
+//   (None/Sub/Up/Average/Paeth) are reconstructed. Palette `tRNS` alpha is
+//   applied. 16-bit samples are reduced to their high byte. Output is always
+//   32-bit ARGB.
+//
+//   Interlaced (Adam7) images are rejected with `nil` rather than decoded as
+//   if they were progressive - which would yield a scrambled image.
+//
+// Encode support:
+//   32-bit ARGB in, colour type 6 (RGBA8) out, single IDAT, zlib level 6.
+//
+//   Rows are filtered adaptively: each row is tried against all five filter
+//   types and the one with the smallest sum of absolute signed deviations is
+//   kept (the heuristic from the PNG spec's own encoder notes). This is what
+//   makes a PNG compress - a fixed filter leaves most of the redundancy in the
+//   stream for deflate to find, and it never fully does.
+//
+//   Adaptive filtering costs five passes over the pixel data. `Png.Encode` and
+//   `Png.Save` take an optional options object to trade it away:
+//
+//     Png.Save("out.png", px, w, h, { filter: Png.FilterNone() });
+//
+//   `Png.FilterAdaptive()` (the default) picks per row; `Png.FilterNone()`
+//   writes filter 0 everywhere, which is markedly faster and markedly bigger.
+//
+// Limits:
+//   Images are bounded to 16384 pixels per side, matching the `Gfx` surface cap.
+// =============================================================================
+
+class Png {
+
+    // ----------------------------------------------------------------
+    // Constants
+    // ----------------------------------------------------------------
+
+    fn static MaxDim():int { return 16384; }
+
+    // Filter strategies for Encode/Save.
+    fn static FilterAdaptive():int { return 0; }
+    fn static FilterNone():int     { return 1; }
+
+    // ----------------------------------------------------------------
+    // Byte helpers
+    //
+    // Block elements read back signed (a stored 0xFF reads as -1), so every
+    // byte load masks with 0xFF. Chunk types are compared as packed big-endian
+    // ints rather than strings - no allocation per chunk.
+    // ----------------------------------------------------------------
+
+    fn static _be32(b:block, o:int):int {
+        return (((b[o] & 0xFF) << 24) | ((b[o + 1] & 0xFF) << 16) |
+                ((b[o + 2] & 0xFF) << 8) | (b[o + 3] & 0xFF));
+    }
+
+    fn static _put32(b:block, o:int, v:int) {
+        b[o]     = (v >> 24) & 0xFF;
+        b[o + 1] = (v >> 16) & 0xFF;
+        b[o + 2] = (v >> 8) & 0xFF;
+        b[o + 3] = v & 0xFF;
+        return;
+    }
+
+    // Sample `si` of a reconstructed row at bit depth `bd`. Returns the raw
+    // value (0..2^bd-1), or the high byte when bd == 16.
+    fn static _samp(row:block, base:int, si:int, bd:int):int {
+        if (bd == 8)  { return row[base + si] & 0xFF; }
+        if (bd == 16) { return row[base + si * 2] & 0xFF; }
+        let bit   = si * bd;
+        let shift = 8 - bd - (bit & 7);
+        return ((row[base + (bit >> 3)] & 0xFF) >> shift) & ((1 << bd) - 1);
+    }
+
+    // Spread a sub-8-bit grayscale sample across the full 0..255 range.
+    fn static _gray8(s:int, bd:int):int {
+        if (bd >= 8) { return s; }
+        return (s * 255) / ((1 << bd) - 1);
+    }
+
+    // ----------------------------------------------------------------
+    // Decode
+    // ----------------------------------------------------------------
+
+    // Decode(bytes:block) -> { Width:int, Height:int, Pixels:block } or nil.
+    // Pixels holds Width*Height 32-bit 0xAARRGGBB words.
+    fn static Decode(bytes:block) : object|nil {
+        if (bytes == nil) { return nil; }
+        let n = len(bytes);
+        if (n < 33) { return nil; }
+
+        // 137 P N G \r \n 26 \n
+        if ((bytes[0] & 0xFF) != 137 || (bytes[1] & 0xFF) != 80  ||
+            (bytes[2] & 0xFF) != 78  || (bytes[3] & 0xFF) != 71  ||
+            (bytes[4] & 0xFF) != 13  || (bytes[5] & 0xFF) != 10  ||
+            (bytes[6] & 0xFF) != 26  || (bytes[7] & 0xFF) != 10) { return nil; }
+
+        var w = 0;
+        var h = 0;
+        var bd = 0;
+        var ct = -1;
+        var interlace = 0;
+        var gotIhdr = false;
+
+        let idatOff:array = [];
+        let idatSz:array  = [];
+        var idatTotal = 0;
+
+        var plte:block = nil;
+        var plteN = 0;
+        var trns:block = nil;
+        var trnsN = 0;
+
+        var p = 8;
+        while (p + 12 <= n) {
+            let clen = Png._be32(bytes, p);
+            let tag  = Png._be32(bytes, p + 4);
+            p = p + 8;
+            // Compare lengths rather than forming p+clen, which a hostile
+            // length could push past the block.
+            if (clen < 0 || clen > n - p - 4) { break; }
+
+            if (tag == 0x49484452 && clen >= 13) {          // IHDR
+                w         = Png._be32(bytes, p);
+                h         = Png._be32(bytes, p + 4);
+                bd        = bytes[p + 8] & 0xFF;
+                ct        = bytes[p + 9] & 0xFF;
+                interlace = bytes[p + 12] & 0xFF;
+                gotIhdr   = true;
+            } else if (tag == 0x49444154) {                 // IDAT
+                Array.Append(idatOff, p);
+                Array.Append(idatSz, clen);
+                idatTotal = idatTotal + clen;
+            } else if (tag == 0x504C5445) {                 // PLTE
+                plteN = clen / 3;
+                if (plteN > 256) { plteN = 256; }
+                plte = Buffer.Slice(bytes, p, plteN * 3);
+            } else if (tag == 0x74524E53) {                 // tRNS
+                trnsN = clen;
+                if (trnsN > 256) { trnsN = 256; }
+                trns = Buffer.Slice(bytes, p, trnsN);
+            } else if (tag == 0x49454E44) {                 // IEND
+                break;
+            }
+
+            p = p + clen + 4;
+        }
+
+        if (!gotIhdr || idatTotal <= 0) { return nil; }
+        if (w <= 0 || h <= 0) { return nil; }
+        if (w > Png.MaxDim() || h > Png.MaxDim()) { return nil; }
+        // Adam7 would need seven sub-image passes; decoding it as progressive
+        // produces a scrambled image, so refuse instead.
+        if (interlace != 0) { return nil; }
+
+        var channels = 0;
+        if (ct == 0)      { channels = 1; }
+        else if (ct == 2) { channels = 3; }
+        else if (ct == 3) { channels = 1; }
+        else if (ct == 4) { channels = 2; }
+        else if (ct == 6) { channels = 4; }
+        else { return nil; }
+
+        var okBd = false;
+        if (ct == 0 && (bd == 1 || bd == 2 || bd == 4 || bd == 8 || bd == 16)) { okBd = true; }
+        if (ct == 3 && (bd == 1 || bd == 2 || bd == 4 || bd == 8))             { okBd = true; }
+        if ((ct == 2 || ct == 4 || ct == 6) && (bd == 8 || bd == 16))          { okBd = true; }
+        if (!okBd) { return nil; }
+        if (ct == 3 && plteN == 0) { return nil; }
+
+        let bitsPp   = channels * bd;
+        let rowBytes = (w * bitsPp + 7) / 8;
+        var filtBpp  = (bitsPp + 7) / 8;
+        if (filtBpp < 1) { filtBpp = 1; }
+
+        // Gather the IDAT chunks into one zlib stream.
+        let idat = Buffer.Create(idatTotal, 1);
+        if (idat == nil) { return nil; }
+        var at = 0;
+        var i = 0;
+        while (i < len(idatOff)) {
+            Buffer.Copy(bytes, idatOff[i], idat, at, idatSz[i]);
+            at = at + idatSz[i];
+            i = i + 1;
+        }
+
+        let rawExpect = h * (1 + rowBytes);
+        let raw = Compress.Unzip(idat, rawExpect);
+        // A truncated-but-well-formed stream inflates to fewer bytes than IHDR
+        // promised; the filter loop would then read uninitialised buffer into
+        // pixels, so demand the exact length.
+        if (raw == nil || len(raw) != rawExpect) { return nil; }
+
+        let out = Buffer.Create(w * h, 4);
+        if (out == nil) { return nil; }
+
+        // Claim an event only on the path that consumes it: an id that is
+        // created and never signalled is never released back to the 64-slot
+        // pool, and the scheduler still waits on it at shutdown.
+        var fast = false;
+        if (ct == 6 && bd == 8) {
+            let id = Event.Create();
+            if (id >= 0) {
+                Buffer.ProcessEvent(Png._rgba8Kernel, raw, len(raw), rowBytes, id);
+                Event.WaitFor([id]);
+                Buffer.Copy(raw, 0, out, 0, w * h * 4);
+                fast = true;
+            }
+        }
+        if (!fast) {
+            Png._unfilter(raw, h, rowBytes, filtBpp);
+            Png._expand(raw, out, w, h, rowBytes, ct, bd, plte, plteN, trns, trnsN);
+        }
+
+        return { Width: w, Height: h, Pixels: out };
+    }
+
+    // Load(path:string) -> { Width, Height, Pixels } or nil.
+    fn static Load(path:string) : object|nil {
+        let bytes = File.ReadAllBytes(path);
+        if (bytes == nil) { return nil; }
+        return Png.Decode(bytes);
+    }
+
+    // Reconstruct all five filter types in place over the raw scanline buffer.
+    // Safe in place: every filter references only bytes to the left in the
+    // current row and bytes in the row above, all already reconstructed.
+    //
+    // The 8-bit RGBA case - by far the most common, and the one Gfx surfaces
+    // round-trip through - goes via _rgba8Kernel instead, which does this plus
+    // the pixel expansion as one offload kernel. The Paeth predictor therefore
+    // exists twice: a kernel touches one block and cannot call helpers, so the
+    // fast path cannot share this code. Any change here must be mirrored there.
+    fn static _unfilter(raw:block, h:int, rowBytes:int, bpp:int) {
+        var y = 0;
+        while (y < h) {
+            let base  = y * (1 + rowBytes);
+            let ftype = raw[base] & 0xFF;
+            let cur   = base + 1;
+            let up    = cur - (1 + rowBytes);
+
+            if (ftype == 0) {
+                y = y + 1;
+                continue;
+            }
+
+            var x = 0;
+            while (x < rowBytes) {
+                var a = 0;
+                var b = 0;
+                var c = 0;
+                if (x >= bpp) { a = raw[cur + x - bpp] & 0xFF; }
+                if (y > 0)    { b = raw[up + x] & 0xFF; }
+                if (x >= bpp && y > 0) { c = raw[up + x - bpp] & 0xFF; }
+
+                var add = 0;
+                if (ftype == 1)      { add = a; }
+                else if (ftype == 2) { add = b; }
+                else if (ftype == 3) { add = (a + b) >> 1; }
+                else if (ftype == 4) {
+                    // Paeth predictor (spec 9.4)
+                    let pp = a + b - c;
+                    var pa = pp - a; if (pa < 0) { pa = 0 - pa; }
+                    var pb = pp - b; if (pb < 0) { pb = 0 - pb; }
+                    var pc = pp - c; if (pc < 0) { pc = 0 - pc; }
+                    if (pa <= pb && pa <= pc)  { add = a; }
+                    else if (pb <= pc)          { add = b; }
+                    else                        { add = c; }
+                }
+
+                raw[cur + x] = ((raw[cur + x] & 0xFF) + add) & 0xFF;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        return;
+    }
+
+    // Fused decode kernel for 8-bit RGBA (colour type 6, bit depth 8).
+    //
+    // Runs as one offload kernel over the single raw-scanline block: phase 1
+    // reconstructs the filters, phase 2 compacts the rows (dropping the filter
+    // byte) and swizzles RGBA into the byte order of a little-endian 0xAARRGGBB
+    // word, so the caller can lift the pixels out with one native Buffer.Copy
+    // instead of a per-pixel bytecode loop. Compaction is a forward move -
+    // destination y*rowBytes is always below source y*(rowBytes+1)+1 - so it is
+    // safe in place. bpp is fixed at 4 here, which frees the one scalar
+    // parameter a kernel gets for rowBytes.
+    fn static _rgba8Kernel(b:block, blen:int, rowBytes:int):int {
+        let stride = rowBytes + 1;
+
+        var base = 0;
+        while (base + stride <= blen) {
+            let ftype = b[base] & 0xFF;
+            if (ftype != 0) {
+                let cur = base + 1;
+                let up  = cur - stride;
+                var x = 0;
+                while (x < rowBytes) {
+                    var a = 0;
+                    var bb = 0;
+                    var c = 0;
+                    if (x >= 4) { a = b[cur + x - 4] & 0xFF; }
+                    if (base > 0) { bb = b[up + x] & 0xFF; }
+                    if (x >= 4 && base > 0) { c = b[up + x - 4] & 0xFF; }
+
+                    var add = 0;
+                    if (ftype == 1)      { add = a; }
+                    else if (ftype == 2) { add = bb; }
+                    else if (ftype == 3) { add = (a + bb) >> 1; }
+                    else if (ftype == 4) {
+                        let pp = a + bb - c;
+                        var pa = pp - a;  if (pa < 0) { pa = 0 - pa; }
+                        var pb = pp - bb; if (pb < 0) { pb = 0 - pb; }
+                        var pc = pp - c;  if (pc < 0) { pc = 0 - pc; }
+                        if (pa <= pb && pa <= pc) { add = a; }
+                        else if (pb <= pc)        { add = bb; }
+                        else                      { add = c; }
+                    }
+
+                    b[cur + x] = ((b[cur + x] & 0xFF) + add) & 0xFF;
+                    x = x + 1;
+                }
+            }
+            base = base + stride;
+        }
+
+        var src = 1;
+        var dst = 0;
+        while (src + rowBytes <= blen) {
+            var x = 0;
+            while (x < rowBytes) {
+                let r  = b[src + x] & 0xFF;
+                let g  = b[src + x + 1] & 0xFF;
+                let bl = b[src + x + 2] & 0xFF;
+                let al = b[src + x + 3] & 0xFF;
+                b[dst]     = bl;
+                b[dst + 1] = g;
+                b[dst + 2] = r;
+                b[dst + 3] = al;
+                dst = dst + 4;
+                x = x + 4;
+            }
+            src = src + rowBytes + 1;
+        }
+        return 0;
+    }
+
+    // Expand reconstructed scanlines to 32-bit ARGB words.
+    fn static _expand(raw:block, out:block, w:int, h:int, rowBytes:int,
+                      ct:int, bd:int, plte:block, plteN:int,
+                      trns:block, trnsN:int) {
+        var step = 1;
+        if (bd == 16) { step = 2; }
+
+        var y = 0;
+        while (y < h) {
+            let cur = y * (1 + rowBytes) + 1;
+            let dst = y * w;
+            var x = 0;
+
+            if (ct == 6) {                                   // RGBA
+                while (x < w) {
+                    let s = cur + x * 4 * step;
+                    out[dst + x] = (((raw[s + 3 * step] & 0xFF) << 24) |
+                                    ((raw[s] & 0xFF) << 16) |
+                                    ((raw[s + step] & 0xFF) << 8) |
+                                    (raw[s + 2 * step] & 0xFF));
+                    x = x + 1;
+                }
+            } else if (ct == 2) {                            // RGB
+                while (x < w) {
+                    let s = cur + x * 3 * step;
+                    out[dst + x] = (0xFF000000 |
+                                    ((raw[s] & 0xFF) << 16) |
+                                    ((raw[s + step] & 0xFF) << 8) |
+                                    (raw[s + 2 * step] & 0xFF));
+                    x = x + 1;
+                }
+            } else if (ct == 0) {                            // grayscale
+                while (x < w) {
+                    let g = Png._gray8(Png._samp(raw, cur, x, bd), bd);
+                    out[dst + x] = (0xFF000000 | (g << 16) | (g << 8) | g);
+                    x = x + 1;
+                }
+            } else if (ct == 4) {                            // grayscale + alpha
+                while (x < w) {
+                    let s = cur + x * 2 * step;
+                    let g = raw[s] & 0xFF;
+                    let a = raw[s + step] & 0xFF;
+                    out[dst + x] = ((a << 24) | (g << 16) | (g << 8) | g);
+                    x = x + 1;
+                }
+            } else if (ct == 3) {                            // palette (+tRNS)
+                while (x < w) {
+                    var idx = Png._samp(raw, cur, x, bd);
+                    if (idx >= plteN) { idx = 0; }
+                    var a = 255;
+                    if (idx < trnsN) { a = trns[idx] & 0xFF; }
+                    out[dst + x] = ((a << 24) |
+                                    ((plte[idx * 3] & 0xFF) << 16) |
+                                    ((plte[idx * 3 + 1] & 0xFF) << 8) |
+                                    (plte[idx * 3 + 2] & 0xFF));
+                    x = x + 1;
+                }
+            }
+            y = y + 1;
+        }
+        return;
+    }
+
+    // ----------------------------------------------------------------
+    // Encode
+    // ----------------------------------------------------------------
+
+    // Encode(pixels:block, w:int, h:int, opts?:object) -> block of PNG bytes,
+    // or nil. `pixels` holds w*h 32-bit 0xAARRGGBB words. `opts.filter` selects
+    // Png.FilterAdaptive() (default) or Png.FilterNone().
+    fn static Encode(pixels:block, w:int, h:int, opts:object|nil) : block|nil {
+        if (pixels == nil) { return nil; }
+        if (w <= 0 || h <= 0) { return nil; }
+        if (w > Png.MaxDim() || h > Png.MaxDim()) { return nil; }
+        if (len(pixels) < w * h) { return nil; }
+
+        var strategy = Png.FilterAdaptive();
+        if (opts != nil && opts.filter != nil) { strategy = opts.filter; }
+
+        let rowBytes = w * 4;
+        let raw = Buffer.Create(h * (1 + rowBytes), 1);
+        if (raw == nil) { return nil; }
+
+        if (strategy == Png.FilterNone()) {
+            Png._rowsUnfiltered(pixels, raw, w, h, rowBytes);
+        } else {
+            Png._rowsAdaptive(pixels, raw, w, h, rowBytes);
+        }
+
+        let comp = Compress.Zip(raw, 6);
+        if (comp == nil) { return nil; }
+        let clen = len(comp);
+
+        // sig(8) + IHDR(12+13) + IDAT(12+clen) + IEND(12)
+        let total = 8 + 25 + 12 + clen + 12;
+        let out = Buffer.Create(total, 1);
+        if (out == nil) { return nil; }
+
+        out[0] = 137; out[1] = 80; out[2] = 78; out[3] = 71;
+        out[4] = 13;  out[5] = 10; out[6] = 26; out[7] = 10;
+        var at = 8;
+
+        let ihdr = Buffer.Create(13, 1);
+        Png._put32(ihdr, 0, w);
+        Png._put32(ihdr, 4, h);
+        ihdr[8]  = 8;   // bit depth
+        ihdr[9]  = 6;   // colour type: RGBA
+        ihdr[10] = 0;   // compression: deflate
+        ihdr[11] = 0;   // filter method: adaptive
+        ihdr[12] = 0;   // interlace: none
+        at = Png._chunk(out, at, "IHDR", ihdr, 13);
+        at = Png._chunk(out, at, "IDAT", comp, clen);
+        at = Png._chunk(out, at, "IEND", nil, 0);
+
+        return out;
+    }
+
+    // Save(path, pixels, w, h, opts?) -> bool
+    fn static Save(path:string, pixels:block, w:int, h:int, opts:object|nil) : bool {
+        let bytes = Png.Encode(pixels, w, h, opts);
+        if (bytes == nil) { return false; }
+        return File.WriteAllBytes(path, bytes);
+    }
+
+    // Write one chunk (length, type, data, CRC) at `at`; returns the new offset.
+    // The CRC covers type+data, so both are staged in one block and handed to
+    // the native Hash.Crc32.
+    fn static _chunk(out:block, at:int, tag:string, data:block, dlen:int) : int {
+        Png._put32(out, at, dlen);
+        let tb = Buffer.FromString(tag);
+        let crcSrc = Buffer.Create(4 + dlen, 1);
+        Buffer.Copy(tb, 0, crcSrc, 0, 4);
+        if (dlen > 0) { Buffer.Copy(data, 0, crcSrc, 4, dlen); }
+        Buffer.Copy(crcSrc, 0, out, at + 4, 4 + dlen);
+        Png._put32(out, at + 8 + dlen, Hash.Crc32(crcSrc));
+        return at + 12 + dlen;
+    }
+
+    // Filter 0 for every row: straight ARGB -> RGBA byte order, no prediction.
+    fn static _rowsUnfiltered(px:block, raw:block, w:int, h:int, rowBytes:int) {
+        var y = 0;
+        while (y < h) {
+            let base = y * (1 + rowBytes);
+            raw[base] = 0;
+            let cur = base + 1;
+            let src = y * w;
+            var x = 0;
+            while (x < w) {
+                let v = px[src + x];
+                let o = cur + x * 4;
+                raw[o]     = (v >> 16) & 0xFF;
+                raw[o + 1] = (v >> 8) & 0xFF;
+                raw[o + 2] = v & 0xFF;
+                raw[o + 3] = (v >> 24) & 0xFF;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        return;
+    }
+
+    // Per-row filter selection. Each row is filtered five ways; the candidate
+    // with the smallest sum of absolute signed deviations wins, which is the
+    // heuristic the PNG spec recommends and what every real encoder uses.
+    fn static _rowsAdaptive(px:block, raw:block, w:int, h:int, rowBytes:int) {
+        let line = Buffer.Create(rowBytes, 1);   // this row, unfiltered RGBA
+        let prev = Buffer.Create(rowBytes, 1);   // previous row, unfiltered
+        let cand = Buffer.Create(rowBytes, 1);   // candidate under test
+        let best = Buffer.Create(rowBytes, 1);   // best candidate so far
+
+        var y = 0;
+        while (y < h) {
+            let src = y * w;
+            var x = 0;
+            while (x < w) {
+                let v = px[src + x];
+                let o = x * 4;
+                line[o]     = (v >> 16) & 0xFF;
+                line[o + 1] = (v >> 8) & 0xFF;
+                line[o + 2] = v & 0xFF;
+                line[o + 3] = (v >> 24) & 0xFF;
+                x = x + 1;
+            }
+
+            var bestType = 0;
+            var bestScore = -1;
+
+            var f = 0;
+            while (f < 5) {
+                var score = 0;
+                var i = 0;
+                while (i < rowBytes) {
+                    let cv = line[i] & 0xFF;
+                    var a = 0;
+                    var b = 0;
+                    var c = 0;
+                    if (i >= 4) { a = line[i - 4] & 0xFF; }
+                    if (y > 0)  { b = prev[i] & 0xFF; }
+                    if (i >= 4 && y > 0) { c = prev[i - 4] & 0xFF; }
+
+                    var pred = 0;
+                    if (f == 1)      { pred = a; }
+                    else if (f == 2) { pred = b; }
+                    else if (f == 3) { pred = (a + b) >> 1; }
+                    else if (f == 4) {
+                        let pp = a + b - c;
+                        var pa = pp - a; if (pa < 0) { pa = 0 - pa; }
+                        var pb = pp - b; if (pb < 0) { pb = 0 - pb; }
+                        var pc = pp - c; if (pc < 0) { pc = 0 - pc; }
+                        if (pa <= pb && pa <= pc) { pred = a; }
+                        else if (pb <= pc)        { pred = b; }
+                        else                      { pred = c; }
+                    }
+
+                    let d = (cv - pred) & 0xFF;
+                    cand[i] = d;
+                    // Sum of absolute deviations, bytes read as signed.
+                    if (d < 128) { score = score + d; } else { score = score + (256 - d); }
+                    i = i + 1;
+                }
+
+                if (bestScore < 0 || score < bestScore) {
+                    bestScore = score;
+                    bestType = f;
+                    Buffer.Copy(cand, 0, best, 0, rowBytes);
+                }
+                f = f + 1;
+            }
+
+            let base = y * (1 + rowBytes);
+            raw[base] = bestType;
+            Buffer.Copy(best, 0, raw, base + 1, rowBytes);
+            Buffer.Copy(line, 0, prev, 0, rowBytes);
+            y = y + 1;
+        }
+        return;
+    }
+}
+
+export { Png };

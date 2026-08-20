@@ -1507,9 +1507,7 @@ Each function table has a `JIT` column stating whether the function can be calle
 | | `Stream` | Unified I/O for files, sockets, and serial ports |
 | | `Console` | Terminal I/O, color, and cursor control |
 | | `FileWatch` | Watch file-states on files and callbacks |
-| **Networking** | `HttpUtil` | URL/query/header helpers and a minimal HTTP server; the HTTP *client* is the `Http` library (`Http.fls`) |
-| | `Tls` | Built-in TLS byte transport (OS-native: Secure Transport / OpenSSL / SChannel) |
-| | `Net` | DNS, IP conversion, and interface inspection |
+| **Networking** | `Net` | DNS, IP conversion, and interface inspection |
 | **Concurrency** | `Fiber` | Green-thread creation, messaging, and lifecycle |
 | | `Event` | One-shot fiber synchronization (max 64 events) |
 | | `Scheduler` | Low-level fiber scheduling primitives |
@@ -2591,51 +2589,6 @@ Non-cryptographic and cryptographic hashes. Input accepts `string` or `block`. M
 
 ---
 
-### HttpUtil
-
-Namespace: **`HttpUtil`**
-
-Small HTTP-utility functions, plus minimal HTTP server. For HTTP-functionality (GET, PUT etc) use the Http-library from Http.fls (shipped as standard-library with source)
-
-```js
-import { Http, Status, ContentType } from library("Http", "1.0");
-```
-
-| Function | Signature | Description | JIT |
-| ---------- | ----------- | ------------- | --- |
-| **EncodeQuery** | `EncodeQuery(params:object) - string` | Encode object as URL query string (form-urlencoded; `+` for space). String/int/bool/float values; other value types skipped. | — |
-| **UrlEncode** | `UrlEncode(s:string) - string` | Percent-encode a string (RFC 3986, `%20` for space). `nil` for a non-string arg. | — |
-| **UrlDecode** | `UrlDecode(s:string) - string` | Decode a percent-encoded string (treats `+` as space). Malformed `%XX` is left literal. | — |
-| **ParseQuery** | `ParseQuery(s:string) - object` | Parse a query string into an object (percent-decoded, `+` as space). Keys that decode to empty are skipped. | — |
-| **ParseUrl** | `ParseUrl(url:string) - object` | Parse a URL into `{ scheme, host, port, path, query, fragment }`. Handles a missing scheme (defaults to `http`), no port (80/443 by scheme), IPv6 literals (`[::1]:9000`), no path (defaults to `/`), the query, and a `#fragment`. `nil` for an empty/`nil` arg. Userinfo (`user:pass@`) is not parsed. | — |
-| **ParseHeaders** | `ParseHeaders(s:string) - object` | Parse a CRLF-delimited header block (no status line) into an object. Keys are **lowercased** for consistent lookup; leading spaces/tabs are trimmed from values. Over-long lines and lines past the internal cap are skipped. | — |
-| **DecodeChunked** | `DecodeChunked(stream:stream) - block` | Read HTTP/1.1 chunked transfer-encoding from a stream and return the decoded bytes as a block. Chunk extensions and trailers are ignored. Bounded by the internal response-size cap. `nil` for a non-stream arg. | — |
-
-**HTTP Server (requires `--unsafe`):**
-
-| Function | Signature | Description | JIT |
-| ---------- | ----------- | ------------- | --- |
-| **StartServer** | `StartServer(port:int, handler:fn) - pointer` | Start server; `handler(request)-response`. Returns server handle. | — |
-| **HandleRequests** | `HandleRequests(handle:pointer) - bool` | Process one pending request. Call in a loop. | — |
-| **WaitReadable** | `WaitReadable(handle:pointer, timeoutMs?:int) - bool` | Park the calling fiber until the listen socket has a pending connection. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Callable from a plain function — no `await` needed. | — |
-| **StopServer** | `StopServer(handle:pointer) - bool` | Shutdown server. | — |
-| **RouteMatch** | `RouteMatch(req:object, method:string, pattern:string) - bool` | Match `req` (using its `method` and `path`) against the given method + URL pattern. On match, captured path parameters are written into `req.params`. | — |
-
-**Response object** (returned by the handler): `{ status:int, body, headers:object }`.
-
-- All entries in `headers` are emitted (e.g. `Access-Control-Allow-Origin`, `Location`, `Set-Cookie`, `Cache-Control`). Header names and values are validated to block CRLF injection; `Content-Type`, `Content-Length` and `Connection` are managed by the server and skipped if present.
-- `body` may be a **string** or a **block** (bytes). When a block is used, `Content-Length` is the exact byte count, so binary payloads with embedded NUL bytes (e.g. `File.ReadAllBytes` for static assets) are sent intact.
-- The status line uses the standard reason phrase for the given `status` (e.g. `404 Not Found`), falling back to a per-class generic.
-- For a `HEAD` request the server sends the status line and headers (including the entity's `Content-Length`) but **no body**.
-
-**Server behaviour / limits:**
-
-- Each connection is served then closed (`Connection: close`); there is no keep-alive, HTTP/2, or TLS — for HTTPS put the server behind a TLS-terminating reverse proxy. This is the intended "minimal server" scope; the HTTP *client* (GET/POST/redirects) lives in `Http.fls`.
-- On POSIX the listen socket sets `SO_REUSEADDR`, so a restarted server can rebind the port immediately instead of failing during the previous socket's `TIME_WAIT` window.
-- Request intake is bounded (max total size, header count, header/line length) and has both a per-`recv` timeout and a **total wall-clock deadline**, so a slow client cannot hold the single-threaded server open indefinitely.
-
-**Route patterns:** `:name` captures a single segment into `params.name`. A trailing `*` is a catch-all matching the remaining path; the matched tail is captured into `params["*"]` (used by `Router.Static`).
-
 ### Json
 
 Namespace: **`Json`**
@@ -3371,18 +3324,79 @@ Namespace: **`Stream`**
 
 Unified I/O for files, network sockets, pipes, and serial ports. All functions operate on a `stream` value backed by a file descriptor.
 
+**TLS streams.** `ConnectTls` and `AcceptTls` return an ordinary `stream` whose bytes happen to be encrypted, so every function below works over TLS and any Stream-based library runs unchanged — there is no separate TLS API to port to. TLS comes from the OS stack (macOS Secure Transport, Linux OpenSSL via `dlopen`, Windows SChannel) and the system trust store; certificates and hostnames are verified by default (TLS >= 1.2).
+
+Four operations behave differently on a TLS stream, because a TLS session is a byte conversation with no file offset:
+
+| Operation | On a TLS stream |
+| --------- | --------------- |
+| `Seek` / `Tell` / `Size` / `Truncate` | refused (`false`/`nil`) - there is no offset to move |
+| `Accept` | `nil` - a TLS session is a connection, not a listener |
+| `Flush` | no-op returning `true` - nothing is buffered locally |
+| `Peek` | reads **decrypted** bytes, never ciphertext |
+| `SendFile` | falls back to a read/encrypt/write loop; the kernel zero-copy path cannot encrypt |
+
+`PeerAddr`, `LocalAddr`, `SetNoDelay`, `SetKeepAlive` and `Shutdown` transparently reach the underlying socket.
+
+**Server credentials** depend on the platform backend, because each OS TLS stack accepts a different form:
+
+| Platform | Backend | `{ certFile, keyFile }` (PEM) | `{ pkcs12File, password }` |
+| -------- | ------- | ----------------------------- | -------------------------- |
+| Linux / POSIX | OpenSSL | ✅ full chain via `certFile` | ✅ |
+| macOS | Secure Transport | ❌ | ✅ |
+| Windows | SChannel | ❌ | ✅ |
+
+PKCS#12 is therefore the portable choice; handing a PEM pair to macOS or Windows fails with the exact conversion command:
+
+```sh
+openssl pkcs12 -export -out server.p12 -inkey privkey.pem -in fullchain.pem
+```
+
+On macOS 15 and later the bundle is imported to process memory only, so a server
+running as a daemon (no `HOME`, no logged-in user) needs no keychain. On earlier
+macOS `SecPKCS12Import` still requires an accessible login keychain.
+
+⚠️ **The handshake is blocking.** Like every synchronous call here it parks *all* fibers until it completes, so on a public listener keep `handshakeTimeoutMs` tight (the 10 s default is generous) — one client that connects and says nothing holds the VM for that long. Reads and writes *after* the handshake have the usual `*Async` twins and suspend only the calling fiber.
+
+```flaris
+// Client - an ordinary stream, encrypted.
+let s = Stream.ConnectTls("api.example.com", 443);
+Stream.WriteString(s, "GET / HTTP/1.0\r\nHost: api.example.com\r\n\r\n");
+Console.WriteLine(Stream.ReadLine(s));
+Stream.Close(s);
+
+// Server - the ordinary accept loop, one extra line.
+let srv = Stream.Listen("tcp", 8443);
+while (true) {
+    Stream.WaitReadable(srv);
+    let sock = Stream.Accept(srv);
+    if (sock == nil) { continue; }
+    // Takes ownership of `sock` - do not Close it.
+    let tls = Stream.AcceptTls(sock, { pkcs12File: "server.p12", password: "secret" });
+    if (tls == nil) { Console.Error(Stream.TlsLastError()); continue; }
+    Stream.WriteString(tls, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+    Stream.Close(tls);
+}
+```
+
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Accept** | `Accept(s:stream) - stream` | Accept an incoming connection on a listening socket. Returns `nil` if no connection is pending. | — |
 | **Close** | `Close(s:stream) - bool` | Close the stream. Flushes first. | — |
 | **Connect** | `Connect(proto:string, host:string, port:int) - stream` | Open socket. `proto`: `"tcp"` or `"udp"`. `host`: hostname or IP (v4/v6). Returns `nil` on failure. | — |
 | **ConnectAsync** | `ConnectAsync(proto:string, host:string, port:int) - fiber` | Non-blocking `Connect`: the DNS lookup and TCP handshake are offloaded to the io pool, so the fiber suspends instead of stalling the VM. Use with `await`; resolves to a socket stream, or `nil` on failure. Raises on a bad `proto`/`port`. | — |
+| **AcceptTls** | `AcceptTls(s:stream, options:object) - stream` | Terminate TLS on a socket `Accept` already returned; the result is an ordinary stream. **Takes ownership of `s`** - it is detached either way, so never `Close` it afterwards. `options`: `pkcs12File` + `password` (all platforms) or `certFile` + `keyFile` (PEM, OpenSSL only); `handshakeTimeoutMs` (default 10000) bounds the handshake *and* every later read/write; `requireClientCert` demands a client certificate, validated against the system trust store. `nil` on failure - reason via `TlsLastError()`. | — |
+| **ConnectTlsAsync** | `ConnectTlsAsync(host:string, port:int, options?:object) - fiber` | Async `ConnectTls`: DNS, the TCP handshake **and** the TLS handshake run on the I/O pool, so only the calling fiber suspends. `await` resolves to a stream, or `nil` on failure. Same `options` as `ConnectTls`. Prefer this in any client that must stay responsive - a TLS handshake is far more expensive than a plain connect. | — |
+| **ConnectTls** | `ConnectTls(host:string, port:int, options?:object) - stream` | Open a TLS connection as an ordinary stream. `options`: `insecure` skips certificate/hostname verification (trusted hosts only), `timeoutMs` (default 30000) bounds the connect and each later read/write, `sni` overrides the name sent and verified against the certificate. `nil` on failure - reason via `TlsLastError()`. | — |
 | **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy data from `src` to `dst`. Optional byte limit. | — |
 | **Flush** | `Flush(s:stream) - bool` | Flush write buffer (`fsync` for files, `tcdrain` for serial, no-op for sockets). | — |
 | **IsOpen** | `IsOpen(s:stream) - bool` | `true` if stream is still open. | — |
 | **LastError** | `LastError() - int` | Why the calling fiber's most recent async operation (`ReadAsync`, `WriteAsync`, `WaitReadable`) resolved to `nil`. `0` = it succeeded, so a `nil` with `LastError() == 0` means a clean end-of-file, not a failure. Per-fiber, so concurrent fibers never overwrite each other's reason. Codes: `1` timeout, `2` stream closed/invalid, `3` connection reset, `4` read exceeded the maximum block size, `5` descriptor cannot be multiplexed, `6` other OS error, `7` cancelled by `Fiber.CancelIo`. | — |
 | **Listen** | `Listen(proto:string, port:int, backlog?:int) - stream` | Create a listening socket. `proto`: `"tcp"` or `"udp"`. Binds a dual-stack IPv6 socket (`IPV6_V6ONLY=0`, so IPv4 clients connect too) and falls back to IPv4-only if v6 is unavailable. Sets `SO_REUSEADDR` and `SO_REUSEPORT`. `backlog` defaults to `128`. | — |
 | **LocalAddr** | `LocalAddr(s:stream) - string` | Local endpoint of a socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
+| **TlsLastError** | `TlsLastError() - string\|nil` | Why the last `ConnectTls`/`AcceptTls` failed (bad certificate, wrong password, handshake refused). Distinct from `LastError()`, which reports an integer io-error code: a TLS setup failure is a message with no errno. `nil` if none. | — |
+| **TlsPeerCert** | `TlsPeerCert(s:stream) - object\|nil` | The peer's leaf certificate as `{ sha256, subject }` (`sha256` = lowercase hex fingerprint of the DER cert). Use for pinning / trust-on-first-use. `nil` for a non-TLS stream or when unavailable. | — |
+| **TlsServerAvailable** | `TlsServerAvailable() - bool` | `true` if this build can terminate TLS (`AcceptTls`). Narrower than having TLS at all: an old or stripped `libssl` may support clients but not servers. | — |
 | **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), or `"rw"` (read-write/create). Returns `nil` on failure. | — |
 | **OpenSerial** | `OpenSerial(port:string, baud:int) - stream` | Open serial port in raw mode. Valid baud rates: `9600`, `19200`, `38400`, `57600`, `115200`. | — |
 | **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it. Sockets use `MSG_PEEK`; files read one byte and rewind. Returns `nil` at EOF, on error, or for a pipe/serial stream (which have no non-destructive read). | — |
@@ -3550,44 +3564,6 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **Utf8Substr** | `Utf8Substr(s:string, cpStart:int, cpLen:int) - string` | Substring by codepoint indices. | ✓ owned¹ |
 | **Utf8ToLower** | `Utf8ToLower(s:string) - string` | Unicode-aware lowercase: `Utf8ToLower("ÅÄÖ")` is `"åäö"`, where the ASCII-only `ToLower` leaves it unchanged. Uses the same tables as `Char.ToLower`; uncased codepoints pass through. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
 | **Utf8ToUpper** | `Utf8ToUpper(s:string) - string` | Unicode-aware uppercase: `Utf8ToUpper("åäö")` is `"ÅÄÖ"`. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
-
----
-
-### Tls
-
-Namespace: **`Tls`**
-
-Built-in TLS byte transport - the encrypted counterpart to the TCP side of `Stream`, and the transport beneath the `Https` library (most code should use `Https`). TLS comes from the OS stack (macOS Secure Transport, Linux OpenSSL via `dlopen`, Windows SChannel) and the system trust store. Certificates and hostnames are verified by default (TLS >= 1.2); connections are opaque `int` handles from a generation-tagged table, so a stale or forged handle is rejected rather than dereferenced.
-
-The synchronous calls are **blocking**: because the VM is cooperative single-threaded, a read or write on a slow peer parks every fiber until data arrives or the timeout fires. A recv timeout is reported through `LastError` (the read returns what it has, or `nil`), so on a stalled connection check `LastError` rather than trusting an early EOF. Buffered reads are bounded (`ReadLine` ≤ 1 MB per line, `ReadAll` ≤ 256 MB) so a hostile peer cannot exhaust memory.
-
-Up to 512 socket/stream operations may be in flight at once (one per parked fiber); past that a further `*Async` call raises `OutOfMemory`. Descriptor numbers are unrestricted — the pump uses `select()` while every descriptor fits its table and switches to `poll()` automatically when one does not, so a process holding thousands of files can still do async I/O.
-
-For concurrency each call has an `*Async` twin (`ConnectAsync`, `WriteAsync`, `ReadLineAsync`, `ReadNAsync`, `ReadAllAsync`) that offloads the blocking work to the I/O thread pool and suspends only the calling fiber - other fibers keep running. The pool queues up to 256 jobs; beyond that a submission runs inline on the VM thread, which still produces the right answer but stalls the scheduler for the duration. `--stats` reports how often that happened, and `--io-threads=<n>` raises the worker count. `await` the result. Only one async op may be in flight per handle, and a handle must not be `Close`d or reused until its async op resolves.
-
-**Certificate pinning** (trust-on-first-use): after `Connect`, compare the peer fingerprint against a known value and drop the connection on mismatch.
-
-```flaris
-let h = Tls.Connect("api.example.com", 443);
-if (h != 0 && Tls.PeerCert(h).sha256 != PINNED_SHA256) { Tls.Close(h); h = 0; }
-```
-
-| Function | Signature | Description | JIT |
-| -------- | --------- | ----------- | --- |
-| **Available** | `Available() - bool` | `true` if a TLS backend is compiled in and usable (on Linux, also that `libssl` loaded at runtime). | — |
-| **Connect** | `Connect(host:string, port:int, insecure?:bool, timeoutMs?:int, options?:object) - int` | Open a TLS connection; returns a handle, or `0` on failure. `insecure=true` skips certificate/hostname verification (trusted hosts only). `timeoutMs` (default 30000; `0`/negative is treated as the default) bounds the TCP connect; `options.readTimeoutMs` overrides the per-read/write timeout. `options.sni` overrides the SNI name sent and verified against the certificate (default: `host`) - useful when connecting to an IP but validating a hostname. | — |
-| **PeerCert** | `PeerCert(h:int) - object\|nil` | The peer's leaf certificate as `{ sha256: string, subject: string }` (`sha256` = lowercase hex fingerprint of the DER cert). Use for pinning / trust-on-first-use. `nil` if unavailable. | — |
-| **Write** | `Write(h:int, data:string) - int` | Encrypt and send all bytes; returns bytes written, or `-1` on error. | — |
-| **ReadLine** | `ReadLine(h:int) - string\|nil` | Read one CRLF/LF-terminated line, terminator stripped; `nil` at EOF. A single line is capped at 1 MB - a longer unterminated line returns `nil` with the reason in `LastError`. | — |
-| **ReadN** | `ReadN(h:int, n:int) - string` | Read exactly `n` bytes (fewer only at EOF). Binary-safe. | — |
-| **ReadAll** | `ReadAll(h:int) - string` | Read until the peer closes the connection. Capped at 256 MB - a larger stream returns `nil` with the reason in `LastError`. | — |
-| **Close** | `Close(h:int) - bool` | Close the connection and free the handle. | — |
-| **LastError** | `LastError(h:int) - string\|nil` | Last error message for the handle, or `nil`. | — |
-| **ConnectAsync** | `ConnectAsync(host, port, insecure?, timeoutMs?) - fiber` | Async `Connect`; `await` resolves to the handle (or `0`). Suspends only the caller. | — |
-| **WriteAsync** | `WriteAsync(h:int, data:string) - fiber` | Async `Write`; `await` resolves to bytes written (or `-1`). | — |
-| **ReadLineAsync** | `ReadLineAsync(h:int) - fiber` | Async `ReadLine`; `await` resolves to the line (or `nil`). | — |
-| **ReadNAsync** | `ReadNAsync(h:int, n:int) - fiber` | Async `ReadN`; `await` resolves to the bytes (or `nil`). | — |
-| **ReadAllAsync** | `ReadAllAsync(h:int) - fiber` | Async `ReadAll`; `await` resolves to the body (or `nil`). | — |
 
 ---
 

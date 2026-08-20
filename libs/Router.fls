@@ -2,8 +2,6 @@
 // Router.fls - HTTP server router with middleware pipeline for Flaris.
 // Version: 1.0
 //
-// Requires -u (unsafe) flag.
-//
 // Exports:
 //   Router              - HTTP router (register routes, run server)
 //   Response            - static response builder helpers
@@ -85,6 +83,7 @@
 //   JwtSign(payload, secret, expirySecs)  →  token string
 // =============================================================================
 
+import { HttpServer } from library("HttpServer", "1.0");
 import { Jwt } from library("Jwt", "1.0");
 import { Logger } from library("Logger", "1.0");
 
@@ -268,11 +267,86 @@ class Router
 
     // ---- dispatch ----
 
+    // Match req.method/req.path against a pattern. ':name' captures into
+    // req.params and a terminal '*' takes the rest. `req` may be a plain object
+    // or a request instance.
+    // HTTP header names are case-insensitive, but a plain object lookup is not.
+    // The parser lowercases keys while handlers conventionally write
+    // req.headers["Authorization"], so expose both spellings.
+    fn _canonHeaders(src): object {
+        let out = {};
+        if (src == nil) { return out; }
+        let keys = Object.Keys(src);
+        let i:int = 0;
+        while (i < len(keys)) {
+            let k: string = keys[i];
+            let v = src[k];
+            out[k] = v;
+            // "content-type" -> "Content-Type"
+            let parts: array = String.Split(k, "-");
+            let canon: string = "";
+            let j:int = 0;
+            while (j < len(parts)) {
+                let p: string = parts[j];
+                if (String.Length(p) > 0) {
+                    p = String.ToUpper(String.Left(p, 1)) +
+                        String.Substr(p, 1, String.Length(p) - 1);
+                }
+                canon = (j == 0) ? p : canon + "-" + p;
+                j += 1;
+            }
+            out[canon] = v;
+            i += 1;
+        }
+        return out;
+    }
+
+    fn _routeMatch(req, method: string, pattern: string): bool {
+        if (req == nil || req.method == nil || req.path == nil) { return false; }
+        if (req.method != method) { return false; }
+
+        let pat: array  = String.Split(pattern, "/");
+        let path: array = String.Split(req.path, "/");
+        let params = {};
+        let pi: int = 0;
+        let ri: int = 0;
+
+        while (pi < len(pat)) {
+            let pseg: string = pat[pi];
+            if (String.Length(pseg) == 0) { pi += 1; continue; }
+            while (ri < len(path) && String.Length(path[ri]) == 0) { ri += 1; }
+
+            if (pseg == "*") {
+                let rest: string = "";
+                while (ri < len(path)) {
+                    if (String.Length(rest) > 0) { rest = rest + "/"; }
+                    rest = rest + path[ri];
+                    ri += 1;
+                }
+                params["*"] = rest;
+                req.params = params;
+                return true;
+            }
+            if (ri >= len(path)) { return false; }
+            if (String.CharAt(pseg, 0) == ':') {
+                params[String.Substr(pseg, 1, String.Length(pseg) - 1)] = path[ri];
+            } else if (pseg != path[ri]) {
+                return false;
+            }
+            pi += 1;
+            ri += 1;
+        }
+        while (ri < len(path) && String.Length(path[ri]) == 0) { ri += 1; }
+        if (ri < len(path)) { return false; }
+        req.params = params;
+        return true;
+    }
+
     fn _dispatch(req) {
         let i:int = 0;
         while (i < len(_routes)) {
             let route = _routes[i];
-            if (HttpUtil.RouteMatch(req, route.method, route.pattern)) {
+            if (this._routeMatch(req, route.method, route.pattern)) {
                 let chain    = this._buildChain(route.middleware);
                 let pipeline = new _Pipeline(chain, route.handler);
                 return pipeline.Run(req);
@@ -294,32 +368,60 @@ class Router
 
     // ---- server loop ----
 
+    // Serves on HttpServer. Every request arrives through OnRequest, so Router
+    // owns dispatch, middleware and 404 handling.
     fn Listen(port:int) {
         Console.WriteLine("Router listening on port ", port);
-        this._server = HttpUtil.StartServer(port, fn(req) {
-            return this._dispatch(req);
+        let srv = new HttpServer({ port: port });
+        this._server = srv;
+        this._running = true;
+
+        srv.OnError(fn(req, res, e) {
+            Console.Error("Router: handler error: ", e);
+        });
+        srv.OnRequest(fn(req, res) {
+            // Handlers and middleware receive a plain request object whose
+            // `body` is a string.
+            let plain = {
+                method:  req.method,
+                path:    req.path,
+                rawPath: req.rawPath,
+                query:   req.query,
+                headers: this._canonHeaders(req.headers),
+                params:  {},
+                body:    req.Text()
+            };
+            let r = this._dispatch(plain);
+            if (r == nil) {
+                res.Status(500).Text("Internal Server Error");
+                return;
+            }
+            // Headers first: _send only supplies a Content-Type when none is
+            // set, so the handler's own choice survives.
+            let hdrs = r.headers ?? {};
+            let keys = Object.Keys(hdrs);
+            let i:int = 0;
+            while (i < len(keys)) {
+                res.Header(keys[i], hdrs[keys[i]]);
+                i += 1;
+            }
+            // A handler may return a block (static files, images) or a string.
+            let body = r.body ?? "";
+            if (Type.Is(body, Type.Block)) {
+                res.Bytes(body, nil, r.status ?? 200);
+            } else {
+                res.Text(body, r.status ?? 200);
+            }
         });
 
-        if (this._server == nil) {
-            Console.WriteLine("StartServer failed - port in use or bad handler type");
-            return;
-        }
-
-        this._running = true;
-        while (this._running) {
-            HttpUtil.WaitReadable(this._server, -1);
-            var more = true;
-            while (more) {
-                more = this._server != nil && HttpUtil.HandleRequests(this._server);
-            }
-        }
+        srv.Listen();
     }
 
     fn Stop() {
         Console.WriteLine("Router stopping...");
         this._running = false;
         if (this._server != nil) {
-            HttpUtil.StopServer(this._server);
+            this._server.Stop();
             this._server = nil;
         }
     }

@@ -1,9 +1,9 @@
-// WebSocket.fls - WebSocket client for Flaris. Requires -u flag.
+// WebSocket.fls - WebSocket client for Flaris. Requires --unsafe flag.
 // Version: 1.0
 //
 // Implements RFC 6455 client-side handshake and framing.
 // Supports text and binary frames, ping/pong, clean close, and ws:// + wss://
-// (wss:// uses the built-in Tls module - OS-native TLS, no extra setup).
+// (wss:// uses the OS-native TLS in Stream.ConnectTls - no extra setup).
 // Limitations: no fragmentation, no compression.
 //
 // Usage:
@@ -25,7 +25,7 @@
 //   WebSocket.ConnectUrl(url, extraHeaders?)  →  instance   - "ws://..." or "wss://..."
 //   - path defaults to "/"; secure=true upgrades the transport to TLS (wss://)
 //   - extraHeaders is an optional object: { "Authorization": "Bearer ..." }
-//   wss:// runs over the built-in Tls module (no plugin); -u is still required
+//   wss:// runs over Stream.ConnectTls (no plugin); --unsafe is still required
 //   because the framing uses the Memory module.
 //
 // Sending:
@@ -37,6 +37,10 @@
 //   Receive()            →  { opcode:int, data:string|block, isBinary:bool } or nil
 //   ReceiveText()        →  string or nil  - expects text frame
 //   ReceiveJson()        →  parsed object or nil
+//   ReceiveWhenReady(timeoutMs?)     →  message or nil on timeout - suspends
+//                                        only the calling fiber, so other
+//                                        fibers keep running while it waits
+//   ReceiveTextWhenReady(timeoutMs?) →  string or nil on timeout
 //
 // Control:
 //   Ping(data?)          →  bool
@@ -106,12 +110,12 @@ class Ws {
         return String.Join(lines, "\r\n") + "\r\n\r\n";
     }
 
-    fn static ReadHttpHeaders(tr): object {
-        let statusLine = tr.readLine();
+    fn static ReadHttpHeaders(sock: stream): object {
+        let statusLine = Stream.ReadLine(sock);
         let headers = { _statusLine: statusLine };
 
         while (true) {
-            let line = tr.readLine();
+            let line = Stream.ReadLine(sock);
             if (line == nil || line == "") break;
 
             let kv = Ws.ParseHeaderLine(line);
@@ -223,37 +227,6 @@ class Ws {
     // --------------------------------------------------------
     //  Transport abstraction
     // --------------------------------------------------------
-    // The handshake and framing code talks to one of these instead of Stream
-    // directly, so the same logic runs over plain TCP (ws://) or TLS (wss://).
-    // Shape: { secure, writeStr(s)->bool, writeBlock(b)->bool, readLine()->str|nil,
-    //          readBytes(n)->block|nil, isOpen()->bool, close()->bool }.
-
-    // Plain TCP transport over a Stream socket.
-    fn static _plainTransport(s): object {
-        return {
-            secure:     false,
-            writeStr:   fn(data) { return Stream.WriteString(s, data); },
-            writeBlock: fn(blk)  { return Stream.WriteAll(s, blk); },
-            readLine:   fn()     { return Stream.ReadLine(s); },
-            readBytes:  fn(n)    { return Stream.ReadBytes(s, n); },
-            isOpen:     fn()     { return Stream.IsOpen(s); },
-            close:      fn()     { return Stream.Close(s); }
-        };
-    }
-
-    // TLS transport over a built-in Tls handle. Tls works in strings, so blocks
-    // are bridged via Buffer.ToString / Buffer.FromString (both binary-safe).
-    fn static _tlsTransport(h): object {
-        return {
-            secure:     true,
-            writeStr:   fn(data) { return Tls.Write(h, data) != -1; },
-            writeBlock: fn(blk)  { return Tls.Write(h, Buffer.ToString(blk)) != -1; },
-            readLine:   fn()     { return Tls.ReadLine(h); },
-            readBytes:  fn(n)    { let str = Tls.ReadN(h, n); return (str == nil) ? nil : Buffer.FromString(str); },
-            isOpen:     fn()     { return true; },   // Tls has no IsOpen; logical state tracked via .closed
-            close:      fn()     { return Tls.Close(h); }
-        };
-    }
 }
 
 class WebSocketClient {
@@ -261,43 +234,43 @@ class WebSocketClient {
     let path = nil; 
     let port = nil; 
     let secure = nil; 
-    let tr = nil; 
+    let sock = nil; 
     let closeCode = 0; 
     let closeReason: string = nil; 
     let closed = nil; 
     fn static Connect(host: string, port: int, path, headers, secure): instance {
-        let tr = nil;
+        // wss:// and ws:// differ only in how the stream is opened; the framing
+        // below is identical for both.
+        let sock = nil;
         if (secure == true) {
-            // Built-in TLS (Tls module): verified handshake, 5 s connect timeout.
-            let h = Tls.Connect(host, port, false, 5000);
-            if (h == 0) {
-                throw(Exception.IOError, "Failed to establish TLS connection");
+            sock = Stream.ConnectTls(host, port, { timeoutMs: 5000 });
+            if (sock == nil) {
+                throw(Exception.IOError, "Failed to establish TLS connection: " +
+                                         (Stream.TlsLastError() ?? "unknown"));
             }
-            tr = Ws._tlsTransport(h);
         } else {
-            let s = Stream.Connect("tcp", host, port);
-            if (s == nil) {
+            sock = Stream.Connect("tcp", host, port);
+            if (sock == nil) {
                 throw(Exception.IOError, "Failed to connect socket");
             }
-            Stream.SetTimeout(s, 5000, 5000);
-            tr = Ws._plainTransport(s);
         }
+        Stream.SetTimeout(sock, 5000, 5000);
 
         let reqPath = Ws.EnsurePath(path);
         let key = Ws.MakeClientKey();
         let request = Ws.BuildRequest(host, reqPath, key, headers);
 
-        if (!tr.writeStr(request)) {
-            tr.close();
+        if (!Stream.WriteString(sock, request)) {
+            Stream.Close(sock);
             throw(Exception.IOError, "Failed to write WebSocket handshake");
         }
 
-        let response = Ws.ReadHttpHeaders(tr);
+        let response = Ws.ReadHttpHeaders(sock);
         let statusLine = response._statusLine ?? "";
 
         if (!String.StartsWith(statusLine, "HTTP/1.1 101") &&
             !String.StartsWith(statusLine, "HTTP/1.0 101")) {
-            tr.close();
+            Stream.Close(sock);
             throw(Exception.RuntimeError, "WebSocket upgrade failed: " + statusLine);
         }
 
@@ -307,22 +280,22 @@ class WebSocketClient {
         let expected = Ws.MakeAccept(key);
 
         if (upgrade != "websocket") {
-            tr.close();
+            Stream.Close(sock);
             throw(Exception.RuntimeError, "Missing or invalid Upgrade header");
         }
 
         if (String.IndexOf(connection, "upgrade") < 0) {
-            tr.close();
+            Stream.Close(sock);
             throw(Exception.RuntimeError, "Missing or invalid Connection header");
         }
 
         if (accept != expected) {
-            tr.close();
+            Stream.Close(sock);
             throw(Exception.RuntimeError, "Invalid Sec-WebSocket-Accept");
         }
 
         let ws = new WebSocketClient();
-        ws.tr = tr;
+        ws.sock = sock;
         ws.secure = (secure == true);
         ws.host = host;
         ws.port = port;
@@ -334,7 +307,7 @@ class WebSocketClient {
     }
 
     fn IsOpen(): bool {
-        return !this.closed && this.tr.isOpen();
+        return !this.closed && Stream.IsOpen(this.sock);
     }
 
     fn CloseCode(): int { return this.closeCode; }
@@ -392,7 +365,7 @@ class WebSocketClient {
 
     fn Close(code, reason): bool {
         if (this.closed) {
-            if (this.tr.isOpen()) this.tr.close();
+            if (Stream.IsOpen(this.sock)) Stream.Close(this.sock);
             return true;
         }
 
@@ -420,14 +393,14 @@ class WebSocketClient {
 
         this.SendFrame(Ws.OpcodeClose(), payload);
         this.closed = true;
-        this.tr.close();
+        Stream.Close(this.sock);
         return true;
     }
 
     fn Abort(): bool {
         this.closed = true;
-        if (this.tr.isOpen()) {
-            return this.tr.close();
+        if (Stream.IsOpen(this.sock)) {
+            return Stream.Close(this.sock);
         }
         return true;
     }
@@ -476,7 +449,7 @@ class WebSocketClient {
             Ws.XorMaskRangeInPlace(frame, payloadOff, mask, n);
         }
 
-        return this.tr.writeBlock(frame);
+        return Stream.WriteAll(this.sock, frame);
     }
 
     fn ReadFrame(): object {
@@ -484,7 +457,7 @@ class WebSocketClient {
             throw(Exception.InvalidState, "WebSocket already closed");
         }
 
-        let head = this.tr.readBytes(2);
+        let head = Stream.ReadBytes(this.sock, 2);
         if (head == nil || len(head) < 2) {
             this.closed = true;
             throw(Exception.IOError, "Failed to read WebSocket frame header");
@@ -508,13 +481,13 @@ class WebSocketClient {
         if (len7 < 126) {
             payloadLen = len7;
         } else if (len7 == 126) {
-            let ext2 = this.tr.readBytes(2);
+            let ext2 = Stream.ReadBytes(this.sock, 2);
             if (ext2 == nil || len(ext2) < 2) {
                 throw(Exception.IOError, "Failed to read extended payload length");
             }
             payloadLen = Ws.ReadU16BE(ext2, 0);
         } else {
-            let ext8 = this.tr.readBytes(8);
+            let ext8 = Stream.ReadBytes(this.sock, 8);
             if (ext8 == nil || len(ext8) < 8) {
                 throw(Exception.IOError, "Failed to read extended payload length");
             }
@@ -529,7 +502,7 @@ class WebSocketClient {
 
         let maskKey = nil;
         if (masked) {
-            maskKey = this.tr.readBytes(4);
+            maskKey = Stream.ReadBytes(this.sock, 4);
             if (maskKey == nil || len(maskKey) < 4) {
                 throw(Exception.IOError, "Failed to read masking key");
             }
@@ -537,7 +510,7 @@ class WebSocketClient {
 
         let payload = Buffer.Create(payloadLen, 1);
         if (payloadLen > 0) {
-            let raw = this.tr.readBytes(payloadLen);
+            let raw = Stream.ReadBytes(this.sock, payloadLen);
             if (raw == nil || len(raw) < payloadLen) {
                 throw(Exception.IOError, "Failed to read frame payload");
             }
@@ -601,9 +574,9 @@ class WebSocketClient {
                 this.closeCode = frame.CloseCode ?? 0;
                 this.closeReason = frame.CloseReason ?? "";
 
-                if (this.tr.isOpen()) {
+                if (Stream.IsOpen(this.sock)) {
                     this.SendFrame(Ws.OpcodeClose(), nil);
-                    this.tr.close();
+                    Stream.Close(this.sock);
                 }
 
                 return frame;
@@ -611,6 +584,31 @@ class WebSocketClient {
 
             return frame;
         }
+    }
+
+    // Receive without stalling the scheduler: suspends only the calling fiber
+    // until a frame arrives, so other fibers keep running. Returns nil if
+    // timeoutMs passes with nothing received. Works for ws:// and wss://.
+    //
+    // No `await` is needed - the wait suspends this fiber on its own.
+    //
+    //   let msg = ws.ReceiveWhenReady(30000);
+    //   if (msg == nil) { /* timed out */ }
+    //
+    // The frame itself is then read synchronously; one split across packets can
+    // still block briefly, bounded by the stream's read timeout.
+    fn ReceiveWhenReady(timeoutMs?): object {
+        if (this.closed) {
+            throw(Exception.InvalidState, "WebSocket already closed");
+        }
+        let ready = Stream.WaitReadable(this.sock, timeoutMs ?? -1);
+        if (ready != true) { return nil; }      // timed out
+        return this.Receive();
+    }
+
+    fn ReceiveTextWhenReady(timeoutMs?): string {
+        let m = this.ReceiveWhenReady(timeoutMs);
+        return (m == nil) ? nil : m.Text;
     }
 
     fn ReceiveText(): string {
