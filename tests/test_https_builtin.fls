@@ -2,9 +2,12 @@
 //
 //   flarisvm tests/test_https_builtin.fls --libs='./libs'
 //
-// Verifies that HTTPS works through the built-in Tls module (OS-native TLS:
+// Verifies that HTTPS works through the built-in TLS transport (OS-native TLS:
 // Secure Transport on macOS, dlopen'd OpenSSL on Linux) with no unsafe flag and
 // no compiled plugin. This is the test the Linux Docker image runs.
+//
+// A TLS stream is an ordinary stream, so the transport checks below are the
+// plain Stream reads and writes - only opening it differs.
 //
 // Hard checks (gate the exit code) cover the TLS path only: backend present, a
 // response comes back, its body is well-formed JSON, the async handles work.
@@ -29,7 +32,12 @@ fn note(cond, msg) {
 fn async Main() {
     Console.WriteLine("=== built-in TLS smoke test (no --unsafe) ===");
 
-    check(Tls.Available(), "built-in TLS backend available");
+    // No standalone availability call: a build without TLS fails at connect
+    // time and names the reason through TlsLastError.
+    let probe = Stream.ConnectTls("api.github.com", 443);
+    check(probe != nil, "built-in TLS backend available" +
+                        (probe == nil ? " (" + (Stream.TlsLastError() ?? "no reason") + ")" : ""));
+    if (probe != nil) { Stream.Close(probe); }
 
     let r = Https.Get("https://api.github.com/", { "User-Agent": "flaris-builtin-test" });
     check(r != nil, "GET https://api.github.com/ returns a response");
@@ -67,33 +75,36 @@ fn async Main() {
 
     // Async transport round-trip (io-pool offload): ConnectAsync -> WriteAsync ->
     // ReadLineAsync -> ReadAllAsync directly against a real server.
-    let ah = await Tls.ConnectAsync("api.github.com", 443);
-    check(ah != 0, "ConnectAsync opens a TLS connection");
-    if (ah != 0) {
-        let sent = await Tls.WriteAsync(ah,
+    let ah = await Stream.ConnectTlsAsync("api.github.com", 443);
+    check(ah != nil, "ConnectTlsAsync opens a TLS connection");
+    if (ah != nil) {
+        let sent = await Stream.WriteAsync(ah,
             "GET / HTTP/1.1\r\nHost: api.github.com\r\nUser-Agent: flaris\r\nConnection: close\r\n\r\n");
-        check(sent > 0, "WriteAsync sends the request");
-        let line = await Tls.ReadLineAsync(ah);
+        check(sent != nil && sent > 0, "WriteAsync sends the request");
+        let line = await Stream.ReadLineAsync(ah);
         check(line != nil && String.StartsWith(line, "HTTP/1."), "ReadLineAsync reads the status line");
         if (line != nil) {
             note(String.Contains(line, " 200 "), "async status line == 200 (got " + String.Trim(line) + ")");
         }
-        let body = await Tls.ReadAllAsync(ah);
-        check(body != nil, "ReadAllAsync reads the body to EOF");
-        Tls.Close(ah);
+        // ReadAsync with no count reads to EOF - the async read-all.
+        let body = await Stream.ReadAsync(ah);
+        check(body != nil, "ReadAsync reads the body to EOF");
+        Stream.Close(ah);
     }
 
-    // PeerCert exposes a pinnable fingerprint + subject.
-    let ph = Tls.Connect("api.github.com", 443);
-    if (ph != 0) {
-        let cert = Tls.PeerCert(ph);
-        check(cert != nil && len(cert.sha256) == 64, "PeerCert returns a 64-hex sha256");
-        check(cert != nil && cert.subject != "",     "PeerCert returns a subject");
-        Tls.Close(ph);
+    // TlsPeerCert exposes a pinnable fingerprint + subject.
+    let ph = Stream.ConnectTls("api.github.com", 443);
+    if (ph != nil) {
+        let cert = Stream.TlsPeerCert(ph);
+        check(cert != nil && len(cert.sha256) == 64, "TlsPeerCert returns a 64-hex sha256");
+        check(cert != nil && cert.subject != "",     "TlsPeerCert returns a subject");
+        Stream.Close(ph);
     }
     // SNI override: a wrong SNI must fail hostname verification.
-    let wrong = Tls.Connect("api.github.com", 443, false, 15000, { sni: "wrong.host.example" });
-    check(wrong == 0, "wrong SNI override rejected by verification");
+    let wrong = Stream.ConnectTls("api.github.com", 443,
+                                  { sni: "wrong.host.example", timeoutMs: 15000 });
+    check(wrong == nil, "wrong SNI override rejected by verification");
+    if (wrong != nil) { Stream.Close(wrong); }
 
     // Https.GetAsync drives the async HTTP engine over async TLS: resolves to a
     // real response, and two started together run concurrently (overlapping I/O).
