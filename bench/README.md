@@ -187,8 +187,8 @@ A few things worth stating plainly, because benchmark pages usually do not:
   record and would roughly halve both its time and its memory while appearing
   to measure the same thing. The cross-checked `result:` integer does not catch
   that class of mistake, because the sum comes out right either way.
-- Flaris appears twice: the plain bytecode VM, and `--jit` with the native
-  backend. Both are honest defaults; the JIT is not on by default.
+- Flaris appears twice: the plain bytecode VM (`--jit-disable`), and the
+  default build, which has the native JIT backend enabled.
 
 ## Adding a benchmark or a language
 

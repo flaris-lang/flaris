@@ -61,8 +61,9 @@ run_lang() {  # run_lang <bench> <lang>
       luajit) f="bench_${b}.lua"; [[ -f "bench_${b}_jit.lua" ]] && f="bench_${b}_jit.lua"
               run_one "$b" luajit "$LUAJIT" "$f" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
-      fls)    run_one "$b" fls    "$FLARISVM" --strip "bench_${b}.fls" ;;
-      flsj)   run_one "$b" flsj   "$FLARISVM" --strip --jit "bench_${b}.fls" ;;
+      # The JIT is on by default, so the plain-VM lane has to switch it OFF.
+      fls)    run_one "$b" fls    "$FLARISVM" --strip --jit-disable "bench_${b}.fls" ;;
+      flsj)   run_one "$b" flsj   "$FLARISVM" --strip "bench_${b}.fls" ;;
     esac
     return 0
 }
@@ -227,7 +228,8 @@ cat >> "$REPORT" <<'METHOD'
 - Every language must produce the same `result:` integer for a benchmark; the
   runner cross-checks them and warns on any disagreement.
 - Flaris runs with `--strip` so debug metadata is not loaded, and appears twice:
-  the plain bytecode VM, and `--jit` with the native backend enabled.
+  the plain bytecode VM (`--jit-disable`), and the default build with the native
+  JIT backend enabled.
 - Lua reports `os.clock()` (CPU time); everything else uses a wall clock. On an
   idle machine these agree for single-threaded work.
 - Runtimes that are not installed are skipped and omitted from the tables

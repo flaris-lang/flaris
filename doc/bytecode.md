@@ -589,6 +589,24 @@ own header does not survive bundling); the TOC itself is covered by the
 bundle's outer signature. A bundle builder MUST refuse dependencies whose
 signatures verify as `BAD`, `STRIPPED` or `UNSUPPORTED`.
 
+**Load order.** A bundled dependency may import another dependency in the same
+bundle. A loader MUST therefore make every TOC entry resolvable before executing
+any of them — registering each as an unloaded module and running it on first
+import — so that a dependency can import one listed after it. Trust
+(`--require-signed`) is decided for every entry at load time, whether or not
+anything imports it; content pins are checked before the dependency executes,
+using the `sha256` the TOC already carries. A dependency nothing imports is
+never executed. A cycle between bundled dependencies is detected and reported
+rather than recursing without bound; the import that closes the cycle fails, so
+the dependency holding it is left partially initialised.
+
+Independently, a bundle builder SHOULD write TOC entries in dependency order —
+every dependency ahead of the entries that import it — so the bundle also loads
+on a runtime that walks the TOC front-to-back. Entries carry explicit offsets,
+so TOC order is independent of where the sections sit in the file. Order is
+advisory: it cannot be relied on, since nothing prevents a hand-built TOC from
+listing entries arbitrarily.
+
 ---
 
 ## 6. Instruction encoding

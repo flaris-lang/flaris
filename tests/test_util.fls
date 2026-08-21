@@ -1,0 +1,208 @@
+// test_util.fls - Util library: encoding, identifiers, comparison, coalescing.
+//
+//   flarisvm tests/test_util.fls --libs='./libs'
+//
+// The encoder/decoder expectations are the RFC 4648 test vectors; the semver
+// cases follow semver section 11 and npm range semantics.
+
+import { Util } from library("Util", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn ck(cond, name) {
+    if (cond) { passed += 1; }
+    else { failed += 1; Console.WriteLine("[FAIL] ", name); }
+}
+fn eq(got, want, name) {
+    if (got == want) { passed += 1; }
+    else {
+        failed += 1;
+        Console.WriteLine("[FAIL] ", name, "  got=", got, " want=", want);
+    }
+}
+fn hexOf(b): string {
+    if (b == nil) { return "<nil>"; }
+    let s = "";
+    let hx = "0123456789abcdef";
+    iter(i from 0 to len(b) - 1) {
+        let v = b[i] & 255;
+        s += String.CharAt(hx, v >> 4) + String.CharAt(hx, v & 15);
+    }
+    return s;
+}
+
+fn Main() {
+    Console.WriteLine("=== Util ===");
+
+    // ---- Base64: RFC 4648 vectors -----------------------------------------
+    eq(Util.Base64Encode(""),       "",         "b64 encode ''");
+    eq(Util.Base64Encode("f"),      "Zg==",     "b64 encode 'f'");
+    eq(Util.Base64Encode("fo"),     "Zm8=",     "b64 encode 'fo'");
+    eq(Util.Base64Encode("foo"),    "Zm9v",     "b64 encode 'foo'");
+    eq(Util.Base64Encode("foob"),   "Zm9vYg==", "b64 encode 'foob'");
+    eq(Util.Base64Encode("fooba"),  "Zm9vYmE=", "b64 encode 'fooba'");
+    eq(Util.Base64Encode("foobar"), "Zm9vYmFy", "b64 encode 'foobar'");
+
+    // base64url: -_ alphabet, no padding
+    eq(Util.Base64UrlEncode("f"),      "Zg",       "b64url drops padding");
+    eq(Util.Base64UrlEncode("fooba"),  "Zm9vYmE",  "b64url 'fooba'");
+    eq(Util.Base64Encode(Util.HexToBin("fbffbf")),    "+/+/", "b64 emits +/");
+    eq(Util.Base64UrlEncode(Util.HexToBin("fbffbf")), "-_-_", "b64url emits -_");
+
+    eq(Util.Base64DecodeString("Zm9vYmFy"), "foobar", "b64 decode padded");
+    eq(Util.Base64DecodeString("Zm9vYmE="), "fooba",  "b64 decode with padding");
+    eq(Util.Base64DecodeString("Zm9vYmE"),  "fooba",  "b64 decode unpadded");
+    eq(hexOf(Util.Base64DecodeBlock("-_-_")), "fbffbf", "b64url decode to block");
+    eq(Util.Base64DecodeString("Zm9vYmE", true),  "fooba", "strict accepts unpadded");
+    eq(Util.Base64DecodeString("Zm9vYmE=", true), "fooba", "strict accepts padded");
+    ck(Util.Base64DecodeString("!!!!") == nil,        "b64 rejects a non-alphabet char");
+    ck(Util.Base64DecodeString("Zm=9", true) == nil,  "strict rejects interior padding");
+
+    // ---- Base32 ------------------------------------------------------------
+    eq(Util.Base32Encode("f"),      "MY======",         "b32 encode 'f'");
+    eq(Util.Base32Encode("foo"),    "MZXW6===",         "b32 encode 'foo'");
+    eq(Util.Base32Encode("fooba"),  "MZXW6YTB",         "b32 encode 'fooba'");
+    eq(Util.Base32Encode("foobar"), "MZXW6YTBOI======", "b32 encode 'foobar'");
+    eq(Util.Base32DecodeString("MZXW6YTB"), "fooba", "b32 decode");
+    eq(Util.Base32DecodeString("mzxw6ytb"), "fooba", "b32 accepts lowercase");
+    eq(Util.Base32DecodeString("MZXW6==="), "foo",   "b32 decode with padding");
+    ck(Util.Base32DecodeString("1") == nil, "b32 rejects an impossible length");
+
+    // ---- Hex ---------------------------------------------------------------
+    eq(Util.AscToHex("foo"),        "666f6f", "hex encode");
+    eq(Util.AscToHex("foo", true),  "666F6F", "hex encode uppercase");
+    eq(Util.HexToAsc("666f6f"),     "foo",    "hex decode");
+    ck(Util.HexToAsc("666") == nil, "hex rejects an odd length");
+    ck(Util.HexToAsc("zz")  == nil, "hex rejects a non-hex digit");
+    eq(Util.BinToHex(Util.HexToBin("fbffbf")), "fbffbf", "block hex round trip");
+    ck(Util.HexToBin("abc") == nil, "HexToBin rejects an odd length");
+
+    // A NUL byte survives the block form; the string form truncates at it -
+    // the reason both exist.
+    eq(hexOf(Util.HexToBin("610062")), "610062", "hex keeps an embedded NUL");
+    eq(len(Util.Base64DecodeBlock(Util.Base64Encode(Util.HexToBin("610062")))), 3,
+       "block decode keeps all 3 bytes incl. NUL");
+
+    // ---- UUID --------------------------------------------------------------
+    let u = "123e4567-e89b-12d3-a456-426614174000";
+    ck(Util.UuidIsValid(u), "canonical UUID accepted");
+    ck(!Util.UuidIsValid("123e4567e89b12d3a456426614174000"), "dashless UUID rejected");
+    ck(!Util.UuidIsValid("zzze4567-e89b-12d3-a456-426614174000"), "non-hex UUID rejected");
+    ck(Util.UuidIsValid("123E4567-E89B-12D3-A456-426614174000"), "uppercase UUID accepted");
+    eq(hexOf(Util.UuidToBytes(u)), "123e4567e89b12d3a456426614174000", "UuidToBytes");
+    eq(Util.UuidFromBytes(Util.UuidToBytes(u)), u, "UuidFromBytes round trip");
+    ck(Util.UuidToBytes("nope") == nil, "UuidToBytes rejects junk");
+
+    let v4 = Util.Uuid();
+    eq(len(v4), 36, "Uuid length");
+    eq(String.CharAt(v4, 14), '4', "Uuid is version 4");
+    ck(Util.UuidIsValid(v4), "generated Uuid is canonical");
+    let v7 = Util.Uuid7();
+    eq(String.CharAt(v7, 14), '7', "Uuid7 is version 7");
+    ck(Util.UuidIsValid(v7), "generated Uuid7 is canonical");
+    ck(Util.Uuid() != Util.Uuid(), "two Uuids differ");
+    eq(len(Util.Nanoid()), 21, "Nanoid default length");
+    eq(len(Util.Nanoid(10)), 10, "Nanoid explicit length");
+    ck(Util.Nanoid(0) == nil, "Nanoid rejects length 0");
+    ck(Util.Nanoid(2000) == nil, "Nanoid rejects an oversized length");
+
+    // ---- Compare -----------------------------------------------------------
+    eq(Util.Compare(1, 2),     -1, "Compare less");
+    eq(Util.Compare(2, 2),      0, "Compare equal");
+    eq(Util.Compare("b", "a"),  1, "Compare greater");
+
+    // ---- Semantic versions -------------------------------------------------
+    eq(Util.CompareVersions("1.0.0", "1.0.1"), -1, "patch ordering");
+    eq(Util.CompareVersions("2.0.0", "10.0.0"), -1, "numeric, not lexical");
+    eq(Util.CompareVersions("1.0.0", "1.0.0"),  0, "equal versions");
+    eq(Util.CompareVersions("1.0.0-rc.1", "1.0.0"), -1, "prerelease sorts first");
+    eq(Util.CompareVersions("1.0.0-alpha", "1.0.0-beta"), -1, "alpha < beta");
+    eq(Util.CompareVersions("1.0.0-alpha.1", "1.0.0-alpha.2"), -1, "numeric identifier");
+    eq(Util.CompareVersions("1.0.0-alpha.beta", "1.0.0-alpha.1"), 1, "numeric < alphanumeric");
+    eq(Util.CompareVersions("v1.2", "1.2.0"),  0, "leading v, missing components");
+    eq(Util.CompareVersions("1.0.0+build", "1.0.0"), 0, "build metadata ignored");
+
+    ck(Util.VersionSatisfies("1.2.3", "^1.2.0"),  "caret in range");
+    ck(!Util.VersionSatisfies("2.0.0", "^1.2.0"), "caret excludes next major");
+    ck(Util.VersionSatisfies("1.2.5", "~1.2.3"),  "tilde in range");
+    ck(!Util.VersionSatisfies("1.3.0", "~1.2.3"), "tilde excludes next minor");
+    ck(Util.VersionSatisfies("1.2.3", "1.2.x"),   "x-range");
+    ck(!Util.VersionSatisfies("1.3.0", "1.2.x"),  "x-range excludes");
+    ck(Util.VersionSatisfies("1.2.3", "*"),       "star matches");
+    ck(Util.VersionSatisfies("1.2.3", ">=1.0.0 <2.0.0"), "AND of comparators");
+    ck(Util.VersionSatisfies("1.2.3", "1.0.0 - 2.0.0"),  "hyphen range");
+    ck(Util.VersionSatisfies("3.0.0", "1.x || 3.x"),     "OR of sets");
+    ck(!Util.VersionSatisfies("1.0.0-rc.1", "^1.0.0"),   "prerelease needs a prerelease set");
+    ck(Util.VersionSatisfies("1.0.0-rc.1", ">=1.0.0-rc.0"), "prerelease matches its own set");
+    ck(Util.VersionSatisfies("0.2.3", "^0.2.0"),  "caret on 0.x pins minor");
+    ck(!Util.VersionSatisfies("0.3.0", "^0.2.0"), "caret on 0.x excludes next minor");
+    ck(!Util.VersionSatisfies("1.2.3", ">1.2"),   "'>1.2' means >=1.3.0");
+
+    eq(Util.VersionMax(["1.0.0", "1.2.0", "2.0.0", "1.9.9"], "^1.0.0"), "1.9.9", "VersionMax");
+    ck(Util.VersionMax(["3.0.0"], "^1.0.0") == nil, "VersionMax with no match");
+    eq(Util.VersionMax([1, nil, "1.5.0"], "^1.0.0"), "1.5.0", "VersionMax skips non-strings");
+
+    // ---- Coalesce ----------------------------------------------------------
+    eq(Util.Coalesce(nil, nil, "x", "y"), "x", "Coalesce first non-nil");
+    eq(Util.Coalesce([nil, nil, 7]), 7, "Coalesce scans a lone array");
+    ck(Util.Coalesce(nil, nil) == nil, "Coalesce all nil");
+    eq(Util.Coalesce(nil, nil, nil, nil, nil, nil, nil, 8), 8, "Coalesce eight candidates");
+    eq(Util.CoalesceEmpty(nil, "", 0, [], "hit"), "hit", "CoalesceEmpty skips empties");
+    eq(Util.CoalesceEmpty(nil, "", false, "no"), false, "false is not empty");
+    eq(Util.CoalesceEmpty(["", 0, "z"]), "z", "CoalesceEmpty scans a lone array");
+    // An empty object counts as empty, and skipping it must return the next value.
+    eq(Util.CoalesceEmpty({}, "x"), "x", "empty object is skipped");
+    eq(Util.CoalesceEmpty(0, "x"), "x", "zero is skipped");
+    ck(Util.CoalesceEmpty(nil, nil) == nil, "CoalesceEmpty all empty");
+
+    Console.WriteLine("passed=", passed, "  failed=", failed);
+    if (failed == 0) { Console.WriteLine("=== ALL PASSED ==="); }
+
+    // ---- Benchmark ---------------------------------------------------------
+    Console.WriteLine("");
+    Console.WriteLine("== Benchmark ==");
+    let big = String.Repeat("The quick brown fox jumps over the lazy dog. ", 512);
+    let blk = Buffer.Create(65536, 1);
+    iter(i from 0 to 65535) { Buffer.WriteU8At(blk, i, i & 255); }
+    let jwt = "{\"sub\":\"1234567890\",\"name\":\"John Doe\",\"iat\":1516239022}";
+    let sink = 0;
+
+    let t0 = Time.Millis();
+    for (let i = 0; i < 20000; i += 1) { sink += len(Util.Base64UrlEncode(jwt)); }
+    Console.WriteLine("  Base64UrlEncode x20000 (JWT-sized)  ", Time.Millis() - t0, " ms");
+
+    t0 = Time.Millis();
+    for (let i = 0; i < 200; i += 1) { sink += len(Util.Base64Encode(big)); }
+    Console.WriteLine("  Base64Encode    x200   (22 KB)      ", Time.Millis() - t0, " ms");
+
+    let enc = Util.Base64Encode(big);
+    t0 = Time.Millis();
+    for (let i = 0; i < 200; i += 1) { sink += len(Util.Base64DecodeBlock(enc)); }
+    Console.WriteLine("  Base64DecodeBlock x200 (30 KB)      ", Time.Millis() - t0, " ms");
+
+    t0 = Time.Millis();
+    for (let i = 0; i < 200; i += 1) { sink += len(Util.BinToHex(blk)); }
+    Console.WriteLine("  BinToHex        x200   (64 KB)      ", Time.Millis() - t0, " ms");
+
+    let hx = Util.BinToHex(blk);
+    t0 = Time.Millis();
+    for (let i = 0; i < 200; i += 1) { sink += len(Util.HexToBin(hx)); }
+    Console.WriteLine("  HexToBin        x200   (128 KB)     ", Time.Millis() - t0, " ms");
+
+    t0 = Time.Millis();
+    for (let i = 0; i < 200; i += 1) { sink += len(Util.Base32Encode(big)); }
+    Console.WriteLine("  Base32Encode    x200   (22 KB)      ", Time.Millis() - t0, " ms");
+
+    t0 = Time.Millis();
+    for (let i = 0; i < 50000; i += 1) { sink += Util.CompareVersions("1.2.3-rc.1", "1.2.3"); }
+    Console.WriteLine("  CompareVersions x50000              ", Time.Millis() - t0, " ms");
+
+    t0 = Time.Millis();
+    for (let i = 0; i < 20000; i += 1) { if (Util.VersionSatisfies("1.2.3", "^1.2.0")) { sink += 1; } }
+    Console.WriteLine("  VersionSatisfies x20000             ", Time.Millis() - t0, " ms");
+
+    t0 = Time.Millis();
+    for (let i = 0; i < 50000; i += 1) { sink += len(Util.Uuid()); }
+    Console.WriteLine("  Uuid            x50000              ", Time.Millis() - t0, " ms");
+}

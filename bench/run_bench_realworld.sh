@@ -64,8 +64,9 @@ run_lang() {  # run_lang <bench> <lang>
       luajit) run_one "$b" luajit "$LUAJIT" "bench_${b}.lua" ;;
       go)     f=$(bin_path "bench_${b}_go");  [[ -n "$f" ]] && run_one "$b" go  "$f" ;;
       nim)    f=$(bin_path "bench_${b}_nim"); [[ -n "$f" ]] && run_one "$b" nim "$f" ;;
-      fls)    run_one "$b" fls    "$FLARISVM" --strip "bench_${b}.fls" ;;
-      flsj)   run_one "$b" flsj   "$FLARISVM" --strip --jit "bench_${b}.fls" ;;
+      # The JIT is on by default, so the plain-VM lane has to switch it OFF.
+      fls)    run_one "$b" fls    "$FLARISVM" --strip --jit-disable "bench_${b}.fls" ;;
+      flsj)   run_one "$b" flsj   "$FLARISVM" --strip "bench_${b}.fls" ;;
     esac
     return 0
 }

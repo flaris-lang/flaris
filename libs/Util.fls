@@ -1,0 +1,998 @@
+// Util.fls - encoding, identifiers, comparison and coalescing helpers.
+// Version: 1.0
+//
+// Four families:
+//
+//   Encoding   Base64 / Base64url / Base32 (RFC 4648) and hex, each with a
+//              string entry point and a binary (block) entry point. String
+//              decode results truncate at a decoded NUL byte, so the *Block
+//              forms are the correct choice for arbitrary binary.
+//   Identity   Uuid (RFC 4122 v4), Uuid7 (RFC 9562 v7) and Nanoid, all drawn
+//              from the OS CSPRNG via Crypto.RandomBytes.
+//   Compare    Compare (three-way, matching the language's own ordering) and
+//              CompareVersions (semver: numeric core, prerelease per section
+//              11, build metadata ignored).
+//   Coalesce   Coalesce / CoalesceEmpty pick the first non-nil / non-empty
+//              argument, or scan a single array argument.
+//
+// Encoders accept a string or a block; a block with multi-byte elements is
+// read through its string form so the byte count is exact. Every entry point
+// returns nil on malformed input rather than raising.
+//
+// Coalesce and CoalesceEmpty take up to six candidates. A lone array argument
+// is treated as the candidate list; passing an array followed only by explicit
+// nils is indistinguishable from that and also scans the array.
+
+
+global _b64Std   = nil;   // 64-byte alphabet block, standard +/ 
+global _b64Url   = nil;   // 64-byte alphabet block, url-safe -_
+global _b64Val   = nil;   // 256-byte value table, 255 = not in the alphabet
+global _b32Std   = nil;   // 32-byte alphabet block
+global _b32Val   = nil;   // 256-byte value table, 255 = invalid
+global _hexLower = nil;   // 16-byte alphabet block
+global _hexUpper = nil;
+global _hexVal   = nil;   // 256-byte nibble table, 255 = not a hex digit
+global _hex16Lo  = nil;   // 256 x u16: byte -> its two lowercase hex chars
+global _hex16Up  = nil;   // 256 x u16: byte -> its two uppercase hex chars
+
+// Build the lookup tables once. Every encoder and decoder calls this first;
+// after the first call it is a single nil test.
+fn _tables() {
+    if (_b64Std != nil) { return; }
+
+    let std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let b32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+    _b64Std = Buffer.FromString(std);
+    _b64Url = Buffer.FromString(url);
+    _b32Std = Buffer.FromString(b32);
+    _hexLower = Buffer.FromString("0123456789abcdef");
+    _hexUpper = Buffer.FromString("0123456789ABCDEF");
+
+    // 255 marks "not in this alphabet" in every value table.
+    _b64Val = Buffer.Create(256, 1);
+    _b32Val = Buffer.Create(256, 1);
+    _hexVal = Buffer.Create(256, 1);
+    Buffer.Fill(_b64Val, 255);
+    Buffer.Fill(_b32Val, 255);
+    Buffer.Fill(_hexVal, 255);
+
+    iter(i from 0 to 63) {
+        Buffer.WriteU8At(_b64Val, Buffer.ReadU8At(_b64Std, i), i);
+    }
+    // base64url's -_ decode to the same values as +/ so one table serves both.
+    Buffer.WriteU8At(_b64Val, 45, 62);
+    Buffer.WriteU8At(_b64Val, 95, 63);
+
+    iter(i from 0 to 31) {
+        let c = Buffer.ReadU8At(_b32Std, i);
+        Buffer.WriteU8At(_b32Val, c, i);
+        if (c >= 65 && c <= 90) { Buffer.WriteU8At(_b32Val, c + 32, i); }  // accept lowercase
+    }
+
+    iter(i from 0 to 15) {
+        Buffer.WriteU8At(_hexVal, Buffer.ReadU8At(_hexLower, i), i);
+        Buffer.WriteU8At(_hexVal, Buffer.ReadU8At(_hexUpper, i), i);
+    }
+
+    // Packed pairs let the encoder do one 16-bit store per input byte instead
+    // of two 8-bit ones. Stored little-endian, so the high nibble lands first.
+    _hex16Lo = Buffer.Create(256, 2);
+    _hex16Up = Buffer.Create(256, 2);
+    iter(b from 0 to 255) {
+        let hi = b >> 4;
+        let lo = b & 15;
+        _hex16Lo[b] = Buffer.ReadU8At(_hexLower, hi) | (Buffer.ReadU8At(_hexLower, lo) << 8);
+        _hex16Up[b] = Buffer.ReadU8At(_hexUpper, hi) | (Buffer.ReadU8At(_hexUpper, lo) << 8);
+    }
+}
+
+// Normalise an encoder input to a byte-sized block, or nil if it is neither a
+// string nor a block. A block whose elements are wider than one byte is
+// rebuilt through its string form so len() is the true byte count.
+fn _asBytes(x): block {
+    if (x == nil) { return nil; }
+    if (Type.Of(x) == Type.String) { return Buffer.FromString(x); }
+    if (Type.Of(x) != Type.Block) { return nil; }
+    let s = Buffer.ToString(x);
+    if (len(s) == len(x)) { return x; }
+    return Buffer.FromString(s);
+}
+
+// ---------------------------------------------------------------------------
+//  Base64
+// ---------------------------------------------------------------------------
+
+// Encode src[0..n) into out using `table`'s alphabet, returning the number of
+// bytes written. `pad` appends '=' to a short final group; without it the group
+// is simply shorter (base64url).
+//
+// A typed leaf: every parameter is a JIT type, the body calls only lowered
+// Buffer ops and allocates nothing, so the loop compiles to native code.
+fn _b64EncInto(src: block, n: int, table: block, pad: bool, out: block): int {
+    // Whole 3-byte groups run as a range loop with both offsets derived from
+    // the group index; only the short tail needs the scalar path.
+    let groups = n / 3;
+    iter(g from 0 to groups - 1) {
+        let gi = g * 3;
+        let go = g * 4;
+        let v = (Buffer.ReadU8At(src, gi) << 16) | (Buffer.ReadU8At(src, gi + 1) << 8) |
+                Buffer.ReadU8At(src, gi + 2);
+        Buffer.WriteU8At(out, go,     Buffer.ReadU8At(table, (v >> 18) & 63));
+        Buffer.WriteU8At(out, go + 1, Buffer.ReadU8At(table, (v >> 12) & 63));
+        Buffer.WriteU8At(out, go + 2, Buffer.ReadU8At(table, (v >> 6) & 63));
+        Buffer.WriteU8At(out, go + 3, Buffer.ReadU8At(table, v & 63));
+    }
+
+    let i = groups * 3;
+    let o = groups * 4;
+    let rem = n - i;
+    if (rem == 1) {
+        let v = Buffer.ReadU8At(src, i) << 16;
+        Buffer.WriteU8At(out, o,     Buffer.ReadU8At(table, (v >> 18) & 63));
+        Buffer.WriteU8At(out, o + 1, Buffer.ReadU8At(table, (v >> 12) & 63));
+        o += 2;
+        if (pad) { Buffer.WriteU8At(out, o, 61); Buffer.WriteU8At(out, o + 1, 61); o += 2; }
+    } else if (rem == 2) {
+        let v = (Buffer.ReadU8At(src, i) << 16) | (Buffer.ReadU8At(src, i + 1) << 8);
+        Buffer.WriteU8At(out, o,     Buffer.ReadU8At(table, (v >> 18) & 63));
+        Buffer.WriteU8At(out, o + 1, Buffer.ReadU8At(table, (v >> 12) & 63));
+        Buffer.WriteU8At(out, o + 2, Buffer.ReadU8At(table, (v >> 6) & 63));
+        o += 3;
+        if (pad) { Buffer.WriteU8At(out, o, 61); o += 1; }
+    }
+
+    return o;
+}
+
+// Strict-mode gate: reject what the tolerant decoder would accept - interior
+// '=', a final group length no byte count can produce, a padding count that
+// disagrees with that length, and non-zero unused bits in the last symbol.
+fn _b64Canonical(s: block, n: int, val: block): bool {
+    let pads = 0;
+    let m = n;
+    while (m > 0 && Buffer.ReadU8At(s, m - 1) == 61) { pads += 1; m -= 1; }
+    if (pads > 2) { return false; }
+    iter(i from 0 to m - 1) {
+        if (Buffer.ReadU8At(s, i) == 61) { return false; }
+    }
+
+    let rem = m % 4;
+    if (rem == 1) { return false; }
+    if (pads > 0 && (m + pads) % 4 != 0) { return false; }
+
+    if (rem == 2 || rem == 3) {
+        let lv = Buffer.ReadU8At(val, Buffer.ReadU8At(s, m - 1));
+        if (lv == 255) { return false; }
+        let mask = 3;
+        if (rem == 2) { mask = 15; }
+        if ((lv & mask) != 0) { return false; }
+    }
+    return true;
+}
+
+// Decode src[0..n) into out, returning the byte count or -1 on an invalid
+// character. Missing trailing padding is synthesised from n % 4. Typed leaf.
+fn _b64DecInto(src: block, n: int, val: block, out: block): int {
+    let o = 0;
+    let pad = (4 - (n % 4)) % 4;
+    let padded = n + pad;
+
+    let quads = padded / 4;
+    iter(q from 0 to quads - 1) {
+        let i = q * 4;
+        // '=' (61) stands in for both real and synthesised padding.
+        let c0 = 61; let c1 = 61; let c2 = 61; let c3 = 61;
+        if (i     < n) { c0 = Buffer.ReadU8At(src, i); }
+        if (i + 1 < n) { c1 = Buffer.ReadU8At(src, i + 1); }
+        if (i + 2 < n) { c2 = Buffer.ReadU8At(src, i + 2); }
+        if (i + 3 < n) { c3 = Buffer.ReadU8At(src, i + 3); }
+
+        let v0 = Buffer.ReadU8At(val, c0);
+        let v1 = 0;
+        let v2 = 0;
+        let v3 = 0;
+        if (c1 != 61) { v1 = Buffer.ReadU8At(val, c1); }
+        if (c2 != 61) { v2 = Buffer.ReadU8At(val, c2); }
+        if (c3 != 61) { v3 = Buffer.ReadU8At(val, c3); }
+        if (v0 == 255 || v1 == 255 || v2 == 255 || v3 == 255) { return -1; }
+
+        let v = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+        Buffer.WriteU8At(out, o, (v >> 16) & 255);
+        o += 1;
+        if (c2 != 61) { Buffer.WriteU8At(out, o, (v >> 8) & 255); o += 1; }
+        if (c3 != 61) { Buffer.WriteU8At(out, o, v & 255); o += 1; }
+    }
+    return o;
+}
+
+// Decode Base64/base64url into a fresh block, or nil on an invalid character
+// (or, under strict, a non-canonical encoding).
+fn _b64Decode(input: string, strict: bool): block {
+    _tables();
+    let s = Buffer.FromString(input);
+    let n = len(s);
+    if (n == 0) { return Buffer.FromString(""); }
+    if (strict && !_b64Canonical(s, n, _b64Val)) { return nil; }
+
+    let cap = ((n + 3) / 4) * 3;
+    let out = Buffer.Create(cap, 1);
+    let o = _b64DecInto(s, n, _b64Val, out);
+    if (o < 0) { return nil; }
+    if (o == 0) { return Buffer.FromString(""); }
+    let res = Buffer.Slice(out, 0, o);
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+//  Base32
+// ---------------------------------------------------------------------------
+
+// Encode src[0..n) into out as Base32, returning bytes written. Typed leaf.
+fn _b32EncInto(src: block, n: int, table: block, out: block): int {
+    let groups = (n + 4) / 5;
+    iter(g from 0 to groups - 1) {
+        let i = g * 5;
+        let o = g * 8;
+        let take = n - i;
+        if (take > 5) { take = 5; }
+        // The 40-bit group is carried as two halves so it never exceeds 32 bits.
+        let hi = 0;                    // bytes 0..1
+        let lo = 0;                    // bytes 2..4
+        iter(j from 0 to 4) {
+            let bv = 0;
+            if (j < take) { bv = Buffer.ReadU8At(src, i + j); }
+            if (j < 2) { hi = (hi << 8) | bv; } else { lo = (lo << 8) | bv; }
+        }
+        // take input bytes fill ceil(take*8/5) symbols; the rest is padding.
+        let syms = 8;
+        if (take == 1) { syms = 2; }
+        else if (take == 2) { syms = 4; }
+        else if (take == 3) { syms = 5; }
+        else if (take == 4) { syms = 7; }
+
+        iter(j from 0 to 7) {
+            if (j < syms) {
+                let shift = 35 - 5 * j;
+                let v = 0;
+                if (shift >= 24) { v = (hi >> (shift - 24)) & 31; }
+                else             { v = ((hi << (24 - shift)) | (lo >> shift)) & 31; }
+                Buffer.WriteU8At(out, o + j, Buffer.ReadU8At(table, v));
+            } else {
+                Buffer.WriteU8At(out, o + j, 61);
+            }
+        }
+    }
+    return groups * 8;
+}
+
+// Decode src[0..n) Base32 symbols into out, returning bytes written or -1 on an
+// invalid character. Typed leaf.
+fn _b32DecInto(src: block, n: int, val: block, out: block): int {
+    let o = 0;
+    let acc = 0;
+    let bits = 0;
+    iter(i from 0 to n - 1) {
+        let v = Buffer.ReadU8At(val, Buffer.ReadU8At(src, i));
+        if (v == 255) { return -1; }
+        acc = (acc << 5) | v;
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            Buffer.WriteU8At(out, o, (acc >> bits) & 255);
+            o += 1;
+        }
+    }
+    return o;
+}
+
+// Decode Base32 into a fresh block, or nil on an invalid character or a symbol
+// count no byte count can produce. Padding is optional and lowercase accepted.
+fn _b32Decode(input: string, strict: bool): block {
+    _tables();
+    let s = Buffer.FromString(input);
+    let n = len(s);
+
+    if (strict) {
+        let pads = 0;
+        let clen = n;
+        while (clen > 0 && Buffer.ReadU8At(s, clen - 1) == 61) { pads += 1; clen -= 1; }
+        iter(i from 0 to clen - 1) {
+            if (Buffer.ReadU8At(s, i) == 61) { return nil; }
+        }
+        if (pads > 6) { return nil; }
+        if (pads > 0 && (clen + pads) % 8 != 0) { return nil; }
+        let crem = clen % 8;
+        if (crem != 0) {
+            let lv = Buffer.ReadU8At(_b32Val, Buffer.ReadU8At(s, clen - 1));
+            if (lv == 255) { return nil; }
+            // Unused low bits of the final symbol, by remainder.
+            let unused = 3;
+            if (crem == 2) { unused = 2; }
+            else if (crem == 4) { unused = 4; }
+            else if (crem == 5) { unused = 1; }
+            if ((lv & ((1 << unused) - 1)) != 0) { return nil; }
+        }
+    }
+
+    while (n > 0 && Buffer.ReadU8At(s, n - 1) == 61) { n -= 1; }
+    if (n == 0) { return Buffer.FromString(""); }
+
+    // 1, 3 and 6 are not reachable symbol counts.
+    let rem = n % 8;
+    if (rem == 1 || rem == 3 || rem == 6) { return nil; }
+
+    let out = Buffer.Create((n * 5) / 8 + 1, 1);
+    let o = _b32DecInto(s, n, _b32Val, out);
+    if (o < 0) { return nil; }
+    if (o == 0) { return Buffer.FromString(""); }
+    let res = Buffer.Slice(out, 0, o);
+    return res;
+}
+
+// Hex-encode src[0..n) into out - a block of n 2-byte elements - through the
+// packed pair table. Element subscripts lower to an inline load/store, so this
+// is one lookup and one 16-bit store per input byte. Typed leaf.
+fn _hexEncInto(src: block, n: int, table16: block, out: block): int {
+    iter(i from 0 to n - 1) { out[i] = table16[Buffer.ReadU8At(src, i)]; }
+    return n * 2;
+}
+
+// Decode n hex characters from src into out (n/2 bytes), or -1 on a non-hex
+// character. Typed leaf.
+fn _hexDecInto(src: block, n: int, val: block, out: block): int {
+    // Iterating the pair index rather than stepping by two keeps the loop in
+    // the range-loop form, which is cheaper in both the JIT and the interpreter.
+    iter(j from 0 to n / 2 - 1) {
+        let hi = Buffer.ReadU8At(val, Buffer.ReadU8At(src, j * 2));
+        let lo = Buffer.ReadU8At(val, Buffer.ReadU8At(src, j * 2 + 1));
+        if (hi == 255 || lo == 255) { return -1; }
+        Buffer.WriteU8At(out, j, (hi << 4) | lo);
+    }
+    return n / 2;
+}
+
+// ---------------------------------------------------------------------------
+//  Semantic versions
+// ---------------------------------------------------------------------------
+
+global _semI = 0;          // cursor left by _semNum
+global _ppM = -1;          // _parsePartial results, copied out by the caller
+global _ppm = -1;
+global _ppp = -1;
+global _ppPre = "";
+global _ppHasPre = false;
+global _allowPre = false;  // set when a comparator names V's own prerelease
+
+// Parse the unsigned number at s[i], leaving the cursor in _semI. Non-digits
+// yield 0. Saturates rather than wrapping on an absurdly long component, which
+// would otherwise flip the comparison.
+fn _semNum(s: string, i: int): int {
+    let v = 0;
+    let n = len(s);
+    let sat = false;
+    while (i < n) {
+        let c = Char.Code(String.CharAt(s, i));
+        if (c < 48 || c > 57) { break; }
+        if (v > 922337203685477580) { sat = true; }
+        if (!sat) { v = v * 10 + (c - 48); }
+        i += 1;
+    }
+    _semI = i;
+    if (sat) { return 9223372036854775807; }
+    return v;
+}
+
+// Compare one dot-separated prerelease identifier. Numeric identifiers compare
+// numerically and rank below alphanumeric ones (semver section 11).
+fn _identCmp(a: string, b: string): int {
+    let aNum = String.IsNumeric(a) && len(a) > 0;
+    let bNum = String.IsNumeric(b) && len(b) > 0;
+
+    if (aNum && bNum) {
+        let x = a;
+        let y = b;
+        while (len(x) > 1 && String.CharAt(x, 0) == '0') { x = String.Substr(x, 1, len(x) - 1); }
+        while (len(y) > 1 && String.CharAt(y, 0) == '0') { y = String.Substr(y, 1, len(y) - 1); }
+        if (len(x) != len(y)) { if (len(x) < len(y)) { return -1; } return 1; }
+        if (x < y) { return -1; }
+        if (x > y) { return 1; }
+        return 0;
+    }
+    if (aNum != bNum) { if (aNum) { return -1; } return 1; }
+
+    if (a < b) { return -1; }
+    if (a > b) { return 1; }
+    return 0;
+}
+
+// Three-way semver compare -> -1 | 0 | 1. MAJOR.MINOR.PATCH numerically, then
+// prerelease (absent ranks above present). Build metadata is ignored, a leading
+// "v" tolerated, and missing components count as 0 ("1.2" == "1.2.0").
+fn _semverCmp(a: string, b: string): int {
+    let ai = 0;
+    let bi = 0;
+    if (len(a) > 0 && (String.CharAt(a, 0) == 'v' || String.CharAt(a, 0) == 'V')) { ai = 1; }
+    if (len(b) > 0 && (String.CharAt(b, 0) == 'v' || String.CharAt(b, 0) == 'V')) { bi = 1; }
+
+    iter(k from 0 to 2) {
+        let na = _semNum(a, ai); ai = _semI;
+        let nb = _semNum(b, bi); bi = _semI;
+        if (na != nb) { if (na < nb) { return -1; } return 1; }
+        if (ai < len(a) && String.CharAt(a, ai) == '.') { ai += 1; }
+        if (bi < len(b) && String.CharAt(b, bi) == '.') { bi += 1; }
+    }
+
+    let aPre = ai < len(a) && String.CharAt(a, ai) == '-';
+    let bPre = bi < len(b) && String.CharAt(b, bi) == '-';
+    if (aPre != bPre) { if (aPre) { return -1; } return 1; }
+    if (!aPre) { return 0; }
+    ai += 1;
+    bi += 1;
+
+    while (true) {
+        // Each identifier runs to the next '.' or to the '+' that starts build
+        // metadata (which ends the comparison).
+        let ae = ai;
+        while (ae < len(a) && String.CharAt(a, ae) != '.' && String.CharAt(a, ae) != '+') { ae += 1; }
+        let be = bi;
+        while (be < len(b) && String.CharAt(b, be) != '.' && String.CharAt(b, be) != '+') { be += 1; }
+
+        let alen = ae - ai;
+        let blen = be - bi;
+        if (alen == 0 && blen == 0) { return 0; }
+        if (alen == 0) { return -1; }
+        if (blen == 0) { return 1; }
+
+        let c = _identCmp(String.Substr(a, ai, alen), String.Substr(b, bi, blen));
+        if (c != 0) { return c; }
+
+        ai = ae;
+        bi = be;
+        if (ai < len(a) && String.CharAt(a, ai) == '+') { ai = len(a); }
+        if (bi < len(b) && String.CharAt(b, bi) == '+') { bi = len(b); }
+        if (ai < len(a) && String.CharAt(a, ai) == '.') { ai += 1; }
+        if (bi < len(b) && String.CharAt(b, bi) == '.') { bi += 1; }
+    }
+}
+
+// Parse a possibly-partial "M.m.p-pre" token into the _pp* globals. Each of
+// M/m/p is its value, or -1 for a wildcard ('x'/'X'/'*') or an absent
+// component. Callers copy the globals out before the next call.
+fn _parsePartial(s: string) {
+    _ppM = -1; _ppm = -1; _ppp = -1;
+    _ppPre = "";
+    _ppHasPre = false;
+
+    let i = 0;
+    if (len(s) > 0 && (String.CharAt(s, 0) == 'v' || String.CharAt(s, 0) == 'V')) { i = 1; }
+
+    iter(idx from 0 to 2) {
+        if (i >= len(s)) { break; }
+        let c = String.CharAt(s, i);
+        if (c == 'x' || c == 'X' || c == '*') {
+            i += 1;                      // leaves this slot at -1
+        } else if (Char.IsDigit(c)) {
+            let v = _semNum(s, i);
+            i = _semI;
+            if (idx == 0) { _ppM = v; } else if (idx == 1) { _ppm = v; } else { _ppp = v; }
+        } else {
+            break;
+        }
+        if (i < len(s) && String.CharAt(s, i) == '.') { i += 1; } else { break; }
+    }
+
+    if (i < len(s) && String.CharAt(s, i) == '-') {
+        i += 1;
+        _ppHasPre = true;
+        let e = i;
+        while (e < len(s) && String.CharAt(s, e) != '+') { e += 1; }
+        _ppPre = String.Substr(s, i, e - i);
+    }
+}
+
+// Format an "M.m.p" (optionally "-pre") bound for comparison against a version.
+fn _bound(M: int, m: int, p: int, pre: string, hasPre: bool): string {
+    let s = Convert.ToString(M) + "." + Convert.ToString(m) + "." + Convert.ToString(p);
+    if (hasPre && len(pre) > 0) { return s + "-" + pre; }
+    return s;
+}
+
+// Apply an operator to _semverCmp(V, bound). op: 0 '=', 1 '>', 2 '>=', 3 '<', 4 '<='.
+fn _satOp(op: int, V: string, bound: string): bool {
+    let c = _semverCmp(V, bound);
+    if (op == 1) { return c > 0; }
+    if (op == 2) { return c >= 0; }
+    if (op == 3) { return c < 0; }
+    if (op == 4) { return c <= 0; }
+    return c == 0;
+}
+
+// Evaluate one comparator token against V (core vM.vn.vp). Sets _allowPre when
+// the token names a prerelease sharing V's core, which admits V's prerelease.
+fn _tokenMatches(tok: string, V: string, vM: int, vn: int, vp: int): bool {
+    let op = -1;                 // -1 = bare, 100 = caret, 101 = tilde
+    let t = tok;
+    if (len(t) > 0) {
+        let c0 = String.CharAt(t, 0);
+        let c1 = ' ';
+        if (len(t) > 1) { c1 = String.CharAt(t, 1); }
+        if (c0 == '>') {
+            if (c1 == '=') { op = 2; t = String.Substr(t, 2, len(t) - 2); }
+            else           { op = 1; t = String.Substr(t, 1, len(t) - 1); }
+        } else if (c0 == '<') {
+            if (c1 == '=') { op = 4; t = String.Substr(t, 2, len(t) - 2); }
+            else           { op = 3; t = String.Substr(t, 1, len(t) - 1); }
+        } else if (c0 == '=') { op = 0;   t = String.Substr(t, 1, len(t) - 1); }
+        else if (c0 == '^')   { op = 100; t = String.Substr(t, 1, len(t) - 1); }
+        else if (c0 == '~')   { op = 101; t = String.Substr(t, 1, len(t) - 1); }
+    }
+
+    _parsePartial(t);
+    let M = _ppM; let m = _ppm; let p = _ppp;
+    let pre = _ppPre; let hp = _ppHasPre;
+
+    if (hp && M == vM && m == vn && p == vp && M >= 0) { _allowPre = true; }
+
+    let lM = M; if (lM < 0) { lM = 0; }
+    let lm = m; if (lm < 0) { lm = 0; }
+    let lp = p; if (lp < 0) { lp = 0; }
+
+    if (op == 100) {                       // caret: leftmost non-zero component
+        let lo = _bound(lM, lm, lp, pre, hp);
+        let uM = 1; let um = 0; let up = 0;
+        if (M > 0)        { uM = M + 1; um = 0;     up = 0; }
+        else if (m > 0)   { uM = 0;     um = m + 1; up = 0; }
+        else if (m == 0)  { if (p >= 0) { uM = 0; um = 0; up = p + 1; } else { uM = 0; um = 1; up = 0; } }
+        return _satOp(2, V, lo) && _satOp(3, V, _bound(uM, um, up, "", false));
+    }
+    if (op == 101) {                       // tilde: patch-level (or minor) drift
+        let lo = _bound(lM, lm, lp, pre, hp);
+        let uM = lM + 1; let um = 0; let up = 0;
+        if (m >= 0) { uM = lM; um = m + 1; up = 0; }
+        return _satOp(2, V, lo) && _satOp(3, V, _bound(uM, um, up, "", false));
+    }
+
+    let wildcard = M < 0 || m < 0 || p < 0;
+
+    if (op < 0 || op == 0) {
+        if (M < 0) { return true; }        // '*' or empty matches anything
+        if (!wildcard) { return _satOp(0, V, _bound(M, m, p, pre, hp)); }
+        let lo = _bound(M, lm, lp, "", false);
+        let uM = M; let um = m + 1; let up = 0;
+        if (m < 0) { uM = M + 1; um = 0; up = 0; }
+        return _satOp(2, V, lo) && _satOp(3, V, _bound(uM, um, up, "", false));
+    }
+    if (op == 2) { return _satOp(2, V, _bound(lM, lm, lp, pre, hp)); }
+    if (op == 3) { return _satOp(3, V, _bound(lM, lm, lp, pre, hp)); }
+    if (op == 1) {
+        if (!wildcard) { return _satOp(1, V, _bound(M, m, p, pre, hp)); }
+        let uM = M + 1; let um = 0; let up = 0;      // >1   => >=2.0.0
+        if (m >= 0) { uM = M; um = m + 1; up = 0; }  // >1.2 => >=1.3.0
+        return _satOp(2, V, _bound(uM, um, up, "", false));
+    }
+    // '<='
+    if (!wildcard) { return _satOp(4, V, _bound(M, m, p, pre, hp)); }
+    let uM = M + 1; let um = 0; let up = 0;          // <=1   => <2.0.0
+    if (m >= 0) { uM = M; um = m + 1; up = 0; }      // <=1.2 => <1.3.0
+    return _satOp(3, V, _bound(uM, um, up, "", false));
+}
+
+// Evaluate one comparator set: an AND of space-separated comparators, or a
+// single "A - B" hyphen range.
+fn _groupMatches(g: string, V: string, vM: int, vn: int, vp: int, vHasPre: bool): bool {
+    _allowPre = false;
+
+    let dash = String.IndexOf(g, " - ");
+    if (dash >= 0) {
+        let left = String.Trim(String.Substr(g, 0, dash));
+        let right = String.Trim(String.Substr(g, dash + 3, len(g) - dash - 3));
+
+        _parsePartial(left);
+        let aM = _ppM; let am = _ppm; let ap = _ppp; let apre = _ppPre; let ahp = _ppHasPre;
+        _parsePartial(right);
+        let bM = _ppM; let bm = _ppm; let bp = _ppp; let bpre = _ppPre; let bhp = _ppHasPre;
+
+        let laM = aM; if (laM < 0) { laM = 0; }
+        let lam = am; if (lam < 0) { lam = 0; }
+        let lap = ap; if (lap < 0) { lap = 0; }
+        let ok = _satOp(2, V, _bound(laM, lam, lap, apre, ahp));
+
+        if (bm < 0 || bp < 0) {            // partial upper bound is exclusive
+            let uM = bM; if (uM < 0) { uM = 0; }
+            let um = 0; let up = 0;
+            if (bm < 0) { uM += 1; } else { um = bm + 1; }
+            ok = ok && _satOp(3, V, _bound(uM, um, up, "", false));
+        } else {
+            ok = ok && _satOp(4, V, _bound(bM, bm, bp, bpre, bhp));
+        }
+
+        if (ahp && aM == vM && am == vn && ap == vp) { _allowPre = true; }
+        if (bhp && bM == vM && bm == vn && bp == vp) { _allowPre = true; }
+        if (vHasPre && !_allowPre) { return false; }
+        return ok;
+    }
+
+    let parts = String.Split(String.Trim(g), " ");
+    let any = false;
+    let ok = true;
+    iter(i from 0 to len(parts) - 1) {
+        let tok = String.Trim(parts[i]);
+        if (len(tok) == 0) { continue; }
+        any = true;
+        if (!_tokenMatches(tok, V, vM, vn, vp)) { ok = false; }
+    }
+    if (!any) { return !vHasPre; }         // an empty set behaves like '*'
+    if (vHasPre && !_allowPre) { return false; }
+    return ok;
+}
+
+// True if V satisfies range R, OR-ing the '||'-separated comparator sets.
+fn _versionInRange(V: string, R: string): bool {
+    let v = V;
+    if (len(v) > 0 && (String.CharAt(v, 0) == 'v' || String.CharAt(v, 0) == 'V')) {
+        v = String.Substr(v, 1, len(v) - 1);
+    }
+    _parsePartial(v);
+    let vM = _ppM; let vn = _ppm; let vp = _ppp; let vhp = _ppHasPre;
+    if (vM < 0) { vM = 0; }
+    if (vn < 0) { vn = 0; }
+    if (vp < 0) { vp = 0; }
+
+    let groups = String.Split(R, "||");
+    iter(i from 0 to len(groups) - 1) {
+        if (_groupMatches(groups[i], V, vM, vn, vp, vhp)) { return true; }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+//  UUID
+// ---------------------------------------------------------------------------
+
+// Format 16 raw bytes as canonical lowercase 8-4-4-4-12. Version and variant
+// bits are emitted as they are.
+fn _uuidFormat(b: block): string {
+    _tables();
+    let out = Buffer.Create(36, 1);
+    let o = 0;
+    iter(i from 0 to 15) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) { Buffer.WriteU8At(out, o, 45); o += 1; }
+        let v = Buffer.ReadU8At(b, i);
+        Buffer.WriteU8At(out, o,     Buffer.ReadU8At(_hexLower, v >> 4));
+        Buffer.WriteU8At(out, o + 1, Buffer.ReadU8At(_hexLower, v & 15));
+        o += 2;
+    }
+    return Buffer.ToString(out);
+}
+
+// Parse a canonical 8-4-4-4-12 UUID into 16 bytes, or nil if s is not one.
+// Any version and variant is accepted, in either case.
+fn _uuidParse(s: string): block {
+    _tables();
+    if (len(s) != 36) { return nil; }
+    let src = Buffer.FromString(s);
+    let out = Buffer.Create(16, 1);
+    let bi = 0;
+    let i = 0;
+    while (i < 36) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (Buffer.ReadU8At(src, i) != 45) { return nil; }
+            i += 1;
+            continue;
+        }
+        let hi = Buffer.ReadU8At(_hexVal, Buffer.ReadU8At(src, i));
+        let lo = Buffer.ReadU8At(_hexVal, Buffer.ReadU8At(src, i + 1));
+        if (hi == 255 || lo == 255) { return nil; }
+        Buffer.WriteU8At(out, bi, (hi << 4) | lo);
+        bi += 1;
+        i += 2;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Emptiness
+// ---------------------------------------------------------------------------
+
+// nil, "", numeric zero, [] and an object with no properties count as empty.
+// false is deliberately NOT empty, so CoalesceEmpty can return it.
+fn _isEmpty(o): bool {
+    if (o == nil) { return true; }
+    let t = Type.Of(o);
+    if (t == Type.String) { return len(o) == 0; }
+    if (t == Type.Int)    { return o == 0; }
+    if (t == Type.Float)  { return o == 0.0; }
+    if (t == Type.Array)  { return len(o) == 0; }
+    if (t == Type.Object) { return Object.Count(o) == 0; }
+    return false;
+}
+
+class Util {
+
+    // Base64Encode(string|block) -> string | nil
+    // Standard RFC 4648 Base64: the +/ alphabet with '=' padding.
+    fn static Base64Encode(input): string {
+        _tables();
+        let src = _asBytes(input);
+        if (src == nil) { return nil; }
+        let n = len(src);
+        if (n == 0) { return ""; }
+        let out = Buffer.Create(4 * ((n + 2) / 3), 1);
+        let o = _b64EncInto(src, n, _b64Std, true, out);
+        let res = Buffer.ToString(out);
+        return res;
+    }
+
+    // Base64UrlEncode(string|block) -> string | nil
+    // RFC 4648 base64url: the -_ alphabet and no padding - the JWT and
+    // URL/filename-safe form.
+    fn static Base64UrlEncode(input): string {
+        _tables();
+        let src = _asBytes(input);
+        if (src == nil) { return nil; }
+        let n = len(src);
+        if (n == 0) { return ""; }
+        // Unpadded length, so the buffer is exact and needs no slicing.
+        let rem = n % 3;
+        let outLen = 4 * (n / 3);
+        if (rem == 1) { outLen += 2; } else if (rem == 2) { outLen += 3; }
+        let out = Buffer.Create(outLen, 1);
+        let o = _b64EncInto(src, n, _b64Url, false, out);
+        let res = Buffer.ToString(out);
+        return res;
+    }
+
+    // Base64DecodeString(string[, strict]) -> string | nil
+    // Decode Base64 or base64url, padded or not. nil on an invalid character,
+    // or - when strict - on any non-canonical encoding. A decoded NUL byte
+    // truncates the result; use Base64DecodeBlock for binary.
+    fn static Base64DecodeString(input: string, strict?): string {
+        let b = _b64Decode(input, strict == true);
+        if (b == nil) { return nil; }
+        return Buffer.ToString(b);
+    }
+
+    // Base64DecodeBlock(string[, strict]) -> block | nil
+    // As Base64DecodeString but byte-exact, for binary payloads.
+    fn static Base64DecodeBlock(input: string, strict?): block {
+        return _b64Decode(input, strict == true);
+    }
+
+    // Base32Encode(string|block) -> string | nil
+    // RFC 4648 Base32 with '=' padding: 5 input bytes -> 8 output symbols.
+    fn static Base32Encode(input): string {
+        _tables();
+        let src = _asBytes(input);
+        if (src == nil) { return nil; }
+        let n = len(src);
+        if (n == 0) { return ""; }
+        let out = Buffer.Create(8 * ((n + 4) / 5), 1);
+        let o = _b32EncInto(src, n, _b32Std, out);
+        let res = Buffer.ToString(out);
+        return res;
+    }
+
+    // Base32DecodeString(string[, strict]) -> string | nil
+    // Decode Base32 into a string. Padding optional, lowercase accepted.
+    fn static Base32DecodeString(input: string, strict?): string {
+        let b = _b32Decode(input, strict == true);
+        if (b == nil) { return nil; }
+        return Buffer.ToString(b);
+    }
+
+    // Base32DecodeBlock(string[, strict]) -> block | nil
+    fn static Base32DecodeBlock(input: string, strict?): block {
+        return _b32Decode(input, strict == true);
+    }
+
+    // AscToHex(string[, upper]) -> string
+    // Hex-encode each byte of the input, lowercase unless upper is true.
+    fn static AscToHex(input: string, upper?): string {
+        _tables();
+        let src = Buffer.FromString(input);
+        let n = len(src);
+        if (n == 0) { return ""; }
+        let table = _hex16Lo;
+        if (upper == true) { table = _hex16Up; }
+        let out = Buffer.Create(n, 2);
+        let o = _hexEncInto(src, n, table, out);
+        let res = Buffer.ToString(out);
+        return res;
+    }
+
+    // HexToAsc(string) -> string | nil
+    // Decode hex back to bytes in string form. nil on odd length or a non-hex
+    // character. Inverse of AscToHex.
+    fn static HexToAsc(input: string): string {
+        let b = Util.HexToBin(input);
+        if (b == nil) { return nil; }
+        return Buffer.ToString(b);
+    }
+
+    // BinToHex(block) -> string
+    // Lowercase hex dump of a block's exact bytes - NUL-safe, unlike AscToHex.
+    fn static BinToHex(input: block): string {
+        _tables();
+        let src = _asBytes(input);
+        if (src == nil) { return nil; }
+        let n = len(src);
+        if (n == 0) { return ""; }
+        let out = Buffer.Create(n, 2);
+        let o = _hexEncInto(src, n, _hex16Lo, out);
+        let res = Buffer.ToString(out);
+        return res;
+    }
+
+    // HexToBin(string) -> block | nil
+    // Decode a hex string into raw bytes. nil on odd length or a non-hex
+    // character. Inverse of BinToHex.
+    fn static HexToBin(input: string): block {
+        _tables();
+        let n = len(input);
+        if (n % 2 != 0) { return nil; }
+        if (n == 0) { return Buffer.FromString(""); }
+        let src = Buffer.FromString(input);
+        let out = Buffer.Create(n / 2, 1);
+        let o = _hexDecInto(src, n, _hexVal, out);
+        if (o < 0) { return nil; }
+        return out;
+    }
+
+    // Uuid() -> string
+    // A random RFC 4122 version-4 UUID, lowercase with dashes. Entropy is one
+    // 16-byte draw of the OS CSPRNG.
+    fn static Uuid(): string {
+        let b = Crypto.RandomBytes(16);
+        if (b == nil) { return nil; }
+        Buffer.WriteU8At(b, 6, (Buffer.ReadU8At(b, 6) & 15) | 64);    // version 4
+        Buffer.WriteU8At(b, 8, (Buffer.ReadU8At(b, 8) & 63) | 128);   // variant 10xx
+        return _uuidFormat(b);
+    }
+
+    // Uuid7() -> string
+    // An RFC 9562 version-7 UUID: 48-bit big-endian Unix-millisecond timestamp
+    // then 74 random bits, so ids sort lexicographically by creation time.
+    fn static Uuid7(): string {
+        let ms = Time.NowMillis();
+        let b = Crypto.RandomBytes(16);
+        if (b == nil) { return nil; }
+        Buffer.WriteU8At(b, 0, (ms >> 40) & 255);
+        Buffer.WriteU8At(b, 1, (ms >> 32) & 255);
+        Buffer.WriteU8At(b, 2, (ms >> 24) & 255);
+        Buffer.WriteU8At(b, 3, (ms >> 16) & 255);
+        Buffer.WriteU8At(b, 4, (ms >> 8) & 255);
+        Buffer.WriteU8At(b, 5, ms & 255);
+        Buffer.WriteU8At(b, 6, 112 | (Buffer.ReadU8At(b, 6) & 15));   // version 7
+        Buffer.WriteU8At(b, 8, 128 | (Buffer.ReadU8At(b, 8) & 63));   // variant 10xx
+        return _uuidFormat(b);
+    }
+
+    // Nanoid([len]) -> string | nil
+    // A URL-safe random id of `len` chars (default 21) over a 64-symbol
+    // alphabet, so masking with 63 is unbiased. nil unless len is 1..1024.
+    fn static Nanoid(length?): string {
+        let n = 21;
+        if (length != nil) { n = length; }
+        if (n < 1 || n > 1024) { return nil; }
+
+        let alpha = Buffer.FromString(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
+        let rnd = Crypto.RandomBytes(n);
+        if (rnd == nil) { return nil; }
+        let out = Buffer.Create(n, 1);
+        iter(i from 0 to n - 1) {
+            Buffer.WriteU8At(out, i, Buffer.ReadU8At(alpha, Buffer.ReadU8At(rnd, i) & 63));
+        }
+        return Buffer.ToString(out);
+    }
+
+    // UuidIsValid(string) -> bool
+    // True for a canonical 8-4-4-4-12 hex UUID, any version or variant.
+    fn static UuidIsValid(s: string): bool {
+        return _uuidParse(s) != nil;
+    }
+
+    // UuidToBytes(string) -> block(16) | nil
+    // Parse a canonical UUID into its 16 raw bytes. Inverse of UuidFromBytes.
+    fn static UuidToBytes(s: string): block {
+        return _uuidParse(s);
+    }
+
+    // UuidFromBytes(block) -> string | nil
+    // Format a 16-byte block as a canonical UUID. Bytes are emitted verbatim -
+    // no version or variant rewrite. nil unless the block is exactly 16 bytes.
+    fn static UuidFromBytes(b: block): string {
+        let src = _asBytes(b);
+        if (src == nil || len(src) != 16) { return nil; }
+        return _uuidFormat(src);
+    }
+
+    // Compare(a, b) -> -1 | 0 | 1
+    // Three-way comparison usable as a sort comparator, following the
+    // language's own ordering for the given types.
+    fn static Compare(a, b): int {
+        if (a == b) { return 0; }
+        if (a < b) { return -1; }
+        return 1;
+    }
+
+    // CompareVersions(a, b) -> -1 | 0 | 1
+    // Semver ordering: numeric core, then prerelease (a prerelease sorts before
+    // its release). Build metadata is ignored and a leading "v" tolerated.
+    fn static CompareVersions(a: string, b: string): int {
+        return _semverCmp(a, b);
+    }
+
+    // VersionSatisfies(version, range) -> bool
+    // npm-style range matching: '||' separates OR-ed comparator sets, spaces
+    // AND within a set. Supports bare/'=', '>', '>=', '<', '<=', '^', '~',
+    // x-ranges (1.2.x, 1.x, *) and hyphen ranges (1.2.3 - 2.3.4). A prerelease
+    // version matches only a set that itself names a prerelease with the same
+    // MAJOR.MINOR.PATCH, so "^1.2.3" never accepts "2.0.0-rc.1".
+    fn static VersionSatisfies(version: string, range: string): bool {
+        return _versionInRange(version, range);
+    }
+
+    // VersionMax(versions, range) -> string | nil
+    // The highest element of `versions` satisfying `range`, or nil if none do -
+    // the dependency-resolver primitive. Non-string elements are skipped.
+    fn static VersionMax(versions: array, range: string): string {
+        let best = nil;
+        iter(i from 0 to len(versions) - 1) {
+            let v = versions[i];
+            if (Type.Of(v) != Type.String) { continue; }
+            if (!_versionInRange(v, range)) { continue; }
+            if (best == nil || _semverCmp(v, best) > 0) { best = v; }
+        }
+        return best;
+    }
+
+    // Coalesce(a[, b..h]) -> first non-nil value
+    // Returns the first argument that is not nil, or nil if all are. A lone
+    // array argument is treated as the candidate list - the form to use for
+    // more than eight candidates.
+    fn static Coalesce(a, b?, c?, d?, e?, f?, g?, h?) {
+        if (Type.Of(a) == Type.Array && b == nil && c == nil && d == nil &&
+            e == nil && f == nil && g == nil && h == nil) {
+            iter(i from 0 to len(a) - 1) {
+                if (a[i] != nil) { return a[i]; }
+            }
+            return nil;
+        }
+        if (a != nil) { return a; }
+        if (b != nil) { return b; }
+        if (c != nil) { return c; }
+        if (d != nil) { return d; }
+        if (e != nil) { return e; }
+        if (f != nil) { return f; }
+        if (g != nil) { return g; }
+        if (h != nil) { return h; }
+        return nil;
+    }
+
+    // CoalesceEmpty(a[, b..h]) -> first non-empty value
+    // Like Coalesce but also skips "", 0, [] and empty objects. false is not
+    // empty, so it can be returned.
+    fn static CoalesceEmpty(a, b?, c?, d?, e?, f?, g?, h?) {
+        if (Type.Of(a) == Type.Array && b == nil && c == nil && d == nil &&
+            e == nil && f == nil && g == nil && h == nil) {
+            iter(i from 0 to len(a) - 1) {
+                if (!_isEmpty(a[i])) { return a[i]; }
+            }
+            return nil;
+        }
+        if (!_isEmpty(a)) { return a; }
+        if (!_isEmpty(b)) { return b; }
+        if (!_isEmpty(c)) { return c; }
+        if (!_isEmpty(d)) { return d; }
+        if (!_isEmpty(e)) { return e; }
+        if (!_isEmpty(f)) { return f; }
+        if (!_isEmpty(g)) { return g; }
+        if (!_isEmpty(h)) { return h; }
+        return nil;
+    }
+}
+
+export { Util };

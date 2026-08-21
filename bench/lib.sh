@@ -252,7 +252,7 @@ lang_detail() { case "$1" in
                   nim)  echo "-d:release -O3" ;;    py)     echo "CPython" ;;
                   lua)  echo "interpreted" ;;       luajit) echo "tracing JIT" ;;
                   js)   echo "interpreted" ;;       node)   echo "V8" ;;
-                  fls)  echo "bytecode VM" ;;       flsj)   echo "bytecode VM --jit" ;;
+                  fls)  echo "bytecode VM, JIT off" ;; flsj)   echo "bytecode VM + JIT" ;;
                   *)    echo "" ;;
                 esac; }
 

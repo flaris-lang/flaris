@@ -45,6 +45,9 @@ The Flaris VM binary is `flarisvm`.
 | `flarisvm --sig-info <file.flx>` | Print the embedded signature status, machine-readable: `unsigned`, or `signed\|<trusted\|valid\|invalid>\|<pubkey-hex>\|<signer>` (see *Package signing*) |
 | `flarisvm --import-key <name> <pubkey>` | Add a 64-hex Ed25519 public key (with a label) to `~/.flaris/trusted_keys` |
 | `flarisvm --check <file.fls>` | Compile without running: full analyzer diagnostics plus a JIT eligibility report - see [R11](#r11---jit-compilation) and [R12](#r12---static-analyzer) |
+| `flarisvm --format <file.fls\|->` | Print the file in canonical layout on stdout - see *Formatting* below |
+| `flarisvm --format-write <file.fls>` | Rewrite the file in canonical layout, in place |
+| `flarisvm --format-check <file.fls>` | Exit 1 if the file is not already formatted (prints nothing on success) |
 | `flarisvm -Wno-<name> …` | Silence one analyzer warning, e.g. `-Wno-unused-symbol` - see [R12](#r12---static-analyzer) |
 | `flarisvm -Werror …` | Treat any analyzer warning as an error |
 | `flarisvm -w …` | Silence all analyzer warnings |
@@ -52,6 +55,40 @@ The Flaris VM binary is `flarisvm`.
 | `flarisvm --version` | Print version string |
 | `flarisvm --compile <input.fls> <output.flx> --bundle='<file1.flx>;...' [options]` | Compile and bundle named modules into a self-contained `.flx` |
 | `flarisvm --embed <input.fls\|.flx> <output> [options]` | Build a self-contained native executable (program + runtime in one file). See *Self-contained executables* |
+
+### Formatting
+
+`--format` re-lays out a source file: indentation, spacing, brace placement and
+blank lines become canonical, and nothing else changes. It works on stdin
+(`--format -`), which is what the VS Code extension uses so an unsaved buffer
+formats as typed.
+
+| Flag | Effect |
+|------|--------|
+| `--indent=<n>` | Spaces per indent level (default 4, 1-16) |
+| `--width=<n>` | Right margin at which argument lists and literals wrap (default 100, 40-400) |
+| `--tabs` | Indent with one tab per level instead of spaces |
+
+The formatter works on the token stream, never the AST, and every token is
+copied verbatim out of the source - so string literals, escapes, `"""` blocks
+and comments come through byte-for-byte. Before emitting anything it
+re-tokenizes its own output and compares it against the input token stream; if
+they differ it writes nothing and exits non-zero. A format can therefore only
+move whitespace, never change what the program means.
+
+Layout is canonical with one exception: a construct the author put on a single
+line keeps that line if it still fits the margin. That covers one-line blocks
+(`fn sq(x) { return x * x; }`), one-line `case` clauses and brace-less bodies
+(`if (!ok) return;`). Everything wider than the margin, and everything the
+author already spread across lines, is laid out by the formatter.
+
+CRLF line endings and a leading UTF-8 BOM are preserved. Output always ends in
+exactly one newline and never contains trailing whitespace.
+
+```bash
+flarisvm --format-check src/app.fls   # CI gate: non-zero if unformatted
+flarisvm --format-write src/app.fls   # rewrite in place
+```
 
 ### Flags - Disablers (default ON)
 
@@ -1463,7 +1500,7 @@ Use `--time` (timing) and `--stats` (statistics) flags. Profile real workloads b
 
 ## R8 - Standard Library
 
-Flaris ships 38 built-in modules covering everything from math and string processing to networking, concurrency, graphics, and low-level memory access.
+Flaris ships 32 built-in modules covering everything from math and string processing to networking, concurrency, graphics, and low-level memory access.
 
 ### Usage
 
@@ -1498,7 +1535,6 @@ Each function table has a `JIT` column stating whether the function can be calle
 | | `Random` | Seeded, deterministic PCG32 random streams |
 | | `Hash` | Non-cryptographic and cryptographic hashes |
 | | `Crypto` | XChaCha20-Poly1305 encryption and CSPRNG |
-| | `Util` | Encoding helpers and value comparison |
 | **I/O & Files** | `File` | File read, write, and metadata |
 | | `Directory` | Filesystem directory operations |
 | | `Path` | Cross-platform path string manipulation |
@@ -3432,40 +3468,6 @@ Timer resolution is approx 1-3ms.
 | **SetImmediate** | `SetImmediate(func:fn ) - int\|nil` | Fire `fn` on the next scheduler pump (a zero-delay one-shot), akin to Node's `setImmediate`. Returns a handle, or `nil` when the timer table is full. | — |
 | **SetInterval** | `SetInterval(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` every `ms` milliseconds. Returns a handle, or `nil` if `ms` is NaN or `<= 0`, or the timer table is full. | — |
 | **SetTimeout** | `SetTimeout(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` once after `ms` milliseconds (a negative delay fires as soon as possible). Returns a handle, or `nil` on a NaN delay or when the timer table is full. | — |
-
----
-
-### Util
-
-Namespace: **`Util`**
-
-Encoding, hashing utilities, and value comparison.
-
-| Function | Signature | Description | JIT |
-| ---------- | ----------- | ------------- | --- |
-| **AscToHex** | `AscToHex(s:string, upper?:bool) - string` | Convert ASCII string to hex representation. | ✓ owned¹ |
-| **Base64Encode** | `Base64Encode(data:string\|block) - string` | Encode string or block as standard Base64 (padded, `+/` alphabet). | ✓ owned¹ |
-| **Base64UrlEncode** | `Base64UrlEncode(data:string\|block) - string` | Encode string or block as Base64url (no padding, `-_` alphabet). Suitable for JWT. | ✓ owned¹ |
-| **Base64DecodeString** | `Base64DecodeString(s:string, strict?:bool) - string` | Decode Base64 or Base64url string to UTF-8 string. Accepts unpadded input and `-_` alphabet. Returns `nil` on invalid input. With `strict=true`, also rejects non-canonical encodings (interior `=`, an impossible length, or non-zero trailing bits). | ✓ owned¹ |
-| **Base64DecodeBlock** | `Base64DecodeBlock(s:string, strict?:bool) - block` | Decode Base64 or Base64url string to binary block. Accepts unpadded input and `-_` alphabet. Returns `nil` on invalid input. With `strict=true`, also rejects non-canonical encodings. | ✓ owned¹ |
-| **Base32Encode** | `Base32Encode(data:string\|block) - string` | Encode as RFC 4648 Base32 (`A-Z2-7`, `=`-padded). The encoding used for TOTP/2FA secrets. | ✓ owned¹ |
-| **Base32DecodeString** | `Base32DecodeString(s:string, strict?:bool) - string` | Decode Base32 to a string. Accepts lowercase and missing padding. Returns `nil` on invalid input. With `strict=true`, also rejects non-canonical encodings (interior `=` or non-zero trailing bits). | ✓ owned¹ |
-| **Base32DecodeBlock** | `Base32DecodeBlock(s:string, strict?:bool) - block` | Decode Base32 to a binary block. Accepts lowercase and missing padding. Returns `nil` on invalid input. With `strict=true`, also rejects non-canonical encodings. | ✓ owned¹ |
-| **BinToHex** | `BinToHex(buf:block) - string` | Convert binary block to hex string. | ✓ owned¹ |
-| **Coalesce** | `Coalesce(args...:any) - any` | Return first non-nil argument. Also accepts a single array and scans it. | — |
-| **CoalesceEmpty** | `CoalesceEmpty(args...:any) - any` | Return first non-nil and non-empty argument. Empty means `nil`, `""`, `0`/`0.0`, `{}` or `[]` (but not `false`). Also accepts a single array. | — |
-| **Compare** | `Compare(a:any, b:any) - int` | Three-way comparison usable as a sort comparator: returns -1, 0, or 1 (matches the language's `<` ordering). | ✓ |
-| **CompareVersions** | `CompareVersions(a:string, b:string) - int` | Semantic-version compare: returns -1, 0, or 1. `MAJOR.MINOR.PATCH` numerically (`"1.2.3" < "1.10.0"`), prerelease per semver (`"1.0.0-rc.1" < "1.0.0"`; numeric identifiers before alphanumeric), build metadata (`+...`) ignored. Tolerates a leading `v`; missing components count as 0. | ✓ |
-| **VersionSatisfies** | `VersionSatisfies(version:string, range:string) - bool` | `true` if `version` falls within an npm-style semver `range`. Supports `^`/`~`, `>`/`>=`/`<`/`<=`/`=`, x-ranges (`1.2.x`, `1.x`, `*`), hyphen ranges (`1.2.3 - 2.3.4`), space-separated `AND`, and `\|\|` `OR`. A prerelease version matches only a set that itself names a prerelease with the same `MAJOR.MINOR.PATCH`. | ✓ |
-| **VersionMax** | `VersionMax(versions:array, range:string) - string` | Highest version string in `versions` that satisfies `range` (see `VersionSatisfies`), or `nil` if none. Non-string elements are skipped. The dependency-resolver primitive. | — |
-| **HexToAsc** | `HexToAsc(s:string) - string` | Convert hex string back to ASCII. | ✓ owned¹ |
-| **HexToBin** | `HexToBin(s:string) - block` | Convert hex string to binary block. | ✓ owned¹ |
-| **Nanoid** | `Nanoid(size?:int) - string` | Generate a URL-safe random ID. Optional size. | ✓ owned¹ |
-| **Uuid** | `Uuid() - string` | Generate a UUID v4 string. | ✓ owned¹ |
-| **Uuid7** | `Uuid7() - string` | Generate an RFC 9562 UUID v7: a 48-bit millisecond timestamp plus random bits, so ids sort lexicographically by creation time (millisecond granularity). Ideal for database keys. | ✓ owned¹ |
-| **UuidFromBytes** | `UuidFromBytes(b:block) - string` | Format a 16-byte block as a canonical lowercase UUID string. `nil` unless the block is exactly 16 bytes. Inverse of `UuidToBytes`. | ✓ owned¹ |
-| **UuidIsValid** | `UuidIsValid(s:string) - bool` | `true` if `s` is a canonical `8-4-4-4-12` hex UUID (any version, either case). | ✓ |
-| **UuidToBytes** | `UuidToBytes(s:string) - block` | Parse a canonical UUID string into its 16 raw bytes, or `nil` if invalid. Inverse of `UuidFromBytes`. | ✓ owned¹ |
 
 ---
 
