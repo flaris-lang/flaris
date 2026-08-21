@@ -53,7 +53,8 @@ The Flaris VM binary is `flarisvm`.
 | `flarisvm -w …` | Silence all analyzer warnings |
 | `flarisvm --diagnostics json …` | Emit diagnostics as a JSON array on stdout |
 | `flarisvm --version` | Print version string |
-| `flarisvm --compile <input.fls> <output.flx> --bundle='<file1.flx>;...' [options]` | Compile and bundle named modules into a self-contained `.flx` |
+| `flarisvm --compile <input.fls> <output.flx> --bundle [options]` | Compile and bundle every module the program imports (transitively) into a self-contained `.flx` |
+| `flarisvm --compile <input.fls> <output.flx> --bundle='<file1.flx>;...' [options]` | Compile and bundle the named modules into a self-contained `.flx` |
 | `flarisvm --embed <input.fls\|.flx> <output> [options]` | Build a self-contained native executable (program + runtime in one file). See *Self-contained executables* |
 
 ### Formatting
@@ -295,14 +296,33 @@ noted above.
 
 ### Bundle files
 
-A bundle is a self-contained `.flx` file produced with `--bundle=<file.flx>;...`. It embeds
-named dependency chunks in a single file with a TOC at the start. At runtime the
+A bundle is a self-contained `.flx` file produced with `--bundle`. It embeds
+dependency chunks in a single file with a TOC at the start. At runtime the
 VM pre-loads all bundled deps before execution begins - no filesystem access
 occurs for those modules.
 
+**Choosing the dependency set:**
+
+| Form | Packs |
+|------|-------|
+| `--bundle` (or `--bundle=auto`) | The program's whole import chain: every module it imports, every module those import, and so on |
+| `--bundle='<f1.flx>;<f2.flx>;...'` | Exactly the named files |
+
+Both may be given together; a file named explicitly is not packed a second time
+when the walk also finds it. The walk resolves each import through the same
+search order the loader uses (the path as written, then each `--libs` segment,
+then `~/.flaris/libs`) and honours the version requirement, so the bundle
+contains the same file the import would have loaded from disk. A content pin
+(`library(name, version, "sha256:...")`) is verified while building, and a URL
+import is downloaded and packed like any other dependency.
+
 **Limitations:**
 
-- Only named modules will be loaded, and they have to be readable from direct path or via `--libs` folder
+- Named modules have to be readable from a direct path, via a `--libs` folder, or from `~/.flaris/libs`
+- A module imported at runtime through a direct `VM.Import(name, version)` call is not bundled: its name is a computed string, invisible to a build-time walk. Ship that `.flx` alongside the program. Only `import ... from library(...)` declarations are followed
+- Native libraries opened with `Ffi` are not bundled - they are OS shared objects loaded at runtime. A build that packs a program using `Ffi` warns about it
+- An embedded binary's runtime always enforces `--require-signed`, so its bundled deps must be signed by a trusted key
+- `--bundle` applies to source input only. A `.flx` given to `--embed` is embedded byte for byte (that is what preserves its signature), so the flag is refused there - compile the bundle first, then embed it
 
 **Inspecting a bundle:**
 
@@ -323,10 +343,13 @@ target machine (comparable to Go's static binaries).
 flarisvm --embed app.fls myapp
 ./myapp arg1 arg2            # runs standalone - no flaris on PATH, no --libs
 
-# Statically link library dependencies into the same binary
+# Statically link every library the program imports into the same binary
+flarisvm --embed app.fls myapp --bundle
+
+# ...or name the exact files to link
 flarisvm --embed app.fls myapp --bundle='./mylib.flx'
 
-# Embed precompiled bytecode directly
+# Embed precompiled bytecode directly (embedded as-is; --bundle is refused here)
 flarisvm --embed app.flx myapp
 ```
 
@@ -406,16 +429,16 @@ flarisvm --sig-info mylib.flx
 flarisvm --import-key "acme corp" <ed25519-pubkey-hex>
 
 # Compile with all imports bundled into a single .flx
-flarisvm --compile app.fls app.flx --bundle='./data.flx'
+flarisvm --compile app.fls app.flx --bundle
 
-# Bundle with explicit version
+# Bundle a hand-picked set, with an explicit version
 flarisvm --compile app.fls app.flx --bundle='./data.flx' --min-version=2.0.0
 
 # Inspect bundle contents
 flarisvm --disasm app.flx
 
 # Build a single self-contained executable (program + runtime), libs bundled in
-flarisvm --embed app.fls app --bundle='./data.flx'
+flarisvm --embed app.fls app --bundle
 ./app
 
 # Compile with JIT code embedded (for every eligible function)

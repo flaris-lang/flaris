@@ -154,15 +154,28 @@ flarisvm --embed app.fls myapp
 ```
 
 **Statically link library dependencies** with `--bundle`, so the shipped binary
-needs no `~/.flaris/libs`:
+needs no `~/.flaris/libs`. On its own it resolves the program's whole import
+chain and packs exactly that set; with an explicit list it packs the files you
+name:
 
 ```sh
-flarisvm --embed app.fls myapp --bundle='./mylib.flx'
+flarisvm --embed app.fls myapp --bundle                 # every library the program imports
+flarisvm --embed app.fls myapp --bundle='./mylib.flx'   # exactly these files
 ```
 
 **Embed precompiled bytecode** directly (detected by content, not extension):
 
 ```sh
+flarisvm --embed app.flx myapp
+```
+
+Bytecode is embedded byte for byte, which keeps its signature and recorded
+identity intact - so `--bundle` cannot apply to a `.flx` input and is refused
+rather than ignored. Link the dependencies when compiling and embed the bundle
+that produces:
+
+```sh
+flarisvm --compile app.fls app.flx --bundle
 flarisvm --embed app.flx myapp
 ```
 
@@ -1074,7 +1087,7 @@ and have every script resolve it with **no `--libs` flag**.
 
 The second argument is a version string matched against the version embedded in
 the `.flx` file at compile time. Set the version during compilation with
-`--version=` - the default is `1.0.0.0`.
+`--min-version=` - the default is `1.0.0.0`.
 
 ### Version syntax
 
@@ -1164,14 +1177,45 @@ at compile time), it is treated as `any` - code still runs correctly at runtime
 
 ### Static linking (self-contained bundles)
 
-Pass `--bundle='<file1.flx>;<file2.flx>;...'` when compiling to embed all imported `.flx` files directly into
-the output. The result is a single `.flx` that runs anywhere without the
-dependency files present:
+Pass `--bundle` when compiling to embed imported `.flx` files directly into the
+output. The result is a single `.flx` that runs anywhere without the dependency
+files present:
 
 ```sh
-flarisvm --compile app.fls app_bundle.flx --bundle='mathlib.flx' --libs='.'
+flarisvm --compile app.fls app_bundle.flx --bundle --libs='.'
 flarisvm --exec app_bundle.flx          # mathlib.flx not needed on disk
 ```
+
+Bare `--bundle` resolves the dependencies itself: every module the program
+`import`s, then every module those libraries import, and so on, each one looked
+up through the same search path an import would use (`--libs`, then
+`~/.flaris/libs`). The bundle therefore carries exactly the libraries the
+program reaches - no more, no less. A pinned import
+(`library("mathlib", "1.0", "sha256:...")`) is verified while building, so a
+wrong pin fails the build instead of the shipped artifact, and a URL import is
+downloaded and packed like any other dependency.
+
+To choose the set by hand, name the files instead - the two forms can be
+combined, and a file named explicitly is never packed twice:
+
+```sh
+flarisvm --compile app.fls app_bundle.flx --bundle='mathlib.flx;util.flx' --libs='.'
+```
+
+Two things stay outside a bundle:
+
+- **A module imported at runtime** through a direct `VM.Import(name, version)`
+  call. Its name is a computed string, so no build-time walk can see it; the
+  `.flx` must be shipped alongside and found through `--libs` or
+  `~/.flaris/libs`. Only `import ... from library(...)` declarations are
+  bundled.
+- **Native libraries loaded with `Ffi`.** Those are OS shared objects opened at
+  runtime; the build warns when a program uses `Ffi` so the dependency is not a
+  surprise on the target machine.
+
+A bundled dep is held to the same rules as an on-disk one, so an embedded binary
+(whose runtime always enforces `--require-signed`) needs its dependencies signed
+by a trusted key - see *Package signing* under §2.
 
 **Inspect the bundle:**
 
@@ -1187,7 +1231,7 @@ single **native executable** with the runtime included, embed the same bundle
 with `--embed` (see *Self-contained binaries* under §2):
 
 ```sh
-flarisvm --embed app.fls app --bundle='mathlib.flx'
+flarisvm --embed app.fls app --bundle
 ./app                                # standalone - no VM or deps needed
 ```
 
@@ -2910,7 +2954,7 @@ Copy both to the same directory as `flarisvm` (e.g. `/usr/local/bin/`). The wrap
 ```sh
 # Verify installation
 flarispm version
-# flarispm 0.4.0
+# flarispm 0.5.0
 ```
 
 `flarispm.flx` itself is signed with the official flaris-lang.org key - verify any copy with `flarisvm --sig-info flarispm.flx`.
@@ -2950,21 +2994,59 @@ Every project managed by `flarispm` has a `flaris.json` at its root. `flarispm i
     "https://github.com/user/mylib": "main",
     "https://github.com/user/other": "v1.2.0",
     "https://example.com/tool.flx": "direct"
-  },
-  "integrity": {
-    "https://example.com/tool.flx": { "tool.flx": "sha256:..." }
-  },
-  "publishers": {
-    "https://example.com/tool.flx": { "key": "ed25519:...", "signer": "example.com" }
   }
 }
 ```
 
-**Dependency keys** are git clone URLs or direct `.flx` download URLs. **Values** are the branch name, tag, or `"main"` for the default branch (`"direct"` for `.flx` URLs). Version pinning with a tag (`"v1.2.0"`) is recommended for production - it gives you a reproducible build.
+**Dependency keys** are git clone URLs or direct `.flx` download URLs. **Values** are the branch name, tag, or `"main"` for the default branch (`"direct"` for `.flx` URLs).
 
-The `integrity` and `publishers` sections are maintained by `flarispm` itself - they record SHA-256 pins and signed packages' publisher keys (see [Security](#security---integrity-and-publisher-pinning) below). Commit `flaris.json` including these sections: anyone who runs `flarispm install` from your checkout then gets exactly the bytes you pinned, or a hard refusal.
+This file is yours to edit: it says what you asked for. Nothing in it identifies a specific build - `"main"` names different code tomorrow than it does today.
 
 URLs are restricted to `https://` (plus `ssh://`/`git@` for git) - plain-http and exotic git transports are refused, both from the command line and from a cloned manifest.
+
+---
+
+### The `flarispm.lock` Lockfile
+
+Beside the manifest, `flarispm` maintains `flarispm.lock`. Where the manifest records what you *asked for*, the lock records what was actually *resolved*:
+
+```json
+{
+  "lockfileVersion": 1,
+  "packages": {
+    "https://github.com/user/mylib": {
+      "requested": "main",
+      "resolved":  "3216f0772242d1429b57e614c0fcd85117db2389",
+      "direct":    true,
+      "modules":   [ "MyLib.flx" ],
+      "integrity": { "MyLib.fls": "sha256:..." }
+    },
+    "https://example.com/tool.flx": {
+      "requested": "direct",
+      "resolved":  "direct",
+      "direct":    true,
+      "modules":   [ "tool.flx" ],
+      "integrity": { "tool.flx": "sha256:..." },
+      "publisher": { "key": "ed25519:...", "signer": "example.com" }
+    }
+  }
+}
+```
+
+| Field       | Meaning                                                                       |
+|-------------|-------------------------------------------------------------------------------|
+| `requested` | the ref from `flaris.json` - the branch or tag you asked for                   |
+| `resolved`  | the exact commit that ref pointed at when it was pinned (`"direct"` for `.flx`) |
+| `direct`    | `true` when you asked for this package; `false` when it came in as a dependency |
+| `modules`   | the `.flx` filenames this package installs - the basis of collision detection   |
+| `integrity` | source hashes for a git package, exact bytes for a `.flx`                      |
+| `publisher` | the pinned Ed25519 key, for signed `.flx` packages                             |
+
+**Commit pinning is what makes a build reproducible.** `"main"` is a moving target; `resolved` is not. `flarispm install` checks out the recorded commit even when the branch has since moved on, so a colleague cloning your project builds the same code you did. Only `add` and `update` move a pin.
+
+**Commit both files.** The manifest alone reproduces an approximation; the lock reproduces the build.
+
+A project created before the lockfile existed keeps its pins: the first `add`, `install` or `update` moves `integrity` and `publishers` out of `flaris.json` into `flarispm.lock` and reports that it did so.
 
 ---
 
@@ -3022,7 +3104,9 @@ flarispm install
 flarisvm main.fls
 ```
 
-`install` is strictly reproducing what was pinned: every download and every locally compiled module is verified against the recorded `sha256:` pin (and, for signed `.flx` packages, the pinned publisher key) **before** it is moved into `~/.flaris/libs`. A mismatch is a hard refusal - `install` never re-pins. If upstream legitimately released something new, accept it explicitly with `flarispm add` (direct `.flx`) or `flarispm update` (git packages).
+`install` reproduces `flarispm.lock` exactly. For a git package it checks out the recorded commit - not the branch tip - and refuses if that commit no longer exists upstream. Every download and every pinned source is verified against its `sha256:` pin (and, for signed `.flx` packages, the pinned publisher key) **before** anything is moved into `~/.flaris/libs`. A mismatch is a hard refusal: `install` never re-pins. If upstream legitimately released something new, accept it explicitly with `flarispm add` (direct `.flx`) or `flarispm update` (git packages).
+
+Packages the manifest does not list but a dependency requires are installed too, in dependency order - a library's own `flaris.json` declares its dependencies exactly as a project does, and they are on disk before anything that imports them compiles. Cycles terminate, and a chain deeper than 16 is refused.
 
 ---
 
@@ -3043,7 +3127,7 @@ flarispm list
 
 #### `flarispm update [url]`
 
-Pulls the latest commits for all packages (or one specific package), recompiles, and re-pins the integrity hashes to the new build:
+Pulls the latest commits for all packages (or one specific package), recompiles, and moves the lock to what it fetched - the new commit, the new source hashes, and for a signed `.flx` the publisher key it arrived with:
 
 ```sh
 flarispm update                              # update everything
@@ -3051,6 +3135,36 @@ flarispm update https://github.com/user/mylib  # update one package
 ```
 
 > **Note:** If the package is pinned to a tag (`"v1.2.0"`), `git pull` will have nothing new to fetch. To upgrade to a newer tag, use `flarispm remove` then `flarispm add` with the new version.
+
+---
+
+#### `flarispm verify`
+
+Checks what is installed against `flarispm.lock` and changes nothing. Exits non-zero on the first failure, so CI can gate on it:
+
+```sh
+flarispm verify || exit 1
+```
+
+It confirms, per package, that:
+
+- every module the lock says the package owns is present in the library directory;
+- pinned bytes still hash to their pin (`.flx`), and pinned sources still hash to theirs (git);
+- the installed `.flx` of a source package is still what its pinned `.fls` compiles to - a source pin alone would not notice a swapped artifact;
+- a git package's checkout still sits on the locked commit;
+- a signed package still carries a valid signature from the pinned publisher key.
+
+---
+
+#### `flarispm prune`
+
+Removes packages nothing references any more. Reachability is recomputed from `flaris.json` outward through each installed package's own dependencies, so removing a library also retires whatever it alone pulled in:
+
+```sh
+flarispm remove https://github.com/user/mylib
+# [·] 2 package(s) now unreferenced: run 'flarispm prune' to remove.
+flarispm prune
+```
 
 ---
 
@@ -3186,7 +3300,7 @@ flarispm add https://github.com/you/my-package v1.0.0
 
 ### Version Matching
 
-When `flarispm` compiles a package it embeds the `version` field from the package's `flaris.json` into the bytecode using `--version=<ver>`. The `library()` call in your code specifies a version requirement that must match:
+When `flarispm` compiles a package it embeds the `version` field from the package's `flaris.json` into the bytecode using `--min-version=<ver>`. The `library()` call in your code specifies a version requirement that must match:
 
 ```js
 // Matches any 1.x release
@@ -3205,13 +3319,16 @@ If the version in the bytecode does not satisfy the requirement, the VM halts be
 
 ### Security - Integrity and Publisher Pinning
 
-`flarispm` enforces three layers, all recorded in `flaris.json` and all verified while a file is still staged - a package that fails any check never reaches the import path:
+`flarispm` enforces four layers, all recorded in `flarispm.lock` and all verified while a file is still staged - a package that fails any check never reaches the import path:
 
-1. **Exact-bytes integrity (all packages).** Every installed `.flx` gets a `sha256:` pin under `integrity` (trust-on-first-use at `add` time). On every later `install`, the downloaded file - or the locally recompiled module, for git packages - must hash to exactly the pinned value or it is refused. `install` can never move a pin; only an explicit `add` (direct `.flx`) or `update` (git) accepts new bytes.
+1. **Integrity pinning (all packages).** Every package gets a `sha256:` pin under `integrity` (trust-on-first-use at `add` time), and on every later `install` the pin must still match or the package is refused. What is pinned differs by package kind: a direct `.flx` download is pinned by its **exact bytes**, while a git package is pinned by the **`.fls` source** it was compiled from, plus the **exact commit** under `resolved`. `install` can never move a pin; only an explicit `add` or `update` accepts a new value.
 2. **Publisher continuity (signed `.flx` packages).** When a signed `.flx` is added, the publisher's Ed25519 key is pinned under `publishers`. Every later download must be signed by the *same* key - a tampered file, a stripped signature, or a silently swapped key all block the install. Accept an intentional key rotation by re-adding with `--key <new-pubkey>`.
 3. **Publisher verification at add (`--key`).** `flarispm add <url> --key <pubkey>` refuses the package unless it is signed by exactly that key - use it when the publisher advertises their key out-of-band (README, website).
+4. **Module ownership.** Every package installs into one flat directory, so two packages that both ship `Util.fls` would race to own `Util.flx` and the loser's importers would silently bind to the winner's code. The lock records which package owns each installed filename; a second claimant is refused outright, naming both packages. This matters most for transitive dependencies, where you never chose the colliding package yourself.
 
-Git/source packages are compiled locally and left unsigned on purpose: a signature applied at compile time would attest to the *installer*, not the publisher. They are trusted via the git ref plus the sha256 pin of the compiled output instead. Note that the compiled hash embeds debug info (including the local source path), so git-package pins are machine-specific; a pin mismatch on another machine means "recompile differs - review and run `flarispm update`", not necessarily an attack.
+Git/source packages are compiled locally and left unsigned on purpose: a signature applied at compile time would attest to the *installer*, not the publisher. They are trusted via the git ref plus the sha256 pin of their `.fls` source instead.
+
+The source is what gets pinned, not the compiled `.flx`, for two reasons. A compiled artifact embeds debug info including the absolute source path, so its hash differs on every machine - pinning it would make a committed `flaris.json` reproducible only for its author. And the source hash is the more meaningful attestation anyway: it detects upstream source that changed since you pinned it, which is the actual threat. A mismatch means the publisher moved the code under a ref you pinned - review it, then `flarispm update <url>` to accept and re-pin.
 
 Signature inspection is delegated to the VM: `flarisvm --sig-info <file.flx>` prints `unsigned` or `signed|<trusted|valid|invalid>|<pubkey>|<signer>`.
 
