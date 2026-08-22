@@ -1,11 +1,29 @@
 #!/bin/bash
 # test_router_full.sh - Full test suite for Router.fls
-# Run server first: flarisvm --unsafe test_router_full.fls
-# Then: bash test_router_full.sh
+#
+# Self-contained: starts test_router_full.fls, waits for it to listen, drives it
+# with curl, and stops it again. Run from the library repo root:
+#
+#   VM=/path/to/flarisvm bash tests/test_router_full.sh
 
 BASE="http://localhost:8087"
 PASS=0
 FAIL=0
+
+# ---- locate the VM and start the server ----
+VM="${VM:-./flarisvm}"
+VMBIN="${VM%% *}"
+if [ ! -x "$VMBIN" ]; then VM="./flaris"; VMBIN="$VM"; fi
+if [ ! -x "$VMBIN" ]; then echo "no flarisvm/flaris binary - run make first"; exit 1; fi
+
+$VM --unsafe ./tests/test_router_full.fls --libs='./libs' >/tmp/flaris_router_full_srv.log 2>&1 &
+SRV=$!
+trap 'kill $SRV 2>/dev/null' EXIT
+
+for i in $(seq 1 60); do
+    curl -s -o /dev/null "$BASE/" && break
+    sleep 0.1
+done
 
 # ---- helpers ----
 

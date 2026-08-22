@@ -1,0 +1,79 @@
+// bench_http.fls - server-side cost per request for the HttpServer paths that
+// matter: a small dynamic response, JSON, a small static file, a cached
+// revalidation, and a large static file.
+//
+//   flarisvm --libs='./libs' bench/realworld/bench_http.fls
+//
+// Client and server share one VM over loopback, so this measures the server's
+// own work rather than network behaviour. Wall-clock on a loaded machine is
+// worthless here - a contended host moves these numbers by 30% or more between
+// identical runs - so run it on a quiet box, or drive it through
+// run_bench_http.sh, which compares CPU time and prints the noise floor.
+
+import { HttpServer } from library("HttpServer", "1.0");
+
+global _sink = 0;
+global gDir  = "";
+
+fn readResp(c) {
+    if (Stream.WaitReadable(c, 4000) == nil) { return nil; }
+    let statusLine = Stream.ReadLine(c);
+    if (statusLine == nil || statusLine == "") { return nil; }
+    let cl = 0;
+    let h  = Stream.ReadLine(c);
+    while (h != nil && h != "") {
+        if (String.StartsWith(String.ToLower(h), "content-length:")) {
+            cl = Convert.ParseInt(String.Trim(String.Substr(h, 15))) ?? 0;
+        }
+        h = Stream.ReadLine(c);
+    }
+    if (cl > 0) { let b = Stream.ReadBytes(c, cl); _sink = _sink + len(b); }
+    return cl;
+}
+
+fn bench(name:string, c, req:string, n:int) {
+    iter (i from 0 to 50) { Stream.WriteString(c, req); readResp(c); }
+    let t0 = Time.Ticks();
+    iter (i from 0 to n - 1) { Stream.WriteString(c, req); readResp(c); }
+    let us = Time.TicksToUs(Time.Ticks() - t0) / float(n);
+    Console.WriteLine(String.PadRight(name, 34),
+        String.PadLeft(String.FormatArray("{0:.2f}", [us]), 10), " us/req");
+}
+
+fn setup() {
+    let d = Path.Combine(Os.TempDir(), "flaris_bench_http");
+    Os.Execute("mkdir -p '" + d + "'");
+    File.WriteText(Path.Combine(d, "small.txt"), String.Repeat("s", 512));
+    File.WriteText(Path.Combine(d, "big.txt"),   String.Repeat("b", 262144));
+    return d;
+}
+
+fn Main() {
+    gDir = setup();
+
+    let srv = new HttpServer({ port: 0, maxRequestsPerConn: 10000000 });
+    srv.Static("/s", gDir, {});
+    srv.Get("/text", fn(_req, res) { res.Text("hello"); });
+    srv.Get("/json", fn(_req, res) { res.Json({ ok: true, n: 42, name: "flaris" }); });
+    let port = srv.ListenAsync();
+
+    let c = Stream.Connect("tcp", "127.0.0.1", port);
+    Stream.SetTimeout(c, 4000);
+
+    // The ETag of small.txt, so the revalidation case is a real 304.
+    Stream.WriteString(c, "GET /s/small.txt HTTP/1.1\r\nHost: b\r\n\r\n");
+    readResp(c);
+
+    Console.WriteLine("=== HttpServer benchmark ===");
+    bench("dynamic text (5 B)",   c, "GET /text HTTP/1.1\r\nHost: b\r\n\r\n", 20000);
+    bench("dynamic json",         c, "GET /json HTTP/1.1\r\nHost: b\r\n\r\n", 20000);
+    bench("static 512 B",         c, "GET /s/small.txt HTTP/1.1\r\nHost: b\r\n\r\n", 20000);
+    bench("static 512 B, 304",    c,
+          "GET /s/small.txt HTTP/1.1\r\nHost: b\r\nIf-None-Match: \"x\"\r\n\r\n", 20000);
+    bench("static 256 KB",        c, "GET /s/big.txt HTTP/1.1\r\nHost: b\r\n\r\n", 500);
+
+    Stream.Close(c);
+    srv.Stop();
+    Console.WriteLine("_sink=", _sink);
+    return 0;
+}

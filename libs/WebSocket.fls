@@ -1,7 +1,13 @@
 // WebSocket.fls - WebSocket client for Flaris. Requires --unsafe flag.
 // Version: 1.0
 //
-// Implements RFC 6455 client-side handshake and framing.
+// Implements RFC 6455 handshake and framing, for both directions: WebSocket
+// connects as a client, and Ws.Accept upgrades a socket an HTTP server has
+// handed over (see HttpResponse.Hijack in HttpServer). The two differ only in
+// masking - a client masks what it sends, a server must not, and a server must
+// refuse an unmasked frame from a client.
+//
+// Runs in the default sandbox: no --unsafe flag is needed.
 // Supports text and binary frames, ping/pong, clean close, and ws:// + wss://
 // (wss:// uses the OS-native TLS in Stream.ConnectTls - no extra setup).
 // Limitations: no fragmentation, no compression.
@@ -112,6 +118,14 @@ class Ws {
     }
 
     fn static ReadHttpHeaders(sock: stream): object {
+        // Park until the peer has actually replied. Stream.ReadLine returns
+        // what has already arrived rather than waiting, so reading straight
+        // after sending the request yields an empty status line - and against a
+        // server sharing this VM, the server fiber would never get a turn to
+        // write one.
+        if (Stream.WaitReadable(sock, 15000) != true) {
+            return { _statusLine: "" };
+        }
         let statusLine = Stream.ReadLine(sock);
         let headers = { _statusLine: statusLine };
 
@@ -137,21 +151,21 @@ class Ws {
     }
 
     fn static ReadU16BE(buf: block, off: int): int {
-        let b0 = Memory.Read8(buf, off);
-        let b1 = Memory.Read8(buf, off + 1);
+        let b0 = Buffer.ReadU8At(buf, off);
+        let b1 = Buffer.ReadU8At(buf, off + 1);
         return u16((b0 << 8) | b1);
     }
 
     fn static WriteU16BE(buf: block, off: int, v: int) {
-        Memory.Write8(buf, (v >> 8) & 255, off);
-        Memory.Write8(buf, v & 255, off + 1);
+        Buffer.WriteU8At(buf, off, (v >> 8) & 255);
+        Buffer.WriteU8At(buf, off + 1, v & 255);
     }
 
     fn static ReadU64BE(buf: block, off: int): int {
         let v = 0;
         let i = 0;
         while (i < 8) {
-            v = (v << 8) | Memory.Read8(buf, off + i);
+            v = (v << 8) | Buffer.ReadU8At(buf, off + i);
             i += 1;
         }
         return v;
@@ -160,52 +174,52 @@ class Ws {
     fn static WriteU64BE(buf: block, off: int, v: int) {
         let i = 7;
         while (i >= 0) {
-            Memory.Write8(buf, v & 255, off + i);
+            Buffer.WriteU8At(buf, off + i, v & 255);
             v = v >> 8;
             i -= 1;
         }
     }
 
     fn static XorMaskInPlace(buf: block, mask: block, count: int) {
-        let m0 = Memory.Read8(mask, 0);
-        let m1 = Memory.Read8(mask, 1);
-        let m2 = Memory.Read8(mask, 2);
-        let m3 = Memory.Read8(mask, 3);
+        let m0 = Buffer.ReadU8At(mask, 0);
+        let m1 = Buffer.ReadU8At(mask, 1);
+        let m2 = Buffer.ReadU8At(mask, 2);
+        let m3 = Buffer.ReadU8At(mask, 3);
         let i = 0;
         let end4 = count - (count & 3);
         while (i < end4) {
-            Memory.Write8(buf, Memory.Read8(buf, i)   ^ m0, i);
-            Memory.Write8(buf, Memory.Read8(buf, i+1) ^ m1, i+1);
-            Memory.Write8(buf, Memory.Read8(buf, i+2) ^ m2, i+2);
-            Memory.Write8(buf, Memory.Read8(buf, i+3) ^ m3, i+3);
+            Buffer.WriteU8At(buf, i, Buffer.ReadU8At(buf, i)   ^ m0);
+            Buffer.WriteU8At(buf, i+1, Buffer.ReadU8At(buf, i+1) ^ m1);
+            Buffer.WriteU8At(buf, i+2, Buffer.ReadU8At(buf, i+2) ^ m2);
+            Buffer.WriteU8At(buf, i+3, Buffer.ReadU8At(buf, i+3) ^ m3);
             i += 4;
         }
         let ms = [m0, m1, m2, m3];
         while (i < count) {
-            Memory.Write8(buf, Memory.Read8(buf, i) ^ ms[i & 3], i);
+            Buffer.WriteU8At(buf, i, Buffer.ReadU8At(buf, i) ^ ms[i & 3]);
             i += 1;
         }
     }
 
     fn static XorMaskRangeInPlace(buf: block, start: int, mask: block, count: int) {
-        let m0 = Memory.Read8(mask, 0);
-        let m1 = Memory.Read8(mask, 1);
-        let m2 = Memory.Read8(mask, 2);
-        let m3 = Memory.Read8(mask, 3);
+        let m0 = Buffer.ReadU8At(mask, 0);
+        let m1 = Buffer.ReadU8At(mask, 1);
+        let m2 = Buffer.ReadU8At(mask, 2);
+        let m3 = Buffer.ReadU8At(mask, 3);
         let i = 0;
         let end4 = count - (count & 3);
         while (i < end4) {
             let off = start + i;
-            Memory.Write8(buf, Memory.Read8(buf, off)   ^ m0, off);
-            Memory.Write8(buf, Memory.Read8(buf, off+1) ^ m1, off+1);
-            Memory.Write8(buf, Memory.Read8(buf, off+2) ^ m2, off+2);
-            Memory.Write8(buf, Memory.Read8(buf, off+3) ^ m3, off+3);
+            Buffer.WriteU8At(buf, off, Buffer.ReadU8At(buf, off)   ^ m0);
+            Buffer.WriteU8At(buf, off+1, Buffer.ReadU8At(buf, off+1) ^ m1);
+            Buffer.WriteU8At(buf, off+2, Buffer.ReadU8At(buf, off+2) ^ m2);
+            Buffer.WriteU8At(buf, off+3, Buffer.ReadU8At(buf, off+3) ^ m3);
             i += 4;
         }
         let ms = [m0, m1, m2, m3];
         while (i < count) {
             let off = start + i;
-            Memory.Write8(buf, Memory.Read8(buf, off) ^ ms[i & 3], off);
+            Buffer.WriteU8At(buf, off, Buffer.ReadU8At(buf, off) ^ ms[i & 3]);
             i += 1;
         }
     }
@@ -215,6 +229,62 @@ class Ws {
         let v = headers[key];
         if (v == nil) return "";
         return str(v);
+    }
+
+    // Does this request want to become a WebSocket?
+    fn static IsUpgrade(headers: object): bool {
+        if (headers == nil) return false;
+        let up = String.ToLower(Ws.HeaderGet(headers, "upgrade"));
+        let cn = String.ToLower(Ws.HeaderGet(headers, "connection"));
+        let k  = Ws.HeaderGet(headers, "sec-websocket-key");
+        return up == "websocket" && String.Contains(cn, "upgrade") && String.Length(k) > 0;
+    }
+
+    // Server side of the RFC 6455 handshake, on a socket the HTTP server has
+    // handed over. `headers` is the request header map with lowercased names -
+    // exactly what HttpServer gives a handler.
+    //
+    // Writes the 101 and returns a connection, or writes the appropriate refusal
+    // and returns nil. The caller owns the socket either way.
+    //
+    //   srv.Get("/ws", fn(req, res) {
+    //       let sock = res.Hijack();
+    //       let ws   = Ws.Accept(sock, req.headers);
+    //       if (ws == nil) { Stream.Close(sock); return; }
+    //       ...
+    //   });
+    fn static Accept(sock: stream, headers: object) {
+        if (!Ws.IsUpgrade(headers)) {
+            Stream.WriteAll(sock, "HTTP/1.1 400 Bad Request\r\n"
+                + "Content-Length: 0\r\nConnection: close\r\n\r\n");
+            return nil;
+        }
+        // Only version 13 exists; anything else is told what we speak.
+        let ver = String.Trim(Ws.HeaderGet(headers, "sec-websocket-version"));
+        if (ver != "13") {
+            Stream.WriteAll(sock, "HTTP/1.1 426 Upgrade Required\r\n"
+                + "Sec-WebSocket-Version: 13\r\n"
+                + "Content-Length: 0\r\nConnection: close\r\n\r\n");
+            return nil;
+        }
+
+        let key = String.Trim(Ws.HeaderGet(headers, "sec-websocket-key"));
+        Stream.WriteAll(sock, "HTTP/1.1 101 Switching Protocols\r\n"
+            + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            + "Sec-WebSocket-Accept: " + Ws.MakeAccept(key) + "\r\n\r\n");
+
+        let ws = new WebSocketClient();
+        ws.sock        = sock;
+        ws.closed      = false;
+        ws.closeCode   = 0;
+        ws.closeReason = "";
+        // The two directions are not symmetric: a server never masks what it
+        // sends, and MUST reject an unmasked frame from a client. Unmasked
+        // client frames are what make WebSocket traffic usable for poisoning
+        // intermediary caches, which is the whole reason masking exists.
+        ws.maskOut     = false;
+        ws.requireMask = true;
+        return ws;
     }
 
     fn static ValidateControlPayload(opcode:int, payloadLen:int) {
@@ -239,6 +309,8 @@ class WebSocketClient {
     let closeCode = 0; 
     let closeReason: string = nil; 
     let closed = nil; 
+    let maskOut = true;      // clients mask outgoing frames; servers must not
+    let requireMask = false; // servers must refuse an unmasked client frame
     fn static Connect(host: string, port: int, path, headers, secure): instance {
         // wss:// and ws:// differ only in how the stream is opened; the framing
         // below is identical for both.
@@ -424,30 +496,37 @@ class WebSocketClient {
             headerLen = 10;
         }
 
-        let mask = Crypto.RandomBytes(4);
-        let frame = Buffer.Create(headerLen + 4 + n, 1);
+        // A server sends unmasked frames and carries no masking key at all, so
+        // the frame is four bytes shorter and the mask bit stays clear.
+        let maskLen = this.maskOut ? 4 : 0;
+        let maskBit = this.maskOut ? 0x80 : 0x00;
+
+        let frame = Buffer.Create(headerLen + maskLen + n, 1);
         Buffer.Fill(frame, 0);
 
-        Memory.Write8(frame, 0x80 | (opcode & 0x0F), 0);
+        Buffer.WriteU8At(frame, 0, 0x80 | (opcode & 0x0F));
 
         if (n < 126) {
-            Memory.Write8(frame, 0x80 | n, 1);
+            Buffer.WriteU8At(frame, 1, maskBit | n);
         } else if (n <= 65535) {
-            Memory.Write8(frame, 0x80 | 126, 1);
+            Buffer.WriteU8At(frame, 1, maskBit | 126);
             Ws.WriteU16BE(frame, 2, n);
         } else {
-            Memory.Write8(frame, 0x80 | 127, 1);
+            Buffer.WriteU8At(frame, 1, maskBit | 127);
             Ws.WriteU64BE(frame, 2, n);
         }
 
-        let maskOff = headerLen;
-        let payloadOff = headerLen + 4;
+        let payloadOff = headerLen + maskLen;
 
-        Buffer.Copy(mask, 0, frame, maskOff, 4);
-
-        if (n > 0) {
+        if (this.maskOut) {
+            let mask = Crypto.RandomBytes(4);
+            Buffer.Copy(mask, 0, frame, headerLen, 4);
+            if (n > 0) {
+                Buffer.Copy(data, 0, frame, payloadOff, n);
+                Ws.XorMaskRangeInPlace(frame, payloadOff, mask, n);
+            }
+        } else if (n > 0) {
             Buffer.Copy(data, 0, frame, payloadOff, n);
-            Ws.XorMaskRangeInPlace(frame, payloadOff, mask, n);
         }
 
         return Stream.WriteAll(this.sock, frame);
@@ -464,8 +543,8 @@ class WebSocketClient {
             throw(Exception.IOError, "Failed to read WebSocket frame header");
         }
 
-        let b0 = Memory.Read8(head, 0);
-        let b1 = Memory.Read8(head, 1);
+        let b0 = Buffer.ReadU8At(head, 0);
+        let b1 = Buffer.ReadU8At(head, 1);
 
         let fin = (b0 & 0x80) != 0;
         let rsv = b0 & 0x70;
@@ -499,6 +578,12 @@ class WebSocketClient {
 
         if ((opcode == Ws.OpcodeClose() || opcode == Ws.OpcodePing() || opcode == Ws.OpcodePong()) && !fin) {
             throw(Exception.RuntimeError, "Fragmented control frames not allowed");
+        }
+
+        // RFC 6455 5.1: every frame a client sends must be masked. A server
+        // that accepts an unmasked one has to fail the connection.
+        if (this.requireMask && !masked) {
+            throw(Exception.RuntimeError, "Unmasked frame from client");
         }
 
         let maskKey = nil;
@@ -604,7 +689,23 @@ class WebSocketClient {
         }
         let ready = Stream.WaitReadable(this.sock, timeoutMs ?? -1);
         if (ready != true) { return nil; }      // timed out
-        return this.Receive();
+
+        // A peer that vanishes mid-frame, and a peer that sends something
+        // malformed, both end the connection - RFC 6455 says to fail it either
+        // way. Report that as a close so a server loop reads
+        // "while (ws.IsOpen()) { let m = ws.ReceiveWhenReady(t); if (m == nil) break; }"
+        // instead of wrapping every iteration in try/catch. The reason is kept
+        // on the connection: CloseCode() is 1006 (abnormal closure) and
+        // CloseReason() carries the detail.
+        try {
+            return this.Receive();
+        } catch (e) {
+            this.closed      = true;
+            this.closeCode   = (this.closeCode != 0) ? this.closeCode : 1006;
+            this.closeReason = str(e);
+            if (Stream.IsOpen(this.sock)) { Stream.Close(this.sock); }
+            return nil;
+        }
     }
 
     fn ReceiveTextWhenReady(timeoutMs?): string {
@@ -669,4 +770,4 @@ class WebSocket {
     }
 }
 
-export { WebSocket, Ws };
+export { WebSocket, Ws, WebSocketClient };

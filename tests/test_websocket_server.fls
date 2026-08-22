@@ -1,0 +1,181 @@
+// test_websocket_server.fls - the server side of RFC 6455: HttpServer hands the
+// socket over with res.Hijack(), Ws.Accept() completes the handshake, and the
+// library's own client talks to it. Both ends run in this one VM on fibers, so
+// the test needs no external client and no --unsafe flag.
+//
+// Run: flarisvm ./tests/test_websocket_server.fls --libs='./libs'
+
+import { HttpServer } from library("HttpServer", "1.0");
+import { WebSocket, Ws } from library("WebSocket", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global gPort       = 0;
+global gLastPath   = "";
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.Error("  FAIL: ", msg); }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.Error("  FAIL: ", msg, " - expected [", expected, "] got [", actual, "]");
+    }
+}
+
+fn buildServer() {
+    let srv = new HttpServer({ port: 0, idleTimeoutMs: 1000, readTimeoutMs: 3000 });
+
+    // Still an ordinary HTTP server alongside the upgrade route.
+    srv.Get("/plain", fn(_req, res) { res.Text("http"); });
+
+    srv.Get("/ws", fn(req, res) {
+        if (!Ws.IsUpgrade(req.headers)) { res.Error(400, "expected a websocket upgrade"); return; }
+        gLastPath = req.path;
+        let sock = res.Hijack();
+        let ws   = Ws.Accept(sock, req.headers);
+        if (ws == nil) { Stream.Close(sock); return; }
+
+        while (ws.IsOpen()) {
+            let m = ws.ReceiveWhenReady(4000);
+            if (m == nil) { break; }
+            if (m.Opcode == Ws.OpcodeClose()) { break; }
+            if (m.Opcode == Ws.OpcodeText())   { ws.SendText("echo:" + m.Text); }
+            if (m.Opcode == Ws.OpcodeBinary()) { ws.SendBinary(m.Payload); }
+        }
+    });
+    return srv;
+}
+
+fn test_handshake_and_echo() {
+    Console.WriteLine("== handshake / echo ==");
+
+    let ws = WebSocket.Connect("127.0.0.1", gPort, "/ws", nil, false);
+    check(ws != nil, "client connected");
+    check(ws.IsOpen(), "connection open after the handshake");
+    checkEq(gLastPath, "/ws", "the handler saw the upgrade request");
+
+    ws.SendText("hello");
+    let m = ws.ReceiveWhenReady(4000);
+    check(m != nil, "a reply arrived");
+    checkEq(m.Opcode, Ws.OpcodeText(), "text opcode");
+    checkEq(m.Text, "echo:hello", "text echoed");
+
+    // A server must not mask what it sends; a client must. The client checks
+    // the first half here, and the frame it received proves the second.
+    checkEq(m.Masked, false, "the server's frame is unmasked, as RFC 6455 requires");
+
+    // Long enough to need the 2-byte length form.
+    ws.SendText(String.Repeat("y", 400));
+    let m2 = ws.ReceiveWhenReady(4000);
+    checkEq(String.Length(m2.Text), 405, "400-byte payload round-trips (extended length)");
+
+    // Binary, including NUL and high bytes.
+    let b = Buffer.Create(256, 1);
+    iter (i from 0 to 255) { Buffer.WriteU8At(b, i, i); }
+    ws.SendBinary(b);
+    let m3 = ws.ReceiveWhenReady(4000);
+    checkEq(m3.Opcode, Ws.OpcodeBinary(), "binary opcode");
+    checkEq(m3.Length, 256, "binary length");
+    let ok = true;
+    iter (i from 0 to 255) { if (Buffer.ReadU8At(m3.Payload, i) != i) { ok = false; } }
+    check(ok, "binary payload byte-exact");
+
+    ws.Close(1000, "done");
+    check(!ws.IsOpen(), "closed after Close()");
+    return 0;
+}
+
+fn test_ping() {
+    Console.WriteLine("== ping / pong ==");
+    let ws = WebSocket.Connect("127.0.0.1", gPort, "/ws", nil, false);
+    ws.Ping(nil);
+    ws.SendText("after-ping");
+
+    // The server answers the ping itself, so a pong arrives first; pongs are
+    // delivered to the caller rather than swallowed. Read on until the echo.
+    let sawPong = false;
+    let text    = nil;
+    let tries   = 0;
+    while (text == nil && tries < 5) {
+        tries = tries + 1;
+        let m = ws.ReceiveWhenReady(4000);
+        if (m == nil) { tries = 5; }
+        else if (m.Opcode == Ws.OpcodePong()) { sawPong = true; }
+        else if (m.Opcode == Ws.OpcodeText()) { text = m.Text; }
+    }
+    check(sawPong, "the server answered the ping with a pong");
+    checkEq(text, "echo:after-ping", "the echo still arrives after a ping exchange");
+    ws.Close(1000, "");
+    return 0;
+}
+
+fn test_refusals() {
+    Console.WriteLine("== refusals ==");
+
+    // A plain GET to the upgrade route is not an upgrade.
+    let c = Stream.Connect("tcp", "127.0.0.1", gPort);
+    Stream.SetTimeout(c, 3000);
+    Stream.WriteAll(c, "GET /ws HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    Stream.WaitReadable(c, 3000);
+    let line = Stream.ReadLine(c);
+    check(String.Contains(line ?? "", "400"), "a non-upgrade request is refused");
+    Stream.Close(c);
+
+    // The wrong protocol version is told which one we speak.
+    let c2 = Stream.Connect("tcp", "127.0.0.1", gPort);
+    Stream.SetTimeout(c2, 3000);
+    Stream.WriteAll(c2, "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        + "Connection: Upgrade\r\nSec-WebSocket-Key: abcdefghijklmnop\r\n"
+        + "Sec-WebSocket-Version: 8\r\n\r\n");
+    Stream.WaitReadable(c2, 3000);
+    let l2 = Stream.ReadLine(c2);
+    check(String.Contains(l2 ?? "", "426"), "an unsupported version gets 426 Upgrade Required");
+    Stream.Close(c2);
+
+    // The rest of the server keeps working.
+    let c3 = Stream.Connect("tcp", "127.0.0.1", gPort);
+    Stream.SetTimeout(c3, 3000);
+    Stream.WriteAll(c3, "GET /plain HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    Stream.WaitReadable(c3, 3000);
+    check(String.Contains(Stream.ReadLine(c3) ?? "", "200"), "ordinary routes still serve");
+    Stream.Close(c3);
+    return 0;
+}
+
+fn test_abrupt_disconnect() {
+    Console.WriteLine("== abrupt disconnect ==");
+    // A peer that vanishes without a close frame must read as a close, not as
+    // an exception - otherwise every server loop needs a try/catch.
+    let ws = WebSocket.Connect("127.0.0.1", gPort, "/ws", nil, false);
+    ws.SendText("bye");
+    ws.ReceiveWhenReady(4000);
+    ws.Abort();                       // drop the socket with no close frame
+    check(!ws.IsOpen(), "aborted connection reports closed");
+    return 0;
+}
+
+fn Main() {
+    Console.WriteLine("=== WebSocket server tests ===");
+    let srv = buildServer();
+    gPort = srv.ListenAsync();
+
+    test_handshake_and_echo();
+    test_ping();
+    test_refusals();
+    test_abrupt_disconnect();
+
+    Console.WriteLine("==============================");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    srv.Stop();
+    Fiber.Sleep(700);
+    if (testsFailed > 0) {
+        Console.Error("Some WebSocket server tests FAILED.");
+        return testsFailed;
+    }
+    Console.Ok("All WebSocket server tests passed!");
+    return 0;
+}

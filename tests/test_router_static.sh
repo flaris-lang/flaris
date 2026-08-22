@@ -23,9 +23,10 @@ check_contains() { # label needle haystack
 }
 
 # ---- locate the VM ----
-VM="./flarisvm"
-[ -x "$VM" ] || VM="./flaris"
-if [ ! -x "$VM" ]; then echo "no flarisvm/flaris binary - run make first"; exit 1; fi
+VM="${VM:-./flarisvm}"
+VMBIN="${VM%% *}"
+if [ ! -x "$VMBIN" ]; then VM="./flaris"; VMBIN="$VM"; fi
+if [ ! -x "$VMBIN" ]; then echo "no flarisvm/flaris binary - run make first"; exit 1; fi
 
 # ---- build the web root ----
 rm -rf "$ROOT"
@@ -36,10 +37,17 @@ printf '{"data":"JSON_MARKER"}'             > "$ROOT/data.json"
 printf '<!doctype html><h1>SUB_PAGE</h1>'   > "$ROOT/sub/page.html"
 # Binary file with embedded NUL bytes (exercises block body + exact length).
 printf '\x00\x01\x02\x00\xff\xfe\x00PNGDATA\x00' > "$ROOT/bin.dat"
+# Files that must never be served, and a symlink escaping the root.
+printf 'SECRET_TOKEN=hunter2' > "$ROOT/.env"
+mkdir -p "$ROOT/.git" && printf 'GIT_SECRET' > "$ROOT/.git/config"
+mkdir -p "$ROOT/.well-known" && printf 'WELLKNOWN_OK' > "$ROOT/.well-known/probe.txt"
+printf 'OUTSIDE_THE_ROOT' > "/tmp/flaris_static_outside.txt"
+ln -sf /tmp/flaris_static_outside.txt "$ROOT/escape.txt"
+ln -sf /tmp "$ROOT/escapedir"
 ORIG_SUM=$(cksum < "$ROOT/bin.dat" | awk '{print $1, $2}')
 
 # ---- start the server ----
-"$VM" --unsafe ./tests/test_router_static.fls --libs='./libs' >/tmp/flaris_static_srv.log 2>&1 &
+$VM --unsafe ./tests/test_router_static.fls --libs='./libs' >/tmp/flaris_static_srv.log 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 
@@ -94,6 +102,25 @@ else
     fail "GET /static/bin.dat corrupted - orig=$ORIG_SUM got=$GOT_SUM"
 fi
 
+# --- exposure: dotfiles, symlinks ---
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/static/.env")
+check_status "GET /static/.env blocked" "404" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/static/.git/config")
+check_status "GET /static/.git/config blocked" "404" "$STATUS"
+BODY=$(curl -s "$BASE/static/.well-known/probe.txt")
+check_contains ".well-known still reachable" "WELLKNOWN_OK" "$BODY"
+
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/static/escape.txt")
+check_status "symlink out of the root blocked" "404" "$STATUS"
+BODY=$(curl -s "$BASE/static/escape.txt")
+if echo "$BODY" | grep -q 'OUTSIDE_THE_ROOT'; then
+    fail "symlink target was disclosed"
+else
+    pass "symlink target not disclosed"
+fi
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/static/escapedir/flaris_static_outside.txt")
+check_status "symlinked directory not traversed" "404" "$STATUS"
+
 # --- CORS: headers emitted on a normal response ---
 HDRS=$(curl -s -D - -o /dev/null -H "Origin: https://app.example.com" "$BASE/api/ping")
 check_contains "CORS Allow-Origin on GET"  "Access-Control-Allow-Origin: https://app.example.com" "$HDRS"
@@ -111,5 +138,5 @@ echo "================================================"
 echo " Results: $PASS passed, $FAIL failed"
 echo "================================================"
 kill $SRV 2>/dev/null
-rm -rf "$ROOT" /tmp/fs_body /tmp/fs_bin
+rm -rf "$ROOT" /tmp/fs_body /tmp/fs_bin /tmp/flaris_static_outside.txt
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

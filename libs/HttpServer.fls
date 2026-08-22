@@ -4,8 +4,8 @@
 //
 // The whole server is built on the Stream socket API, so
 // it runs in the default sandbox. It handles keep-alive, chunked request bodies
-// and streamed responses, and hands you the connection. Router.fls builds on it
-// when you want routing, middleware, JWT and CORS.
+// and streamed responses, terminates TLS, and hands you the connection.
+// Router.fls builds on it when you want routing, middleware, JWT and CORS.
 //
 // Usage:
 //   import { HttpServer } from library("HttpServer", "1.0");
@@ -18,6 +18,24 @@
 //
 //   // Or take every request yourself:
 //   srv.OnRequest(fn(req, res) { res.Text(req.method + " " + req.path); });
+//
+// HTTPS:
+//   Pass `tls` and the same server serves https:// - the handshake runs on the
+//   OS TLS stack (Secure Transport / OpenSSL / SChannel), so there is no
+//   OpenSSL install, no --unsafe flag and no proxy in front:
+//
+//   let srv = new HttpServer({
+//       port: 8443,
+//       tls: { pkcs12File: "server.p12", password: "secret" }
+//   });
+//   srv.Get("/", fn(req, res) { res.Text("over TLS"); });
+//   srv.Listen();
+//
+//   Each handshake runs on its own connection fiber, so a slow client delays
+//   only itself. Handshake failures are routine on a public port (scanners,
+//   plain http:// sent to an https:// URL) and are dropped silently unless you
+//   register OnTlsError. A build that cannot terminate TLS fails at Listen()
+//   rather than quietly serving in the clear.
 //
 // Concurrency:
 //   Each accepted connection is served on its own fiber, so a slow client does
@@ -35,17 +53,43 @@
 //       maxHeaders           header count cap                  (default 100)
 //       maxHeaderBytes       total header-block cap            (default 65536)
 //       maxBodyBytes         request-body cap                  (default 8388608)
-//       maxConnections       concurrent connections            (default 64)
+//       maxConnections       concurrent connections            (default 512)
+//                            Bounds memory and descriptors - keep it under the
+//                            process descriptor limit (`ulimit -n`, 1024 on
+//                            many Linux systems). It is not slow-client
+//                            protection: a stalled peer is refused on its own.
+//       streamBodies         leave the body on the socket for   (default false)
+//                            the handler to pull - see Uploads
+//       maxUploadBytes       ceiling for a streamed body        (default 0 = none)
 //       serverName           Server: header                    (default "Flaris")
+//       tls                  AcceptTls options -> serve HTTPS  (default nil)
+//                            { pkcs12File, password } on any platform, or
+//                            { certFile, keyFile } (PEM, OpenSSL only);
+//                            handshakeTimeoutMs (default 10000) bounds the
+//                            handshake and every later read/write;
+//                            requireClientCert demands a client certificate.
 //   .Get / .Post / .Put / .Delete / .Patch / .Head(pattern, handler)
 //   .Route(method, pattern, handler)
 //   .OnRequest(handler)        - catch-all; runs when no route matches
 //   .NotFound(handler)         - custom 404
 //   .OnError(handler)          - fn(req, res, err); default sends a 500
-//   .Static(urlPrefix, rootDir, opts?)  - { index:"index.html", cacheControl }
+//   .OnTlsError(handler)       - fn(peer, message); default drops silently
+//   .OnAccess(handler)         - fn(entry) once per completed request; pair
+//                                with HttpStatus.CombinedLogLine(entry)
+//   .InFlight()  .ActiveConnections()
+//   .IsSecure()                - true when this server terminates TLS
+//   .Static(urlPrefix, rootDir, opts?)
+//       index          directory index file            (default "index.html")
+//       cacheControl   Cache-Control header            (default none)
+//       gzip           serve a precompressed "<file>.gz" sidecar to clients
+//                      that accept gzip                (default false)
 //   .Listen()                  - bind and serve; blocks the calling fiber
 //   .ListenAsync()             - bind, then serve on a fiber; returns at once
-//   .Stop()                    - stop accepting and close the listen socket
+//   .Stop(timeoutMs?)          - stop accepting, then wait for the requests
+//                                already in flight to finish (default 5000 ms).
+//                                Returns true if they all completed. Idle
+//                                keep-alive connections are not waited on -
+//                                they carry no work.
 //   .IsRunning()  .Port()      - Port() is the real port after binding with 0
 //
 //   Patterns: "/users/:id" captures a segment into req.Param("id");
@@ -54,23 +98,98 @@
 // Handler signature: fn(req, res)
 //
 // HttpRequest:
-//   .method .path .rawPath .version .headers .body .peer
+//   .method .path .rawPath .version .headers .body .peer .secure
 //   .Header(name, default?)  - case-insensitive lookup
 //   .Query(name, default?)   - decoded query-string parameter
 //   .Param(name)             - captured path parameter
+//   .Cookies()  .Cookie(name, default?)   - parsed Cookie header
+//   .Form()     .FormValue(name, default?) - urlencoded body fields
+//   .Multipart(opts?)        - multipart/form-data; see Uploads below
 //   .Text()                  - body as a string
 //   .Json()                  - body parsed as JSON (nil when malformed)
 //   .ContentLength()  .IsKeepAlive()
+//   .HasPendingBody()        - a streamed body not yet read
+//   .ReadBody(sink, max?)    - stream it; sink(block) -> bool
+//   .SaveBody(path, max?)    - stream it straight to a file
 //
 // HttpResponse:
 //   .Status(code)  .Header(name, value)  .ContentType(ct)   - chainable
 //   .Text(s, status?)   .Html(s, status?)   .Json(value, status?)
 //   .Bytes(block, contentType?, status?)    - binary body, exact length
 //   .File(path, contentType?)               - send a file (MIME by extension)
+//   .SetCookie(name, value, opts?)  .ClearCookie(name, opts?)
+//       opts: { maxAge, expires, path, domain, httpOnly, secure, sameSite }
+//       Defaults are the safe ones - HttpOnly, SameSite=Lax, and Secure
+//       whenever the request arrived over TLS. Values are percent-encoded, so
+//       a ";" or a newline in one cannot introduce a header. Repeated calls
+//       produce repeated Set-Cookie lines.
 //   .Redirect(url, status?)  .NoContent()   .Error(status, message)
 //   .StartChunked(contentType?)  .WriteChunk(data)  .EndChunked()
 //                            - stream a response of unknown length
 //   .Sent()                  - true once the response has been written
+//   .Hijack()                - take the raw socket; the server stops managing
+//                              the connection entirely (protocol upgrades)
+//
+// Files:
+//   .File() and the static mounts answer with the validators a browser needs:
+//   ETag (from size and mtime, so it changes exactly when the bytes do) and
+//   Last-Modified. A conditional request that still matches gets 304 with no
+//   body and no file read - If-None-Match decides alone when present, and
+//   If-Modified-Since is consulted only when no entity tag was offered. Byte
+//   ranges are served as 206 with Content-Range ("bytes=0-499", "bytes=500-"
+//   and "bytes=-500"; an unsatisfiable range is 416, a multi-range request is
+//   answered whole, and If-Range guards the slice against a changed entity).
+//   A body over 16 KB goes out with Stream.SendFile, so the kernel moves it and
+//   a file larger than memory still streams; below that it is read and sent with
+//   the header in one write, which costs less than the extra syscall SendFile
+//   would add. HEAD never touches the file at all.
+//
+//   Compression is by precompressed sidecar only: mount with { gzip: true } and
+//   put "app.js.gz" next to "app.js" (`gzip -k -9 app.js`, or any build step).
+//   The sidecar is used only when the client accepts gzip and the .gz is no
+//   older than the original, and it carries its own ETag plus Vary. Compressing
+//   per request is deliberately absent: Deflate runs about 11 MB/s here, so a
+//   single 300 KB file would stall every other connection on this VM for ~30 ms.
+//
+// Responses:
+//   Every response carries Date (formatted once per second and reused) and
+//   Server. Header block and body go out in a single write when the body is at
+//   or below 16 KB, so the common small response costs one syscall and one
+//   packet; larger bodies take a second write rather than a second copy. Every
+//   write is retried to completion - a short write on a keep-alive connection
+//   would desynchronise framing for the next request on that socket.
+//
+// Uploads:
+//   By default a request body is read into memory before the handler runs, so
+//   maxBodyBytes caps what a client can send. Construct with
+//   { streamBodies: true } and the body is left on the socket instead:
+//
+//   let srv = new HttpServer({ port: 8080, streamBodies: true });
+//   srv.Post("/upload", fn(req, res) {
+//       let n = req.SaveBody("/var/tmp/incoming.bin");   // never held in memory
+//       res.Json({ bytes: n });
+//   });
+//
+//   Text() and Json() still work - they drain a pending body on demand, still
+//   bounded by maxBodyBytes. ReadBody() and SaveBody() are bounded by
+//   maxUploadBytes instead, so an upload can exceed what you would ever buffer.
+//   A handler that returns without reading the body forces the connection
+//   closed, since the bytes still owed would otherwise frame the next request.
+//
+//   Note: a closure captures scalars by value, so a sink cannot count into a
+//   plain local. Use ReadBody's return value, or accumulate into an object.
+//
+//   For an HTML form with a file input, req.Multipart() parses the body the
+//   same streaming way:
+//
+//   srv.Post("/upload", fn(req, res) {
+//       let mp = req.Multipart({ dir: "/var/tmp/uploads" });
+//       if (!mp.ok) { res.Error(400, mp.error); return; }
+//       res.Json({ user: mp.fields.user, files: len(mp.files) });
+//   });
+//
+//   Each file is written under a name this server picks; the client-supplied
+//   `filename` is reported for display and never used to build a path.
 //
 // Limits and safety:
 //   Request line, header count/size and body size are all capped; a request
@@ -80,8 +199,27 @@
 //   the VM: the accept loop and the keep-alive idle wait park the fiber via
 //   Stream.WaitReadable, and every blocking read is bounded by readTimeoutMs.
 //
-// Not implemented: TLS (put it behind a TLS-terminating proxy), HTTP/2, and
-// request pipelining (a second request is read only after the first replies).
+// WebSockets:
+//   res.Hijack() hands the socket over, and the WebSocket library does the
+//   RFC 6455 handshake on it:
+//
+//   import { Ws } from library("WebSocket", "1.0");
+//   srv.Get("/ws", fn(req, res) {
+//       let sock = res.Hijack();
+//       let ws   = Ws.Accept(sock, req.headers);   // writes the 101, or refuses
+//       if (ws == nil) { Stream.Close(sock); return; }
+//       while (ws.IsOpen()) {
+//           let m = ws.ReceiveWhenReady(30000);    // parks this fiber only
+//           if (m == nil) { break; }
+//           ws.SendText(m.Text);
+//       }
+//   });
+//
+//   The upgraded socket no longer counts against maxConnections, and closing it
+//   is the caller's job.
+//
+// Not implemented: HTTP/2, and request pipelining (a second request is read
+// only after the first replies).
 // =============================================================================
 
 // A method named Json or File shadows the namespace of the same name for the
@@ -93,6 +231,407 @@ fn _jsonEncode(value): string { return Json.Stringify(value); }
 fn _jsonDecode(text:string)   { return Json.Parse(text); }
 fn _fileExists(path:string): bool { return File.Exists(path); }
 fn _fileBytes(path:string)        { return File.ReadAllBytes(path); }
+fn _fileStat(path:string)         { return File.Stat(path); }
+
+// RFC 9110 token characters - the only ones allowed in a header name (or a
+// method). Anything else and this server and a proxy in front may disagree
+// about what the header is even called, which is how a smuggled request hides.
+// Compared as bytes: String.CharAt yields a char, which will not index into a
+// string of allowed characters, and comparing one against a one-character
+// *string* silently never matches.
+fn _isToken(s:string): bool {
+    let n:int = String.Length(s);
+    if (n == 0) { return false; }
+    let b = Buffer.FromString(s);
+    let i:int = 0;
+    while (i < n) {
+        let v:int = Buffer.ReadU8At(b, i);
+        let ok:bool = (v >= 97 && v <= 122)                              // a-z
+                   || (v >= 65 && v <= 90)                               // A-Z
+                   || (v >= 48 && v <= 57)                               // 0-9
+                   || v == 33 || v == 35 || v == 36 || v == 37 || v == 38 // ! # $ % &
+                   || v == 39 || v == 42 || v == 43 || v == 45 || v == 46 // ' * + - .
+                   || v == 94 || v == 95 || v == 96                       // ^ _ `
+                   || v == 124 || v == 126;                               // | ~
+        if (!ok) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// Content-Length is DIGIT only. Convert.ParseInt would otherwise accept "+5"
+// and "0x10", neither of which any proxy in front will read the same way.
+// "42" -> "42"; "42, 42" -> "42"; "42, 43" -> nil.
+//
+// RFC 9110 8.6: duplicate Content-Length values that agree may have been
+// combined by an upstream processor, and a recipient must either reject them or
+// replace them with the single value. Collapsing is the more interoperable
+// branch and costs nothing - values that agree cannot be disagreed about. Values
+// that differ are the dangerous case and RFC 9112 6.3 requires a 400.
+fn _collapseCL(v:string) {
+    if (!String.Contains(v, ",")) {
+        return _isDigits(v) ? v : nil;
+    }
+    let first = nil;
+    foreach (p in String.Split(v, ",")) {
+        let t = String.Trim(p);
+        if (!_isDigits(t)) { return nil; }
+        if (first == nil) { first = t; }
+        else if (t != first) { return nil; }
+    }
+    return first;
+}
+
+// A Host must be a real authority: no whitespace, no control bytes, not empty.
+// RFC 9112 3.2 requires a 400 for an invalid field value just as it does for a
+// missing one.
+fn _isValidHost(v:string): bool {
+    if (String.Length(v) == 0) { return false; }
+    if (String.Contains(v, " ") || String.Contains(v, "\t")) { return false; }
+    return !_hasCtlBytes(v);
+}
+
+// Validate one header line and return the index of its colon, or a negative
+// code: -1 malformed / bad name, -2 obsolete line folding, -3 a bare CR.
+//
+// One allocation and one pass. Done separately this was a String.Contains for
+// the CR, two String.StartsWith for the fold, a String.IndexOf, a String.Left
+// to cut the name out, and then a second buffer inside _isToken - per header,
+// on every request. Real requests carry ten or more headers, so this is the
+// hot loop of the whole parser.
+fn _validateHeaderLine(hl:string): int {
+    let n:int = String.Length(hl);
+    if (n == 0) { return -1; }
+    let b = Buffer.FromString(hl);
+
+    let f:int = Buffer.ReadU8At(b, 0);
+    if (f == 32 || f == 9) { return -2; }        // SP or HTAB: obs-fold
+
+    let colon:int = -1;
+    let i:int = 0;
+    while (i < n) {
+        let v:int = Buffer.ReadU8At(b, i);
+        if (v == 13) { return -3; }              // a bare CR anywhere in the line
+        if (colon < 0) {
+            if (v == 58) {                       // ':'
+                if (i == 0) { return -1; }
+                colon = i;
+            } else if (!((v >= 97 && v <= 122) || (v >= 65 && v <= 90)
+                      || (v >= 48 && v <= 57)
+                      || v == 33 || v == 35 || v == 36 || v == 37 || v == 38
+                      || v == 39 || v == 42 || v == 43 || v == 45 || v == 46
+                      || v == 94 || v == 95 || v == 96 || v == 124 || v == 126)) {
+                return -1;                        // not a token character
+            }
+        }
+        i += 1;
+    }
+    if (colon < 0) { return -1; }
+    return colon;
+}
+
+fn _isHex(s:string): bool {
+    let n:int = String.Length(s);
+    if (n == 0) { return false; }
+    let b = Buffer.FromString(s);
+    let i:int = 0;
+    while (i < n) {
+        let v:int = Buffer.ReadU8At(b, i);
+        if (!((v >= 48 && v <= 57) || (v >= 97 && v <= 102) || (v >= 65 && v <= 70))) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn _isDigits(s:string): bool {
+    let n:int = String.Length(s);
+    if (n == 0) { return false; }
+    let b = Buffer.FromString(s);
+    let i:int = 0;
+    while (i < n) {
+        let v:int = Buffer.ReadU8At(b, i);
+        if (v < 48 || v > 57) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// Bodies at or below this size are written together with the header block in a
+// single call. With TCP_NODELAY on, a separate body write costs both a syscall
+// and a second packet; above the threshold the extra copy costs more than it
+// saves, so the two-write path takes over.
+const _COALESCE_MAX = 16384;
+
+// Cached HTTP-date for the Date header. Time.Format runs ~0.3 us, which is real
+// money against a ~60 us request, and every response inside the same second
+// carries an identical string - so format once per second and hand out the copy.
+global _dateSec:int     = -1;
+global _dateStr:string  = "";
+global _dateLine:string = "";
+
+fn _httpDate(): string {
+    if (Time.Now() != _dateSec) { _httpDateRefresh(); }
+    return _dateStr;
+}
+
+// The whole header line, ready to append. Formatting the timestamp is the cheap
+// part; building "Date: " + value on every response is not, and it is identical
+// for every response in the same second.
+fn _httpDateLine(): string {
+    if (Time.Now() != _dateSec) { _httpDateRefresh(); }
+    return _dateLine;
+}
+
+fn _httpDateRefresh() {
+    let now:int = Time.Now();
+    _dateSec  = now;
+    _dateStr  = Time.Format(now, "%a, %d %b %Y %H:%M:%S GMT");
+    _dateLine = "Date: " + _dateStr;
+    return nil;
+}
+
+// Format an arbitrary timestamp as an HTTP-date (Last-Modified, Expires, ...).
+// Time.Format costs ~0.44 us and a static mount asks for the same handful of
+// mtimes over and over, so memoise them. The map is cleared rather than evicted
+// one by one: it exists to catch a hot working set, not to be a real cache.
+global _mtimeMemo = {};
+global _mtimeMemoN:int = 0;
+
+fn _httpDateOf(t:int): string {
+    let k = str(t);
+    let hit = Object.TryGet(_mtimeMemo, k, nil);
+    if (hit != nil) { return hit; }
+    if (_mtimeMemoN >= 256) { _mtimeMemo = {}; _mtimeMemoN = 0; }
+    let v = Time.Format(t, "%a, %d %b %Y %H:%M:%S GMT");
+    _mtimeMemo[k] = v;
+    _mtimeMemoN = _mtimeMemoN + 1;
+    return v;
+}
+
+// Entity tag from the file's identity rather than its content: hashing every
+// response would cost more than it saves, and size+mtime changes whenever the
+// bytes do. Matches the shape nginx uses. A precompressed variant is a
+// different entity, so its encoding joins the tag.
+fn _etagFor(st, encoding): string {
+    let t = "\"" + Convert.ToRadixString(st.Modified, 16)
+          + "-" + Convert.ToRadixString(st.Size, 16);
+    if (encoding != nil) { t = t + "-" + encoding; }
+    return t + "\"";
+}
+
+// Stream.SendFile hands back what the socket accepted and stops there - a
+// 330 KB file came back 11 KB short under test - so resume from the offset it
+// reached. The kernel moves the bytes, so nothing is copied into the VM heap
+// and a file larger than memory still streams.
+fn _sendFileAll(conn, path:string, offset:int, count:int): bool {
+    let off:int = offset;
+    let end:int = offset + count;
+    while (off < end) {
+        let n = Stream.SendFile(conn, path, off, end - off);
+        if (n == nil || n <= 0) { return false; }
+        off = off + n;
+    }
+    return true;
+}
+
+// Any control byte in a decoded path. A "%00" would otherwise reach the
+// filesystem layer and truncate the name there, so a check on the extension
+// (".js", ".txt") can be walked straight past.
+fn _hasCtlBytes(s:string): bool {
+    let n:int = String.Length(s);
+    if (n == 0) { return false; }
+    let b = Buffer.FromString(s);
+    let i:int = 0;
+    while (i < n) {
+        let v:int = Buffer.ReadU8At(b, i);
+        if (v < 32 || v == 127) { return true; }
+        i += 1;
+    }
+    return false;
+}
+
+// A path segment beginning with "." marks a file that is conventionally
+// private but perfectly readable: .env, .git, .htpasswd. ".well-known" is the
+// standard exception - ACME challenges and security.txt live there.
+fn _hasDotSegment(rel:string): bool {
+    if (rel == "") { return false; }
+    foreach (sg in String.Split(rel, "/")) {
+        if (String.StartsWith(sg, ".") && sg != ".well-known") { return true; }
+    }
+    return false;
+}
+
+// A symlink anywhere below the mount root can point anywhere on the disk, and
+// the containment check cannot see it: Path.Resolve is purely lexical. Checking
+// only the final component is not enough either - a file reached *through* a
+// symlinked directory stats with IsSymlink false - so every segment below the
+// root is checked. The root itself is not: "/var/www -> /data/www" is a
+// perfectly ordinary deployment.
+// Only the *intermediate* segments are checked here: the final component is
+// stat'd by the caller anyway, and its IsSymlink is read from that result
+// instead of paying for a second stat. For a flat mount this walks nothing.
+fn _crossesSymlink(root:string, rel:string): bool {
+    if (rel == "") { return false; }
+    let segs = String.Split(rel, "/");
+    let n:int = len(segs);
+    if (n < 2) { return false; }
+    let cur:string = root;
+    let i:int = 0;
+    while (i < n - 1) {
+        let sg = segs[i];
+        i += 1;
+        if (String.Length(sg) == 0) { continue; }
+        cur = cur + "/" + sg;
+        let st = _fileStat(cur);
+        if (st != nil && st.IsSymlink) { return true; }
+    }
+    return false;
+}
+
+// Read exactly `count` bytes, or nil if the peer stops first.
+//
+// Stream.ReadBytes returns whatever has already arrived and does not wait, so
+// on a body larger than the socket buffer it runs dry and returns nil long
+// before the body is complete - and after a 100-continue it returns nil
+// immediately, because the client has not started sending. Parking on
+// WaitReadable first is what turns that into a real read; it also suspends only
+// this fiber, so a slow upload does not hold up anything else.
+fn _readChunk(conn, want:int, timeoutMs:int) {
+    let ms = (timeoutMs > 0) ? timeoutMs : 10000;
+    if (Stream.WaitReadable(conn, ms) == nil) { return nil; }
+    return Stream.ReadBytes(conn, want);
+}
+
+fn _readExact(conn, count:int, timeoutMs:int) {
+    let out = Buffer.Create(count, 1);
+    let off:int = 0;
+    while (off < count) {
+        let part = _readChunk(conn, count - off, timeoutMs);
+        if (part == nil || len(part) == 0) { return nil; }
+        Buffer.Copy(part, 0, out, off, len(part));
+        off = off + len(part);
+    }
+    return out;
+}
+
+// Decode a chunked body incrementally, handing each chunk to `sink` as it
+// arrives. Both the buffering path and the streaming one go through here, so
+// the framing rules have exactly one implementation.
+//   sink(block) -> bool   false aborts the read
+// Returns { ok, status, total }.
+fn _streamChunked(conn, maxBytes:int, sink, timeoutMs:int) {
+    let total:int = 0;
+    let done:bool = false;
+    while (!done) {
+        let line = Stream.ReadLine(conn);
+        // nil is a stalled peer, "" is EOF; neither is a chunk header.
+        if (line == nil || line == "") { return { ok: false, status: 400, total: total }; }
+
+        let semi = String.IndexOf(line, ";");     // drop any chunk extension
+        if (semi >= 0) { line = String.Substr(line, 0, semi); }
+        let sizeStr = String.Trim(line);
+        if (!_isHex(sizeStr)) { return { ok: false, status: 400, total: total }; }
+        let n = Convert.ParseInt("0x" + sizeStr);
+        if (n == nil || n < 0) { return { ok: false, status: 400, total: total }; }
+
+        if (n == 0) {
+            let t = Stream.ReadLine(conn);        // trailer section
+            while (t != nil && t != "") { t = Stream.ReadLine(conn); }
+            done = true;
+        } else {
+            total = total + n;
+            if (maxBytes > 0 && total > maxBytes) { return { ok: false, status: 413, total: total }; }
+            let part = _readExact(conn, n, timeoutMs);
+            if (part == nil || len(part) != n) { return { ok: false, status: 400, total: total }; }
+            if (!sink(part)) { return { ok: false, status: 0, total: total }; }
+            Stream.ReadLine(conn);                // CRLF after the chunk
+        }
+    }
+    return { ok: true, status: 0, total: total };
+}
+
+// The same, for a body framed by Content-Length. Read in slices so a large
+// upload never has to exist in memory all at once.
+fn _streamFixed(conn, count:int, maxBytes:int, sink, timeoutMs:int) {
+    if (maxBytes > 0 && count > maxBytes) { return { ok: false, status: 413, total: 0 }; }
+    let left:int = count;
+    while (left > 0) {
+        let want:int = (left > 65536) ? 65536 : left;
+        let part = _readChunk(conn, want, timeoutMs);
+        // Short is fine and expected; no progress at all means the peer stopped.
+        if (part == nil) { return { ok: false, status: 400, total: count - left }; }
+        let got:int = len(part);
+        if (got <= 0) { return { ok: false, status: 400, total: count - left }; }
+        if (!sink(part)) { return { ok: false, status: 0, total: count - left }; }
+        left = left - got;
+    }
+    return { ok: true, status: 0, total: count };
+}
+
+// A cookie value is percent-encoded on the way out, so it is always made of
+// valid cookie-octets and round-trips exactly. UrlDecode follows query-string
+// rules and turns "+" into a space; in a cookie "+" is a literal plus, so it is
+// protected before decoding.
+fn _cookieDecode(v:string): string {
+    let out = HttpUtil.UrlDecode(String.Replace(v, "+", "%2B"));
+    return (out == nil) ? v : out;
+}
+
+// Parse a Cookie request header: name=value pairs separated by ";".
+fn _parseCookieHeader(h): object {
+    let out = {};
+    if (h == nil || h == "") { return out; }
+    foreach (pair in String.Split(h, ";")) {
+        let p = String.Trim(pair);
+        if (String.Length(p) == 0) { continue; }
+        let eq = String.IndexOf(p, "=");
+        if (eq <= 0) { continue; }                  // no name, or no "=" at all
+        let name = String.Trim(String.Left(p, eq));
+        let val  = String.Trim(String.Substr(p, eq + 1));
+        // A value may be wrapped in double quotes.
+        if (String.Length(val) >= 2 && String.StartsWith(val, "\"") && String.EndsWith(val, "\"")) {
+            val = String.Substr(val, 1, String.Length(val) - 2);
+        }
+        // First occurrence wins: a repeated name is a common way to confuse two
+        // readers into disagreeing about which value applies.
+        if (!Object.HasKey(out, name)) { out[name] = _cookieDecode(val); }
+    }
+    return out;
+}
+
+// An attribute value cannot carry CR, LF or ";" - any of them would let a
+// caller append attributes of their own or split the response outright.
+fn _cookieAttr(v): string {
+    let t = str(v);
+    if (String.Contains(t, "\r") || String.Contains(t, "\n") || String.Contains(t, ";")) {
+        throw(1, "HttpServer: invalid cookie attribute");
+    }
+    return t;
+}
+
+// Containment test with a separator boundary, so a mount rooted at "/srv/www"
+// does not also accept "/srv/www-secret/x". A path equal to the root is inside.
+fn _isUnder(child:string, root:string): bool {
+    if (child == root) return true;
+    return String.StartsWith(child, root + "/")
+        || String.StartsWith(child, root + "\\");
+}
+
+// Stream.WriteBytes may come up short on a slow socket, and unlike WriteAll it
+// has no offset argument to resume from. Re-slice only when a write is actually
+// partial, so the common case allocates nothing.
+fn _writeBlock(conn, buf, count:int): bool {
+    let off:int = 0;
+    while (off < count) {
+        let chunk = (off == 0) ? buf : Buffer.Slice(buf, off, count - off);
+        let n = Stream.WriteBytes(conn, chunk, count - off);
+        if (n == nil || n <= 0) { return false; }
+        off = off + n;
+    }
+    return true;
+}
 
 // =============================================================================
 // HttpStatus - reason phrases and extension-to-MIME mapping.
@@ -123,6 +662,8 @@ class HttpStatus
         if (code == 413) return "Content Too Large";
         if (code == 414) return "URI Too Long";
         if (code == 415) return "Unsupported Media Type";
+        if (code == 417) return "Expectation Failed";
+        if (code == 416) return "Range Not Satisfiable";
         if (code == 429) return "Too Many Requests";
         if (code == 431) return "Request Header Fields Too Large";
         if (code == 500) return "Internal Server Error";
@@ -141,6 +682,35 @@ class HttpStatus
     }
 
     // Content type guessed from a file extension.
+    // Strip CR/LF and escape quotes in anything that goes into a log line.
+    // These fields are client-supplied: a User-Agent carrying a newline would
+    // otherwise let a caller write log entries of its own choosing.
+    fn static _logSafe(v): string {
+        let t = str(v ?? "-");
+        if (String.Length(t) == 0) { return "-"; }
+        t = String.Replace(t, "\r", " ");
+        t = String.Replace(t, "\n", " ");
+        t = String.Replace(t, "\"", "'");
+        return t;
+    }
+
+    // One line in the Combined Log Format, which every existing log tool parses:
+    //   host - - [date] "method target version" status bytes "referer" "agent"
+    fn static CombinedLogLine(e): string {
+        let host = HttpStatus._logSafe(Object.TryGet(e, "peer", "-"));
+        let colon = String.LastIndexOf(host, ":");
+        // The port is noise in a log; keep just the address.
+        if (colon > 0 && !String.EndsWith(host, "]")) { host = String.Left(host, colon); }
+        return host + " - - [" + Time.Format(Time.Now(), "%d/%b/%Y:%H:%M:%S +0000") + "] \""
+             + HttpStatus._logSafe(Object.TryGet(e, "method",  "-")) + " "
+             + HttpStatus._logSafe(Object.TryGet(e, "path",    "-")) + " "
+             + HttpStatus._logSafe(Object.TryGet(e, "version", "-")) + "\" "
+             + str(Object.TryGet(e, "status", 0)) + " "
+             + str(Object.TryGet(e, "bytes",  0)) + " \""
+             + HttpStatus._logSafe(Object.TryGet(e, "referer",   "-")) + "\" \""
+             + HttpStatus._logSafe(Object.TryGet(e, "userAgent", "-")) + "\"";
+    }
+
     fn static MimeFor(path:string): string {
         let e = String.ToLower(Path.GetExtension(path));
         if (e == ".html" || e == ".htm") return "text/html; charset=utf-8";
@@ -166,6 +736,330 @@ class HttpStatus
 }
 
 // =============================================================================
+// Multipart/form-data parsing.
+//
+// Streaming, not buffering: the body arrives in blocks and a part's data is
+// flushed as it goes, so an upload never has to fit in memory. The scanner
+// keeps only the bytes that could still be the start of a boundary.
+//
+// Security notes, because this parses attacker-controlled input:
+//   - the client's `filename` is NEVER used to build a path. Files are written
+//     under a server-chosen name; the original is reported for display only.
+//     Treating it as a path is the classic upload traversal.
+//   - part count and per-part size are capped, or a body of endless tiny parts
+//     is a memory exhaustion vector.
+// =============================================================================
+
+// A growable byte queue. Buffer.Copy is memmove-safe for overlapping ranges,
+// so compaction happens in place.
+class _Buf
+{
+    let _b        = nil;
+    let _cap:int  = 0;
+    let _len:int  = 0;
+
+    fn Constructor(initial:int) {
+        _cap = (initial > 0) ? initial : 1024;
+        _b   = Buffer.Create(_cap, 1);
+        _len = 0;
+    }
+
+    fn Len(): int { return _len; }
+
+    fn Append(src, n:int) {
+        if (n <= 0) { return nil; }
+        if (_len + n > _cap) {
+            let ncap = _cap * 2;
+            while (ncap < _len + n) { ncap = ncap * 2; }
+            let nb = Buffer.Create(ncap, 1);
+            if (_len > 0) { Buffer.Copy(_b, 0, nb, 0, _len); }
+            _b   = nb;
+            _cap = ncap;
+        }
+        Buffer.Copy(src, 0, _b, _len, n);
+        _len = _len + n;
+        return nil;
+    }
+
+    fn AppendString(s:string) {
+        let b = Buffer.FromString(s);
+        this.Append(b, len(b));
+        return nil;
+    }
+
+    // Buffer.IndexOf scans the whole backing allocation, so a hit in stale
+    // bytes past the logical length has to be rejected.
+    fn Find(needle:string, start:int): int {
+        if (_len == 0) { return -1; }
+        let idx = Buffer.IndexOf(_b, needle, start);
+        if (idx < 0) { return -1; }
+        if (idx + String.Length(needle) > _len) { return -1; }
+        return idx;
+    }
+
+    fn ByteAt(i:int): int { return Buffer.ReadU8At(_b, i); }
+    fn Slice(off:int, n:int) { return Buffer.Slice(_b, off, n); }
+    fn Str(off:int, n:int): string { return Buffer.ToString(Buffer.Slice(_b, off, n)); }
+
+    fn Drop(n:int) {
+        if (n <= 0) { return nil; }
+        if (n >= _len) { _len = 0; return nil; }
+        Buffer.Copy(_b, n, _b, 0, _len - n);
+        _len = _len - n;
+        return nil;
+    }
+}
+
+// Split a "form-data; name=..; filename=.." parameter list.
+// A quoted value containing ";" is not supported - browsers do not emit one.
+fn _mpParams(v:string): object {
+    let out = {};
+    foreach (seg in String.Split(v, ";")) {
+        let t = String.Trim(seg);
+        let eq = String.IndexOf(t, "=");
+        if (eq <= 0) { continue; }
+        let k   = String.ToLower(String.Trim(String.Left(t, eq)));
+        let val = String.Trim(String.Substr(t, eq + 1));
+        if (String.Length(val) >= 2 && String.StartsWith(val, "\"") && String.EndsWith(val, "\"")) {
+            val = String.Substr(val, 1, String.Length(val) - 2);
+        }
+        out[k] = val;
+    }
+    return out;
+}
+
+// Pull the boundary out of a Content-Type header.
+fn _mpBoundary(ct:string) {
+    let semi = String.IndexOf(ct, ";");
+    if (semi < 0) { return nil; }
+    let ps = _mpParams(String.Substr(ct, semi + 1));
+    let b  = Object.TryGet(ps, "boundary", nil);
+    if (b == nil) { return nil; }
+    // RFC 2046 caps a boundary at 70 characters.
+    if (String.Length(b) == 0 || String.Length(b) > 70) { return nil; }
+    return b;
+}
+
+class _MultipartParser
+{
+    let _delim:string = "";
+    let _dlen:int     = 0;
+    let _buf          = nil;
+    let _state:int    = 0;      // 0 seek, 1 headers, 2 data, 3 done
+    let _err          = nil;
+
+    let _fields       = nil;
+    let _files        = nil;
+
+    let _pName:string = "";
+    let _pFilename    = nil;    // nil marks a plain field
+    let _pType:string = "";
+    let _pBytes:int   = 0;
+    let _sinkFile     = nil;
+    let _sinkPath:string = "";
+    let _sinkBuf      = nil;
+    let _nParts:int   = 0;
+
+    let _dir          = nil;
+    let _maxParts:int      = 256;
+    let _maxFieldBytes:int = 1048576;
+    let _maxFileBytes:int  = 33554432;
+
+    fn Constructor(boundary:string, opts) {
+        // The delimiter always carries the CRLF that ends the previous part;
+        // seeding the buffer with one makes the very first boundary match the
+        // same way as every later one.
+        _delim  = "\r\n--" + boundary;
+        _dlen   = String.Length(_delim);
+        _buf    = new _Buf(16384);
+        _buf.AppendString("\r\n");
+        _fields = {};
+        _files  = [];
+        _state  = 0;
+
+        let o = opts ?? nil;
+        if (o != nil) {
+            if (Object.HasKey(o, "dir"))            _dir            = o.dir;
+            if (Object.HasKey(o, "maxParts"))       _maxParts       = o.maxParts;
+            if (Object.HasKey(o, "maxFieldBytes"))  _maxFieldBytes  = o.maxFieldBytes;
+            if (Object.HasKey(o, "maxFileBytes"))   _maxFileBytes   = o.maxFileBytes;
+        }
+    }
+
+    fn Failed(): bool { return _err != nil; }
+    fn Error() { return _err; }
+
+    fn _fail(msg:string): bool {
+        if (_err == nil) { _err = msg; }
+        _state = 3;
+        this._abortPart();
+        return false;
+    }
+
+    fn _abortPart() {
+        if (_sinkFile != nil) { Stream.Close(_sinkFile); _sinkFile = nil; }
+        _sinkBuf = nil;
+        return nil;
+    }
+
+    // Accept the next block of body. Returns false once parsing has failed, so
+    // ReadBody stops pulling.
+    fn Feed(chunk, n:int): bool {
+        if (_state == 3) { return _err == nil; }
+        _buf.Append(chunk, n);
+        return this._pump();
+    }
+
+    fn _pump(): bool {
+        let working = true;
+        while (working) {
+            if (_state == 3) { return _err == nil; }
+
+            if (_state == 0) {                       // seek the next delimiter
+                let idx = _buf.Find(_delim, 0);
+                if (idx < 0) {
+                    // Nothing yet: drop all but a possible partial delimiter.
+                    if (_buf.Len() > _dlen) { _buf.Drop(_buf.Len() - _dlen + 1); }
+                    return true;
+                }
+                // Two bytes after the delimiter decide: "--" ends the body,
+                // CRLF starts another part.
+                if (_buf.Len() < idx + _dlen + 2) {
+                    if (idx > 0) { _buf.Drop(idx); }
+                    return true;
+                }
+                let c1 = _buf.ByteAt(idx + _dlen);
+                let c2 = _buf.ByteAt(idx + _dlen + 1);
+                if (c1 == 45 && c2 == 45) { _state = 3; return true; }   // "--"
+                if (c1 == 13 && c2 == 10) {
+                    _buf.Drop(idx + _dlen + 2);
+                    _state = 1;
+                } else {
+                    return this._fail("malformed multipart delimiter");
+                }
+            }
+
+            if (_state == 1) {                       // part headers
+                let end = _buf.Find("\r\n\r\n", 0);
+                if (end < 0) {
+                    if (_buf.Len() > 16384) { return this._fail("multipart part headers too large"); }
+                    return true;
+                }
+                let head = _buf.Str(0, end);
+                _buf.Drop(end + 4);
+                if (!this._startPart(head)) { return false; }
+                _state = 2;
+            }
+
+            if (_state == 2) {                       // part data
+                let idx = _buf.Find(_delim, 0);
+                if (idx >= 0) {
+                    if (idx > 0) {
+                        if (!this._emit(_buf.Slice(0, idx), idx)) { return false; }
+                        _buf.Drop(idx);
+                    }
+                    if (!this._finishPart()) { return false; }
+                    _state = 0;
+                } else {
+                    // Flush everything that cannot be the start of a delimiter.
+                    let keep = _dlen - 1;
+                    if (_buf.Len() > keep) {
+                        let take = _buf.Len() - keep;
+                        if (!this._emit(_buf.Slice(0, take), take)) { return false; }
+                        _buf.Drop(take);
+                    }
+                    return true;
+                }
+            }
+        }
+        return _err == nil;
+    }
+
+    fn _startPart(head:string): bool {
+        _nParts = _nParts + 1;
+        if (_nParts > _maxParts) { return this._fail("too many multipart parts"); }
+
+        _pName     = "";
+        _pFilename = nil;
+        _pType     = "";
+        _pBytes    = 0;
+        _sinkFile  = nil;
+        _sinkPath  = "";
+        _sinkBuf   = nil;
+
+        foreach (line in String.Split(head, "\r\n")) {
+            let c = String.IndexOf(line, ":");
+            if (c <= 0) { continue; }
+            let hn = String.ToLower(String.Trim(String.Left(line, c)));
+            let hv = String.Trim(String.Substr(line, c + 1));
+            if (hn == "content-disposition") {
+                let ps = _mpParams(hv);
+                _pName     = Object.TryGet(ps, "name", "") ?? "";
+                _pFilename = Object.TryGet(ps, "filename", nil);
+            } else if (hn == "content-type") {
+                _pType = hv;
+            }
+        }
+        if (String.Length(_pName) == 0) { return this._fail("multipart part has no name"); }
+
+        if (_pFilename != nil && _dir != nil) {
+            // A server-chosen name. The client's filename is display data and
+            // never touches the path - that is the upload traversal defence.
+            _sinkPath = Path.Combine(_dir, "upload_" + str(Time.Millis()) + "_" + str(_nParts) + ".part");
+            _sinkFile = Stream.Open(_sinkPath, "w");
+            if (_sinkFile == nil) { return this._fail("cannot open upload file"); }
+        } else {
+            _sinkBuf = new _Buf(1024);
+        }
+        return true;
+    }
+
+    fn _emit(block, n:int): bool {
+        if (n <= 0) { return true; }
+        _pBytes = _pBytes + n;
+        let cap = (_pFilename != nil) ? _maxFileBytes : _maxFieldBytes;
+        if (cap > 0 && _pBytes > cap) {
+            return this._fail((_pFilename != nil) ? "uploaded file too large"
+                                                  : "multipart field too large");
+        }
+        if (_sinkFile != nil) {
+            if (Stream.WriteBytes(_sinkFile, block, n) != n) {
+                return this._fail("write to upload file failed");
+            }
+        } else {
+            _sinkBuf.Append(block, n);
+        }
+        return true;
+    }
+
+    fn _finishPart(): bool {
+        if (_pFilename != nil) {
+            let entry = { name: _pName, filename: _pFilename, contentType: _pType, size: _pBytes };
+            if (_sinkFile != nil) {
+                Stream.Close(_sinkFile);
+                _sinkFile   = nil;
+                entry.path  = _sinkPath;
+            } else {
+                entry.data = (_sinkBuf.Len() > 0) ? _sinkBuf.Slice(0, _sinkBuf.Len()) : nil;
+            }
+            Array.Append(_files, entry);
+        } else {
+            _fields[_pName] = (_sinkBuf.Len() > 0) ? _sinkBuf.Str(0, _sinkBuf.Len()) : "";
+        }
+        _sinkBuf = nil;
+        return true;
+    }
+
+    fn Result() {
+        // Reaching the end without the closing "--boundary--" means the body
+        // was cut short; accepting it would hand the handler a partial upload.
+        if (_err == nil && _state != 3) { _err = "truncated multipart body"; }
+        this._abortPart();
+        return { ok: _err == nil, error: _err, fields: _fields, files: _files };
+    }
+}
+
+// =============================================================================
 // HttpRequest - one parsed request. Handlers receive it read-only.
 // =============================================================================
 
@@ -181,6 +1075,17 @@ class HttpRequest
     let body             = nil;     // block, or nil when there is no body
     let peer:string     = "";
     let keepAlive:bool  = true;
+    let secure:bool     = false;    // true when the connection terminated TLS
+
+    // Set only when the server was told to stream bodies: the body has not been
+    // read yet and the handler decides what to do with it.
+    let _conn            = nil;
+    let _pending:int    = 0;
+    let _chunkedBody:bool = false;
+    let _maxBody:int    = 0;
+    let _readTimeout:int = 10000;
+    let _cookies         = nil;    // lazily parsed from the Cookie header
+    let _form            = nil;    // lazily parsed from a urlencoded body
 
     fn Constructor() {
         headers = {};
@@ -194,17 +1099,144 @@ class HttpRequest
     }
 
     fn Query(name:string, dflt?) { return Object.TryGet(query,  name, dflt ?? nil); }
+
+    // Cookies sent by the client, parsed on first use.
+    fn Cookies(): object {
+        if (_cookies == nil) { _cookies = _parseCookieHeader(this.Header("Cookie", nil)); }
+        return _cookies;
+    }
+
+    fn Cookie(name:string, dflt?) { return Object.TryGet(this.Cookies(), name, dflt ?? nil); }
+
+    // An application/x-www-form-urlencoded body as an object. Any other content
+    // type yields an empty object rather than a misparse - a JSON body is not a
+    // form, and treating it as one would invent fields.
+    fn Form(): object {
+        if (_form != nil) { return _form; }
+        let ct = String.ToLower(this.Header("Content-Type", "") ?? "");
+        if (!String.Contains(ct, "application/x-www-form-urlencoded")) {
+            _form = {};
+            return _form;
+        }
+        _form = HttpUtil.ParseQuery(this.Text()) ?? {};
+        return _form;
+    }
+
+    fn FormValue(name:string, dflt?) { return Object.TryGet(this.Form(), name, dflt ?? nil); }
+
+    // Parse a multipart/form-data body - what an HTML form with a file input
+    // sends. Returns { ok, error, fields, files }:
+    //   fields  object of the plain text fields
+    //   files   array of { name, filename, contentType, size } plus either
+    //           `path` (when opts.dir is given, streamed to disk) or `data`
+    //           (a block, when buffered)
+    //
+    //   opts: { dir, maxParts, maxFieldBytes, maxFileBytes }
+    //
+    // With `dir` the body never has to fit in memory. The file is written under
+    // a name this server chooses; `filename` reports what the client claimed
+    // and is display data only - building a path from it is how uploads become
+    // arbitrary file writes.
+    //
+    //   let mp = req.Multipart({ dir: "/var/tmp/uploads" });
+    //   if (!mp.ok) { res.Error(400, mp.error); return; }
+    //   res.Json({ user: mp.fields.user, saved: len(mp.files) });
+    fn Multipart(opts?) {
+        let ct = this.Header("Content-Type", "") ?? "";
+        if (!String.Contains(String.ToLower(ct), "multipart/form-data")) {
+            return { ok: false, error: "not multipart/form-data", fields: {}, files: [] };
+        }
+        let boundary = _mpBoundary(ct);
+        if (boundary == nil) {
+            return { ok: false, error: "missing or invalid multipart boundary",
+                     fields: {}, files: [] };
+        }
+
+        let p = new _MultipartParser(boundary, opts ?? nil);
+        if (this.HasPendingBody()) {
+            // Streamed: the parser consumes each block as it arrives.
+            this.ReadBody(fn(b) { return p.Feed(b, len(b)); }, 0);
+        } else if (body != nil) {
+            p.Feed(body, len(body));
+        }
+        return p.Result();
+    }
     fn Param(name:string)        { return Object.TryGet(params, name, nil); }
 
     fn ContentLength(): int {
+        if (this.HasPendingBody()) { return _pending; }
         if (body == nil) return 0;
         return len(body);
     }
 
     fn IsKeepAlive(): bool { return keepAlive; }
 
+    // True while a body is present but still unread. A handler that leaves one
+    // pending forces the connection closed, since the bytes still owed would
+    // otherwise frame the next request on it.
+    fn HasPendingBody(): bool {
+        return _conn != nil && (_pending > 0 || _chunkedBody);
+    }
+
+    // Stream the body, handing each block to `sink` as it arrives - the point
+    // being that an upload never has to fit in memory. Returns the byte count,
+    // or -1 if the body was truncated or the sink refused a block.
+    //   maxBytes: 0 (default) means no ceiling beyond the server's own.
+    //
+    // A closure captures a scalar by value, so a sink cannot count into a plain
+    // local - the write is simply lost. Use the returned total, or accumulate
+    // into an object or array, which are captured by reference:
+    //   let acc = { chunks: 0 };
+    //   let n = req.ReadBody(fn(b) { acc.chunks = acc.chunks + 1; return true; });
+    fn ReadBody(sink:fn, maxBytes?): int {
+        if (!this.HasPendingBody()) { return 0; }
+        let cap:int = maxBytes ?? 0;
+        let c       = _conn;
+        let chunked = _chunkedBody;
+        let pending = _pending;
+
+        // Clear first: a sink that raises must not leave the request looking
+        // like it still owns an unread body.
+        _conn = nil; _pending = 0; _chunkedBody = false;
+
+        let r = chunked ? _streamChunked(c, cap, sink, _readTimeout)
+                        : _streamFixed(c, pending, cap, sink, _readTimeout);
+        return r.ok ? r.total : -1;
+    }
+
+    // Stream the body straight to a file, never holding more than one block.
+    fn SaveBody(path:string, maxBytes?): int {
+        let f = Stream.Open(path, "w");
+        if (f == nil) { return -1; }
+        let n = this.ReadBody(fn(b) { return Stream.WriteBytes(f, b, len(b)) == len(b); },
+                              maxBytes ?? 0);
+        Stream.Close(f);
+        return n;
+    }
+
+    // Pull a pending body into memory, bounded by the server's maxBodyBytes, so
+    // Text() and Json() work whether or not streaming is enabled.
+    fn _drain() {
+        if (!this.HasPendingBody()) { return nil; }
+        // The sink only collects; the total is derived afterwards, because a
+        // closure cannot write back to an outer scalar.
+        let parts = [];
+        if (this.ReadBody(fn(p) { Array.Append(parts, p); return true; }, _maxBody) < 0) {
+            return nil;
+        }
+        let total = 0;
+        foreach (p in parts) { total = total + len(p); }
+        if (total <= 0) { return nil; }
+        let out = Buffer.Create(total, 1);
+        let off = 0;
+        foreach (p in parts) { Buffer.Copy(p, 0, out, off, len(p)); off = off + len(p); }
+        body = out;
+        return nil;
+    }
+
     // Body decoded as UTF-8 text.
     fn Text(): string {
+        this._drain();
         if (body == nil) return "";
         return Buffer.ToString(body);
     }
@@ -232,12 +1264,20 @@ class HttpResponse
     let _keepAlive:bool = true;
     let _chunked:bool   = false;
     let _serverName:string = "Flaris";
+    let _serverLine:string = "Server: Flaris";
+    let _setCookies:array = [];    // one entry per Set-Cookie line
+    let _hijacked:bool   = false;  // the caller took the socket
+    let _bodyBytes:int   = 0;      // payload written, for the access log
+    let _req             = nil;    // the request being answered, for If-* / Range
 
-    fn Constructor(conn, headOnly:bool, keepAlive:bool, serverName:string) {
+    fn Constructor(conn, headOnly:bool, keepAlive:bool, serverName:string, req?) {
         _conn       = conn;
         _headOnly   = headOnly;
         _keepAlive  = keepAlive;
         _serverName = serverName;
+        _serverLine = "Server: " + serverName;
+        _setCookies = [];
+        _req        = req ?? nil;
         _headers    = {};
         _order      = [];
         _status     = 200;
@@ -246,6 +1286,26 @@ class HttpResponse
     }
 
     fn Sent(): bool        { return _sent; }
+    fn Hijacked(): bool    { return _hijacked; }
+    fn StatusCode(): int   { return _status; }
+    fn BodyBytes(): int    { return _bodyBytes; }
+
+    // Hand the raw connection to the caller and step out of its way: the server
+    // writes nothing further, does not close it, and does not reuse it for
+    // another request. This is the seam for switching protocols - a WebSocket
+    // upgrade being the obvious one. The caller owns the socket from here,
+    // including closing it.
+    //
+    //   srv.Get("/ws", fn(req, res) {
+    //       let sock = res.Hijack();
+    //       let ws   = Ws.Accept(sock, req.headers);   // from the WebSocket library
+    //       ...
+    //   });
+    fn Hijack() {
+        _sent     = true;      // nothing more may be written as an HTTP response
+        _hijacked = true;
+        return _conn;
+    }
     fn IsKeepAlive(): bool { return _keepAlive; }
 
     fn Status(code:int) { _status = code; return this; }
@@ -267,13 +1327,74 @@ class HttpResponse
 
     fn ContentType(ct:string) { return this.Header("Content-Type", ct); }
 
+    // Set a cookie. Several calls produce several Set-Cookie lines - a cookie
+    // is one of the few headers that legitimately repeats, so these are kept
+    // apart from the ordinary header map, which holds one value per name.
+    //
+    // The defaults are the safe ones: HttpOnly so script cannot read it,
+    // SameSite=Lax so it is not sent on cross-site requests, and Secure
+    // automatically whenever the request itself arrived over TLS.
+    //   opts: { maxAge, expires, path, domain, httpOnly, secure, sameSite }
+    fn SetCookie(name:string, value, opts?) {
+        if (!_isToken(name)) { throw(1, "HttpServer: invalid cookie name"); }
+        let o = opts ?? nil;
+
+        // Encoding the value is what makes ";" or a newline in it harmless.
+        let parts = [ name + "=" + (HttpUtil.UrlEncode(str(value)) ?? "") ];
+
+        let path = (o != nil && Object.HasKey(o, "path")) ? o.path : "/";
+        if (path != nil) { Array.Append(parts, "Path=" + _cookieAttr(path)); }
+        if (o != nil && Object.HasKey(o, "domain") && o.domain != nil) {
+            Array.Append(parts, "Domain=" + _cookieAttr(o.domain));
+        }
+        if (o != nil && Object.HasKey(o, "maxAge") && o.maxAge != nil) {
+            Array.Append(parts, "Max-Age=" + str(int(o.maxAge)));
+        }
+        if (o != nil && Object.HasKey(o, "expires") && o.expires != nil) {
+            Array.Append(parts, "Expires=" + _httpDateOf(int(o.expires)));
+        }
+
+        let httpOnly = (o != nil && Object.HasKey(o, "httpOnly")) ? o.httpOnly : true;
+        let sameSite = (o != nil && Object.HasKey(o, "sameSite")) ? o.sameSite : "Lax";
+        let secure   = (o != nil && Object.HasKey(o, "secure")) ? o.secure
+                                                               : (_req != nil && _req.secure);
+        // A browser ignores SameSite=None unless the cookie is also Secure, so
+        // without this the cookie would silently never arrive.
+        if (sameSite != nil && String.ToLower(str(sameSite)) == "none") { secure = true; }
+
+        if (sameSite != nil) { Array.Append(parts, "SameSite=" + _cookieAttr(sameSite)); }
+        if (httpOnly) { Array.Append(parts, "HttpOnly"); }
+        if (secure)   { Array.Append(parts, "Secure"); }
+
+        Array.Append(_setCookies, String.Join(parts, "; "));
+        return this;
+    }
+
+    // Expire a cookie now. Path and Domain must match the ones it was set with,
+    // or the browser keeps the original.
+    fn ClearCookie(name:string, opts?) {
+        let o = opts ?? {};
+        return this.SetCookie(name, "", {
+            maxAge:   0,
+            path:     Object.TryGet(o, "path",   "/"),
+            domain:   Object.TryGet(o, "domain", nil),
+            httpOnly: Object.TryGet(o, "httpOnly", true),
+            secure:   Object.TryGet(o, "secure", nil) ?? (_req != nil && _req.secure),
+            sameSite: Object.TryGet(o, "sameSite", "Lax")
+        });
+    }
+
     // Serialize the status line plus headers. bodyLen < 0 means chunked.
     fn _headBlock(bodyLen:int): string {
         let sb = [];
         Array.Append(sb, "HTTP/1.1 " + str(_status) + " " + HttpStatus.Reason(_status));
 
         if (!Object.HasKey(_headers, "Server")) {
-            Array.Append(sb, "Server: " + _serverName);
+            Array.Append(sb, _serverLine);
+        }
+        // RFC 9110 requires Date on any response from a clock-bearing server.
+        if (!Object.HasKey(_headers, "Date")) {
+            Array.Append(sb, _httpDateLine());
         }
         foreach (k in _order) {
             // Length and framing are decided here, never by the handler.
@@ -282,6 +1403,7 @@ class HttpResponse
                 Array.Append(sb, k + ": " + _headers[k]);
             }
         }
+        foreach (c in _setCookies) { Array.Append(sb, "Set-Cookie: " + c); }
         if (bodyLen >= 0) {
             Array.Append(sb, "Content-Length: " + str(bodyLen));
         } else {
@@ -308,10 +1430,32 @@ class HttpResponse
         // 204 and 304 carry no body at all.
         if (_status == 204 || _status == 304) { body = nil; bodyLen = 0; }
 
-        Stream.WriteString(_conn, this._headBlock(bodyLen));
-        if (body != nil && !_headOnly && bodyLen > 0) {
-            if (isBlock) { Stream.WriteBytes(_conn, body, bodyLen); }
-            else         { Stream.WriteString(_conn, body); }
+        let head    = this._headBlock(bodyLen);
+        let hasBody = (body != nil) && !_headOnly && bodyLen > 0;
+        _bodyBytes  = hasBody ? bodyLen : 0;
+
+        if (!hasBody) {
+            Stream.WriteAll(_conn, head);
+        } else if (bodyLen <= _COALESCE_MAX) {
+            // One write for the whole response: header and body reach the wire
+            // in a single syscall, and a single packet.
+            if (isBlock) {
+                let hl:int = String.Length(head);
+                let out    = Buffer.Create(hl + bodyLen, 1);
+                Buffer.CopyStringAt(out, 0, head, hl);
+                Buffer.Copy(body, 0, out, hl, bodyLen);
+                _writeBlock(_conn, out, hl + bodyLen);
+            } else {
+                Stream.WriteAll(_conn, head + body);
+            }
+        } else {
+            // Large body: joining it to the header would copy more than the
+            // extra write costs. WriteAll/_writeBlock still guarantee the whole
+            // body goes out - a short write here would desynchronise framing on
+            // a keep-alive connection.
+            Stream.WriteAll(_conn, head);
+            if (isBlock) { _writeBlock(_conn, body, bodyLen); }
+            else         { Stream.WriteAll(_conn, body); }
         }
         _sent = true;
         return true;
@@ -338,12 +1482,157 @@ class HttpResponse
                           "application/json", status);
     }
 
-    // Send a file's bytes. Returns false (and sends 404) when it is missing.
+    // Send a file with the semantics a browser expects: ETag and Last-Modified,
+    // conditional revalidation (304), byte ranges (206/416), and a zero-copy
+    // body. Sends 404 when the path is missing or is a directory.
     fn File(path:string, contentType?: string) {
-        if (!_fileExists(path)) { return this.Error(404, "not found"); }
-        let data = _fileBytes(path);
-        if (data == nil) { return this.Error(500, "could not read file"); }
-        return this._send(data, contentType ?? HttpStatus.MimeFor(path), nil);
+        let st = _fileStat(path);
+        if (st == nil || st.IsDir) { return this.Error(404, "not found"); }
+        return this._sendFile(path, st, contentType ?? HttpStatus.MimeFor(path), nil);
+    }
+
+    // Shared by File() and the static mounts. `encoding` names a Content-Encoding
+    // when `path` is a precompressed sidecar - the entity is then the compressed
+    // one, so it carries its own entity tag.
+    fn _sendFile(path:string, st, contentType:string, encoding) {
+        if (_sent) return false;
+
+        let size:int = st.Size;
+        let etag     = _etagFor(st, encoding);
+
+        if (!Object.HasKey(_headers, "Content-Type"))  { this.ContentType(contentType); }
+        if (!Object.HasKey(_headers, "Last-Modified")) { this.Header("Last-Modified", _httpDateOf(st.Modified)); }
+        if (!Object.HasKey(_headers, "ETag"))          { this.Header("ETag", etag); }
+        if (!Object.HasKey(_headers, "Accept-Ranges")) { this.Header("Accept-Ranges", "bytes"); }
+        if (encoding != nil) {
+            this.Header("Content-Encoding", encoding);
+            // Caches must not hand this body to a client that cannot decode it.
+            this.Header("Vary", "Accept-Encoding");
+        }
+
+        // A validated cache costs no body and no file read at all.
+        if (this._notModified(etag, st.Modified)) {
+            _status = 304;
+            Stream.WriteAll(_conn, this._headBlock(0));
+            _sent = true;
+            return true;
+        }
+
+        let start:int = 0;
+        let count:int = size;
+        let r = this._parseRange(size, etag);
+        if (r != nil) {
+            if (r.bad) {
+                this.Header("Content-Range", "bytes */" + str(size));
+                return this.Error(416, "range not satisfiable");
+            }
+            start   = r.start;
+            count   = r.count;
+            _status = 206;
+            this.Header("Content-Range",
+                "bytes " + str(start) + "-" + str(start + count - 1) + "/" + str(size));
+        }
+
+        // HEAD: the headers are the whole answer, so never touch the file.
+        if (_headOnly) {
+            Stream.WriteAll(_conn, this._headBlock(count));
+            _sent = true;
+            return true;
+        }
+
+        // Small enough to travel with the header block: read it and take the
+        // coalesced path, so the response is still one write and one packet.
+        // SendFile costs an extra syscall and a second packet, and only pays
+        // once the copy it avoids outweighs them - which is not true of the
+        // small files that dominate a real static mount.
+        if (count <= _COALESCE_MAX) {
+            let data = _fileBytes(path);
+            if (data != nil) {
+                if (start > 0 || count < size) { data = Buffer.Slice(data, start, count); }
+                return this._send(data, nil, nil);
+            }
+        }
+
+        // Large body: the kernel moves it straight from page cache to socket,
+        // so the bytes never enter the VM heap and a file bigger than memory
+        // still streams.
+        Stream.WriteAll(_conn, this._headBlock(count));
+        _bodyBytes = count;
+        if (count > 0) { _sendFileAll(_conn, path, start, count); }
+        _sent = true;
+        return true;
+    }
+
+    // RFC 9110 13.1.3: If-None-Match decides on its own when present, and
+    // If-Modified-Since is consulted only when no entity tag was offered.
+    fn _notModified(etag:string, modified:int): bool {
+        if (_req == nil) return false;
+        if (_req.method != "GET" && _req.method != "HEAD") return false;
+
+        let inm = _req.Header("If-None-Match", nil);
+        if (inm != nil) {
+            let v = String.Trim(inm);
+            if (v == "*") return true;
+            // The header may carry a list, and a weak tag differs from ours only
+            // by the "W/" prefix, so a substring test covers both spellings.
+            return String.Contains(v, etag);
+        }
+
+        let ims = _req.Header("If-Modified-Since", nil);
+        if (ims != nil) {
+            let t = Time.Parse(String.Trim(ims), "RFC");
+            if (t != nil && modified <= t) return true;
+        }
+        return false;
+    }
+
+    // One byte range only: "bytes=0-499", "bytes=500-" or "bytes=-500".
+    // nil when there is no usable range, { bad:true } when it cannot be met,
+    // otherwise { start, count }. A multi-range request is served in full.
+    fn _parseRange(size:int, etag:string) {
+        if (_req == nil || _req.method != "GET") return nil;
+
+        let h = _req.Header("Range", nil);
+        if (h == nil) return nil;
+
+        // If-Range guards the slice against a changed entity: when the validator
+        // no longer matches, the client needs the whole thing, not a fragment of
+        // something new.
+        let ifr = _req.Header("If-Range", nil);
+        if (ifr != nil && !String.Contains(String.Trim(ifr), etag)) return nil;
+
+        let v = String.Trim(h);
+        if (!String.StartsWith(v, "bytes=")) return nil;
+        v = String.Substr(v, 6);
+        if (String.Contains(v, ",")) return nil;      // multi-range: send it whole
+        if (size <= 0) return { bad: true, start: 0, count: 0 };
+
+        let dash = String.IndexOf(v, "-");
+        if (dash < 0) return { bad: true, start: 0, count: 0 };
+
+        let lhs = String.Trim(String.Substr(v, 0, dash));
+        let rhs = String.Trim(String.Substr(v, dash + 1));
+
+        let start:int = 0;
+        let last:int  = size - 1;
+
+        if (lhs == "") {
+            // Suffix form: the final N bytes.
+            let n = Convert.ParseInt(rhs);
+            if (n == nil || n <= 0) return { bad: true, start: 0, count: 0 };
+            if (n > size) { n = size; }
+            start = size - n;
+        } else {
+            let a = Convert.ParseInt(lhs);
+            if (a == nil || a < 0 || a >= size) return { bad: true, start: 0, count: 0 };
+            start = a;
+            if (rhs != "") {
+                let b = Convert.ParseInt(rhs);
+                if (b == nil || b < start) return { bad: true, start: 0, count: 0 };
+                if (b < last) { last = b; }
+            }
+        }
+        return { bad: false, start: start, count: last - start + 1 };
     }
 
     // --- Chunked streaming --------------------------------------------------
@@ -355,7 +1644,7 @@ class HttpResponse
             this.ContentType(contentType);
         }
         _chunked = true;
-        Stream.WriteString(_conn, this._headBlock(-1));
+        Stream.WriteAll(_conn, this._headBlock(-1));
         return true;
     }
 
@@ -367,16 +1656,24 @@ class HttpResponse
         if (n == 0) return true;
         if (_headOnly) return true;
 
-        Stream.WriteString(_conn, Convert.ToRadixString(n, 16) + "\r\n");
-        if (isBlock) { Stream.WriteBytes(_conn, data, n); }
-        else         { Stream.WriteString(_conn, data); }
-        Stream.WriteString(_conn, "\r\n");
+        // Size line, payload and terminator in one write when the chunk is
+        // small - three syscalls per chunk is the dominant cost of streaming.
+        if (!isBlock && n <= _COALESCE_MAX) {
+            Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n" + data + "\r\n");
+            _bodyBytes = _bodyBytes + n;
+            return true;
+        }
+        Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n");
+        if (isBlock) { _writeBlock(_conn, data, n); }
+        else         { Stream.WriteAll(_conn, data); }
+        Stream.WriteAll(_conn, "\r\n");
+        _bodyBytes = _bodyBytes + n;
         return true;
     }
 
     fn EndChunked(): bool {
         if (!_chunked || _sent) return false;
-        if (!_headOnly) { Stream.WriteString(_conn, "0\r\n\r\n"); }
+        if (!_headOnly) { Stream.WriteAll(_conn, "0\r\n\r\n"); }
         _sent = true;
         return true;
     }
@@ -453,8 +1750,15 @@ class HttpServer
     let _maxHeaders:int        = 100;
     let _maxHeaderBytes:int    = 65536;
     let _maxBodyBytes:int      = 8388608;
-    let _maxConnections:int    = 64;
+    // Raised from 64 now that a stalled client can no longer hold a slot: the
+    // cap bounds memory and file descriptors, not slow-client exposure. Keep it
+    // below the process descriptor limit (`ulimit -n`), which is 1024 on many
+    // Linux systems.
+    let _maxConnections:int    = 512;
+    let _streamBodies:bool     = false;
+    let _maxUploadBytes:int    = 0;      // 0 = no ceiling; streaming only
     let _serverName:string     = "Flaris";
+    let _tls                    = nil;   // AcceptTls options, or nil for plain HTTP
 
     let _sock                   = nil;
     let _running:bool          = false;
@@ -465,6 +1769,9 @@ class HttpServer
     let _onRequest              = nil;
     let _notFound               = nil;
     let _onError                = nil;
+    let _onTlsError             = nil;
+    let _onAccess               = nil;
+    let _inFlight:int          = 0;    // requests being handled right now
     let _statics:array         = [];   // { prefix, root, index, cacheControl }
 
     fn Constructor(opts?) {
@@ -480,8 +1787,11 @@ class HttpServer
             _maxHeaders         = Object.TryGet(opts, "maxHeaders",         100);
             _maxHeaderBytes     = Object.TryGet(opts, "maxHeaderBytes",     65536);
             _maxBodyBytes       = Object.TryGet(opts, "maxBodyBytes",       8388608);
-            _maxConnections     = Object.TryGet(opts, "maxConnections",     64);
+            _maxConnections     = Object.TryGet(opts, "maxConnections",     512);
+            _streamBodies       = Object.TryGet(opts, "streamBodies",       false);
+            _maxUploadBytes     = Object.TryGet(opts, "maxUploadBytes",     0);
             _serverName         = Object.TryGet(opts, "serverName",         "Flaris");
+            _tls                = Object.TryGet(opts, "tls",                nil);
         }
     }
 
@@ -505,19 +1815,49 @@ class HttpServer
     fn NotFound(handler)  { _notFound  = handler; return this; }
     fn OnError(handler)   { _onError   = handler; return this; }
 
+    // fn(peer, message) - called when a TLS handshake fails. Handshake failures
+    // are routine on a public port (scanners, plain http:// to an https:// URL),
+    // so without a hook they are dropped silently rather than logged.
+    fn OnTlsError(handler) { _onTlsError = handler; return this; }
+
+    // fn(entry) - called once per completed request with
+    //   { peer, method, path, version, status, bytes, durationMs,
+    //     referer, userAgent }
+    // Format it yourself, or pass it to HttpStatus.CombinedLogLine():
+    //   srv.OnAccess(fn(e) { Console.WriteLine(HttpStatus.CombinedLogLine(e)); });
+    fn OnAccess(handler) { _onAccess = handler; return this; }
+
+    // Requests being handled right now - what Stop() waits for.
+    fn InFlight(): int { return _inFlight; }
+    fn ActiveConnections(): int { return _activeConns; }
+
+    // true when this server terminates TLS itself.
+    fn IsSecure(): bool { return _tls != nil; }
+
     // Serve files under rootDir for URLs beginning with urlPrefix.
     fn Static(urlPrefix:string, rootDir:string, opts?) {
         let o = (opts != nil) ? opts : {};
         Array.Append(_statics, {
             prefix:       urlPrefix,
             root:         rootDir,
+            // Resolved once: it cannot change, and Path.Resolve on every
+            // request was pure repetition.
+            rootAbs:      Path.Resolve(rootDir),
             index:        Object.TryGet(o, "index",        "index.html"),
-            cacheControl: Object.TryGet(o, "cacheControl", "")
+            cacheControl: Object.TryGet(o, "cacheControl", ""),
+            // Both default to the safe answer; a deployment that genuinely
+            // needs them opts in.
+            dotfiles:       Object.TryGet(o, "dotfiles",       false),
+            followSymlinks: Object.TryGet(o, "followSymlinks", false),
+            // Off by default: when no sidecars exist it would only add a stat
+            // syscall to every request.
+            gzip:         Object.TryGet(o, "gzip",         false)
         });
         return this;
     }
 
     fn IsRunning(): bool { return _running; }
+
     fn Port(): int       { return _boundPort; }
 
     // -------------------------------------------------------------------------
@@ -528,6 +1868,12 @@ class HttpServer
     // guarantee the port is open before it returns.
     fn _bind() {
         if (_sock != nil) return true;
+        // Fail at bind, not at the first connection: a server that cannot do the
+        // TLS it was configured for must not come up listening in the clear.
+        if (_tls != nil && !Stream.TlsServerAvailable()) {
+            throw(1, "HttpServer: this build cannot terminate TLS "
+                     + "(no server-capable TLS backend for Stream.AcceptTls)");
+        }
         let s = Stream.Listen("tcp", _port, _backlog);
         if (s == nil) {
             throw(1, "HttpServer: could not bind port " + str(_port));
@@ -565,13 +1911,28 @@ class HttpServer
         return _boundPort;
     }
 
-    // Ask the accept loop to stop. The loop owns the listen socket and closes it
-    // on its way out - closing it here could pull the socket out from under a
-    // fiber parked in WaitReadable. Shutdown therefore completes within one
-    // accept tick (500 ms), not instantly.
-    fn Stop() {
-        _running = false;
-        return nil;
+    // Stop accepting, then wait for the requests already in flight to finish.
+    //
+    // The accept loop owns the listen socket and closes it on its way out -
+    // closing it here could pull it from under a fiber parked in WaitReadable.
+    //
+    // What is waited for is requests, not connections: an idle keep-alive
+    // socket has no work on it and holding shutdown open for its idle timeout
+    // would serve nobody. A request that is mid-handler does get to finish,
+    // which is the point of shutting down gracefully rather than cutting.
+    //
+    //   timeoutMs: how long to wait (default 5000).
+    // Returns true if everything drained, false if the deadline passed first.
+    fn Stop(timeoutMs?) {
+        _running = false;                  // accept loop exits; handlers see it too
+        let deadline:int = timeoutMs ?? 5000;
+        let t0:int = Time.Millis();
+        // Sleeping yields to the connection fibers, which is what lets them
+        // finish; a busy wait here would starve the very work being waited on.
+        while (_inFlight > 0 && (Time.Millis() - t0) < deadline) {
+            Fiber.Sleep(5);
+        }
+        return _inFlight == 0;
     }
 
     // Accept connections, handing each to its own fiber.
@@ -580,14 +1941,20 @@ class HttpServer
         let self = this;
         while (_running && _sock != nil) {
             // Park until a connection arrives; the timeout re-checks _running.
-            let ready = Stream.WaitReadable(_sock, 500);
+            // Short enough that a shutdown is noticed promptly, long enough
+            // that an idle server is not waking up constantly.
+            let ready = Stream.WaitReadable(_sock, 200);
             if (ready != nil && _running && _sock != nil) {
                 let conn = Stream.Accept(_sock);
                 if (conn != nil) {
                     if (_activeConns >= _maxConnections) {
                         // At capacity: answer 503 immediately rather than queueing.
-                        Stream.WriteString(conn,
-                            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        // On a TLS port no handshake has happened yet, so a
+                        // plaintext reply would be unreadable noise - just close.
+                        if (_tls == nil) {
+                            Stream.WriteAll(conn,
+                                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        }
                         Stream.Close(conn);
                     } else {
                         _activeConns = _activeConns + 1;
@@ -611,34 +1978,66 @@ class HttpServer
 
     // Serve requests on one connection until it closes or the limits run out.
     fn _serveConnection(conn) {
-        Stream.SetNoDelay(conn, true);
+        // Read the peer from the raw socket first: AcceptTls detaches it, so
+        // this is the last point where the address is available.
+        let peer = Stream.PeerAddr(conn) ?? "";
+        let c    = conn;
+
+        Stream.SetNoDelay(c, true);
         // An OS-level read timeout bounds every blocking read below, so a client
         // that stops mid-request cannot hold the single-threaded VM.
-        Stream.SetTimeout(conn, _readTimeoutMs);
+        Stream.SetTimeout(c, _readTimeoutMs);
 
-        let peer   = Stream.PeerAddr(conn) ?? "";
+        // TLS terminates here, inside the connection fiber - never in the accept
+        // loop, where one slow handshake would hold up every other client.
+        // AcceptTls takes ownership of the raw socket and detaches it either
+        // way, so the failure path must not close it.
+        if (_tls != nil) {
+            c = Stream.AcceptTls(c, _tls);
+            if (c == nil) {
+                if (_onTlsError != nil) {
+                    _onTlsError(peer, Stream.TlsLastError() ?? "handshake failed");
+                }
+                _activeConns = _activeConns - 1;
+                return nil;
+            }
+            Stream.SetTimeout(c, _readTimeoutMs);
+        }
+
         let served = 0;
         let alive  = true;
 
         while (alive && _running && served < _maxRequestsPerConn) {
             // Park (not block) while the connection is idle between requests.
-            let ready = Stream.WaitReadable(conn, _idleTimeoutMs);
+            // On a TLS stream this watches the socket, not the decrypted buffer,
+            // which is what we want: each new request arrives as new TCP data.
+            let ready = Stream.WaitReadable(c, _idleTimeoutMs);
             if (ready == nil) {
                 alive = false;
             } else {
-                let handled = this._serveOne(conn, peer, served);
+                let handled = this._serveOne(c, peer, served);
                 served = served + 1;
-                if (!handled) { alive = false; }
+                if (handled == 2) {
+                    // Handed off: the new owner closes it. It also stops
+                    // counting against maxConnections, which bounds *HTTP*
+                    // connections - a long-lived upgraded socket is the
+                    // caller's to budget for.
+                    _activeConns = _activeConns - 1;
+                    return nil;
+                }
+                if (handled != 1) { alive = false; }
             }
         }
 
-        Stream.Close(conn);
+        Stream.Close(c);
         _activeConns = _activeConns - 1;
         return nil;
     }
 
-    // Read one request and write its response. Returns false to close.
-    fn _serveOne(conn, peer:string, served:int): bool {
+    // Read one request and write its response.
+    // Returns 1 to keep the connection, 0 to close it, 2 when a handler took it
+    // over and this server must neither close nor touch it again.
+    fn _serveOne(conn, peer:string, served:int): int {
         let parsed = this._readRequest(conn, peer);
         let req    = parsed.req;
 
@@ -646,18 +2045,45 @@ class HttpServer
         if (parsed.status != 0) {
             let res = new HttpResponse(conn, false, false, _serverName);
             if (parsed.status > 0) { res.Error(parsed.status, parsed.message); }
-            return false;
+            return 0;
         }
 
-        // Honour the client's wish to close, plus our own per-connection cap.
-        let keep = _keepAlive && req.keepAlive && (served + 1) < _maxRequestsPerConn;
-        let res  = new HttpResponse(conn, req.method == "HEAD", keep, _serverName);
+        // Honour the client's wish to close, our own per-connection cap, and a
+        // shutdown in progress - during a drain each reply says close so the
+        // client does not wait on a connection that is going away.
+        let keep = _keepAlive && req.keepAlive && _running
+                   && (served + 1) < _maxRequestsPerConn;
+        let res  = new HttpResponse(conn, req.method == "HEAD", keep, _serverName, req);
 
+        let t0:int = Time.Millis();
+        _inFlight = _inFlight + 1;
         this._dispatch(req, res);
+        _inFlight = _inFlight - 1;
+
+        if (_onAccess != nil) {
+            _onAccess({
+                peer:       peer,
+                method:     req.method,
+                path:       req.rawPath,
+                version:    req.version,
+                status:     res.StatusCode(),
+                bytes:      res.BodyBytes(),
+                durationMs: Time.Millis() - t0,
+                referer:    req.Header("Referer",    "") ?? "",
+                userAgent:  req.Header("User-Agent", "") ?? ""
+            });
+        }
+
+        // The handler took the socket over - it is no longer an HTTP connection.
+        if (res.Hijacked()) { return 2; }
 
         // A handler that wrote nothing still owes the client a response.
         if (!res.Sent()) { res.Error(500, "handler produced no response"); }
-        return keep;
+
+        // A body the handler never read is still sitting on the socket, and
+        // would frame the next request on this connection. Close instead.
+        if (req.HasPendingBody()) { return 0; }
+        return keep ? 1 : 0;
     }
 
     // Route the request to a handler, converting a raised error into a 500.
@@ -732,18 +2158,56 @@ class HttpServer
                     return true;
                 }
 
+                // 404 rather than 403 for the guards below: a distinct status
+                // would confirm that the file is there.
+                if (!m.dotfiles && _hasDotSegment(rel)) {
+                    res.Error(404, "not found");
+                    return true;
+                }
+
                 let full = Path.Combine(m.root, rel);
                 // Confirm the resolved path really is inside the mount root.
-                let rootFull = Path.GetFullPath(m.root);
-                let fileFull = Path.GetFullPath(full);
-                if (rootFull == nil || fileFull == nil
-                    || !String.StartsWith(fileFull, rootFull)) {
+                // Path.Resolve collapses "..", which GetFullPath does not, and
+                // _isUnder requires a separator boundary so a root of "/srv/www"
+                // cannot also match "/srv/www-secret".
+                let rootFull = m.rootAbs;
+                let fileFull = Path.Resolve(full);
+                if (rootFull == nil || fileFull == nil || !_isUnder(fileFull, rootFull)) {
                     res.Error(403, "forbidden");
                     return true;
                 }
-                if (!File.Exists(fileFull)) { return false; }
+
+                // One stat answers exists / is-a-directory / size / mtime / is-a-symlink;
+                // the old path called Exists, then Directory.Exists, then read.
+                let st = _fileStat(fileFull);
+                if (st == nil || st.IsDir) { return false; }
+
+                if (!m.followSymlinks
+                    && (st.IsSymlink || _crossesSymlink(rootFull, rel))) {
+                    res.Error(404, "not found");
+                    return true;
+                }
 
                 if (m.cacheControl != "") { res.Header("Cache-Control", m.cacheControl); }
+
+                // Precompressed sidecar, nginx-style: when the client takes gzip
+                // and a "<file>.gz" sits next to it that is no older than the
+                // original, send that instead. Compressing per request would
+                // cost far more - Deflate runs about 11 MB/s, which in a
+                // cooperative VM stalls every other connection too.
+                if (m.gzip) {
+                    let ae = String.ToLower(req.Header("Accept-Encoding", "") ?? "");
+                    if (String.Contains(ae, "gzip")) {
+                        let gzPath = fileFull + ".gz";
+                        let gzSt   = _fileStat(gzPath);
+                        if (gzSt != nil && !gzSt.IsDir && gzSt.Modified >= st.Modified) {
+                            // Content-Type stays that of the real file.
+                            res._sendFile(gzPath, gzSt, HttpStatus.MimeFor(fileFull), "gzip");
+                            return true;
+                        }
+                    }
+                }
+
                 res.File(fileFull);
                 return true;
             }
@@ -767,9 +2231,15 @@ class HttpServer
             return { req: nil, status: 414, message: "request line too long" };
         }
 
+        // Exactly three fields. "GET /a b HTTP/1.1" otherwise parses as a
+        // target of "/a" with a version of "b", which is a different request
+        // from the one a proxy in front would have seen.
         let parts = String.Split(line, " ");
-        if (len(parts) < 3) {
+        if (len(parts) != 3) {
             return { req: nil, status: 400, message: "malformed request line" };
+        }
+        if (!_isToken(parts[0])) {
+            return { req: nil, status: 400, message: "invalid method" };
         }
 
         let req = new HttpRequest();
@@ -777,6 +2247,7 @@ class HttpServer
         req.rawPath = parts[1];
         req.version = String.Trim(parts[2]);
         req.peer    = peer;
+        req.secure  = (_tls != nil);
 
         // Split off the query string, then percent-decode the path.
         let target = req.rawPath;
@@ -789,6 +2260,9 @@ class HttpServer
         req.path = HttpUtil.UrlDecode(target) ?? target;
         if (!String.StartsWith(req.path, "/")) {
             return { req: nil, status: 400, message: "path must be absolute" };
+        }
+        if (_hasCtlBytes(req.path)) {
+            return { req: nil, status: 400, message: "control character in path" };
         }
 
         // Headers, bounded by both count and total size.
@@ -805,6 +2279,79 @@ class HttpServer
             Array.Append(raw, h);
             h = Stream.ReadLine(conn);
         }
+        // ReadLine returns "" for a genuine blank line (and at EOF) but nil
+        // when the peer stalled mid-line. Treating the two alike answers a
+        // request the client never finished sending - and leaves whatever it
+        // sends next to be read as a second request.
+        if (h == nil) {
+            return { req: nil, status: 400, message: "incomplete request headers" };
+        }
+        // Validate the header block before trusting any of it. ParseHeaders
+        // resolves a duplicate by keeping the last one; here ambiguity is
+        // refused instead, because "resolved differently by each hop" is
+        // precisely what request smuggling needs.
+        let clCount:int   = 0;
+        let clVal:string  = "";
+        let teSeen:bool   = false;
+        let hostCount:int = 0;
+        let vi:int = 0;
+        while (vi < len(raw)) {
+            let hl:string = raw[vi];
+            vi += 1;
+
+            // One pass checks for a bare CR (which a proxy may split on),
+            // obsolete line folding, and that the name is a token - so
+            // "Transfer-Encoding :" is rejected rather than quietly ignored.
+            let ci:int = _validateHeaderLine(hl);
+            if (ci == -2) {
+                return { req: nil, status: 400, message: "obsolete line folding" };
+            }
+            if (ci == -3) {
+                return { req: nil, status: 400, message: "control character in header" };
+            }
+            if (ci < 0) {
+                return { req: nil, status: 400, message: "invalid header name" };
+            }
+
+            let lname:string = String.ToLower(String.Left(hl, ci));
+            if (lname == "content-length") {
+                let v = _collapseCL(String.Trim(String.Substr(hl, ci + 1)));
+                if (v == nil) {
+                    return { req: nil, status: 400, message: "bad Content-Length" };
+                }
+                // Repeated headers are the same case as a combined list: only a
+                // disagreement is fatal.
+                if (clCount > 0 && v != clVal) {
+                    return { req: nil, status: 400, message: "conflicting Content-Length" };
+                }
+                clCount = clCount + 1;
+                clVal   = v;
+            } else if (lname == "transfer-encoding") {
+                teSeen = true;
+            } else if (lname == "host") {
+                hostCount = hostCount + 1;
+                if (!_isValidHost(String.Trim(String.Substr(hl, ci + 1)))) {
+                    return { req: nil, status: 400, message: "invalid Host" };
+                }
+            }
+        }
+
+        // RFC 9112 3.2: an HTTP/1.1 request carries exactly one Host. None, or
+        // several, leaves the origin ambiguous, and every hop is then free to
+        // pick a different one. HTTP/1.0 predates the header and is exempt.
+        if (req.version == "HTTP/1.1") {
+            if (hostCount != 1) {
+                return { req: nil, status: 400, message: "missing or repeated Host" };
+            }
+        } else if (hostCount > 1) {
+            return { req: nil, status: 400, message: "repeated Host" };
+        }
+        // Both framings present: this server prefers Transfer-Encoding and many
+        // proxies prefer Content-Length, so the pair is refused outright.
+        if (clCount > 0 && teSeen) {
+            return { req: nil, status: 400, message: "Content-Length with Transfer-Encoding" };
+        }
+
         if (len(raw) > 0) {
             req.headers = HttpUtil.ParseHeaders(String.Join(raw, "\r\n") + "\r\n") ?? {};
         }
@@ -818,25 +2365,87 @@ class HttpServer
             req.keepAlive = !String.Contains(connHdr, "close");
         }
 
+        // RFC 9110 10.1.1: a client that sent "Expect: 100-continue" is waiting
+        // for permission before it sends the body, so it must be answered with
+        // either an interim 100 or a final status. Without this the client
+        // stalls for about a second and its body then arrives too late to be
+        // read - which looks exactly like a truncated request. curl sends this
+        // for any body over 1 KB, so it affects ordinary large POSTs, not just
+        // uploads.
+        let expectHdr = String.ToLower(String.Trim(req.Header("Expect", "") ?? ""));
+        if (expectHdr != "") {
+            if (expectHdr != "100-continue") {
+                return { req: nil, status: 417, message: "expectation failed" };
+            }
+            if (req.version == "HTTP/1.1") {
+                Stream.WriteAll(conn, "HTTP/1.1 100 Continue\r\n\r\n");
+            }
+        }
+
+        // With streaming enabled the body is left on the socket for the handler
+        // to pull, so an upload never has to fit in memory. maxBodyBytes then
+        // bounds only what Text()/Json() will buffer; maxUploadBytes bounds the
+        // stream itself.
+        req._maxBody     = _maxBodyBytes;
+        req._readTimeout = _readTimeoutMs;
+        if (_streamBodies) {
+            let teS = String.ToLower(req.Header("Transfer-Encoding", "") ?? "");
+            if (String.Contains(teS, "chunked")) {
+                req._conn        = conn;
+                req._chunkedBody = true;
+                return { req: req, status: 0, message: "" };
+            }
+            if (clCount > 0) {
+                let clS = Convert.ParseInt(clVal);
+                if (clS == nil || clS < 0) {
+                    return { req: nil, status: 400, message: "bad Content-Length" };
+                }
+                if (_maxUploadBytes > 0 && clS > _maxUploadBytes) {
+                    return { req: nil, status: 413, message: "body too large" };
+                }
+                if (clS > 0) {
+                    req._conn    = conn;
+                    req._pending = clS;
+                }
+            }
+            return { req: req, status: 0, message: "" };
+        }
+
         // Body: chunked wins over Content-Length, per RFC 9112.
         let te = String.ToLower(req.Header("Transfer-Encoding", "") ?? "");
         if (String.Contains(te, "chunked")) {
             let r = this._readChunkedBody(conn);
             if (!r.ok) {
-                return { req: nil, status: 413, message: "body too large" };
+                // 400 for a malformed body, 413 when it simply ran over the cap.
+                // Either way _serveOne closes the connection, so no undecoded
+                // bytes are left to be read as another request.
+                return (r.status == 413)
+                    ? { req: nil, status: 413, message: "body too large" }
+                    : { req: nil, status: 400, message: "malformed chunked body" };
             }
             req.body = r.body;
         } else {
-            let clRaw = req.Header("Content-Length", nil);
-            if (clRaw != nil) {
-                let cl = Convert.ParseInt(String.Trim(clRaw));
+            // The validated, collapsed value - not the raw header, which may
+            // still read "5, 5".
+            if (clCount > 0) {
+                let cl = Convert.ParseInt(clVal);
                 if (cl == nil || cl < 0) {
                     return { req: nil, status: 400, message: "bad Content-Length" };
                 }
                 if (cl > _maxBodyBytes) {
                     return { req: nil, status: 413, message: "body too large" };
                 }
-                if (cl > 0) { req.body = Stream.ReadBytes(conn, cl); }
+                if (cl > 0) {
+                    req.body = _readExact(conn, cl, _readTimeoutMs);
+                    // ReadBytes can come up short when the peer stalls or hangs
+                    // up. A body that never fully arrived must not be dispatched
+                    // as though it had: the handler would see a truncated
+                    // payload, and the bytes still owed would frame the next
+                    // request on this connection.
+                    if (req.body == nil || len(req.body) != cl) {
+                        return { req: nil, status: 400, message: "incomplete request body" };
+                    }
+                }
             }
         }
 
@@ -844,46 +2453,23 @@ class HttpServer
     }
 
     // Decode a chunked body into one block.
-    // Returns { ok, body }: ok is false when the body exceeds maxBodyBytes, and
-    // body is nil for a chunked body that carried no bytes.
+    //
+    // Returns { ok, status, body }. `ok` false means the body was not a
+    // well-formed chunked body and `status` says how to answer. This
+    // distinction is the whole point: the previous version treated a malformed
+    // chunk size as end-of-body and reported success, which left the rest of
+    // the stream to be parsed as a *second* request - a smuggled one the proxy
+    // in front never saw. Anything it cannot decode exactly is now a 400 and a
+    // closed connection.
     fn _readChunkedBody(conn) {
         let parts = [];
-        let total = 0;
-        let more  = true;
-
-        while (more) {
-            let line = Stream.ReadLine(conn);
-            if (line == nil || line == "") {
-                more = false;
-            } else {
-                // Drop any chunk extension after ';'.
-                let semi = String.IndexOf(line, ";");
-                if (semi >= 0) { line = String.Substr(line, 0, semi); }
-                let n = Convert.ParseInt("0x" + String.Trim(line));
-
-                if (n == nil || n < 0) {
-                    more = false;
-                } else if (n == 0) {
-                    // Final chunk: consume the trailer section.
-                    let t = Stream.ReadLine(conn);
-                    while (t != nil && t != "") { t = Stream.ReadLine(conn); }
-                    more = false;
-                } else {
-                    total = total + n;
-                    if (total > _maxBodyBytes) { return { ok: false, body: nil }; }
-                    let part = Stream.ReadBytes(conn, n);
-                    if (part == nil) {
-                        more = false;
-                    } else {
-                        Array.Append(parts, part);
-                        Stream.ReadLine(conn);   // trailing CRLF after the chunk
-                    }
-                }
-            }
-        }
+        let r = _streamChunked(conn, _maxBodyBytes, fn(p) { Array.Append(parts, p); return true; },
+                               _readTimeoutMs);
+        if (!r.ok) { return { ok: false, status: r.status, body: nil }; }
+        let total = r.total;
 
         // Buffer.Create rejects a zero count, so an empty body stays nil.
-        if (total == 0) { return { ok: true, body: nil }; }
+        if (total == 0) { return { ok: true, status: 0, body: nil }; }
 
         let out = Buffer.Create(total, 1);
         let off = 0;
@@ -891,7 +2477,7 @@ class HttpServer
             Buffer.Copy(p, 0, out, off, len(p));
             off = off + len(p);
         }
-        return { ok: true, body: out };
+        return { ok: true, status: 0, body: out };
     }
 }
 

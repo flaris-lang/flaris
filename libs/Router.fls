@@ -9,7 +9,8 @@
 //   JwtSign(payload, secret, expirySecs)  - issue a signed HS256 JWT
 //   LoggerMiddleware    - request/response logging
 //   CorsMiddleware      - CORS response headers
-//   RateLimitMiddleware - simple in-memory per-IP rate limiter
+//   RateLimitMiddleware - sliding-window rate limiter keyed on the client
+//   SecurityHeadersMiddleware - browser-side defence headers in one place
 //
 // Usage:
 //   import { Router, Response, LoggerMiddleware, CorsMiddleware, JwtMiddleware, JwtSign }
@@ -40,22 +41,53 @@
 //   .Head(pattern, handler)
 //   .Use(middleware)            - add global middleware (fn(req, next) → response)
 //   .Group(prefix)  →  RouteGroup  - prefix-scoped sub-router
-//   .Static(urlPrefix, rootDir, opts?) - serve files under rootDir (path-safe);
-//       opts: { index:"index.html", fallback:"<file>", cacheControl:"<value>" }
+//   .Host(hostname) →  RouteGroup  - routes that answer only for that Host.
+//       "*.example.com" covers any subdomain but not the bare domain;
+//       comparison ignores case and the port. Routes registered directly on
+//       the router still serve every host, and a host-scoped route wins over a
+//       host-agnostic one for the same path.
+//       let site = app.Host("shop.example.com");
+//       site.Get("/", fn(req) { ... });
+//   .Static(urlPrefix, rootDir, opts?) - serve files under rootDir (path-safe)
+//       opts: { index:"index.html", fallback:"<file>", cacheControl:"<value>",
+//               dotfiles:false, followSymlinks:false }
+//       Dotfiles (.env, .git, ...) and symlinks leaving the root are refused
+//       by default; ".well-known" stays reachable for ACME and security.txt.
 //   .NotFound(handler)          - custom 404 handler
-//   .Listen(port)               - start blocking HTTP server
-//   .Stop()                     - shut down server
+//   .Listen(port, opts?)        - start blocking HTTP server; opts pass through
+//                                 to HttpServer (tls, streamBodies, timeouts...)
+//   .OnAccess(handler)          - fn(entry) per completed request; pair with
+//                                 HttpStatus.CombinedLogLine(entry)
+//   .Stop(timeoutMs?)           - stop accepting, then wait for in-flight
+//                                 requests to finish (default 5000 ms)
+//
+//   Dispatch: patterns are split once at registration, not per request. A
+//   pattern with no ":param" and no "*" is answered from a map, so the route
+//   table can grow without slowing those routes down; only parametric routes
+//   are scanned in order, and each route caches its combined middleware chain
+//   until Use() adds another. Matching stays lenient about empty and trailing
+//   path segments, as before.
 //
 //   Note: global middleware also runs for unmatched routes, so CORS preflight
 //   (OPTIONS) and logging apply even without a registered handler.
 //
 //   handler signature:  fn(req) → response
-//   req object:  { method, path, params, query, headers, body }
+//   req object:  { method, path, rawPath, params, query, headers, cookies,
+//                  form, peer, secure, body }
+//   cookies:     parsed Cookie header (empty when the request sent none)
+//   form:        parsed application/x-www-form-urlencoded body (empty otherwise)
 //   params:      path parameters from :name segments (req.params.name)
+//   headers:     readable under both spellings - req.headers["Content-Type"]
+//                and req.headers["content-type"] both resolve
+//   peer:        client address as "ip:port"; identify a caller with this
+//                rather than a header, which the client controls
+//   secure:      true when the connection terminated TLS
 //
-// RouteGroup (returned by Group):
+// RouteGroup (returned by Group or Host):
 //   .Get / .Post / .Put / .Delete / .Patch(pattern, handler)
 //   .Use(middleware)    - group-scoped middleware
+//   .Group(prefix)      - nested prefix group, keeping this group's host and
+//                         middleware:  app.Host("api.example").Group("/v1")
 //
 // Middleware:
 //   fn(req, next) → response
@@ -69,17 +101,37 @@
 //   Response.Error(status, message)   - JSON error body
 //   Response.Redirect(url, status?)   - 302 by default
 //   Response.NoContent()              - 204
-//   Response.File(path, contentType?) - serve a file (raw bytes, MIME inferred)
+//   Response.WithCookie(resp, name, value, opts?)  - attach a Set-Cookie
+//   Response.ClearCookie(resp, name, opts?)        - expire one
+//       opts: { maxAge, expires, path, domain, httpOnly, secure, sameSite }
+//       Defaults are HttpOnly, SameSite=Lax, and Secure over TLS.
+//   Response.File(path, contentType?) - serve a file. The response names the
+//       file rather than carrying its bytes ({ status, file, headers }), so the
+//       server can answer with ETag/Last-Modified, honour a conditional request
+//       or a byte range, and send it without copying it through this VM.
+//       Middleware still sees and can amend status and headers.
 //
 // Bundled middleware classes:
 //   new LoggerMiddleware()
 //   new CorsMiddleware(origin, opts?)  - origin: "*" or specific domain
 //       - opts: { methods, headers, maxAge, credentials, exposeHeaders }
-//   new JwtMiddleware(secret, skipPaths?)
-//       - validates "Authorization: Bearer <token>"; adds req.jwtPayload
-//       - skipPaths: array of path prefixes that bypass auth
-//   new RateLimitMiddleware(limit, windowSeconds)
-//       - per-IP rate limiter; returns 429 when exceeded
+//   new JwtMiddleware(secret, skipPaths?, opts?)
+//       - validates "Authorization: Bearer <token>"; adds req.jwt
+//       - verifies the signature *and* the claims: an expired (exp) or
+//         not-yet-valid (nbf) token is refused, not just a badly signed one
+//       - skipPaths: array of exact paths that bypass auth
+//       - opts: { leeway: seconds of clock skew to tolerate,
+//                 requireExp: refuse a token that carries no expiry }
+//   new RateLimitMiddleware(limit, windowSeconds, opts?)
+//       - sliding window, so a caller cannot spend its whole allowance at the
+//         end of one window and again at the start of the next
+//       - keyed on req.peer (port stripped). X-Forwarded-For is honoured only
+//         with { trustProxy: true }: without a proxy in front it is
+//         client-controlled, and trusting it lets any caller mint identities
+//       - opts: { keyFn, skip, trustProxy, maxKeys, headers, clock }
+//       - emits RateLimit-Limit / -Remaining / -Reset, and Retry-After on 429
+//       - bounded memory: idle buckets are swept at maxKeys (default 10000)
+//       - .TrackedKeys() gauges the live set; .Reset() clears it
 //   JwtSign(payload, secret, expirySecs)  →  token string
 // =============================================================================
 
@@ -88,6 +140,74 @@ import { Jwt } from library("Jwt", "1.0");
 import { Logger } from library("Logger", "1.0");
 
 global _jwt = new Jwt();
+
+// Canonical spelling of a header name ("content-type" -> "Content-Type").
+// Handlers conventionally write req.headers["Authorization"] while the parser
+// hands us lowercase keys, so both spellings are exposed - but the split,
+// capitalise and rejoin only has to happen once per distinct name, not once per
+// header on every request. Cleared wholesale rather than evicted: it exists to
+// catch the small set of names real clients send, and a peer inventing new ones
+// must not grow it without bound.
+global _MIME = {
+            html: "text/html; charset=utf-8",
+            htm:  "text/html; charset=utf-8",
+            css:  "text/css; charset=utf-8",
+            js:   "text/javascript; charset=utf-8",
+            mjs:  "text/javascript; charset=utf-8",
+            json: "application/json; charset=utf-8",
+            xml:  "application/xml; charset=utf-8",
+            txt:  "text/plain; charset=utf-8",
+            md:   "text/markdown; charset=utf-8",
+            csv:  "text/csv; charset=utf-8",
+            svg:  "image/svg+xml",
+            png:  "image/png",
+            jpg:  "image/jpeg",
+            jpeg: "image/jpeg",
+            gif:  "image/gif",
+            webp: "image/webp",
+            ico:  "image/x-icon",
+            bmp:  "image/bmp",
+            woff: "font/woff",
+            woff2:"font/woff2",
+            ttf:  "font/ttf",
+            otf:  "font/otf",
+            eot:  "application/vnd.ms-fontobject",
+            pdf:  "application/pdf",
+            wasm: "application/wasm",
+            mp4:  "video/mp4",
+            webm: "video/webm",
+            mp3:  "audio/mpeg",
+            wav:  "audio/wav",
+            ogg:  "audio/ogg",
+            zip:  "application/zip",
+            gz:   "application/gzip"
+};
+
+global _canonMemo = {};
+global _canonMemoN:int = 0;
+
+fn _canonName(k:string): string {
+    let hit = Object.TryGet(_canonMemo, k, nil);
+    if (hit != nil) { return hit; }
+
+    let parts:array  = String.Split(k, "-");
+    let canon:string = "";
+    let j:int = 0;
+    while (j < len(parts)) {
+        let p:string = parts[j];
+        if (String.Length(p) > 0) {
+            p = String.ToUpper(String.Left(p, 1)) +
+                String.Substr(p, 1, String.Length(p) - 1);
+        }
+        canon = (j == 0) ? p : canon + "-" + p;
+        j += 1;
+    }
+
+    if (_canonMemoN >= 512) { _canonMemo = {}; _canonMemoN = 0; }
+    _canonMemo[k] = canon;
+    _canonMemoN = _canonMemoN + 1;
+    return canon;
+}
 
 // =============================================================================
 // _Pipeline - executes a middleware chain + terminal handler for one request.
@@ -131,30 +251,41 @@ class RouteGroup
     let _router           = nil;
     let _prefix:string    = "";
     let _middleware:array = [];
+    let _host             = nil;   // nil = serves every host
 
-    fn Constructor(router, prefix:string) {
-        _router = router;
-        _prefix = prefix;
+    fn Constructor(router, prefix:string, host?) {
+        _router     = router;
+        _prefix     = prefix;
+        _middleware = [];
+        _host       = host ?? nil;
+    }
+
+    // A nested prefix group, keeping this group's host and middleware:
+    //   let api = app.Host("api.example").Group("/v1");
+    fn Group(prefix:string) {
+        let g = new RouteGroup(_router, _prefix + prefix, _host);
+        foreach (m in _middleware) { g.Use(m.handler); }
+        return g;
     }
 
     fn Get(pattern:string, handler:fn) {
-        _router._addGroupRoute("GET", _prefix + pattern, handler, _middleware);
+        _router._addGroupRoute("GET", _prefix + pattern, handler, _middleware, _host);
     }
 
     fn Post(pattern:string, handler:fn) {
-        _router._addGroupRoute("POST", _prefix + pattern, handler, _middleware);
+        _router._addGroupRoute("POST", _prefix + pattern, handler, _middleware, _host);
     }
 
     fn Put(pattern:string, handler:fn) {
-        _router._addGroupRoute("PUT", _prefix + pattern, handler, _middleware);
+        _router._addGroupRoute("PUT", _prefix + pattern, handler, _middleware, _host);
     }
 
     fn Delete(pattern:string, handler:fn) {
-        _router._addGroupRoute("DELETE", _prefix + pattern, handler, _middleware);
+        _router._addGroupRoute("DELETE", _prefix + pattern, handler, _middleware, _host);
     }
 
     fn Patch(pattern:string, handler:fn) {
-        _router._addGroupRoute("PATCH", _prefix + pattern, handler, _middleware);
+        _router._addGroupRoute("PATCH", _prefix + pattern, handler, _middleware, _host);
     }
 
     // Register middleware scoped to this group only: fn(req, next) -> response
@@ -169,11 +300,22 @@ class RouteGroup
 
 class Router
 {
-    let _routes:array     = [];
+    let _routes:array     = [];   // dynamic routes (":param" or "*"), in order
+    let _exact             = nil;  // "GET /api/users" -> route, for fixed patterns
     let _middleware:array = [];
     let _server            = nil;
     let _notFound          = nil;
     let _running           = true;
+    let _gen:int          = 0;    // bumped by Use(); invalidates cached chains
+    let _onAccess          = nil;
+    let _hasHosts:bool     = false;  // any host-scoped routes at all?
+
+    fn Constructor() {
+        _routes     = [];
+        _exact      = {};
+        _middleware = [];
+        _gen        = 0;
+    }
 
     // ---- route registration ----
 
@@ -201,23 +343,72 @@ class Router
         _addRoute("HEAD", pattern, handler, []);
     }
 
-    fn _addRoute(method:string, pattern:string, handler:fn, routeMiddleware:array) {
-        Array.Append(_routes, {
+    // Patterns are split once, at registration. The old matcher re-split both
+    // the pattern *and* the request path for every route on every request.
+    fn _addRoute(method:string, pattern:string, handler:fn, routeMiddleware:array, host?) {
+        let raw = String.Split(pattern, "/");
+        let segs:array    = [];
+        let catchAll:bool = false;
+        let dynamic:bool  = false;
+
+        let i:int = 0;
+        while (i < len(raw)) {
+            let sg:string = raw[i];
+            i += 1;
+            if (String.Length(sg) == 0) { continue; }
+            if (sg == "*") { catchAll = true; dynamic = true; continue; }
+            if (String.CharAt(sg, 0) == ':') { dynamic = true; }
+            Array.Append(segs, sg);
+        }
+
+        let h = host ?? nil;
+        if (h != nil) { _hasHosts = true; }
+
+        let route = {
             method:     method,
             pattern:    pattern,
+            segs:       segs,
+            catchAll:   catchAll,
             handler:    handler,
-            middleware: routeMiddleware
-        });
+            middleware: routeMiddleware,
+            host:       h,
+            chain:      nil,
+            chainGen:   -1
+        };
+
+        // A pattern with no ":param" and no "*" can only ever match one path,
+        // so it answers from a map and never enters the segment loop. A
+        // wildcard host cannot be hashed, so those routes are scanned instead.
+        let wildHost = (h != nil) && String.StartsWith(h, "*");
+        if (dynamic || wildHost) {
+            Array.Append(_routes, route);
+        } else {
+            _exact[(h ?? "") + "\n" + method + " /" + String.Join(segs, "/")] = route;
+        }
     }
 
-    fn _addGroupRoute(method:string, pattern:string, handler:fn, routeMiddleware:array) {
-        _addRoute(method, pattern, handler, routeMiddleware);
+    fn _addGroupRoute(method:string, pattern:string, handler:fn, routeMiddleware:array, host?) {
+        _addRoute(method, pattern, handler, routeMiddleware, host ?? nil);
     }
 
     // ---- route groups ----
 
     fn Group(prefix:string) {
-        return new RouteGroup(this, prefix);
+        return new RouteGroup(this, prefix, nil);
+    }
+
+    // ---- virtual hosts ----
+    // Routes registered on the returned group answer only for that Host:
+    //   let site = app.Host("shop.example.com");
+    //   site.Get("/", fn(req) { ... });
+    //
+    // "*.example.com" covers any subdomain but not the bare domain. Comparison
+    // ignores case and the port. A route registered directly on the router
+    // (not through Host) keeps serving every host, and a host-scoped route
+    // takes precedence over a host-agnostic one for the same path.
+    fn Host(hostname:string) {
+        _hasHosts = true;
+        return new RouteGroup(this, "", String.ToLower(hostname));
     }
 
     // ---- static file serving ----
@@ -240,12 +431,22 @@ class Router
 
     fn Use(middleware:fn) {
         Array.Append(_middleware, { handler: middleware });
+        // Routes cache their combined chain; a middleware registered after the
+        // routes were declared still has to apply to them.
+        _gen = _gen + 1;
     }
 
     // ---- custom 404 handler ----
 
     fn NotFound(handler:fn) {
         _notFound = handler;
+    }
+
+    // fn(entry) once per completed request. Pair it with
+    // HttpStatus.CombinedLogLine(entry) for a standard access log.
+    fn OnAccess(handler:fn) {
+        _onAccess = handler;
+        return this;
     }
 
     // ---- combine global + route-scoped middleware into one chain ----
@@ -265,6 +466,18 @@ class Router
         return combined;
     }
 
+    fn _cookiesOf(req): object {
+        let h = req.Header("Cookie", nil);
+        if (h == nil) { return {}; }
+        return req.Cookies();
+    }
+
+    fn _formOf(req): object {
+        let ct = String.ToLower(req.Header("Content-Type", "") ?? "");
+        if (!String.Contains(ct, "application/x-www-form-urlencoded")) { return {}; }
+        return req.Form();
+    }
+
     // ---- dispatch ----
 
     // Match req.method/req.path against a pattern. ':name' captures into
@@ -277,75 +490,130 @@ class Router
         let out = {};
         if (src == nil) { return out; }
         let keys = Object.Keys(src);
-        iter (i from 0 to len(keys) - 1) {
-            let k: string = keys[i];
+        let i:int = 0;
+        while (i < len(keys)) {
+            let k:string = keys[i];
             let v = src[k];
             out[k] = v;
-            // "content-type" -> "Content-Type"
-            let parts: array = String.Split(k, "-");
-            let canon: string = "";
-            iter (j from 0 to len(parts) - 1) {
-                let p: string = parts[j];
-                if (String.Length(p) > 0) {
-                    p = String.ToUpper(String.Left(p, 1)) +
-                        String.Substr(p, 1, String.Length(p) - 1);
-                }
-                canon = (j == 0) ? p : canon + "-" + p;
-            }
-            out[canon] = v;
+            let c:string = _canonName(k);
+            if (c != k) { out[c] = v; }
+            i += 1;
         }
         return out;
     }
 
-    fn _routeMatch(req, method: string, pattern: string): bool {
-        if (req == nil || req.method == nil || req.path == nil) { return false; }
-        if (req.method != method) { return false; }
+    // Split a request path into its non-empty segments. Once per request, not
+    // once per request per route.
+    fn _pathSegs(path:string): array {
+        let raw = String.Split(path, "/");
+        let out:array = [];
+        let i:int = 0;
+        while (i < len(raw)) {
+            if (String.Length(raw[i]) > 0) { Array.Append(out, raw[i]); }
+            i += 1;
+        }
+        return out;
+    }
 
-        let pat: array  = String.Split(pattern, "/");
-        let path: array = String.Split(req.path, "/");
-        let params = {};
-        let pi: int = 0;
-        let ri: int = 0;
+    // Match pre-split request segments against a pre-split route, filling
+    // req.params on success. The params object is allocated only once a capture
+    // actually happens, so a route that fails on its first literal costs nothing.
+    fn _matchRoute(route, segs:array, req): bool {
+        let rs:array = route.segs;
+        let n:int    = len(rs);
 
-        while (pi < len(pat)) {
-            let pseg: string = pat[pi];
-            if (String.Length(pseg) == 0) { pi += 1; continue; }
-            while (ri < len(path) && String.Length(path[ri]) == 0) { ri += 1; }
+        if (route.catchAll) {
+            if (len(segs) < n) { return false; }
+        } else if (len(segs) != n) {
+            return false;
+        }
 
-            if (pseg == "*") {
-                let rest: string = "";
-                while (ri < len(path)) {
-                    if (String.Length(rest) > 0) { rest = rest + "/"; }
-                    rest = rest + path[ri];
-                    ri += 1;
-                }
-                params["*"] = rest;
-                req.params = params;
-                return true;
-            }
-            if (ri >= len(path)) { return false; }
-            if (String.CharAt(pseg, 0) == ':') {
-                params[String.Substr(pseg, 1, String.Length(pseg) - 1)] = path[ri];
-            } else if (pseg != path[ri]) {
+        let params = nil;
+        let i:int  = 0;
+        while (i < n) {
+            let ps:string = rs[i];
+            if (String.CharAt(ps, 0) == ':') {
+                if (params == nil) { params = {}; }
+                params[String.Substr(ps, 1, String.Length(ps) - 1)] = segs[i];
+            } else if (ps != segs[i]) {
                 return false;
             }
-            pi += 1;
-            ri += 1;
+            i += 1;
         }
-        while (ri < len(path) && String.Length(path[ri]) == 0) { ri += 1; }
-        if (ri < len(path)) { return false; }
-        req.params = params;
+
+        if (route.catchAll) {
+            if (params == nil) { params = {}; }
+            let rest:string = "";
+            let j:int = n;
+            while (j < len(segs)) {
+                if (String.Length(rest) > 0) { rest = rest + "/"; }
+                rest = rest + segs[j];
+                j += 1;
+            }
+            params["*"] = rest;
+        }
+
+        req.params = (params == nil) ? {} : params;
         return true;
     }
 
+    // The combined global + route-scoped chain, built once per route and reused
+    // until Use() adds another middleware. The old code rebuilt and re-copied
+    // this array on every single request.
+    fn _chainFor(route) {
+        if (route.chainGen != _gen) {
+            route.chain    = this._buildChain(route.middleware);
+            route.chainGen = _gen;
+        }
+        return route.chain;
+    }
+
     fn _dispatch(req) {
-        iter (i from 0 to len(_routes) - 1) {
+        if (req == nil || req.method == nil || req.path == nil) {
+            return Response.Error(400, "Bad Request");
+        }
+
+        let segs = this._pathSegs(req.path);
+        let tail = req.method + " /" + String.Join(segs, "/");
+        let host = _hasHosts ? _reqHostOf(req) : "";
+
+        // Fixed patterns resolve in a single map lookup. Keying on the rejoined
+        // segments keeps the old lenient behaviour, where "/a/b/" and "//a//b"
+        // both match "/a/b". A route bound to this host is preferred over one
+        // that serves every host.
+        let hit = nil;
+        if (_hasHosts) { hit = Object.TryGet(_exact, host + "\n" + tail, nil); }
+        if (hit == nil) { hit = Object.TryGet(_exact, "\n" + tail, nil); }
+        if (hit != nil) {
+            req.params = {};
+            let pipeline = new _Pipeline(this._chainFor(hit), hit.handler);
+            return pipeline.Run(req);
+        }
+
+        // Two passes for the same reason: host-scoped routes first, then the
+        // ones that serve any host. Skipped entirely when no host is in play.
+        if (_hasHosts) {
+            let hi:int = 0;
+            while (hi < len(_routes)) {
+                let hr = _routes[hi];
+                if (hr.host != nil && hr.method == req.method
+                    && _hostMatches(hr.host, host) && this._matchRoute(hr, segs, req)) {
+                    let pipeline = new _Pipeline(this._chainFor(hr), hr.handler);
+                    return pipeline.Run(req);
+                }
+                hi += 1;
+            }
+        }
+
+        let i:int = 0;
+        while (i < len(_routes)) {
             let route = _routes[i];
-            if (this._routeMatch(req, route.method, route.pattern)) {
-                let chain    = this._buildChain(route.middleware);
-                let pipeline = new _Pipeline(chain, route.handler);
+            if (route.host == nil && route.method == req.method
+                && this._matchRoute(route, segs, req)) {
+                let pipeline = new _Pipeline(this._chainFor(route), route.handler);
                 return pipeline.Run(req);
             }
+            i += 1;
         }
 
         // No route matched. Still run the global middleware chain so that
@@ -364,13 +632,19 @@ class Router
 
     // Serves on HttpServer. Every request arrives through OnRequest, so Router
     // owns dispatch, middleware and 404 handling.
-    fn Listen(port:int) {
+    // opts are passed straight through to HttpServer, so everything it offers -
+    // tls, streamBodies, maxConnections, the timeouts - is reachable from here:
+    //   app.Listen(8443, { tls: { pkcs12File: "s.p12", password: "..." } });
+    fn Listen(port:int, opts?) {
         Console.WriteLine("Router listening on port ", port);
-        let srv = new HttpServer({ port: port });
+        let o = opts ?? {};
+        o["port"] = port;
+        let srv = new HttpServer(o);
         this._server = srv;
         this._running = true;
+        if (_onAccess != nil) { srv.OnAccess(_onAccess); }
 
-        srv.OnError(fn(req, res, e) {
+        srv.OnError(fn(_req, _res, e) {
             Console.Error("Router: handler error: ", e);
         });
         srv.OnRequest(fn(req, res) {
@@ -383,6 +657,15 @@ class Router
                 query:   req.query,
                 headers: this._canonHeaders(req.headers),
                 params:  {},
+                // Parsed only when the request carries them, so an API call
+                // with neither pays nothing.
+                cookies: this._cookiesOf(req),
+                form:    this._formOf(req),
+                // The client address, which middleware needs to identify a peer
+                // - a rate limiter keying on a header alone is keying on
+                // something the client controls.
+                peer:    req.peer,
+                secure:  req.secure,
                 body:    req.Text()
             };
             let r = this._dispatch(plain);
@@ -397,7 +680,34 @@ class Router
             iter (i from 0 to len(keys) - 1) {
                 res.Header(keys[i], hdrs[keys[i]]);
             }
-            // A handler may return a block (static files, images) or a string.
+            // Cookies are applied before the body is written, and go out as
+            // one Set-Cookie line each rather than overwriting one another.
+            let cookies = Object.TryGet(r, "cookies", nil);
+            if (cookies != nil) {
+                iter (ci from 0 to len(cookies) - 1) {
+                    let ck = cookies[ci];
+                    if (Object.TryGet(ck, "clear", false)) {
+                        res.ClearCookie(ck.name, ck.opts);
+                    } else {
+                        res.SetCookie(ck.name, ck.value, ck.opts);
+                    }
+                }
+            }
+
+            // A response may name a file instead of carrying a body. Handing
+            // the path down lets the server answer with validators, honour a
+            // conditional request or a byte range, and send the bytes without
+            // routing them through this VM at all.
+            let ref = Object.TryGet(r, "file", nil);
+            if (ref != nil) {
+                // A middleware may have set its own status; File() only
+                // overrides it for a 206 range or a 304 revalidation.
+                let st = r.status ?? 200;
+                if (st != 200) { res.Status(st); }
+                res.File(ref, nil);
+                return;
+            }
+            // Otherwise a block (images, generated binaries) or a string.
             let body = r.body ?? "";
             if (Type.Is(body, Type.Block)) {
                 res.Bytes(body, nil, r.status ?? 200);
@@ -409,13 +719,17 @@ class Router
         srv.Listen();
     }
 
-    fn Stop() {
+    // Stop accepting and wait for the requests in flight to finish.
+    // Returns true if they all completed within timeoutMs (default 5000).
+    fn Stop(timeoutMs?) {
         Console.WriteLine("Router stopping...");
         this._running = false;
+        let drained = true;
         if (this._server != nil) {
-            this._server.Stop();
+            drained = this._server.Stop(timeoutMs ?? 5000);
             this._server = nil;
         }
+        return drained;
     }
 }
 
@@ -477,6 +791,26 @@ class Response
         };
     }
 
+    // Attach a cookie to any response these helpers build. Chainable:
+    //   return Response.WithCookie(Response.Json(user), "sid", token,
+    //                              { maxAge: 3600 });
+    // Defaults come from the server: HttpOnly, SameSite=Lax, and Secure
+    // whenever the request arrived over TLS.
+    fn static WithCookie(resp, name:string, value, options) {
+        if (resp == nil) { return resp; }
+        if (!Object.HasKey(resp, "cookies") || resp.cookies == nil) { resp["cookies"] = []; }
+        Array.Append(resp.cookies, { name: name, value: value, opts: options ?? nil });
+        return resp;
+    }
+
+    // Expire a cookie. Path and Domain must match how it was set.
+    fn static ClearCookie(resp, name:string, options) {
+        if (resp == nil) { return resp; }
+        if (!Object.HasKey(resp, "cookies") || resp.cookies == nil) { resp["cookies"] = []; }
+        Array.Append(resp.cookies, { name: name, value: "", clear: true, opts: options ?? nil });
+        return resp;
+    }
+
     // Serve a single file. Content-Type is inferred from the extension unless
     // `contentType` is given. The body is the raw bytes, so binary assets
     // (images, fonts, ...) are transmitted intact. Returns 404 if missing.
@@ -495,13 +829,19 @@ class _StaticHandler
     let _index:string = "index.html";
     let _fallback     = nil;
     let _cache        = nil;
+    let _dotfiles:bool       = false;
+    let _followSymlinks:bool = false;
 
     fn Constructor(root:string, options) {
         if (root != nil and len(root) > 0) _root = root;
         if (options != nil) {
-            if (Object.HasKey(options, "index"))        _index    = options.index;
-            if (Object.HasKey(options, "fallback"))     _fallback = options.fallback;
-            if (Object.HasKey(options, "cacheControl")) _cache    = options.cacheControl;
+            if (Object.HasKey(options, "index"))          _index          = options.index;
+            if (Object.HasKey(options, "fallback"))       _fallback       = options.fallback;
+            if (Object.HasKey(options, "cacheControl"))   _cache          = options.cacheControl;
+            // Both default to the safe answer; a deployment that needs them
+            // opts in explicitly.
+            if (Object.HasKey(options, "dotfiles"))       _dotfiles       = options.dotfiles;
+            if (Object.HasKey(options, "followSymlinks")) _followSymlinks = options.followSymlinks;
         }
     }
 
@@ -516,8 +856,29 @@ class _StaticHandler
             return Response.Error(403, "Forbidden");
         }
 
+        // 404 rather than 403: a distinct status would confirm the file is there.
+        if (!_dotfiles and _hasDotSeg(safe)) {
+            return Response.Error(404, "Not Found");
+        }
+
         var path:string = _root;
         if (len(safe) > 0) path = _root + "/" + safe;
+
+        // Belt as well as braces: _safeRel already rejects ".." segments, but
+        // confirm the resolved path really lands inside the root. Path.Resolve
+        // collapses "..", and the separator boundary stops a root of "./www"
+        // from also accepting "./www-secret".
+        let rootAbs = Path.Resolve(_root);
+        let pathAbs = Path.Resolve(path);
+        if (rootAbs == nil or pathAbs == nil) { return Response.Error(403, "Forbidden"); }
+        if (pathAbs != rootAbs
+            and !String.StartsWith(pathAbs, rootAbs + "/")
+            and !String.StartsWith(pathAbs, rootAbs + "\\")) {
+            return Response.Error(403, "Forbidden");
+        }
+        if (!_followSymlinks and _crossesLink(rootAbs, safe)) {
+            return Response.Error(404, "Not Found");
+        }
 
         // A directory request (including the mount root) serves the index file.
         // Directory.Exists() uses stat()+S_ISDIR; File.Exists() (fopen) is true for
@@ -538,14 +899,14 @@ class _StaticHandler
         return Response.Error(404, "Not Found");
     }
 
+    // Return a reference to the file rather than its bytes. The server then
+    // does the validators, conditional revalidation, byte ranges and the
+    // zero-copy send - none of which is possible once the body has already been
+    // read into a block here.
     fn _fileResponse(path:string) {
-        let bytes = File.ReadAllBytes(path);
-        if (bytes == nil) {
-            return Response.Error(404, "Not Found");
-        }
         let headers = { "Content-Type": _StaticHandler._mimeFor(path) };
         if (_cache != nil) headers["Cache-Control"] = _cache;
-        return { status: 200, body: bytes, headers: headers };
+        return { status: 200, file: path, headers: headers };
     }
 
     // Read a file and build a response with an inferred (or given) Content-Type.
@@ -555,12 +916,8 @@ class _StaticHandler
         if (!File.Exists(path) or Directory.Exists(path)) {
             return Response.Error(404, "Not Found");
         }
-        let bytes = File.ReadAllBytes(path);
-        if (bytes == nil) {
-            return Response.Error(404, "Not Found");
-        }
         let ct = (contentType == nil) ? _StaticHandler._mimeFor(path) : contentType;
-        return { status: 200, body: bytes, headers: { "Content-Type": ct } };
+        return { status: 200, file: path, headers: { "Content-Type": ct } };
     }
 
     // Validate a request-relative path. Returns the cleaned path, or nil if it
@@ -580,6 +937,8 @@ class _StaticHandler
     }
 
     // Map a file extension to a MIME type (defaults to octet-stream).
+    // The table lives at module scope: built as a literal inside this function
+    // it was a fresh 30-key object allocated on every single file served.
     fn static _mimeFor(path:string): string {
         let parts = String.Split(path, ".");
         let n:int = len(parts);
@@ -587,41 +946,7 @@ class _StaticHandler
         let ext = String.ToLower(parts[n - 1]);
         if (String.Contains(ext, "/")) return "application/octet-stream";
 
-        let m = {
-            html: "text/html; charset=utf-8",
-            htm:  "text/html; charset=utf-8",
-            css:  "text/css; charset=utf-8",
-            js:   "text/javascript; charset=utf-8",
-            mjs:  "text/javascript; charset=utf-8",
-            json: "application/json; charset=utf-8",
-            xml:  "application/xml; charset=utf-8",
-            txt:  "text/plain; charset=utf-8",
-            md:   "text/markdown; charset=utf-8",
-            csv:  "text/csv; charset=utf-8",
-            svg:  "image/svg+xml",
-            png:  "image/png",
-            jpg:  "image/jpeg",
-            jpeg: "image/jpeg",
-            gif:  "image/gif",
-            webp: "image/webp",
-            ico:  "image/x-icon",
-            bmp:  "image/bmp",
-            woff: "font/woff",
-            woff2:"font/woff2",
-            ttf:  "font/ttf",
-            otf:  "font/otf",
-            eot:  "application/vnd.ms-fontobject",
-            pdf:  "application/pdf",
-            wasm: "application/wasm",
-            mp4:  "video/mp4",
-            webm: "video/webm",
-            mp3:  "audio/mpeg",
-            wav:  "audio/wav",
-            ogg:  "audio/ogg",
-            zip:  "application/zip",
-            gz:   "application/gzip"
-        };
-        if (Object.HasKey(m, ext)) return m[ext];
+        if (Object.HasKey(_MIME, ext)) return _MIME[ext];
         return "application/octet-stream";
     }
 }
@@ -671,15 +996,29 @@ class LoggerMiddleware
 
 class CorsMiddleware
 {
-    let _origin:string      = "*";
+    let _any:bool           = true;   // "*" - no allowlist
+    let _origins:array      = [];
     let _methods:string     = "GET, POST, PUT, DELETE, PATCH, OPTIONS";
     let _headers:string     = "Content-Type, Authorization";
     let _maxAge:string      = "86400";
     let _credentials:bool   = false;
     let _exposeHeaders      = nil;
 
-    fn Constructor(origin:string, options) {
-        if (origin != nil) _origin = origin;
+    // origin: "*", a single origin, or an array of allowed origins. With an
+    // allowlist the request's own Origin is echoed back when it is on the list
+    // and omitted when it is not - never reflected blindly, which would let any
+    // site read authenticated responses.
+    fn Constructor(origin, options) {
+        _origins = [];
+        if (origin == nil || origin == "*") {
+            _any = true;
+        } else if (Type.Is(origin, Type.Array)) {
+            _any = false;
+            foreach (o in origin) { Array.Append(_origins, o); }
+        } else {
+            _any = false;
+            Array.Append(_origins, origin);
+        }
         if (options != nil) {
             if (Object.HasKey(options, "methods"))       _methods       = options.methods;
             if (Object.HasKey(options, "headers"))       _headers       = options.headers;
@@ -687,25 +1026,146 @@ class CorsMiddleware
             if (Object.HasKey(options, "credentials"))   _credentials   = options.credentials;
             if (Object.HasKey(options, "exposeHeaders")) _exposeHeaders = options.exposeHeaders;
         }
+
+        // Fetch forbids "*" together with credentials and every browser rejects
+        // the pair, so a server that sends both is silently doing no CORS at
+        // all. Fail here rather than at 3am.
+        if (_any and _credentials) {
+            throw(1, "CorsMiddleware: credentials require an explicit origin list, not \"*\"");
+        }
+    }
+
+    // The value to send for this request, or nil when the origin is not allowed.
+    fn _allowedOrigin(req) {
+        if (_any) { return "*"; }
+        let o = Object.TryGet(req.headers ?? {}, "Origin", nil);
+        if (o == nil) { return nil; }
+        foreach (a in _origins) { if (a == o) { return o; } }
+        return nil;
     }
 
     fn Handle(req, next) {
+        let allow = this._allowedOrigin(req);
+
         if (req.method == "OPTIONS") {
             let h = {
-                "Access-Control-Allow-Origin":  _origin,
                 "Access-Control-Allow-Methods": _methods,
                 "Access-Control-Allow-Headers": _headers,
                 "Access-Control-Max-Age":       _maxAge
             };
-            if (_credentials) h["Access-Control-Allow-Credentials"] = "true";
+            if (allow != nil) {
+                h["Access-Control-Allow-Origin"] = allow;
+                if (_credentials) h["Access-Control-Allow-Credentials"] = "true";
+            }
+            // The answer depends on the Origin, so a shared cache must not
+            // serve one origin's approval to another.
+            if (!_any) { h["Vary"] = "Origin"; }
             return { status: 204, body: "", headers: h };
         }
 
         let resp = next(req);
+        if (resp == nil) { return resp; }
         if (resp.headers == nil) resp["headers"] = {};
-        resp.headers["Access-Control-Allow-Origin"] = _origin;
-        if (_credentials) resp.headers["Access-Control-Allow-Credentials"] = "true";
-        if (_exposeHeaders != nil) resp.headers["Access-Control-Expose-Headers"] = _exposeHeaders;
+        if (!_any) { resp.headers["Vary"] = "Origin"; }
+        if (allow != nil) {
+            resp.headers["Access-Control-Allow-Origin"] = allow;
+            if (_credentials) resp.headers["Access-Control-Allow-Credentials"] = "true";
+            if (_exposeHeaders != nil) resp.headers["Access-Control-Expose-Headers"] = _exposeHeaders;
+        }
+        return resp;
+    }
+}
+
+// =============================================================================
+// SecurityHeadersMiddleware - the response headers a browser needs in order to
+// defend a page, applied in one place.
+//
+// Usage:
+//   let sec = new SecurityHeadersMiddleware();
+//   app.Use(fn(req, next) { return sec.Handle(req, next); });
+//
+// Options (defaults in brackets):
+//   contentTypeOptions  [true]           X-Content-Type-Options: nosniff
+//   frameOptions        ["DENY"]         X-Frame-Options; nil to omit
+//   referrerPolicy      ["no-referrer"]  Referrer-Policy; nil to omit
+//   crossOriginOpener   ["same-origin"]  Cross-Origin-Opener-Policy; nil to omit
+//   csp                 [nil]            Content-Security-Policy
+//   permissionsPolicy   [nil]            Permissions-Policy
+//   hsts                [nil]            Strict-Transport-Security; true for a
+//                                        year, or { maxAge, includeSubDomains,
+//                                        preload }
+//
+// Two defaults are deliberately off. A Content-Security-Policy cannot be
+// guessed for someone else's application - a wrong one silently breaks the page
+// - and HSTS is remembered by the browser, so switching it on before TLS is
+// actually working everywhere locks your own users out for maxAge seconds. Both
+// are one option away.
+//
+// A header the handler already set is never overwritten.
+// =============================================================================
+
+class SecurityHeadersMiddleware
+{
+    let _nosniff:bool = true;
+    let _frame        = "DENY";
+    let _referrer     = "no-referrer";
+    let _coop         = "same-origin";
+    let _csp          = nil;
+    let _permissions  = nil;
+    let _hsts         = nil;
+
+    fn Constructor(options?) {
+        let o = options ?? nil;
+        if (o != nil) {
+            if (Object.HasKey(o, "contentTypeOptions")) _nosniff     = o.contentTypeOptions;
+            if (Object.HasKey(o, "frameOptions"))       _frame       = o.frameOptions;
+            if (Object.HasKey(o, "referrerPolicy"))     _referrer    = o.referrerPolicy;
+            if (Object.HasKey(o, "crossOriginOpener"))  _coop        = o.crossOriginOpener;
+            if (Object.HasKey(o, "csp"))                _csp         = o.csp;
+            if (Object.HasKey(o, "permissionsPolicy"))  _permissions = o.permissionsPolicy;
+            if (Object.HasKey(o, "hsts"))               _hsts        = SecurityHeadersMiddleware._hstsValue(o.hsts);
+        }
+    }
+
+    fn static _hstsValue(h) {
+        if (h == nil or h == false) { return nil; }
+        let maxAge = 31536000;
+        let sub    = false;
+        let pre    = false;
+        if (h != true) {
+            if (Object.HasKey(h, "maxAge"))            maxAge = h.maxAge;
+            if (Object.HasKey(h, "includeSubDomains")) sub    = h.includeSubDomains;
+            if (Object.HasKey(h, "preload"))           pre    = h.preload;
+        }
+        let v = "max-age=" + str(maxAge);
+        if (sub) { v = v + "; includeSubDomains"; }
+        if (pre) { v = v + "; preload"; }
+        return v;
+    }
+
+    fn _set(h, name:string, value) {
+        if (value != nil and !Object.HasKey(h, name)) { h[name] = value; }
+    }
+
+    fn Handle(req, next) {
+        let resp = next(req);
+        if (resp == nil) { return resp; }
+        if (resp.headers == nil) resp["headers"] = {};
+        let h = resp.headers;
+
+        if (_nosniff) { this._set(h, "X-Content-Type-Options", "nosniff"); }
+        this._set(h, "X-Frame-Options",             _frame);
+        this._set(h, "Referrer-Policy",             _referrer);
+        this._set(h, "Cross-Origin-Opener-Policy",  _coop);
+        this._set(h, "Content-Security-Policy",     _csp);
+        this._set(h, "Permissions-Policy",          _permissions);
+
+        // HSTS means something only over TLS, and the browser remembers it -
+        // sending it from a plaintext listener would pin clients to a scheme
+        // this deployment may not actually serve.
+        if (_hsts != nil and req.secure == true) {
+            this._set(h, "Strict-Transport-Security", _hsts);
+        }
         return resp;
     }
 }
@@ -725,10 +1185,21 @@ class JwtMiddleware
 {
     let _secret:string   = "";
     let _skipPaths:array = [];
+    let _claimOpts        = nil;
 
-    fn Constructor(secret:string, skipPaths) {
+    // options: { leeway:int, requireExp:bool }
+    fn Constructor(secret:string, skipPaths, options?) {
         _secret    = secret;
         _skipPaths = (skipPaths == nil) ? [] : skipPaths;
+
+        let o = options ?? nil;
+        // exp and nbf are always enforced when the token carries them - that is
+        // the entire point of giving a bearer token a lifetime. requireExp goes
+        // further and refuses a token with no expiry at all.
+        _claimOpts = {
+            leeway:     (o != nil && Object.HasKey(o, "leeway"))     ? o.leeway     : 0,
+            requireExp: (o != nil && Object.HasKey(o, "requireExp")) ? o.requireExp : false
+        };
     }
 
     fn Handle(req, next) {
@@ -748,8 +1219,11 @@ class JwtMiddleware
 
         let token = String.Substr(auth, len(prefix), len(auth) - len(prefix));
 
-        let verified = _jwt.VerifyHS256(token, _secret);
-        if (!verified) {
+        // Signature *and* claims. VerifyHS256 on its own checks only the
+        // signature, so a token that expired months ago still verifies - which
+        // makes every issued token a credential that never expires, including
+        // any that have leaked.
+        if (!Jwt.VerifyHS256WithClaims(token, _secret, _claimOpts)) {
             return Response.Error(401, "Invalid or expired token");
         }
 
@@ -762,52 +1236,266 @@ class JwtMiddleware
 }
 
 // =============================================================================
-// RateLimitMiddleware - simple in-memory rate limiter
+// RateLimitMiddleware - in-memory rate limiter, sliding window.
 //
 // Usage:
-//   let rateMw = new RateLimitMiddleware(100, 60);  // 100 req / 60 seconds
+//   let rateMw = new RateLimitMiddleware(100, 60);   // 100 requests / 60 s
 //   app.Use(fn(req, next) { return rateMw.Handle(req, next); });
+//
+//   // Behind a reverse proxy, and keyed on the API key when there is one:
+//   let rateMw = new RateLimitMiddleware(100, 60, {
+//       trustProxy: true,
+//       skip:       fn(req) { return req.path == "/health"; },
+//       keyFn:      fn(req) { return req.headers["X-Api-Key"] ?? req.peer; }
+//   });
+//
+// Options (all optional):
+//   keyFn       fn(req) -> string   what to count per (default: client address)
+//   skip        fn(req) -> bool     true bypasses the limiter entirely
+//   trustProxy  bool                honour X-Forwarded-For (default false)
+//   maxKeys     int                 cap on tracked clients (default 10000)
+//   headers     bool                emit RateLimit-* headers (default true)
+//   clock       fn() -> int         millisecond source; for tests
+//
+// Identity: by default the bucket is the client address from req.peer, with the
+// port stripped - keep the port and every new connection is a fresh bucket, so
+// the limit never binds. X-Forwarded-For is consulted only when trustProxy is
+// set, because a client can put anything in it; without a proxy in front,
+// trusting it lets any caller mint unlimited identities.
+//
+// Window: a sliding window rather than a fixed one. A fixed window lets a
+// caller spend its whole allowance at the end of one window and again at the
+// start of the next - twice the limit across the boundary. Here the previous
+// window's count is carried over, weighted by how much of it is still in view.
+//
+// Memory: bounded. Idle buckets are swept once maxKeys is reached, and if the
+// live set still exceeds the cap it is dropped wholesale. An unbounded map here
+// is a denial-of-service vector, since the keys come from the network.
 // =============================================================================
+
+// A path segment beginning with "." marks a file that is conventionally private
+// but perfectly readable: .env, .git, .htpasswd. ".well-known" is the standard
+// exception - ACME challenges and security.txt live there.
+fn _hasDotSeg(rel:string): bool {
+    if (rel == nil or rel == "") { return false; }
+    foreach (sg in String.Split(rel, "/")) {
+        if (String.StartsWith(sg, ".") and sg != ".well-known") { return true; }
+    }
+    return false;
+}
+
+// A symlink below the mount root can point anywhere, and the containment check
+// cannot see it - Path.Resolve is purely lexical. The final component alone is
+// not enough either: a file reached *through* a symlinked directory stats with
+// IsSymlink false. So every segment below the root is checked; the root itself
+// is not, since "/var/www -> /data/www" is an ordinary deployment.
+fn _crossesLink(root:string, rel:string): bool {
+    if (rel == nil or rel == "") { return false; }
+    let cur:string = root;
+    foreach (sg in String.Split(rel, "/")) {
+        if (String.Length(sg) > 0) {
+            cur = cur + "/" + sg;
+            let st = File.Stat(cur);
+            if (st != nil and st.IsSymlink) { return true; }
+        }
+    }
+    return false;
+}
+
+// The site a request is asking for: the Host header, lowercased and without its
+// port, since "example.com" and "example.com:8080" are the same site.
+fn _reqHostOf(req): string {
+    let hdrs = req.headers ?? {};
+    let h = Object.TryGet(hdrs, "Host", nil) ?? Object.TryGet(hdrs, "host", "");
+    let t = String.ToLower(String.Trim(str(h ?? "")));
+    if (String.StartsWith(t, "[")) {                 // IPv6 literal keeps its brackets
+        let close = String.IndexOf(t, "]");
+        return (close > 0) ? String.Left(t, close + 1) : t;
+    }
+    let colon = String.LastIndexOf(t, ":");
+    return (colon > 0) ? String.Left(t, colon) : t;
+}
+
+// Does a route's configured host cover this request? nil means the route is not
+// host-scoped and serves every host. A leading "*." matches any subdomain, at
+// any depth, but never the bare domain - "*.example.com" is not "example.com".
+fn _hostMatches(pattern, host:string): bool {
+    if (pattern == nil) { return true; }
+    if (pattern == host) { return true; }
+    if (String.StartsWith(pattern, "*.")) {
+        let suffix = String.Substr(pattern, 1);      // ".example.com"
+        return String.EndsWith(host, suffix) && String.Length(host) > String.Length(suffix);
+    }
+    return false;
+}
+
+// "1.2.3.4:5678" -> "1.2.3.4"; "[::1]:5678" -> "[::1]".
+fn _hostOf(peer): string {
+    if (peer == nil || peer == "") { return "unknown"; }
+    if (String.StartsWith(peer, "[")) {
+        let close = String.IndexOf(peer, "]");
+        if (close > 0) { return String.Substr(peer, 0, close + 1); }
+        return peer;
+    }
+    let colon = String.LastIndexOf(peer, ":");
+    if (colon > 0) { return String.Substr(peer, 0, colon); }
+    return peer;
+}
 
 class RateLimitMiddleware
 {
-    let _limit:int  = 100;
-    let _window:int = 60;
-    let _counts      = {};
-    let _windows     = {};
+    let _limit:int       = 100;
+    let _windowMs:int    = 60000;
+    let _keyFn            = nil;
+    let _skip             = nil;
+    let _trustProxy:bool = false;
+    let _maxKeys:int     = 10000;
+    let _emit:bool       = true;
+    let _clock            = nil;
 
-    fn Constructor(limit:int, windowSeconds:int) {
-        _limit  = limit;
-        _window = windowSeconds;
+    // key -> { start, cur, prev }: the current window's count and the previous
+    // window's, which is what makes the window slide.
+    let _buckets          = nil;
+    let _nKeys:int       = 0;
+
+    fn Constructor(limit:int, windowSeconds:int, options?) {
+        _limit    = limit;
+        _windowMs = windowSeconds * 1000;
+        _buckets  = {};
+        _nKeys    = 0;
+
+        let o = options ?? nil;
+        if (o != nil) {
+            if (Object.HasKey(o, "keyFn"))      _keyFn      = o.keyFn;
+            if (Object.HasKey(o, "skip"))       _skip       = o.skip;
+            if (Object.HasKey(o, "trustProxy")) _trustProxy = o.trustProxy;
+            if (Object.HasKey(o, "maxKeys"))    _maxKeys    = o.maxKeys;
+            if (Object.HasKey(o, "headers"))    _emit       = o.headers;
+            if (Object.HasKey(o, "clock"))      _clock      = o.clock;
+        }
+    }
+
+    // Monotonic by default: a wall clock can step backwards under NTP, and only
+    // deltas matter here.
+    fn _now(): int {
+        if (_clock != nil) { return _clock(); }
+        return Time.Millis();
+    }
+
+    fn _key(req): string {
+        if (_keyFn != nil) { return str(_keyFn(req)); }
+
+        if (_trustProxy) {
+            let hdrs = req.headers ?? {};
+            let xff  = Object.TryGet(hdrs, "X-Forwarded-For", nil);
+            if (xff != nil) {
+                // The left-most entry is the original client; the rest are proxies.
+                let comma = String.IndexOf(xff, ",");
+                let first = String.Trim((comma >= 0) ? String.Substr(xff, 0, comma) : xff);
+                if (String.Length(first) > 0) { return first; }
+            }
+        }
+        return _hostOf(req.peer);
+    }
+
+    // Drop buckets whose window has fully passed. Called only when the cap is
+    // reached, so the common path never walks the map.
+    fn _sweep(now:int) {
+        let keys = Object.Keys(_buckets);
+        let kept = {};
+        let n:int = 0;
+        let i:int = 0;
+        while (i < len(keys)) {
+            let k = keys[i];
+            let b = _buckets[k];
+            if ((now - b.start) < (2 * _windowMs)) { kept[k] = b; n = n + 1; }
+            i += 1;
+        }
+        // Still over the cap after sweeping: the live set itself is the problem,
+        // so start clean rather than grow without bound.
+        if (n > _maxKeys) { kept = {}; n = 0; }
+        _buckets = kept;
+        _nKeys   = n;
+    }
+
+    // Roll `b` forward to the window containing `now`.
+    fn _advance(b, now:int) {
+        let elapsed:int = now - b.start;
+        if (elapsed >= (2 * _windowMs)) {
+            b.prev  = 0;
+            b.cur   = 0;
+            b.start = now;
+        } else if (elapsed >= _windowMs) {
+            b.prev  = b.cur;
+            b.cur   = 0;
+            b.start = b.start + _windowMs;
+        }
+        return b;
     }
 
     fn Handle(req, next) {
-        let ip = req.headers["X-Forwarded-For"];
-        if (ip == nil) { ip = "unknown"; }
+        if (_skip != nil && _skip(req)) { return next(req); }
 
-        let now:int  = Time.Now();
-        let winStart = _windows[ip];
+        let now:int = this._now();
+        let key     = this._key(req);
 
-        if (winStart == nil || (now - winStart) > _window) {
-            _windows[ip] = now;
-            _counts[ip]  = 1;
+        let b = Object.TryGet(_buckets, key, nil);
+        if (b == nil) {
+            if (_nKeys >= _maxKeys) { this._sweep(now); }
+            b = { start: now, cur: 0, prev: 0 };
+            _buckets[key] = b;
+            _nKeys = _nKeys + 1;
         } else {
-            _counts[ip] = _counts[ip] + 1;
+            this._advance(b, now);
         }
 
-        if (_counts[ip] > _limit) {
+        // Sliding estimate: the part of the previous window still inside the
+        // trailing window counts in proportion to how much of it remains.
+        let into:int    = now - b.start;
+        let weight      = float(_windowMs - into) / float(_windowMs);
+        if (weight < 0.0) { weight = 0.0; }
+        let estimate    = (float(b.prev) * weight) + float(b.cur);
+
+        let resetSecs:int = ((_windowMs - into) + 999) / 1000;
+        if (resetSecs < 1) { resetSecs = 1; }
+
+        if (estimate >= float(_limit)) {
+            let h = {
+                "Content-Type": "application/json",
+                "Retry-After":  str(resetSecs)
+            };
+            if (_emit) {
+                h["RateLimit-Limit"]     = str(_limit);
+                h["RateLimit-Remaining"] = "0";
+                h["RateLimit-Reset"]     = str(resetSecs);
+            }
             return {
                 status:  429,
                 body:    Json.Stringify({ error: "Too many requests" }),
-                headers: {
-                    "Content-Type": "application/json",
-                    "Retry-After":  "" + _window
-                }
+                headers: h
             };
         }
 
-        return next(req);
+        b.cur = b.cur + 1;
+
+        let resp = next(req);
+        if (_emit && resp != nil) {
+            let remaining = _limit - int(estimate) - 1;
+            if (remaining < 0) { remaining = 0; }
+            if (resp.headers == nil) { resp["headers"] = {}; }
+            resp.headers["RateLimit-Limit"]     = str(_limit);
+            resp.headers["RateLimit-Remaining"] = str(remaining);
+            resp.headers["RateLimit-Reset"]     = str(resetSecs);
+        }
+        return resp;
     }
+
+    // Number of clients currently tracked - useful as a gauge, and to confirm
+    // the bound is holding.
+    fn TrackedKeys(): int { return _nKeys; }
+
+    // Forget every bucket.
+    fn Reset() { _buckets = {}; _nKeys = 0; return this; }
 }
 
 // =============================================================================
@@ -823,4 +1511,5 @@ fn JwtSign(payload, secret, expirySeconds) {
     return _jwt.EncodeHS256(payload, secret, options);
 }
 
-export { Router, Response, JwtMiddleware, JwtSign, LoggerMiddleware, CorsMiddleware, RateLimitMiddleware };
+export { Router, Response, JwtMiddleware, JwtSign, LoggerMiddleware, CorsMiddleware,
+         RateLimitMiddleware, SecurityHeadersMiddleware };

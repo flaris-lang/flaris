@@ -1,0 +1,689 @@
+// test_router_dispatch.fls - the routing layer on its own: pattern matching,
+// middleware chain assembly, header canonicalisation. No sockets and no server,
+// so it is deterministic and fast.
+//
+// Run: flarisvm ./tests/test_router_dispatch.fls --libs='./libs'
+
+import { Router, Response, RateLimitMiddleware, JwtMiddleware,
+         CorsMiddleware, SecurityHeadersMiddleware }
+    from library("Router", "1.0");
+import { Jwt } from library("Jwt", "1.0");
+
+// A controllable clock, so the sliding window can be tested without sleeping.
+global gClock:int = 0;
+fn clockMs(): int { return gClock; }
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.Error("  FAIL: ", msg); }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.Error("  FAIL: ", msg, " - expected [", expected, "] got [", actual, "]");
+    }
+}
+
+// A request as HttpServer hands it to the router.
+fn mkReq(method:string, path:string) {
+    return { method: method, path: path, rawPath: path, params: {},
+             query: {}, headers: {}, peer: "127.0.0.1:1234", secure: false, body: "" };
+}
+
+fn mkPeerReq(peer:string) {
+    return { method: "GET", path: "/", rawPath: "/", params: {},
+             query: {}, headers: {}, peer: peer, secure: false, body: "" };
+}
+
+// Drive the limiter directly; the terminal handler just answers 200.
+fn hit(mw, req) {
+    return mw.Handle(req, fn(_r) { return Response.Text("ok", nil); });
+}
+
+// How many of `n` consecutive requests were allowed through.
+fn allowedOf(mw, req, n:int): int {
+    let ok:int = 0;
+    let i:int  = 0;
+    while (i < n) {
+        if (hit(mw, req).status != 429) { ok = ok + 1; }
+        i += 1;
+    }
+    return ok;
+}
+
+fn bodyOf(resp) { return (resp == nil) ? nil : resp.body; }
+
+// ---------------------------------------------------------------------------
+fn test_matching() {
+    Console.WriteLine("== matching ==");
+    let app = new Router();
+
+    app.Get("/",            fn(_r) { return Response.Text("root", nil); });
+    app.Get("/health",      fn(_r) { return Response.Text("ok", nil); });
+    app.Get("/a/b/c",       fn(_r) { return Response.Text("abc", nil); });
+    app.Get("/u/:id",       fn(r)  { return Response.Text("u:" + r.params.id, nil); });
+    app.Get("/u/:id/posts/:pid", fn(r) {
+        return Response.Text(r.params.id + "/" + r.params.pid, nil);
+    });
+    app.Get("/files/*",     fn(r)  { return Response.Text("f:" + r.params["*"], nil); });
+    app.Post("/health",     fn(_r) { return Response.Text("posted", nil); });
+
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/"))),        "root", "root path");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/health"))),  "ok",   "fixed route");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/a/b/c"))),   "abc",  "multi-segment fixed route");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/u/42"))),    "u:42", "single param");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/u/7/posts/9"))), "7/9", "two params");
+
+    // A fixed route and a parametric one that overlap must not shadow wrongly.
+    checkEq(bodyOf(app._dispatch(mkReq("POST", "/health"))), "posted", "method selects the route");
+
+    // Catch-all, including the zero-remaining-segments case that a mount
+    // registered as "/files/*" has to answer for a bare "/files".
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/files/x/y.txt"))), "f:x/y.txt", "catch-all captures the rest");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/files/"))),        "f:",        "catch-all with nothing left");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/files"))),         "f:",        "catch-all without the slash");
+
+    // Leniency the old matcher had, which the map lookup must preserve.
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/health/"))),  "ok", "trailing slash still matches");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "//health"))),  "ok", "empty segments ignored");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/a//b/c"))),   "abc", "internal empty segment ignored");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/u/42/"))),    "u:42", "param route, trailing slash");
+
+    // Non-matches.
+    let r404 = app._dispatch(mkReq("GET", "/nope"));
+    checkEq(r404.status, 404, "unknown path is 404");
+    let rMethod = app._dispatch(mkReq("DELETE", "/health"));
+    checkEq(rMethod.status, 404, "known path, wrong method");
+    let rShort = app._dispatch(mkReq("GET", "/u"));
+    checkEq(rShort.status, 404, "param route needs its segment");
+    let rLong = app._dispatch(mkReq("GET", "/a/b/c/d"));
+    checkEq(rLong.status, 404, "extra segment does not match a fixed route");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+fn test_middleware() {
+    Console.WriteLine("== middleware ==");
+
+    // Routes cache their combined chain. A middleware registered *after* the
+    // routes must still apply to them, or the cache is a correctness bug.
+    let app = new Router();
+    app.Get("/x", fn(_r) { return Response.Text("x", nil); });
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/x"))), "x", "no middleware yet");
+
+    app.Use(fn(r, next) {
+        let resp = next(r);
+        resp.body = "[" + resp.body + "]";
+        return resp;
+    });
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/x"))), "[x]",
+            "middleware added after the route still runs");
+
+    app.Use(fn(r, next) {
+        let resp = next(r);
+        resp.body = "<" + resp.body + ">";
+        return resp;
+    });
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/x"))), "[<x>]",
+            "second middleware runs inside the first");
+
+    // Cached chains must stay correct when reused across many dispatches.
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/x"))), "[<x>]", "chain reuse is stable");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/x"))), "[<x>]", "chain reuse is still stable");
+
+    // A route registered after the middleware picks it up too.
+    app.Get("/y", fn(_r) { return Response.Text("y", nil); });
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/y"))), "[<y>]", "later route inherits the chain");
+
+    // Short-circuit: a middleware that never calls next owns the response.
+    let app2 = new Router();
+    app2.Use(fn(_r, _next) { return Response.Text("blocked", 403); });
+    app2.Get("/z", fn(_r) { return Response.Text("z", nil); });
+    let blocked = app2._dispatch(mkReq("GET", "/z"));
+    checkEq(blocked.status, 403, "middleware can short-circuit");
+    checkEq(blocked.body, "blocked", "short-circuit body wins");
+
+    // Global middleware also runs for unmatched routes, so CORS preflight and
+    // logging still apply where no handler is registered.
+    let app3 = new Router();
+    global seen = 0;
+    app3.Use(fn(r, next) { seen = seen + 1; return next(r); });
+    app3.Get("/known", fn(_r) { return Response.Text("k", nil); });
+    app3._dispatch(mkReq("GET", "/unknown"));
+    checkEq(seen, 1, "global middleware runs on a 404 too");
+
+    // Group middleware applies to the group only.
+    let app4 = new Router();
+    let grp  = app4.Group("/api");
+    grp.Use(fn(r, next) {
+        let resp = next(r);
+        resp.body = "g:" + resp.body;
+        return resp;
+    });
+    grp.Get("/in",  fn(_r) { return Response.Text("in", nil); });
+    app4.Get("/out", fn(_r) { return Response.Text("out", nil); });
+    checkEq(bodyOf(app4._dispatch(mkReq("GET", "/api/in"))), "g:in", "group middleware applies inside");
+    checkEq(bodyOf(app4._dispatch(mkReq("GET", "/out"))),    "out",  "group middleware stays inside");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+fn test_headers_and_request() {
+    Console.WriteLine("== headers / request ==");
+    let app = new Router();
+
+    // The parser produces lowercase keys; handlers conventionally write the
+    // canonical spelling. Both must resolve, and the memo must not confuse
+    // one name for another.
+    let h = app._canonHeaders({
+        "content-type":    "application/json",
+        "authorization":   "Bearer t",
+        "x-forwarded-for": "1.2.3.4",
+        "host":            "example.com"
+    });
+    checkEq(h["Content-Type"],    "application/json", "canonical Content-Type");
+    checkEq(h["content-type"],    "application/json", "lowercase still present");
+    checkEq(h["Authorization"],   "Bearer t",         "canonical Authorization");
+    checkEq(h["X-Forwarded-For"], "1.2.3.4",          "canonical multi-dash name");
+    checkEq(h["Host"],            "example.com",      "single-word name");
+
+    // Repeat with the same names to exercise the memo, and with a new one.
+    let h2 = app._canonHeaders({ "content-type": "text/plain", "x-new-name": "v" });
+    checkEq(h2["Content-Type"], "text/plain", "memoised name maps to the new value");
+    checkEq(h2["X-New-Name"],   "v",          "unseen name canonicalises correctly");
+
+    // The client address reaches the handler - middleware cannot identify a
+    // peer from a header alone, since the client controls those.
+    app.Get("/peer", fn(r) { return Response.Text(r.peer ?? "none", nil); });
+    let plain = mkReq("GET", "/peer");
+    checkEq(bodyOf(app._dispatch(plain)), "127.0.0.1:1234", "req.peer reaches the handler");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Bearer-token authentication.
+//
+// The middleware is an authentication boundary: anything it lets through is
+// treated as an authenticated caller by everything downstream.
+// ---------------------------------------------------------------------------
+fn authReq(token:string) {
+    return { method: "GET", path: "/admin", rawPath: "/admin", params: {}, query: {},
+             headers: { "Authorization": "Bearer " + token },
+             peer: "1.2.3.4:5", secure: false, body: "" };
+}
+
+fn authApp(mw) {
+    let app = new Router();
+    app.Use(fn(r, next) { return mw.Handle(r, next); });
+    app.Get("/admin",  fn(_r) { return Response.Text("secret", nil); });
+    app.Get("/public", fn(_r) { return Response.Text("open", nil); });
+    return app;
+}
+
+fn test_jwt_auth() {
+    Console.WriteLine("== jwt auth ==");
+    let secret = "unit-test-secret";
+    let jwt    = new Jwt();
+    let now    = Time.Now();
+
+    let app = authApp(new JwtMiddleware(secret, ["/public"]));
+
+    // A current token is accepted.
+    let good = jwt.EncodeHS256({ sub: "alice" }, secret, { iat: now, exp: now + 3600 });
+    checkEq(app._dispatch(authReq(good)).status, 200, "valid token accepted");
+
+    // An expired token must not be. The signature is still perfectly valid -
+    // only the claims say otherwise, which is exactly the case a signature-only
+    // check waves through.
+    let expired = jwt.EncodeHS256({ sub: "attacker" }, secret,
+                                  { iat: now - 7200, exp: now - 3600 });
+    check(Jwt.VerifyHS256(expired, secret), "the expired token's signature is genuine");
+    checkEq(app._dispatch(authReq(expired)).status, 401, "EXPIRED token rejected");
+
+    // Not-yet-valid.
+    let future = jwt.EncodeHS256({ sub: "early" }, secret,
+                                 { iat: now, exp: now + 7200, nbf: now + 3600 });
+    checkEq(app._dispatch(authReq(future)).status, 401, "not-yet-valid (nbf) token rejected");
+
+    // Forgeries.
+    let wrongKey = jwt.EncodeHS256({ sub: "mallory" }, "other-secret", { exp: now + 3600 });
+    checkEq(app._dispatch(authReq(wrongKey)).status, 401, "token signed with another key rejected");
+
+    let tampered = good + "x";
+    checkEq(app._dispatch(authReq(tampered)).status, 401, "tampered signature rejected");
+
+    let none = jwt.Base64UrlEncodeString("{\"alg\":\"none\",\"typ\":\"JWT\"}") + "."
+             + jwt.Base64UrlEncodeString("{\"sub\":\"attacker\"}") + ".";
+    checkEq(app._dispatch(authReq(none)).status, 401, "alg=none forgery rejected");
+
+    // Malformed Authorization headers.
+    let noHdr = authReq(""); Object.Delete(noHdr.headers, "Authorization");
+    checkEq(app._dispatch(noHdr).status, 401, "missing Authorization rejected");
+    let basic = authReq(""); basic.headers["Authorization"] = "Basic dXNlcjpwdw==";
+    checkEq(app._dispatch(basic).status, 401, "non-Bearer scheme rejected");
+
+    // skipPaths still bypasses.
+    let pub = authReq(""); pub.path = "/public"; pub.rawPath = "/public";
+    Object.Delete(pub.headers, "Authorization");
+    checkEq(app._dispatch(pub).status, 200, "skipPaths bypasses auth");
+
+    // A token with no exp at all is accepted by default, and refused when the
+    // caller asks for expiry to be mandatory.
+    let noExp = jwt.EncodeHS256({ sub: "forever" }, secret, nil);
+    checkEq(app._dispatch(authReq(noExp)).status, 200, "token without exp accepted by default");
+    let strict = authApp(new JwtMiddleware(secret, [], { requireExp: true }));
+    checkEq(strict._dispatch(authReq(noExp)).status, 401, "requireExp refuses a token with no exp");
+    checkEq(strict._dispatch(authReq(good)).status, 200, "requireExp still accepts a bounded token");
+
+    // Leeway covers clock skew without accepting a genuinely stale token.
+    let justExpired = jwt.EncodeHS256({ sub: "skew" }, secret, { exp: now - 5 });
+    let lenient = authApp(new JwtMiddleware(secret, [], { leeway: 60 }));
+    checkEq(lenient._dispatch(authReq(justExpired)).status, 200, "leeway tolerates small skew");
+    checkEq(lenient._dispatch(authReq(expired)).status, 401, "leeway does not resurrect an old token");
+
+    // The verified payload reaches the handler.
+    let app2 = new Router();
+    let mw2  = new JwtMiddleware(secret, []);
+    app2.Use(fn(r, next) { return mw2.Handle(r, next); });
+    app2.Get("/admin", fn(r) { return Response.Text(r.jwt.sub, nil); });
+    checkEq(app2._dispatch(authReq(good)).body, "alice", "verified claims reach the handler");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+fn test_rate_limit() {
+    Console.WriteLine("== rate limiting ==");
+
+    // --- the limit binds, and only for the caller that spent it ---
+    gClock = 1000000;
+    let mw = new RateLimitMiddleware(5, 60, { clock: clockMs });
+    checkEq(allowedOf(mw, mkPeerReq("10.0.0.1:1111"), 8), 5, "exactly `limit` requests pass");
+    checkEq(hit(mw, mkPeerReq("10.0.0.1:1111")).status, 429, "the next one is refused");
+    checkEq(hit(mw, mkPeerReq("10.0.0.2:1111")).status, 200, "a different client is unaffected");
+
+    // --- the port must not create a new bucket per connection ---
+    let mw2 = new RateLimitMiddleware(3, 60, { clock: clockMs });
+    hit(mw2, mkPeerReq("10.0.0.9:1001"));
+    hit(mw2, mkPeerReq("10.0.0.9:2002"));
+    hit(mw2, mkPeerReq("10.0.0.9:3003"));
+    checkEq(hit(mw2, mkPeerReq("10.0.0.9:4004")).status, 429,
+            "same address on new ports shares one bucket");
+    checkEq(mw2.TrackedKeys(), 1, "one address is one tracked key");
+
+    // IPv6 keeps its brackets and loses its port.
+    let mw2b = new RateLimitMiddleware(2, 60, { clock: clockMs });
+    hit(mw2b, mkPeerReq("[2001:db8::1]:5555"));
+    hit(mw2b, mkPeerReq("[2001:db8::1]:6666"));
+    checkEq(hit(mw2b, mkPeerReq("[2001:db8::1]:7777")).status, 429, "IPv6 port stripped too");
+    checkEq(hit(mw2b, mkPeerReq("[2001:db8::2]:7777")).status, 200, "different IPv6 host is separate");
+
+    // --- X-Forwarded-For must not be trusted by default ---
+    let mw3 = new RateLimitMiddleware(2, 60, { clock: clockMs });
+    let spoof1 = mkPeerReq("10.0.0.5:1111"); spoof1.headers["X-Forwarded-For"] = "1.1.1.1";
+    let spoof2 = mkPeerReq("10.0.0.5:1111"); spoof2.headers["X-Forwarded-For"] = "2.2.2.2";
+    hit(mw3, spoof1);
+    hit(mw3, spoof2);
+    checkEq(hit(mw3, spoof1).status, 429,
+            "a client cannot mint identities with X-Forwarded-For");
+
+    // --- but it is used when a proxy is trusted ---
+    let mw4 = new RateLimitMiddleware(2, 60, { clock: clockMs, trustProxy: true });
+    let p1 = mkPeerReq("10.0.0.5:1111"); p1.headers["X-Forwarded-For"] = "1.1.1.1";
+    let p2 = mkPeerReq("10.0.0.5:1111"); p2.headers["X-Forwarded-For"] = "2.2.2.2";
+    hit(mw4, p1); hit(mw4, p1);
+    checkEq(hit(mw4, p1).status, 429, "trusted proxy: first client limited");
+    checkEq(hit(mw4, p2).status, 200, "trusted proxy: second client independent");
+
+    // The left-most entry is the origin client, not the proxy chain.
+    let mw5 = new RateLimitMiddleware(1, 60, { clock: clockMs, trustProxy: true });
+    let chain = mkPeerReq("10.0.0.5:1111");
+    chain.headers["X-Forwarded-For"] = "9.9.9.9, 10.0.0.1, 10.0.0.2";
+    hit(mw5, chain);
+    checkEq(hit(mw5, chain).status, 429, "left-most forwarded address is the client");
+    let other = mkPeerReq("10.0.0.5:1111");
+    other.headers["X-Forwarded-For"] = "8.8.8.8, 10.0.0.1";
+    checkEq(hit(mw5, other).status, 200, "a different origin behind the same proxy is separate");
+
+    // --- keyFn and skip ---
+    let mw6 = new RateLimitMiddleware(1, 60, {
+        clock: clockMs,
+        keyFn: fn(r) { return Object.TryGet(r.headers, "X-Api-Key", "anon"); }
+    });
+    let k1 = mkPeerReq("10.0.0.7:1"); k1.headers["X-Api-Key"] = "key-a";
+    let k2 = mkPeerReq("10.0.0.7:1"); k2.headers["X-Api-Key"] = "key-b";
+    hit(mw6, k1);
+    checkEq(hit(mw6, k1).status, 429, "keyFn buckets by API key");
+    checkEq(hit(mw6, k2).status, 200, "a different API key is a different bucket");
+
+    let mw7 = new RateLimitMiddleware(1, 60, {
+        clock: clockMs,
+        skip:  fn(r) { return r.path == "/health"; }
+    });
+    let health = mkPeerReq("10.0.0.8:1"); health.path = "/health";
+    checkEq(allowedOf(mw7, health, 20), 20, "skip predicate bypasses the limiter");
+    checkEq(mw7.TrackedKeys(), 0, "a skipped request is not even tracked");
+
+    // --- headers ---
+    let mw8 = new RateLimitMiddleware(3, 60, { clock: clockMs });
+    let r1 = hit(mw8, mkPeerReq("10.0.1.1:1"));
+    checkEq(r1.headers["RateLimit-Limit"],     "3", "RateLimit-Limit on an allowed response");
+    checkEq(r1.headers["RateLimit-Remaining"], "2", "Remaining counts down");
+    let r2 = hit(mw8, mkPeerReq("10.0.1.1:1"));
+    checkEq(r2.headers["RateLimit-Remaining"], "1", "Remaining keeps counting down");
+    hit(mw8, mkPeerReq("10.0.1.1:1"));
+    let r429 = hit(mw8, mkPeerReq("10.0.1.1:1"));
+    checkEq(r429.status, 429, "limit reached");
+    checkEq(r429.headers["RateLimit-Remaining"], "0", "429 reports nothing remaining");
+    check(Object.HasKey(r429.headers, "Retry-After"), "429 carries Retry-After");
+    let reset = Convert.ParseInt(r429.headers["Retry-After"]) ?? 0;
+    check(reset > 0 && reset <= 60, "Retry-After is within the window (" + str(reset) + "s)");
+
+    // --- the window actually slides ---
+    // A fixed window lets a caller spend the full allowance at the end of one
+    // window and again at the start of the next. Spend it all, step just over
+    // the boundary, and a full second allowance must NOT be available.
+    gClock = 2000000;
+    let mwS = new RateLimitMiddleware(10, 10, { clock: clockMs });
+    let peer = mkPeerReq("10.0.2.1:1");
+    checkEq(allowedOf(mwS, peer, 10), 10, "sliding: first window spent");
+    gClock = gClock + 10500;                      // 0.5 s into the next window
+    let burst = allowedOf(mwS, peer, 10);
+    check(burst <= 2, "sliding window blocks the boundary burst (allowed " + str(burst) + ")");
+
+    // Once a full window has passed with nothing carried over, the allowance is
+    // back in full.
+    gClock = gClock + 25000;
+    checkEq(allowedOf(mwS, peer, 10), 10, "allowance restored after a quiet window");
+
+    // --- memory is bounded ---
+    let mwM = new RateLimitMiddleware(100, 1, { clock: clockMs, maxKeys: 50 });
+    gClock = 3000000;
+    let i:int = 0;
+    while (i < 500) { hit(mwM, mkPeerReq("10.9." + str(i / 250) + "." + str(i % 250) + ":1")); i += 1; }
+    check(mwM.TrackedKeys() <= 50, "tracked keys stay under the cap (" + str(mwM.TrackedKeys()) + ")");
+
+    // Idle buckets are reclaimed rather than pinned forever.
+    let mwR = new RateLimitMiddleware(100, 1, { clock: clockMs, maxKeys: 10 });
+    gClock = 4000000;
+    let j:int = 0;
+    while (j < 10) { hit(mwR, mkPeerReq("10.8.0." + str(j) + ":1")); j += 1; }
+    checkEq(mwR.TrackedKeys(), 10, "cap reached");
+    gClock = gClock + 5000;                        // every window long expired
+    hit(mwR, mkPeerReq("10.8.9.9:1"));
+    check(mwR.TrackedKeys() <= 2, "expired buckets swept (" + str(mwR.TrackedKeys()) + " left)");
+
+    checkEq(mwR.Reset().TrackedKeys(), 0, "Reset clears the table");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+fn originReq(origin, method:string) {
+    let r = { method: method, path: "/x", rawPath: "/x", params: {}, query: {},
+              headers: {}, peer: "1.2.3.4:5", secure: false, body: "" };
+    if (origin != nil) { r.headers["Origin"] = origin; }
+    return r;
+}
+
+fn corsApp(mw) {
+    let app = new Router();
+    app.Use(fn(r, next) { return mw.Handle(r, next); });
+    app.Get("/x", fn(_r) { return Response.Text("body", nil); });
+    return app;
+}
+
+fn hdr(resp, name) { return Object.TryGet(resp.headers ?? {}, name, nil); }
+
+fn test_cors() {
+    Console.WriteLine("== cors ==");
+
+    // Wildcard: no credentials, so the pair is legal.
+    let anyApp = corsApp(new CorsMiddleware("*", nil));
+    checkEq(hdr(anyApp._dispatch(originReq("https://a.example", "GET")), "Access-Control-Allow-Origin"),
+            "*", "wildcard origin echoed");
+
+    // "*" with credentials is forbidden by Fetch and rejected by every browser,
+    // so a server sending both is silently doing no CORS at all. Fail loudly at
+    // construction instead of at 3am.
+    let threw = false;
+    try { let bad = new CorsMiddleware("*", { credentials: true }); }
+    catch (_e) { threw = true; }
+    check(threw, "wildcard + credentials refused at construction");
+
+    // An allowlist reflects only origins on it, and says so with Vary.
+    let listApp = corsApp(new CorsMiddleware(["https://a.example", "https://b.example"],
+                                             { credentials: true }));
+    let okResp = listApp._dispatch(originReq("https://b.example", "GET"));
+    checkEq(hdr(okResp, "Access-Control-Allow-Origin"), "https://b.example", "allowed origin reflected");
+    checkEq(hdr(okResp, "Access-Control-Allow-Credentials"), "true", "credentials allowed for it");
+    checkEq(hdr(okResp, "Vary"), "Origin", "Vary: Origin set when reflecting");
+
+    let evil = listApp._dispatch(originReq("https://evil.example", "GET"));
+    checkEq(hdr(evil, "Access-Control-Allow-Origin"), nil, "unlisted origin gets no CORS header");
+    checkEq(evil.status, 200, "unlisted origin still gets the response; the browser blocks it");
+
+    // No Origin at all is not a CORS request.
+    checkEq(hdr(listApp._dispatch(originReq(nil, "GET")), "Access-Control-Allow-Origin"), nil,
+            "no Origin means no CORS header");
+
+    // Preflight.
+    let pre = listApp._dispatch(originReq("https://a.example", "OPTIONS"));
+    checkEq(pre.status, 204, "preflight answered 204");
+    check(hdr(pre, "Access-Control-Allow-Methods") != nil, "preflight lists methods");
+    let preEvil = listApp._dispatch(originReq("https://evil.example", "OPTIONS"));
+    checkEq(hdr(preEvil, "Access-Control-Allow-Origin"), nil, "preflight from an unlisted origin not approved");
+    return 0;
+}
+
+fn test_security_headers() {
+    Console.WriteLine("== security headers ==");
+
+    let app = new Router();
+    let mw  = new SecurityHeadersMiddleware(nil);
+    app.Use(fn(r, next) { return mw.Handle(r, next); });
+    app.Get("/x", fn(_r) { return Response.Html("<p>hi</p>", nil); });
+
+    let plain = app._dispatch(originReq(nil, "GET"));
+    checkEq(hdr(plain, "X-Content-Type-Options"), "nosniff", "nosniff by default");
+    checkEq(hdr(plain, "X-Frame-Options"), "DENY", "framing denied by default");
+    checkEq(hdr(plain, "Referrer-Policy"), "no-referrer", "referrer policy by default");
+    // HSTS is off unless asked for: a browser remembers it, so a misconfigured
+    // deployment would lock its own users out.
+    checkEq(hdr(plain, "Strict-Transport-Security"), nil, "HSTS off by default");
+    // And CSP cannot be guessed for an arbitrary app.
+    checkEq(hdr(plain, "Content-Security-Policy"), nil, "no CSP guessed by default");
+
+    // HSTS, when enabled, only goes out over TLS.
+    let app2 = new Router();
+    let mw2  = new SecurityHeadersMiddleware({ hsts: true, csp: "default-src 'self'" });
+    app2.Use(fn(r, next) { return mw2.Handle(r, next); });
+    app2.Get("/x", fn(_r) { return Response.Text("hi", nil); });
+
+    let overHttp = app2._dispatch(originReq(nil, "GET"));
+    checkEq(hdr(overHttp, "Strict-Transport-Security"), nil, "HSTS withheld on a plaintext request");
+    checkEq(hdr(overHttp, "Content-Security-Policy"), "default-src 'self'", "CSP emitted when configured");
+
+    let secure = originReq(nil, "GET"); secure.secure = true;
+    checkEq(hdr(app2._dispatch(secure), "Strict-Transport-Security"), "max-age=31536000",
+            "HSTS emitted over TLS");
+
+    let mw3 = new SecurityHeadersMiddleware({ hsts: { maxAge: 60, includeSubDomains: true, preload: true } });
+    let app3 = new Router();
+    app3.Use(fn(r, next) { return mw3.Handle(r, next); });
+    app3.Get("/x", fn(_r) { return Response.Text("hi", nil); });
+    let s3 = originReq(nil, "GET"); s3.secure = true;
+    checkEq(hdr(app3._dispatch(s3), "Strict-Transport-Security"),
+            "max-age=60; includeSubDomains; preload", "HSTS options rendered");
+
+    // A handler that set its own value keeps it.
+    let app4 = new Router();
+    let mw4  = new SecurityHeadersMiddleware(nil);
+    app4.Use(fn(r, next) { return mw4.Handle(r, next); });
+    app4.Get("/x", fn(_r) {
+        let resp = Response.Text("hi", nil);
+        resp.headers["X-Frame-Options"] = "SAMEORIGIN";
+        return resp;
+    });
+    checkEq(hdr(app4._dispatch(originReq(nil, "GET")), "X-Frame-Options"), "SAMEORIGIN",
+            "a handler's own value is not overwritten");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+fn test_router_cookies() {
+    Console.WriteLine("== router cookies ==");
+
+    // Response.WithCookie attaches without disturbing the body or status.
+    let r = Response.WithCookie(Response.Json({ ok: true }, 201), "sid", "abc", { maxAge: 60 });
+    checkEq(r.status, 201, "status survives WithCookie");
+    check(String.Contains(r.body, "\"ok\":true"), "body survives WithCookie");
+    checkEq(len(r.cookies), 1, "one cookie attached");
+    checkEq(r.cookies[0].name, "sid", "cookie name carried");
+
+    // Several cookies accumulate rather than replacing each other.
+    let r2 = Response.WithCookie(Response.Text("x", nil), "a", "1", nil);
+    Response.WithCookie(r2, "b", "2", nil);
+    Response.ClearCookie(r2, "old", nil);
+    checkEq(len(r2.cookies), 3, "cookies accumulate");
+    checkEq(r2.cookies[2].clear, true, "ClearCookie marks the entry");
+
+    // A response with no cookies stays as it was.
+    checkEq(Object.TryGet(Response.Text("plain", nil), "cookies", nil), nil,
+            "an untouched response gains no cookie field");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+fn hostReq(host, path:string) {
+    let r = { method: "GET", path: path, rawPath: path, params: {}, query: {},
+              headers: {}, peer: "1.2.3.4:5", secure: false, body: "" };
+    if (host != nil) { r.headers["Host"] = host; }
+    return r;
+}
+
+fn test_virtual_hosts() {
+    Console.WriteLine("== virtual hosts ==");
+    let app = new Router();
+
+    // A route with no host serves every host, as before.
+    app.Get("/shared", fn(_r) { return Response.Text("shared", nil); });
+
+    let a = app.Host("a.example.com");
+    a.Get("/",     fn(_r) { return Response.Text("site-a", nil); });
+    a.Get("/u/:id", fn(r) { return Response.Text("a:" + r.params.id, nil); });
+
+    let b = app.Host("b.example.com");
+    b.Get("/", fn(_r) { return Response.Text("site-b", nil); });
+
+    let w = app.Host("*.wild.example");
+    w.Get("/", fn(_r) { return Response.Text("wildcard", nil); });
+
+    checkEq(bodyOf(app._dispatch(hostReq("a.example.com", "/"))), "site-a", "host a routed");
+    checkEq(bodyOf(app._dispatch(hostReq("b.example.com", "/"))), "site-b", "host b routed");
+    checkEq(bodyOf(app._dispatch(hostReq("a.example.com", "/u/7"))), "a:7", "params work under a host");
+
+    // Host comparison ignores case and the port.
+    checkEq(bodyOf(app._dispatch(hostReq("A.Example.COM", "/"))), "site-a", "host match is case-insensitive");
+    checkEq(bodyOf(app._dispatch(hostReq("a.example.com:8080", "/"))), "site-a", "the port is ignored");
+
+    // Wildcards cover subdomains but not the bare domain.
+    checkEq(bodyOf(app._dispatch(hostReq("shop.wild.example", "/"))), "wildcard", "wildcard subdomain");
+    checkEq(bodyOf(app._dispatch(hostReq("a.b.wild.example", "/"))), "wildcard", "multi-level subdomain");
+    checkEq(app._dispatch(hostReq("wild.example", "/")).status, 404, "the bare domain is not the wildcard");
+
+    // An unknown host gets nothing host-specific.
+    checkEq(app._dispatch(hostReq("other.example.com", "/")).status, 404, "unknown host is a 404");
+    // ...but still reaches host-agnostic routes.
+    checkEq(bodyOf(app._dispatch(hostReq("other.example.com", "/shared"))), "shared",
+            "host-agnostic routes serve any host");
+    checkEq(bodyOf(app._dispatch(hostReq(nil, "/shared"))), "shared", "and serve a request with no Host");
+
+    // A host-scoped route wins over a host-agnostic one for the same path.
+    let app2 = new Router();
+    app2.Get("/p", fn(_r) { return Response.Text("generic", nil); });
+    app2.Host("x.example").Get("/p", fn(_r) { return Response.Text("specific", nil); });
+    checkEq(bodyOf(app2._dispatch(hostReq("x.example", "/p"))), "specific",
+            "the host-scoped route wins");
+    checkEq(bodyOf(app2._dispatch(hostReq("y.example", "/p"))), "generic",
+            "another host still gets the generic one");
+
+    // The same for a parametric route.
+    let app3 = new Router();
+    app3.Get("/d/:id", fn(_r) { return Response.Text("generic", nil); });
+    app3.Host("x.example").Get("/d/:id", fn(r) { return Response.Text("specific:" + r.params.id, nil); });
+    checkEq(bodyOf(app3._dispatch(hostReq("x.example", "/d/9"))), "specific:9",
+            "host-scoped parametric route wins");
+    checkEq(bodyOf(app3._dispatch(hostReq("y.example", "/d/9"))), "generic",
+            "other hosts fall back to the generic parametric route");
+
+    // A host group composes with a prefix group and its middleware.
+    let app4 = new Router();
+    let api = app4.Host("api.example").Group("/v1");
+    api.Use(fn(r, next) { let resp = next(r); resp.body = "[" + resp.body + "]"; return resp; });
+    api.Get("/ping", fn(_r) { return Response.Text("pong", nil); });
+    checkEq(bodyOf(app4._dispatch(hostReq("api.example", "/v1/ping"))), "[pong]",
+            "host + prefix group with group middleware");
+    checkEq(app4._dispatch(hostReq("other.example", "/v1/ping")).status, 404,
+            "that group does not answer another host");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+fn Main() {
+    Console.WriteLine("=== Router dispatch tests ===");
+    test_matching();
+    test_middleware();
+    test_headers_and_request();
+    test_jwt_auth();
+    test_rate_limit();
+    test_virtual_hosts();
+    test_router_cookies();
+    test_cors();
+    test_security_headers();
+
+    Console.WriteLine("=============================");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    if (testsFailed > 0) {
+        Console.Error("Some Router dispatch tests FAILED.");
+        return testsFailed;
+    }
+    Console.Ok("All Router dispatch tests passed!");
+
+    // -----------------------------------------------------------------------
+    // Benchmarks - dispatch only, no sockets, so this is the least noisy view
+    // of the routing layer available. Still worthless on a loaded machine.
+    // -----------------------------------------------------------------------
+    Console.WriteLine("\n=== Router dispatch benchmarks ===");
+    let app = new Router();
+    iter (i from 0 to 49) {
+        app.Get("/bench/" + str(i), fn(_r) { return Response.Text("b", nil); });
+    }
+    iter (i from 0 to 49) {
+        app.Get("/dyn/" + str(i) + "/:id", fn(_r) { return Response.Text("d", nil); });
+    }
+    app.Use(fn(r, next) { return next(r); });
+    app.Use(fn(r, next) { return next(r); });
+
+    let n = 20000;
+    let t0 = Time.Ticks();
+    iter (i from 0 to n - 1) { _sink = _sink + String.Length(app._dispatch(mkReq("GET", "/bench/49")).body); }
+    Console.WriteLine("fixed route, last of 50   ",
+        String.FormatArray("{0:.3f}", [Time.TicksToUs(Time.Ticks() - t0) / float(n)]), " us/dispatch");
+
+    let t1 = Time.Ticks();
+    iter (i from 0 to n - 1) { _sink = _sink + String.Length(app._dispatch(mkReq("GET", "/dyn/49/7")).body); }
+    Console.WriteLine("param route, last of 50   ",
+        String.FormatArray("{0:.3f}", [Time.TicksToUs(Time.Ticks() - t1) / float(n)]), " us/dispatch");
+
+    let t2 = Time.Ticks();
+    iter (i from 0 to n - 1) { _sink = _sink + app._dispatch(mkReq("GET", "/missing")).status; }
+    Console.WriteLine("unmatched (404)           ",
+        String.FormatArray("{0:.3f}", [Time.TicksToUs(Time.Ticks() - t2) / float(n)]), " us/dispatch");
+    Console.WriteLine("_sink=", _sink);
+    return 0;
+}

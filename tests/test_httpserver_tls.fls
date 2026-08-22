@@ -1,0 +1,54 @@
+// test_httpserver_tls.fls
+// HTTPS server: HttpServer terminating TLS itself via Stream.AcceptTls.
+// Run via tests/test_httpserver_tls.sh, which generates the certificate,
+// starts this server, then drives it with curl.
+//
+//   flarisvm ./tests/test_httpserver_tls.fls --libs='./libs'
+//
+// The certificate is written by the shell driver into TLS_DIR below.
+
+import { HttpServer } from library("HttpServer", "1.0");
+
+global TLS_DIR = "/tmp/flaris_tls_test";
+
+fn Main() {
+    // A build without a server-capable TLS backend cannot run this test at all;
+    // say so on stdout so the driver can skip rather than report failures.
+    if (!Stream.TlsServerAvailable()) {
+        Console.WriteLine("TLS_UNAVAILABLE");
+        return 0;
+    }
+
+    let srv = new HttpServer({
+        port: 8453,
+        tls: {
+            pkcs12File:         Path.Combine(TLS_DIR, "server.p12"),
+            password:           "testpass",
+            handshakeTimeoutMs: 5000
+        }
+    });
+
+    // Handshake failures are expected here - the driver sends plain HTTP to the
+    // TLS port on purpose - so record them instead of dropping them silently.
+    srv.OnTlsError(fn(peer, msg) { Console.WriteLine("TLS_HANDSHAKE_FAILED ", peer, " ", msg); });
+
+    srv.Get("/",     fn(req, res) { res.Text("secure=" + str(req.secure)); });
+    srv.Get("/json", fn(_req, res) { res.Json({ ok: true, n: 42 }); });
+
+    // Above the write-coalescing threshold, so the two-write path runs over TLS.
+    srv.Get("/big",  fn(_req, res) { res.Text(String.Repeat("Z", 40000)); });
+
+    srv.Get("/stream", fn(_req, res) {
+        res.StartChunked("text/plain; charset=utf-8");
+        res.WriteChunk("a");
+        res.WriteChunk("b");
+        res.WriteChunk("c");
+        res.EndChunked();
+    });
+
+    srv.Static("/pub", Path.Combine(TLS_DIR, "pub"));
+
+    Console.WriteLine("TLS_READY secure=", srv.IsSecure());
+    srv.Listen();
+    return 0;
+}

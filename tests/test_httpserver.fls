@@ -16,6 +16,11 @@ global _sink       = 0;
 global gPort       = 0;    // main test server
 global gLimitPort  = 0;    // server with tight limits
 global gStaticDir  = "";
+global gSlowPort   = 0;    // short read timeout, for truncated-request tests
+global gStreamPort = 0;    // streamBodies: true
+global gUploadPath = "";
+global gUploadDir  = "";
+global gAccess     = [];   // entries captured by the access-log hook
 
 fn bench(name: string, f: fn, n: int) {
     f(); f(); f();
@@ -100,6 +105,47 @@ fn readResponse(c, headOnly: bool) {
         }
     }
     return { code: code, status: statusLine, headers: ho, body: body };
+}
+
+// Send one raw request and report { code, second }: the status of the first
+// reply, and whether a *second* reply followed. A second reply is the signature
+// of a desync - the server treated part of the body as another request.
+//
+// Every read parks via WaitReadable first; a plain blocking read would starve
+// the server fiber in this cooperative VM and look like "no response at all".
+fn rawExchange(port: int, raw: string) {
+    let c = openConn(port);
+    if (c == nil) { return { code: 0, second: false }; }
+    Stream.WriteString(c, raw);
+
+    let first = readResponse(c, false);
+    let code  = (first == nil) ? 0 : first.code;
+
+    let second = false;
+    if (first != nil && Stream.WaitReadable(c, 800) != nil) {
+        let line = Stream.ReadLine(c);
+        if (line != nil && String.StartsWith(line, "HTTP/")) { second = true; }
+    }
+    Stream.Close(c);
+    return { code: code, second: second };
+}
+
+// The response's raw header block. ParseHeaders keeps only the last value for a
+// repeated name, which would hide all but one Set-Cookie.
+fn rawHeaders(port: int, raw: string): string {
+    let c = openConn(port);
+    if (c == nil) { return ""; }
+    Stream.WriteString(c, raw);
+    if (Stream.WaitReadable(c, 4000) == nil) { Stream.Close(c); return ""; }
+    let out = Stream.ReadLine(c) ?? "";
+    let h = Stream.ReadLine(c);
+    while (h != nil && h != "") { out = out + "\n" + h; h = Stream.ReadLine(c); }
+    Stream.Close(c);
+    return out;
+}
+
+fn countLines(s: string, needle: string): int {
+    return len(String.Split(s, needle)) - 1;
 }
 
 // One request on a fresh connection.
@@ -401,6 +447,677 @@ fn test_header_safety() {
 }
 
 // ---------------------------------------------------------------------------
+// Request framing.
+//
+// Every case here is a request-smuggling primitive: if a proxy in front and
+// this server can be made to disagree about where one request ends, an attacker
+// can hide a whole request from the proxy. Ambiguity is refused, never resolved.
+// ---------------------------------------------------------------------------
+fn test_request_framing() {
+    Console.WriteLine("== request framing ==");
+
+    // Two Content-Length headers: a proxy taking the first and this server
+    // taking the last is exactly how a smuggled request gets through.
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n"
+        + "Content-Length: 6\r\nConnection: close\r\n\r\nAAAAAA", false).code,
+        400, "conflicting Content-Length rejected");
+    // RFC 9110 8.6 says to reject *or* collapse duplicates that agree, since an
+    // upstream processor may have generated them. Collapsing is the friendlier
+    // branch and gives up nothing: identical values cannot be disagreed about.
+    let dupSame = request(gPort, "POST /len HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n"
+        + "Content-Length: 5\r\nConnection: close\r\n\r\nAAAAA", false);
+    checkEq(dupSame.code, 200, "duplicate Content-Length that agrees is collapsed");
+    checkEq(dupSame.body, "5", "collapsed duplicate frames the body correctly");
+
+    // The same case as a combined list value, which 8.6 names explicitly.
+    let listSame = request(gPort, "POST /len HTTP/1.1\r\nHost: t\r\nContent-Length: 5, 5\r\n"
+        + "Connection: close\r\n\r\nAAAAA", false);
+    checkEq(listSame.code, 200, "Content-Length '5, 5' collapsed");
+    checkEq(listSame.body, "5", "collapsed list frames the body correctly");
+    checkEq(request(gPort, "POST /len HTTP/1.1\r\nHost: t\r\nContent-Length: 5, 6\r\n"
+        + "Connection: close\r\n\r\nAAAAA", false).code,
+        400, "Content-Length '5, 6' rejected");
+
+    // Content-Length with Transfer-Encoding: this server prefers TE and many
+    // proxies prefer CL, so the pair must be refused rather than resolved.
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\n"
+        + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n", false).code,
+        400, "Content-Length with Transfer-Encoding rejected");
+
+    // A space before the colon is not a header. Accepting it silently lets a
+    // proxy see a Transfer-Encoding that this server does not.
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 6\r\n"
+        + "Transfer-Encoding : chunked\r\nConnection: close\r\n\r\nAAAAAA", false).code,
+        400, "space before the colon rejected");
+
+    // Obsolete line folding, same reasoning.
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n"
+        + "\tContent-Length: 6\r\nConnection: close\r\n\r\nAAAAA", false).code,
+        400, "obsolete line folding rejected");
+
+    // Content-Length must be digits. ParseInt otherwise accepts "+5" and
+    // "0x10", which nothing in front of this server will agree with.
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: +5\r\n"
+        + "Connection: close\r\n\r\nAAAAA", false).code, 400, "Content-Length '+5' rejected");
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 0x10\r\n"
+        + "Connection: close\r\n\r\nAAAAA", false).code, 400, "Content-Length '0x10' rejected");
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5 \r\n"
+        + "Connection: close\r\n\r\nAAAAA", false).code, 200, "trailing space in a value is still fine");
+
+    // A header name outside the token characters.
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nX Bad: v\r\nConnection: close\r\n\r\n", false).code,
+        400, "invalid header name rejected");
+
+    // A bare CR inside a header line: ReadLine keeps it, and a proxy may split
+    // the line there.
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nX-A: a\rb\r\nConnection: close\r\n\r\n", false).code,
+        400, "bare CR in a header line rejected");
+
+    // Embedded space in the request target.
+    checkEq(request(gPort, "GET /a b HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false).code,
+        400, "space in the request target rejected");
+
+    // The desync itself. A bad chunk size used to truncate the body and report
+    // success, leaving the rest of the stream to be parsed as a second request.
+    let smuggled = rawExchange(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+        + "ZZZ\r\nGET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    checkEq(smuggled.code, 400, "a bad chunk size is a 400");
+    check(!smuggled.second, "the smuggled request is NOT answered as a second request");
+
+    // RFC 9112 3.2: an HTTP/1.1 request carries exactly one Host. None, or
+    // several, leaves the origin ambiguous - which is what host-routing and
+    // cache-key confusion feed on.
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nConnection: close\r\n\r\n", false).code,
+            400, "HTTP/1.1 without Host rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: a.example\r\nHost: evil.example\r\n"
+        + "Connection: close\r\n\r\n", false).code, 400, "repeated Host rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nhost: t\r\nConnection: close\r\n\r\n", false).code,
+            200, "Host is matched case-insensitively");
+    // 3.2 also requires a 400 for a Host with an invalid field value.
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: a b\r\nConnection: close\r\n\r\n", false).code,
+            400, "Host containing whitespace rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: \r\nConnection: close\r\n\r\n", false).code,
+            400, "empty Host rejected");
+    // HTTP/1.0 predates Host and must still work without one.
+    checkEq(request(gPort, "GET / HTTP/1.0\r\nConnection: close\r\n\r\n", false).code,
+            200, "HTTP/1.0 without Host still served");
+
+    // A truncated chunked body must not be accepted as a complete one.
+    let truncated = rawExchange(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+        + "5\r\nAB\r\n");
+    check(truncated.code != 200, "a truncated chunk is not answered 200");
+
+    // A request the client never finished sending must not be answered as if it
+    // had. ReadLine yields nil when the peer stalls mid-line but "" for a real
+    // blank line, and treating the two alike serves a truncated header block.
+    let cut = request(gSlowPort, "GET / HTTP/1.1\r\nHost: t\r\nX-Partial: abc", false);
+    check(cut == nil || cut.code == 400, "unterminated header block is not served");
+
+    // Content-Length promises bytes that never arrive: ReadBytes comes up short
+    // and the body must not be dispatched as complete.
+    let shortBody = request(gSlowPort,
+        "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\nConnection: close\r\n\r\nonly-a-few", false);
+    check(shortBody == nil || shortBody.code == 400, "truncated body is not served");
+
+    // The same request, complete, still works on that server.
+    let whole = request(gSlowPort,
+        "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde", false);
+    checkEq(whole.code, 200, "a complete body is still served");
+    checkEq(whole.body, "abcde", "complete body intact");
+
+    // Well-formed chunked still works.
+    let good = request(gPort, "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+        + "Connection: close\r\n\r\n4\r\nabcd\r\n3\r\nefg\r\n0\r\n\r\n", false);
+    checkEq(good.code, 200, "valid chunked body still accepted");
+    checkEq(good.body, "abcdefg", "valid chunked body reassembled");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Cookies and form bodies
+// ---------------------------------------------------------------------------
+fn test_cookies_and_forms() {
+    Console.WriteLine("== cookies / forms ==");
+
+    // --- reading ---
+    let r = request(gPort, "GET /readcookies HTTP/1.1\r\nHost: t\r\n"
+        + "Cookie: sid=abc123; theme=dark\r\nConnection: close\r\n\r\n", false);
+    let j = Json.Parse(r.body);
+    checkEq(j.sid, "abc123", "cookie read");
+    checkEq(j.theme, "dark", "second cookie read");
+    checkEq(j.missing, "dflt", "absent cookie falls back to the default");
+
+    // Quoted values, odd spacing, and a stray pair with no "=".
+    let r2 = request(gPort, "GET /readcookies HTTP/1.1\r\nHost: t\r\n"
+        + "Cookie:   sid=\"q1\" ;theme=light; ; junk\r\nConnection: close\r\n\r\n", false);
+    let j2 = Json.Parse(r2.body);
+    checkEq(j2.sid, "q1", "quoted value unwrapped");
+    checkEq(j2.theme, "light", "spacing tolerated, junk ignored");
+
+    // Percent-decoding, and "+" is a literal plus in a cookie (unlike a query).
+    let r3 = request(gPort, "GET /readcookies HTTP/1.1\r\nHost: t\r\n"
+        + "Cookie: sid=a%20b; theme=c+d\r\nConnection: close\r\n\r\n", false);
+    let j3 = Json.Parse(r3.body);
+    checkEq(j3.sid, "a b", "percent-decoded");
+    checkEq(j3.theme, "c+d", "'+' stays a plus in a cookie");
+
+    // No Cookie header at all.
+    let r4 = req1(gPort, "GET", "/readcookies");
+    checkEq(Json.Parse(r4.body).missing, "dflt", "no Cookie header is not an error");
+
+    // --- writing ---
+    let h = rawHeaders(gPort, "GET /setcookie HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    check(String.Contains(h, "Set-Cookie: sid=abc123"), "Set-Cookie emitted");
+    check(String.Contains(h, "Path=/"), "Path defaults to /");
+    check(String.Contains(h, "HttpOnly"), "HttpOnly by default - script must not read it");
+    check(String.Contains(h, "SameSite=Lax"), "SameSite defaults to Lax");
+    check(!String.Contains(h, "Secure"), "Secure not set on a plaintext request");
+
+    // Several cookies need several header lines, not one overwriting the rest.
+    let hm = rawHeaders(gPort, "GET /setmany HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    checkEq(countLines(hm, "Set-Cookie:"), 3, "three cookies produce three Set-Cookie lines");
+
+    let ho = rawHeaders(gPort, "GET /setopts HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    check(String.Contains(ho, "Max-Age=3600"), "Max-Age");
+    check(String.Contains(ho, "Path=/admin"), "explicit Path");
+    check(String.Contains(ho, "Domain=example.com"), "Domain");
+    check(String.Contains(ho, "SameSite=Strict"), "explicit SameSite");
+    check(String.Contains(ho, "Secure"), "explicit Secure");
+    check(!String.Contains(ho, "HttpOnly"), "httpOnly can be turned off");
+
+    // SameSite=None is only honoured on a secure cookie; a browser drops it
+    // otherwise, so the cookie would silently never work.
+    let hn = rawHeaders(gPort, "GET /setnone HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    check(String.Contains(hn, "SameSite=None"), "SameSite=None kept");
+    check(String.Contains(hn, "Secure"), "SameSite=None forces Secure");
+
+    // A value with characters a cookie cannot carry is encoded, not emitted raw.
+    let hw = rawHeaders(gPort, "GET /setweird HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    check(!String.Contains(hw, "w=a b;c=d"), "raw separators not emitted");
+    check(String.Contains(hw, "w=a%20b%3Bc%3Dd"), "value percent-encoded");
+
+    let hc = rawHeaders(gPort, "GET /clearcookie HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    check(String.Contains(hc, "Max-Age=0"), "ClearCookie expires it immediately");
+
+    // CRLF in a cookie value must not split the response. Encoding is the
+    // defence rather than rejection: the value survives intact and cannot
+    // introduce a header, so a legitimate value containing a newline still works.
+    let hb = request(gPort, "GET /badcookie HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false);
+    checkEq(hb.code, 200, "a cookie value containing CRLF is still served");
+    check(!Object.HasKey(hb.headers, "x-injected"), "no header was injected");
+    let hbr = rawHeaders(gPort, "GET /badcookie HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    checkEq(countLines(hbr, "Set-Cookie:"), 1, "still exactly one Set-Cookie line");
+    check(String.Contains(hbr, "%0D%0A"), "the CRLF was percent-encoded");
+    check(!String.Contains(hbr, "X-Injected: yes"), "the injected header never appears");
+
+    // An invalid cookie *name* has no encoding that would make it safe, so it
+    // is refused outright - the handler raises and the 500 path runs.
+    let bn = req1(gPort, "GET", "/badname");
+    checkEq(bn.code, 500, "an invalid cookie name is rejected");
+    check(!String.Contains(rawHeaders(gPort,
+        "GET /badname HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"), "bad name="),
+        "the malformed cookie is never emitted");
+
+    // --- form bodies ---
+    let f = reqBody(gPort, "POST", "/form", "application/x-www-form-urlencoded",
+                    "user=alice&msg=hello+world&empty=");
+    let jf = Json.Parse(f.body);
+    checkEq(jf.user, "alice", "form field read");
+    checkEq(jf.msg, "hello world", "'+' is a space in a form body");
+    checkEq(jf.missing, "dflt", "absent field falls back to the default");
+
+    // A body that is not a form yields nothing rather than nonsense.
+    let f2 = reqBody(gPort, "POST", "/form", "application/json", "{\"user\":\"bob\"}");
+    checkEq(Json.Parse(f2.body).user, nil, "JSON body is not parsed as a form");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Access logging and graceful shutdown
+// ---------------------------------------------------------------------------
+fn test_access_log() {
+    Console.WriteLine("== access log ==");
+
+    gAccess = [];
+    request(gPort, "GET /users/7?x=1 HTTP/1.1\r\nHost: t\r\nUser-Agent: probe/1.0\r\n"
+        + "Referer: http://example.com/from\r\nConnection: close\r\n\r\n", false);
+    check(len(gAccess) >= 1, "the hook fired");
+
+    let e = gAccess[len(gAccess) - 1];
+    checkEq(e.method, "GET", "method recorded");
+    checkEq(e.path, "/users/7?x=1", "raw target recorded, query included");
+    checkEq(e.status, 200, "status recorded");
+    check(e.bytes > 0, "response size recorded");
+    check(e.durationMs >= 0, "duration recorded");
+    checkEq(e.userAgent, "probe/1.0", "user agent recorded");
+    checkEq(e.referer, "http://example.com/from", "referer recorded");
+    check(String.Contains(e.peer, "127.0.0.1"), "peer recorded");
+
+    // A 404 is logged too, with its real status.
+    gAccess = [];
+    req1(gPort, "GET", "/definitely-missing");
+    checkEq(gAccess[len(gAccess) - 1].status, 404, "a 404 is logged with its status");
+
+    // The Combined Log Format line every log tool already parses.
+    let line = HttpStatus.CombinedLogLine(e);
+    check(String.Contains(line, "\"GET /users/7?x=1 HTTP/1.1\" 200"), "combined format request and status");
+    check(String.Contains(line, "probe/1.0"), "combined format carries the user agent");
+
+    // A client-supplied field must not be able to forge a second log line.
+    let forged = {
+        peer: "1.2.3.4:1", method: "GET", path: "/x", version: "HTTP/1.1",
+        status: 200, bytes: 1, durationMs: 0, referer: "-",
+        userAgent: "eviltool\r\n1.2.3.4 - - [x] \"GET /admin HTTP/1.1\" 200 0 \"-\" \"-\""
+    };
+    let fl = HttpStatus.CombinedLogLine(forged);
+    check(!String.Contains(fl, "\n"), "a newline in a field cannot split the log line");
+    check(!String.Contains(fl, "\r"), "nor a carriage return");
+    return 0;
+}
+
+fn test_graceful_shutdown() {
+    Console.WriteLine("== graceful shutdown ==");
+
+    let srv = new HttpServer({ port: 0, idleTimeoutMs: 400, readTimeoutMs: 2000 });
+    srv.Get("/slow", fn(_req, res) {
+        Fiber.Sleep(300);              // still in flight when Stop is called
+        res.Text("finished");
+    });
+    srv.Get("/fast", fn(_req, res) { res.Text("ok"); });
+    let port = srv.ListenAsync();
+
+    checkEq(srv.InFlight(), 0, "nothing in flight before any request");
+
+    // Start a slow request on its own fiber, then shut down while it runs.
+    global gSlowBody = "";
+    Fiber.Run(fn() {
+        let r = req1(port, "GET", "/slow");
+        gSlowBody = (r == nil) ? "" : r.body;
+        return 0;
+    });
+    Fiber.Sleep(120);                  // let it reach the handler
+    check(srv.InFlight() >= 1, "the in-flight request is counted");
+
+    let drained = srv.Stop(3000);
+    check(drained, "Stop waited for the request in flight");
+    checkEq(gSlowBody, "finished", "the in-flight request completed rather than being cut");
+    checkEq(srv.InFlight(), 0, "nothing left in flight");
+    check(!srv.IsRunning(), "server reports stopped");
+
+    // And it really has stopped accepting.
+    let c = Stream.Connect("tcp", "127.0.0.1", port);
+    if (c != nil) {
+        Stream.SetTimeout(c, 700);
+        Stream.WriteString(c, "GET /fast HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        let got = (Stream.WaitReadable(c, 700) == nil) ? "" : (Stream.ReadLine(c) ?? "");
+        check(!String.Contains(got, "200"), "no longer serving after Stop");
+        Stream.Close(c);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// multipart/form-data
+// ---------------------------------------------------------------------------
+fn test_multipart() {
+    Console.WriteLine("== multipart ==");
+    let B = "----FlarisTestBoundary9x";
+
+    // Fields and a file together, the ordinary HTML form shape.
+    let body = mpBody(B, [
+        ["user",  nil,        nil,          "alice"],
+        ["msg",   nil,        nil,          "hello world"],
+        ["avatar", "photo.png", "image/png", "PNGDATA-1234567890"]
+    ]);
+    let r = mpPost(gStreamPort, "/mp", B, body);
+    checkEq(r.code, 200, "multipart accepted");
+    let j = Json.Parse(r.body);
+    checkEq(j.ok, true, "parse succeeded");
+    checkEq(j.fields.user, "alice", "text field parsed");
+    checkEq(j.fields.msg, "hello world", "second text field parsed");
+    checkEq(len(j.files), 1, "one file part");
+    checkEq(j.files[0].name, "avatar", "file field name");
+    checkEq(j.files[0].filename, "photo.png", "client filename reported");
+    checkEq(j.files[0].contentType, "image/png", "part content type");
+    checkEq(j.files[0].size, 18, "file size");
+    checkEq(j.files[0].onDisk, true, "file written to disk");
+
+    // The client's filename must never become the path. A traversing name is
+    // reported verbatim but the bytes land under a name the server chose.
+    let evil = mpBody(B, [["f", "../../../../tmp/flaris_pwned.txt", "text/plain", "OWNED"]]);
+    let re = mpPost(gStreamPort, "/mp", B, evil);
+    let je = Json.Parse(re.body);
+    checkEq(je.ok, true, "traversing filename still parses");
+    checkEq(je.files[0].filename, "../../../../tmp/flaris_pwned.txt", "reported verbatim");
+    checkEq(File.Exists("/tmp/flaris_pwned.txt"), false, "no file written outside the upload dir");
+
+    // Buffered mode returns the bytes instead of a path.
+    let rm = mpPost(gStreamPort, "/mpmem", B,
+                    mpBody(B, [["a", nil, nil, "x"], ["f", "d.bin", "application/octet-stream", "BINARY"]]));
+    let jm = Json.Parse(rm.body);
+    checkEq(jm.fields.a, "x", "buffered mode parses fields");
+    checkEq(jm.files[0].body, "BINARY", "buffered mode returns the data");
+
+    // A part larger than one network read, so the scanner has to match a
+    // boundary that spans chunks.
+    let big = String.Repeat("Q", 200000);
+    let rb = mpPost(gStreamPort, "/mp", B, mpBody(B, [["big", "big.bin", nil, big]]));
+    let jb = Json.Parse(rb.body);
+    checkEq(jb.ok, true, "large part parsed");
+    checkEq(jb.files[0].size, 200000, "large part size exact");
+
+    // A value that contains the boundary text but is not a delimiter.
+    let tricky = mpBody(B, [["t", nil, nil, "prefix--" + B + "suffix-not-a-delimiter"]]);
+    let rt = mpPost(gStreamPort, "/mp", B, tricky);
+    checkEq(Json.Parse(rt.body).ok, true, "boundary-like text inside a value is fine");
+
+    // Empty value, and a quoted boundary in the Content-Type.
+    let re2 = mpPost(gStreamPort, "/mp", B, mpBody(B, [["empty", nil, nil, ""]]));
+    checkEq(Json.Parse(re2.body).fields.empty, "", "empty field value");
+    let rq = request(gStreamPort, "POST /mp HTTP/1.1\r\nHost: t\r\n"
+        + "Content-Type: multipart/form-data; boundary=\"" + B + "\"\r\n"
+        + "Content-Length: " + str(String.Length(body))
+        + "\r\nConnection: close\r\n\r\n" + body, false);
+    checkEq(Json.Parse(rq.body).ok, true, "quoted boundary accepted");
+
+    // Malformed input is refused, not half-accepted.
+    let cut = String.Substr(body, 0, String.Length(body) - 30);
+    let rc = request(gStreamPort, "POST /mp HTTP/1.1\r\nHost: t\r\n"
+        + "Content-Type: multipart/form-data; boundary=" + B + "\r\n"
+        + "Content-Length: " + str(String.Length(cut))
+        + "\r\nConnection: close\r\n\r\n" + cut, false);
+    checkEq(Json.Parse(rc.body).ok, false, "truncated body rejected");
+
+    let rnb = request(gStreamPort, "POST /mp HTTP/1.1\r\nHost: t\r\n"
+        + "Content-Type: multipart/form-data\r\nContent-Length: 4"
+        + "\r\nConnection: close\r\n\r\nxxxx", false);
+    checkEq(Json.Parse(rnb.body).ok, false, "missing boundary rejected");
+
+    let rwrong = reqBody(gStreamPort, "POST", "/mp", "application/json", "{}");
+    checkEq(Json.Parse(rwrong.body).ok, false, "a non-multipart body is refused");
+
+    // Caps hold.
+    let rl = mpPost(gStreamPort, "/mplimit", B,
+                    mpBody(B, [["f", "x.bin", nil, String.Repeat("Z", 5000)]]));
+    let jl = Json.Parse(rl.body);
+    checkEq(jl.ok, false, "oversized file refused");
+    check(String.Contains(jl.error, "too large"), "and says why");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Streamed request bodies
+// ---------------------------------------------------------------------------
+fn test_streaming_bodies() {
+    Console.WriteLine("== streamed bodies ==");
+
+    // An upload goes to disk without the whole thing existing in memory. 256 KB
+    // is well over the 64 KB slice size, so this really is several reads.
+    let payload = String.Repeat("U", 262144);
+    let up = reqBody(gStreamPort, "POST", "/upload", "application/octet-stream", payload);
+    checkEq(up.code, 200, "streamed upload accepted");
+    let j = Json.Parse(up.body);
+    checkEq(j.bytes, 262144, "every byte reached SaveBody");
+    checkEq(File.Exists(gUploadPath), true, "upload landed on disk");
+    let st = File.Stat(gUploadPath);
+    checkEq((st == nil) ? -1 : st.Size, 262144, "file on disk is the right size");
+
+    // Chunk-by-chunk delivery.
+    let cnt = reqBody(gStreamPort, "POST", "/count", "application/octet-stream",
+                      String.Repeat("C", 200000));
+    let jc = Json.Parse(cnt.body);
+    checkEq(jc.total, 200000, "ReadBody delivered every byte");
+    check(jc.chunks > 1, "a large body arrived in several blocks (" + str(jc.chunks) + ")");
+
+    // Content-Length is known before a single byte is read.
+    checkEq(reqBody(gStreamPort, "POST", "/len", "text/plain", "abcdefghij").body, "10",
+            "ContentLength known before reading");
+
+    // Text() still works - it drains a pending body on demand.
+    checkEq(reqBody(gStreamPort, "POST", "/echo", "text/plain", "hello streaming").body,
+            "hello streaming", "Text() drains a pending body");
+
+    // A chunked body streams too.
+    let chunked = request(gStreamPort,
+        "POST /count HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+        + "Connection: close\r\n\r\n4\r\nabcd\r\n3\r\nefg\r\n0\r\n\r\n", false);
+    let jch = Json.Parse(chunked.body);
+    checkEq(jch.total, 7, "chunked body streamed");
+    checkEq(jch.chunks, 2, "each chunk delivered separately");
+
+    // A handler that ignores the body must not leave it framing the next
+    // request: the connection has to close instead of being reused.
+    let ign = rawExchange(gStreamPort,
+        "POST /ignore HTTP/1.1\r\nHost: t\r\nContent-Length: 20\r\n\r\n"
+        + "AAAAAAAAAAAAAAAAAAAA" + "GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
+    checkEq(ign.code, 200, "handler that ignores the body still answers");
+    check(!ign.second, "an unread body does not become a second request");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// File semantics: validators, conditional requests, byte ranges
+// ---------------------------------------------------------------------------
+fn test_file_semantics() {
+    Console.WriteLine("== file semantics ==");
+
+    let r = req1(gPort, "GET", "/pub/hello.txt");
+    checkEq(r.code, 200, "static file served");
+    let etag = Object.TryGet(r.headers, "etag", nil);
+    check(etag != nil, "ETag emitted");
+    check(Object.TryGet(r.headers, "last-modified", nil) != nil, "Last-Modified emitted");
+    checkEq(Object.TryGet(r.headers, "accept-ranges", ""), "bytes", "Accept-Ranges emitted");
+
+    // The same file twice must validate identically, or caches never hit.
+    let r2 = req1(gPort, "GET", "/pub/hello.txt");
+    checkEq(Object.TryGet(r2.headers, "etag", ""), etag, "ETag stable across requests");
+
+    // If-None-Match -> 304 with no body.
+    let c304 = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nIf-None-Match: " + etag
+        + "\r\nConnection: close\r\n\r\n", false);
+    checkEq(c304.code, 304, "If-None-Match revalidates to 304");
+    checkEq(c304.body, "", "304 carries no body");
+    checkEq(Object.TryGet(c304.headers, "etag", ""), etag, "304 repeats the ETag");
+
+    // A stale validator must still get the bytes.
+    let cStale = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nIf-None-Match: \"stale-1\""
+        + "\r\nConnection: close\r\n\r\n", false);
+    checkEq(cStale.code, 200, "stale If-None-Match still sends the body");
+    checkEq(cStale.body, "static-content", "stale revalidation body intact");
+
+    // If-Modified-Since against the file's own Last-Modified.
+    let lm  = Object.TryGet(r.headers, "last-modified", "");
+    let ims = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nIf-Modified-Since: " + lm
+        + "\r\nConnection: close\r\n\r\n", false);
+    checkEq(ims.code, 304, "If-Modified-Since revalidates to 304");
+
+    // Byte ranges. "static-content" is 14 bytes.
+    let rg = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-5\r\nConnection: close\r\n\r\n", false);
+    checkEq(rg.code, 206, "Range yields 206");
+    checkEq(rg.body, "static", "Range returns the requested slice");
+    checkEq(Object.TryGet(rg.headers, "content-range", ""), "bytes 0-5/14", "Content-Range");
+
+    let sfx = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=-7\r\nConnection: close\r\n\r\n", false);
+    checkEq(sfx.body, "content", "suffix range returns the tail");
+
+    let opn = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=7-\r\nConnection: close\r\n\r\n", false);
+    checkEq(opn.body, "content", "open-ended range runs to the end");
+
+    let bad = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=99-200\r\nConnection: close\r\n\r\n", false);
+    checkEq(bad.code, 416, "unsatisfiable range yields 416");
+    checkEq(Object.TryGet(bad.headers, "content-range", ""), "bytes */14", "416 reports the full length");
+    checkEq(HttpStatus.Reason(416), "Range Not Satisfiable", "416 has its own reason phrase");
+
+    // A multi-range request is answered in full rather than mis-framed.
+    let multi = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-1,4-5\r\nConnection: close\r\n\r\n", false);
+    checkEq(multi.code, 200, "multi-range falls back to the whole entity");
+    checkEq(multi.body, "static-content", "multi-range body complete");
+
+    // If-Range guards the slice: a mismatched validator must send the whole file.
+    let ifr = request(gPort,
+        "GET /pub/hello.txt HTTP/1.1\r\nHost: t\r\nIf-Range: \"stale-1\"\r\nRange: bytes=0-5"
+        + "\r\nConnection: close\r\n\r\n", false);
+    checkEq(ifr.code, 200, "If-Range mismatch sends the entity whole");
+
+    // HEAD reports the length without a body.
+    let hd = request(gPort, "HEAD /pub/hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", true);
+    checkEq(hd.code, 200, "HEAD on a file");
+    checkEq(Object.TryGet(hd.headers, "content-length", ""), "14", "HEAD reports the real length");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Response framing: Date, and both sides of the write-coalescing threshold
+// ---------------------------------------------------------------------------
+fn test_response_framing() {
+    Console.WriteLine("== response framing ==");
+
+    // RFC 9110: a server with a clock sends Date on every response.
+    let r = req1(gPort, "GET", "/");
+    let d = Object.TryGet(r.headers, "date", nil);
+    check(d != nil, "Date header present");
+
+    // It must be a real HTTP-date, and it must be *this* second - a stale cache
+    // would still parse, so compare against the clock rather than the format.
+    if (d != nil) {
+        let parsed = Time.Parse(d, "RFC");
+        check(parsed != nil, "Date parses as an HTTP-date");
+        if (parsed != nil) {
+            let skew = Time.Now() - parsed;
+            if (skew < 0) { skew = -skew; }
+            check(skew <= 2, "Date tracks the clock (skew " + str(skew) + "s)");
+        }
+    }
+
+    // A handler that sets Date itself keeps it.
+    let ro = req1(gPort, "GET", "/own-date");
+    checkEq(Object.TryGet(ro.headers, "date", ""), "Thu, 01 Jan 1970 00:00:00 GMT",
+            "handler Date is not overwritten");
+
+    // 40 KB string body - above the coalescing threshold, so header and body
+    // are written separately and every byte must still land.
+    let rb = req1(gPort, "GET", "/big");
+    checkEq(rb.code, 200, "large text body status");
+    checkEq(Object.TryGet(rb.headers, "content-length", ""), "40000",
+            "large text body Content-Length");
+    checkEq(String.Length(rb.body), 40000, "large text body fully received");
+    check(!String.Contains(rb.body, "H"), "large text body not corrupted by the header block");
+
+    // Same again as a binary block, which takes the partial-write retry path.
+    let rby = requestBytes(gPort, "/bigbytes");
+    checkEq(rby.code, 200, "large binary body status");
+    checkEq(len(rby.body), 40000, "large binary body fully received");
+    let ok = true;
+    iter (i from 0 to 39999) {
+        if (Buffer.ReadU8At(rby.body, i) != (i % 256)) { ok = false; }
+    }
+    check(ok, "large binary body byte-exact");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Static file exposure.
+//
+// A mount points at a directory, and everything reachable from it is public.
+// Two things make "reachable" wider than it looks: files that are conventionally
+// private but perfectly readable (.env, .git), and symlinks, which the lexical
+// containment check cannot see through.
+// ---------------------------------------------------------------------------
+fn test_static_exposure() {
+    Console.WriteLine("== static exposure ==");
+
+    checkEq(req1(gPort, "GET", "/pub/hello.txt").code, 200, "an ordinary file is still served");
+
+    // Dotfiles.
+    checkEq(req1(gPort, "GET", "/pub/.env").code, 404, ".env not served");
+    checkEq(req1(gPort, "GET", "/pub/.git/config").code, 404, ".git/config not served");
+    // .well-known is the standard exception - ACME and security.txt live there.
+    let wk = req1(gPort, "GET", "/pub/.well-known/probe.txt");
+    checkEq(wk.code, 200, ".well-known is still reachable");
+    checkEq(wk.body, "WELLKNOWN_OK", ".well-known content intact");
+
+    // Symlinks out of the tree.
+    if (File.Exists(Path.Combine(gStaticDir, "escape.txt"))) {
+        let esc = req1(gPort, "GET", "/pub/escape.txt");
+        checkEq(esc.code, 404, "a symlink leaving the root is not followed");
+        check(!String.Contains(esc.body, "OUTSIDE_THE_ROOT"), "symlink target not disclosed");
+
+        // Via a symlinked *directory* - File.Stat on the final component reports
+        // IsSymlink=false here, so a check on the last segment alone misses it.
+        let escd = req1(gPort, "GET", "/pub/escapedir/flaris_outside_root.txt");
+        checkEq(escd.code, 404, "a symlinked directory is not traversed");
+        check(!String.Contains(escd.body, "OUTSIDE_THE_ROOT"), "symlinked directory target not disclosed");
+    }
+
+    // The guards are opt-out, and opting out restores the old behaviour.
+    checkEq(req1(gPort, "GET", "/loose/.env").code, 200, "dotfiles:true serves .env");
+    if (File.Exists(Path.Combine(gStaticDir, "escape.txt"))) {
+        checkEq(req1(gPort, "GET", "/loose/escape.txt").code, 200, "followSymlinks:true follows the link");
+    }
+
+    // A NUL smuggled through percent-encoding must not reach the filesystem:
+    // it would truncate the path and defeat any check made on the extension.
+    checkEq(request(gPort, "GET /pub/hello.txt%00.js HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false).code,
+            400, "NUL in the decoded path rejected");
+    checkEq(request(gPort, "GET /pub/hello%01.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false).code,
+            400, "control byte in the decoded path rejected");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Precompressed sidecars
+// ---------------------------------------------------------------------------
+fn test_gzip_sidecar() {
+    Console.WriteLine("== gzip sidecar ==");
+
+    if (!File.Exists(Path.Combine(gStaticDir, "zipped.txt.gz"))) {
+        Console.WriteLine("   (gzip(1) unavailable - skipped)");
+        return 0;
+    }
+
+    // Client takes gzip: the sidecar answers, with the original file's type.
+    let gz = request(gPort,
+        "GET /gz/zipped.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip, deflate\r\n"
+        + "Connection: close\r\n\r\n", false);
+    checkEq(gz.code, 200, "sidecar served");
+    checkEq(Object.TryGet(gz.headers, "content-encoding", ""), "gzip", "Content-Encoding: gzip");
+    checkEq(Object.TryGet(gz.headers, "vary", ""), "Accept-Encoding", "Vary set so caches stay honest");
+    check(String.Contains(Object.TryGet(gz.headers, "content-type", ""), "text/plain"),
+          "Content-Type comes from the real file, not the .gz");
+
+    let full  = 2600;   // "compress me. " x 200
+    let gzLen = Convert.ParseInt(Object.TryGet(gz.headers, "content-length", "0")) ?? 0;
+    check(gzLen > 0 && gzLen < full, "compressed body is smaller (" + str(gzLen) + " < " + str(full) + ")");
+
+    // Client does not take gzip: it must get the identity entity, in full.
+    let id = request(gPort,
+        "GET /gz/zipped.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: identity\r\n"
+        + "Connection: close\r\n\r\n", false);
+    checkEq(Object.TryGet(id.headers, "content-encoding", "none"), "none", "no encoding when not accepted");
+    checkEq(String.Length(id.body), full, "identity body is the whole file");
+
+    // The two entities must not share an ETag - they are different bytes.
+    check(Object.TryGet(gz.headers, "etag", "a") != Object.TryGet(id.headers, "etag", "b"),
+          "compressed and identity entities have distinct ETags");
+
+    // A mount without gzip:true ignores the sidecar entirely.
+    let plain = request(gPort,
+        "GET /pub/zipped.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n"
+        + "Connection: close\r\n\r\n", false);
+    checkEq(Object.TryGet(plain.headers, "content-encoding", "none"), "none",
+            "sidecar ignored when the mount did not opt in");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Request introspection
 // ---------------------------------------------------------------------------
 fn test_request_object() {
@@ -472,6 +1189,47 @@ fn buildServer() {
         iter (i from 0 to 255) { Buffer.WriteU8At(b, i, i); }
         res.Bytes(b);
     });
+    // Either side of the 16 KB write-coalescing threshold: the small body goes
+    // out with the header block in one write, the large one takes the second
+    // write path, and both must arrive byte-for-byte with an exact length.
+    srv.Get("/big", fn(_req, res) { res.Text(String.Repeat("Z", 40000)); });
+    srv.Get("/bigbytes", fn(_req, res) {
+        let b = Buffer.Create(40000, 1);
+        iter (i from 0 to 39999) { Buffer.WriteU8At(b, i, i % 256); }
+        res.Bytes(b);
+    });
+    srv.Get("/own-date", fn(_req, res) {
+        res.Header("Date", "Thu, 01 Jan 1970 00:00:00 GMT").Text("d");
+    });
+
+    // --- cookies and form bodies ---
+    srv.Get("/readcookies", fn(req, res) {
+        res.Json({ sid: req.Cookie("sid"), theme: req.Cookie("theme"),
+                   missing: req.Cookie("nope", "dflt"), all: req.Cookies() });
+    });
+    srv.Get("/setcookie", fn(_req, res) { res.SetCookie("sid", "abc123").Text("ok"); });
+    srv.Get("/setmany", fn(_req, res) {
+        res.SetCookie("a", "1").SetCookie("b", "2").SetCookie("c", "3").Text("ok");
+    });
+    srv.Get("/setopts", fn(_req, res) {
+        res.SetCookie("s", "v", { maxAge: 3600, path: "/admin", domain: "example.com",
+                                  sameSite: "Strict", httpOnly: false, secure: true });
+        res.Text("ok");
+    });
+    srv.Get("/setnone", fn(_req, res) {
+        res.SetCookie("n", "v", { sameSite: "None", secure: false }).Text("ok");
+    });
+    srv.Get("/setweird", fn(_req, res) { res.SetCookie("w", "a b;c=d").Text("ok"); });
+    srv.Get("/clearcookie", fn(_req, res) { res.ClearCookie("sid").Text("ok"); });
+    srv.Get("/badname", fn(_req, res) { res.SetCookie("bad name", "v").Text("never"); });
+    srv.Get("/badcookie", fn(_req, res) {
+        res.SetCookie("evil", "a\r\nX-Injected: yes").Text("never");
+    });
+    srv.Post("/form", fn(req, res) {
+        res.Json({ user: req.FormValue("user"), msg: req.FormValue("msg"),
+                   missing: req.FormValue("nope", "dflt"), all: req.Form() });
+    });
+
     srv.Get("/boom",   fn(_req, _res) { throw(1, "handler exploded"); });
     srv.Get("/silent", fn(_req, _res) { _sink = _sink + 1; });
 
@@ -504,8 +1262,100 @@ fn buildServer() {
         });
     });
 
+    srv.OnAccess(fn(e) { Array.Append(gAccess, e); });
     srv.Static("/pub", gStaticDir, { index: "index.html", cacheControl: "max-age=60" });
+    srv.Static("/gz",  gStaticDir, { gzip: true });
+    // Same tree, but with the guards deliberately switched off, so the tests
+    // can prove the guards are what makes the difference.
+    srv.Static("/loose", gStaticDir, { dotfiles: true, followSymlinks: true });
     return srv;
+}
+
+// A server with a short read timeout, so the truncated-request tests do not
+// have to wait out a realistic one.
+fn buildSlowServer() {
+    let srv = new HttpServer({ port: 0, idleTimeoutMs: 500, readTimeoutMs: 500 });
+    srv.Get("/",     fn(_req, res) { res.Text("ok"); });
+    srv.Post("/raw", fn(req, res) { res.Text(req.Text()); });
+    return srv;
+}
+
+// A server that leaves request bodies on the socket for the handler to pull.
+fn buildStreamServer() {
+    let srv = new HttpServer({ port: 0, streamBodies: true, idleTimeoutMs: 700,
+                               readTimeoutMs: 3000, maxRequestsPerConn: 5000 });
+    // Stream to a file without ever holding the whole upload.
+    srv.Post("/upload", fn(req, res) {
+        let n = req.SaveBody(gUploadPath, 0);
+        res.Json({ bytes: n });
+    });
+    // Count bytes chunk by chunk, and report how many chunks arrived.
+    srv.Post("/count", fn(req, res) {
+        // An object, not locals: a closure captures scalars by value, so
+        // counting into a plain local would silently stay at zero.
+        let acc = { total: 0, chunks: 0 };
+        let n = req.ReadBody(fn(b) { acc.total = acc.total + len(b); acc.chunks = acc.chunks + 1; return true; }, 0);
+        res.Json({ n: n, total: acc.total, chunks: acc.chunks });
+    });
+    // Text() still works: it drains a pending body on demand.
+    srv.Post("/echo", fn(req, res) { res.Text(req.Text()); });
+    // ContentLength before reading anything.
+    srv.Post("/len", fn(req, res) { res.Text(str(req.ContentLength())); });
+    // A handler that deliberately ignores the body.
+    srv.Post("/ignore", fn(_req, res) { res.Text("ignored"); });
+    // Multipart over a streamed body: nothing is buffered whole.
+    srv.Post("/mp", fn(req, res) {
+        let mp = req.Multipart({ dir: gUploadDir });
+        if (!mp.ok) { res.Json({ ok: false, error: mp.error }, 400); return; }
+        let out = [];
+        iter (i from 0 to len(mp.files) - 1) {
+            let f = mp.files[i];
+            Array.Append(out, { name: f.name, filename: f.filename,
+                                contentType: f.contentType, size: f.size,
+                                onDisk: File.Exists(f.path) });
+        }
+        res.Json({ ok: true, fields: mp.fields, files: out });
+    });
+    // Same, but buffered in memory (no dir).
+    srv.Post("/mpmem", fn(req, res) {
+        let mp = req.Multipart(nil);
+        if (!mp.ok) { res.Json({ ok: false, error: mp.error }, 400); return; }
+        let out = [];
+        iter (i from 0 to len(mp.files) - 1) {
+            let f = mp.files[i];
+            Array.Append(out, { filename: f.filename, size: f.size,
+                                body: (f.data == nil) ? "" : Buffer.ToString(f.data) });
+        }
+        res.Json({ ok: true, fields: mp.fields, files: out });
+    });
+    srv.Post("/mplimit", fn(req, res) {
+        let mp = req.Multipart({ maxFileBytes: 16, maxParts: 3 });
+        res.Json({ ok: mp.ok, error: mp.error });
+    });
+    srv.Get("/ping", fn(_req, res) { res.Text("pong"); });
+    return srv;
+}
+
+// Build a multipart body with the given boundary from [name, filename, type, value]
+// entries; filename nil marks a plain field.
+fn mpBody(boundary: string, parts: array): string {
+    let out = "";
+    iter (i from 0 to len(parts) - 1) {
+        let p = parts[i];
+        out = out + "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + p[0] + "\"";
+        if (p[1] != nil) { out = out + "; filename=\"" + p[1] + "\""; }
+        out = out + "\r\n";
+        if (p[2] != nil) { out = out + "Content-Type: " + p[2] + "\r\n"; }
+        out = out + "\r\n" + p[3] + "\r\n";
+    }
+    return out + "--" + boundary + "--\r\n";
+}
+
+fn mpPost(port: int, path: string, boundary: string, bodyStr: string) {
+    return request(port, "POST " + path + " HTTP/1.1\r\nHost: t\r\n"
+        + "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n"
+        + "Content-Length: " + str(String.Length(bodyStr))
+        + "\r\nConnection: close\r\n\r\n" + bodyStr, false);
 }
 
 fn buildLimitServer() {
@@ -524,6 +1374,21 @@ fn setupStaticDir() {
     File.WriteText(Path.Combine(dir, "hello.txt"),  "static-content");
     File.WriteText(Path.Combine(dir, "page.html"),  "<p>page</p>");
     File.WriteText(Path.Combine(dir, "index.html"), "<p>index</p>");
+    // A precompressed sidecar for the { gzip: true } mount. gzip(1) is present
+    // on every platform the suite runs on; without it those checks skip.
+    File.WriteText(Path.Combine(dir, "zipped.txt"), String.Repeat("compress me. ", 200));
+    Os.Execute("gzip -k -9 -f '" + Path.Combine(dir, "zipped.txt") + "' 2>/dev/null");
+
+    // Files that must never be served, and a symlink escaping the mount root.
+    File.WriteText(Path.Combine(dir, ".env"), "SECRET_TOKEN=hunter2");
+    Os.Execute("mkdir -p '" + Path.Combine(dir, ".git") + "'");
+    File.WriteText(Path.Combine(dir, ".git", "config"), "GIT_SECRET");
+    Os.Execute("mkdir -p '" + Path.Combine(dir, ".well-known") + "'");
+    File.WriteText(Path.Combine(dir, ".well-known", "probe.txt"), "WELLKNOWN_OK");
+    File.WriteText(Path.Combine(Os.TempDir(), "flaris_outside_root.txt"), "OUTSIDE_THE_ROOT");
+    Os.Execute("ln -sf '" + Path.Combine(Os.TempDir(), "flaris_outside_root.txt")
+               + "' '" + Path.Combine(dir, "escape.txt") + "' 2>/dev/null");
+    Os.Execute("ln -sf '" + Os.TempDir() + "' '" + Path.Combine(dir, "escapedir") + "' 2>/dev/null");
     return dir;
 }
 
@@ -537,8 +1402,15 @@ fn async Main() {
 
     let srv   = buildServer();
     let lim   = buildLimitServer();
-    gPort      = srv.ListenAsync();
-    gLimitPort = lim.ListenAsync();
+    let slow  = buildSlowServer();
+    let strm  = buildStreamServer();
+    gUploadPath = Path.Combine(Os.TempDir(), "flaris_upload_test.bin");
+    gUploadDir  = Path.Combine(Os.TempDir(), "flaris_mp_test");
+    Os.Execute("mkdir -p '" + gUploadDir + "'");
+    gPort       = srv.ListenAsync();
+    gLimitPort  = lim.ListenAsync();
+    gSlowPort   = slow.ListenAsync();
+    gStreamPort = strm.ListenAsync();
     Console.WriteLine("server on port", gPort, " limits server on port", gLimitPort);
 
     test_routing();
@@ -549,6 +1421,16 @@ fn async Main() {
     test_limits();
     test_static();
     test_header_safety();
+    test_response_framing();
+    test_request_framing();
+    test_cookies_and_forms();
+    test_streaming_bodies();
+    test_multipart();
+    test_access_log();
+    test_graceful_shutdown();
+    test_file_semantics();
+    test_gzip_sidecar();
+    test_static_exposure();
     test_request_object();
     test_status_helpers();
 
@@ -558,6 +1440,8 @@ fn async Main() {
     if (testsFailed > 0) {
         srv.Stop();
         lim.Stop();
+        slow.Stop();
+        strm.Stop();
         Console.Error("Some HttpServer tests FAILED.");
         return testsFailed;
     }
@@ -625,6 +1509,8 @@ fn async Main() {
 
     srv.Stop();
     lim.Stop();
+    slow.Stop();
+    strm.Stop();
     // Give both accept loops a tick to notice and release their ports.
     Fiber.Sleep(700);
     return 0;
