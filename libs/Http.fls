@@ -645,6 +645,18 @@ class Http {
     //  Returns: { status: int, body: string } or nil if curl not found / failed.
     // --------------------------------------------------------
 
+    // Quote a value for /bin/sh. Everything inside single quotes is literal,
+    // and the one character that cannot appear there is a single quote itself -
+    // so it is closed, escaped, and reopened: ' -> '\''.
+    //
+    // Wrapping a value in quotes without this is not protection: a URL of
+    //   http://x/'; rm -rf ~; echo '
+    // closes the quote and the rest runs as a command. URLs arrive from config,
+    // redirects and user input, so this is reachable.
+    fn static _shq(v): string {
+        return "'" + String.Replace(Convert.ToString(v), "'", "'\\''") + "'";
+    }
+
     fn static Curl(url:string, options?) {
         let method  = "GET";
         let timeout = 30;
@@ -665,26 +677,28 @@ class Http {
         }
 
         let cmd = "curl -s -w '\\n%{http_code}'";
-        cmd = cmd + " -X " + method;
-        cmd = cmd + " --max-time " + Convert.ToString(timeout);
+        cmd = cmd + " -X " + Http._shq(method);
+        // Forced to an integer: a string from options would otherwise reach the
+        // shell unquoted.
+        cmd = cmd + " --max-time " + Convert.ToString(int(timeout));
         if (follow)   { cmd = cmd + " -L"; }
         if (insecure) { cmd = cmd + " -k"; }
 
         if (headers != nil) {
             foreach (val, key in headers) {
-                cmd = cmd + " -H '" + key + ": " + Convert.ToString(val) + "'";
+                cmd = cmd + " -H " + Http._shq(key + ": " + Convert.ToString(val));
             }
         }
 
         if (body != nil && len(body) > 0) {
-            cmd = cmd + " -d '" + body + "'";
+            cmd = cmd + " -d " + Http._shq(body);
         }
 
         if (output != nil) {
-            cmd = cmd + " -o '" + output + "'";
+            cmd = cmd + " -o " + Http._shq(output);
         }
 
-        cmd = cmd + " '" + url + "'";
+        cmd = cmd + " " + Http._shq(url);
 
         let raw = Os.Execute(cmd);
         if (raw == nil) { return nil; }
@@ -721,10 +735,10 @@ class Http {
         let cmd = "wget -q --server-response";
 
         if (dest != nil && len(dest) > 0) {
-            cmd = cmd + " -O '" + dest + "'";
+            cmd = cmd + " -O " + Http._shq(dest);
         }
 
-        cmd = cmd + " '" + url + "' 2>&1";
+        cmd = cmd + " " + Http._shq(url) + " 2>&1";
 
         let raw = Os.Execute(cmd);
         if (raw == nil) { return nil; }

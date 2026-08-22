@@ -205,7 +205,54 @@ fn test_benchmarks() {
     Console.WriteLine("=== benchmarks done ===");
 }
 
+
+// ---------------------------------------------------------------------------
+// Shell safety of the curl/wget fallbacks.
+//
+// Curl() and WGet() build a /bin/sh command line. Wrapping a value in single
+// quotes is not protection on its own: a single quote inside the value closes
+// the quote and everything after it runs as a command. URLs reach these from
+// config, redirects and user input, so the quoting has to be real.
+// ---------------------------------------------------------------------------
+fn test_shell_quoting() {
+    Console.WriteLine("== shell quoting ==");
+
+    let marker = Path.Combine(Os.TempDir(), "flaris_shq_probe.txt");
+    Os.Execute("rm -f '" + marker + "'");
+
+    // A URL that tries to close the quote and run `touch`.
+    let evil = "http://127.0.0.1:1/x'; touch " + marker + "; echo '";
+    Http.Curl(evil, nil);
+    check(!File.Exists(marker), "Curl does not execute an injected command in the url");
+
+    Os.Execute("rm -f '" + marker + "'");
+    Http.WGet("http://127.0.0.1:1/y'; touch " + marker + "; echo '", nil);
+    check(!File.Exists(marker), "WGet does not execute an injected command in the url");
+
+    // The same through the other interpolated parameters.
+    Os.Execute("rm -f '" + marker + "'");
+    Http.Curl("http://127.0.0.1:1/z", {
+        method:  "GET",
+        headers: { "X-Test": "a'; touch " + marker + "; echo 'b" },
+        body:    "c'; touch " + marker + "; echo 'd"
+    });
+    check(!File.Exists(marker), "neither a header nor a body can inject");
+
+    Os.Execute("rm -f '" + marker + "'");
+    Http.WGet("http://127.0.0.1:1/w", "/tmp/out'; touch " + marker + "; echo '");
+    check(!File.Exists(marker), "nor the destination path");
+
+    // Quoting must still leave ordinary values intact.
+    checkEq(Http._shq("plain"), "'plain'", "an ordinary value is simply quoted");
+    checkEq(Http._shq("a b&c;d"), "'a b&c;d'", "metacharacters stay literal inside quotes");
+    checkEq(Http._shq("it's"), "'it'\\''s'", "an embedded quote is closed, escaped and reopened");
+
+    Os.Execute("rm -f '" + marker + "'");
+    return 0;
+}
+
 fn Main() {
+    test_shell_quoting();
     Console.WriteLine("=== Http extra (offline) test suite ===");
 
     test_cookiejar();

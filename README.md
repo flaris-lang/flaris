@@ -66,7 +66,9 @@ section.
 flarisvm ./tests/test_csv.fls
 ```
 
-Libraries that use native bindings need the unsafe flag:
+Three libraries bind native code through FFI and need the unsafe flag —
+`SQLite`, `Postgres` and `Redis`. Every other library runs in the default
+sandbox:
 
 ```bash
 flarisvm ./tests/test_sqlite.fls --unsafe
