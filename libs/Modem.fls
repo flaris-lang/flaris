@@ -1,0 +1,2692 @@
+// Modem.fls - AT-command transport and cellular modem control for Flaris.
+// Version: 1.0
+//
+// Two layers, deliberately separate:
+//
+//   AT     - owns the serial port. Line framing, echo, the "> " prompt,
+//            OK/ERROR/+CME/+CMS terminators, per-command timeouts, unsolicited
+//            result codes, command serialisation, tracing. Knows nothing about
+//            SIMs or messages, so it drives anything that speaks AT.
+//
+//   Modem  - owns 3GPP semantics. SIM and PIN state, signal, registration,
+//            operator, SMS, data contexts. Returns structured objects and never
+//            touches the stream itself.
+//
+// Usage:
+//   import { Modem } from library("Modem", "1.0");
+//
+//   let m = Modem.Open("/dev/ttyUSB2", 115200);
+//   if (m == nil) { ... }
+//
+//   let sim = m.SimStatus();            // { state, pinRetries, pukRetries }
+//   if (sim.state == "pin") { m.UnlockPin("1234"); }
+//
+//   let s = m.SignalInfo();             // { rssi, dbm, ber, quality }
+//   let r = m.Registration();           // { registered, roaming, tech, lac, ci }
+//   m.SendMessage("+46701234567", "hello");
+//
+//   m.OnMessage(fn(sms) { Console.WriteLine(sms.sender + ": " + sms.text); });
+//   m.Poll(1000);                       // service URCs while otherwise idle
+//
+// Nothing here raises. Every call returns a result object carrying `ok` and,
+// when ok is false, an `error` string and an `errorKind` naming the class of
+// failure ("timeout", "port", "modem", "usage"). A timeout is reported as a
+// timeout rather than as a failure, because on a modem those are not the same
+// thing - see SendMessage.
+//
+// SAFETY - read before using UnlockPin:
+//   A SIM allows three PIN attempts before it locks to PUK, and ten PUK
+//   attempts before it is destroyed permanently. UnlockPin therefore reads the
+//   card state first and refuses unless it is exactly "pin", never retries, and
+//   never loops. There is deliberately no "just try this PIN" convenience.
+//   Nothing in this library sends a PIN more than once per call.
+//
+// Secrets never reach the trace hook: the arguments of +CPIN, +CPWD and +CLCK
+// are redacted before OnTrace sees them.
+//
+// Testing without hardware: tests/fake_modem.py answers AT commands on a
+// pseudo-terminal, and Stream.OpenSerial cannot tell it from a real device.
+// tests/test_modem.sh drives the library against it through the awkward cases -
+// a line split across two reads, a URC racing a reply, a silent modem, a
+// PUK-locked card. No modem, and no --unsafe: the whole library runs sandboxed.
+//
+// Baud is passed straight through to Stream.OpenSerial - no rate list is baked
+// in here, because which rates are usable is a property of the VM build and the
+// driver, not of this library. A rate the platform will not take comes back as
+// a nil from Open rather than as an exception. 115200 is the safe default for
+// control commands; 460800 and 921600 are what modules want for bulk data.
+//
+// Exported classes:
+//   AT    - Open / Attach / Send / SendPrompt / OnUrc / OnTrace / Poll / Close
+//   Modem - device    : Open / Attach / Info / At / Poll / Close
+//           identity  : Imei / Imsi / Iccid / OwnNumber
+//                       (+ static ValidateImei; there is no IMEI setter,
+//                        see the note on ValidateImei)
+//           SIM       : SimStatus / UnlockPin / UnlockPuk
+//           radio     : SignalInfo (+CSQ) / SignalQuality (+CESQ) /
+//                       Registration / Operator / ScanOperators /
+//                       SelectOperator / SelectOperatorAuto / NetworkTime /
+//                       Functionality / SetFunctionality /
+//                       SupportedFunctionality / RadioOn / RadioOff /
+//                       LowPower / Airplane / Reset
+//           SIM slots : SimSlot / SelectSimSlot (vendor-specific, see
+//                       _SIM_SLOT_CMDS)
+//           messaging : ConfigureMessaging / SendMessage / ReadMessage /
+//                       ListMessages / DeleteMessage / DeleteMessages /
+//                       StorageStatus / ServiceCentre / SetServiceCentre /
+//                       OnMessage
+//           data      : Contexts / Apn / SetApn / DeleteContext /
+//                       StartData / StopData / DataStatus / ContextInfo
+//           USSD      : Ussd / CancelUssd
+//           calls     : Dial / Answer / Hangup / CurrentCalls / OnRing
+//           static    : EncodeMessage / DecodeMessage, for inspecting a PDU
+//                       with no modem attached
+
+import { Util } from library("Util", "1.0");
+
+// ===========================================================================
+//  GSM 03.38 alphabet
+// ===========================================================================
+
+// The default 7-bit alphabet, septet value -> Unicode codepoint. Position in
+// this array *is* the septet, so it doubles as the decode table.
+const _GSM_BASIC = [
+      64,  163,   36,  165,  232,  233,  249,  236,   // @ £ $ ¥ è é ù ì
+     242,  199,   10,  216,  248,   13,  197,  229,   // ò Ç LF Ø ø CR Å å
+     916,   95,  934,  915,  923,  937,  928,  936,   // Δ _ Φ Γ Λ Ω Π Ψ
+     931,  920,  926,   27,  198,  230,  223,  201,   // Σ Θ Ξ ESC Æ æ ß É
+      32,   33,   34,   35,  164,   37,   38,   39,
+      40,   41,   42,   43,   44,   45,   46,   47,
+      48,   49,   50,   51,   52,   53,   54,   55,
+      56,   57,   58,   59,   60,   61,   62,   63,
+     161,   65,   66,   67,   68,   69,   70,   71,   // ¡ A-G
+      72,   73,   74,   75,   76,   77,   78,   79,
+      80,   81,   82,   83,   84,   85,   86,   87,
+      88,   89,   90,  196,  214,  209,  220,  167,   // X Y Z Ä Ö Ñ Ü §
+     191,   97,   98,   99,  100,  101,  102,  103,   // ¿ a-g
+     104,  105,  106,  107,  108,  109,  110,  111,
+     112,  113,  114,  115,  116,  117,  118,  119,
+     120,  121,  122,  228,  246,  241,  252,  224    // x y z ä ö ñ ü à
+];
+
+// The extension table, reached with an ESC (0x1B) prefix. Pairs of
+// [septet, codepoint]; anything not listed here has no escape form.
+const _GSM_EXT = [
+     10,   12,      // form feed
+     20,   94,      // ^
+     40,  123,      // {
+     41,  125,      // }
+     47,   92,      // backslash
+     60,   91,      // [
+     61,  126,      // ~
+     62,   93,      // ]
+     64,  124,      // |
+    101, 8364       // €
+];
+
+// codepoint -> septet, built once on first use. Keys are decimal codepoints as
+// strings: an object subscript wants a string, and the table is small enough
+// that the conversion never shows up in a profile.
+global _gsmEnc = nil;
+global _gsmExtEnc = nil;
+
+fn _gsmTables(): int {
+    if (_gsmEnc != nil) return 0;
+    let enc = { };
+    iter (i from 0 to 127) { enc[str(_GSM_BASIC[i])] = i; }
+    let ext = { };
+    var j = 0;
+    while (j < len(_GSM_EXT)) {
+        ext[str(_GSM_EXT[j + 1])] = _GSM_EXT[j];
+        j = j + 2;
+    }
+    _gsmEnc = enc;
+    _gsmExtEnc = ext;
+    return 0;
+}
+
+// Every codepoint of `text` as a septet, with escaped characters expanded to
+// the two septets they really occupy. nil when any character has no GSM 03.38
+// form at all, which is the caller's signal to fall back to UCS-2.
+fn _gsmSeptets(text: string): array {
+    _gsmTables();
+    let out = [];
+    var i = 0;
+    let n = len(text);
+    while (i < n) {
+        let cp  = Char.Code(String.Utf8CpAt(text, i));
+        let key = str(cp);
+        if (key in _gsmEnc) {
+            Array.Append(out, _gsmEnc[key]);
+        } else if (key in _gsmExtEnc) {
+            Array.Append(out, 27);                 // ESC
+            Array.Append(out, _gsmExtEnc[key]);
+        } else {
+            return nil;
+        }
+        i = String.Utf8CpNext(text, i);
+    }
+    return out;
+}
+
+// Septets -> text. `_GSM_BASIC` is indexed by septet, so decoding is a lookup
+// plus the ESC special case.
+fn _gsmFromSeptets(septets: array): string {
+    let parts = [];
+    var i = 0;
+    let n = len(septets);
+    while (i < n) {
+        let v = septets[i];
+        if (v == 27 && i + 1 < n) {
+            let e = septets[i + 1];
+            var cp = -1;
+            var j = 0;
+            while (j < len(_GSM_EXT)) {
+                if (_GSM_EXT[j] == e) { cp = _GSM_EXT[j + 1]; break; }
+                j = j + 2;
+            }
+            // An ESC before a character with no escape form is defined to read
+            // as a space, not as an error.
+            Array.Append(parts, "" + Char.FromInt(cp < 0 ? 32 : cp));
+            i = i + 2;
+        } else {
+            Array.Append(parts, "" + Char.FromInt(_GSM_BASIC[v & 127]));
+            i = i + 1;
+        }
+    }
+    return String.Join(parts, "");
+}
+
+// Pack septets into octets, LSB first. `fillBits` shifts the whole run up by
+// that many bits, which is what a user-data header needs: the header occupies
+// whole octets, so the septets after it have to start on a septet boundary
+// rather than immediately after the header's last bit.
+fn _gsm7Pack(septets: array, fillBits: int): block {
+    let n = len(septets);
+    if (n == 0) return Buffer.FromString("");
+    let totalBits = fillBits + n * 7;
+    let nOct = (totalBits + 7) / 8;
+    let out = Buffer.Create(nOct, 1);
+    Buffer.Fill(out, 0);
+
+    var bit = fillBits;
+    iter (i from 0 to n - 1) {
+        let v = septets[i] & 127;
+        let byteIx = bit / 8;
+        let shift  = bit % 8;
+        let lo = Buffer.ReadU8At(out, byteIx) | ((v << shift) & 255);
+        Buffer.WriteU8At(out, byteIx, lo);
+        if (shift > 1 && byteIx + 1 < nOct) {
+            Buffer.WriteU8At(out, byteIx + 1,
+                Buffer.ReadU8At(out, byteIx + 1) | ((v >> (8 - shift)) & 255));
+        }
+        bit = bit + 7;
+    }
+    return out;
+}
+
+// Unpack `count` septets out of packed octets, skipping `fillBits` first.
+fn _gsm7Unpack(data: block, count: int, fillBits: int): array {
+    let out = [];
+    let nOct = len(data);
+    var bit = fillBits;
+    iter (i from 0 to count - 1) {
+        let byteIx = bit / 8;
+        let shift  = bit % 8;
+        if (byteIx >= nOct) break;
+        var v = (Buffer.ReadU8At(data, byteIx) >> shift) & 127;
+        if (shift > 1 && byteIx + 1 < nOct) {
+            v = (v | (Buffer.ReadU8At(data, byteIx + 1) << (8 - shift))) & 127;
+        }
+        Array.Append(out, v);
+        bit = bit + 7;
+    }
+    return out;
+}
+
+// ===========================================================================
+//  PDU encoding (3GPP TS 23.040)
+// ===========================================================================
+
+const _DCS_GSM7 = 0;
+const _DCS_UCS2 = 8;
+
+fn _hexOf(b: block): string { return String.ToUpper(Util.BinToHex(b)); }
+
+fn _hexByte(v: int): string {
+    return String.ToUpper(String.PadLeft(Convert.ToRadixString(v & 255, 16), 2, '0'));
+}
+
+// Text as UCS-2 (big-endian UTF-16), the fallback whenever GSM 03.38 cannot
+// hold a character. Codepoints above the BMP become a surrogate pair, which is
+// what UTF-16 is; a modem that cannot render them still stores them intact.
+fn _ucs2Bytes(text: string): block {
+    let out = [];
+    var i = 0;
+    while (i < len(text)) {
+        var cp = Char.Code(String.Utf8CpAt(text, i));
+        if (cp > 65535) {
+            cp = cp - 65536;
+            let hi = 55296 + ((cp >> 10) & 1023);
+            let lo = 56320 + (cp & 1023);
+            Array.Append(out, (hi >> 8) & 255); Array.Append(out, hi & 255);
+            Array.Append(out, (lo >> 8) & 255); Array.Append(out, lo & 255);
+        } else {
+            Array.Append(out, (cp >> 8) & 255); Array.Append(out, cp & 255);
+        }
+        i = String.Utf8CpNext(text, i);
+    }
+    let b = Buffer.Create(len(out) == 0 ? 1 : len(out), 1);
+    iter (k from 0 to len(out) - 1) { Buffer.WriteU8At(b, k, out[k]); }
+    return len(out) == 0 ? Buffer.FromString("") : Buffer.Slice(b, 0, len(out));
+}
+
+fn _ucs2Text(b: block, start: int, count: int): string {
+    let parts = [];
+    var i = start;
+    let end = start + count;
+    while (i + 1 < end) {
+        var u = (Buffer.ReadU8At(b, i) << 8) | Buffer.ReadU8At(b, i + 1);
+        i = i + 2;
+        // A high surrogate is only half a character; pair it with the next.
+        if (u >= 55296 && u <= 56319 && i + 1 < end) {
+            let lo = (Buffer.ReadU8At(b, i) << 8) | Buffer.ReadU8At(b, i + 1);
+            if (lo >= 56320 && lo <= 57343) {
+                u = 65536 + ((u - 55296) << 10) + (lo - 56320);
+                i = i + 2;
+            }
+        }
+        Array.Append(parts, "" + Char.FromInt(u));
+    }
+    return String.Join(parts, "");
+}
+
+// A phone number as a PDU address field: length in digits, type-of-address,
+// then the digits in swapped nibble pairs padded with F.
+fn _encodeAddress(number: string): string {
+    var digits = "";
+    var intl = false;
+    var i = 0;
+    while (i < len(number)) {
+        let c = String.Substr(number, i, 1);
+        if (c == "+" && i == 0) { intl = true; }
+        else if (String.IndexOf("0123456789", c) >= 0) { digits = digits + c; }
+        i = i + 1;
+    }
+    if (len(digits) == 0) return nil;
+
+    let toa = intl ? 145 : 129;            // 0x91 international, 0x81 national
+    var swapped = "";
+    var j = 0;
+    while (j < len(digits)) {
+        let a = String.Substr(digits, j, 1);
+        let b = (j + 1 < len(digits)) ? String.Substr(digits, j + 1, 1) : "F";
+        swapped = swapped + b + a;
+        j = j + 2;
+    }
+    return _hexByte(len(digits)) + _hexByte(toa) + String.ToUpper(swapped);
+}
+
+// The inverse. `octets` is the swapped-nibble run; `digitCount` says how many
+// digits are real, so a trailing F pad is dropped rather than decoded.
+fn _decodeAddress(hex: string, toa: int, digitCount: int): string {
+    var out = "";
+    var i = 0;
+    while (i + 1 < len(hex) && len(out) < digitCount) {
+        out = out + String.Substr(hex, i + 1, 1);
+        if (len(out) < digitCount) { out = out + String.Substr(hex, i, 1); }
+        i = i + 2;
+    }
+    return ((toa & 112) == 16) ? "+" + out : out;      // 0x70 mask, 0x10 = international
+}
+
+// Build the SMS-SUBMIT PDUs for one message. Returns an array of
+// { hex, tpduLen, part, total } - more than one when the text does not fit in
+// a single message and has to be split with a user-data header.
+//
+// `tpduLen` is what AT+CMGS wants: the octet count of the PDU *excluding* the
+// leading service-centre address, which is why the SCA is emitted separately.
+fn _buildSubmit(number: string, text: string, ref: int, opts): array {
+    let addr = _encodeAddress(number);
+    if (addr == nil) return nil;
+
+    var flash = false;
+    var report = false;
+    if (opts != nil) {
+        if ("flash"  in opts) { flash  = opts["flash"] == true; }
+        if ("report" in opts) { report = opts["report"] == true; }
+    }
+
+    // GSM 03.38 when every character fits, UCS-2 otherwise. Choosing per
+    // message rather than per part keeps every part in one alphabet, which is
+    // what a receiver reassembling them expects.
+    let septets = _gsmSeptets(text);
+    let gsm7 = septets != nil;
+
+    // Single-part capacity, and the smaller capacity once a 6-octet
+    // concatenation header eats into the payload.
+    let capOne  = gsm7 ? 160 : 140;
+    let capPart = gsm7 ? 153 : 134;
+    let total   = gsm7 ? len(septets) : len(_ucs2Bytes(text));
+
+    let chunks = [];
+    if (total <= capOne) {
+        Array.Append(chunks, gsm7 ? septets : _ucs2Bytes(text));
+    } else if (gsm7) {
+        var i = 0;
+        while (i < len(septets)) {
+            let take = (len(septets) - i < capPart) ? len(septets) - i : capPart;
+            // An escaped character is two septets and must not be cut in half.
+            var t = take;
+            if (i + t < len(septets)) {
+                var esc = 0;
+                var k = i;
+                while (k < i + t) { if (septets[k] == 27) { k = k + 2; esc = k; } else { k = k + 1; } }
+                if (esc > i + t) { t = t - 1; }
+            }
+            Array.Append(chunks, Array.Subset(septets, i, t));
+            i = i + t;
+        }
+    } else {
+        let all = _ucs2Bytes(text);
+        var i = 0;
+        while (i < len(all)) {
+            var take = (len(all) - i < capPart) ? len(all) - i : capPart;
+            // Never split a surrogate pair across two parts.
+            if (i + take < len(all) && take >= 2) {
+                let u = (Buffer.ReadU8At(all, i + take - 2) << 8) | Buffer.ReadU8At(all, i + take - 1);
+                if (u >= 55296 && u <= 56319) { take = take - 2; }
+            }
+            Array.Append(chunks, Buffer.Slice(all, i, take));
+            i = i + take;
+        }
+    }
+
+    let nParts = len(chunks);
+    let out = [];
+    iter (p from 0 to nParts - 1) {
+        let multi = nParts > 1;
+        // TP-MTI=1 (SUBMIT) | TP-VPF=2 (relative) | UDHI when concatenated |
+        // TP-SRR when a delivery report was asked for.
+        var first = 17;                      // 0x11
+        if (multi)  { first = first | 64; }  // 0x40 UDHI
+        if (report) { first = first | 32; }  // 0x20 SRR
+
+        var ud = "";
+        var udl = 0;
+        let chunk = chunks[p];
+
+        if (gsm7) {
+            // The header is 6 octets = 48 bits. User data has to resume on a
+            // septet boundary, and the next one is bit 49, so exactly one fill
+            // bit goes in front of the packed run - not seven. UDL counts the
+            // header and that fill as seven septets of their own.
+            let fill = multi ? 1 : 0;
+            let hdrSeptets = multi ? 7 : 0;
+            let packed = _gsm7Pack(chunk, fill);
+            udl = hdrSeptets + len(chunk);
+            ud = (multi ? "050003" + _hexByte(ref) + _hexByte(nParts) + _hexByte(p + 1) : "")
+               + _hexOf(packed);
+        } else {
+            udl = (multi ? 6 : 0) + len(chunk);
+            ud = (multi ? "050003" + _hexByte(ref) + _hexByte(nParts) + _hexByte(p + 1) : "")
+               + _hexOf(chunk);
+        }
+
+        let dcs = gsm7 ? (flash ? 16 : _DCS_GSM7) : (flash ? 24 : _DCS_UCS2);
+        let tpdu = _hexByte(first) + "00" + addr + "00" + _hexByte(dcs) + "AA"
+                 + _hexByte(udl) + ud;
+        Array.Append(out, { hex: "00" + tpdu, tpduLen: len(tpdu) / 2,
+                            part: p + 1, total: nParts });
+    }
+    return out;
+}
+
+// Parse one received PDU (SMS-DELIVER, as +CMGR/+CMGL hand it over) into
+// { ok, from, when, text, dcs, concat }. `concat` is nil unless the message
+// carried a concatenation header, in which case it is { ref, total, part }
+// and the caller is responsible for reassembly.
+//
+// Returns { ok: false, error } rather than raising on anything malformed: a
+// PDU arrives from the network, so it is not trusted input.
+fn _parseDeliver(hex: string): object {
+    let raw = Util.HexToBin(hex);
+    if (raw == nil || len(raw) < 2) { return { ok: false, error: "not hex" }; }
+    let n = len(raw);
+    var p = 0;
+
+    // Service-centre address: a length in octets, then that many.
+    let scaLen = Buffer.ReadU8At(raw, p); p = p + 1;
+    p = p + scaLen;
+    if (p + 1 > n) { return { ok: false, error: "truncated at SCA" }; }
+
+    let first = Buffer.ReadU8At(raw, p); p = p + 1;
+    let udhi  = (first & 64) != 0;
+
+    // Originating address: length is in *digits*, so the octet count rounds up.
+    if (p >= n) { return { ok: false, error: "truncated at OA" }; }
+    let oaDigits = Buffer.ReadU8At(raw, p); p = p + 1;
+    if (p >= n) { return { ok: false, error: "truncated at OA type" }; }
+    let oaType = Buffer.ReadU8At(raw, p); p = p + 1;
+    let oaOct  = (oaDigits + 1) / 2;
+    if (p + oaOct > n) { return { ok: false, error: "truncated in OA" }; }
+    let oaHex  = String.ToUpper(Util.BinToHex(Buffer.Slice(raw, p, oaOct)));
+    p = p + oaOct;
+    let sender = _decodeAddress(oaHex, oaType, oaDigits);
+
+    if (p + 2 > n) { return { ok: false, error: "truncated at PID/DCS" }; }
+    p = p + 1;                                   // TP-PID
+    let dcs = Buffer.ReadU8At(raw, p); p = p + 1;
+
+    // TP-SCTS: seven semi-octet fields, the last being a signed quarter-hour
+    // timezone offset.
+    if (p + 7 > n) { return { ok: false, error: "truncated at SCTS" }; }
+    let ts = Buffer.Slice(raw, p, 7); p = p + 7;
+    let when = _decodeTimestamp(ts);
+
+    if (p >= n) { return { ok: false, error: "truncated at UDL" }; }
+    let udl = Buffer.ReadU8At(raw, p); p = p + 1;
+    let udOct = n - p;
+    if (udOct < 0) { return { ok: false, error: "truncated at UD" }; }
+    let ud = Buffer.Slice(raw, p, udOct);
+
+    // The alphabet lives in bits 3-2 of DCS: 00 = GSM 7-bit, 01 = 8-bit data,
+    // 10 = UCS-2.
+    let alphabet = (dcs >> 2) & 3;
+
+    var udhLen = 0;
+    var concat = nil;
+    if (udhi && udOct > 0) {
+        udhLen = Buffer.ReadU8At(ud, 0);
+        concat = _parseUdhConcat(ud, udhLen);
+    }
+
+    var text = "";
+    if (alphabet == 2) {
+        let skip = udhi ? (udhLen + 1) : 0;
+        text = _ucs2Text(ud, skip, udOct - skip);
+    } else if (alphabet == 0) {
+        // Skip the header, then the fill bits that realign the septets.
+        let hdrOct = udhi ? (udhLen + 1) : 0;
+        let hdrSeptets = (hdrOct * 8 + 6) / 7;
+        let fill = (hdrSeptets * 7) - (hdrOct * 8);
+        let count = udl - (udhi ? hdrSeptets : 0);
+        text = _gsmFromSeptets(_gsm7Unpack(Buffer.Slice(ud, hdrOct, udOct - hdrOct),
+                                            count < 0 ? 0 : count, fill));
+    } else {
+        let skip = udhi ? (udhLen + 1) : 0;
+        text = Buffer.ToString(Buffer.Slice(ud, skip, udOct - skip));
+    }
+
+    // `sender` rather than the natural `from`: that is a reserved word in
+    // Flaris and cannot be an object key, so `.from` would not even parse.
+    return { ok: true, sender: sender, when: when, text: text, dcs: dcs, concat: concat };
+}
+
+// The 8-bit concatenation header, in either of its two forms: IEI 0x00 with a
+// one-octet reference, or IEI 0x08 with two.
+fn _parseUdhConcat(ud: block, udhLen: int): object {
+    var i = 1;
+    let stop = udhLen + 1;
+    if (stop > len(ud)) { return nil; }
+    while (i + 1 < stop) {
+        let iei = Buffer.ReadU8At(ud, i);
+        let ielen = Buffer.ReadU8At(ud, i + 1);
+        let body = i + 2;
+        if (body + ielen > stop) { return nil; }
+        if (iei == 0 && ielen == 3) {
+            return { ref: Buffer.ReadU8At(ud, body),
+                     total: Buffer.ReadU8At(ud, body + 1),
+                     part: Buffer.ReadU8At(ud, body + 2) };
+        }
+        if (iei == 8 && ielen == 4) {
+            return { ref: (Buffer.ReadU8At(ud, body) << 8) | Buffer.ReadU8At(ud, body + 1),
+                     total: Buffer.ReadU8At(ud, body + 2),
+                     part: Buffer.ReadU8At(ud, body + 3) };
+        }
+        i = body + ielen;
+    }
+    return nil;
+}
+
+// TP-SCTS -> { iso, unix, tzMinutes }. Each field is a swapped-nibble pair; the
+// timezone is quarter-hours with the sign in bit 3 of its first nibble.
+fn _decodeTimestamp(ts: block): object {
+    let v = [];
+    iter (i from 0 to 6) {
+        let b = Buffer.ReadU8At(ts, i);
+        Array.Append(v, ((b & 15) * 10) + ((b >> 4) & 15));
+    }
+    let tzRaw = Buffer.ReadU8At(ts, 6);
+    let neg = (tzRaw & 8) != 0;
+    let quarters = (((tzRaw & 7) * 10) + ((tzRaw >> 4) & 15));
+    let tzMin = (neg ? -quarters : quarters) * 15;
+
+    let year = 2000 + v[0];
+    let iso = String.PadLeft(str(year), 4, '0') + "-" + String.PadLeft(str(v[1]), 2, '0')
+            + "-" + String.PadLeft(str(v[2]), 2, '0') + "T" + String.PadLeft(str(v[3]), 2, '0')
+            + ":" + String.PadLeft(str(v[4]), 2, '0') + ":" + String.PadLeft(str(v[5]), 2, '0');
+    let local = Time.Parse(iso);
+    return { iso: iso, unix: (local == nil) ? 0 : local - (tzMin * 60), tzMinutes: tzMin };
+}
+
+
+// ===========================================================================
+//  AT - the transport
+// ===========================================================================
+
+// Per-command timeouts, in milliseconds. These differ by three orders of
+// magnitude and a single global value is wrong for all of them: AT answers in
+// a few hundred ms, sending a message waits on the network, and a manual
+// operator scan can legitimately take three minutes. Longest matching prefix
+// wins, so "AT+COPS=?" picks the scan timeout and "AT+COPS?" does not.
+const _TIMEOUTS = [
+    "AT+COPS=?",  180000,     // manual network scan
+    "AT+CMGS",     60000,     // waits for the network to accept the message
+    "AT+CMGD",     25000,
+    "AT+CMGL",     20000,
+    "AT+CMGR",     20000,
+    "AT+CFUN",     15000,
+    "AT+CGATT",    75000,
+    "AT+CGACT",   150000,
+    "AT+CPIN",     15000,     // SIM initialisation is slow after a correct PIN
+    "AT+COPS",     30000
+];
+const _DEFAULT_TIMEOUT = 3000;
+
+fn _timeoutFor(cmd: string): int {
+    var best = _DEFAULT_TIMEOUT;
+    var bestLen = 0;
+    let up = String.ToUpper(cmd);
+    var i = 0;
+    while (i < len(_TIMEOUTS)) {
+        let pfx = _TIMEOUTS[i];
+        if (String.StartsWith(up, pfx) && len(pfx) > bestLen) {
+            best = _TIMEOUTS[i + 1];
+            bestLen = len(pfx);
+        }
+        i = i + 2;
+    }
+    return best;
+}
+
+// Commands whose argument is a secret. A trace hook is for debugging, and a
+// debug log that captures the SIM PIN is a credential leak that outlives the
+// session - so the argument is replaced before the hook ever sees the line.
+const _SECRET_CMDS = [ "+CPIN", "+CPWD", "+CLCK", "+CPINR" ];
+
+fn _redact(line: string): string {
+    let up = String.ToUpper(line);
+    foreach (c in _SECRET_CMDS) {
+        if (String.Contains(up, c)) {
+            let eq = String.IndexOf(line, "=");
+            if (eq > 0) { return String.Left(line, eq + 1) + "<redacted>"; }
+        }
+    }
+    return line;
+}
+
+// A final result code ends a command; anything before it is response data.
+fn _isTerminator(line: string): bool {
+    return line == "OK" || line == "ERROR" || line == "NO CARRIER"
+        || line == "BUSY" || line == "NO ANSWER" || line == "NO DIALTONE"
+        || String.StartsWith(line, "+CME ERROR:")
+        || String.StartsWith(line, "+CMS ERROR:");
+}
+
+class AT {
+    let _s      = nil;
+    let _owned  = false;      // true when Open() made the stream and must close it
+    let _buf    = "";         // bytes read but not yet split into lines
+    let _lines  = nil;        // complete lines waiting to be consumed
+    let _urcs   = nil;        // [prefix, handler] pairs
+    let _trace  = nil;
+    let _queue  = nil;        // FIFO of fiber ids waiting for the port
+    let _port   = "";
+    let _gone   = false;      // the port vanished (USB re-enumeration)
+    let _pending = nil;       // URCs seen mid-command, dispatched after it ends
+    let _inCmd  = false;
+    let _cmdPrefix = nil;     // reply prefix of the command in flight
+    let _draining = false;
+
+    fn Constructor(stream, port: string, owned: bool) {
+        this._s     = stream;
+        this._port  = port;
+        this._owned = owned;
+        this._buf   = "";
+        this._lines = [];
+        this._urcs  = [];
+        this._queue = [];
+        this._gone  = false;
+        this._pending = [];
+        this._inCmd = false;
+        this._cmdPrefix = nil;
+        this._draining = false;
+    }
+
+    // Open a serial port and put the modem in a known state: echo off, verbose
+    // errors on. `opts.init` false skips that, for a device that is mid-session.
+    fn static Open(port: string, baud: int, opts?) {
+        // Stream.OpenSerial does not agree with itself across VM versions about
+        // an unusable baud rate: older builds raise, newer ones hand the value
+        // to the driver. This library promises never to raise, so both shapes
+        // come back as nil and the caller checks one thing.
+        var s = nil;
+        try { s = Stream.OpenSerial(port, baud); }
+        catch (e) { return nil; }
+        if (s == nil) return nil;
+        let at = new AT(s, port, true);
+        if (opts == nil || !("init" in opts) || opts["init"] == true) { at.Init(); }
+        return at;
+    }
+
+    // Wrap a stream somebody else owns - a pty in a test, or a socket to a
+    // modem multiplexer. Close() will not close it.
+    fn static Attach(stream, opts?) {
+        if (stream == nil) return nil;
+        let at = new AT(stream, "<attached>", false);
+        if (opts == nil || !("init" in opts) || opts["init"] == true) { at.Init(); }
+        return at;
+    }
+
+    // ATE0 turns off command echo, and AT+CMEE=2 asks for "+CME ERROR: <text>"
+    // instead of a bare ERROR. Both are best-effort: a device that rejects them
+    // still works, it is just noisier to debug.
+    fn Init(): object {
+        this.Send("ATE0", 1000);
+        this.Send("AT+CMEE=2", 1000);
+        return { ok: true };
+    }
+
+    fn OnUrc(prefix: string, handler: fn): int {
+        Array.Append(this._urcs, [prefix, handler]);
+        return 0;
+    }
+
+    fn OnTrace(handler: fn): int { this._trace = handler; return 0; }
+
+    fn IsOpen(): bool { return this._s != nil && !this._gone; }
+    fn Port(): string { return this._port; }
+
+    // -- reading ----------------------------------------------------------
+    //
+    // Stream.ReadLine cannot be used here. On a serial port a line routinely
+    // arrives in two reads, and ReadLine *discards* the first half: writing
+    // "+CSQ: 23,9" then "9\r\n" makes it return only "9". So bytes are pulled
+    // in bulk and split into lines here, where a partial tail is simply kept
+    // for the next read.
+    fn _pump(waitMs: int): bool {
+        if (this._s == nil) { return false; }
+        if (Stream.WaitReadable(this._s, waitMs) == nil) { return false; }
+        let b = Stream.ReadAll(this._s, 4096, 1);
+        if (b == nil) {
+            // A hard error on a port that is no longer open means the device
+            // went away - a modem reset re-enumerates USB and takes the tty
+            // with it. That is a different outcome from a timeout.
+            if (!Stream.IsOpen(this._s)) { this._gone = true; }
+            return false;
+        }
+        let chunk = Buffer.ToString(b);
+        if (len(chunk) == 0) { return false; }
+        if (this._trace != nil) { this._trace("rx", chunk); }
+        this._buf = this._buf + chunk;
+        this._split();
+        return true;
+    }
+
+    // Move every complete line out of the byte buffer. AT framing is CR LF,
+    // but modems are loose about it, so both are treated as terminators and
+    // empty lines are dropped rather than surfaced.
+    fn _split(): int {
+        var at = String.IndexOfAnyFrom(this._buf, "\r\n", 0);
+        while (at >= 0) {
+            let line = String.Left(this._buf, at);
+            this._buf = String.Substr(this._buf, at + 1);
+            if (len(line) > 0) { Array.Append(this._lines, line); }
+            at = String.IndexOfAnyFrom(this._buf, "\r\n", 0);
+        }
+        return 0;
+    }
+
+    // Next complete line, or nil once `deadline` passes.
+    fn _nextLine(deadline: int) {
+        while (true) {
+            if (len(this._lines) > 0) {
+                let l = this._lines[0];
+                Array.RemoveAt(this._lines, 0);
+                return l;
+            }
+            let left = deadline - Time.Millis();
+            if (left <= 0) { return nil; }
+            if (this._gone) { return nil; }
+            this._pump(left > 250 ? 250 : left);
+        }
+    }
+
+    // True when the line was an unsolicited result code and has been handed to
+    // its handler. A URC can arrive in the middle of a command's response - a
+    // "+CMTI" landing between "AT+CSQ" and its "+CSQ:" reply is normal - so
+    // every line is offered here before it is treated as response data.
+    // The reply prefix a command will answer with: "AT+CEREG?" -> "+CEREG".
+    // Needed because several notifications share a prefix with the query that
+    // reads the same value.
+    fn static _replyPrefix(cmd: string) {
+        var c = cmd;
+        if (String.StartsWith(String.ToUpper(c), "AT")) { c = String.Substr(c, 2); }
+        let stop = String.IndexOfAnyFrom(c, "=?;", 0);
+        if (stop >= 0) { c = String.Left(c, stop); }
+        return (len(c) > 0) ? c : nil;
+    }
+
+    fn _dispatchUrc(line: string): bool {
+        // A registration report is both a notification and the answer to
+        // "AT+CEREG?" - identical prefix, near-identical shape. While a
+        // command is in flight, a line carrying that command's own prefix
+        // belongs to the command; treating it as unsolicited would swallow the
+        // reply and leave the caller waiting for data that already arrived.
+        if (this._inCmd && this._cmdPrefix != nil
+            && String.StartsWith(line, this._cmdPrefix)) {
+            return false;
+        }
+        foreach (u in this._urcs) {
+            if (String.StartsWith(line, u[0])) {
+                // A handler is free to issue its own commands - reading the
+                // message a "+CMTI" just announced is the obvious case - and
+                // doing that from inside the exchange that saw the line would
+                // consume the reply the outer command is still waiting for.
+                // So mid-command URCs are parked and run once the port is free.
+                if (this._inCmd) { Array.Append(this._pending, line); }
+                else { this._invokeUrc(line, u); }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn _invokeUrc(line: string, u): int {
+        let colon = String.IndexOf(line, ":");
+        let args = (colon >= 0) ? String.Trim(String.Substr(line, colon + 1)) : "";
+        u[1](line, args);
+        return 0;
+    }
+
+    // Run the handlers for URCs that arrived while a command held the port.
+    // Guarded against re-entry: a handler issuing a command reaches this again
+    // on its way out, and without the flag two nested drains would run the same
+    // line twice.
+    fn _drain(): int {
+        if (this._draining) return 0;
+        this._draining = true;
+        while (len(this._pending) > 0) {
+            let line = this._pending[0];
+            Array.RemoveAt(this._pending, 0);
+            foreach (u in this._urcs) {
+                if (String.StartsWith(line, u[0])) { this._invokeUrc(line, u); break; }
+            }
+        }
+        this._draining = false;
+        return 0;
+    }
+
+    // Service URCs while no command is running. Nothing reads the port in the
+    // background - there is one scheduler and a hidden reader fiber would race
+    // the command path - so an application that wants unsolicited notifications
+    // calls this from its idle loop.
+    fn Poll(ms: int): int {
+        let deadline = Time.Millis() + (ms < 0 ? 0 : ms);
+        var n = 0;
+        while (true) {
+            let line = this._nextLine(deadline);
+            if (line == nil) { break; }
+            if (this._dispatchUrc(line)) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // -- the port is single-user -------------------------------------------
+    //
+    // A modem answers one command at a time, so two fibers issuing commands
+    // would interleave their replies beyond repair. There is no Mutex builtin,
+    // and a plain busy flag is not safe: the scheduler can deschedule between
+    // testing it and setting it. A FIFO of fiber ids has no such window -
+    // Array.Append is one operation - and it keeps the order fair.
+    fn _acquire(): int {
+        let me = Fiber.Id();
+        Array.Append(this._queue, me);
+        while (this._queue[0] != me) { Fiber.Sleep(2); }
+        return 0;
+    }
+
+    fn _release(): int {
+        if (len(this._queue) > 0) { Array.RemoveAt(this._queue, 0); }
+        return 0;
+    }
+
+    fn _fail(kind: string, msg: string): object {
+        return { ok: false, lines: [], error: msg, errorKind: kind,
+                 cme: nil, cms: nil, final: nil };
+    }
+
+    // -- sending ------------------------------------------------------------
+
+    // Run one command and collect its response.
+    //
+    // Returns { ok, lines, error, errorKind, cme, cms, final }. errorKind is
+    // "timeout", "port", "modem" or "usage", never nil when ok is false. A
+    // timeout is reported as one rather than folded into a generic failure,
+    // because for some commands the two mean very different things.
+    fn Send(cmd: string, timeoutMs?): object {
+        if (this._s == nil) { return this._fail("port", "port is closed"); }
+        if (cmd == nil || len(cmd) == 0) { return this._fail("usage", "empty command"); }
+        // A CR inside the command would end it early and turn the remainder
+        // into a second, unintended command.
+        if (String.IndexOfAnyFrom(cmd, "\r\n", 0) >= 0) {
+            return this._fail("usage", "command contains CR or LF");
+        }
+        this._acquire();
+        this._inCmd = true;
+        this._cmdPrefix = AT._replyPrefix(cmd);
+        let r = this._exchange(cmd, timeoutMs, nil);
+        this._inCmd = false;
+        this._cmdPrefix = nil;
+        this._release();
+        this._drain();
+        return r;
+    }
+
+    // For commands that answer with a bare "> " prompt and then take a payload
+    // terminated by Ctrl-Z - AT+CMGS is the one that matters. The prompt has no
+    // line terminator, so it can only be recognised in the raw byte buffer.
+    fn SendPrompt(cmd: string, payload: string, timeoutMs?): object {
+        if (this._s == nil) { return this._fail("port", "port is closed"); }
+        this._acquire();
+        this._inCmd = true;
+        this._cmdPrefix = AT._replyPrefix(cmd);
+        let r = this._exchange(cmd, timeoutMs, payload);
+        this._inCmd = false;
+        this._cmdPrefix = nil;
+        this._release();
+        this._drain();
+        return r;
+    }
+
+    fn _exchange(cmd: string, timeoutMs, payload): object {
+        let budget = (timeoutMs == nil || timeoutMs <= 0) ? _timeoutFor(cmd) : timeoutMs;
+        var deadline = Time.Millis() + budget;
+
+        if (this._trace != nil) { this._trace("tx", _redact(cmd)); }
+        if (!Stream.WriteString(this._s, cmd + "\r")) {
+            if (!Stream.IsOpen(this._s)) { this._gone = true; return this._fail("port", "port went away"); }
+            return this._fail("port", "write failed");
+        }
+
+        if (payload != nil) {
+            let pr = this._awaitPrompt(deadline);
+            if (!pr.ok) { return pr; }
+            if (this._trace != nil) { this._trace("tx", "<payload " + str(len(payload)) + " bytes>"); }
+            // Ctrl-Z (0x1A) submits; ESC (0x1B) would cancel.
+            if (!Stream.WriteString(this._s, payload + "" + Char.FromInt(26))) {
+                return this._fail("port", "payload write failed");
+            }
+        }
+
+        let out = [];
+        while (true) {
+            let line = this._nextLine(deadline);
+            if (line == nil) {
+                if (this._gone) { return this._fail("port", "port went away"); }
+                return { ok: false, lines: out, error: "timed out after " + str(budget) + " ms",
+                         errorKind: "timeout", cme: nil, cms: nil, final: nil };
+            }
+            // Echo of our own command, when ATE0 has not taken effect.
+            if (line == cmd) { continue; }
+            if (this._dispatchUrc(line)) { continue; }
+            if (_isTerminator(line)) {
+                if (line == "OK") {
+                    return { ok: true, lines: out, error: nil, errorKind: nil,
+                             cme: nil, cms: nil, final: line };
+                }
+                var cme = nil;
+                var cms = nil;
+                if (String.StartsWith(line, "+CME ERROR:")) { cme = String.Trim(String.Substr(line, 11)); }
+                if (String.StartsWith(line, "+CMS ERROR:")) { cms = String.Trim(String.Substr(line, 11)); }
+                return { ok: false, lines: out, error: line, errorKind: "modem",
+                         cme: cme, cms: cms, final: line };
+            }
+            Array.Append(out, line);
+        }
+    }
+
+    // Wait for "> ". It arrives without a terminator, so _split() will never
+    // produce it as a line; it has to be matched against the raw buffer.
+    fn _awaitPrompt(deadline: int): object {
+        while (true) {
+            if (String.Contains(this._buf, ">")) {
+                this._buf = "";
+                return { ok: true };
+            }
+            // A modem that refuses the command answers with a normal final
+            // result instead of a prompt.
+            while (len(this._lines) > 0) {
+                let l = this._lines[0];
+                Array.RemoveAt(this._lines, 0);
+                if (this._dispatchUrc(l)) { continue; }
+                if (_isTerminator(l)) {
+                    var cms = nil;
+                    if (String.StartsWith(l, "+CMS ERROR:")) { cms = String.Trim(String.Substr(l, 11)); }
+                    return { ok: false, lines: [], error: l, errorKind: "modem",
+                             cme: nil, cms: cms, final: l };
+                }
+            }
+            let left = deadline - Time.Millis();
+            if (left <= 0) {
+                return { ok: false, lines: [], error: "no \"> \" prompt", errorKind: "timeout",
+                         cme: nil, cms: nil, final: nil };
+            }
+            if (this._gone) { return this._fail("port", "port went away"); }
+            this._pump(left > 200 ? 200 : left);
+        }
+    }
+
+    fn Close(): int {
+        if (this._s != nil && this._owned) { Stream.Close(this._s); }
+        this._s = nil;
+        return 0;
+    }
+}
+
+// ===========================================================================
+//  Modem - the semantics
+// ===========================================================================
+
+// One comma-separated argument list, respecting quotes: +COPS answers
+// 0,0,"Telia AB",7 and a naive split on "," would cut a network name in half.
+fn _splitArgs(s: string): array {
+    let out = [];
+    var cur = "";
+    var q = false;
+    var i = 0;
+    while (i < len(s)) {
+        let c = String.Substr(s, i, 1);
+        if (c == "\"") { q = !q; }
+        else if (c == "," && !q) { Array.Append(out, String.Trim(cur)); cur = ""; }
+        else { cur = cur + c; }
+        i = i + 1;
+    }
+    Array.Append(out, String.Trim(cur));
+    return out;
+}
+
+// The payload of a "+XXX: ..." line, or nil when the line is something else.
+fn _payload(line: string, prefix: string): string {
+    if (!String.StartsWith(line, prefix)) return nil;
+    let colon = String.IndexOf(line, ":");
+    if (colon < 0) return nil;
+    return String.Trim(String.Substr(line, colon + 1));
+}
+
+fn _firstPayload(lines: array, prefix: string): string {
+    foreach (l in lines) {
+        let p = _payload(l, prefix);
+        if (p != nil) return p;
+    }
+    return nil;
+}
+
+fn _toInt(s: string) {
+    if (s == nil) return nil;
+    let t = String.Trim(s);
+    if (len(t) == 0) return nil;
+    return Convert.ParseInt(t);
+}
+
+// Strip the quotes an AT reply wraps most strings in.
+fn _unquote(s: string): string {
+    if (s == nil) return nil;
+    var t = String.Trim(s);
+    if (len(t) >= 2 && String.StartsWith(t, "\"") && String.EndsWith(t, "\"")) {
+        t = String.Substr(t, 1, len(t) - 2);
+    }
+    return t;
+}
+
+// 3GPP TS 27.007 access technology numbers, as +COPS and +CREG report them.
+fn _techName(n): string {
+    if (n == nil) return "unknown";
+    if (n == 0) return "gsm";
+    if (n == 1) return "gsm-compact";
+    if (n == 2) return "utran";
+    if (n == 3) return "gsm-egprs";
+    if (n == 4) return "utran-hsdpa";
+    if (n == 5) return "utran-hsupa";
+    if (n == 6) return "utran-hspa";
+    if (n == 7) return "lte";
+    if (n == 8) return "ec-gsm-iot";
+    if (n == 9) return "lte-cat-m1";
+    if (n == 10) return "lte-nb-iot";
+    if (n == 11) return "5gnr";
+    if (n == 12) return "lte-5gcn";
+    if (n == 13) return "nr-5gcn";
+    return "unknown";
+}
+
+// Join concatenated parts in a list of decoded messages back into whole ones.
+//
+// Parts of one message share a reference and a total, and can be stored out of
+// order and interleaved with other messages. A set that is missing a part is
+// still returned - as the parts that did arrive, in order, with `complete`
+// false - because dropping it would silently lose a message whose remaining
+// part may simply never come.
+fn _joinConcat(msgs: array): array {
+    let out = [];
+    let groups = { };
+    let order = [];
+
+    foreach (m in msgs) {
+        if (m.concat == nil) {
+            Array.Append(out, { index: m.index, sender: m.sender, when: m.when,
+                                text: m.text, parts: 1, complete: true });
+            continue;
+        }
+        let key = str(m.sender) + "|" + str(m.concat.ref) + "|" + str(m.concat.total);
+        if (!(key in groups)) {
+            groups[key] = { index: m.index, sender: m.sender, when: m.when,
+                            total: m.concat.total, slots: Array.Create(m.concat.total),
+                            seen: 0 };
+            Array.Append(order, key);
+        }
+        let g = groups[key];
+        let ix = m.concat.part - 1;
+        if (ix >= 0 && ix < g.total && g.slots[ix] == nil) {
+            g.slots[ix] = m.text;
+            g.seen = g.seen + 1;
+        }
+    }
+
+    foreach (key in order) {
+        let g = groups[key];
+        let parts = [];
+        iter (i from 0 to g.total - 1) {
+            if (g.slots[i] != nil) { Array.Append(parts, g.slots[i]); }
+        }
+        Array.Append(out, { index: g.index, sender: g.sender, when: g.when,
+                            text: String.Join(parts, ""), parts: g.total,
+                            complete: g.seen == g.total });
+    }
+    return out;
+}
+
+// Vendor commands for selecting a physical SIM slot, keyed on a substring of
+// the +CGMI manufacturer string.
+//
+// Only entries confirmed against a datasheet belong here. An unlisted vendor
+// is reported as unsupported rather than probed, because a wrong guess does
+// not merely fail - the same command name can carry a different meaning on
+// another module, and this one reconfigures hardware.
+//
+//   prefix - the reply prefix the query answers with
+//   query  - reads the current slot
+//   set    - the slot number is appended to this
+const _SIM_SLOT_CMDS = [
+    "quectel", "+QUIMSLOT", "AT+QUIMSLOT?", "AT+QUIMSLOT="
+];
+
+fn _simSlotCmds(vendor: string) {
+    if (vendor == nil) return nil;
+    let v = String.ToLower(vendor);
+    var i = 0;
+    while (i < len(_SIM_SLOT_CMDS)) {
+        if (String.Contains(v, _SIM_SLOT_CMDS[i])) {
+            return { prefix: _SIM_SLOT_CMDS[i + 1],
+                     query:  _SIM_SLOT_CMDS[i + 2],
+                     set:    _SIM_SLOT_CMDS[i + 3] };
+        }
+        i = i + 4;
+    }
+    return nil;
+}
+
+fn _callState(n): string {
+    if (n == 0) return "active";
+    if (n == 1) return "held";
+    if (n == 2) return "dialing";
+    if (n == 3) return "alerting";
+    if (n == 4) return "incoming";
+    if (n == 5) return "waiting";
+    return "unknown";
+}
+
+// A hex string, as +CUSD packs its text into.
+fn _looksHex(s: string): bool {
+    if (s == nil || len(s) < 2 || (len(s) % 2) != 0) return false;
+    var i = 0;
+    while (i < len(s)) {
+        if (String.IndexOf("0123456789abcdefABCDEF", String.Substr(s, i, 1)) < 0) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+// "10.64.72.9.255.255.255.0" - +CGCONTRDP reports address and mask as one
+// run of dotted octets, so the two halves are separated here.
+fn _splitAddrMask(s: string): string {
+    if (s == nil) return nil;
+    let parts = String.Split(s, ".");
+    if (len(parts) == 8) { return String.Join(Array.Subset(parts, 0, 4), "."); }
+    return s;
+}
+
+// +CGCONTRDP reports IPv4 in the dotted form everything already understands.
+// IPv6 it reports as 16 dot-separated decimal octets, which is not a form any
+// tool accepts - that is passed through unconverted rather than guessed at, so
+// a caller can see what the modem said. Converting it properly needs the
+// address and prefix split apart first, which differs per module.
+fn _dotted(s: string): string {
+    if (s == nil || len(s) == 0) return nil;
+    return s;
+}
+
+fn _allDigits(s: string): bool {
+    if (s == nil || len(s) == 0) return false;
+    var i = 0;
+    while (i < len(s)) {
+        if (String.IndexOf("0123456789", String.Substr(s, i, 1)) < 0) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+// +CFUN levels. 0, 1 and 4 are the ones 27.007 defines; 2 and 3 are defined
+// but rarely implemented, and everything from 5 up is manufacturer-specific,
+// so those are named as such rather than guessed at.
+fn _cfunName(n): string {
+    if (n == nil) return "unknown";
+    if (n == 0) return "minimum";
+    if (n == 1) return "full";
+    if (n == 2) return "tx-disabled";
+    if (n == 3) return "rx-disabled";
+    if (n == 4) return "airplane";
+    return "vendor-" + str(n);
+}
+
+// +CREG/+CGREG/+CEREG registration status.
+fn _regName(n): string {
+    if (n == 0) return "not-registered";
+    if (n == 1) return "home";
+    if (n == 2) return "searching";
+    if (n == 3) return "denied";
+    if (n == 5) return "roaming";
+    if (n == 6) return "home-sms-only";
+    if (n == 7) return "roaming-sms-only";
+    if (n == 8) return "emergency-only";
+    return "unknown";
+}
+
+class Modem {
+    let _at   = nil;
+    let _ref  = 0;        // rolling concatenation reference
+    let _onMsg = nil;
+    let _parts = nil;     // partial multipart messages, keyed "ref:total"
+    let _vendor = "";
+    let _retryCmd = nil;  // which PIN-counter command this modem answers, once known
+    let _iccid = nil;     // cached: it cannot change while the card is inserted
+    let _msgReady = false;
+    let _ussd = nil;      // last +CUSD result, filled by the URC handler
+    let _onRing = nil;
+    let _onReg2 = nil;
+    let _reg = nil;       // most recent registration state seen
+
+    fn Constructor(at) {
+        this._at = at;
+        this._ref = 0;
+        this._parts = { };
+        this._vendor = "";
+        this._retryCmd = nil;
+        this._iccid = nil;
+        this._msgReady = false;
+        this._ussd = nil;
+        this._onRing = nil;
+        this._onReg2 = nil;
+        this._reg = nil;
+        this._wireUrcs();
+    }
+
+    fn static Open(port: string, baud: int, opts?) {
+        let at = AT.Open(port, baud, opts);
+        if (at == nil) return nil;
+        return new Modem(at);
+    }
+
+    fn static Attach(at) {
+        if (at == nil) return nil;
+        return new Modem(at);
+    }
+
+    fn At() { return this._at; }
+
+    // ---- codec, exposed --------------------------------------------------
+
+    // The SMS-SUBMIT PDUs a message would be sent as, without sending it:
+    // [{ hex, tpduLen, part, total }]. Useful for inspecting what a message
+    // will cost before committing to it - `total` is the number of messages
+    // the network will bill for - and for decoding a modem log after the fact.
+    fn static EncodeMessage(number: string, text: string, ref?, opts?) {
+        return _buildSubmit(number, text ?? "", (ref == nil) ? 0 : (ref & 255), opts);
+    }
+
+    // Decode a received PDU (SMS-DELIVER) as +CMGR or +CMGL hands it over.
+    // Returns { ok, sender, text, when, dcs, concat } or { ok: false, error }.
+    fn static DecodeMessage(hex: string) { return _parseDeliver(hex); }
+    fn Poll(ms: int): int { return this._at.Poll(ms); }
+    fn Close(): int { return this._at.Close(); }
+
+    // ---- device ---------------------------------------------------------
+
+    // Identity, and the vendor string the quirk handling keys on. Kept even
+    // though it is not part of the requested surface, because SimStatus needs
+    // to know the vendor to ask for the right PIN-retry counter.
+    fn Info(): object {
+        let mfr = this._at.Send("AT+CGMI");
+        let mdl = this._at.Send("AT+CGMM");
+        let rev = this._at.Send("AT+CGMR");
+        let imei = this._at.Send("AT+CGSN");
+        let m = (mfr.ok && len(mfr.lines) > 0) ? mfr.lines[0] : "";
+        this._vendor = String.ToLower(m);
+        return {
+            ok: mfr.ok,
+            manufacturer: m,
+            model:        (mdl.ok && len(mdl.lines) > 0) ? mdl.lines[0] : "",
+            revision:     (rev.ok && len(rev.lines) > 0) ? rev.lines[0] : "",
+            imei:         (imei.ok && len(imei.lines) > 0) ? imei.lines[0] : "",
+            error: mfr.ok ? nil : mfr.error
+        };
+    }
+
+    // ---- SIM and PIN -----------------------------------------------------
+
+    // Card state plus, where the modem will say, how many attempts remain.
+    //
+    // states: "ready" | "pin" | "puk" | "pin2" | "puk2" | "absent" | "unknown"
+    fn SimStatus(): object {
+        let r = this._at.Send("AT+CPIN?");
+        if (!r.ok) {
+            // "+CME ERROR: SIM not inserted" is a state, not a malfunction.
+            let e = String.ToLower(r.cme ?? r.error ?? "");
+            if (String.Contains(e, "not inserted") || String.Contains(e, "absent")
+                || String.Contains(e, "10")) {
+                return { ok: true, state: "absent", pinRetries: nil, pukRetries: nil, error: nil };
+            }
+            return { ok: false, state: "unknown", pinRetries: nil, pukRetries: nil,
+                     error: r.cme ?? r.error, errorKind: r.errorKind };
+        }
+        let p = String.ToUpper(_firstPayload(r.lines, "+CPIN") ?? "");
+        var st = "unknown";
+        if (p == "READY")         { st = "ready"; }
+        else if (p == "SIM PIN")  { st = "pin"; }
+        else if (p == "SIM PUK")  { st = "puk"; }
+        else if (p == "SIM PIN2") { st = "pin2"; }
+        else if (p == "SIM PUK2") { st = "puk2"; }
+
+        let rt = this._pinRetries();
+        return { ok: true, state: st, pinRetries: rt.pin, pukRetries: rt.puk, error: nil };
+    }
+
+    // Remaining attempts. +CPINR is the 3GPP command but plenty of firmware
+    // does not implement it, so two common vendor forms are tried as well.
+    // Returning nil is a normal outcome, not a failure - it means "this modem
+    // will not say", and the caller must treat the count as unknown.
+    fn _pinRetries(): object {
+        // Which of these a modem answers never changes, so it is learned once.
+        // Without that, every SimStatus() costs up to three extra commands and
+        // UnlockPin calls SimStatus twice - nine round trips to read a counter.
+        if (this._retryCmd == "none") { return { pin: nil, puk: nil }; }
+
+        if (this._retryCmd == nil || this._retryCmd == "cpinr") {
+        let r = this._at.Send("AT+CPINR=\"SIM PIN\"", 2000);
+        if (r.ok) {
+            foreach (l in r.lines) {
+                let p = _payload(l, "+CPINR");
+                if (p != nil) {
+                    let a = _splitArgs(p);
+                    if (len(a) >= 2) {
+                        this._retryCmd = "cpinr";
+                        return { pin: _toInt(a[1]), puk: (len(a) >= 3) ? _toInt(a[2]) : nil };
+                    }
+                }
+            }
+        }
+        }
+        // Quectel
+        if (this._retryCmd == nil || this._retryCmd == "qpinc") {
+        let q = this._at.Send("AT+QPINC?", 2000);
+        if (q.ok) {
+            foreach (l in q.lines) {
+                let p = _payload(l, "+QPINC");
+                if (p != nil && String.Contains(String.ToUpper(p), "SC")) {
+                    let a = _splitArgs(p);
+                    if (len(a) >= 3) {
+                        this._retryCmd = "qpinc";
+                        return { pin: _toInt(a[1]), puk: _toInt(a[2]) };
+                    }
+                }
+            }
+        }
+        }
+        // SIMCom
+        if (this._retryCmd == nil || this._retryCmd == "spic") {
+        let s = this._at.Send("AT+SPIC", 2000);
+        if (s.ok) {
+            foreach (l in s.lines) {
+                let p = _payload(l, "+SPIC");
+                if (p != nil) {
+                    let a = _splitArgs(p);
+                    if (len(a) >= 1) {
+                        this._retryCmd = "spic";
+                        return { pin: _toInt(a[0]), puk: (len(a) >= 3) ? _toInt(a[2]) : nil };
+                    }
+                }
+            }
+        }
+        }
+        // This modem will not report the counter. That is a normal outcome -
+        // plenty of firmware does not - so it is remembered rather than
+        // re-probed, and the caller sees nil and treats the count as unknown.
+        this._retryCmd = "none";
+        return { pin: nil, puk: nil };
+    }
+
+    // Present the SIM PIN. Exactly once.
+    //
+    // A SIM allows three PIN attempts before it locks to PUK, and ten PUK
+    // attempts before the card is destroyed for good. So this reads the card
+    // state first and refuses unless it is exactly "pin"; it never retries, it
+    // never loops, and a wrong PIN returns an error rather than a second go.
+    // Calling it twice with a wrong PIN is the caller's decision to make, in
+    // the caller's own code, where it is visible.
+    fn UnlockPin(pin: string): object {
+        if (pin == nil || len(pin) < 4 || len(pin) > 8) {
+            return { ok: false, state: "unknown", retriesLeft: nil,
+                     error: "a SIM PIN is 4 to 8 digits", errorKind: "usage" };
+        }
+        var i = 0;
+        while (i < len(pin)) {
+            if (String.IndexOf("0123456789", String.Substr(pin, i, 1)) < 0) {
+                return { ok: false, state: "unknown", retriesLeft: nil,
+                         error: "a SIM PIN is digits only", errorKind: "usage" };
+            }
+            i = i + 1;
+        }
+
+        let st = this.SimStatus();
+        if (!st.ok) { return { ok: false, state: st.state, retriesLeft: nil,
+                               error: st.error, errorKind: "modem" }; }
+        if (st.state == "ready") {
+            return { ok: true, state: "ready", retriesLeft: st.pinRetries, error: nil };
+        }
+        if (st.state == "puk" || st.state == "puk2") {
+            return { ok: false, state: st.state, retriesLeft: st.pukRetries,
+                     error: "card is PUK-locked; a PIN would be refused - use UnlockPuk",
+                     errorKind: "usage" };
+        }
+        if (st.state != "pin") {
+            return { ok: false, state: st.state, retriesLeft: st.pinRetries,
+                     error: "card is not waiting for a PIN (state " + st.state + ")",
+                     errorKind: "usage" };
+        }
+
+        let r = this._at.Send("AT+CPIN=\"" + pin + "\"");
+        let after = this.SimStatus();
+        if (r.ok) {
+            return { ok: after.state == "ready", state: after.state,
+                     retriesLeft: after.pinRetries,
+                     error: (after.state == "ready") ? nil : "PIN accepted but card is " + after.state };
+        }
+        return { ok: false, state: after.state, retriesLeft: after.pinRetries,
+                 error: r.cme ?? r.error, errorKind: r.errorKind };
+    }
+
+    // Unblock a PUK-locked card and set a new PIN. Also exactly once: ten wrong
+    // PUKs destroy the card permanently, and no library should spend one of
+    // those on its own initiative.
+    fn UnlockPuk(puk: string, newPin: string): object {
+        if (puk == nil || len(puk) != 8) {
+            return { ok: false, state: "unknown", retriesLeft: nil,
+                     error: "a PUK is exactly 8 digits", errorKind: "usage" };
+        }
+        if (newPin == nil || len(newPin) < 4 || len(newPin) > 8) {
+            return { ok: false, state: "unknown", retriesLeft: nil,
+                     error: "a new PIN is 4 to 8 digits", errorKind: "usage" };
+        }
+        let st = this.SimStatus();
+        if (st.state != "puk" && st.state != "puk2") {
+            return { ok: false, state: st.state, retriesLeft: st.pukRetries,
+                     error: "card is not PUK-locked (state " + st.state + ")",
+                     errorKind: "usage" };
+        }
+        let r = this._at.Send("AT+CPIN=\"" + puk + "\",\"" + newPin + "\"");
+        let after = this.SimStatus();
+        if (r.ok) {
+            return { ok: after.state == "ready", state: after.state,
+                     retriesLeft: after.pukRetries, error: nil };
+        }
+        return { ok: false, state: after.state, retriesLeft: after.pukRetries,
+                 error: r.cme ?? r.error, errorKind: r.errorKind };
+    }
+
+    // ---- radio -----------------------------------------------------------
+
+    // +CSQ reports RSSI on an index scale, not in dBm: 0 is -113 dBm or worse,
+    // 31 is -51 or better, and 99 means "not known", which is a real answer
+    // rather than zero signal.
+    fn SignalInfo(): object {
+        let r = this._at.Send("AT+CSQ");
+        if (!r.ok) { return { ok: false, rssi: nil, dbm: nil, ber: nil,
+                              quality: "unknown", error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _firstPayload(r.lines, "+CSQ");
+        if (p == nil) { return { ok: false, rssi: nil, dbm: nil, ber: nil,
+                                 quality: "unknown", error: "no +CSQ in reply", errorKind: "modem" }; }
+        let a = _splitArgs(p);
+        let rssi = _toInt(a[0]);
+        let ber  = (len(a) > 1) ? _toInt(a[1]) : nil;
+        if (rssi == nil || rssi == 99) {
+            return { ok: true, rssi: nil, dbm: nil, ber: ber, quality: "unknown", error: nil };
+        }
+        let dbm = -113 + (2 * rssi);
+        var q = "none";
+        if (rssi >= 20)      { q = "excellent"; }
+        else if (rssi >= 15) { q = "good"; }
+        else if (rssi >= 10) { q = "fair"; }
+        else if (rssi >= 2)  { q = "poor"; }
+        return { ok: true, rssi: rssi, dbm: dbm, ber: ber, quality: q, error: nil };
+    }
+
+    // Registration state. Asks the LTE (+CEREG), then packet (+CGREG), then
+    // circuit (+CREG) variants and keeps the first that answers, because which
+    // one is meaningful depends on the radio the modem is camped on.
+    fn Registration(): object {
+        foreach (cmd in ["+CEREG", "+CGREG", "+CREG"]) {
+            // n=2 asks for the cell fields; a modem that refuses still answers
+            // the query, just without lac/ci.
+            this._at.Send("AT" + cmd + "=2", 2000);
+            let r = this._at.Send("AT" + cmd + "?", 5000);
+            if (!r.ok) { continue; }
+            let p = _firstPayload(r.lines, cmd);
+            if (p == nil) { continue; }
+            let a = _splitArgs(p);
+            // <n>,<stat>[,<lac>,<ci>[,<AcT>]]
+            if (len(a) < 2) { continue; }
+            let stat = _toInt(a[1]);
+            if (stat == nil) { continue; }
+            let name = _regName(stat);
+            return {
+                ok: true,
+                registered: (stat == 1 || stat == 5 || stat == 6 || stat == 7),
+                roaming: (stat == 5 || stat == 7),
+                status: name,
+                lac: (len(a) > 2) ? _unquote(a[2]) : nil,
+                ci:  (len(a) > 3) ? _unquote(a[3]) : nil,
+                tech: (len(a) > 4) ? _techName(_toInt(a[4])) : "unknown",
+                source: cmd,
+                error: nil
+            };
+        }
+        return { ok: false, registered: false, roaming: false, status: "unknown",
+                 lac: nil, ci: nil, tech: "unknown", source: nil,
+                 error: "no registration report from +CEREG/+CGREG/+CREG", errorKind: "modem" };
+    }
+
+    // The serving operator. Asked in numeric form as well, because the long
+    // alphanumeric name is not present on every network and the MCC/MNC always
+    // is - that pair is what identifies the operator unambiguously.
+    fn Operator(): object {
+        this._at.Send("AT+COPS=3,0", 5000);
+        let r = this._at.Send("AT+COPS?", 30000);
+        if (!r.ok) { return { ok: false, name: nil, mcc: nil, mnc: nil,
+                              tech: "unknown", error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _firstPayload(r.lines, "+COPS");
+        if (p == nil) { return { ok: false, name: nil, mcc: nil, mnc: nil, tech: "unknown",
+                                 error: "no +COPS in reply", errorKind: "modem" }; }
+        let a = _splitArgs(p);
+        // <mode>[,<format>,<oper>[,<AcT>]] - unregistered gives just <mode>.
+        let name = (len(a) > 2) ? _unquote(a[2]) : nil;
+        let tech = (len(a) > 3) ? _techName(_toInt(a[3])) : "unknown";
+
+        var mcc = nil;
+        var mnc = nil;
+        this._at.Send("AT+COPS=3,2", 5000);
+        let r2 = this._at.Send("AT+COPS?", 30000);
+        if (r2.ok) {
+            let p2 = _firstPayload(r2.lines, "+COPS");
+            if (p2 != nil) {
+                let b = _splitArgs(p2);
+                if (len(b) > 2) {
+                    let num = _unquote(b[2]);
+                    if (num != nil && len(num) >= 5) {
+                        mcc = String.Left(num, 3);
+                        mnc = String.Substr(num, 3);
+                    }
+                }
+            }
+        }
+        this._at.Send("AT+COPS=3,0", 5000);
+        return { ok: true, name: name, mcc: mcc, mnc: mnc, tech: tech, error: nil };
+    }
+
+    // ---- messages --------------------------------------------------------
+
+    fn _wireUrcs(): int {
+        // New message stored on the card: read it out and hand it over.
+        this._at.OnUrc("+CMTI", fn(_line, args) { this._onCmti(args); });
+        // Some modems deliver the message inline instead of storing it.
+        this._at.OnUrc("+CMT",  fn(_line, args) { this._onCmt(args); });
+        // USSD answers arrive unsolicited, after the command has already
+        // returned OK.
+        this._at.OnUrc("+CUSD", fn(_line, args) { this._onCusd(args); });
+        // Registration changes arrive unsolicited once +CEREG=2 has been set,
+        // which Registration() does. Registering them here means they are
+        // recognised as notifications rather than mistaken for the response
+        // data of whatever command happened to be running.
+        this._at.OnUrc("+CEREG", fn(_line, args) { this._onReg("+CEREG", args); });
+        this._at.OnUrc("+CGREG", fn(_line, args) { this._onReg("+CGREG", args); });
+        this._at.OnUrc("+CREG",  fn(_line, args) { this._onReg("+CREG",  args); });
+        // An incoming call announces itself as bare RING lines, with the
+        // caller id on a separate +CLIP when it is enabled.
+        this._at.OnUrc("RING",  fn(_line, _args) {
+            if (this._onRing != nil) { this._onRing({ number: nil }); }
+        });
+        this._at.OnUrc("+CLIP", fn(_line, args) {
+            if (this._onRing != nil) {
+                let a = _splitArgs(args);
+                this._onRing({ number: (len(a) > 0) ? _unquote(a[0]) : nil });
+            }
+        });
+        return 0;
+    }
+
+    // Deliver assembled messages to the application. A multipart message is
+    // held until every part has arrived, so the callback never sees a fragment.
+    // Register a handler for incoming messages, enabling the notifications
+    // that make it fire. Registering alone is not enough on real hardware -
+    // see ConfigureMessaging - and a handler that never fires because of a
+    // missing +CNMI is a genuinely hard thing to debug, so it is done here.
+    fn OnMessage(handler: fn): int {
+        this._onMsg = handler;
+        if (!this._msgReady) { this.ConfigureMessaging(nil); }
+        return 0;
+    }
+
+    fn _onCmti(args: string): int {
+        let a = _splitArgs(args);
+        if (len(a) < 2) return 0;
+        let idx = _toInt(a[1]);
+        if (idx == nil) return 0;
+        let m = this.ReadMessage(idx);
+        if (m != nil && m.ok) { this._deliver(m); }
+        return 0;
+    }
+
+    // Registered so an inline delivery is recognised rather than treated as
+    // stray response data, but not acted on: ConfigureMessaging never asks for
+    // this form. A modem left in +CMT mode by other software would otherwise
+    // have its notifications land in the middle of an unrelated command.
+    fn _onCmt(_args: string): int { return 0; }
+
+    // Read one stored message by index. PDU mode, so the reply is a hex PDU on
+    // the line after the +CMGR header.
+    fn ReadMessage(index: int): object {
+        this._at.Send("AT+CMGF=0", 2000);
+        let r = this._at.Send("AT+CMGR=" + str(index));
+        if (!r.ok) { return { ok: false, error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        foreach (l in r.lines) {
+            if (_payload(l, "+CMGR") != nil) { continue; }
+            let d = _parseDeliver(String.Trim(l));
+            if (d.ok) {
+                return { ok: true, index: index, sender: d.sender, text: d.text,
+                         when: d.when, concat: d.concat, error: nil };
+            }
+        }
+        return { ok: false, index: index, error: "no readable PDU in +CMGR reply",
+                 errorKind: "modem" };
+    }
+
+    fn DeleteMessage(index: int): object {
+        let r = this._at.Send("AT+CMGD=" + str(index));
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // Put the messaging subsystem in a known state and ask the modem to
+    // announce new messages.
+    //
+    // OnMessage alone is not enough on real hardware: a modem stays silent
+    // until +CNMI tells it where to route notifications, so a handler
+    // registered without this never fires. Called automatically by OnMessage,
+    // and separately when the storage or notification mode needs choosing.
+    //
+    // `opts.storage` selects where messages are read from and written to:
+    // "SM" the card, "ME" the modem, "MT" both (the default).
+    //
+    // Notifications are always configured as store-and-index (+CNMI mt=1): the
+    // modem stores the message and sends a +CMTI with its index, which
+    // OnMessage then reads. The alternative, having the modem push whole
+    // messages inline as +CMT, is deliberately not offered - a +CMT that
+    // arrives while nothing is reading the port is gone for good, whereas a
+    // stored message waits, and the inline form splits one message across two
+    // lines in a way the URC path cannot reassemble safely.
+    fn ConfigureMessaging(opts?): object {
+        var storage = "MT";
+        if (opts != nil) {
+            if ("storage" in opts) { storage = opts["storage"]; }
+        }
+
+        let f = this._at.Send("AT+CMGF=0", 3000);
+        if (!f.ok) { return { ok: false, error: "modem refused PDU mode: "
+                              + str(f.cme ?? f.error), errorKind: f.errorKind }; }
+
+        // Storage is best-effort: some modules expose only one area and reject
+        // the command, which does not stop messaging from working.
+        this._at.Send("AT+CPMS=\"" + storage + "\",\"" + storage + "\",\"" + storage + "\"", 5000);
+
+        // <mode>,<mt>,<bm>,<ds>,<bfr>
+        //   mode 2 - buffer URCs while the link is busy, then deliver them
+        //   mt   1 - store the message and notify with +CMTI
+        let n = this._at.Send("AT+CNMI=2,1,0,0,0", 5000);
+        if (!n.ok) {
+            // Not every module accepts buffering mode; the unbuffered form is
+            // the one everything implements.
+            let n2 = this._at.Send("AT+CNMI=1,1,0,0,0", 5000);
+            if (!n2.ok) {
+                return { ok: false, storage: storage,
+                         error: "modem would not enable new-message indications: "
+                                + str(n2.cme ?? n2.error), errorKind: n2.errorKind };
+            }
+        }
+        this._msgReady = true;
+        return { ok: true, storage: storage, error: nil };
+    }
+
+    // How full the message storage is.
+    fn StorageStatus(): object {
+        let r = this._at.Send("AT+CPMS?", 5000);
+        if (!r.ok) { return { ok: false, areas: [], error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _firstPayload(r.lines, "+CPMS");
+        if (p == nil) { return { ok: false, areas: [], error: "no +CPMS in reply", errorKind: "modem" }; }
+        let a = _splitArgs(p);
+        let out = [];
+        // Three groups of <name>,<used>,<total>: read, write, receive.
+        var i = 0;
+        foreach (role in ["read", "write", "receive"]) {
+            if (i + 2 < len(a)) {
+                Array.Append(out, { role: role, name: _unquote(a[i]),
+                                    used: _toInt(a[i + 1]), total: _toInt(a[i + 2]) });
+            }
+            i = i + 3;
+        }
+        return { ok: true, areas: out, error: nil };
+    }
+
+    // The service centre the modem will submit through. A blank one is why
+    // sending silently fails on some cards, so it is worth checking before
+    // blaming the network.
+    fn ServiceCentre(): object {
+        let r = this._at.Send("AT+CSCA?", 5000);
+        if (!r.ok) { return { ok: false, number: nil, error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _firstPayload(r.lines, "+CSCA");
+        if (p == nil) { return { ok: false, number: nil, error: "no +CSCA in reply", errorKind: "modem" }; }
+        let a = _splitArgs(p);
+        let num = _unquote(a[0]);
+        return { ok: true, number: (num != nil && len(num) > 0) ? num : nil, error: nil };
+    }
+
+    fn SetServiceCentre(number: string): object {
+        if (number == nil || len(number) < 4) {
+            return { ok: false, error: "a service centre number is required", errorKind: "usage" };
+        }
+        let toa = String.StartsWith(number, "+") ? ",145" : ",129";
+        let r = this._at.Send("AT+CSCA=\"" + number + "\"" + toa, 5000);
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // Every message in storage, with concatenated ones joined back together.
+    //
+    // `filter` is the 27.005 status: "all" (default), "unread", "read",
+    // "unsent", "sent". Reading is non-destructive, but note that on many
+    // modems +CMGL with "unread" flips those messages to read as a side effect
+    // of listing them - which is why "all" is the default here.
+    fn ListMessages(filter?): object {
+        let want = (filter == nil) ? "all" : filter;
+        var stat = 4;
+        if      (want == "unread") { stat = 0; }
+        else if (want == "read")   { stat = 1; }
+        else if (want == "unsent") { stat = 2; }
+        else if (want == "sent")   { stat = 3; }
+        else if (want != "all")    {
+            return { ok: false, messages: [],
+                     error: "filter must be all/unread/read/unsent/sent", errorKind: "usage" };
+        }
+
+        this._at.Send("AT+CMGF=0", 3000);
+        let r = this._at.Send("AT+CMGL=" + str(stat), 30000);
+        if (!r.ok) { return { ok: false, messages: [], error: r.cme ?? r.error, errorKind: r.errorKind }; }
+
+        // The reply alternates a "+CMGL: <index>,<stat>,<alpha>,<length>"
+        // header with the PDU on the following line.
+        let raw = [];
+        var pendingIndex = nil;
+        foreach (l in r.lines) {
+            let h = _payload(l, "+CMGL");
+            if (h != nil) {
+                pendingIndex = _toInt(_splitArgs(h)[0]);
+                continue;
+            }
+            let d = _parseDeliver(String.Trim(l));
+            if (d.ok) {
+                Array.Append(raw, { index: pendingIndex, sender: d.sender, text: d.text,
+                                    when: d.when, concat: d.concat });
+            }
+            pendingIndex = nil;
+        }
+        return { ok: true, messages: _joinConcat(raw), error: nil };
+    }
+
+    // Delete stored messages. `scope` is "index" (with `index`), "read",
+    // "sent", "unsent", "inbox" or "all". Deleting is not reversible and the
+    // sweeping forms take no confirmation, so they are named explicitly rather
+    // than hidden behind a flag on DeleteMessage.
+    fn DeleteMessages(scope: string, index?): object {
+        var cmd = nil;
+        if      (scope == "index")  {
+            if (index == nil) { return { ok: false, error: "index is required", errorKind: "usage" }; }
+            cmd = "AT+CMGD=" + str(index);
+        }
+        else if (scope == "read")   { cmd = "AT+CMGD=1,1"; }
+        else if (scope == "sent")   { cmd = "AT+CMGD=1,2"; }
+        else if (scope == "unsent") { cmd = "AT+CMGD=1,3"; }
+        else if (scope == "inbox")  { cmd = "AT+CMGD=1,4"; }
+        else if (scope == "all")    { cmd = "AT+CMGD=1,4"; }
+        else { return { ok: false, error: "scope must be index/read/sent/unsent/inbox/all",
+                        errorKind: "usage" }; }
+        let r = this._at.Send(cmd, 25000);
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // Reassemble concatenated messages before handing them up.
+    fn _deliver(m: object): int {
+        if (this._onMsg == nil) return 0;
+        if (m.concat == nil) { this._onMsg(m); return 0; }
+
+        let key = str(m.concat.ref) + ":" + str(m.concat.total);
+        if (!(key in this._parts)) { this._parts[key] = { seen: 0, total: m.concat.total, text: [] }; }
+        let slot = this._parts[key];
+        // Parts are 1-based and can arrive out of order.
+        while (len(slot.text) < slot.total) { Array.Append(slot.text, nil); }
+        if (slot.text[m.concat.part - 1] == nil) {
+            slot.text[m.concat.part - 1] = m.text;
+            slot.seen = slot.seen + 1;
+        }
+        if (slot.seen < slot.total) return 0;
+
+        Object.Delete(this._parts, key);
+        this._onMsg({ ok: true, index: m.index, sender: m.sender, when: m.when,
+                      text: String.Join(slot.text, ""), concat: m.concat, error: nil });
+        return 0;
+    }
+
+    // Send a message. PDU mode throughout: text mode is not portable and
+    // mangles anything outside a narrow charset.
+    //
+    // Returns { ok, reference, parts, error, errorKind }. A timeout comes back
+    // as ok:false with errorKind "timeout" and is NOT a failure to send - the
+    // network may well have taken the message and only the acknowledgement was
+    // lost. Re-sending on a timeout delivers the message twice and bills twice,
+    // so this never retries and the caller should not either without checking.
+    fn SendMessage(number: string, text: string, opts?): object {
+        if (number == nil || len(number) == 0) {
+            return { ok: false, reference: nil, parts: 0,
+                     error: "no destination number", errorKind: "usage" };
+        }
+        if (text == nil) { text = ""; }
+
+        this._ref = (this._ref + 1) & 255;
+        let pdus = _buildSubmit(number, text, this._ref, opts);
+        if (pdus == nil) {
+            return { ok: false, reference: nil, parts: 0,
+                     error: "could not encode destination number", errorKind: "usage" };
+        }
+
+        let f = this._at.Send("AT+CMGF=0", 2000);
+        if (!f.ok) {
+            return { ok: false, reference: nil, parts: 0,
+                     error: "modem refused PDU mode: " + str(f.cme ?? f.error),
+                     errorKind: f.errorKind };
+        }
+
+        var sent = 0;
+        var lastRef = nil;
+        foreach (pdu in pdus) {
+            let r = this._at.SendPrompt("AT+CMGS=" + str(pdu.tpduLen), pdu.hex);
+            if (!r.ok) {
+                return { ok: false, reference: lastRef, parts: sent,
+                         error: r.cms ?? r.cme ?? r.error, errorKind: r.errorKind,
+                         partsTotal: len(pdus),
+                         note: (r.errorKind == "timeout")
+                               ? "timed out waiting for the network; the message may still have been sent - do not retry blindly"
+                               : nil };
+            }
+            let mr = _firstPayload(r.lines, "+CMGS");
+            if (mr != nil) { lastRef = _toInt(_splitArgs(mr)[0]); }
+            sent = sent + 1;
+        }
+        return { ok: true, reference: lastRef, parts: sent, error: nil };
+    }
+
+    // ---- identity --------------------------------------------------------
+
+    // The subscriber identity on the card. Distinct from the IMEI, which
+    // belongs to the modem: swap the SIM and the IMSI changes, the IMEI does
+    // not. Only readable once the card is unlocked.
+    fn Imsi(): object {
+        let r = this._at.Send("AT+CIMI");
+        if (!r.ok) { return { ok: false, imsi: nil, error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        foreach (l in r.lines) {
+            let t = String.Trim(l);
+            if (len(t) >= 6 && _allDigits(t)) { return { ok: true, imsi: t, error: nil }; }
+        }
+        return { ok: false, imsi: nil, error: "no IMSI in reply", errorKind: "modem" };
+    }
+
+    // The card's own serial number. +CCID is the common spelling, but the
+    // command is not in 27.007 at all, so every vendor picked their own - all
+    // three known spellings are tried and the answer is cached.
+    fn Iccid(): object {
+        if (this._iccid != nil) { return { ok: true, iccid: this._iccid, error: nil }; }
+        foreach (cmd in ["AT+CCID", "AT+ICCID", "AT+QCCID"]) {
+            let r = this._at.Send(cmd, 3000);
+            if (!r.ok) { continue; }
+            foreach (l in r.lines) {
+                var t = String.Trim(l);
+                let colon = String.IndexOf(t, ":");
+                if (colon >= 0) { t = String.Trim(String.Substr(t, colon + 1)); }
+                t = _unquote(t);
+                // An ICCID is 19 or 20 digits, optionally with a trailing
+                // checksum letter on some cards.
+                if (len(t) >= 18 && len(t) <= 21 && _allDigits(String.Left(t, 18))) {
+                    this._iccid = t;
+                    return { ok: true, iccid: t, error: nil };
+                }
+            }
+        }
+        return { ok: false, iccid: nil, error: "modem does not report an ICCID", errorKind: "modem" };
+    }
+
+    // The MSISDNs stored on the card. Frequently empty - most operators never
+    // write the subscriber's own number to the SIM - so an empty list is a
+    // successful answer, not a failure.
+    fn OwnNumber(): object {
+        let r = this._at.Send("AT+CNUM", 5000);
+        if (!r.ok) { return { ok: false, numbers: [], error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let out = [];
+        foreach (l in r.lines) {
+            let p = _payload(l, "+CNUM");
+            if (p == nil) { continue; }
+            let a = _splitArgs(p);
+            if (len(a) >= 2) {
+                Array.Append(out, { name: _unquote(a[0]), number: _unquote(a[1]) });
+            }
+        }
+        return { ok: true, numbers: out, error: nil };
+    }
+
+    // The modem's own identity. Unlike the IMSI this belongs to the hardware,
+    // not the card: swap SIMs and it does not change.
+    //
+    // 27.007 defines both a bare "AT+CGSN" and "AT+CGSN=<snt>" which answers
+    // "+CGSN: <value>"; modules implement one, the other, or both, so the reply
+    // is taken whichever way it comes.
+    fn Imei(): object {
+        foreach (cmd in ["AT+CGSN", "AT+CGSN=1"]) {
+            let r = this._at.Send(cmd, 5000);
+            if (!r.ok) { continue; }
+            foreach (l in r.lines) {
+                var t = String.Trim(l);
+                let colon = String.IndexOf(t, ":");
+                if (colon >= 0) { t = String.Trim(String.Substr(t, colon + 1)); }
+                t = _unquote(t);
+                if (len(t) == 15 && _allDigits(t)) {
+                    let v = Modem.ValidateImei(t);
+                    return { ok: true, imei: t, valid: v.valid, error: nil };
+                }
+            }
+        }
+        return { ok: false, imei: nil, valid: false,
+                 error: "no 15-digit IMEI in reply", errorKind: "modem" };
+    }
+
+    // Check an IMEI's Luhn check digit. Worth running on anything that came
+    // from a config file or a label: a transposed pair of digits is the common
+    // mistake and this catches it, where the modem would simply reject the
+    // value with no explanation.
+    //
+    // There is deliberately no setter to go with this. Re-programming an IMEI
+    // is a criminal offence in a number of jurisdictions and is how stolen
+    // hardware is laundered; where it is legitimate - a manufacturer
+    // provisioning modules from its own allocated TAC range - it runs through
+    // the vendor's authenticated tooling, not an AT command in a library.
+    fn static ValidateImei(imei: string): object {
+        if (imei == nil || len(imei) != 15 || !_allDigits(imei)) {
+            return { valid: false, reason: "an IMEI is exactly 15 digits" };
+        }
+        // Luhn over the first 14, checked against the 15th.
+        var sum = 0;
+        iter (i from 0 to 13) {
+            var d = _toInt(String.Substr(imei, i, 1));
+            // Every second digit counting from the right of the 14 - which is
+            // every odd index here - is doubled.
+            if ((i % 2) == 1) {
+                d = d * 2;
+                if (d > 9) { d = d - 9; }
+            }
+            sum = sum + d;
+        }
+        let want = (10 - (sum % 10)) % 10;
+        let got = _toInt(String.Substr(imei, 14, 1));
+        if (want != got) {
+            return { valid: false, reason: "check digit is " + str(got)
+                     + " but should be " + str(want) };
+        }
+        return { valid: true, reason: nil };
+    }
+
+    // ---- extended signal --------------------------------------------------
+
+    // +CESQ, which is what you want on anything newer than GSM: +CSQ collapses
+    // everything to one 0-31 index, while this reports the per-technology
+    // measurements a link budget is actually judged on - RSRP and RSRQ on LTE,
+    // RSCP and Ec/No on UMTS.
+    //
+    // Every field has its own "unknown" sentinel and its own scale, so each is
+    // converted separately and reported as nil when the modem said it does not
+    // know. Fields for a technology the modem is not camped on are always nil.
+    fn SignalQuality(): object {
+        let r = this._at.Send("AT+CESQ", 5000);
+        if (!r.ok) {
+            return { ok: false, rssi: nil, dbm: nil, rscp: nil, ecno: nil,
+                     rsrq: nil, rsrp: nil, error: r.cme ?? r.error, errorKind: r.errorKind };
+        }
+        let p = _firstPayload(r.lines, "+CESQ");
+        if (p == nil) {
+            return { ok: false, rssi: nil, dbm: nil, rscp: nil, ecno: nil, rsrq: nil, rsrp: nil,
+                     error: "no +CESQ in reply", errorKind: "modem" };
+        }
+        let a = _splitArgs(p);
+        // <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>
+        let rxlev = (len(a) > 0) ? _toInt(a[0]) : nil;
+        let rscpR = (len(a) > 2) ? _toInt(a[2]) : nil;
+        let ecnoR = (len(a) > 3) ? _toInt(a[3]) : nil;
+        let rsrqR = (len(a) > 4) ? _toInt(a[4]) : nil;
+        let rsrpR = (len(a) > 5) ? _toInt(a[5]) : nil;
+
+        // rxlev 0..63 maps to -110..-47 dBm; 99 means not known.
+        let dbm  = (rxlev == nil || rxlev == 99)  ? nil : (-110 + rxlev);
+        // rscp 0..96 -> -120..-24 dBm; 255 not known.
+        let rscp = (rscpR == nil || rscpR == 255) ? nil : (-120 + rscpR);
+        // ecno 0..49 -> -24..0.5 dB in half steps; 255 not known.
+        let ecno = (ecnoR == nil || ecnoR == 255) ? nil : (-24.0 + (float(ecnoR) / 2.0));
+        // rsrq 0..34 -> -19.5..-3 dB in half steps; 255 not known.
+        let rsrq = (rsrqR == nil || rsrqR == 255) ? nil : (-19.5 + (float(rsrqR) / 2.0));
+        // rsrp 0..97 -> -140..-44 dBm; 255 not known.
+        let rsrp = (rsrpR == nil || rsrpR == 255) ? nil : (-140 + rsrpR);
+
+        return { ok: true, rssi: (rxlev == 99) ? nil : rxlev, dbm: dbm,
+                 rscp: rscp, ecno: ecno, rsrq: rsrq, rsrp: rsrp, error: nil };
+    }
+
+    // ---- network ----------------------------------------------------------
+
+    // Network time, as the operator last pushed it. Worth having on a headless
+    // box with no RTC, but only as good as the network: +CCLK reads whatever
+    // the modem was told, and a modem that has never registered returns its
+    // own power-on default rather than an error.
+    fn NetworkTime(): object {
+        let r = this._at.Send("AT+CCLK?", 5000);
+        if (!r.ok) { return { ok: false, iso: nil, unix: nil, tzMinutes: nil,
+                              error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _unquote(_firstPayload(r.lines, "+CCLK"));
+        if (p == nil || len(p) < 17) {
+            return { ok: false, iso: nil, unix: nil, tzMinutes: nil,
+                     error: "no usable +CCLK value", errorKind: "modem" };
+        }
+        // "yy/MM/dd,hh:mm:ss+zz" where zz is quarter-hours, signed.
+        let yy = _toInt(String.Substr(p, 0, 2));
+        let mo = _toInt(String.Substr(p, 3, 2));
+        let dd = _toInt(String.Substr(p, 6, 2));
+        let hh = _toInt(String.Substr(p, 9, 2));
+        let mi = _toInt(String.Substr(p, 12, 2));
+        let ss = _toInt(String.Substr(p, 15, 2));
+        if (yy == nil || mo == nil || dd == nil || hh == nil || mi == nil || ss == nil) {
+            return { ok: false, iso: nil, unix: nil, tzMinutes: nil,
+                     error: "malformed +CCLK value", errorKind: "modem" };
+        }
+        var tz = 0;
+        if (len(p) >= 20) {
+            let sign = String.Substr(p, 17, 1);
+            let q = _toInt(String.Substr(p, 18, 2));
+            if (q != nil) { tz = (sign == "-" ? -q : q) * 15; }
+        }
+        let iso = "20" + String.PadLeft(str(yy), 2, '0') + "-" + String.PadLeft(str(mo), 2, '0')
+                + "-" + String.PadLeft(str(dd), 2, '0') + "T" + String.PadLeft(str(hh), 2, '0')
+                + ":" + String.PadLeft(str(mi), 2, '0') + ":" + String.PadLeft(str(ss), 2, '0');
+        let local = Time.Parse(iso);
+        return { ok: true, iso: iso, unix: (local == nil) ? nil : local - (tz * 60),
+                 tzMinutes: tz, error: nil };
+    }
+
+    // Every operator the radio can currently see. This is the slowest command
+    // a modem has - the radio has to sweep the bands - so it gets three
+    // minutes by default and will drop the data connection while it runs.
+    fn ScanOperators(timeoutMs?): object {
+        let r = this._at.Send("AT+COPS=?", (timeoutMs == nil) ? 180000 : timeoutMs);
+        if (!r.ok) { return { ok: false, operators: [],
+                              error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _firstPayload(r.lines, "+COPS");
+        if (p == nil) { return { ok: true, operators: [], error: nil }; }
+
+        // (stat,"long","short","numeric",AcT),(...),,(list of supported modes)
+        let out = [];
+        var i = 0;
+        while (i < len(p)) {
+            let open = String.IndexOfFrom(p, "(", i);
+            if (open < 0) break;
+            let close = String.IndexOfFrom(p, ")", open);
+            if (close < 0) break;
+            let body = String.Substr(p, open + 1, close - open - 1);
+            i = close + 1;
+            let a = _splitArgs(body);
+            if (len(a) < 4) { continue; }
+            let stat = _toInt(a[0]);
+            if (stat == nil || stat > 4) { continue; }
+            // The reply ends with groups listing the supported modes and
+            // formats - "(0,1,2,3,4),(0,1,2)" - which are the same shape as an
+            // operator entry and long enough to pass a field count. What tells
+            // them apart is the fourth field: an operator carries its numeric
+            // MCC+MNC there, a mode list carries a single digit.
+            let num = _unquote(a[3]);
+            if (num == nil || len(num) < 5 || !_allDigits(num)) { continue; }
+            Array.Append(out, {
+                status: (stat == 0) ? "unknown" : (stat == 1) ? "available"
+                      : (stat == 2) ? "current" : (stat == 3) ? "forbidden" : "unknown",
+                name: _unquote(a[1]),
+                short: _unquote(a[2]),
+                mcc: String.Left(num, 3),
+                mnc: String.Substr(num, 3),
+                tech: (len(a) > 4) ? _techName(_toInt(a[4])) : "unknown"
+            });
+        }
+        return { ok: true, operators: out, error: nil };
+    }
+
+    // Hand operator choice back to the modem.
+    fn SelectOperatorAuto(): object {
+        let r = this._at.Send("AT+COPS=0", 60000);
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // Camp on one operator by MCC+MNC. Manual selection sticks across reboots
+    // on most modules and will leave the modem with no service if the operator
+    // is not reachable, which is why there is no "try this one" wrapper.
+    fn SelectOperator(mccmnc: string, tech?): object {
+        if (mccmnc == nil || len(mccmnc) < 5 || !_allDigits(mccmnc)) {
+            return { ok: false, error: "operator must be a numeric MCC+MNC", errorKind: "usage" };
+        }
+        var cmd = "AT+COPS=1,2,\"" + mccmnc + "\"";
+        if (tech != nil) { cmd = cmd + "," + str(tech); }
+        let r = this._at.Send(cmd, 60000);
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // ---- radio power ------------------------------------------------------
+
+    // +CFUN: 0 minimum, 1 full, 4 radio off (airplane). Reading it is the
+    // reliable way to tell "no signal" from "the radio is switched off".
+    fn Functionality(): object {
+        let r = this._at.Send("AT+CFUN?", 10000);
+        if (!r.ok) { return { ok: false, level: nil, name: "unknown",
+                              error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let n = _toInt(_firstPayload(r.lines, "+CFUN"));
+        return { ok: true, level: n, name: _cfunName(n), error: nil };
+    }
+
+    fn SetFunctionality(level: int): object {
+        let r = this._at.Send("AT+CFUN=" + str(level), 20000);
+        return { ok: r.ok, level: level, error: r.ok ? nil : (r.cme ?? r.error),
+                 errorKind: r.errorKind };
+    }
+
+    // Which +CFUN levels this module implements. Asking beats guessing: 0, 1
+    // and 4 are the ones 27.007 defines, everything above is manufacturer
+    // territory and differs per module.
+    fn SupportedFunctionality(): object {
+        let r = this._at.Send("AT+CFUN=?", 10000);
+        if (!r.ok) { return { ok: false, levels: [],
+                              error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _firstPayload(r.lines, "+CFUN");
+        if (p == nil) { return { ok: false, levels: [], error: "no +CFUN in reply",
+                                 errorKind: "modem" }; }
+        // "(0-1,4),(0-1)" - the first group is the functionality levels, the
+        // second is whether a reset is supported alongside them.
+        let open = String.IndexOf(p, "(");
+        let close = (open >= 0) ? String.IndexOfFrom(p, ")", open) : -1;
+        if (open < 0 || close < 0) { return { ok: true, levels: [], error: nil }; }
+        let out = [];
+        foreach (part in String.Split(String.Substr(p, open + 1, close - open - 1), ",")) {
+            let dash = String.IndexOf(part, "-");
+            if (dash > 0) {
+                let lo = _toInt(String.Left(part, dash));
+                let hi = _toInt(String.Substr(part, dash + 1));
+                if (lo != nil && hi != nil && hi >= lo && hi - lo < 128) {
+                    iter (v from lo to hi) { Array.Append(out, { level: v, name: _cfunName(v) }); }
+                }
+            } else {
+                let v = _toInt(part);
+                if (v != nil) { Array.Append(out, { level: v, name: _cfunName(v) }); }
+            }
+        }
+        return { ok: true, levels: out, error: nil };
+    }
+
+    // Radio off but the rest of the module awake, so the SIM stays readable.
+    // This is what "airplane mode" means on a phone.
+    fn Airplane(on: bool): object { return this.SetFunctionality(on ? 4 : 1); }
+
+    // Named forms of the three levels 27.007 actually defines.
+    fn RadioOff(): object  { return this.SetFunctionality(4); }
+    fn RadioOn(): object   { return this.SetFunctionality(1); }
+    fn LowPower(): object  { return this.SetFunctionality(0); }
+
+    // Reset the modem. The port goes away: a USB module re-enumerates, so the
+    // tty disappears and comes back a few seconds later under a possibly
+    // different name. The AT stream is closed here rather than left dangling,
+    // and the caller has to re-Open once the device is back.
+    fn Reset(): object {
+        let r = this._at.Send("AT+CFUN=1,1", 5000);
+        this._at.Close();
+        // A modem that resets often never answers, so a timeout is the expected
+        // outcome and is not reported as a failure.
+        return { ok: (r.ok || r.errorKind == "timeout" || r.errorKind == "port"),
+                 note: "the serial device will disappear and re-enumerate; re-open it",
+                 error: nil };
+    }
+
+    // ---- data ------------------------------------------------------------
+
+    // Define and activate a PDP context.
+    //
+    // This configures and activates the context on the modem. It does NOT
+    // raise a network interface: on a Pi or OpenWrt box that is pppd's job, or
+    // the qmi_wwan/cdc_ether driver's. Treat a true here as "the modem has a
+    // bearer", not "the host has a route".
+    // Every PDP context the modem has defined, whether or not it is active.
+    // This is where the APN lives, so it is also how you read the APN back.
+    fn Contexts(): object {
+        let r = this._at.Send("AT+CGDCONT?", 10000);
+        if (!r.ok) { return { ok: false, contexts: [],
+                              error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let out = [];
+        foreach (l in r.lines) {
+            let p = _payload(l, "+CGDCONT");
+            if (p == nil) { continue; }
+            let a = _splitArgs(p);
+            // <cid>,<PDP_type>,<APN>,<PDP_addr>,...
+            if (len(a) < 2) { continue; }
+            let apn = (len(a) > 2) ? _unquote(a[2]) : "";
+            Array.Append(out, {
+                cid: _toInt(a[0]),
+                type: _unquote(a[1]),
+                apn: (apn != nil && len(apn) > 0) ? apn : nil
+            });
+        }
+        return { ok: true, contexts: out, error: nil };
+    }
+
+    // The APN on one context, or nil when none is set. A context with a blank
+    // APN is normal and means "whatever the network defaults to", so it is
+    // reported as nil rather than as an empty string.
+    fn Apn(cid?): object {
+        let want = (cid == nil) ? 1 : cid;
+        let c = this.Contexts();
+        if (!c.ok) { return { ok: false, apn: nil, error: c.error, errorKind: c.errorKind }; }
+        foreach (ctx in c.contexts) {
+            if (ctx.cid == want) {
+                return { ok: true, cid: want, apn: ctx.apn, type: ctx.type, error: nil };
+            }
+        }
+        return { ok: false, apn: nil, error: "no context with cid " + str(want),
+                 errorKind: "usage" };
+    }
+
+    // Define a context without activating it. Separating this from StartData
+    // matters because a context usually has to be defined *before* the modem
+    // attaches, and because writing an APN is the part you want to be able to
+    // do once at provisioning time.
+    //
+    // `opts`:
+    //   cid   : int    - context id, default 1
+    //   type  : string - "IP" (default), "IPV6" or "IPV4V6". An operator that
+    //                    is IPv6-only will refuse a context typed IP, which is
+    //                    a confusing failure if you cannot set this.
+    //   user  / password / auth - PAP or CHAP credentials for a private APN,
+    //                    written with +CGAUTH. auth is "none", "pap", "chap"
+    //                    or "any" (default when a user is given).
+    fn SetApn(apn: string, opts?): object {
+        var cid = 1;
+        var ptype = "IP";
+        var user = nil;
+        var pass = nil;
+        var auth = nil;
+        if (opts != nil) {
+            if ("cid"      in opts) { cid   = opts["cid"]; }
+            if ("type"     in opts) { ptype = String.ToUpper(opts["type"]); }
+            if ("user"     in opts) { user  = opts["user"]; }
+            if ("password" in opts) { pass  = opts["password"]; }
+            if ("auth"     in opts) { auth  = String.ToLower(opts["auth"]); }
+        }
+        if (apn == nil) { apn = ""; }
+        if (ptype != "IP" && ptype != "IPV6" && ptype != "IPV4V6") {
+            return { ok: false, error: "type must be IP, IPV6 or IPV4V6", errorKind: "usage" };
+        }
+        // The APN goes inside a quoted string, so a quote in it would end that
+        // string early and the rest would be read as further arguments.
+        if (String.Contains(apn, "\"")) {
+            return { ok: false, error: "an APN cannot contain a quote", errorKind: "usage" };
+        }
+
+        // Every argument is validated before anything is written. Checking the
+        // auth type after the +CGDCONT would leave a half-configured context
+        // behind on a bad value - the APN written, the credentials not - which
+        // is worse than not writing at all.
+        var authN = nil;
+        if (user != nil || auth != nil) {
+            if      (auth == nil)    { authN = 3; }
+            else if (auth == "none") { authN = 0; }
+            else if (auth == "pap")  { authN = 1; }
+            else if (auth == "chap") { authN = 2; }
+            else if (auth == "any")  { authN = 3; }
+            else { return { ok: false, error: "auth must be none, pap, chap or any",
+                            errorKind: "usage" }; }
+        }
+
+        let d = this._at.Send("AT+CGDCONT=" + str(cid) + ",\"" + ptype + "\",\"" + apn + "\"", 10000);
+        if (!d.ok) { return { ok: false, error: d.cme ?? d.error, errorKind: d.errorKind }; }
+
+        if (authN != nil) {
+            let n = authN;
+            var cmd = "AT+CGAUTH=" + str(cid) + "," + str(n);
+            if (n != 0) {
+                cmd = cmd + ",\"" + (user ?? "") + "\",\"" + (pass ?? "") + "\"";
+            }
+            let a = this._at.Send(cmd, 10000);
+            if (!a.ok) {
+                return { ok: false, cid: cid, apn: apn,
+                         error: "APN set but credentials were refused: "
+                                + str(a.cme ?? a.error), errorKind: a.errorKind };
+            }
+        }
+        return { ok: true, cid: cid, apn: apn, type: ptype, error: nil };
+    }
+
+    // Undefine a context. Passing +CGDCONT a cid and nothing else clears it.
+    fn DeleteContext(cid: int): object {
+        let r = this._at.Send("AT+CGDCONT=" + str(cid), 10000);
+        return { ok: r.ok, cid: cid, error: r.ok ? nil : (r.cme ?? r.error),
+                 errorKind: r.errorKind };
+    }
+
+    // Define a context if an APN was given, then activate it.
+    //
+    // `opts` takes everything SetApn takes, plus nothing of its own. Calling
+    // it with only a cid activates a context that was defined earlier.
+    fn StartData(opts): object {
+        var cid = 1;
+        var apn = nil;
+        if (opts != nil) {
+            if ("cid" in opts) { cid = opts["cid"]; }
+            if ("apn" in opts) { apn = opts["apn"]; }
+        }
+        if (apn != nil && len(apn) > 0) {
+            let d = this.SetApn(apn, opts);
+            if (!d.ok) { return d; }
+        } else {
+            // Activating a context that was never defined attaches to whatever
+            // the network defaults to, which is rarely what was meant.
+            let existing = this.Apn(cid);
+            if (!existing.ok || existing.apn == nil) {
+                return { ok: false, cid: cid,
+                         error: "no APN given and context " + str(cid) + " has none defined",
+                         errorKind: "usage" };
+            }
+            apn = existing.apn;
+        }
+        let a = this._at.Send("AT+CGACT=1," + str(cid));
+        if (!a.ok) { return { ok: false, cid: cid, apn: apn,
+                              error: a.cme ?? a.error, errorKind: a.errorKind }; }
+        return { ok: true, cid: cid, apn: apn, error: nil };
+    }
+
+    fn StopData(cid?): object {
+        let c = (cid == nil) ? 1 : cid;
+        let r = this._at.Send("AT+CGACT=0," + str(c));
+        return { ok: r.ok, cid: c, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // Whether each context is active, plus the address the network gave it.
+    fn DataStatus(): object {
+        let att = this._at.Send("AT+CGATT?", 10000);
+        let attached = false;
+        if (att.ok) {
+            let p = _firstPayload(att.lines, "+CGATT");
+            attached = (p != nil && _toInt(p) == 1);
+        }
+        let r = this._at.Send("AT+CGACT?", 10000);
+        let contexts = [];
+        if (r.ok) {
+            foreach (l in r.lines) {
+                let p = _payload(l, "+CGACT");
+                if (p == nil) { continue; }
+                let a = _splitArgs(p);
+                if (len(a) >= 2) {
+                    Array.Append(contexts, { cid: _toInt(a[0]), active: _toInt(a[1]) == 1, address: nil });
+                }
+            }
+        }
+        let addr = this._at.Send("AT+CGPADDR", 10000);
+        if (addr.ok) {
+            foreach (l in addr.lines) {
+                let p = _payload(l, "+CGPADDR");
+                if (p == nil) { continue; }
+                let a = _splitArgs(p);
+                if (len(a) >= 2) {
+                    let cid = _toInt(a[0]);
+                    // foreach binds each element as a const, so the slot is
+                    // reached by index rather than through the loop variable.
+                    iter (k from 0 to len(contexts) - 1) {
+                        if (contexts[k].cid == cid) { contexts[k].address = _unquote(a[1]); }
+                    }
+                }
+            }
+        }
+        return { ok: true, attached: attached, contexts: contexts, error: nil };
+    }
+
+    // What the network actually granted for a context: the address, the
+    // gateway and the DNS servers. This is the information a host needs to
+    // configure its interface, and +CGACT does not carry it - a context can be
+    // active and still have no usable DNS.
+    fn ContextInfo(cid?): object {
+        let r = this._at.Send("AT+CGCONTRDP" + ((cid == nil) ? "" : ("=" + str(cid))), 15000);
+        if (!r.ok) { return { ok: false, contexts: [], error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let out = [];
+        foreach (l in r.lines) {
+            let p = _payload(l, "+CGCONTRDP");
+            if (p == nil) { continue; }
+            let a = _splitArgs(p);
+            // <cid>,<bearer>,<apn>,<local addr and subnet>,<gw>,<dns1>,<dns2>,...
+            if (len(a) < 3) { continue; }
+            Array.Append(out, {
+                cid: _toInt(a[0]),
+                apn: (len(a) > 2) ? _unquote(a[2]) : nil,
+                address: (len(a) > 3) ? _splitAddrMask(_unquote(a[3])) : nil,
+                gateway: (len(a) > 4) ? _dotted(_unquote(a[4])) : nil,
+                dns1:    (len(a) > 5) ? _dotted(_unquote(a[5])) : nil,
+                dns2:    (len(a) > 6) ? _dotted(_unquote(a[6])) : nil
+            });
+        }
+        return { ok: true, contexts: out, error: nil };
+    }
+
+    // ---- SIM slots ---------------------------------------------------------
+
+    // Which physical SIM slot is selected, on a module that has more than one.
+    //
+    // There is no 3GPP command for this - 27.007 has nothing to say about
+    // multiple card slots - so it is entirely vendor territory and dispatched
+    // strictly on the detected manufacturer. Nothing is probed speculatively:
+    // the same mnemonic can mean something completely different on another
+    // vendor's module, and firing a guessed command at a modem to see what
+    // happens is not a thing this library does.
+    //
+    // An unrecognised module returns errorKind "unsupported" with the vendor
+    // name, which is the signal to add an entry to _SIM_SLOT_CMDS rather than
+    // a sign that anything is wrong.
+    fn SimSlot(): object {
+        let v = this._vendorKey();
+        let c = _simSlotCmds(v);
+        if (c == nil) {
+            return { ok: false, slot: nil, vendor: v, errorKind: "unsupported",
+                     error: "no SIM-slot command known for vendor " + str(v)
+                            + "; see _SIM_SLOT_CMDS in Modem.fls" };
+        }
+        let r = this._at.Send(c.query, 10000);
+        if (!r.ok) { return { ok: false, slot: nil, vendor: v,
+                              error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let p = _firstPayload(r.lines, c.prefix);
+        let n = _toInt((p == nil) ? nil : _splitArgs(p)[0]);
+        if (n == nil) { return { ok: false, slot: nil, vendor: v,
+                                 error: "could not read a slot number from the reply",
+                                 errorKind: "modem" }; }
+        return { ok: true, slot: n, vendor: v, error: nil };
+    }
+
+    // Select a physical SIM slot.
+    //
+    // Switching does not take effect until the radio stack restarts, so the
+    // modem is cycled through +CFUN unless `opts.cycle` is false - and after
+    // the cycle the card has to be read again, which takes a moment. The
+    // result reports the slot read back afterwards rather than the one asked
+    // for, so a switch that silently did not take is visible.
+    fn SelectSimSlot(slot: int, opts?): object {
+        if (slot == nil || slot < 1 || slot > 4) {
+            return { ok: false, slot: nil, error: "slot must be 1-4", errorKind: "usage" };
+        }
+        let v = this._vendorKey();
+        let c = _simSlotCmds(v);
+        if (c == nil) {
+            return { ok: false, slot: nil, vendor: v, errorKind: "unsupported",
+                     error: "no SIM-slot command known for vendor " + str(v)
+                            + "; see _SIM_SLOT_CMDS in Modem.fls" };
+        }
+        var cycle = true;
+        if (opts != nil && ("cycle" in opts)) { cycle = opts["cycle"] == true; }
+
+        let r = this._at.Send(c.set + str(slot), 15000);
+        if (!r.ok) { return { ok: false, slot: nil, vendor: v,
+                              error: r.cme ?? r.error, errorKind: r.errorKind }; }
+
+        if (cycle) {
+            // Minimum functionality then full: the SIM interface is torn down
+            // and brought back up against the newly selected slot. A full
+            // reset would also work but costs the serial device as well.
+            this.SetFunctionality(0);
+            this.SetFunctionality(1);
+            // The card needs a moment before +CPIN? means anything.
+            Fiber.Sleep(1500);
+            this._iccid = nil;          // a different card, so the cache is stale
+            this._retryCmd = nil;
+        }
+
+        let back = this.SimSlot();
+        return { ok: back.ok && back.slot == slot, slot: back.slot, vendor: v,
+                 cycled: cycle,
+                 error: (back.ok && back.slot == slot) ? nil
+                        : "slot did not switch (modem reports " + str(back.slot) + ")" };
+    }
+
+    // The manufacturer name, lowercased, fetching it once if Info has not run.
+    fn _vendorKey(): string {
+        if (this._vendor == nil || len(this._vendor) == 0) { this.Info(); }
+        return this._vendor;
+    }
+
+    // ---- USSD --------------------------------------------------------------
+
+    // Run a USSD code and wait for the network's reply - "*100#" for a balance
+    // check is the usual reason. The answer arrives as an unsolicited +CUSD
+    // rather than as part of the command's response, so this waits for it
+    // rather than returning as soon as OK comes back.
+    //
+    // `status` mirrors the network: "no-further-action", "further-action"
+    // (a menu, answer it with another Ussd call), "terminated", "unsupported".
+    fn Ussd(code: string, timeoutMs?): object {
+        if (code == nil || len(code) == 0) {
+            return { ok: false, text: nil, status: nil,
+                     error: "a USSD code is required", errorKind: "usage" };
+        }
+        let budget = (timeoutMs == nil) ? 30000 : timeoutMs;
+        this._ussd = nil;
+        // DCS 15 asks for the GSM 7-bit alphabet, which is what the decoder
+        // below assumes; a network that answers in UCS-2 says so in its reply.
+        let r = this._at.Send("AT+CUSD=1,\"" + code + "\",15", budget);
+        if (!r.ok) {
+            return { ok: false, text: nil, status: nil,
+                     error: r.cme ?? r.error, errorKind: r.errorKind };
+        }
+
+        // Networks differ on whether the answer beats the OK. If it did, it
+        // shares its prefix with the command and so was collected as response
+        // data rather than dispatched as a notification - correct for every
+        // other command, wrong for this one, which is the only case where the
+        // interesting content comes back under the command's own prefix.
+        foreach (l in r.lines) {
+            let p = _payload(l, "+CUSD");
+            if (p != nil) { this._onCusd(p); }
+        }
+
+        // Otherwise it is still in flight; poll until it lands or time runs out.
+        let deadline = Time.Millis() + budget;
+        while (this._ussd == nil && Time.Millis() < deadline) { this._at.Poll(250); }
+        if (this._ussd == nil) {
+            return { ok: false, text: nil, status: nil,
+                     error: "no +CUSD reply within " + str(budget) + " ms",
+                     errorKind: "timeout" };
+        }
+        return this._ussd;
+    }
+
+    fn CancelUssd(): object {
+        let r = this._at.Send("AT+CUSD=2", 10000);
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    fn _onCusd(args: string): int {
+        let a = _splitArgs(args);
+        let m = (len(a) > 0) ? _toInt(a[0]) : nil;
+        var text = (len(a) > 1) ? _unquote(a[1]) : nil;
+        let dcs = (len(a) > 2) ? _toInt(a[2]) : nil;
+
+        // A network answering in 7-bit sends the text hex-packed, not as
+        // readable characters. DCS 72 (0x48) and friends mean UCS-2.
+        if (text != nil && _looksHex(text)) {
+            if (dcs != nil && ((dcs & 12) == 8)) {
+                let b = Util.HexToBin(text);
+                if (b != nil) { text = _ucs2Text(b, 0, len(b)); }
+            } else {
+                let b = Util.HexToBin(text);
+                if (b != nil) {
+                    text = _gsmFromSeptets(_gsm7Unpack(b, (len(b) * 8) / 7, 0));
+                }
+            }
+        }
+        var st = "unknown";
+        if      (m == 0) { st = "no-further-action"; }
+        else if (m == 1) { st = "further-action"; }
+        else if (m == 2) { st = "terminated"; }
+        else if (m == 4) { st = "unsupported"; }
+        this._ussd = { ok: (m == 0 || m == 1), text: text, status: st, error: nil };
+        return 0;
+    }
+
+    // ---- calls -------------------------------------------------------------
+
+    // Place a voice call. Many data-only modules have no voice path at all and
+    // answer with an error; that is a modem error, not a usage one.
+    fn Dial(number: string): object {
+        if (number == nil || len(number) == 0) {
+            return { ok: false, error: "a number is required", errorKind: "usage" };
+        }
+        // The trailing ";" is what makes it a voice call rather than a data one.
+        let r = this._at.Send("ATD" + number + ";", 60000);
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    fn Answer(): object {
+        let r = this._at.Send("ATA", 30000);
+        return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // Hang up everything. +CHUP is the 27.007 command and clears every call;
+    // ATH is the older form and some modules only implement one of them.
+    fn Hangup(): object {
+        let r = this._at.Send("AT+CHUP", 20000);
+        if (r.ok) { return { ok: true, error: nil }; }
+        let h = this._at.Send("ATH", 20000);
+        return { ok: h.ok, error: h.ok ? nil : (h.cme ?? h.error), errorKind: h.errorKind };
+    }
+
+    // Calls in progress. An empty list is the normal idle answer.
+    fn CurrentCalls(): object {
+        let r = this._at.Send("AT+CLCC", 10000);
+        if (!r.ok) { return { ok: false, calls: [], error: r.cme ?? r.error, errorKind: r.errorKind }; }
+        let out = [];
+        foreach (l in r.lines) {
+            let p = _payload(l, "+CLCC");
+            if (p == nil) { continue; }
+            let a = _splitArgs(p);
+            // <id>,<dir>,<stat>,<mode>,<mpty>[,<number>,<type>]
+            if (len(a) < 5) { continue; }
+            Array.Append(out, {
+                id: _toInt(a[0]),
+                incoming: _toInt(a[1]) == 1,
+                state: _callState(_toInt(a[2])),
+                voice: _toInt(a[3]) == 0,
+                number: (len(a) > 5) ? _unquote(a[5]) : nil
+            });
+        }
+        return { ok: true, calls: out, error: nil };
+    }
+
+    // Fires whenever the network registration state changes - dropping to
+    // "searching" and back is the signal that a link went away and returned.
+    fn OnRegistration(handler: fn): int { this._onReg2 = handler; return 0; }
+
+    fn _onReg(source: string, args: string): int {
+        // Unsolicited form is "<stat>[,<lac>,<ci>[,<AcT>]]" - no leading mode,
+        // which is what separates it from the query response.
+        let a = _splitArgs(args);
+        if (len(a) == 0) return 0;
+        let stat = _toInt(a[0]);
+        if (stat == nil) return 0;
+        this._reg = {
+            registered: (stat == 1 || stat == 5 || stat == 6 || stat == 7),
+            roaming: (stat == 5 || stat == 7),
+            status: _regName(stat),
+            lac: (len(a) > 1) ? _unquote(a[1]) : nil,
+            ci:  (len(a) > 2) ? _unquote(a[2]) : nil,
+            tech: (len(a) > 3) ? _techName(_toInt(a[3])) : "unknown",
+            source: source
+        };
+        if (this._onReg2 != nil) { this._onReg2(this._reg); }
+        return 0;
+    }
+
+    // The last registration state seen, from either a query or a notification,
+    // without going to the modem for it.
+    fn LastRegistration() { return this._reg; }
+
+    // Fires on RING / +CLIP for an incoming call.
+    fn OnRing(handler: fn): int {
+        this._onRing = handler;
+        // +CLIP=1 adds the caller's number to the notification.
+        this._at.Send("AT+CLIP=1", 5000);
+        return 0;
+    }
+}
+
+export { AT, Modem };

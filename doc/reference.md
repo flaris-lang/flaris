@@ -1011,6 +1011,81 @@ class Dog : Animal {
 }
 ```
 
+### `enum` declarations
+
+An `enum` declares a named group of related integer constants:
+
+```js
+enum Color { Red, Green, Blue }          // Red = 0, Green = 1, Blue = 2
+```
+
+Members are numbered from `0` and each unlisted member continues from the
+previous one. An explicit value restarts the sequence from there:
+
+```js
+enum Status { Ok = 200, Created, Accepted, NotFound = 404, Gone }
+// Ok = 200, Created = 201, Accepted = 202, NotFound = 404, Gone = 405
+```
+
+A trailing comma after the last member is allowed. `enum Name { }` is legal and
+declares an empty object.
+
+**Values must be plain non-negative integer literals.** An expression
+(`A = 1 + 2`), a reference to another member (`B = A`), or a negative literal
+(`A = -1`) is rejected at compile time - "Enum values must be integer literals".
+Values are `int32`; auto-numbering past `2147483647` wraps.
+
+**Enums are folded at compile time.** The declaration lowers to a `const`
+object whose members are integer literals, so a member read costs nothing at
+run time and carries the `int` type through inference:
+
+```js
+enum Color { Red, Green, Blue = 10, Cyan }
+
+Console.WriteLine(Color.Blue);        // 10
+Console.WriteLine(Color.Cyan);        // 11  - continues from Blue
+type(Color.Blue) == Type.Int;         // true  - members are plain ints
+type(Color)      == Type.Object;      // true  - the enum itself is an object
+Color.Blue + 1   == Color.Cyan;       // true  - full int arithmetic
+```
+
+Because members are ordinary `int` values they work anywhere an `int` does -
+arithmetic, comparison, array indices, and `case` labels:
+
+```js
+switch (state) {
+    case Color.Red:  return "stop";
+    case Color.Blue: return "go";
+    default:         return "unknown";
+}
+```
+
+**Scope and lifetime.** An `enum` may be declared at the top level or inside a
+function, where it is scoped to the enclosing block like any other declaration.
+It can be exported and imported like any other symbol, and imported members
+remain usable as `case` labels:
+
+```js
+// Palette.fls
+enum Color { Red, Green, Blue = 10, Cyan }
+export { Color };
+
+// consumer.fls
+import { Color } from library("Palette", "1.0");
+Console.WriteLine(Color.Cyan);        // 11
+```
+
+**Limitations.**
+
+- The enum object is const: assigning to a member (`Color.Red = 5`) raises
+  `Invalid assignment of const-object` (code 19) at run time.
+- Reading a member that does not exist yields `nil` rather than a compile-time
+  error - member names are not checked against the declaration.
+- Duplicate member names are accepted silently; the first value wins.
+- There is no reverse mapping - `str(Color.Red)` is `"0"`, not `"Red"`.
+- `switch` over an enum is not checked for exhaustiveness (see
+  [R12 - Static Analyzer](#r12---static-analyzer)).
+
 ### `switch` matching
 
 `switch` compares the scrutinee against each `case` label:
@@ -1020,11 +1095,24 @@ class Dog : Animal {
   subclass-aware). Imported classes are supported: the most specific matching
   class wins. An identifier whose type cannot be resolved falls back to value
   equality (with a compiler warning).
-- `default` runs when no case matches. Cases do **not** implicitly fall through
-  to the next case's body; use `break` to leave a case early.
+- `default` runs when no case matches, and also when an earlier case falls into
+  it (see below).
 
-When every case label is a dense range of integer literals, the compiler emits a
-**jump table** (one O(1) indexed branch) instead of a comparison chain.
+Once a case matches, control enters that body and **falls through** into every
+following body, exactly as in C. End a case with `break` (or `return` / `throw` /
+`continue`) unless fallthrough is intended:
+
+```js
+switch (x) {
+    case 1: s = s + "one";           // falls through
+    case 2: s = s + "two";           // falls through
+    default: s = s + "other";
+}
+// x == 1 -> "onetwoother"     x == 2 -> "twoother"     x == 9 -> "other"
+```
+
+Consecutive labels with no statements between them share one body - that is the
+idiomatic way to match several values without relying on fallthrough:
 
 ```js
 switch (shape) {
@@ -1033,6 +1121,27 @@ switch (shape) {
     default:                return "unknown";
 }
 ```
+
+`break` leaves the switch; it never affects an enclosing loop. `continue` inside
+a switch targets the enclosing loop, not the switch.
+
+**`default` is always the last body.** Unlike C, its position in the source does
+not affect the fallthrough order - the compiler emits every `case` body in source
+order and `default` after all of them. So a `default` written in the middle still
+runs *after* the final case body:
+
+```js
+switch (x) {
+    case 1: s = s + "1";
+    default: s = s + "D";            // emitted last, whatever its position
+    case 2: s = s + "2";
+}
+// x == 1 -> "12D"   (C would give "1D2")
+```
+
+When every case label is a dense range of integer literals, the compiler emits a
+**jump table** (one O(1) indexed branch) instead of a comparison chain. Both
+lowerings have identical fallthrough behaviour.
 
 ---
 
@@ -3153,7 +3262,60 @@ Regex.Match("HELLO",                "(?i)[a-z]+")        // "HELLO"
 Regex.Replace("FOO bar foo",        "(?i)foo", "baz")    // "baz bar baz"
 ```
 
-#### Limitations
+#### Nil-narrowing
+
+A union that includes `nil` cannot normally be used where the non-nil type is
+required. Once a test has *proven* the value is not nil, the analyzer drops the
+`nil` alternative for exactly the region where that proof holds:
+
+```js
+fn use(a: int|nil) {
+    let bad: int = a;              // 1000 - a may be nil here
+
+    if (a != nil) {
+        let ok: int = a;           // fine - narrowed inside the branch
+    }
+
+    if (a == nil) { return; }
+    let alsoOk: int = a;           // fine - narrowed for the rest of the block
+}
+```
+
+Two shapes are recognised:
+
+- **Branch narrowing.** The `if` branch the test proves non-nil - the `then` of
+  `a != nil`, the `else` of `a == nil`.
+- **Early-exit guards.** When the branch handling the nil case always leaves
+  (`return` or `throw`), the value stays narrowed for the remainder of the
+  enclosing region. That region ends at the enclosing block, and also at the
+  end of a loop body or a single `case` body - a loop may run zero times and
+  every case label is its own jump target, so neither proves anything about the
+  code that follows it:
+
+```js
+switch (k) {
+    case 1: if (a == nil) { return; }
+            let ok: int = a;       // narrowed - same case body
+    case 2: let bad: int = a;      // 1000 - case 2 can be entered directly
+}
+```
+
+The condition may be `a != nil` / `a == nil` in either operand order, the
+built-in `is_nil(a)`, any of these behind `!`, and conjunctions - `&&` when
+narrowing the true branch, `||` when narrowing the false branch:
+
+```js
+if (a != nil && b != nil) { /* both a and b narrowed */ }
+if (!is_nil(a))           { /* a narrowed */ }
+if (a == nil || b == nil) { return; }   // both narrowed after the guard
+```
+
+Narrowing only ever **removes** `nil` from a type for a bounded region, so it
+can retract a false "may be nil" diagnostic but never introduces a new error,
+and it never changes generated code - it is a typing rule, not an optimization.
+See [Limitations](#limitations) for what it does not cover.
+
+### Limitations
 
 - No backreferences (`\1`, `\2`, etc.)
 - No lookahead or lookbehind
@@ -3266,7 +3428,7 @@ while (true) {
 | **TlsPeerCert** | `TlsPeerCert(s:stream) - object\|nil` | The peer's leaf certificate as `{ sha256, subject }` (`sha256` = lowercase hex fingerprint of the DER cert). Use for pinning / trust-on-first-use. `nil` for a non-TLS stream or when unavailable. | — |
 | **TlsServerAvailable** | `TlsServerAvailable() - bool` | `true` if this build can terminate TLS (`AcceptTls`). Narrower than having TLS at all: an old or stripped `libssl` may support clients but not servers. | — |
 | **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), or `"rw"` (read-write/create). Returns `nil` on failure. | — |
-| **OpenSerial** | `OpenSerial(port:string, baud:int) - stream` | Open serial port in raw mode. Valid baud rates: `9600`, `19200`, `38400`, `57600`, `115200`. | — |
+| **OpenSerial** | `OpenSerial(port:string, baud:int, format?:string, flow?:string) - stream` | Open serial port in raw mode. Returns `nil` if the port cannot be opened. `format` is `[7\|8][N\|E\|O][1\|2]`, default `"8N1"` (databits, parity, stopbits). `flow` is `"none"` (default), `"rtscts"` (hardware RTS/CTS) or `"xonxoff"` (software). Flow control is always applied explicitly, so a port left in RTS/CTS by a previous opener is reset by `"none"`. **Baud:** on Linux any rate the C library names, `50`–`4000000` – including `230400`, `460800` and `921600` for LTE/PPP; on macOS/BSD any rate the driver accepts; on Windows any rate the driver accepts. An unsupported rate raises rather than silently running at the wrong speed. | — |
 | **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it. Sockets use `MSG_PEEK`; files read one byte and rewind. Returns `nil` at EOF, on error, or for a pipe/serial stream (which have no non-destructive read). | — |
 | **PeerAddr** | `PeerAddr(s:stream) - string` | Remote endpoint of a connected socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
 | **Pipe** | `Pipe() - array` | Create a pipe. Returns `[readStream, writeStream]`. | — |
@@ -4948,10 +5110,14 @@ runtime guard applies instead.
   read as a typed array.
 - **Member checks need a provable receiver.** Chained access (`a.b.Method()`)
   and values from dynamic sources are not checked.
-- **No nil-narrowing.** `if (x != nil)` does not narrow `x` in the branch.
-  Expression types are memoized per AST node, so a variable has one type
-  throughout a function; flow-sensitive narrowing would need that layer
-  replaced.
+- **Nil-narrowing is branch- and guard-local.** See
+  [Nil-narrowing](#nil-narrowing) for what is narrowed. It applies to bare
+  variables only - a narrowed `a.b` or `a[i]` could be invalidated by any
+  intervening write, so member and index expressions stay wide. Narrowing also
+  does not reach the right-hand side of the guard itself
+  (`if (x != nil && x.Length() > 0)`), the branches of a `?:`, or a `while`
+  condition, and `break` / `continue` do not count as an early exit the way
+  `return` and `throw` do.
 - **No exhaustiveness checking for `switch`** over an enum.
 
 Definite-assignment analysis is not needed: `let x;` without an initializer is

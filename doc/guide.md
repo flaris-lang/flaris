@@ -508,6 +508,45 @@ fn init() {
 }
 ```
 
+### Enums
+
+`enum` names a group of related integer constants. Members number from `0`, and
+each unlisted member continues from the one before it:
+
+```js
+enum Color { Red, Green, Blue }        // 0, 1, 2
+
+enum Status { Ok = 200, Created, NotFound = 404, Gone }
+// Ok = 200, Created = 201, NotFound = 404, Gone = 405
+```
+
+Members are plain `int` values folded at compile time, so they cost nothing at
+run time and work anywhere an int does - arithmetic, array indices, `case`
+labels:
+
+```js
+enum Level { Debug, Info, Warn, Error }
+
+fn label(l) {
+    switch (l) {
+        case Level.Debug: return "DBG";
+        case Level.Warn:  return "WRN";
+        default:          return "???";
+    }
+}
+```
+
+Values must be plain non-negative integer literals - `A = 1 + 2`, `B = A` and
+`A = -1` are all rejected. Declare an enum at the top level or inside a
+function, and `export` it like any other symbol.
+
+There is no reverse mapping: `str(Color.Red)` is `"0"`, not `"Red"`. Keep a
+lookup array or a `switch` if you need names. Reading a member that was never
+declared yields `nil` rather than raising an error.
+
+See [R2 - `enum` declarations](reference.md#enum-declarations) for the full
+rules.
+
 ### Closures
 
 Flaris supports closures: inner functions capture variables from their enclosing scope
@@ -950,6 +989,18 @@ switch (value) {
 ```
 
 Cases fall through unless you `break`. `break` inside a switch does not affect outer loops.
+
+Unlike C, `default` is always the **last** body regardless of where it appears in
+the source, so a case falling through reaches it after every other case body:
+
+```js
+switch (x) {
+    case 1: s = s + "1";
+    default: s = s + "D";   // emitted last, whatever its position
+    case 2: s = s + "2";
+}
+// x == 1 -> "12D"   (C would give "1D2")
+```
 
 ## Return
 
@@ -2205,6 +2256,36 @@ by source position.
 **Fix**
 
 - Add `return` in every branch, or allow `nil` return if that is intended.
+
+### Value may be nil where a non-nil type is required
+
+**Symptom**
+
+- `1000: Type mismatch for 'b' (expected compatible with declared type).` on a
+  read of a `T|nil` value.
+
+**Fix**
+
+- Prove it is not nil first. The analyzer narrows the value for the region the
+  test covers - the guarded branch, or the rest of the block after an early
+  exit:
+
+```js
+fn use(a: int|nil) {
+    let bad: int = a;              // 1000 - a may be nil here
+
+    if (a != nil) {
+        let ok: int = a;           // narrowed inside the branch
+    }
+
+    if (a == nil) { return; }
+    let alsoOk: int = a;           // narrowed for the rest of the block
+}
+```
+
+`a == nil`, `a != nil` (either operand order), `is_nil(a)`, `!`, and `&&` / `||`
+combinations are all recognised. Narrowing applies to plain variables only, not
+to `a.b` or `a[i]`. If none of these fit, cast: `let ok: int = (int)a;`.
 
 ### Assignment used as a condition
 
