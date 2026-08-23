@@ -9,8 +9,9 @@
 //
 // Exported classes:
 //   Archive   - factories: Open / OpenFile / Create
-//   ZipReader - List / Read / Extract / ExtractAll
-//   ZipWriter - Add / AddFile / Build / Save
+//   ZipReader - List / Read / Extract / ExtractAll / Comment /
+//               SkippedUnsafe / SafeName
+//   ZipWriter - Add / AddFile / AddDirectory / SetComment / Build / Save
 //
 // Usage:
 //   import { Archive } from library("Zip", "1.0");
@@ -23,13 +24,37 @@
 //   foreach (e in r.List()) { Console.WriteLine(e.Name + " " + str(e.Size)); }
 //   let data = r.Read("hello.txt");
 //
+//   // Package a directory, keeping each file's timestamp and executable bit
+//   let w2 = Archive.Create();
+//   w2.AddDirectory("./dist", { prefix: "app/" });
+//   w2.SetComment("built by CI");
+//   w2.Save("app.zip");
+//
+//   // A List() entry carries { Name, Size, CompressedSize, IsDir, Modified, Mode }
+//   // and ExtractAll restores Modified and the executable bit.
+//
 // Entries whose name ends in "/" are directories: zero-length, stored, and
 // reported with IsDir true.
+//
+// Reading an entry verifies its CRC-32 and uncompressed length against the
+// central directory; a mismatch reads as nil rather than as silently wrong
+// bytes. ExtractAll refuses any entry name that would escape the destination
+// directory - see ZipReader.SafeName and ZipReader.SkippedUnsafe.
 //
 // Limits: classic ZIP only - no ZIP64, no encryption, no multi-disk. An
 // archive is capped at 4 GiB and 65535 entries, and a single entry at 4 GiB.
 // Methods 0 (stored) and 8 (deflate) are read; writing picks whichever of the
-// two is smaller per entry.
+// two is smaller per entry, unless the caller passes { store: true }.
+//
+// Both reading and writing hold the whole archive in memory, so the practical
+// ceiling is well under the format's - which is also why ZIP64 would buy
+// nothing here: an archive too large for classic ZIP is one that does not fit
+// in the buffer either.
+//
+// Timestamps are DOS-packed: two-second resolution, no timezone, and they are
+// read and written as UTC. A stored Unix mode is masked to 0755 on extraction,
+// which keeps the executable bit and a restrictive 0600 but refuses setuid,
+// setgid, sticky and group/other-write.
 
 import { BinaryWriter, BinaryReader } from library("BinaryIO", "1.0");
 import { Inflate, Deflate } from library("Deflate", "1.0");
@@ -58,16 +83,66 @@ fn _zipDeflateRaw(data: block): block {
     return raw;
 }
 
-// DOS date/time pair for the current wall clock (ZIP stores 2-second
-// resolution, and its epoch is 1980).
-fn _zipDosStamp(): array {
-    // Time.* date parts take seconds; NowMillis is milliseconds.
-    let ms = Time.FromMillis(Time.NowMillis());
-    let y = Time.Year(ms);
-    if (y < 1980) { y = 1980; }
-    let dosDate = ((y - 1980) << 9) | (Time.Month(ms) << 5) | Time.Day(ms);
-    let dosTime = (Time.Hour(ms) << 11) | (Time.Minute(ms) << 5) | (Time.Second(ms) >> 1);
+// [dosDate, dosTime] for a Unix timestamp in seconds, or for now when `unix`
+// is nil. ZIP inherited MS-DOS's packed date: a two-second resolution and an
+// epoch of 1980, which is why anything older clamps rather than wrapping.
+fn _zipDosStamp(unix?): array {
+    let secs = (unix == nil || unix <= 0) ? Time.Now() : unix;
+    let t = Time.FromMillis(secs * 1000);
+    var y = Time.Year(t);
+    if (y < 1980) {
+        return [((1980 - 1980) << 9) | (1 << 5) | 1, 0];
+    }
+    if (y > 2107) { y = 2107; }     // the last year the 7-bit field can hold
+    let dosDate = ((y - 1980) << 9) | (Time.Month(t) << 5) | Time.Day(t);
+    let dosTime = (Time.Hour(t) << 11) | (Time.Minute(t) << 5) | (Time.Second(t) >> 1);
     return [dosDate & 0xFFFF, dosTime & 0xFFFF];
+}
+
+// The inverse: a packed DOS date/time as a Unix timestamp in seconds, or 0 when
+// the fields are empty or nonsensical.
+//
+// A DOS stamp carries no timezone, so it is read as UTC. Every simple ZIP tool
+// makes the same choice; the alternative is to invent an offset the archive
+// never recorded.
+fn _zipDosToUnix(dosDate: int, dosTime: int): int {
+    if (dosDate == 0) return 0;
+    let y  = 1980 + ((dosDate >> 9) & 0x7F);
+    let mo = (dosDate >> 5) & 0x0F;
+    let d  = dosDate & 0x1F;
+    let h  = (dosTime >> 11) & 0x1F;
+    let mi = (dosTime >> 5) & 0x3F;
+    let sec = (dosTime & 0x1F) * 2;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 59) return 0;
+    let iso = String.PadLeft(str(y), 4, '0') + "-" + String.PadLeft(str(mo), 2, '0')
+            + "-" + String.PadLeft(str(d), 2, '0') + "T" + String.PadLeft(str(h), 2, '0')
+            + ":" + String.PadLeft(str(mi), 2, '0') + ":" + String.PadLeft(str(sec), 2, '0');
+    let u = Time.Parse(iso);
+    return u == nil ? 0 : u;
+}
+
+// A permission mode out of an archive is attacker-controlled data, so it is
+// masked down to the bits that are safe to honour before being applied.
+//
+// The mask is 0755, and that single number does the whole job:
+//   * setuid, setgid and sticky live above 0777, so they cannot survive it -
+//     an archive does not get to hand out a setuid binary;
+//   * group- and other-write are dropped, so an archive cannot leave something
+//     behind that anyone on the box can rewrite (the system unzip does restore
+//     0666 here, and that is the behaviour being declined);
+//   * owner rwx and group/other rx pass through, which keeps the two things
+//     worth keeping: an executable stays executable, and a private file stays
+//     private (0600 restores as 0600, not widened to the umask default).
+//
+// Returns 0 when nothing meaningful was stored, leaving the file with whatever
+// the umask gave it.
+fn _zipSafeMode(mode: int): int {
+    if (mode == 0) return 0;
+    // Regular files only. S_IFMT (0170000) must read as S_IFREG (0100000); a
+    // zero type field means a producer with no real mode to offer.
+    let kind = mode & 61440;                     // 0170000
+    if (kind != 0 && kind != 32768) return 0;    // 0100000
+    return mode & 493;                           // 0755
 }
 
 // Offset of the end-of-central-directory record, or -1.
@@ -106,22 +181,34 @@ fn _zipParse(buf: block): array {
         if (p + 46 > len(buf)) return nil;
         r.Seek(p);
         if (r.ReadU32() != SIG_CENTRAL) return nil;
+        let madeBy = r.ReadU16();
         r.Seek(p + 10);
-        let method = r.ReadU16();
-        r.Seek(p + 16);
+        let method  = r.ReadU16();
+        let dosTime = r.ReadU16();
+        let dosDate = r.ReadU16();
         let crc    = r.ReadU32();
         let csize  = r.ReadU32();
         let usize  = r.ReadU32();
         let nameLen  = r.ReadU16();
         let extraLen = r.ReadU16();
         let cmtLen   = r.ReadU16();
-        r.Seek(p + 42);
+        r.Seek(p + 38);
+        let extAttrs = r.ReadU32();
         let localOff = r.ReadU32();
         r.Seek(p + 46);
         let name = r.ReadStringFixed(nameLen);
+
+        // The Unix mode lives in the top 16 bits of the external attributes,
+        // but only when the producer said it was a Unix host (version-made-by
+        // high byte 3). A DOS or Windows producer puts FAT attribute flags in
+        // the low bits and nothing meaningful in the high ones.
+        let mode = ((madeBy >> 8) == 3) ? ((extAttrs >> 16) & 0xFFFF) : 0;
+
         Array.Append(out, {
             Name: name, Size: usize, CompressedSize: csize,
             IsDir: String.EndsWith(name, "/"),
+            Modified: _zipDosToUnix(dosDate, dosTime),
+            Mode: mode,
             _method: method, _crc: crc, _off: localOff
         });
         p = p + 46 + nameLen + extraLen + cmtLen;
@@ -143,19 +230,101 @@ fn _zipReadEntry(buf: block, e: object): block {
     let extraLen = r.ReadU16();
     let dataOff  = off + 30 + nameLen + extraLen;
     if (dataOff + e.CompressedSize > len(buf)) return nil;
-    if (e.CompressedSize == 0) return Buffer.FromString("");
+    if (e.CompressedSize == 0) return _zipVerify(Buffer.FromString(""), e);
 
     let raw = Buffer.Slice(buf, dataOff, e.CompressedSize);
-    if (e._method == METHOD_STORE) return raw;
+    if (e._method == METHOD_STORE)   return _zipVerify(raw, e);
     if (e._method != METHOD_DEFLATE) return nil;
-    return Inflate.Raw(raw, e.Size);
+    return _zipVerify(Inflate.Raw(raw, e.Size), e);
+}
+
+// The central directory states both the uncompressed length and a CRC-32 of the
+// payload. Checking neither leaves a truncated, corrupt or tampered entry
+// indistinguishable from a good one, and hands the caller wrong bytes with no
+// error anywhere. The CRC is taken from the central directory, which is correct
+// even for entries written with a trailing data descriptor (general-purpose
+// bit 3), where the local header's copy is zero.
+fn _zipVerify(data: block, e: object): block {
+    if (data == nil) return nil;
+    if (len(data) != e.Size) return nil;
+    if ((Hash.Crc32(data) & MAX_U32) != e._crc) return nil;
+    return data;
+}
+
+// ---------------------------------------------------------------------------
+//  Entry-name containment
+// ---------------------------------------------------------------------------
+
+// A ZIP entry name is attacker-controlled data, not a path to trust: the format
+// puts no constraint on it, so "../../etc/cron.d/job" and "/etc/passwd" are both
+// storable and both escape an extraction directory. Returns the name reduced to
+// a safe relative path, or nil when it cannot be made safe.
+//
+// Rejecting rather than repairing is deliberate. Stripping a leading "../" turns
+// a hostile name into a plausible one and writes it anyway; the caller wants to
+// know the archive tried. (An embedded NUL needs no check here: a Flaris string
+// cannot hold one, so ReadStringFixed has already truncated at that byte.)
+fn _zipSafeRel(name: string): string {
+    if (name == nil || len(name) == 0) return nil;
+
+    // Archives written on Windows store "\\" separators. Normalising both ways
+    // means "..\\..\\x" is caught wherever the archive is opened, not only on
+    // the platform that produced it.
+    let s = String.Replace(name, "\\", "/");
+
+    if (String.StartsWith(s, "/")) return nil;                     // absolute
+    // "C:x" is drive-relative and "C:/x" absolute; both leave the root.
+    if (len(s) >= 2 && String.Substr(s, 1, 1) == ":") return nil;
+
+    let parts = [];
+    foreach (sg in String.Split(s, "/")) {
+        if (len(sg) == 0 || sg == ".") { continue; }
+        if (sg == "..") return nil;
+        Array.Append(parts, sg);
+    }
+    if (len(parts) == 0) return nil;
+    return String.Join(parts, "/");
+}
+
+// Containment test with a separator boundary, so a root of "/srv/out" does not
+// also match "/srv/out-secret".
+fn _zipIsUnder(child: string, root: string): bool {
+    if (child == root) return true;
+    return String.StartsWith(child, root + "/")
+        || String.StartsWith(child, root + "\\");
+}
+
+// A directory that already exists below the extraction root as a symlink points
+// anywhere on the disk, and no check on the entry name can see it: an entirely
+// innocent "logs/app.txt" lands outside the root when "logs" is a link. The
+// lexical containment check cannot catch this - Path.Resolve does not resolve
+// symlinks - so every intermediate segment is stat'd. The root itself is not
+// checked: extracting into a symlinked directory is an ordinary thing to ask
+// for. For a flat archive this walks nothing.
+fn _zipCrossesSymlink(root: string, rel: string): bool {
+    let segs = String.Split(rel, "/");
+    let n = len(segs);
+    if (n < 2) return false;
+    var cur = root;
+    var i = 0;
+    while (i < n - 1) {
+        cur = cur + "/" + segs[i];
+        i += 1;
+        let st = File.Stat(cur);
+        if (st != nil && st.IsSymlink) return true;
+    }
+    return false;
 }
 
 // Create every directory on the way to `path`'s parent.
+//
+// Directory.Ensure, not Directory.Create: Create makes one level and fails if
+// its own parent is missing, so extracting "app/docs/x.txt" into a destination
+// that did not already exist wrote nothing and reported nothing.
 fn _zipEnsureParent(path: string): int {
     let dir = Path.GetDirectoryName(path);
     if (dir != nil && len(dir) > 0 && !Directory.Exists(dir)) {
-        Directory.Create(dir);
+        Directory.Ensure(dir);
     }
     return 0;
 }
@@ -167,10 +336,12 @@ fn _zipEnsureParent(path: string): int {
 class ZipReader {
     let _buf = nil;
     let _entries = nil;
+    let _skipped = 0;
 
     fn Constructor(data: block) {
         this._buf = data;
         this._entries = nil;
+        this._skipped = 0;
     }
 
     // Parsed on first use rather than in the constructor: the central
@@ -185,13 +356,17 @@ class ZipReader {
         return 0;
     }
 
-    // [{Name, Size, CompressedSize, IsDir}] in central-directory order.
+    // [{Name, Size, CompressedSize, IsDir, Modified, Mode}] in central-directory
+    // order. Modified is a Unix timestamp in seconds, 0 when the archive did not
+    // record one; Mode is the stored Unix permission bits, 0 for an archive
+    // written on a non-Unix host.
     fn List(): array {
         this._ensure();
         let out = [];
         foreach (e in this._entries) {
             Array.Append(out, { Name: e.Name, Size: e.Size,
-                                 CompressedSize: e.CompressedSize, IsDir: e.IsDir });
+                                 CompressedSize: e.CompressedSize, IsDir: e.IsDir,
+                                 Modified: e.Modified, Mode: e.Mode });
         }
         return out;
     }
@@ -208,24 +383,96 @@ class ZipReader {
         return nil;
     }
 
-    // Write one entry to `dest`, creating intermediate directories.
+    // Write one entry to `dest`, creating intermediate directories, and restore
+    // the entry's modification time and executable bit.
     fn Extract(name: string, dest: string): bool {
-        let data = this.Read(name);
+        this._ensure();
+        foreach (e in this._entries) {
+            if (e.Name == name) { return this._writeEntry(e, dest); }
+        }
+        return false;
+    }
+
+    // Shared tail of Extract and ExtractAll: decode, write, restore metadata.
+    fn _writeEntry(e, dest: string): bool {
+        let data = _zipReadEntry(this._buf, e);
         if (data == nil) return false;
         _zipEnsureParent(dest);
-        return File.WriteAllBytes(dest, data);
+        if (!File.WriteAllBytes(dest, data)) return false;
+
+        // Metadata is best-effort: a filesystem that refuses either of these is
+        // not a reason to report the extraction as failed - the bytes landed.
+        let mode = _zipSafeMode(e.Mode);
+        if (mode != 0)       { File.SetMode(dest, mode); }
+        if (e.Modified > 0)  { File.SetModifiedTime(dest, e.Modified); }
+        return true;
     }
 
     // Extract every non-directory entry under `dir`. Returns the count written.
+    //
+    // Entry names are treated as hostile. Anything that would land outside
+    // `dir` - a "..", an absolute or drive-relative name, or a path reached
+    // through a symlinked directory already sitting on disk - is skipped rather
+    // than written, and counted in SkippedUnsafe(). Extract() is left alone:
+    // there the destination is the caller's own, not the archive's.
+    //
+    // Entries are read by position rather than looked up by name, so an archive
+    // carrying two entries under one name extracts both instead of writing the
+    // first one twice.
     fn ExtractAll(dir: string): int {
         this._ensure();
+        this._skipped = 0;
+        let root = Path.Resolve(dir);
+        if (root == nil) return 0;
+
         let n = 0;
         foreach (e in this._entries) {
             if (e.IsDir) { continue; }
-            let dest = Path.Combine(dir, e.Name);
-            if (this.Extract(e.Name, dest)) { n = n + 1; }
+
+            let rel = _zipSafeRel(e.Name);
+            if (rel == nil) { this._skipped = this._skipped + 1; continue; }
+
+            // Second line of defence: the segment filter is purely lexical, so
+            // confirm the path it produced really does resolve inside the root.
+            let dest = Path.Resolve(Path.Combine(root, rel));
+            if (dest == nil || !_zipIsUnder(dest, root)) {
+                this._skipped = this._skipped + 1;
+                continue;
+            }
+            if (_zipCrossesSymlink(root, rel)) {
+                this._skipped = this._skipped + 1;
+                continue;
+            }
+
+            if (this._writeEntry(e, dest)) { n = n + 1; }
         }
         return n;
+    }
+
+    // How many entries the last ExtractAll refused to write because their name
+    // would have escaped the destination directory. Nonzero means the archive
+    // is hostile, not merely odd - worth surfacing rather than ignoring.
+    fn SkippedUnsafe(): int { return this._skipped; }
+
+    // The name reduced to the relative path ExtractAll would use, or nil when
+    // it would escape. Exposed so a caller can vet an archive before writing
+    // anything, or apply its own policy to the names that fail.
+    fn static SafeName(name: string): string { return _zipSafeRel(name); }
+
+    // The archive-level comment, or "" when there is none.
+    fn Comment(): string {
+        let eocd = _zipFindEocd(this._buf);
+        if (eocd < 0) return "";
+        let n = len(this._buf);
+        if (eocd + 22 > n) return "";
+        let r = new BinaryReader(this._buf, false);
+        r.Seek(eocd + 20);
+        var cl = r.ReadU16();
+        // Trust the buffer over the declared length: a truncated archive would
+        // otherwise read past the end.
+        if (eocd + 22 + cl > n) { cl = n - (eocd + 22); }
+        if (cl <= 0) return "";
+        return r.ReadStringFixed(cl);
     }
 }
 
@@ -235,26 +482,125 @@ class ZipReader {
 
 class ZipWriter {
     let _items = nil;
+    let _comment = "";
 
-    fn Constructor() { this._items = []; }
+    fn Constructor() { this._items = []; this._comment = ""; }
 
     // Add one entry. `data` may be a string or a block; a name ending in "/"
     // is written as a zero-length directory entry.
-    fn Add(name: string, data): int {
+    //
+    // `opts` (all optional):
+    //   modified : int  - Unix seconds for the entry's timestamp; defaults to now
+    //   mode     : int  - Unix permission bits to record (e.g. 0o755 as 493)
+    //   store    : bool - skip compression. Worth setting for data that is
+    //                     already compressed (jpeg, png, another zip): deflating
+    //                     it costs time and usually grows it by a few bytes.
+    fn Add(name: string, data, opts?): int {
         if (name == nil || len(name) == 0) return 0;
         let payload = nil;
         if (String.EndsWith(name, "/")) { payload = Buffer.FromString(""); }
         else if (Type.Of(data) == Type.String) { payload = Buffer.FromString(data); }
         else { payload = data; }
         if (payload == nil) { payload = Buffer.FromString(""); }
-        Array.Append(this._items, { name: name, data: payload });
+
+        var modified = 0;
+        var mode     = 0;
+        var store    = false;
+        if (opts != nil) {
+            if ("modified" in opts) { modified = opts["modified"]; }
+            if ("mode"     in opts) { mode     = opts["mode"];     }
+            if ("store"    in opts) { store    = opts["store"] == true; }
+        }
+
+        Array.Append(this._items, { name: name, data: payload,
+                                     modified: modified, mode: mode, store: store });
         return 0;
     }
 
-    fn AddFile(name: string, path: string): int {
+    // Add a file from disk, carrying its modification time and permission bits
+    // into the archive. Explicit `opts` win over what the file says.
+    fn AddFile(name: string, path: string, opts?): int {
         let data = File.ReadAllBytes(path);
         if (data == nil) return 0;
-        return this.Add(name, data);
+
+        let st = File.Stat(path);
+        let o = { };
+        if (st != nil) {
+            o["modified"] = st.Modified;
+            // Stat gives permission bits only; the regular-file type bits are
+            // added so the mode reads as a complete Unix mode to other tools.
+            o["mode"] = (st.Mode & 4095) | 32768;     // 0o7777 mask | S_IFREG
+        }
+        if (opts != nil) { foreach (v, k in opts) { o[k] = v; } }
+        return this.Add(name, data, o);
+    }
+
+    // Add a directory tree. Every regular file under `dir` becomes an entry
+    // named by its path relative to `dir`, with its timestamp and mode carried
+    // over - the one-call form of what packaging a folder actually needs.
+    //
+    // `opts` (all optional):
+    //   prefix     : string - placed in front of every entry name ("src/")
+    //   includeDirs: bool   - also write explicit directory entries; off by
+    //                         default, since the file entries already imply them
+    //   filter     : fn(relPath, stat) -> bool - false skips the file
+    //   followSymlinks: bool - descend into symlinked directories (default false;
+    //                         a link out of the tree would otherwise pull in
+    //                         whatever it points at)
+    //
+    // Returns the number of files added.
+    fn AddDirectory(dir: string, opts?): int {
+        let root = Path.Resolve(dir);
+        if (root == nil || !Directory.Exists(root)) return 0;
+
+        var prefix   = "";
+        var incDirs  = false;
+        var filter   = nil;
+        var follow   = false;
+        if (opts != nil) {
+            if ("prefix"         in opts) { prefix  = opts["prefix"];  }
+            if ("includeDirs"    in opts) { incDirs = opts["includeDirs"] == true; }
+            if ("filter"         in opts) { filter  = opts["filter"];  }
+            if ("followSymlinks" in opts) { follow  = opts["followSymlinks"] == true; }
+        }
+        if (len(prefix) > 0 && !String.EndsWith(prefix, "/")) { prefix = prefix + "/"; }
+
+        return this._walk(root, "", prefix, incDirs, filter, follow);
+    }
+
+    // One directory level. Recurses breadth-first per directory; the relative
+    // path is threaded down rather than recomputed from the absolute one.
+    fn _walk(abs: string, rel: string, prefix: string, incDirs: bool, filter, follow: bool): int {
+        var n = 0;
+
+        foreach (nm in Directory.ListFiles(abs)) {
+            let childRel = (rel == "") ? nm : rel + "/" + nm;
+            let childAbs = Path.Combine(abs, nm);
+            let st = File.Stat(childAbs);
+            if (st == nil) { continue; }
+            if (st.IsSymlink && !follow) { continue; }
+            if (filter != nil && !filter(childRel, st)) { continue; }
+            if (this.AddFile(prefix + childRel, childAbs) == 0) { n = n + 1; }
+        }
+
+        foreach (nm in Directory.ListDirs(abs)) {
+            let childRel = (rel == "") ? nm : rel + "/" + nm;
+            let childAbs = Path.Combine(abs, nm);
+            let st = File.Stat(childAbs);
+            if (st != nil && st.IsSymlink && !follow) { continue; }
+            if (incDirs) {
+                this.Add(prefix + childRel + "/", "",
+                         st != nil ? { modified: st.Modified } : nil);
+            }
+            n = n + this._walk(childAbs, childRel, prefix, incDirs, filter, follow);
+        }
+        return n;
+    }
+
+    // Archive-level comment, written into the end-of-central-directory record.
+    fn SetComment(text: string): int {
+        this._comment = (text == nil) ? "" : text;
+        return 0;
     }
 
     fn Count(): int { return len(this._items); }
@@ -264,9 +610,9 @@ class ZipWriter {
     fn Build(): block {
         if (len(this._items) > MAX_ENTRIES) return nil;
 
-        let stamp = _zipDosStamp();
-        let dosDate = stamp[0];
-        let dosTime = stamp[1];
+        // One "now" for every entry that did not bring its own, so a build is
+        // internally consistent even if it straddles a second boundary.
+        let nowStamp = _zipDosStamp();
 
         let w = new BinaryWriter(false);
         let central = [];
@@ -277,9 +623,13 @@ class ZipWriter {
             if (usize > MAX_U32) return nil;
             let isDir = String.EndsWith(it.name, "/");
 
+            let stamp = (it.modified > 0) ? _zipDosStamp(it.modified) : nowStamp;
+            let dosDate = stamp[0];
+            let dosTime = stamp[1];
+
             let method = METHOD_STORE;
             let body = raw;
-            if (!isDir) {
+            if (!isDir && !it.store) {
                 let def = _zipDeflateRaw(raw);
                 if (def != nil) { method = METHOD_DEFLATE; body = def; }
             }
@@ -303,18 +653,27 @@ class ZipWriter {
 
             Array.Append(central, { name: it.name, method: method, crc: crc,
                                      csize: len(body), usize: usize,
-                                     off: off, isDir: isDir });
+                                     off: off, isDir: isDir, mode: it.mode,
+                                     dosDate: dosDate, dosTime: dosTime });
         }
 
         let cdStart = w.Size();
         foreach (c in central) {
+            // "Version made by" carries the host in its high byte. Recording a
+            // Unix mode is only meaningful when that byte says Unix (3) - a
+            // reader is right to ignore the high external-attribute bits
+            // otherwise, which is why the mode goes hand in hand with it.
+            let unixMode = (c.mode != nil && c.mode != 0);
+            let extAttrs = (unixMode ? ((c.mode & 0xFFFF) << 16) : 0)
+                         | (c.isDir ? 16 : 0);   // MS-DOS directory bit
+
             w.WriteU32(SIG_CENTRAL);
-            w.WriteU16(20);            // version made by
+            w.WriteU16(unixMode ? (3 << 8) | 20 : 20);   // version made by
             w.WriteU16(20);            // version needed
             w.WriteU16(0);             // flags
             w.WriteU16(c.method);
-            w.WriteU16(dosTime);
-            w.WriteU16(dosDate);
+            w.WriteU16(c.dosTime);
+            w.WriteU16(c.dosDate);
             w.WriteU32(c.crc);
             w.WriteU32(c.csize);
             w.WriteU32(c.usize);
@@ -323,11 +682,16 @@ class ZipWriter {
             w.WriteU16(0);             // comment len
             w.WriteU16(0);             // disk start
             w.WriteU16(0);             // internal attrs
-            w.WriteU32(c.isDir ? 16 : 0);   // external attrs: MS-DOS directory bit
+            w.WriteU32(extAttrs);
             w.WriteU32(c.off);
             w.WriteStringFixed(c.name, len(c.name));
         }
         let cdSize = w.Size() - cdStart;
+
+        // The comment length field is 16 bits; a longer one is truncated rather
+        // than written as a length that wraps and corrupts the record.
+        var comment = this._comment;
+        if (len(comment) > 65535) { comment = String.Left(comment, 65535); }
 
         w.WriteU32(SIG_EOCD);
         w.WriteU16(0);                 // this disk
@@ -336,7 +700,8 @@ class ZipWriter {
         w.WriteU16(len(central));
         w.WriteU32(cdSize);
         w.WriteU32(cdStart);
-        w.WriteU16(0);                 // comment len
+        w.WriteU16(len(comment));
+        if (len(comment) > 0) { w.WriteStringFixed(comment, len(comment)); }
         return w.ToBuffer();
     }
 

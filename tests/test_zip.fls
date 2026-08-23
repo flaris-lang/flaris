@@ -196,6 +196,178 @@ fn test_benchmarks() {
     checkEq(cnt, 1000, "benchmark 1000 entries listed");
 }
 
+
+// ============================================================
+//  Entry-name containment  (Zip Slip)
+// ============================================================
+
+fn test_path_containment() {
+    let root = "/tmp/flaris_zip_slip";
+    Directory.DeleteAll(root);
+    Directory.Ensure(root + "/dest");
+
+    let w = Archive.Create();
+    w.Add("../escaped.txt",      "traversal");
+    w.Add("..\\win_escaped.txt", "windows traversal");
+    w.Add("/tmp/abs_escaped.txt", "absolute");
+    w.Add("./ok/./fine.txt",     "normalised");
+    let r = Archive.Open(w.Build());
+
+    checkEq(r.ExtractAll(root + "/dest"), 1, "only the safe entry is written");
+    checkEq(r.SkippedUnsafe(), 3, "three escaping names refused");
+    checkEq(File.ReadText(root + "/dest/ok/fine.txt"), "normalised", "safe entry landed, path normalised");
+    check(!File.Exists(root + "/escaped.txt"),     "no relative traversal escape");
+    check(!File.Exists(root + "/win_escaped.txt"), "no backslash traversal escape");
+    check(!File.Exists("/tmp/abs_escaped.txt"),    "no absolute-path escape");
+
+    // SafeName exposes the same judgement without writing anything.
+    checkEq(ZipReader.SafeName("a/b.txt"),  "a/b.txt", "SafeName passes an ordinary name");
+    checkEq(ZipReader.SafeName("./a/./b"),  "a/b",     "SafeName normalises . segments");
+    check(ZipReader.SafeName("../x")   == nil, "SafeName rejects ..");
+    check(ZipReader.SafeName("/etc/x") == nil, "SafeName rejects absolute");
+    check(ZipReader.SafeName("C:/x")   == nil, "SafeName rejects drive-relative");
+    check(ZipReader.SafeName("")       == nil, "SafeName rejects empty");
+
+    // A symlinked directory already on disk redirects an innocent-looking name.
+    Directory.Ensure(root + "/outside");
+    Directory.Ensure(root + "/dest2");
+    File.CreateSymlink(root + "/outside", root + "/dest2/logs");
+    let w2 = Archive.Create();
+    w2.Add("logs/app.txt", "through a symlink");
+    let r2 = Archive.Open(w2.Build());
+    checkEq(r2.ExtractAll(root + "/dest2"), 0, "symlinked parent blocks the write");
+    checkEq(r2.SkippedUnsafe(), 1, "symlink traversal counted as unsafe");
+    check(!File.Exists(root + "/outside/app.txt"), "nothing written through the symlink");
+
+    Directory.DeleteAll(root);
+}
+
+// ============================================================
+//  Payload verification
+// ============================================================
+
+fn test_crc_verification() {
+    let w = Archive.Create();
+    w.Add("a.txt", "the quick brown fox");
+    let z = w.Build();
+    checkEq(str(Archive.Open(z).Read("a.txt")), "the quick brown fox", "clean payload reads back");
+
+    // Corrupt one payload byte; the stored CRC no longer matches.
+    let at = Buffer.IndexOf(z, "quick");
+    check(at > 0, "payload located for tampering");
+    Buffer.WriteU8At(z, at, 88);
+    check(Archive.Open(z).Read("a.txt") == nil, "tampered payload reads as nil, not as wrong bytes");
+}
+
+// ============================================================
+//  Entry metadata: timestamps and modes
+// ============================================================
+
+fn test_metadata() {
+    let stamp = 1577975045;            // 2020-01-02T14:24:05Z
+
+    let w = Archive.Create();
+    w.Add("plain.txt", "x", { modified: stamp });
+    w.Add("script.sh", "#!/bin/sh\n", { modified: stamp, mode: 33261 });   // 0100755
+    w.Add("packed.bin", String.Repeat("a", 2000), { store: true });
+    let r = Archive.Open(w.Build());
+
+    let byName = { };
+    foreach (e in r.List()) { byName[e.Name] = e; }
+
+    // Two-second DOS resolution: the stored value is the timestamp rounded down.
+    checkEq(byName["plain.txt"].Modified, stamp - (stamp % 2), "timestamp round-trips at DOS resolution");
+    checkEq(byName["script.sh"].Mode, 33261, "unix mode round-trips");
+    checkEq(byName["plain.txt"].Mode, 0, "no mode stored when none was given");
+
+    // { store: true } must leave the payload uncompressed even when it would
+    // compress well - 2000 identical bytes otherwise deflate to almost nothing.
+    check(byName["packed.bin"].CompressedSize == 2000, "store:true skips compression");
+    checkEq(str(r.Read("packed.bin")), String.Repeat("a", 2000), "stored payload round-trips");
+
+    // Extraction restores what it safely can.
+    let out = "/tmp/flaris_zip_meta";
+    Directory.DeleteAll(out);
+    checkEq(r.ExtractAll(out), 3, "all three entries extracted");
+    let st = File.Stat(out + "/script.sh");
+    check(st != nil, "extracted script stat");
+    if (st != nil) { checkEq(st.Mode & 511, 493, "executable bit restored as 0755"); }
+    let st2 = File.Stat(out + "/plain.txt");
+    if (st2 != nil) { checkEq(st2.Modified, stamp - (stamp % 2), "mtime restored on disk"); }
+    Directory.DeleteAll(out);
+}
+
+fn test_mode_sanitising() {
+    // Modes an archive must not be allowed to hand out verbatim.
+    let w = Archive.Create();
+    w.Add("suid",  "x", { mode: 35309 });   // 0104755  setuid + rwxr-xr-x
+    w.Add("ww",    "x", { mode: 33206 });   // 0100666  world-writable
+    w.Add("tight", "x", { mode: 33152 });   // 0100600  owner-only
+    let r = Archive.Open(w.Build());
+
+    let out = "/tmp/flaris_zip_modes";
+    Directory.DeleteAll(out);
+    checkEq(r.ExtractAll(out), 3, "all entries extracted");
+
+    let a = File.Stat(out + "/suid");
+    let b = File.Stat(out + "/ww");
+    let c = File.Stat(out + "/tight");
+    if (a != nil) { checkEq(a.Mode & 4095, 493, "setuid stripped, exec kept (0755)"); }
+    if (b != nil) { checkEq(b.Mode & 4095, 420, "group/other write dropped (0644)"); }
+    if (c != nil) { checkEq(c.Mode & 4095, 384, "restrictive 0600 preserved"); }
+    Directory.DeleteAll(out);
+}
+
+// ============================================================
+//  Directory packaging and archive comment
+// ============================================================
+
+fn test_add_directory() {
+    let src = "/tmp/flaris_zip_tree";
+    Directory.DeleteAll(src);
+    Directory.Ensure(src + "/bin");
+    Directory.Ensure(src + "/docs/deep");
+    File.WriteText(src + "/top.txt",            "top");
+    File.WriteText(src + "/bin/run.sh",         "#!/bin/sh\n");
+    File.WriteText(src + "/docs/readme.md",     "readme");
+    File.WriteText(src + "/docs/deep/note.txt", "note");
+    File.WriteText(src + "/skip.tmp",           "temporary");
+    File.SetMode(src + "/bin/run.sh", 493);
+
+    let w = Archive.Create();
+    let added = w.AddDirectory(src, { prefix: "app/",
+                    filter: fn(rel, _st) { return !String.EndsWith(rel, ".tmp"); } });
+    checkEq(added, 4, "AddDirectory walks the tree and honours the filter");
+    w.SetComment("built by the test suite");
+
+    let r = Archive.Open(w.Build());
+    checkEq(r.Comment(), "built by the test suite", "archive comment round-trips");
+    checkEq(len(r.List()), 4, "four entries in the archive");
+    checkEq(str(r.Read("app/docs/deep/note.txt")), "note", "nested entry name carries the prefix");
+    check(r.Read("app/skip.tmp") == nil, "filtered file is absent");
+
+    var exec = 0;
+    foreach (e in r.List()) { if ((e.Mode & 73) != 0) { exec = exec + 1; } }
+    checkEq(exec, 1, "only the executable file carries an exec bit");
+
+    // Extract into a destination that does not exist yet, nested two deep.
+    let out = "/tmp/flaris_zip_tree_out/nested";
+    Directory.DeleteAll("/tmp/flaris_zip_tree_out");
+    checkEq(r.ExtractAll(out), 4, "ExtractAll creates missing parent directories");
+    checkEq(File.ReadText(out + "/app/docs/deep/note.txt"), "note", "deep file extracted");
+
+    Directory.DeleteAll(src);
+    Directory.DeleteAll("/tmp/flaris_zip_tree_out");
+}
+
+fn test_empty_comment() {
+    let w = Archive.Create();
+    w.Add("a.txt", "x");
+    checkEq(Archive.Open(w.Build()).Comment(), "", "no comment reads as empty string");
+}
+
+// ============================================================
+
 fn Main() {
     Console.WriteLine("=== Zip tests ===");
     test_roundtrip();
@@ -204,6 +376,12 @@ fn Main() {
     test_large_payload();
     test_malformed();
     test_disk_io();
+    test_path_containment();
+    test_crc_verification();
+    test_metadata();
+    test_mode_sanitising();
+    test_add_directory();
+    test_empty_comment();
     test_benchmarks();
 
     Console.WriteLine("");

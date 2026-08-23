@@ -1,0 +1,56 @@
+// test_http_redirect_client.fls - client half of the redirect credential test.
+// Run via tests/test_http_redirect.sh, which starts the server first.
+
+import { Http } from library("Http", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (cond) { Console.WriteLine("[PASS] " + msg); }
+    else      { testsFailed = testsFailed + 1; Console.WriteLine("[FAIL] " + msg); }
+}
+
+fn field(resp, key: string): string {
+    if (resp == nil) return "<no response>";
+    let o = Json.Parse(resp.body);
+    if (o == nil) return "<unparseable>";
+    return str(o[key]);
+}
+
+fn Main() {
+    let base = "http://127.0.0.1:18091";
+    let creds = { "Authorization":       "Bearer SECRET-TOKEN",
+                  "Cookie":              "sid=SECRET-SESSION",
+                  "Proxy-Authorization": "Basic SECRET-PROXY",
+                  "X-Trace":             "keep-me" };
+
+    // 1. No redirect: everything the caller sent arrives.
+    let direct = Http.Get(base + "/landed", creds);
+    check(direct != nil, "direct request succeeds");
+    check(field(direct, "auth")   == "Bearer SECRET-TOKEN",  "direct: Authorization delivered");
+    check(field(direct, "cookie") == "sid=SECRET-SESSION",   "direct: Cookie delivered");
+
+    // 2. Same-origin redirect: still the caller's own origin, so nothing is lost.
+    let same = Http.Get(base + "/same", creds);
+    check(same != nil, "same-origin redirect succeeds");
+    check(field(same, "auth")   == "Bearer SECRET-TOKEN", "same-origin: Authorization kept");
+    check(field(same, "cookie") == "sid=SECRET-SESSION",  "same-origin: Cookie kept");
+    check(field(same, "trace")  == "keep-me",             "same-origin: ordinary header kept");
+
+    // 3. Cross-origin redirect: the credential headers must not follow.
+    let cross = Http.Get(base + "/cross", creds);
+    check(cross != nil, "cross-origin redirect succeeds");
+    check(field(cross, "auth")   == "-", "cross-origin: Authorization dropped");
+    check(field(cross, "cookie") == "-", "cross-origin: Cookie dropped");
+    check(field(cross, "proxy")  == "-", "cross-origin: Proxy-Authorization dropped");
+    check(field(cross, "trace")  == "keep-me",
+          "cross-origin: ordinary header still sent - only credentials are dropped");
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All redirect credential tests passed!");
+    return 0;
+}

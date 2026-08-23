@@ -231,6 +231,39 @@ class Http {
         return _httpSecureTransport;
     }
 
+    // Headers that authenticate the caller to *one* origin. A 302 can point
+    // anywhere, and replaying these to whatever host the Location names hands
+    // the bearer token or session cookie to that host - the caller trusted the
+    // origin they typed, not every origin it can redirect to. Browsers and curl
+    // both drop them on a cross-origin hop; so does this.
+    //
+    // A same-origin redirect keeps them, which is the common case: a trailing
+    // slash, a canonical path. Scheme counts as part of the origin, so an
+    // http -> https hop on the same host does lose them - that is the correct
+    // reading, since the two are different origins and the first leg was
+    // already in the clear.
+    fn static _stripCredentials(userHeaders) {
+        if (userHeaders == nil) { return nil; }
+        let out = { };
+        var dropped = false;
+        foreach (val, key in userHeaders) {
+            let k = String.ToLower(key);
+            if (k == "authorization" || k == "cookie" || k == "proxy-authorization") {
+                dropped = true;
+            } else {
+                out[key] = val;
+            }
+        }
+        return dropped ? out : userHeaders;
+    }
+
+    // scheme://host:port, with the default port made explicit so that
+    // "http://x" and "http://x:80" compare equal.
+    fn static _origin(scheme, host, port) {
+        let p = (port != nil && port > 0) ? port : (scheme == "https" ? 443 : 80);
+        return String.ToLower(scheme) + "://" + String.ToLower(host) + ":" + Convert.ToString(p);
+    }
+
     // Build the full request text (headers + body), or nil if any component
     // carries a CR/LF that would inject a header or split the request. Shared by
     // the sync and async engines so the injection check lives in one place.
@@ -335,6 +368,13 @@ class Http {
         let curBody   = body;
         let redirects = 0;
 
+        // The origin the caller asked for. Credential headers survive only as
+        // long as the hops stay on it - see _stripCredentials.
+        let start     = HttpUtil.ParseUrl(url);
+        let homeOrigin = (start == nil) ? nil
+                       : Http._origin(start.scheme, start.host, start.port);
+        var curHeaders = userHeaders;
+
         // Normalize a structured body (object/array) to a JSON string. Without
         // this, an object body would be written via the default value->string
         // repr (unquoted keys = invalid JSON) and Content-Length would be set to
@@ -378,7 +418,7 @@ class Http {
             try {
                 // Assemble the request; nil means a CR/LF injection was detected
                 // in the path/host/headers - drop the connection and fail.
-                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, userHeaders);
+                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, curHeaders);
                 if (req == nil) { tr.close(s); return nil; }
                 tr.write(s, req);
 
@@ -438,6 +478,15 @@ class Http {
             if (redirectUrl != nil) {
                 curUrl = redirectUrl;
                 redirects = redirects + 1;
+                // Leaving the caller's origin drops whatever authenticated them
+                // to it. Once dropped they stay dropped, even if a later hop
+                // returns to the origin: a redirect chain through a third party
+                // is not a reason to re-issue the credential.
+                let next = HttpUtil.ParseUrl(curUrl);
+                if (homeOrigin == nil || next == nil
+                    || Http._origin(next.scheme, next.host, next.port) != homeOrigin) {
+                    curHeaders = Http._stripCredentials(curHeaders);
+                }
             } else {
                 return response; // nil on I/O error, object on success
             }
@@ -493,6 +542,13 @@ class Http {
         let curBody   = body;
         let redirects = 0;
 
+        // The origin the caller asked for. Credential headers survive only as
+        // long as the hops stay on it - see _stripCredentials.
+        let start     = HttpUtil.ParseUrl(url);
+        let homeOrigin = (start == nil) ? nil
+                       : Http._origin(start.scheme, start.host, start.port);
+        var curHeaders = userHeaders;
+
         if (curBody != nil &&
             (Type.Is(curBody, Type.Object) || Type.Is(curBody, Type.Array))) {
             curBody = Json.Stringify(curBody);
@@ -521,7 +577,7 @@ class Http {
             let response    = nil;
 
             try {
-                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, userHeaders);
+                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, curHeaders);
                 if (req == nil) { tr.close(s); return nil; }
                 await tr.writeAsync(s, req);
 
@@ -570,6 +626,11 @@ class Http {
             if (redirectUrl != nil) {
                 curUrl = redirectUrl;
                 redirects = redirects + 1;
+                let next = HttpUtil.ParseUrl(curUrl);
+                if (homeOrigin == nil || next == nil
+                    || Http._origin(next.scheme, next.host, next.port) != homeOrigin) {
+                    curHeaders = Http._stripCredentials(curHeaders);
+                }
             } else {
                 return response;
             }
@@ -698,7 +759,10 @@ class Http {
             cmd = cmd + " -o " + Http._shq(output);
         }
 
-        cmd = cmd + " " + Http._shq(url);
+        // --url rather than a bare positional: shell quoting keeps the shell out
+        // of it, but curl's own parser still reads a leading "-" as an option,
+        // so a URL of "-o/etc/cron.d/x" would become one.
+        cmd = cmd + " --url " + Http._shq(url);
 
         let raw = Os.Execute(cmd);
         if (raw == nil) { return nil; }
@@ -738,7 +802,7 @@ class Http {
             cmd = cmd + " -O " + Http._shq(dest);
         }
 
-        cmd = cmd + " " + Http._shq(url) + " 2>&1";
+        cmd = cmd + " --url " + Http._shq(url) + " 2>&1";
 
         let raw = Os.Execute(cmd);
         if (raw == nil) { return nil; }

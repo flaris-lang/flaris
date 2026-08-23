@@ -641,6 +641,66 @@ fn test_bytes() {
     bstr("ToBytes ignores sign", BigInt.FromBytes(BigInt.ToBytes(BigInt.From(-255), false), false), "255");
 }
 
+
+// ---------------------------------------------------------------
+// Base conversion across limb boundaries
+//
+// ToHex/ToBytes/FromHex/FromBytes are built on limb-level short division and
+// short multiplication rather than the general DivMod/Mul. That is far faster
+// but it is also where an off-by-one in the carry would hide, so these walk
+// the powers of the 10^6 limb base and round-trip a long run of widths.
+// ---------------------------------------------------------------
+
+fn test_base_conversion() {
+    Console.WriteLine("-- base conversion across limb boundaries");
+
+    // Exactly at, either side of, and two limbs past the base.
+    eq("ToHex(999999)",           BigInt.ToHex(BigInt.From("999999")),           "f423f");
+    eq("ToHex(1000000)",          BigInt.ToHex(BigInt.From("1000000")),          "f4240");
+    eq("ToHex(1000001)",          BigInt.ToHex(BigInt.From("1000001")),          "f4241");
+    eq("ToHex(999999999999)",     BigInt.ToHex(BigInt.From("999999999999")),     "e8d4a50fff");
+    eq("ToHex(1000000000000)",    BigInt.ToHex(BigInt.From("1000000000000")),    "e8d4a51000");
+
+    bstr("FromHex round-trips the base",  BigInt.FromHex("f4240"),      "1000000");
+    bstr("FromHex round-trips two limbs", BigInt.FromHex("e8d4a51000"), "1000000000000");
+
+    // Big-endian byte layout, checked against a value whose bytes are 1,2,3,4.
+    let b = BigInt.ToBytes(BigInt.From(16909060));
+    eq("ToBytes length",  len(b), 4);
+    eq("ToBytes[0]",      b[0],   1);
+    eq("ToBytes[3]",      b[3],   4);
+    let l = BigInt.ToBytes(BigInt.From(16909060), true);
+    eq("ToBytes LE[0]",   l[0],   4);
+    eq("ToBytes LE[3]",   l[3],   1);
+
+    // Round-trip every width from 1 to 200 digits through both encodings.
+    var hexBad = 0; var beBad = 0; var leBad = 0;
+    iter (d from 1 to 200) {
+        var dec = "";
+        iter (i from 0 to d - 1) { dec = dec + str((i * 7 + 3) % 10); }
+        while (len(dec) > 1 && String.StartsWith(dec, "0")) { dec = String.Substr(dec, 1); }
+        let v = BigInt.From(dec);
+        if (BigInt.ToString(BigInt.FromHex(BigInt.ToHex(v)))                 != dec) { hexBad += 1; }
+        if (BigInt.ToString(BigInt.FromBytes(BigInt.ToBytes(v)))             != dec) { beBad  += 1; }
+        if (BigInt.ToString(BigInt.FromBytes(BigInt.ToBytes(v, true), true)) != dec) { leBad  += 1; }
+    }
+    eq("hex round-trip, widths 1-200",           hexBad, 0);
+    eq("big-endian round-trip, widths 1-200",    beBad,  0);
+    eq("little-endian round-trip, widths 1-200", leBad,  0);
+
+    // A 2048-bit-scale value: the size these are actually reached for, and the
+    // size at which the old DivMod-per-digit loop took several seconds.
+    var big = "";
+    iter (i from 0 to 616) { big = big + str((i * 3 + 1) % 10); }
+    while (len(big) > 1 && String.StartsWith(big, "0")) { big = String.Substr(big, 1); }
+    let n = BigInt.From(big);
+    let t0 = Time.Ticks();
+    let h = BigInt.ToHex(n);
+    let dt = Time.TicksToMs(Time.Ticks() - t0);
+    eq("617-digit hex round-trips", BigInt.ToString(BigInt.FromHex(h)), big);
+    ok("617-digit ToHex under 500 ms (was ~5 s)", dt < 500.0);
+}
+
 // ================================================================
 // Main
 // ================================================================
@@ -668,6 +728,7 @@ fn Main() {
     test_sqrt();
     test_bitlength();
     test_hex();
+    test_base_conversion();
     test_bitwise();
     test_bytes();
 

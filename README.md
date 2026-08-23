@@ -76,29 +76,33 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 
 ## The libraries
 
-37 libraries, all pure Flaris unless noted:
+42 libraries, all pure Flaris unless noted:
 
 **Data & formats** — `CSV`, `XML`, `BinaryIO`, `BitConverter`, `Config`,
 `Template`, `Lexer`
+
+**Compression & archives** — `Deflate`, `Zip`
 
 **Numbers** — `BigInt`, `Decimal`, `Complex`, `Numerics`
 
 **Collections & structure** — `Linq`, `Graph`, `Treemap`, `Cache`,
 `StringBuilder`
 
-**Web & network** — `Http`, `Https`, `HttpServer`, `Router`, `WebSocket`, `Jwt`
+**Web & network** — `Http`, `Https`, `HttpServer`, `HttpUtil`, `Router`,
+`WebSocket`, `Jwt`
 
 **Data stores** — `SQLite`, `Postgres`, `Redis`
 
 **System & tooling** — `Argparse`, `Process`, `Logger`, `Datetime`, `Promise`,
-`Signals`, `ConsoleMenu`, `Test`
+`Signals`, `ConsoleMenu`, `Test`, `Util`
 
-**Media** — `Graphics`, `Audio`, `QRCode`
+**Media** — `Graphics`, `Audio`, `QRCode`, `Png`
 
 **AI** — `AI` (Ollama client)
 
-`BinaryIO`, `SQLite`, `Postgres`, `Redis` and `WebSocket` require `--unsafe`
-because they use FFI or raw memory access.
+Only `SQLite`, `Postgres` and `Redis` require `--unsafe`, because they bind
+their C client libraries through FFI. Every other library, `BinaryIO` and
+`WebSocket` included, runs in the default sandbox.
 
 ## Native plugins (FFI)
 

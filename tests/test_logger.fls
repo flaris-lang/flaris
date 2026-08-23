@@ -672,6 +672,94 @@ fn test_rotation() {
 // Main
 // ============================================================
 
+
+// ============================================================
+// Log-line forgery
+//
+// Every assertion here reads the file sink rather than the console: the
+// console is not a reliable witness for this, since Console.Write expands a
+// backslash escape back into the character it stands for.
+// ============================================================
+
+fn test_line_forgery() {
+    Console.WriteLine("== Log-line forgery ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_forge.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetOutput("file", path);
+
+    // A username straight off a request, carrying a newline and a fake level.
+    log.Info("login for bob" + "\n" + "[ERR] payment refunded to attacker");
+    log.InfoWith("audit", { actor: "carol" + "\r" + "[ERR] deleted all records" });
+    let forgedKey = { };
+    forgedKey["k" + "\n" + "[ERR] forged"] = "v";
+    log.InfoWith("audit", forgedKey);
+    log.Info("screen" + "\x1b" + "[2J");
+
+    let lines = File.ReadLines(path);
+    checkEq(len(lines), 4, "four calls produce exactly four lines");
+
+    let all = File.ReadText(path);
+    check(String.Contains(all, "bob\\n[ERR] payment"),   "message newline escaped, not emitted");
+    check(String.Contains(all, "carol\\r[ERR] deleted"), "field value CR escaped");
+    check(String.Contains(all, "k\\n[ERR] forged="),     "field name newline escaped");
+    check(String.Contains(all, "screen\\e[2J"),          "ANSI escape neutralised");
+    File.Delete(path);
+}
+
+fn test_forgery_via_prefix() {
+    Console.WriteLine("== Prefix forgery ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_forge2.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetOutput("file", path);
+    log.SetPrefix("svc" + "\n" + "[ERR] forged by prefix");
+    log.Info("hello");
+
+    let child = log.Child("sub" + "\n" + "[ERR] forged by child");
+    child.Info("world");
+
+    checkEq(len(File.ReadLines(path)), 2, "two calls produce exactly two lines");
+    File.Delete(path);
+}
+
+fn test_ordinary_text_untouched() {
+    Console.WriteLine("== Escaping leaves ordinary text alone ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_plain.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetOutput("file", path);
+    let msg = "C:\\Users\\ada, 50% done, \"quoted\", tab->\tend";
+    log.Info(msg);
+
+    check(String.Contains(File.ReadText(path), msg), "a message with no CR/LF/ESC is written verbatim");
+    File.Delete(path);
+}
+
+fn test_json_mode_still_structured() {
+    Console.WriteLine("== JSON mode ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_json2.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetOutput("file", path);
+    log.SetJson(true);
+    log.Info("a" + "\n" + "b", { k: "c" + "\n" + "d" });
+
+    // JSON escaping is the reversible one, so the value must survive intact.
+    checkEq(len(File.ReadLines(path)), 1, "one JSON record on one line");
+    let obj = Json.Parse(File.ReadText(path));
+    check(obj != nil, "record parses as JSON");
+    if (obj != nil) {
+        checkEq(obj.msg, "a" + "\n" + "b", "JSON keeps the real newline in the message");
+        checkEq(obj.k,   "c" + "\n" + "d", "JSON keeps the real newline in the field");
+    }
+    File.Delete(path);
+}
+
 fn async Main() {
     Console.WriteLine("=== Logger test suite ===");
 
@@ -698,6 +786,10 @@ fn async Main() {
     test_format_fields();
     test_json_output();
     test_rotation();
+    test_line_forgery();
+    test_forgery_via_prefix();
+    test_ordinary_text_untouched();
+    test_json_mode_still_structured();
 
     Console.WriteLine("=== Done ===");
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

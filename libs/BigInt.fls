@@ -141,6 +141,46 @@ class BigInt {
         return BigInt._trim(r);
     }
 
+    // Divide `ls` by a small int in place, most-significant limb first, carrying
+    // the remainder down. `top` is the index of the highest live limb; the
+    // returned `top` is where it sits afterwards, so the array is never resized
+    // and a whole conversion allocates nothing per digit.
+    //
+    // This is what a base conversion actually needs. Going through the general
+    // _divmodL instead costs a full doubling table of the divisor per output
+    // digit, which is why ToHex on an 800-digit number used to take nine
+    // seconds; the same conversion built on this runs in about a millisecond.
+    // `d` must be small enough that d*_BASE stays inside int64 - true of every
+    // radix anyone converts to.
+    fn static _divSmallInPlace(ls, top: int, d: int) {
+        var rem = 0;
+        var i = top;
+        while (i >= 0) {
+            let cur = rem * BigInt._BASE + ls[i];
+            ls[i] = BigInt._idiv(cur, d);
+            rem   = cur % d;
+            i -= 1;
+        }
+        var t = top;
+        while (t > 0 && ls[t] == 0) { t -= 1; }
+        return { top: t, r: rem };
+    }
+
+    // limbs * m + add, in one pass. The inverse direction of _divSmallL, and
+    // the reason FromHex/FromBytes no longer pay a full _mulL per input digit.
+    fn static _mulSmallAddL(ls, m: int, add: int) {
+        let n = len(ls);
+        let r = Array.Create(n + 1);
+        var carry = add;
+        iter (i from 0 to n - 1) {
+            let cur = ls[i] * m + carry;
+            r[i]  = cur % BigInt._BASE;
+            carry = BigInt._idiv(cur, BigInt._BASE);
+        }
+        r[n] = carry;
+        return (carry == 0 && n > 0) ? Array.Subset(r, 0, n) : r;
+    }
+
     fn static _mulL(a, b) {
         var na = len(a); var nb = len(b);
         var r = Array.Create(na + nb);
@@ -252,12 +292,17 @@ class BigInt {
 
     fn static ToString(n): string {
         var ls = n.limbs; var k = len(ls);
-        var s = Convert.ToString(ls[k - 1]);    // most-significant limb, no padding
+        let parts = Array.Create(k);
+        parts[0] = Convert.ToString(ls[k - 1]);   // most-significant limb, no padding
         var i = k - 2;
+        var j = 1;
         while (i >= 0) {
-            s = s + String.PadLeft(Convert.ToString(ls[i]), 6, '0');
-            i -= 1;
+            parts[j] = String.PadLeft(Convert.ToString(ls[i]), 6, '0');
+            i -= 1; j += 1;
         }
+        // One join rather than k string concatenations, each of which copies
+        // everything written so far.
+        let s = String.Join(parts, "");
         return (n.sign == -1 && s != "0") ? "-" + s : s;
     }
 
@@ -523,24 +568,18 @@ class BigInt {
     // Negative n gets a leading '-'. Zero returns "0".
     fn static ToHex(n): string {
         if (BigInt.IsZero(n)) { return "0"; }
-        var hexDigits = "0123456789abcdef";
-        var abs = BigInt.Abs(n);
-        var sixteen = BigInt.From(16);
-        var digits = [];
-        var cur = abs;
-        while (!BigInt.IsZero(cur)) {
-            var dm  = BigInt.DivMod(cur, sixteen);
-            var idx = BigInt.ToInt(dm.r);
-            Array.Append(digits, String.Substr(hexDigits, idx, 1));
-            cur = dm.q;
+        let hexDigits = "0123456789abcdef";
+        var ls  = BigInt._copyL(n.limbs);
+        var top = len(ls) - 1;
+        let digits = [];
+        while (top > 0 || ls[0] != 0) {
+            let dm = BigInt._divSmallInPlace(ls, top, 16);
+            Array.Append(digits, String.Substr(hexDigits, dm.r, 1));
+            top = dm.top;
         }
-        // digits is in reverse order (least significant first) - reverse it.
-        var result = "";
-        var i = len(digits) - 1;
-        while (i >= 0) {
-            result = result + digits[i];
-            i -= 1;
-        }
+        // Least-significant digit first; reverse, then join in one allocation
+        // rather than growing a string a character at a time.
+        var result = String.Join(Array.Reverse(digits), "");
         if (n.sign == -1) { result = "-" + result; }
         return result;
     }
@@ -557,17 +596,19 @@ class BigInt {
         if (len(s) == 0) { return BigInt._zero(); }
 
         var hexDigits = "0123456789abcdef";
-        var result = BigInt._zero();
-        var sixteen = BigInt.From(16);
+        var limbs = [0];
         var i = 0;
         var n = len(s);
         while (i < n) {
             var ch  = String.ToLower(String.Substr(s, i, 1));
             var idx = String.IndexOf(hexDigits, ch);
             if (idx < 0) { return BigInt._zero(); }
-            result = BigInt.Add(BigInt.Mul(result, sixteen), BigInt.From(idx));
+            // A whole-number multiply per digit is what made this quadratic in
+            // the number of limbs; scaling the limb array in place is linear.
+            limbs = BigInt._mulSmallAddL(limbs, 16, idx);
             i += 1;
         }
+        var result = BigInt._make(1, BigInt._trim(limbs));
         if (sign == -1 && !BigInt.IsZero(result)) { result = BigInt.Neg(result); }
         return result;
     }
@@ -684,15 +725,15 @@ class BigInt {
     // ToBytes(n, littleEndian?) -> array of byte ints (0-255). Zero -> [0].
     fn static ToBytes(n, littleEndian?: bool) {
         var le  = (littleEndian == nil) ? false : littleEndian;
-        var cur = BigInt.Abs(n);
-        if (BigInt.IsZero(cur)) { return [0]; }
+        if (BigInt.IsZero(n)) { return [0]; }
 
-        var b256 = BigInt._fromInt(256);
-        var out  = [];                     // least-significant byte first
-        while (!BigInt.IsZero(cur)) {
-            var dm = BigInt.DivMod(cur, b256);
-            Array.Append(out, BigInt.ToInt(dm.r));
-            cur = dm.q;
+        var ls  = BigInt._copyL(n.limbs);
+        var top = len(ls) - 1;
+        var out = [];                      // least-significant byte first
+        while (top > 0 || ls[0] != 0) {
+            let dm = BigInt._divSmallInPlace(ls, top, 256);
+            Array.Append(out, dm.r);
+            top = dm.top;
         }
         if (le) { return out; }
         return Array.Reverse(out);         // big-endian
@@ -701,17 +742,16 @@ class BigInt {
     // FromBytes(bytes, littleEndian?) -> non-negative BigInt. `bytes` is an array
     // of ints (0-255) or a byte block. Big-endian unless littleEndian is true.
     fn static FromBytes(bytes, littleEndian?: bool) {
-        var le   = (littleEndian == nil) ? false : littleEndian;
-        var n    = len(bytes);
-        var r    = BigInt._zero();
-        var b256 = BigInt._fromInt(256);
+        var le    = (littleEndian == nil) ? false : littleEndian;
+        var n     = len(bytes);
+        var limbs = [0];
         if (le) {
             var i = n - 1;
-            while (i >= 0) { r = BigInt.Add(BigInt.Mul(r, b256), BigInt._fromInt(bytes[i] % 256)); i -= 1; }
+            while (i >= 0) { limbs = BigInt._mulSmallAddL(limbs, 256, bytes[i] % 256); i -= 1; }
         } else {
-            iter (i from 0 to n - 1) { r = BigInt.Add(BigInt.Mul(r, b256), BigInt._fromInt(bytes[i] % 256)); }
+            iter (i from 0 to n - 1) { limbs = BigInt._mulSmallAddL(limbs, 256, bytes[i] % 256); }
         }
-        return r;
+        return BigInt._make(1, BigInt._trim(limbs));
     }
 }
 export { BigInt };

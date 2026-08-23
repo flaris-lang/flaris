@@ -1,0 +1,39 @@
+// test_http_redirect.fls - server half of the redirect credential test.
+//
+// Started by tests/test_http_redirect.sh, which then runs
+// test_http_redirect_client.fls against it in a separate process. Two
+// processes are needed because the Http client blocks the scheduler: a
+// client and a server fiber in one VM deadlock.
+//
+// Two origins on two ports. Both report back which credential headers
+// actually reached them, which is the whole question under test.
+
+import { HttpServer } from library("HttpServer", "1.0");
+
+const FOREIGN_PORT = 18092;
+const HOME_PORT    = 18091;
+
+fn report(req, res) {
+    res.Json({
+        auth:   req.Header("authorization")       ?? "-",
+        cookie: req.Header("cookie")              ?? "-",
+        proxy:  req.Header("proxy-authorization") ?? "-",
+        trace:  req.Header("x-trace")             ?? "-"
+    });
+}
+
+fn Main() {
+    let foreign = new HttpServer({ port: FOREIGN_PORT, idleTimeoutMs: 2000 });
+    foreign.Get("/land", fn(req, res) { report(req, res); });
+    foreign.ListenAsync();
+
+    let home = new HttpServer({ port: HOME_PORT, idleTimeoutMs: 2000 });
+    home.Get("/cross", fn(_req, res) {
+        res.Redirect("http://127.0.0.1:" + str(FOREIGN_PORT) + "/land");
+    });
+    // Same host and port, so the caller never leaves the origin it trusted.
+    home.Get("/same",   fn(_req, res) { res.Redirect("/landed"); });
+    home.Get("/landed", fn(req, res) { report(req, res); });
+    home.Listen();
+    return 0;
+}

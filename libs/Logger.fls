@@ -142,8 +142,10 @@ class Logger {
     fn Disable()         { this._enabled = false; }
     fn IsEnabled(): bool { return this._enabled; }
 
+    // Escaped here rather than per write: the prefix is set once and printed on
+    // every line, so the cost belongs at the setter.
     fn SetPrefix(prefix:string) {
-        this._prefix = (prefix == nil ? "" : prefix);
+        this._prefix = (prefix == nil ? "" : Logger._safe(prefix));
     }
 
     fn SetTimestamp(enabled:bool) {
@@ -167,6 +169,28 @@ class Logger {
     fn SetRotation(maxBytes:int, maxFiles?:int) {
         this._maxBytes = (maxBytes == nil) ? 0 : maxBytes;
         if (maxFiles != nil && maxFiles >= 1) { this._maxFiles = maxFiles; }
+    }
+
+    // A log is a line-oriented record, so a newline inside a message is not
+    // formatting - it is a second record that the message's author gets to
+    // author. A username of "bob\n[ERR] payment refunded" lands in the file as
+    // its own ERR line and no reader can tell it apart from a real one. ESC is
+    // escaped for the same reason one step further out: a message replayed to a
+    // terminal with `cat` can otherwise repaint what is already on screen.
+    //
+    // Rendered as visible escapes rather than dropped, so the message still
+    // says what it said. This is a display encoding, not a reversible one -
+    // SetJson(true) is the mode to use when something has to parse the output
+    // back, and it needs no help here because Json.Stringify already escapes.
+    fn static _safe(v): string {
+        let t = str(v);
+        // One strcspn pass decides it; the overwhelming majority of messages
+        // hold none of these and return without allocating.
+        if (String.IndexOfAnyFrom(t, "\r\n\x1b", 0) < 0) { return t; }
+        var r = String.Replace(t, "\r", "\\r");
+        r     = String.Replace(r, "\n", "\\n");
+        r     = String.Replace(r, "\x1b", "\\e");
+        return r;
     }
 
     fn static LevelName(lvl:int): string {
@@ -219,7 +243,7 @@ class Logger {
                 levelTag = ansi + levelTag + "\x1b[0m";
             }
             let fieldsStr = ((obj ?? nil) != nil) ? Json.Stringify(obj) : nil;
-            line = line + levelTag + " " + msg + (fieldsStr != nil ? " " + fieldsStr : "") + "\n";
+            line = line + levelTag + " " + Logger._safe(msg) + (fieldsStr != nil ? " " + fieldsStr : "") + "\n";
         }
 
         if      (this._sink == 0)                              { Console.Write(line); }
@@ -240,7 +264,7 @@ class Logger {
             else if (lvl == 3) { sev = 3; }
             else if (lvl == 4) { sev = 2; }
             let sfields = ((obj ?? nil) != nil) ? Json.Stringify(obj) : nil;
-            let smsg = "<" + str(8 + sev) + ">flaris: [" + prefix + "] " + msg;
+            let smsg = "<" + str(8 + sev) + ">flaris: [" + prefix + "] " + Logger._safe(msg);
             if (sfields != nil) { smsg = smsg + " " + sfields; }
             Stream.WriteString(this._syslog, smsg);
         }
@@ -303,7 +327,7 @@ class Logger {
         child._sink      = this._sink;
         child._file      = this._file;
         child._fileStream = this._fileStream;
-        child._prefix    = (this._prefix != "" ? this._prefix + "." : "") + prefix;
+        child._prefix    = (this._prefix != "" ? this._prefix + "." : "") + Logger._safe(prefix);
         child._timestamp = this._timestamp;
         child._useColor  = this._useColor;
         child._enabled   = this._enabled;
@@ -314,10 +338,12 @@ class Logger {
         return child;
     }
 
+    // Both halves are escaped: a field *name* is as likely to come from caller
+    // data as its value, and either one carrying a newline splits the line.
     fn _formatFields(fields:object) : string {
         var s = "";
         foreach (entry in Object.Entries(fields)) {
-            s = s + " " + entry[0] + "=" + str(entry[1]);
+            s = s + " " + Logger._safe(entry[0]) + "=" + Logger._safe(entry[1]);
         }
         return s;
     }

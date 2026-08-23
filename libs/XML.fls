@@ -90,14 +90,95 @@ class XML {
 
     // ── Entity codec ──────────────────────────────────────────────────────────
 
+    // Decoding is a single left-to-right pass, and it has to be. Chained
+    // String.Replace calls decode their own output: expanding "&amp;" first
+    // turns "&amp;lt;" into "&lt;", which the very next Replace then turns into
+    // a real "<". A document that correctly escaped a literal "&lt;" comes back
+    // holding a tag delimiter instead - an escaping bypass wherever that text is
+    // later re-serialised or handed to an HTML sink. Scanning once cannot do
+    // that: every entity is consumed from the source, never from the result.
+    //
+    // An unrecognised "&..." is passed through verbatim rather than dropped.
+    // XML calls it a well-formedness error, but a parser that silently deletes
+    // text is worse than one that hands it back unchanged.
     fn _decode(s: string) : string {
-        if (!String.Contains(s, "&")) return s;
-        var r = String.Replace(s,    "&amp;",  "&");
-        r      = String.Replace(r,   "&lt;",   "<");
-        r      = String.Replace(r,   "&gt;",   ">");
-        r      = String.Replace(r,   "&quot;", "\"");
-        r      = String.Replace(r,   "&apos;", "'");
-        return r;
+        let amp = String.IndexOf(s, "&");
+        if (amp < 0) return s;
+
+        let n = len(s);
+        let parts = [];
+        var pos = 0;
+        var at  = amp;
+
+        while (at >= 0) {
+            if (at > pos) { Array.Append(parts, String.Substr(s, pos, at - pos)); }
+
+            // The longest reference this parser knows is "&#x10FFFF;" - an
+            // eight-character body - so a ";" further off than that cannot be
+            // closing an entity, and the "&" is just an ampersand. Bounding it
+            // also keeps a document full of stray "&" from scanning to the end
+            // of the text on every one.
+            let semi = String.IndexOfFrom(s, ";", at + 1);
+            var lit = nil;
+            if (semi > at && semi - at <= 9) {
+                lit = XML._entity(String.Substr(s, at + 1, semi - at - 1));
+            }
+
+            if (lit == nil) {
+                Array.Append(parts, String.Substr(s, at, 1));   // a bare "&"
+                pos = at + 1;
+            } else {
+                Array.Append(parts, lit);
+                pos = semi + 1;
+            }
+            at = (pos < n) ? String.IndexOfFrom(s, "&", pos) : -1;
+        }
+
+        if (pos < n) { Array.Append(parts, String.Substr(s, pos, n - pos)); }
+        return String.Join(parts, "");
+    }
+
+    // The body of one entity reference - what sits between "&" and ";" - as the
+    // text it stands for, or nil when it is not a reference this parser knows.
+    fn static _entity(body: string) : string {
+        if (body == "amp")  return "&";
+        if (body == "lt")   return "<";
+        if (body == "gt")   return ">";
+        if (body == "quot") return "\"";
+        if (body == "apos") return "'";
+
+        // Numeric character references. Real documents are full of them -
+        // "&#8217;" for a right single quote is what most editors emit - and
+        // without this they survive the parse as literal text and then get
+        // re-encoded to "&amp;#8217;" on the way out, mangling the document.
+        if (len(body) < 2 || String.Substr(body, 0, 1) != "#") return nil;
+
+        var digits = "";
+        var radix  = 10;
+        let second = String.Substr(body, 1, 1);
+        if (second == "x" || second == "X") {
+            if (len(body) < 3) return nil;
+            digits = String.Substr(body, 2, len(body) - 2);
+            radix  = 16;
+        } else {
+            digits = String.Substr(body, 1, len(body) - 1);
+        }
+
+        // Every character has to be a digit of the right base. Without this a
+        // parser that stops at the first bad character would read "&#5abc;" as
+        // codepoint 5 and silently drop the rest.
+        let allowed = (radix == 16) ? "0123456789abcdefABCDEF" : "0123456789";
+        iter (i from 0 to len(digits) - 1) {
+            if (String.IndexOf(allowed, String.Substr(digits, i, 1)) < 0) return nil;
+        }
+
+        let cp = Convert.ParseRadix(digits, radix);
+
+        // U+0000 cannot be represented in a Flaris string, and anything past
+        // U+10FFFF or inside the surrogate range is not a codepoint at all.
+        if (cp == nil || cp <= 0 || cp > 1114111) return nil;
+        if (cp >= 55296 && cp <= 57343) return nil;
+        return "" + Char.FromInt(cp);
     }
 
     fn _encode(s: string) : string {
