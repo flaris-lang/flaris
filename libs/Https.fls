@@ -51,10 +51,16 @@
 //
 // Self-signed / internal endpoints (skips certificate + hostname verification):
 //   Https.GetInsecure(url, headers?)
+//   Https.PostInsecure / PutInsecure / PatchInsecure / QueryInsecure / DeleteInsecure
+//   Https.HeadInsecure(url, headers?)
 //   Https.RequestInsecure(method, url, body, contentType, headers?)
 //
 // Async variants (genuinely non-blocking):
 //   Https.GetAsync / PostAsync / PutAsync / PatchAsync / QueryAsync / DeleteAsync
+//   Https.HeadAsync
+//   Https.GetInsecureAsync / PostInsecureAsync / PutInsecureAsync / PatchInsecureAsync
+//   Https.QueryInsecureAsync / DeleteInsecureAsync / HeadInsecureAsync
+//   Https.RequestInsecureAsync
 //   Each returns a fiber and offloads the blocking TLS connect/read/write to the
 //   I/O thread pool, suspending only the calling fiber - so requests started
 //   together actually overlap. `await` the result (or Scheduler.Schedule several,
@@ -102,10 +108,18 @@ class Https {
     // OpenSSL / SChannel). The HTTP engine drives it exactly like the plain-TCP
     // transport - only the bytes on the wire are encrypted.
     fn static _buildTransport(opts) {
+        // Always apply the library default timeout unless the caller overrides
+        // it per transport.
+        let finalOpts = { timeoutMs: _httpsTimeoutMs };
+        if (opts != nil) {
+            foreach (val, key in opts) {
+                finalOpts[key] = val;
+            }
+        }
         // The ordinary Stream transport, opened with ConnectTls. A build without
         // TLS surfaces at connect time via Stream.TlsLastError, which names the
         // missing dependency.
-        return Http._streamTransport(true, opts);
+        return Http._streamTransport(true, finalOpts);
     }
 
     // Default verifying transport, cached for reuse across requests.
@@ -123,6 +137,7 @@ class Https {
     // Raise this for slow upstreams, e.g. long LLM generations:
     //   Https.SetTimeout(300000);   // 5 minutes
     fn static SetTimeout(ms:int) {
+        if (ms <= 0) throw(400, "Https.SetTimeout: ms must be > 0");
         _httpsTimeoutMs = ms;
         _httpsTransportSecure = nil;   // rebuild the cached transport with the new timeout
     }
@@ -174,6 +189,82 @@ class Https {
                             Https._buildTransport({ insecure: true }));
     }
 
+    fn static PostInsecure(url:string, body, headers?) {
+        return Http.Request("POST", url, body, ContentType.JSON, headers ?? nil,
+                            Https._buildTransport({ insecure: true }));
+    }
+
+    fn static PutInsecure(url:string, body, headers?) {
+        return Http.Request("PUT", url, body, ContentType.JSON, headers ?? nil,
+                            Https._buildTransport({ insecure: true }));
+    }
+
+    fn static PatchInsecure(url:string, body, headers?) {
+        return Http.Request("PATCH", url, body, ContentType.JSON, headers ?? nil,
+                            Https._buildTransport({ insecure: true }));
+    }
+
+    fn static QueryInsecure(url:string, body, headers?) {
+        return Http.Request("QUERY", url, body, ContentType.JSON, headers ?? nil,
+                            Https._buildTransport({ insecure: true }));
+    }
+
+    fn static DeleteInsecure(url:string, headers?) {
+        return Http.Request("DELETE", url, nil, nil, headers ?? nil,
+                            Https._buildTransport({ insecure: true }));
+    }
+
+    fn static HeadInsecure(url:string, headers?) {
+        let res = Http.Request("HEAD", url, nil, nil, headers ?? nil,
+                               Https._buildTransport({ insecure: true }));
+        if (res == nil) { return nil; }
+        return { status: res.status, headers: res.headers };
+    }
+
+    // Async insecure helpers for self-signed/internal endpoints when callers
+    // still want non-blocking behavior.
+    fn static RequestInsecureAsync(method:string, url:string, body, contentType, headers?) {
+        return Http.RequestAsync(method, url, body, contentType, headers ?? nil,
+                                 Https._buildTransport({ insecure: true }));
+    }
+
+    fn static GetInsecureAsync(url:string, headers?) {
+        return Http.RequestAsync("GET", url, nil, nil, headers ?? nil,
+                                 Https._buildTransport({ insecure: true }));
+    }
+
+    fn static PostInsecureAsync(url:string, body, headers?) {
+        return Http.RequestAsync("POST", url, body, ContentType.JSON, headers ?? nil,
+                                 Https._buildTransport({ insecure: true }));
+    }
+
+    fn static PutInsecureAsync(url:string, body, headers?) {
+        return Http.RequestAsync("PUT", url, body, ContentType.JSON, headers ?? nil,
+                                 Https._buildTransport({ insecure: true }));
+    }
+
+    fn static PatchInsecureAsync(url:string, body, headers?) {
+        return Http.RequestAsync("PATCH", url, body, ContentType.JSON, headers ?? nil,
+                                 Https._buildTransport({ insecure: true }));
+    }
+
+    fn static QueryInsecureAsync(url:string, body, headers?) {
+        return Http.RequestAsync("QUERY", url, body, ContentType.JSON, headers ?? nil,
+                                 Https._buildTransport({ insecure: true }));
+    }
+
+    fn static DeleteInsecureAsync(url:string, headers?) {
+        return Http.RequestAsync("DELETE", url, nil, nil, headers ?? nil,
+                                 Https._buildTransport({ insecure: true }));
+    }
+
+    fn static async HeadInsecureAsync(url:string, headers?) {
+        let res = await Http.RequestAsync("HEAD", url, nil, nil, headers ?? nil,
+                                          Https._buildTransport({ insecure: true }));
+        if (res == nil) { return nil; }
+        return { status: res.status, headers: res.headers };
+    }
+
     // --------------------------------------------------------
     //  Async variants - genuinely non-blocking.
     //
@@ -193,6 +284,12 @@ class Https {
     fn static PatchAsync(url:string, body, headers?) { return Http.RequestAsync("PATCH",  url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
     fn static QueryAsync(url:string, body, headers?) { return Http.RequestAsync("QUERY",  url, body, ContentType.JSON, headers ?? nil, Https._transport()); }
     fn static DeleteAsync(url:string, headers?)      { return Http.RequestAsync("DELETE", url, nil,  nil,              headers ?? nil, Https._transport()); }
+
+    fn static async HeadAsync(url:string, headers?) {
+        let res = await Http.RequestAsync("HEAD", url, nil, nil, headers ?? nil, Https._transport());
+        if (res == nil) { return nil; }
+        return { status: res.status, headers: res.headers };
+    }
 }
 
 // Re-export Http's helpers so callers can `import { Https, Status, CookieJar } from library("Https","1.0")`.

@@ -73,21 +73,68 @@ fn test_timeout_config() {
 
     Https.SetTimeout(original);   // restore so later tests use the default
     checkEq(Https.GetTimeout(), original, "SetTimeout restores default");
+
+    let threw = false;
+    try { Https.SetTimeout(0); } catch (e) { threw = true; }
+    check(threw, "SetTimeout(0) throws");
 }
 
-// Plain Http must refuse https:// and point the user at the Https library.
-fn test_plain_http_rejects_https() {
-    Console.WriteLine("-- plain Http rejects https://");
+// Insecure method surface should be available and gracefully return nil on a
+// clearly invalid URL instead of throwing.
+fn async test_insecure_surface_offline() {
+    Console.WriteLine("-- insecure API surface (offline)");
+
+    let s1 = Https.GetInsecure("", nil);
+    let s2 = Https.PostInsecure("", { x: 1 }, nil);
+    let s3 = Https.PutInsecure("", { x: 1 }, nil);
+    let s4 = Https.PatchInsecure("", { x: 1 }, nil);
+    let s5 = Https.QueryInsecure("", { x: 1 }, nil);
+    let s6 = Https.DeleteInsecure("", nil);
+    let s7 = Https.HeadInsecure("", nil);
+    let s8 = Https.RequestInsecure("GET", "", nil, nil, nil);
+
+    checkEq(s1, nil, "GetInsecure invalid URL -> nil");
+    checkEq(s2, nil, "PostInsecure invalid URL -> nil");
+    checkEq(s3, nil, "PutInsecure invalid URL -> nil");
+    checkEq(s4, nil, "PatchInsecure invalid URL -> nil");
+    checkEq(s5, nil, "QueryInsecure invalid URL -> nil");
+    checkEq(s6, nil, "DeleteInsecure invalid URL -> nil");
+    checkEq(s7, nil, "HeadInsecure invalid URL -> nil");
+    checkEq(s8, nil, "RequestInsecure invalid URL -> nil");
+
+    let a1 = await Https.GetInsecureAsync("", nil);
+    let a2 = await Https.PostInsecureAsync("", { x: 1 }, nil);
+    let a3 = await Https.PutInsecureAsync("", { x: 1 }, nil);
+    let a4 = await Https.PatchInsecureAsync("", { x: 1 }, nil);
+    let a5 = await Https.QueryInsecureAsync("", { x: 1 }, nil);
+    let a6 = await Https.DeleteInsecureAsync("", nil);
+    let a7 = await Https.HeadInsecureAsync("", nil);
+    let a8 = await Https.RequestInsecureAsync("GET", "", nil, nil, nil);
+
+    checkEq(a1, nil, "GetInsecureAsync invalid URL -> nil");
+    checkEq(a2, nil, "PostInsecureAsync invalid URL -> nil");
+    checkEq(a3, nil, "PutInsecureAsync invalid URL -> nil");
+    checkEq(a4, nil, "PatchInsecureAsync invalid URL -> nil");
+    checkEq(a5, nil, "QueryInsecureAsync invalid URL -> nil");
+    checkEq(a6, nil, "DeleteInsecureAsync invalid URL -> nil");
+    checkEq(a7, nil, "HeadInsecureAsync invalid URL -> nil");
+    checkEq(a8, nil, "RequestInsecureAsync invalid URL -> nil");
+}
+
+// Plain Http now supports https:// directly via the shared transport engine.
+fn test_plain_http_accepts_https() {
+    Console.WriteLine("-- plain Http accepts https://");
     let threw = false;
-    var code  = 0;
+    let res = nil;
     try {
-        Http.Get("https://api.github.com/");
+        res = Http.Get("https://api.github.com/");
     } catch (e) {
         threw = true;
-        code  = e.Code;
     }
-    check(threw, "Http.Get on https:// throws");
-    checkEq(code, 100, "Http.Get on https:// throws code 100");
+    check(!threw, "Http.Get on https:// does not throw");
+    if (res != nil) {
+        soft(res.status == Status.OK, "Http.Get https status == 200 (got " + Convert.ToString(res.status) + ")");
+    }
 }
 
 // ============================================================
@@ -179,6 +226,24 @@ fn test_live_head() {
     }
 }
 
+fn async test_live_head_async() {
+    Console.WriteLine("-- live HEAD async (soft)");
+    if (!netOk) { Console.WriteLine("  (skip) network down"); return; }
+    let res = await Https.HeadAsync("https://api.github.com/", { "User-Agent": "flaris-test" });
+    soft(res != nil,                  "HeadAsync returns a response");
+    if (res != nil) {
+        soft(res.status == Status.OK, "HeadAsync status == 200");
+        soft(res.headers != nil,       "HeadAsync returns headers");
+    }
+}
+
+fn async test_live_insecure_async() {
+    Console.WriteLine("-- insecure async (soft)");
+    if (!netOk) { Console.WriteLine("  (skip) network down"); return; }
+    let res = await Https.GetInsecureAsync("https://wrong.host.badssl.com/", nil);
+    soft(res != nil, "GetInsecureAsync succeeds on wrong-hostname cert");
+}
+
 // Certificate verification: a wrong-hostname cert must be rejected (nil) when
 // verifying, but accepted by the insecure variant.
 fn test_cert_verification() {
@@ -223,17 +288,20 @@ fn test_benchmarks() {
     Console.WriteLine("=== benchmarks done ===");
 }
 
-fn Main() {
+fn async Main() {
     Console.WriteLine("=== Https test suite ===");
 
     test_transport_shape();
     test_timeout_config();
-    test_plain_http_rejects_https();
+    await test_insecure_surface_offline();
+    test_plain_http_accepts_https();
     test_object_body_is_json();
     test_string_body_passthrough();
     test_live_get();
     test_live_head();
+    await test_live_head_async();
     test_cert_verification();
+    await test_live_insecure_async();
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

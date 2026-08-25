@@ -802,10 +802,15 @@ class Http {
             cmd = cmd + " -O " + Http._shq(dest);
         }
 
-        cmd = cmd + " --url " + Http._shq(url) + " 2>&1";
+        // wget expects URL as a positional argument (no --url flag).
+        cmd = cmd + " " + Http._shq(url) + " 2>&1";
 
         let raw = Os.Execute(cmd);
         if (raw == nil) { return nil; }
+        let low = String.ToLower(raw);
+        if (String.Contains(low, "command not found") || String.Contains(low, "not recognized")) {
+            return nil;
+        }
 
         // wget writes status line to stderr, captured via 2>&1
         // Look for "  HTTP/1.x NNN" in output
@@ -814,9 +819,13 @@ class Http {
         foreach (line in lines) {
             if (String.Contains(line, "HTTP/")) {
                 let parts = String.Split(String.Trim(line), " ");
-                if (len(parts) >= 2) {
-                    let s = Convert.ParseInt(parts[1]);
-                    if (s != nil) { status = s; }
+                if (len(parts) > 0) {
+                    // Be tolerant of variable spacing and proxy chains:
+                    // pick the latest token that looks like a status code.
+                    foreach (tok in parts) {
+                        let s = Convert.ParseInt(tok);
+                        if (s != nil && s >= 100 && s <= 599) { status = s; }
+                    }
                 }
             }
         }
@@ -942,15 +951,15 @@ class Http {
     //  Async API
     // --------------------------------------------------------
 
-    fn static async GetAsync(url:string, headers?)    { return Http._request("GET",    url, nil,  nil,              headers ?? nil); }
-    fn static async PostAsync(url:string, body, headers?)   { return Http._request("POST",   url, body, ContentType.JSON, headers ?? nil); }
-    fn static async PutAsync(url:string, body, headers?)    { return Http._request("PUT",    url, body, ContentType.JSON, headers ?? nil); }
-    fn static async PatchAsync(url:string, body, headers?)  { return Http._request("PATCH",  url, body, ContentType.JSON, headers ?? nil); }
-    fn static async QueryAsync(url:string, body, headers?)   { return Http._request("QUERY",  url, body, ContentType.JSON, headers ?? nil); }
-    fn static async DeleteAsync(url:string, headers?) { return Http._request("DELETE", url, nil,  nil,              headers ?? nil); }
+    fn static async GetAsync(url:string, headers?)    { return await Http._requestAsync("GET",    url, nil,  nil,              headers ?? nil, nil); }
+    fn static async PostAsync(url:string, body, headers?)   { return await Http._requestAsync("POST",   url, body, ContentType.JSON, headers ?? nil, nil); }
+    fn static async PutAsync(url:string, body, headers?)    { return await Http._requestAsync("PUT",    url, body, ContentType.JSON, headers ?? nil, nil); }
+    fn static async PatchAsync(url:string, body, headers?)  { return await Http._requestAsync("PATCH",  url, body, ContentType.JSON, headers ?? nil, nil); }
+    fn static async QueryAsync(url:string, body, headers?)   { return await Http._requestAsync("QUERY",  url, body, ContentType.JSON, headers ?? nil, nil); }
+    fn static async DeleteAsync(url:string, headers?) { return await Http._requestAsync("DELETE", url, nil,  nil,              headers ?? nil, nil); }
 
     fn static async HeadAsync(url:string, headers?) {
-        let res = Http._request("HEAD", url, nil, nil, headers ?? nil);
+        let res = await Http._requestAsync("HEAD", url, nil, nil, headers ?? nil, nil);
         if (res == nil) { return nil; }
         return { status: res.status, headers: res.headers };
     }
