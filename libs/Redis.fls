@@ -132,6 +132,8 @@
 //   Del(key)      Exists(key)     Rename(key, newkey)
 //   Expire(key, seconds)    Persist(key)    Ttl(key)
 //   Keys(pattern)           →  array of matching key names
+//   Scan(cursor, pattern?, count?)   →  { cursor, keys }
+//   ScanKeys(pattern, count?, limit?) → array of matching key names
 //
 // Lists:
 //   LPush(key, value)    RPush(key, value)
@@ -299,6 +301,46 @@ class Redis {
 
     // r.Keys(pattern) - array<string>   (use sparingly on large keyspaces)
     fn Keys(pattern: string) { return this._a(["KEYS", pattern]); }
+
+    // r.Scan(cursor, pattern?, count?) - object { cursor, keys }
+    // Incremental keyspace scan. Use this instead of KEYS for large databases.
+    // cursor: "0" starts a new scan and also indicates completion when returned.
+    fn Scan(cursor: string, pattern?, count?) {
+        let argv = ["SCAN", cursor];
+        if (pattern != nil) {
+            Array.Append(argv, "MATCH");
+            Array.Append(argv, pattern);
+        }
+        if (count != nil) {
+            Array.Append(argv, "COUNT");
+            Array.Append(argv, str(count));
+        }
+        let raw = this._a(argv);
+        if (raw == nil || len(raw) < 2) { return { cursor: "0", keys: [] }; }
+        let next = str(raw[0]);
+        let keys = raw[1] == nil ? [] : raw[1];
+        return { cursor: next, keys: keys };
+    }
+
+    // r.ScanKeys(pattern, count?, limit?) - array<string>
+    // Collect all matching keys by paging SCAN until cursor returns to "0".
+    // limit caps the number of keys returned (useful for sampling).
+    fn ScanKeys(pattern: string, count?, limit?) {
+        let out = [];
+        let cursor = "0";
+        while (true) {
+            let page = this.Scan(cursor, pattern, count);
+            cursor = page.cursor;
+            if (page.keys != nil) {
+                foreach (k in page.keys) {
+                    Array.Append(out, k);
+                    if (limit != nil && len(out) >= limit) { return out; }
+                }
+            }
+            if (cursor == "0") { break; }
+        }
+        return out;
+    }
 
     // ── List commands ────────────────────────────────────────────────────────
 
