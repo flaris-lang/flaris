@@ -3092,6 +3092,7 @@ Process, environment, and system interface. Functions marked **unsafe** require 
 | **TempDir** | `TempDir() - string` | Returns path to system temp directory. | — |
 | **Uid** | `Uid() - int` | Returns the real user ID of the process. | — |
 | **Wait** | `Wait(pid:int) - int` | Wait (blocking) for child process to exit. Returns its exit code, the negative signal number if killed by a signal, or `nil` on `waitpid` error. | — |
+| **WaitTimeout** | `WaitTimeout(pid:int, timeoutMs:int) - object` | Wait up to `timeoutMs` milliseconds for a child process to exit. Returns `{Alive:bool, Exit:int, TimedOut:bool}`; when the deadline expires first, `Alive` stays `true` and `TimedOut` is `true`. | — |
 | **Spawn** | `Spawn(cmd:string, args?:array) - object` | Fork and exec `cmd` with separate stdin/stdout/stderr pipes. Returns `{Pid:int, Stdin:int, Stdout:int, Stderr:int}` where the int values are raw file descriptors for use with `ReadPipe`/`WritePipe`/`ClosePipe`. Returns `nil` on error. Stdout and stderr fds are non-blocking. | — |
 | **ReadPipe** | `ReadPipe(fd:int) - string` | Non-blocking read from a pipe fd returned by `Spawn`. Returns `nil` when no data is available or the pipe is closed. | — |
 | **WritePipe** | `WritePipe(fd:int, data:string) - int` | Write `data` to a pipe fd (stdin of a spawned process). Returns bytes written, or `-1` on error. | — |
@@ -3100,6 +3101,7 @@ Process, environment, and system interface. Functions marked **unsafe** require 
 | **TryWait** | `TryWait(pid:int) - object` | Non-blocking wait. Returns `{Alive:bool, Exit:int}`. When `Alive` is `false` the child has been reaped and `Exit` holds the exit code. Prefer over polling `IsAlive`+`Wait` to avoid double-reap. | — |
 | **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance. For sending signals to arbitrary PIDs use `Os.Kill` (requires `--unsafe`). | — |
 | **RunEx** | `RunEx(cmd:string, args?:array) - object` | Run `cmd` and wait for it to finish. Returns `{Exit:int, Stdout:string, Stderr:string}` with stdout and stderr captured separately. Returns `nil` on fork/spawn failure. | — |
+| **RunExTimeout** | `RunExTimeout(cmd:string, timeoutMs:int, args?:array) - object` | Run `cmd` with separate stdout/stderr capture and wait up to `timeoutMs` milliseconds. Returns `{Exit:int, Stdout:string, Stderr:string, TimedOut:bool}`. If the timeout expires first, the child is terminated and `TimedOut` is `true` with `Exit` set to `124`. | — |
 | **GetEnvAll** | `GetEnvAll() - object` | Returns all environment variables as an object `{NAME: "value", ...}`. | — |
 
 ---

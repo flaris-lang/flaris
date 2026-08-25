@@ -40,8 +40,9 @@
 //
 // API
 // ---
-//   Run(cmd, args?)       → {Exit:int, Stdout:string, Stderr:string} | nil
-//   Shell(cmd)            → {Exit:int, Stdout:string, Stderr:string} | nil
+//   Run(cmd, args?, opts?) → {Exit:int, Stdout:string, Stderr:string, TimedOut:bool} | nil
+//   Shell(cmd, opts?)      → {Exit:int, Stdout:string, Stderr:string, TimedOut:bool} | nil
+//   WaitTimeout(pid, timeoutMs) → {Alive:bool, Exit:int, TimedOut:bool}
 //   Spawn(cmd, args?)     → Process | nil
 //
 //   p.Pid                 int - process id
@@ -117,6 +118,10 @@ class Process {
             if (this._exited) return this._exitCode;
             Fiber.Sleep(1);
         }
+    }
+
+    fn WaitTimeout(timeoutMs:int) {
+        return Os.WaitTimeout(this._pid, timeoutMs);
     }
 
     fn Write(data) {
@@ -217,7 +222,7 @@ fn Start(cmd, args?, _opts?) {
     return p;
 }
 
-fn _withProcessResult(raw, timedOut) {
+fn _withProcessResult(raw) {
     let r = raw;
     if (r == nil) {
         return {
@@ -225,19 +230,20 @@ fn _withProcessResult(raw, timedOut) {
             Stdout: "",
             Stderr: "",
             Success: false,
-            TimedOut: timedOut ?? false
+            TimedOut: false
         };
     }
     r.Success = (r.Exit == 0);
-    r.TimedOut = timedOut ?? false;
+    r.TimedOut = r.TimedOut ?? false;
     return r;
 }
 
 fn Run(cmd, args?, _opts?) {
-    let raw = Os.RunEx(cmd, args ?? []);
     let timeout = (_opts != nil && _opts.timeout != nil) ? _opts.timeout : 0;
-    let timedOut = (timeout > 0 && raw != nil && raw.Exit == 0) ? false : false;
-    return _withProcessResult(raw, timedOut);
+    let raw = (timeout > 0)
+        ? Os.RunExTimeout(cmd, timeout, args ?? [])
+        : Os.RunEx(cmd, args ?? []);
+    return _withProcessResult(raw);
 }
 
 fn RunAsync(cmd, args?, _opts?) {
@@ -248,12 +254,19 @@ fn Shell(cmd, _opts?) {
     let isWin = Os.Name() == "Windows";
     let shell = isWin ? "cmd" : "sh";
     let flag  = isWin ? "/c"  : "-c";
-    let raw = Os.RunEx(shell, [flag, cmd]);
-    return _withProcessResult(raw, false);
+    let timeout = (_opts != nil && _opts.timeout != nil) ? _opts.timeout : 0;
+    let raw = (timeout > 0)
+        ? Os.RunExTimeout(shell, timeout, [flag, cmd])
+        : Os.RunEx(shell, [flag, cmd]);
+    return _withProcessResult(raw);
+}
+
+fn WaitTimeout(pid:int, timeoutMs:int) {
+    return Os.WaitTimeout(pid, timeoutMs);
 }
 
 fn StartAsync(cmd, args?, _opts?) {
     return Start(cmd, args ?? [], _opts ?? {});
 }
 
-export { Process, Spawn, Start, Run, RunAsync, Shell, StartAsync };
+export { Process, Spawn, Start, Run, RunAsync, Shell, StartAsync, WaitTimeout };
