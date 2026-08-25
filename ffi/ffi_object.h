@@ -1,5 +1,5 @@
-#ifndef FFIOBJECT_H
-#define FFIOBJECT_H
+#ifndef FLARIS_VM_FFI_OBJECT_H
+#define FLARIS_VM_FFI_OBJECT_H
 
 #include <stdint.h>
 
@@ -364,4 +364,4 @@ static inline FfiObject *ffi_object_get(const FfiObject *o, const char *key)
             return ffi_nil();            \
     } while (0)
 
-#endif
+#endif // FLARIS_VM_FFI_OBJECT_H

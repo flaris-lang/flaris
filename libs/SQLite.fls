@@ -17,10 +17,10 @@
 //
 // Compile the FFI plugin (run from repo root):
 //
-//   macOS:         gcc -shared -fPIC -O2 -o libs/sqlite_ffi.dylib libs/sqlite_ffi.c -lsqlite3
-//   Linux:         gcc -shared -fPIC -O2 -o libs/sqlite_ffi.so   libs/sqlite_ffi.c -lsqlite3
-//   Windows MinGW: gcc -shared -O2 -o libs/sqlite_ffi.dll libs/sqlite_ffi.c -lsqlite3
-//   Windows MSVC:  cl /LD libs/sqlite_ffi.c /link sqlite3.lib
+//   macOS:         gcc -shared -fPIC -O2 -I ffi -o sqlite_ffi.dylib ffi/sqlite_ffi.c -lsqlite3
+//   Linux:         gcc -shared -fPIC -O2 -I ffi -o sqlite_ffi.so   ffi/sqlite_ffi.c -lsqlite3
+//   Windows MinGW: gcc -shared -O2 -I ffi -o sqlite_ffi.dll ffi/sqlite_ffi.c -lsqlite3
+//   Windows MSVC:  cl /LD /I ffi ffi/sqlite_ffi.c /link sqlite3.lib
 //
 // Run your script with the --unsafe flag:
 //   flarisvm --unsafe script.fls --libs='./libs'
@@ -103,7 +103,7 @@
 // ---------------
 //   Open returns nil       -  check path is writable; parent directory must exist
 //   Exception.UnsafeOperation  -  add --unsafe flag: flarisvm --unsafe script.fls
-//   "symbol not found"     -  recompile sqlite_ffi; check build_sqlite.sh
+//   "symbol not found"     -  recompile sqlite_ffi from ffi/sqlite_ffi.c
 //
 // API REFERENCE
 // -------------
@@ -144,16 +144,16 @@
 // ============================================================
 
 class SQLite {
-    let _db = nil; 
-    let _sq_close = nil; 
-    let _sq_exec = nil; 
-    let _sq_exec_p = nil; 
-    let _sq_last_err = nil; 
-    let _sq_last_id = nil; 
-    let _sq_qp = nil; 
-    let _sq_query = nil; 
+    let _db:int = 0;
+    let _sq_close = nil;
+    let _sq_exec = nil;
+    let _sq_exec_p = nil;
+    let _sq_last_err = nil;
+    let _sq_last_id = nil;
+    let _sq_qp = nil;
+    let _sq_query = nil;
 
-    fn static _lib_path() {
+    fn static _lib_path(): string {
         // Bare name - Ffi.Load resolves it from ~/.flaris/ffi ($FLARIS_FFI),
         // appending the platform extension (.dylib/.so/.dll) automatically.
         return "sqlite_ffi";
@@ -172,30 +172,30 @@ class SQLite {
 
     // SQLite.Open(path) - SQLite | nil
     // Opens or creates a database file. Pass ":memory:" for a temporary in-memory DB.
-    fn static Open(path: string) {
+    fn static Open(path: string): instance|nil {
         let lib = Ffi.Load(SQLite._lib_path(), nil);
         if (lib == nil) { return nil; }
         let sq_open = Ffi.GetFunction(lib, "sqlite_open");
         if (sq_open == nil) { return nil; }
-        let handle = sq_open(path);
+        let handle:int = sq_open(path);
         if (handle == nil || handle == 0) { return nil; }
         return new SQLite(handle, lib);
     }
 
     // db.Query(sql) - array<object> | { error: string }
     // Never interpolate user input - use QueryParams instead.
-    fn Query(sql: string) {
+    fn Query(sql: string): object {
         return this._sq_query(this._db, sql);
     }
 
     // db.QueryParams(sql, params) - array<object> | { error: string }
     // Use ? placeholders; pass values as array.
-    fn QueryParams(sql: string, params) {
+    fn QueryParams(sql: string, params: array): object {
         return this._sq_qp(this._db, sql, params);
     }
 
     // db.QueryOne(sql) - object | nil   Returns first row or nil; nil on empty or error.
-    fn QueryOne(sql: string) {
+    fn QueryOne(sql: string): object|nil {
         let rows = this._sq_query(this._db, sql);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -203,7 +203,7 @@ class SQLite {
     }
 
     // db.QueryOneParams(sql, params) - object | nil
-    fn QueryOneParams(sql: string, params) {
+    fn QueryOneParams(sql: string, params: array): object|nil {
         let rows = this._sq_qp(this._db, sql, params);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -211,7 +211,7 @@ class SQLite {
     }
 
     // db.ScalarInt(sql) - int | nil
-    fn ScalarInt(sql: string) {
+    fn ScalarInt(sql: string): int|nil {
         let rows = this._sq_query(this._db, sql);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -221,7 +221,7 @@ class SQLite {
     }
 
     // db.ScalarIntParams(sql, params) - int | nil
-    fn ScalarIntParams(sql: string, params) {
+    fn ScalarIntParams(sql: string, params: array): int|nil {
         let rows = this._sq_qp(this._db, sql, params);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -231,7 +231,7 @@ class SQLite {
     }
 
     // db.ScalarString(sql) - string | nil
-    fn ScalarString(sql: string) {
+    fn ScalarString(sql: string): string|nil {
         let rows = this._sq_query(this._db, sql);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -241,7 +241,7 @@ class SQLite {
     }
 
     // db.ScalarStringParams(sql, params) - string | nil
-    fn ScalarStringParams(sql: string, params) {
+    fn ScalarStringParams(sql: string, params: array): string|nil {
         let rows = this._sq_qp(this._db, sql, params);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -252,20 +252,64 @@ class SQLite {
 
     // db.Exec(sql) - int  (affected rows, -1 on error)
     // For CREATE TABLE, INSERT, UPDATE, DELETE. Never interpolate user input.
-    fn Exec(sql: string) {
+    fn Exec(sql: string): int {
         return this._sq_exec(this._db, sql);
     }
 
     // db.ExecParams(sql, params) - int  (affected rows, -1 on error)
     // Use ? placeholders; pass values as array.
-    fn ExecParams(sql: string, params) {
+    fn ExecParams(sql: string, params: array): int {
         return this._sq_exec_p(this._db, sql, params);
+    }
+
+    // db.ExecMany(sql, rows) - total affected rows, or -1 on error.
+    // rows is an array of param arrays, each like [v1, v2, ...].
+    fn ExecMany(sql: string, rows: array): int {
+        if (rows == nil) { return this.Exec(sql); }
+        let total:int = 0;
+        foreach (params in rows) {
+            let n:int = this.ExecParams(sql, params);
+            if (n == -1) return -1;
+            total = total + n;
+        }
+        return total;
+    }
+
+    // db.QueryValue(sql) - first cell of first row, or nil.
+    fn QueryValue(sql: string): object|nil {
+        let rows = this.Query(sql);
+        if (rows == nil || "error" in rows || len(rows) == 0) return nil;
+        let row = rows[0];
+        foreach (v in row) { return v; }
+        return nil;
+    }
+
+    // db.QueryValueParams(sql, params) - first cell of first row, or nil.
+    fn QueryValueParams(sql: string, params: array): object|nil {
+        let rows = this.QueryParams(sql, params);
+        if (rows == nil || "error" in rows || len(rows) == 0) return nil;
+        let row = rows[0];
+        foreach (v in row) { return v; }
+        return nil;
+    }
+
+    // db.QueryMap(sql, keyField, params?) - object keyed by keyField value.
+    fn QueryMap(sql: string, keyField: string, params?): object|nil {
+        let rows = (params == nil) ? this.Query(sql) : this.QueryParams(sql, params);
+        if (rows == nil || "error" in rows) return nil;
+        let out = {};
+        foreach (row in rows) {
+            let key = row[keyField];
+            if (key == nil) continue;
+            out[str(key)] = row;
+        }
+        return out;
     }
 
     // db.ExecError(sql) - { error: string } | int
     // Like Exec but returns { error: string } on failure so the message is accessible.
-    fn ExecError(sql: string) {
-        let n = this._sq_exec(this._db, sql);
+    fn ExecError(sql: string): object|int {
+        let n:int = this._sq_exec(this._db, sql);
         if (n == -1) {
             let msg = this._sq_last_err(this._db);
             return { error: msg == nil ? "exec failed" : msg };
@@ -274,8 +318,8 @@ class SQLite {
     }
 
     // db.ExecParamsError(sql, params) - { error: string } | int
-    fn ExecParamsError(sql: string, params) {
-        let n = this._sq_exec_p(this._db, sql, params);
+    fn ExecParamsError(sql: string, params: array): object|int {
+        let n:int = this._sq_exec_p(this._db, sql, params);
         if (n == -1) {
             let msg = this._sq_last_err(this._db);
             return { error: msg == nil ? "exec failed" : msg };
@@ -284,24 +328,24 @@ class SQLite {
     }
 
     // db.Begin() - bool
-    fn Begin() {
+    fn Begin(): bool {
         return this.Exec("BEGIN") != -1;
     }
 
     // db.Commit() - bool
-    fn Commit() {
+    fn Commit(): bool {
         return this.Exec("COMMIT") != -1;
     }
 
     // db.Rollback() - bool
-    fn Rollback() {
+    fn Rollback(): bool {
         return this.Exec("ROLLBACK") != -1;
     }
 
     // db.Transaction(f) - bool
     // Wraps f() in BEGIN/COMMIT. ROLLBACKs and rethrows on exception; rolls back
     // and returns false if f() returns false.
-    fn Transaction(f: fn) {
+    fn Transaction(f: fn): bool {
         this.Exec("BEGIN");
         try {
             let ok = f();
@@ -319,12 +363,12 @@ class SQLite {
 
     // db.LastInsertId() - int
     // Row ID of the last successful INSERT.
-    fn LastInsertId() {
+    fn LastInsertId(): int {
         return this._sq_last_id(this._db);
     }
 
     // db.Close() - bool
-    fn Close() {
+    fn Close(): bool {
         return this._sq_close(this._db);
     }
 }

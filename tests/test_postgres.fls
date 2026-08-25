@@ -11,11 +11,12 @@
 //
 // Run: ./flarisvm ./tests/test_postgres.fls --unsafe
 
-import { Postgres } from library("Postgres", "1.0");
+import { Postgres, PostgresPool } from library("Postgres", "1.0");
 
 global testsRun    = 0;
 global testsFailed = 0;
 global skipped     = 0;
+global _liveConn   = nil;
 
 fn check(cond, msg) {
     testsRun = testsRun + 1;
@@ -25,6 +26,33 @@ fn check(cond, msg) {
 fn skip(msg) {
     skipped = skipped + 1;
     Console.WriteLine("  SKIP: " + msg);
+}
+
+fn _detect_live_conn() {
+    if (_liveConn != nil) { return _liveConn; }
+
+    let env = Os.GetEnvAll();
+    let fromEnv = env["FLARIS_PG_TEST"];
+    if (fromEnv != nil && len(fromEnv) > 0) {
+        _liveConn = fromEnv;
+        return _liveConn;
+    }
+
+    // Common local Docker defaults; try fast and non-fatal probes.
+    let candidates = [
+        "host=localhost port=5432 dbname=postgres user=postgres password=postgres connect_timeout=1",
+        "host=127.0.0.1 port=5432 dbname=postgres user=postgres password=postgres connect_timeout=1"
+    ];
+    foreach (conn in candidates) {
+        let db = Postgres.Connect(conn);
+        if (db != nil) {
+            db.Close();
+            _liveConn = conn;
+            return _liveConn;
+        }
+    }
+
+    return nil;
 }
 
 // Connect must answer nil for an unusable target - never raise, never crash.
@@ -48,10 +76,9 @@ fn test_graceful_failure() {
 }
 
 fn test_live_server() {
-    let env = Os.GetEnvAll();
-    let conn = env["FLARIS_PG_TEST"];
+    let conn = _detect_live_conn();
     if (conn == nil || len(conn) == 0) {
-        skip("live server checks - set FLARIS_PG_TEST to a connection string to run them");
+        skip("live server checks - set FLARIS_PG_TEST or run a local Docker Postgres on :5432");
         return 0;
     }
     let db = Postgres.Connect(conn);
@@ -73,10 +100,46 @@ fn test_live_server() {
     let p = db.QueryParams("SELECT $1::int AS v", [7]);
     check(p != nil && !("error" in p) && p[0].v == 7, "parameterised query binds values");
 
+    let val = db.QueryValueParams("SELECT $1::int AS v", [11]);
+    check(val == 11, "QueryValueParams returns the first scalar value");
+
+    let map = db.QueryMap("SELECT 1 AS id, 'alpha' AS label UNION ALL SELECT 2, 'beta'", "id");
+    check(map != nil && map["1"] != nil && map["2"] != nil, "QueryMap builds a keyed result map");
+
+    let inserted = db.ExecMany("CREATE TABLE IF NOT EXISTS _pg_test_pool (id SERIAL PRIMARY KEY, name TEXT)");
+    check(inserted >= 0, "ExecMany accepts a single statement without params");
+
+    let bulk = db.ExecMany("INSERT INTO _pg_test_pool(name) VALUES ($1)", [["a"], ["b"], ["c"]]);
+    check(bulk == 3, "ExecMany inserts all rows");
+    check(db.ScalarInt("SELECT COUNT(*) FROM _pg_test_pool") == 3, "bulk insert produced 3 rows");
+
     let bad = db.Query("SELECT * FROM a_table_that_does_not_exist");
     check(bad != nil && ("error" in bad), "a failing query reports an error object");
 
+    db.Exec("DROP TABLE IF EXISTS _pg_test_pool");
     db.Close();
+    return 0;
+}
+
+fn test_pooling() {
+    let conn = _detect_live_conn();
+    if (conn == nil || len(conn) == 0) {
+        skip("pool tests - set FLARIS_PG_TEST or run a local Docker Postgres on :5432");
+        return 0;
+    }
+
+    let pool = new PostgresPool(conn, 2);
+    let db1 = pool.Acquire();
+    let db2 = pool.Acquire();
+    check(db1 != nil && db2 != nil, "pool acquires live connections");
+    let st = pool.Stats();
+    check(st.total == 2 || st.total == 1, "pool reports connection inventory");
+    pool.Release(db1);
+    pool.Release(db2);
+    let db3 = pool.Acquire();
+    check(db3 != nil, "pool reuses released connections");
+    pool.Release(db3);
+    pool.Close();
     return 0;
 }
 
@@ -84,6 +147,7 @@ fn Main() {
     Console.WriteLine("=== Postgres tests ===");
     test_graceful_failure();
     test_live_server();
+    test_pooling();
     Console.WriteLine("");
     Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed) + "  skipped:" + str(skipped));
     if (testsFailed > 0) { return 1; }

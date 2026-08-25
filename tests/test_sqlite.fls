@@ -4,7 +4,7 @@
 //   flarisvm --unsafe tests/test_sqlite.fls --libs='./libs'
 //
 // Prerequisites:
-//   - libs/sqlite_ffi.dylib (or .so) compiled - run ./libs/build_sqlite.sh
+//   - sqlite_ffi.dylib (or .so) compiled from ffi/sqlite_ffi.c
 //   - SQLite.fls compiled: flarisvm --compile libs/SQLite.fls libs/SQLite.flx
 //
 // Uses an in-memory database - no setup required.
@@ -276,6 +276,32 @@ fn test_exec_update_delete(db) {
     checkEq("DELETE returns 1", del, 1);
 }
 
+fn test_convenience_helpers(db) {
+    Console.WriteLine("\n[14] Convenience helpers");
+
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["MapRow", 7.25, 1]);
+    db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["MapRow2", 9.5, 1]);
+
+    let score = db.QueryValueParams("SELECT score FROM users WHERE name = ?", ["MapRow"]);
+    checkEq("QueryValueParams returns a scalar", score, 7.25);
+
+    let map = db.QueryMap("SELECT id, name, score FROM users WHERE name LIKE 'MapRow%'", "name");
+    check("QueryMap returns object", map != nil);
+    check("QueryMap keyed by name", map["MapRow"] != nil);
+    checkEq("QueryMap row score", map["MapRow"].score, 7.25);
+
+    let inserted = db.ExecMany("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", [
+        ["BulkA", 1.1, 1],
+        ["BulkB", 2.2, 0],
+        ["BulkC", 3.3, 1]
+    ]);
+    checkEq("ExecMany inserts all rows", inserted, 3);
+    let bulkCount = db.ScalarInt("SELECT COUNT(*) FROM users WHERE name LIKE 'Bulk%' ");
+    checkEq("ExecMany produced three rows", bulkCount, 3);
+
+    db.Exec("DELETE FROM users WHERE name LIKE 'Bulk%' OR name LIKE 'MapRow%'");
+}
+
 fn test_exec_error(db) {
     Console.WriteLine("\n[14] Exec - error handling");
 
@@ -285,6 +311,12 @@ fn test_exec_error(db) {
     let bad2 = db.Query("SELECT * FROM no_such_table_xyz");
     check("bad Query has error key", "error" in bad2);
     check("error message non-empty", len(bad2.error) > 0);
+
+    let bad3 = db.QueryParams("SELECT name FROM users WHERE id = ? AND active = ?", [1]);
+    check("bad QueryParams has error key", "error" in bad3);
+
+    let bad4 = db.ExecParams("INSERT INTO users (name, score, active) VALUES (?, ?, ?)", ["OnlyTwo", 1.0]);
+    checkEq("bad ExecParams arity - -1", bad4, -1);
 }
 
 fn test_transaction(db) {
@@ -402,6 +434,7 @@ fn Main() {
     test_query_null(db);
     test_query_params(db);
     test_exec_update_delete(db);
+    test_convenience_helpers(db);
     test_exec_error(db);
     test_transaction(db);
     test_query_one(db);

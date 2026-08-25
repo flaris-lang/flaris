@@ -118,6 +118,20 @@ header:
 gcc -shared -fPIC -I ffi -o sqlite_ffi.so ffi/sqlite_ffi.c -lsqlite3
 ```
 
+Or use the helper script:
+
+```bash
+# system sqlite (default)
+./ffi/build_sqlite_ffi.sh --system
+
+# vendored sqlite amalgamation (no -lsqlite3 dependency)
+./ffi/build_sqlite_ffi.sh --vendored --sqlite-dir third_party/sqlite
+```
+
+For vendored mode, place `sqlite3.c` and `sqlite3.h` from the open source
+SQLite project (GitHub mirror or sqlite.org amalgamation release) in
+`third_party/sqlite/`.
+
 `ffi/ffi_object.h` is the only header a plugin needs to include - see the
 [FFI guide](doc/ffi.md) for the marshalling rules and for writing your own.
 

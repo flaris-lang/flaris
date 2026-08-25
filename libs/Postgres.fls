@@ -143,16 +143,16 @@
 // ============================================================
 
 class Postgres {
-    let _conn = nil; 
-    let _pg_close = nil; 
-    let _pg_exec = nil; 
-    let _pg_exec_p = nil; 
-    let _pg_qp = nil; 
-    let _pg_query = nil; 
-    let _pg_scalar_i = nil; 
-    let _pg_scalar_s = nil; 
+    let _conn:int = 0;
+    let _pg_close = nil;
+    let _pg_exec = nil;
+    let _pg_exec_p = nil;
+    let _pg_qp = nil;
+    let _pg_query = nil;
+    let _pg_scalar_i = nil;
+    let _pg_scalar_s = nil;
 
-    fn static _lib_path() {
+    fn static _lib_path(): string {
         // Bare name - Ffi.Load resolves it from ~/.flaris/ffi ($FLARIS_FFI),
         // appending the platform extension (.dylib/.so/.dll) automatically.
         return "pg_ffi";
@@ -170,12 +170,12 @@ class Postgres {
     }
 
     // Postgres.Connect(connstr) - Postgres | nil
-    fn static Connect(connstr: string) {
+    fn static Connect(connstr: string): instance|nil {
         let lib = Ffi.Load(Postgres._lib_path(), nil);
         if (lib == nil) { return nil; }
         let pg_connect = Ffi.GetFunction(lib, "pg_connect");
         if (pg_connect == nil) { return nil; }
-        let handle = pg_connect(connstr);
+        let handle:int = pg_connect(connstr);
         if (handle == nil || handle == 0) { return nil; }
         return new Postgres(handle, lib);
     }
@@ -183,18 +183,18 @@ class Postgres {
     // db.Query(sql) - array<object> | { error: string }
     // Each row is an object keyed by column name; types are mapped natively.
     // Never interpolate user input - use QueryParams instead.
-    fn Query(sql: string) {
+    fn Query(sql: string): object {
         return this._pg_query(this._conn, sql);
     }
 
     // db.QueryParams(sql, params) - array<object> | { error: string }
     // Parameterized SELECT. Use $1, $2, … placeholders; pass values as array.
-    fn QueryParams(sql: string, params) {
+    fn QueryParams(sql: string, params: array): object {
         return this._pg_qp(this._conn, sql, params);
     }
 
     // db.QueryOne(sql) - object | nil   Returns first row or nil; nil on empty or error.
-    fn QueryOne(sql: string) {
+    fn QueryOne(sql: string): object|nil {
         let rows = this._pg_query(this._conn, sql);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -202,7 +202,7 @@ class Postgres {
     }
 
     // db.QueryOneParams(sql, params) - object | nil
-    fn QueryOneParams(sql: string, params) {
+    fn QueryOneParams(sql: string, params: array): object|nil {
         let rows = this._pg_qp(this._conn, sql, params);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -210,12 +210,12 @@ class Postgres {
     }
 
     // db.ScalarInt(sql) - int | nil
-    fn ScalarInt(sql: string) {
+    fn ScalarInt(sql: string): int|nil {
         return this._pg_scalar_i(this._conn, sql);
     }
 
     // db.ScalarIntParams(sql, params) - int | nil
-    fn ScalarIntParams(sql: string, params) {
+    fn ScalarIntParams(sql: string, params: array): int|nil {
         let rows = this._pg_qp(this._conn, sql, params);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -225,12 +225,12 @@ class Postgres {
     }
 
     // db.ScalarString(sql) - string | nil
-    fn ScalarString(sql: string) {
+    fn ScalarString(sql: string): string|nil {
         return this._pg_scalar_s(this._conn, sql);
     }
 
     // db.ScalarStringParams(sql, params) - string | nil
-    fn ScalarStringParams(sql: string, params) {
+    fn ScalarStringParams(sql: string, params: array): string|nil {
         let rows = this._pg_qp(this._conn, sql, params);
         if ("error" in rows) { return nil; }
         if (len(rows) == 0)  { return nil; }
@@ -241,34 +241,153 @@ class Postgres {
 
     // db.Exec(sql) - int  (affected rows, or -1 on error)
     // For INSERT / UPDATE / DELETE / DDL. Never interpolate user input.
-    fn Exec(sql: string) {
+    fn Exec(sql: string): int {
         return this._pg_exec(this._conn, sql);
     }
 
     // db.ExecParams(sql, params) - int  (affected rows, or -1 on error)
     // Parameterized DML. Use $1, $2, … placeholders; pass values as array.
-    fn ExecParams(sql: string, params) {
+    fn ExecParams(sql: string, params: array): int {
         return this._pg_exec_p(this._conn, sql, params);
+    }
+
+    // db.ExecMany(sql, paramsList?) - total affected rows or -1 on error.
+    // When the second argument is omitted, the SQL is run once.
+    fn ExecMany(sql: string, paramsList?): int {
+        if (paramsList == nil) { return this.Exec(sql); }
+        let total:int = 0;
+        foreach (params in paramsList) {
+            let n:int = this.ExecParams(sql, params);
+            if (n == -1) return -1;
+            total = total + n;
+        }
+        return total;
+    }
+
+    // db.QueryValue(sql) - first scalar value from the first row, or nil.
+    fn QueryValue(sql: string): object|nil {
+        let rows = this.Query(sql);
+        if (rows == nil || "error" in rows || len(rows) == 0) return nil;
+        let row = rows[0];
+        foreach (v in row) { return v; }
+        return nil;
+    }
+
+    // db.QueryValueParams(sql, params) - first scalar value from the first row, or nil.
+    fn QueryValueParams(sql: string, params: array): object|nil {
+        let rows = this.QueryParams(sql, params);
+        if (rows == nil || "error" in rows || len(rows) == 0) return nil;
+        let row = rows[0];
+        foreach (v in row) { return v; }
+        return nil;
+    }
+
+    // db.QueryMap(sql, keyField, params?) - object keyed by the specified column.
+    fn QueryMap(sql: string, keyField: string, params?): object|nil {
+        let rows = (params == nil) ? this.Query(sql) : this.QueryParams(sql, params);
+        if (rows == nil || "error" in rows) return nil;
+        let out = {};
+        foreach (row in rows) {
+            let key = row[keyField];
+            if (key == nil) continue;
+            out[str(key)] = row;
+        }
+        return out;
     }
 
     // db.Transaction(f) - bool
     // Wraps f() in BEGIN/COMMIT. If f() returns false, rolls back and returns false.
     // Example: db.Transaction(fn() { return db.ExecParams("...", [...]) == 1; });
-    fn Transaction(f: fn) {
+    fn Transaction(f: fn): bool {
         this.Exec("BEGIN");
-        let ok = f();
-        if (ok == false) {
+        try {
+            let ok = f();
+            if (ok == false) {
+                this.Exec("ROLLBACK");
+                return false;
+            }
+            this.Exec("COMMIT");
+            return true;
+        } catch (e) {
             this.Exec("ROLLBACK");
-            return false;
+            throw(e.Code, e.Message);
         }
-        this.Exec("COMMIT");
-        return true;
     }
 
     // db.Close() - bool
-    fn Close() {
+    fn Close(): bool {
         return this._pg_close(this._conn);
     }
 }
 
-export { Postgres };
+class PostgresPool {
+    let _connstr:string = "";
+    let _cap:int = 0;
+    let _free:array = [];
+    let _inUse:array = [];
+
+    fn Constructor(connstr:string, size:int): instance {
+        if (size <= 0) throw(400, "PostgresPool: size must be > 0");
+        this._connstr = connstr;
+        this._cap = size;
+        this._free = [];
+        this._inUse = [];
+        return this;
+    }
+
+    fn Acquire(): instance|nil {
+        if (len(this._free) > 0) {
+            let db = this._free[0];
+            Array.RemoveAt(this._free, 0);
+            Array.Append(this._inUse, db);
+            return db;
+        }
+        if (len(this._free) + len(this._inUse) < this._cap) {
+            let db: instance = Postgres.Connect(this._connstr);
+            if (db == nil) return nil;
+            Array.Append(this._inUse, db);
+            return db;
+        }
+        return nil;
+    }
+
+    fn Release(db: instance): instance {
+        let i:int = 0;
+        while (i < len(this._inUse)) {
+            if (this._inUse[i] == db) {
+                Array.RemoveAt(this._inUse, i);
+                Array.Append(this._free, db);
+                return this;
+            }
+            i += 1;
+        }
+        return this;
+    }
+
+    fn Stats(): object {
+        return {
+            total: len(this._free) + len(this._inUse),
+            available: len(this._free),
+            inUse: len(this._inUse),
+            capacity: this._cap
+        };
+    }
+
+    fn Close(): instance {
+        let i:int = 0;
+        while (i < len(this._free)) {
+            this._free[i].Close();
+            i += 1;
+        }
+        let j:int = 0;
+        while (j < len(this._inUse)) {
+            this._inUse[j].Close();
+            j += 1;
+        }
+        this._free = [];
+        this._inUse = [];
+        return this;
+    }
+}
+
+export { Postgres, PostgresPool };

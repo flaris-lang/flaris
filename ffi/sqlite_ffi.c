@@ -28,12 +28,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "../vm/ffi_object.h"
+#include "ffi_object.h"
 
 /* Exports flaris_abi_version() so the runtime can verify this plugin was
  * built against a compatible FfiObject layout. */
 FLARIS_PLUGIN_ABI()
+
+// Optional self-contained build: compile with
+//   -DFLARIS_SQLITE_AMALGAMATION -I/path/to/sqlite-amalgamation
+// and place sqlite3.c/sqlite3.h in that include path.
+#ifdef FLARIS_SQLITE_AMALGAMATION
+#include "sqlite3.c"
+#else
 #include <sqlite3.h>
+#endif
 
 #ifdef _WIN32
   #define SQ_EXPORT __declspec(dllexport)
@@ -259,6 +267,12 @@ SQ_EXPORT FfiObject sqlite_query_params(FfiObject *args, int argc) {
     if (rc != SQLITE_OK) return make_error(sqlite3_errmsg(db));
 
     uint32_t nparams = args[2].array.length;
+    int expected = sqlite3_bind_parameter_count(stmt);
+    if ((int)nparams != expected) {
+        FfiObject err = make_error("parameter count mismatch");
+        sqlite3_finalize(stmt);
+        return err;
+    }
     for (uint32_t i = 0; i < nparams; i++) {
         FfiObject *el = args[2].array.elements ? &args[2].array.elements[i] : NULL;
         rc = sqlite_bind_param(stmt, (int)(i + 1), el);
@@ -320,6 +334,8 @@ SQ_EXPORT FfiObject sqlite_exec_params(FfiObject *args, int argc) {
     if (rc != SQLITE_OK) return make_int(-1);
 
     uint32_t nparams = args[2].array.length;
+    int expected = sqlite3_bind_parameter_count(stmt);
+    if ((int)nparams != expected) { sqlite3_finalize(stmt); return make_int(-1); }
     for (uint32_t i = 0; i < nparams; i++) {
         FfiObject *el = args[2].array.elements ? &args[2].array.elements[i] : NULL;
         rc = sqlite_bind_param(stmt, (int)(i + 1), el);
@@ -362,6 +378,6 @@ SQ_EXPORT FfiObject sqlite_close(FfiObject *args, int argc) {
 
     sqlite3 *db = (sqlite3 *)(uintptr_t)(uint64_t)args[0].ival;
     if (!db) return make_bool(0);
-    sqlite3_close_v2(db);
-    return make_bool(1);
+    int rc = sqlite3_close_v2(db);
+    return make_bool(rc == SQLITE_OK);
 }
