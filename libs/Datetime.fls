@@ -179,6 +179,12 @@ global _DT_TZ_BUILTIN = {
 class Duration {
     let _secs = 0;
 
+    fn AddMilliseconds(n:number): instance { return new Duration(this._secs + int(n / 1000.0)); }
+    fn AddSeconds(n:number): instance { return new Duration(this._secs + int(n)); }
+    fn AddMinutes(n:number): instance { return new Duration(this._secs + int(n * 60)); }
+    fn AddHours(n:number): instance { return new Duration(this._secs + int(n * 3600)); }
+    fn AddDays(n:number): instance { return new Duration(this._secs + int(n * 86400)); }
+
     fn Constructor(seconds:number) {
         this._secs = int(seconds);
     }
@@ -231,6 +237,7 @@ class Duration {
     // ── Static constructors ───────────────────────────────────────────────────
 
     fn static FromMilliseconds(n:number): instance { return new Duration(int(n / 1000)); }
+    fn static FromMicroseconds(n:number): instance { return new Duration(int(n / 1000000.0)); }
     fn static FromSeconds(n:number): instance      { return new Duration(n); }
     fn static FromMinutes(n:number): instance      { return new Duration(n * 60); }
     fn static FromHours(n:number): instance        { return new Duration(n * 3600); }
@@ -265,16 +272,95 @@ class Duration {
 }
 
 
+class TimeSpan {
+    let _ms = 0.0;
+
+    fn Constructor(milliseconds:number) {
+        this._ms = float(milliseconds);
+    }
+
+    fn Add(other:instance): instance { return new TimeSpan(this._ms + other._ms); }
+    fn Sub(other:instance): instance { return new TimeSpan(this._ms - other._ms); }
+    fn Scale(factor:number): instance { return new TimeSpan(this._ms * factor); }
+    fn Negate(): instance { return new TimeSpan(-this._ms); }
+    fn Abs(): instance { return new TimeSpan(Math.Abs(this._ms)); }
+
+    fn TotalMilliseconds(): float { return this._ms; }
+    fn TotalSeconds(): float { return this._ms / 1000.0; }
+    fn TotalMinutes(): float { return this._ms / 60000.0; }
+    fn TotalHours(): float { return this._ms / 3600000.0; }
+    fn TotalDays(): float { return this._ms / 86400000.0; }
+
+    fn CompareTo(other:instance): int {
+        if (this._ms < other._ms) return -1;
+        if (this._ms > other._ms) return 1;
+        return 0;
+    }
+
+    fn ToString(): string {
+        let sign = (this._ms < 0.0 ? "-" : "");
+        let total = Math.Abs(this._ms);
+        let ms = int(total) % 1000;
+        let sec = int(total / 1000.0) % 60;
+        let min = int(total / 60000.0) % 60;
+        let hour = int(total / 3600000.0);
+        return sign + String.PadLeft(str(hour), 2, "0") + ":" +
+               String.PadLeft(str(min), 2, "0") + ":" +
+               String.PadLeft(str(sec), 2, "0") + "." +
+               String.PadLeft(str(ms), 3, "0");
+    }
+
+    fn static FromMilliseconds(v:number): instance { return new TimeSpan(v); }
+    fn static FromSeconds(v:number): instance { return new TimeSpan(v * 1000.0); }
+    fn static FromMinutes(v:number): instance { return new TimeSpan(v * 60000.0); }
+    fn static FromHours(v:number): instance { return new TimeSpan(v * 3600000.0); }
+
+    fn static Parse(s:string): instance|nil {
+        let src = String.Trim(s);
+        if (String.IndexOf(src, ".") >= 0) {
+            let parts = String.Split(src, ".");
+            if (len(parts) != 2) return nil;
+            let main = TimeSpan.Parse(parts[0]);
+            if (main == nil) return nil;
+            let frac = Convert.TryParseInt(parts[1]);
+            if (frac == nil) return nil;
+            let ms = 0;
+            if (len(parts[1]) == 1) ms = frac * 100;
+            else if (len(parts[1]) == 2) ms = frac * 10;
+            else if (len(parts[1]) == 3) ms = frac;
+            else return nil;
+            return new TimeSpan(main.TotalMilliseconds() + ms);
+        }
+        let sign = (String.StartsWith(src, "-") ? -1 : 1);
+        if (sign < 0) src = String.Substr(src, 1, len(src) - 1);
+        let parts = String.Split(src, ":");
+        if (len(parts) != 3) return nil;
+        let h = Convert.TryParseInt(parts[0]);
+        let m = Convert.TryParseInt(parts[1]);
+        let sec = Convert.TryParseInt(parts[2]);
+        if (h == nil || m == nil || sec == nil) return nil;
+        if (m < 0 || m > 59 || sec < 0 || sec > 59) return nil;
+        return new TimeSpan(sign * ((h * 3600.0 + m * 60.0 + sec) * 1000.0));
+    }
+}
+
 // ── DateTime ──────────────────────────────────────────────────────────────────
 // Immutable wrapper around a UTC Unix timestamp (seconds since epoch).
 // _tz is for display/component access only - _ts is always UTC.
 
 class DateTime {
     let _ts = 0;
+    let _ms = 0;
     let _tz: string = nil; 
 
     fn Constructor(timestamp:number, tz:string|nil) {
-        this._ts = int(timestamp);
+        let secs = int(timestamp);
+        let fraction = timestamp - float(secs);
+        this._ts = secs;
+        this._ms = int(fraction * 1000.0);
+        if (this._ms < 0) {
+            this._ms = 0;
+        }
         this._tz = (tz == nil ? "UTC" : tz);
     }
 
@@ -460,11 +546,24 @@ class DateTime {
 
     // ── Simple arithmetic ─────────────────────────────────────────────────────
 
-    fn AddSeconds(n:number): instance { return new DateTime(Time.AddSeconds(this._ts, n), this._tz); }
-    fn AddMinutes(n:number): instance { return new DateTime(Time.AddMinutes(this._ts, n), this._tz); }
-    fn AddHours(n:number): instance   { return new DateTime(Time.AddHours(this._ts, n), this._tz); }
-    fn AddDays(n:number): instance    { return new DateTime(Time.AddDays(this._ts, n), this._tz); }
-    fn AddWeeks(n:number): instance   { return new DateTime(Time.AddWeeks(this._ts, n), this._tz); }
+    fn AddSeconds(n:number): instance { return new DateTime(this._ts + int(n), this._tz); }
+    fn AddMinutes(n:number): instance { return new DateTime(this._ts + int(n * 60.0), this._tz); }
+    fn AddHours(n:number): instance   { return new DateTime(this._ts + int(n * 3600.0), this._tz); }
+    fn AddDays(n:number): instance    { return new DateTime(this._ts + int(n * 86400.0), this._tz); }
+    fn AddWeeks(n:number): instance   { return new DateTime(this._ts + int(n * 604800.0), this._tz); }
+    fn AddMilliseconds(n:number): instance {
+        let totalMs = (this._ts * 1000) + this._ms + int(n);
+        let dt = new DateTime(0, this._tz);
+        dt._ts = int(float(totalMs) / 1000.0);
+        dt._ms = totalMs - (dt._ts * 1000);
+        if (dt._ms < 0) {
+            dt._ms = dt._ms + 1000;
+            dt._ts = dt._ts - 1;
+        }
+        return dt;
+    }
+    fn AddDuration(d:instance): instance { return new DateTime(this._ts + d.TotalSeconds(), this._tz); }
+    fn SubDuration(d:instance): instance { return new DateTime(this._ts - d.TotalSeconds(), this._tz); }
 
     // ── Calendar arithmetic ───────────────────────────────────────────────────
 
@@ -609,7 +708,7 @@ class DateTime {
     // ── Raw values ────────────────────────────────────────────────────────────
 
     fn Unix(): int       { return this._ts; }
-    fn UnixMillis(): int { return this._ts * 1000; }
+    fn UnixMillis(): int { return this._ts * 1000 + this._ms; }
 
     // ── Formatting ────────────────────────────────────────────────────────────
 
@@ -639,7 +738,16 @@ class DateTime {
 
     fn static FromUnix(ts:int): instance         { return new DateTime(ts, "UTC"); }
     fn static FromUnixIn(ts:int, tz:string): instance { return new DateTime(ts, tz); }
-    fn static FromMillis(ms:int): instance        { return new DateTime(int(ms / 1000), "UTC"); }
+    fn static FromMillis(ms:int): instance {
+        let dt = new DateTime(0, "UTC");
+        dt._ts = int(float(ms) / 1000.0);
+        dt._ms = ms - (dt._ts * 1000);
+        if (dt._ms < 0) {
+            dt._ms = dt._ms + 1000;
+            dt._ts = dt._ts - 1;
+        }
+        return dt;
+    }
 
     // Parse ISO 8601 string treated as UTC.
     fn static Parse(s:string, tz:string|nil): instance {
@@ -691,4 +799,4 @@ class DateTime {
     }
 }
 
-export { DateTime, Duration };
+export { DateTime, Duration, TimeSpan };

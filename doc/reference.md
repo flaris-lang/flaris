@@ -2581,8 +2581,10 @@ Non-cryptographic and cryptographic hashes. Input accepts `string` or `block`. M
 | **Adler32** | `Adler32(data:string\|block) - int` | Adler-32 checksum. | ✓ |
 | **Blake2b** | `Blake2b(data:string\|block, outLen?:int) - string` | BLAKE2b hash (hex string). `outLen` 1-64 bytes, default 32. | ✓ owned¹ |
 | **Blake2s** | `Blake2s(data:string\|block) - string` | BLAKE2s hash (hex string). | ✓ owned¹ |
-| **Crc32** | `Crc32(data:string\|block) - int` | CRC-32 checksum. | ✓ |
-| **Crc32c** | `Crc32c(data:string\|block) - int` | CRC-32C (Castagnoli) checksum. | ✓ |
+| **Crc8** | `Crc8(data:string\|block) - int` | CRC-8 (poly `0x07`, init `0x00`, refin/refout false, xorout `0x00`). | ✓ |
+| **Crc16** | `Crc16(data:string\|block) - int` | CRC-16/ARC (poly `0xA001` reflected, init `0x0000`, refin/refout true, xorout `0x0000`). | ✓ |
+| **Crc32** | `Crc32(data:string\|block) - int` | CRC-32/ISO-HDLC (zlib/gzip; reflected poly `0xEDB88320`, init/xorout `0xFFFFFFFF`). | ✓ |
+| **Crc32c** | `Crc32c(data:string\|block) - int` | CRC-32C/Castagnoli (reflected poly `0x82F63B78`, init/xorout `0xFFFFFFFF`). | ✓ |
 | **Md5** | `Md5(data:string\|block) - string` | MD5 (hex string). Legacy/interop checksums only (Content-MD5, ETags); **not** for security. | ✓ owned¹ |
 | **Sha1** | `Sha1(data:string\|block) - string` | SHA-1 hash (hex string). Legacy; prefer SHA-256/BLAKE2 for security. | ✓ owned¹ |
 | **Sha256** | `Sha256(data:string\|block) - string` | SHA-256 hash (hex string). | ✓ owned¹ |
@@ -2590,6 +2592,12 @@ Non-cryptographic and cryptographic hashes. Input accepts `string` or `block`. M
 | **SipHash24** | `SipHash24(data:string\|block, key:string) - int` | SipHash-2-4 with 16-byte key. | ✓ |
 | **Xxhash32** | `Xxhash32(data:string\|block, seed?:int) - int` | xxHash-32. Optional seed. | ✓ |
 | **Xxhash64** | `Xxhash64(data:string\|block, seed?:int) - int` | xxHash-64. Optional seed. | ✓ |
+
+CRC interoperability note:
+
+- `Crc8`, `Crc16`, `Crc32`, and `Crc32c` are fixed named variants to keep outputs stable across platforms and languages.
+- Only the input bytes are configurable. Polynomial/init/reflection/xor parameters are not currently exposed in the public API.
+- Canonical check value for `"123456789"`: `Crc8=0xF4`, `Crc16=0xBB3D`, `Crc32=0xCBF43926`, `Crc32c=0xE3069283`.
 
 ---
 
