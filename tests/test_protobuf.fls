@@ -1,0 +1,944 @@
+// test_protobuf.fls  v1.0
+// Run: flarisvm tests/test_protobuf.fls --libs='./libs'
+
+import { Pb, PbWriter, PbReader } from library("Protobuf", "1.0");
+import { BitConverter } from library("BitConverter", "1.0");
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+global BATCH:int = 100;
+global _benchMsg:instance = nil;
+global _benchBytes:block  = nil;
+
+// Reference bytes for AllTypes, produced by the Go protobuf runtime
+// (google.golang.org/protobuf v1.36). The schema and the tool that emits this
+// constant live outside this repo, in flaris-lang/tools/protobuf-interop, so
+// that this suite stays self-contained: `./protobuf-interop alltypes emit`.
+global GOLD_ALLTYPES:string = "090000000000000cc0150000c03f18b5f693f088dcffffff0120ffffffffffffffffff0128d6ffffffffffffffff013100000000000100003dffffffff40014a1068c3a96c6c6fe286922077c3b6726c6462040001feff6880bcc1960b7df9ffffff8101f8ffffffffffffff8801ab0290018180808080808020a201080807120464656570aa0110038e029ea705ffffffffffffffffff01b2010161b20100b20103636363ba01020801ba01020802c201070a036f6e651001c201070a0374776f1002ca011008fdffffffffffffffff0112036e6567ca0107080a120374656ed201070a016b12020863fa010663686f73656e";
+
+fn check(label, got, expected) {
+    if (got == expected) {
+        Console.WriteLine("[PASS] ", label);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] ", label, " - got: ", got, " expected: ", expected);
+        failed += 1;
+    }
+}
+
+fn checkHex(label:string, got:block, expectedHex:string) {
+    check(label, String.ToLower(BitConverter.ToHex(got)), expectedHex);
+}
+
+
+// =============================================================================
+// Message classes - mirror interop.proto in flaris-lang/tools/protobuf-interop
+// =============================================================================
+
+class Inner {
+    let n    = 0;
+    let note = "";
+    fn static Descriptor() {
+        return {
+            n:    { num: 1, kind: Pb.INT32  },
+            note: { num: 2, kind: Pb.STRING },
+        };
+    }
+}
+
+class AllTypes {
+    let f_double   = 0.0;
+    let f_float    = 0.0;
+    let f_int64    = 0;
+    let f_uint64   = 0;
+    let f_int32    = 0;
+    let f_fixed64  = 0;
+    let f_fixed32  = 0;
+    let f_bool     = false;
+    let f_string   = "";
+    let f_bytes    = nil;
+    let f_uint32   = 0;
+    let f_sfixed32 = 0;
+    let f_sfixed64 = 0;
+    let f_sint32   = 0;
+    let f_sint64   = 0;
+
+    let inner  = nil;
+    let nums   = nil;
+    let strs   = nil;
+    let inners = nil;
+    let m_si   = nil;
+    let m_is   = nil;
+    let m_sm   = nil;
+
+    let c_int = nil;
+    let c_str = nil;
+    let c_msg = nil;
+
+    fn static Descriptor() {
+        return {
+            f_double:   { num: 1,  kind: Pb.DOUBLE   },
+            f_float:    { num: 2,  kind: Pb.FLOAT    },
+            f_int64:    { num: 3,  kind: Pb.INT64    },
+            f_uint64:   { num: 4,  kind: Pb.UINT64   },
+            f_int32:    { num: 5,  kind: Pb.INT32    },
+            f_fixed64:  { num: 6,  kind: Pb.FIXED64  },
+            f_fixed32:  { num: 7,  kind: Pb.FIXED32  },
+            f_bool:     { num: 8,  kind: Pb.BOOL     },
+            f_string:   { num: 9,  kind: Pb.STRING   },
+            f_bytes:    { num: 12, kind: Pb.BYTES    },
+            f_uint32:   { num: 13, kind: Pb.UINT32   },
+            f_sfixed32: { num: 15, kind: Pb.SFIXED32 },
+            f_sfixed64: { num: 16, kind: Pb.SFIXED64 },
+            f_sint32:   { num: 17, kind: Pb.SINT32   },
+            f_sint64:   { num: 18, kind: Pb.SINT64   },
+
+            inner:  { num: 20, kind: Pb.MESSAGE, msg: Inner },
+            nums:   { num: 21, kind: Pb.INT32,   repeated: true },
+            strs:   { num: 22, kind: Pb.STRING,  repeated: true },
+            inners: { num: 23, kind: Pb.MESSAGE, msg: Inner, repeated: true },
+            m_si:   { num: 24, kind: Pb.MAP, key: Pb.STRING, val: Pb.INT32 },
+            m_is:   { num: 25, kind: Pb.MAP, key: Pb.INT32,  val: Pb.STRING },
+            m_sm:   { num: 26, kind: Pb.MAP, key: Pb.STRING, val: Pb.MESSAGE, msg: Inner },
+
+            c_int: { num: 30, kind: Pb.INT32,   oneof: "choice" },
+            c_str: { num: 31, kind: Pb.STRING,  oneof: "choice" },
+            c_msg: { num: 32, kind: Pb.MESSAGE, msg: Inner, oneof: "choice" },
+        };
+    }
+}
+
+// Spec examples from Google's "Protocol Buffer Encoding" document.
+class Spec1 {
+    let a = 0;
+    fn static Descriptor() { return { a: { num: 1, kind: Pb.INT32 } }; }
+}
+class Spec2 {
+    let b = "";
+    fn static Descriptor() { return { b: { num: 2, kind: Pb.STRING } }; }
+}
+class Spec3 {
+    let c = nil;
+    fn static Descriptor() { return { c: { num: 3, kind: Pb.MESSAGE, msg: Spec1 } }; }
+}
+class Spec4 {
+    let d = nil;
+    fn static Descriptor() { return { d: { num: 4, kind: Pb.INT32, repeated: true } }; }
+}
+
+// Forward + self reference, to prove recursive messages resolve.
+class Tree {
+    let label = "";
+    let left  = nil;
+    let right = nil;
+    fn static Descriptor() {
+        return {
+            label: { num: 1, kind: Pb.STRING },
+            left:  { num: 2, kind: Pb.MESSAGE, msg: Tree },
+            right: { num: 3, kind: Pb.MESSAGE, msg: Tree },
+        };
+    }
+}
+
+// Retains fields it does not understand.
+class Partial {
+    let n        = 0;
+    let _unknown = nil;
+    fn static Descriptor() { return { n: { num: 1, kind: Pb.INT32 } }; }
+}
+
+// Explicit presence: a zero here is still written.
+class Opt {
+    let a = 0;
+    let b = nil;
+    fn static Descriptor() {
+        return {
+            a: { num: 1, kind: Pb.INT32 },
+            b: { num: 2, kind: Pb.INT32, optional: true },
+        };
+    }
+}
+
+class Unpacked {
+    let nums = nil;
+    fn static Descriptor() {
+        return { nums: { num: 4, kind: Pb.INT32, repeated: true, packed: false } };
+    }
+}
+
+
+// =============================================================================
+// Golden vectors from the Protocol Buffer Encoding specification
+// =============================================================================
+
+fn test_spec_vectors() {
+    let a = new Spec1(); a.a = 150;
+    checkHex("spec: varint field 1 = 150", Pb.Encode(a), "089601");
+
+    let b = new Spec2(); b.b = "testing";
+    checkHex("spec: string field 2", Pb.Encode(b), "120774657374696e67");
+
+    let c = new Spec3(); c.c = new Spec1(); c.c.a = 150;
+    checkHex("spec: embedded message field 3", Pb.Encode(c), "1a03089601");
+
+    let d = new Spec4(); d.d = [3, 270, 86942];
+    checkHex("spec: packed repeated field 4", Pb.Encode(d), "2206038e029ea705");
+
+    check("spec: decode varint",   Pb.Decode(BitConverter.FromHex("089601"), Spec1).a, 150);
+    check("spec: decode string",   Pb.Decode(BitConverter.FromHex("120774657374696e67"), Spec2).b, "testing");
+    check("spec: decode embedded", Pb.Decode(BitConverter.FromHex("1a03089601"), Spec3).c.a, 150);
+
+    let dd = Pb.Decode(BitConverter.FromHex("2206038e029ea705"), Spec4);
+    check("spec: decode packed len", len(dd.d), 3);
+    check("spec: decode packed [2]", dd.d[2], 86942);
+
+    // A decoder must accept the unpacked form of a packable field too.
+    let un = Pb.Decode(BitConverter.FromHex("2003208e02209ea705"), Spec4);
+    check("spec: unpacked accepted", len(un.d), 3);
+    check("spec: unpacked value",    un.d[1], 270);
+}
+
+// =============================================================================
+// Interop: bytes produced by the Go protobuf runtime
+// =============================================================================
+
+fn checkAllTypes(tag:string, m:instance) {
+    check(tag + " f_double",   m.f_double,   -3.5);
+    check(tag + " f_float",    m.f_float,     1.5);
+    check(tag + " f_int64",    m.f_int64,    -1234567890123);
+    check(tag + " f_uint64",   m.f_uint64,   -1);              // 2^64-1 as signed
+    check(tag + " f_int32",    m.f_int32,    -42);
+    check(tag + " f_fixed64",  m.f_fixed64,   1099511627776);
+    check(tag + " f_fixed32",  m.f_fixed32,   4294967295);
+    check(tag + " f_bool",     m.f_bool,      true);
+    check(tag + " f_string",   m.f_string,   "héllo→ wörld");
+    check(tag + " f_bytes",    String.ToLower(BitConverter.ToHex(m.f_bytes)), "0001feff");
+    check(tag + " f_uint32",   m.f_uint32,    3000000000);
+    check(tag + " f_sfixed32", m.f_sfixed32, -7);
+    check(tag + " f_sfixed64", m.f_sfixed64, -8);
+    check(tag + " f_sint32",   m.f_sint32,   -150);
+    check(tag + " f_sint64",   m.f_sint64,   -9007199254740993);
+
+    check(tag + " inner.n",    m.inner.n,     7);
+    check(tag + " inner.note", m.inner.note, "deep");
+
+    check(tag + " nums len",   len(m.nums),   4);
+    check(tag + " nums[1]",    m.nums[1],     270);
+    check(tag + " nums[2]",    m.nums[2],     86942);
+    check(tag + " nums[3]",    m.nums[3],    -1);
+
+    check(tag + " strs len",   len(m.strs),   3);
+    check(tag + " strs[0]",    m.strs[0],    "a");
+    check(tag + " strs[1]",    m.strs[1],    "");
+    check(tag + " strs[2]",    m.strs[2],    "ccc");
+
+    check(tag + " inners len", len(m.inners), 2);
+    check(tag + " inners[0].n", m.inners[0].n, 1);
+    check(tag + " inners[1].n", m.inners[1].n, 2);
+
+    check(tag + " m_si one",   m.m_si["one"], 1);
+    check(tag + " m_si two",   m.m_si["two"], 2);
+    check(tag + " m_is 10",    m.m_is["10"],  "ten");
+    check(tag + " m_is -3",    m.m_is["-3"],  "neg");
+    check(tag + " m_sm k.n",   m.m_sm["k"].n, 99);
+
+    check(tag + " oneof set",  Pb.WhichOneof(m, "choice"), "c_str");
+    check(tag + " c_str",      m.c_str, "chosen");
+    check(tag + " c_int nil",  is_nil(m.c_int), true);
+}
+
+fn test_interop_decode() {
+    let m = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), AllTypes);
+    checkAllTypes("go->flaris", m);
+}
+
+fn test_interop_reencode() {
+    // Decode Go's bytes, re-encode with Flaris, decode again: every field must
+    // survive the round trip through our own encoder.
+    let m1 = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), AllTypes);
+    let m2 = Pb.Decode(Pb.Encode(m1), AllTypes);
+    checkAllTypes("flaris round-trip", m2);
+    check("round-trip Equals", Pb.Equals(m1, m2), true);
+}
+
+// =============================================================================
+// Presence, oneof, maps, recursion, unknown fields
+// =============================================================================
+
+fn test_presence() {
+    let o = new Opt();
+    o.a = 0;          // implicit presence - a zero is not written
+    o.b = nil;
+    checkHex("presence: both absent", Pb.Encode(o), "");
+
+    o.b = 0;          // explicit presence - a zero IS written
+    checkHex("presence: explicit zero written", Pb.Encode(o), "1000");
+
+    let back = Pb.Decode(BitConverter.FromHex("1000"), Opt);
+    check("presence: explicit zero decodes", back.b, 0);
+    check("presence: implicit stays zero",   back.a, 0);
+
+    let none = Pb.Decode(nil, Opt);
+    check("presence: absent explicit is nil", is_nil(none.b), true);
+}
+
+fn test_oneof() {
+    let m = new AllTypes();
+    m.c_int = 5;
+    check("oneof: which is c_int", Pb.WhichOneof(m, "choice"), "c_int");
+
+    // Setting a second member on the wire clears the first.
+    let w = new PbWriter(nil);
+    w.VarInt((30 << 3) | Pb.WIRE_VARINT); w.VarInt(5);
+    w.VarInt((31 << 3) | Pb.WIRE_LEN);    w.Str("later");
+    let d = Pb.Decode(w.ToBuffer(), AllTypes);
+    check("oneof: last wins",       Pb.WhichOneof(d, "choice"), "c_str");
+    check("oneof: sibling cleared", is_nil(d.c_int), true);
+
+    // A oneof member has explicit presence: a zero still goes on the wire.
+    let z = new AllTypes();
+    z.c_int = 0;
+    check("oneof: zero is written", len(Pb.Encode(z)) > 0, true);
+    check("oneof: zero decodes",    Pb.Decode(Pb.Encode(z), AllTypes).c_int, 0);
+
+    check("oneof: clear", Pb.ClearOneof(z, "choice"), true);
+    check("oneof: cleared is nil", is_nil(Pb.WhichOneof(z, "choice")), true);
+}
+
+fn test_maps() {
+    let m = new AllTypes();
+    m.m_si = { alpha: 1, beta: -2 };
+    m.m_is = {};
+    m.m_is["0"]  = "zero";
+    m.m_is["-7"] = "minus";
+
+    let d = Pb.Decode(Pb.Encode(m), AllTypes);
+    check("map: string->int alpha", d.m_si["alpha"], 1);
+    check("map: string->int beta",  d.m_si["beta"], -2);
+    check("map: int->string 0",     d.m_is["0"],    "zero");
+    check("map: int->string -7",    d.m_is["-7"],   "minus");
+    check("map: entry count",       len(d.m_si),    2);
+
+    // An empty map contributes nothing.
+    let e = new AllTypes();
+    e.m_si = {};
+    checkHex("map: empty writes nothing", Pb.Encode(e), "");
+}
+
+fn test_recursive() {
+    let root = new Tree();
+    root.label = "root";
+    root.left  = new Tree();
+    root.left.label = "L";
+    root.left.right = new Tree();
+    root.left.right.label = "LR";
+    root.right = new Tree();
+    root.right.label = "R";
+
+    let d = Pb.Decode(Pb.Encode(root), Tree);
+    check("recursive: root",     d.label,             "root");
+    check("recursive: L",        d.left.label,        "L");
+    check("recursive: LR",       d.left.right.label,  "LR");
+    check("recursive: R",        d.right.label,       "R");
+    check("recursive: L.left nil", is_nil(d.left.left), true);
+}
+
+fn test_unknown_fields() {
+    // AllTypes bytes decoded as Partial: field 1 is known, everything else is
+    // retained and must reappear when Partial is encoded again.
+    let src = new Spec1(); src.a = 150;
+    let w = new PbWriter(nil);
+    w.VarInt((1 << 3) | Pb.WIRE_VARINT); w.VarInt(150);
+    w.VarInt((5 << 3) | Pb.WIRE_LEN);    w.Str("kept");
+    w.VarInt((6 << 3) | Pb.WIRE_VARINT); w.VarInt(99);
+    let bytes = w.ToBuffer();
+
+    let p = Pb.Decode(bytes, Partial);
+    check("unknown: known field decoded", p.n, 150);
+    check("unknown: retained",            is_nil(p._unknown), false);
+    checkHex("unknown: re-emitted verbatim", Pb.Encode(p), String.ToLower(BitConverter.ToHex(bytes)));
+
+    // Without a _unknown field the same bytes are simply skipped.
+    let s = Pb.Decode(bytes, Spec1);
+    check("unknown: dropped without _unknown", s.a, 150);
+    checkHex("unknown: not re-emitted", Pb.Encode(s), "089601");
+}
+
+fn test_merge() {
+    let a = new AllTypes();
+    a.f_int32 = 1;
+    a.nums    = [1, 2];
+    a.inner   = new Inner();
+    a.inner.n = 5;
+
+    let b = new AllTypes();
+    b.f_int32 = 9;
+    b.nums    = [3];
+    b.inner   = new Inner();
+    b.inner.note = "merged";
+
+    Pb.Merge(a, Pb.Encode(b));
+    check("merge: scalar overwritten",  a.f_int32, 9);
+    check("merge: repeated appended",   len(a.nums), 3);
+    check("merge: repeated tail",       a.nums[2], 3);
+    check("merge: submessage kept",     a.inner.n, 5);
+    check("merge: submessage merged",   a.inner.note, "merged");
+}
+
+fn test_equals_clone() {
+    let m = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), AllTypes);
+    let c = Pb.Clone(m);
+    check("clone: equal",         Pb.Equals(m, c), true);
+    check("clone: not identical", m == c, false);
+
+    c.f_int32 = 1234;
+    check("equals: detects difference", Pb.Equals(m, c), false);
+
+    // nil and the zero value are the same state for an implicit-presence field.
+    let x = new Spec1();
+    let y = new Spec1();
+    y.a = 0;
+    check("equals: nil vs zero", Pb.Equals(x, y), true);
+}
+
+fn test_delimited() {
+    let a = new Spec1(); a.a = 150;
+    let b = new Spec1(); b.a = 7;
+
+    let w = new PbWriter(nil);
+    w.Raw(Pb.EncodeDelimited(a));
+    w.Raw(Pb.EncodeDelimited(b));
+    checkHex("delimited: framing", w.ToBuffer(), "03089601" + "020807");
+
+    let r = new PbReader(w.ToBuffer(), nil, nil);
+    check("delimited: first",  Pb.DecodeDelimited(r, Spec1).a, 150);
+    check("delimited: second", Pb.DecodeDelimited(r, Spec1).a, 7);
+    check("delimited: drained", r.AtEnd(), true);
+}
+
+fn test_encoded_size() {
+    let m = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), AllTypes);
+    check("EncodedSize matches Encode", Pb.EncodedSize(m), len(Pb.Encode(m)));
+
+    let s = new Spec2(); s.b = "héllo";   // 6 bytes UTF-8
+    check("EncodedSize counts bytes not chars", Pb.EncodedSize(s), 8);
+}
+
+fn test_unpacked_writer() {
+    let u = new Unpacked();
+    u.nums = [3, 270, 86942];
+    checkHex("unpacked: one tag per element", Pb.Encode(u), "2003208e02209ea705");
+    check("unpacked: round-trips", len(Pb.Decode(Pb.Encode(u), Unpacked).nums), 3);
+}
+
+fn test_errors() {
+    let caught = false;
+    try { Pb.Decode(BitConverter.FromHex("0896"), Spec1); }        // truncated varint
+    catch (e) { caught = true; }
+    check("error: truncated varint raises", caught, true);
+
+    caught = false;
+    try { Pb.Decode(BitConverter.FromHex("1a05089601"), Spec3); }  // length past end
+    catch (e) { caught = true; }
+    check("error: submessage overruns parent", caught, true);
+
+    caught = false;
+    try { Pb.Decode(BitConverter.FromHex("0b00"), Spec1); }        // group wire type
+    catch (e) { caught = true; }
+    check("error: groups rejected", caught, true);
+
+    // A field whose wire type contradicts the descriptor is skipped, not fatal.
+    let ok = Pb.Decode(BitConverter.FromHex("0d00000000"), Spec1);
+    check("error: wrong wire type skipped", ok.a, 0);
+
+    caught = false;
+    try {
+        let deep = new Tree();
+        let cur = deep;
+        iter (i from 0 to 120) { cur.left = new Tree(); cur = cur.left; }
+        Pb.Encode(deep);
+    } catch (e) { caught = true; }
+    check("error: depth cap enforced", caught, true);
+}
+
+fn test_lowlevel() {
+    let w = new PbWriter(nil);
+    w.VarInt(0);
+    w.VarInt(127);
+    w.VarInt(128);
+    w.VarInt(-1);
+    w.ZigZag(-1);
+    w.ZigZag(1);
+    w.Fixed32(0xDEADBEEF);
+    w.Fixed64(1);
+    w.Float(1.5);
+    w.Double(-3.5);
+    w.Str("hi");
+    w.Bytes(BitConverter.FromHex("00ff"));
+
+    let r = new PbReader(w.ToBuffer(), nil, nil);
+    check("ll: varint 0",      r.VarInt(), 0);
+    check("ll: varint 127",    r.VarInt(), 127);
+    check("ll: varint 128",    r.VarInt(), 128);
+    check("ll: varint -1",     r.VarInt(), -1);
+    check("ll: zigzag -1",     r.ZigZag(), -1);
+    check("ll: zigzag 1",      r.ZigZag(), 1);
+    check("ll: fixed32",       r.Fixed32(), 0xDEADBEEF);
+    check("ll: fixed64",       r.Fixed64(), 1);
+    check("ll: float",         r.Float(), 1.5);
+    check("ll: double",        r.Double(), -3.5);
+    check("ll: str",           r.Str(r.VarInt()), "hi");
+    check("ll: bytes",         String.ToLower(BitConverter.ToHex(r.Bytes(r.VarInt()))), "00ff");
+    check("ll: drained",       r.AtEnd(), true);
+}
+
+
+// =============================================================================
+// Runtime-defined messages (Class.Define + Pb.Register)
+//
+// The schema is data, not code: no .proto, no codegen, no compiler. This is the
+// path a runtime-only deployment uses, where the descriptor ships as bytes and
+// the signed codec interprets it.
+// =============================================================================
+
+fn defineMessage(name:string, spec) {
+    let fields = {};
+    let names  = Object.Keys(spec);
+    let i:int = 0;
+    while (i < len(names)) {
+        let fn_:string = names[i];
+        let f = spec[fn_];
+        i += 1;
+        if (f.repeated == true || f.kind == Pb.MAP || !is_nil(f.oneof)) {
+            fields[fn_] = nil;
+        } else {
+            fields[fn_] = Pb.ZeroFor(f.kind);
+        }
+    }
+    fields["_unknown"] = nil;
+    let cls = Class.Define(name, fields);
+    Pb.Register(cls, spec);
+    return cls;
+}
+
+fn test_dynamic_messages() {
+    let DynInner = defineMessage("DynInner", {
+        n:    { num: 1, kind: Pb.INT32  },
+        note: { num: 2, kind: Pb.STRING },
+    });
+    let DynAll = defineMessage("DynAll", {
+        f_string: { num: 9,  kind: Pb.STRING },
+        f_sint64: { num: 18, kind: Pb.SINT64 },
+        inner:    { num: 20, kind: Pb.MESSAGE, msg: DynInner },
+        nums:     { num: 21, kind: Pb.INT32,   repeated: true },
+        inners:   { num: 23, kind: Pb.MESSAGE, msg: DynInner, repeated: true },
+        m_si:     { num: 24, kind: Pb.MAP, key: Pb.STRING, val: Pb.INT32 },
+        m_sm:     { num: 26, kind: Pb.MAP, key: Pb.STRING, val: Pb.MESSAGE, msg: DynInner },
+        c_str:    { num: 31, kind: Pb.STRING, oneof: "choice" },
+    });
+
+    // Decode the SAME Go-produced bytes the generated-class tests use.
+    let m = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), DynAll);
+
+    check("dyn: class name",     Class.GetName(m), "DynAll");
+    check("dyn: string field",   m.f_string, "héllo→ wörld");
+    check("dyn: sint64",         m.f_sint64, -9007199254740993);
+    check("dyn: nested message", m.inner.n, 7);
+    check("dyn: nested string",  m.inner.note, "deep");
+    check("dyn: packed len",     len(m.nums), 4);
+    check("dyn: packed value",   m.nums[2], 86942);
+    check("dyn: repeated msg",   m.inners[1].n, 2);
+    check("dyn: map scalar",     m.m_si["two"], 2);
+    check("dyn: map message",    m.m_sm["k"].n, 99);
+    check("dyn: oneof",          Pb.WhichOneof(m, "choice"), "c_str");
+
+    // Property syntax on a class the analyzer cannot resolve.
+    m.f_string = "rewritten";
+    check("dyn: property write", m.f_string, "rewritten");
+    m.f_string = "héllo→ wörld";
+
+    // Fields this partial schema never declared were retained, so re-encoding
+    // reproduces the original message rather than a lossy subset.
+    let again = Pb.Decode(Pb.Encode(m), DynAll);
+    check("dyn: round-trip nested", again.inner.note, "deep");
+    check("dyn: round-trip map",    again.m_sm["k"].n, 99);
+    check("dyn: unknowns retained", is_nil(again._unknown), false);
+
+    // A generated class and a dynamic one describing the same wire format are
+    // interchangeable on the wire.
+    let viaStatic = Pb.Decode(Pb.Encode(m), AllTypes);
+    check("dyn -> static decode", viaStatic.f_string, "héllo→ wörld");
+    check("dyn -> static nested", viaStatic.inner.n, 7);
+
+    // Two Defines with the same name stay distinct types with their own specs.
+    let Other = defineMessage("DynInner", { n: { num: 1, kind: Pb.INT32 } });
+    check("dyn: distinct types", Other != DynInner, true);
+
+    // A class with no descriptor and no Descriptor() is a clear error.
+    let bare = Class.Define("Bare", { a: 0 });
+    let caught = false;
+    try { Pb.Encode(Class.New(bare)); } catch (e) { caught = true; }
+    check("dyn: unregistered class raises", caught, true);
+}
+
+// =============================================================================
+// .proto schemas loaded at runtime
+//
+// Pb.LoadProto parses the schema and defines a class per message. No codegen,
+// no compiler - this is the path a runtime-only build uses.
+// =============================================================================
+
+global TMPDIR:string = "";
+
+fn writeProto(name:string, body:string):string {
+    if (TMPDIR == "") {
+        TMPDIR = Path.Combine(Os.TempDir(), "flaris_protobuf_test");
+        Directory.Ensure(TMPDIR);
+    }
+    let p:string = Path.Combine(TMPDIR, name);
+    File.WriteText(p, body);
+    return p;
+}
+
+fn rejects(label:string, src:string, fragment:string) {
+    let msg:string = "";
+    try { Pb.LoadProto(src, "t.proto"); }
+    catch (e) { msg = e.Error; }
+    if (msg == "") { check(label, "accepted", "rejected: " + fragment); return; }
+    check(label, String.Contains(msg, fragment), true);
+}
+
+fn test_proto_parse() {
+    let sch = Pb.ParseProto(
+        "syntax = \"proto3\";\n"
+      + "package a.b;\n"
+      + "import \"x.proto\";\n"
+      + "option java_package = \"com.z\";\n"
+      + "message M {\n"
+      + "  string s = 1;\n"
+      + "  repeated int32 r = 2;\n"
+      + "  optional int32 o = 3;\n"
+      + "  map<string, int64> m = 4;\n"
+      + "  repeated int32 loose = 5 [packed = false];\n"
+      + "  reserved 90, 95 to 99;\n"
+      + "  message Inner { int32 v = 1; }\n"
+      + "  enum E { E0 = 0; E1 = 1; }\n"
+      + "  oneof pick { string a = 6; int32 b = 7; }\n"
+      + "}\n"
+      + "service S { rpc Go(M) returns (stream M); }\n", "t.proto");
+
+    check("parse: syntax",        sch.syntax, "proto3");
+    check("parse: package",       sch.package, "a.b");
+    check("parse: import",        sch.imports[0].path, "x.proto");
+    check("parse: message fq",    sch.messages[0].fqName, "a.b.M");
+    let f = sch.messages[0].fields;
+    check("parse: singular",      f[0].label, "singular");
+    check("parse: repeated",      f[1].label, "repeated");
+    check("parse: optional",      f[2].label, "optional");
+    check("parse: map label",     f[3].label, "map");
+    check("parse: map key",       f[3].keyType, "string");
+    check("parse: packed=false",  f[4].opts.packed, false);
+    check("parse: nested msg",    sch.messages[0].nested[0].fqName, "a.b.M.Inner");
+    check("parse: nested enum",   sch.messages[0].enums[0].fqName, "a.b.M.E");
+    check("parse: oneof",         sch.messages[0].oneofs[0].name, "pick");
+    check("parse: oneof on field", f[5].oneof, "pick");
+    check("parse: reserved",      len(sch.messages[0].reservedNums), 2);
+    check("parse: service",       sch.services[0].fqName, "a.b.S");
+    check("parse: rpc streaming", sch.services[0].methods[0].serverStream, true);
+}
+
+// proto has no reserved words, so these are all legal field names.
+fn test_proto_keyword_fields() {
+    let sch = Pb.ParseProto(
+        "syntax = \"proto3\";\n"
+      + "message M {\n"
+      + "  string message = 1; string optional = 2; string repeated = 3;\n"
+      + "  string map = 4; string stream = 5; string reserved = 6;\n"
+      + "}\n", "t.proto");
+    let f = sch.messages[0].fields;
+    check("field named 'message'",  f[0].name, "message");
+    check("field named 'optional'", f[1].name, "optional");
+    check("'optional' not a label", f[1].label, "singular");
+    check("field named 'map'",      f[3].name, "map");
+    check("field named 'stream'",   f[4].name, "stream");
+}
+
+fn test_proto_define() {
+    let t = Pb.LoadProto(
+        "syntax = \"proto3\";\n"
+      + "package demo;\n"
+      + "enum Status { UNKNOWN = 0; ACTIVE = 1; }\n"
+      + "message Line { string sku = 1; }\n"
+      + "message Order {\n"
+      + "  string id = 1;\n"
+      + "  Status status = 2;\n"
+      + "  repeated int32 nums = 3;\n"
+      + "  map<string, int32> tally = 4;\n"
+      + "  optional int32 discount = 5;\n"
+      + "  repeated Line lines = 6;\n"
+      + "  Order parent = 7;\n"
+      + "  oneof pay { string card = 8; int64 inv = 9; }\n"
+      + "  message Note { string text = 1; }\n"
+      + "  Note note = 10;\n"
+      + "}\n", "demo.proto");
+
+    check("define: types",        len(Object.Keys(t)), 4);
+    check("define: enum object",  t["Status"].ACTIVE, 1);
+    check("define: class",        Class.IsClass(t["Order"]), true);
+    check("define: nested flat",  Class.IsClass(t["Order_Note"]), true);
+
+    let o = Class.New(t["Order"]);
+    check("define: string default", Class.GetField(o, "id"), "");
+    check("define: enum default",   Class.GetField(o, "status"), 0);
+    check("define: repeated nil",   is_nil(Class.GetField(o, "nums")), true);
+    check("define: optional nil",   is_nil(Class.GetField(o, "discount")), true);
+    check("define: unknown field",  Class.GetField(o, "_unknown"), nil);
+
+    // Populate through property syntax and round-trip it.
+    o.id = "A1";
+    o.status = t["Status"].ACTIVE;
+    o.nums = [1, -2, 300000];
+    o.tally = { x: 7 };
+    o.discount = 0;                       // explicit presence: a zero survives
+    let l = Class.New(t["Line"]);
+    l.sku = "sku-1";
+    o.lines = [l];
+    o.parent = Class.New(t["Order"]);     // self-reference
+    o.parent.id = "root";
+    o.inv = 42;
+    let n = Class.New(t["Order_Note"]);
+    n.text = "hi";
+    o.note = n;
+
+    let back = Pb.Decode(Pb.Encode(o), t["Order"]);
+    check("rt: id",           back.id, "A1");
+    check("rt: enum",         back.status, 1);
+    check("rt: packed",       Json.Stringify(back.nums), "[1,-2,300000]");
+    check("rt: map",          back.tally["x"], 7);
+    check("rt: explicit zero", back.discount, 0);
+    check("rt: repeated msg", back.lines[0].sku, "sku-1");
+    check("rt: recursive",    back.parent.id, "root");
+    check("rt: nested type",  back.note.text, "hi");
+    check("rt: oneof",        Pb.WhichOneof(back, "pay"), "inv");
+    check("rt: oneof value",  back.inv, 42);
+}
+
+// A schema loaded at runtime must decode bytes a generated class produced, and
+// vice versa - they describe the same wire format.
+fn test_proto_matches_static() {
+    let t = Pb.LoadProto(
+        "syntax = \"proto3\";\n"
+      + "package interop;\n"
+      + "message Inner { int32 n = 1; string note = 2; }\n"
+      + "message AllTypes {\n"
+      + "  string f_string = 9;\n"
+      + "  sint64 f_sint64 = 18;\n"
+      + "  Inner inner = 20;\n"
+      + "  repeated int32 nums = 21;\n"
+      + "  repeated Inner inners = 23;\n"
+      + "  map<string, Inner> m_sm = 26;\n"
+      + "}\n", "interop.proto");
+
+    let dyn = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), t["AllTypes"]);
+    check("proto vs go: string",  dyn.f_string, "héllo→ wörld");
+    check("proto vs go: sint64",  dyn.f_sint64, -9007199254740993);
+    check("proto vs go: nested",  dyn.inner.note, "deep");
+    check("proto vs go: packed",  dyn.nums[2], 86942);
+    check("proto vs go: rep msg", dyn.inners[1].n, 2);
+    check("proto vs go: map msg", dyn.m_sm["k"].n, 99);
+
+    // Undeclared fields were retained, so re-encoding reproduces the original
+    // and the generated class still reads every field.
+    let viaStatic = Pb.Decode(Pb.Encode(dyn), AllTypes);
+    check("proto -> static: string", viaStatic.f_string, "héllo→ wörld");
+    check("proto -> static: kept",   viaStatic.f_fixed32, 4294967295);
+    check("proto -> static: equal",  Pb.Equals(viaStatic, Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), AllTypes)), true);
+}
+
+fn test_proto_imports() {
+    writeProto("dep.proto",
+        "syntax = \"proto3\";\n"
+      + "package demo.common;\n"
+      + "message Money { int64 units = 1; }\n"
+      + "enum Region { NONE = 0; EU = 1; }\n");
+    let main:string = writeProto("main.proto",
+        "syntax = \"proto3\";\n"
+      + "package demo;\n"
+      + "import \"dep.proto\";\n"
+      + "message Bill {\n"
+      + "  common.Money       rel = 1;\n"
+      + "  .demo.common.Money abs = 2;\n"
+      + "  .demo.common.Region reg = 3;\n"
+      + "  map<string, common.Money> adj = 4;\n"
+      + "}\n");
+
+    let sch = Pb.ParseProtoFile(main, [TMPDIR]);
+    check("imports: dep parsed",   len(sch.deps), 1);
+    check("imports: no self-ref",  is_nil(sch.files), true);
+
+    let t = Pb.DefineSchema(sch);
+    check("imports: dep type defined", Class.IsClass(t["Money"]), true);
+    check("imports: enum from dep",    t["Region"].EU, 1);
+
+    let b = Class.New(t["Bill"]);
+    let m = Class.New(t["Money"]);
+    m.units = 99;
+    b.rel = m;
+    b.abs = m;
+    b.reg = t["Region"].EU;
+    b.adj = { vat: m };
+    let back = Pb.Decode(Pb.Encode(b), t["Bill"]);
+    check("imports: relative ref", back.rel.units, 99);
+    check("imports: absolute ref", back.abs.units, 99);
+    check("imports: enum value",   back.reg, 1);
+    check("imports: map to dep",   back.adj["vat"].units, 99);
+
+    let caught:string = "";
+    let orphan:string = writeProto("orphan.proto",
+        "syntax = \"proto3\";\nimport \"nope.proto\";\nmessage M { int32 v = 1; }\n");
+    try { Pb.ParseProtoFile(orphan, [TMPDIR]); } catch (e) { caught = e.Error; }
+    check("imports: missing file reported",
+          String.Contains(caught, "cannot find imported file"), true);
+}
+
+fn test_proto_rejections() {
+    rejects("proto2 rejected",
+        "syntax = \"proto2\";\nmessage M { optional int32 v = 1; }\n", "proto3 only");
+    rejects("required rejected",
+        "syntax = \"proto3\";\nmessage M { required int32 v = 1; }\n", "'required' is not supported");
+    rejects("groups rejected",
+        "syntax = \"proto3\";\nmessage M { optional group G = 1 { int32 v = 2; } }\n", "groups are not supported");
+    rejects("extensions rejected",
+        "syntax = \"proto3\";\nmessage M { extensions 100 to 200; int32 v = 1; }\n", "extension ranges");
+    rejects("unknown type",
+        "syntax = \"proto3\";\nmessage M { Nope v = 1; }\n", "unknown type 'Nope'");
+    rejects("duplicate field number",
+        "syntax = \"proto3\";\nmessage M { int32 a = 1; int32 b = 1; }\n", "field number 1 twice");
+    rejects("field number 0",
+        "syntax = \"proto3\";\nmessage M { int32 a = 0; }\n", "outside 1..536870911");
+    rejects("float map key",
+        "syntax = \"proto3\";\nmessage M { map<double, int32> m = 1; }\n", "only integral");
+    rejects("message map key",
+        "syntax = \"proto3\";\nmessage K { int32 v = 1; }\nmessage M { map<K, int32> m = 1; }\n",
+        "only integral");
+    rejects("duplicate type",
+        "syntax = \"proto3\";\nmessage M { int32 a = 1; }\nmessage M { int32 b = 1; }\n",
+        "declared twice");
+    rejects("unterminated message",
+        "syntax = \"proto3\";\nmessage M { int32 v = 1;\n", "unterminated message");
+    rejects("missing semicolon",
+        "syntax = \"proto3\";\nmessage M { int32 v = 1 }\n", "expected ';'");
+}
+
+// =============================================================================
+// Benchmark
+// =============================================================================
+
+fn bench(name:string, f:fn, n:int, batch:int) {
+    f(); f(); f();
+
+    let t0:int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt:int = Time.Ticks() - t0;
+
+    let ms:float = Time.TicksToMs(dt);
+    let ns:float = (Time.TicksToUs(dt) * 1000.0) / float(n * batch);
+
+    Console.WriteLine(
+        String.PadRight(name, 42),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]), 9), "ms ",
+        String.PadLeft(String.FormatArray("{0:.2f}", [ns]), 11), "ns/op"
+    );
+}
+
+fn test_benchmark() {
+    let N:int = 200;
+    _benchMsg   = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), AllTypes);
+    _benchBytes = Pb.Encode(_benchMsg);
+
+    let small = new Spec1();
+    small.a = 150;
+    let smallBytes = Pb.Encode(small);
+
+    Console.WriteLine("");
+    Console.WriteLine("== Benchmark == (AllTypes is ", len(_benchBytes), " bytes, 24 fields)");
+
+    bench("baseline (empty loop)", fn() {
+        iter (i from 0 to BATCH - 1) { _sink = 0; }
+    }, N, BATCH);
+
+    bench("Encode  AllTypes", fn() {
+        iter (i from 0 to BATCH - 1) { _sink = len(Pb.Encode(_benchMsg)); }
+    }, N, BATCH);
+
+    bench("Decode  AllTypes", fn() {
+        iter (i from 0 to BATCH - 1) { _sink = Pb.Decode(_benchBytes, AllTypes).f_int32; }
+    }, N, BATCH);
+
+    bench("EncodedSize AllTypes", fn() {
+        iter (i from 0 to BATCH - 1) { _sink = Pb.EncodedSize(_benchMsg); }
+    }, N, BATCH);
+
+    bench("Encode  3-byte message", fn() {
+        iter (i from 0 to BATCH - 1) { _sink = len(Pb.Encode(small)); }
+    }, N, BATCH);
+
+    bench("Decode  3-byte message", fn() {
+        iter (i from 0 to BATCH - 1) { _sink = Pb.Decode(smallBytes, Spec1).a; }
+    }, N, BATCH);
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+fn Main() {
+    Console.WriteLine("--- wire format ---");
+    test_spec_vectors();
+    test_lowlevel();
+    test_unpacked_writer();
+    test_encoded_size();
+
+    Console.WriteLine("--- interop with the Go protobuf runtime ---");
+    test_interop_decode();
+    test_interop_reencode();
+
+    Console.WriteLine("--- semantics ---");
+    test_presence();
+    test_oneof();
+    test_maps();
+    test_recursive();
+    test_unknown_fields();
+    test_merge();
+    test_equals_clone();
+    test_delimited();
+
+    Console.WriteLine("--- runtime-defined messages ---");
+    test_dynamic_messages();
+
+    Console.WriteLine("--- .proto loaded at runtime ---");
+    test_proto_parse();
+    test_proto_keyword_fields();
+    test_proto_define();
+    test_proto_matches_static();
+    test_proto_imports();
+    test_proto_rejections();
+
+    Console.WriteLine("--- malformed input ---");
+    test_errors();
+
+    test_benchmark();
+
+    if (TMPDIR != "") { Directory.DeleteAll(TMPDIR); }
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: ", passed, " passed, ", failed, " failed.");
+    if (failed == 0) {
+        Console.Ok("All tests passed.");
+        return 0;
+    } else {
+        Console.WriteLine("FAILURES DETECTED.");
+        return 1;
+    }
+}

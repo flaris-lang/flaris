@@ -1623,9 +1623,36 @@ let p = new Point(10, 20);
 
 1. Allocate a new object with class `Point`
 2. Call `Constructor(10, 20)` if defined
-3. Return the constructed instance
+3. Run the initializer block if the `new` has one (below)
+4. Return the constructed instance
 
 If `Constructor` is missing, the instance is created without initialization.
+
+### Initializer blocks
+
+A `new` may end with a block that finishes the object off:
+
+```js
+class Point {
+    let x = 0;
+    let y = 0;
+    fn Constructor(a) { this.x = a; }
+    fn scale(f) { return this.x * f; }
+}
+
+let n = 10;
+let p = new Point(3) {
+    y = scale(2);        // 6 - a bare name is this class's own member
+    x = x + n;           // 13 - `n` is captured from here, by value
+};
+```
+
+The block is a constructor body for the class you are constructing: `this` is
+the new instance even when the `new` sits inside another class, bare names are
+that class's own fields and methods (an inherited member still needs
+`this.`), and names from the surrounding scope are captured by value the way a
+closure captures them. `let` inside the block declares a block-local, and an
+exception thrown in the block propagates out of the `new`.
 
 ### The Constructor
 

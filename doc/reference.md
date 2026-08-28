@@ -989,6 +989,47 @@ field set cannot be seen, so the seal is relaxed for that subclass: undeclared
 `this.<field>` writes are allowed and validated by the VM's runtime guard
 instead of at compile time.
 
+### Object initializer blocks
+
+A `new` expression may carry a trailing block that runs on the fresh instance
+right after the class's own `Constructor`:
+
+```js
+class Point {
+    let x = 0;
+    let y = 0;
+    fn Constructor(a) { this.x = a; }
+    fn scale(f) { return this.x * f; }
+}
+
+let p = new Point(3) {
+    y = scale(2);       // 6 - `this` is the new instance
+};
+```
+
+The block is a constructor body for the class being constructed, not an
+expression list: it is compiled as an anonymous method of that class and
+invoked on the instance, so inside it
+
+- `this` is the new instance, whatever class encloses the `new`;
+- a bare name is one of that class's **own** fields or methods when it matches
+  one (`y = scale(2)` means `this.y = this.scale(2)`) - an inherited member
+  needs an explicit `this.`, exactly as in a method body;
+- a name from the enclosing scope is captured **by value**, like a closure's
+  capture, and a field of the same name wins over it;
+- `let` declares a block-local, and statements (`if`, loops, `try`) are all
+  allowed. `return` ends the block early; the block's value is discarded.
+
+Writing to an undeclared field is rejected the same way as in a method
+(`Sealed instance fields`, above). When the class is not visible in this
+compilation unit - imported, or constructed through a computed expression -
+its member set is unknown: bare assignments are compiled as field writes and
+left to the VM's runtime guard, and bare reads resolve as globals.
+
+The block runs as an ordinary call on the current fiber, so it may call, yield
+and raise; an exception thrown inside it propagates out of the `new`
+expression.
+
 ### Inheritance and `super`
 
 A subclass reaches its base class through `super`:
@@ -1931,6 +1972,7 @@ Type-level introspection, inheritance inspection, and dynamic reflection on user
 | **SetField** | `SetField(inst:instance, name:string, value:any) - bool` | Writes a declared field; returns `false` for an undeclared name or frozen instance. Never fabricates a field. | — |
 | **Invoke** | `Invoke(target:instance\|class, name:string, ...args) - any` | Dynamically calls method `name` on instance or class. | — |
 | **Instantiate** | `Instantiate(name:string) - instance` | New instance of the named global class **without** running its Constructor (fields get declared defaults). Nil for an unknown or non-class name. | — |
+| **Define** | `Define(name:string, fields:object) - class` | Build a class at runtime from `fields` (field name → default value) and return it. The class is **anonymous**: it is never bound to a global, so it cannot shadow a declared class, and two calls with the same `name` yield two distinct types (`name` is metadata for `GetName`). Instances get a real slot per field, are sealed exactly like a declared class's, and work with every `Class.*` function, `Json.Deserialize`. Each default is cloned, so instances never share one mutable value and later mutation of the object you passed cannot reach the template. Field order follows the object's insertion order. **The field set is final** — an instance is a single allocation sized from the field count, so a class can never gain a field afterwards. Raises `InvalidArgs` on a non-string name, a non-object `fields`, or more than 4096 fields. | — |
 | **New** | `New(target:class\|string, ...args) - instance` | New instance of a class (object or global name) **with** its Constructor run against `args`. Nil for an unknown/non-class target. | — |
 
 ---

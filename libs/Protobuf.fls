@@ -1,0 +1,2094 @@
+// =============================================================================
+// Protobuf.fls - Protocol Buffers (proto3) for Flaris: wire codec + .proto reader.
+// Version: 1.0
+//
+// Encodes and decodes protobuf wire-format bytes directly into and out of
+// ordinary Flaris class instances. A message class is a normal class whose
+// fields carry the message's data; a static Descriptor() method maps each
+// field name to its field number and wire type.
+//
+// Message classes come from one of two places:
+//
+//   * written by hand, with a static Descriptor() - shown next;
+//   * built from a .proto at runtime by Pb.LoadProto - see ".proto schemas"
+//     below. That path needs no compiler, so it works on a runtime-only build.
+//
+//   import { Pb } from library("Protobuf", "1.0");
+//
+//   class Person {
+//       let name   = "";
+//       let id     = 0;
+//       let emails = nil;          // repeated -> array
+//       let home   = nil;          // nested message -> instance or nil
+//
+//       fn static Descriptor() {
+//           return {
+//               name:   { num: 1, kind: Pb.STRING },
+//               id:     { num: 2, kind: Pb.INT32  },
+//               emails: { num: 3, kind: Pb.STRING,  repeated: true },
+//               home:   { num: 4, kind: Pb.MESSAGE, msg: Address    },
+//           };
+//       }
+//   }
+//
+//   let p = new Person();
+//   p.name = "Ada";
+//   p.id   = 7;
+//
+//   let bytes = Pb.Encode(p);              // -> block
+//   let back  = Pb.Decode(bytes, Person);  // -> Person instance
+//
+// Descriptor() is a static method, so it may reference message classes that are
+// declared later in the file, and a message may reference itself - recursive and
+// mutually recursive messages both work.
+//
+// -----------------------------------------------------------------------------
+// Field specification
+// -----------------------------------------------------------------------------
+//   num:int          field number (required, 1..536870911)
+//   kind:int         one of the Pb type constants below (required)
+//   repeated:bool    field holds an array
+//   packed:bool      override packing; proto3 packs repeated numeric scalars by
+//                    default, and a decoder always accepts either form
+//   msg:class        message class - required for MESSAGE, and for a MAP whose
+//                    value is a MESSAGE
+//   optional:bool    explicit presence: nil means absent, and a zero value is
+//                    still written (proto3 `optional`)
+//   oneof:string     name of the oneof group this field belongs to
+//   key:int          MAP only - key type (an integral or STRING kind)
+//   val:int          MAP only - value type
+//
+// Type constants (the numbering is protobuf's own FieldDescriptorProto.Type):
+//
+//   Pb.DOUBLE   Pb.FLOAT    Pb.INT64    Pb.UINT64   Pb.INT32
+//   Pb.FIXED64  Pb.FIXED32  Pb.BOOL     Pb.STRING   Pb.MESSAGE
+//   Pb.BYTES    Pb.UINT32   Pb.ENUM     Pb.SFIXED32 Pb.SFIXED64
+//   Pb.SINT32   Pb.SINT64   Pb.MAP
+//
+// -----------------------------------------------------------------------------
+// How Flaris values map to protobuf types
+// -----------------------------------------------------------------------------
+//   DOUBLE, FLOAT                      float
+//   INT32/64, SINT32/64, SFIXED32/64   int
+//   UINT32/64, FIXED32/64              int  (see "Unsigned 64-bit" below)
+//   BOOL                               bool
+//   STRING                             string   (UTF-8 bytes; NUL is allowed)
+//   BYTES                              block
+//   MESSAGE                            instance, or nil when absent
+//   ENUM                               int
+//   repeated X                         array of the above
+//   map<K,V>                           object - see "Maps" below
+//
+// Presence (proto3 semantics):
+//   A scalar equal to its type's zero value is not written, and an absent scalar
+//   decodes to that zero value. A field marked `optional: true`, or one inside a
+//   oneof, uses explicit presence instead: nil means absent, and a zero value is
+//   written. A message field is always explicit - nil means absent.
+//
+// Maps:
+//   A map field is a plain Flaris object, so its keys are strings. Integer and
+//   bool keys appear in their decimal / "true" / "false" form, which is the same
+//   convention protobuf's own canonical JSON mapping uses; the declared `key`
+//   kind converts them back losslessly on encode. On the wire a map is the
+//   repeated key/value entry message the spec defines, so this interoperates
+//   with every other implementation.
+//
+//       tags: { num: 5, kind: Pb.MAP, key: Pb.STRING, val: Pb.INT32 }
+//       m.tags = { "a": 1, "b": 2 };
+//
+// Unsigned 64-bit:
+//   Flaris ints are signed 64-bit, so a uint64 or fixed64 above 2^63-1 reads
+//   back as a negative int with the same bit pattern. The bytes round-trip
+//   exactly; only the decimal rendering differs. Java's protobuf runtime makes
+//   the same trade.
+//
+// Unknown fields:
+//   A field the descriptor does not name is skipped. Declare a field named
+//   `_unknown` (default nil) on a message class and those bytes are instead
+//   retained verbatim and re-emitted when the message is encoded again, so a
+//   proxy can forward a message it only partly understands without dropping data.
+//
+// -----------------------------------------------------------------------------
+// Pb API - all static
+// -----------------------------------------------------------------------------
+//   Encode(msg:instance)                 -> block    wire bytes for msg
+//   Decode(bytes:block, cls:class)       -> instance new instance of cls
+//                                                    (a string payload is accepted
+//                                                    too - same bytes)
+//   Merge(msg:instance, bytes:block)     -> instance decode into an existing
+//                                                    message (protobuf merge:
+//                                                    scalars overwrite, repeated
+//                                                    fields append, messages
+//                                                    merge recursively)
+//   EncodedSize(msg:instance)            -> int      byte length Encode returns
+//
+//   EncodeDelimited(msg:instance)        -> block    varint length + message
+//   DecodeDelimited(r:PbReader, cls)     -> instance one length-prefixed message
+//   ReadDelimited(s:stream, cls:class)   -> instance one message off a stream,
+//                                                    or nil at a clean EOF
+//   WriteDelimited(s:stream, msg)        -> bool     length-prefixed to a stream
+//
+//   WhichOneof(msg:instance, name:string) -> string  the set field's name, or nil
+//   ClearOneof(msg:instance, name:string) -> bool    clear every member
+//
+//   Equals(a:instance, b:instance)       -> bool     wire-canonical comparison
+//   Clone(msg:instance)                  -> instance deep copy via a round-trip
+//
+//   Register(cls:class, descriptor)      -> class    give a class its descriptor
+//                                                    explicitly (see below)
+//   ZeroFor(kind:int)                    -> any      the value a field of this
+//                                                    kind holds when absent
+//
+//   LoadProto(source:string, name?)      -> object   .proto text -> { name: class }
+//   LoadProtoFile(path, includes?)       -> object   same, resolving imports
+//   ParseProto(source:string, name?)     -> schema   parse only, as plain data
+//   ParseProtoFile(path, includes?)      -> schema   parse a file and its imports
+//   DefineSchema(schema)                 -> object   schema -> { name: class }
+//
+// -----------------------------------------------------------------------------
+// Messages defined at runtime
+// -----------------------------------------------------------------------------
+// A class built by Class.Define has no body, so it cannot carry a static
+// Descriptor(). Register one for it instead and everything else is identical -
+// this is the path for a schema that arrives as data (a descriptor file, a gRPC
+// reflection reply) rather than as generated code, and the only one available on
+// a runtime-only build, which has no compiler.
+//
+//   let Person = Class.Define("Person", { name: Pb.ZeroFor(Pb.STRING),
+//                                         id:   Pb.ZeroFor(Pb.INT32) });
+//   Pb.Register(Person, { name: { num: 1, kind: Pb.STRING },
+//                         id:   { num: 2, kind: Pb.INT32  } });
+//
+//   let p = Pb.Decode(bytes, Person);   // same call as a generated class
+//   Console.WriteLine(p.name);
+//
+// Build every class first and register descriptors in a second pass, so a
+// message can reference one defined later, or itself. A registered descriptor
+// takes precedence over a Descriptor() method, so it also works as a deliberate
+// override; re-registering replaces the previous one.
+//
+// Descriptors live in a side table rather than on the class on purpose: a
+// schema's messages refer to each other, and a descriptor stored on the class it
+// describes would close a reference cycle that is never reclaimed.
+//
+// Give a runtime-defined message an `_unknown` field like the generated classes
+// have, and a partial schema still round-trips losslessly.
+//
+// -----------------------------------------------------------------------------
+// .proto schemas
+// -----------------------------------------------------------------------------
+// A .proto file is data, so it can be read at runtime and turned into live
+// classes - no code generation, no compiler, nothing new becomes executable:
+//
+//   let types = Pb.LoadProtoFile("api.proto", nil);
+//   let msg   = Pb.Decode(bytes, types["Person"]);
+//   Console.WriteLine(msg.name);
+//
+// LoadProto returns a map of name -> class. A nested type flattens
+// (`Outer.Inner` becomes `Outer_Inner`), because a Flaris class cannot nest. An
+// enum maps to a plain object of its values, so `types["Status"].ACTIVE` reads
+// the way a Flaris enum would. Every message gets an `_unknown` field, so a
+// partial schema still re-encodes losslessly.
+//
+// Supported: package, import (public/weak), nested messages and enums,
+// singular / repeated / proto3 optional, oneof, map<K,V>, reserved, and
+// service/rpc including streaming (parsed into the schema; nothing binds it
+// yet). Field and file options parse but only `[packed = false]` changes
+// behaviour. proto2 - `required`, groups, extensions - and proto editions are
+// reported as errors rather than mis-read.
+//
+// ParseProto stops after parsing and hands back the schema as plain data, for
+// inspection (`Json.Stringify`) or for building something else from it.
+//
+// PbWriter / PbReader are the low-level encoder and decoder. Reach for them to
+// hand-write a codec for a hot message; Pb.Encode/Decode are built on them.
+//
+//   PbWriter: Tag(num, wire) VarInt(v) ZigZag(v) Fixed32(v) Fixed64(v)
+//             Float(v) Double(v) Str(s) Bytes(blk) Raw(blk) Position() ToBuffer()
+//   PbReader: Tag() VarInt() ZigZag() Fixed32() SFixed32() Fixed64() Float()
+//             Double() Str(n) Bytes(n) Skip(wire) AtEnd() Position() Limit()
+//
+// Wire-type constants: Pb.WIRE_VARINT, WIRE_64, WIRE_LEN, WIRE_32.
+//
+// Limits: nesting is capped at 100 levels and a field number must be in
+// 1..536870911; both raise rather than recurse or emit a malformed tag.
+// =============================================================================
+
+
+import { Lexer } from library("Lexer", "1.0");
+
+
+// A payload that arrived as a string (an HTTP body, a file read) holds the same
+// bytes; take a block view of it rather than failing later in the first typed
+// read. Anything else is rejected here instead of silently decoding to nothing.
+fn _pb_asBlock(v):block {
+    if (type(v) == Type.Block)  { return v; }
+    if (type(v) == Type.String) { return Buffer.FromString(v); }
+    throw(1, "Protobuf: expected wire bytes as a block or string");
+}
+
+
+// =============================================================================
+// PbWriter - growable block-backed encoder
+// =============================================================================
+class PbWriter
+{
+    let _buf:block = nil;
+    let _cap:int   = 0;
+    let _pos:int   = 0;
+
+    fn Constructor(capacity:int|nil) {
+        let c:int = 256;
+        if (capacity != nil && capacity > 0) { c = capacity; }
+        _buf = Buffer.Create(c, 1);
+        _cap = c;
+    }
+
+    fn _grow(need:int) {
+        let c:int = _cap;
+        while (c < _pos + need) { c = c * 2; }
+        Buffer.Reserve(_buf, c);
+        _cap = c;
+    }
+
+    fn Position():int { return _pos; }
+
+    // Filled bytes as a new block; the writer stays usable.
+    fn ToBuffer():block { return Buffer.Slice(_buf, 0, _pos); }
+
+    fn Reset() { _pos = 0; }
+
+    fn VarInt(v:int) {
+        if (_pos + 10 > _cap) { _grow(10); }
+        _pos += Buffer.WriteVarintAt(_buf, _pos, v);
+    }
+
+    // LEB128 of the zigzag transform - the sint32/sint64 encoding.
+    fn ZigZag(v:int) { VarInt((v << 1) ^ (v >> 63)); }
+
+    fn Tag(num:int, wire:int) { VarInt((num << 3) | wire); }
+
+    fn Fixed32(v:int) {
+        if (_pos + 4 > _cap) { _grow(4); }
+        Buffer.WriteU32At(_buf, _pos, v, false);
+        _pos += 4;
+    }
+
+    fn Fixed64(v:int) {
+        if (_pos + 8 > _cap) { _grow(8); }
+        Buffer.WriteU64At(_buf, _pos, v, false);
+        _pos += 8;
+    }
+
+    fn Float(v:float) {
+        if (_pos + 4 > _cap) { _grow(4); }
+        Buffer.WriteFloat32At(_buf, _pos, v, false);
+        _pos += 4;
+    }
+
+    fn Double(v:float) {
+        if (_pos + 8 > _cap) { _grow(8); }
+        Buffer.WriteFloat64At(_buf, _pos, v, false);
+        _pos += 8;
+    }
+
+    fn Byte(v:int) {
+        if (_pos + 1 > _cap) { _grow(1); }
+        Buffer.WriteU8At(_buf, _pos, v & 0xFF);
+        _pos += 1;
+    }
+
+    // Length-delimited UTF-8. String bytes go straight in - no intermediate block.
+    fn Str(s:string) {
+        let n:int = len(s);
+        VarInt(n);
+        if (n == 0) { return; }
+        if (_pos + n > _cap) { _grow(n); }
+        Buffer.CopyStringAt(_buf, _pos, s, n);
+        _pos += n;
+    }
+
+    fn Bytes(blk:block) {
+        if (is_nil(blk)) { VarInt(0); return; }
+        let n:int = len(blk);
+        VarInt(n);
+        if (n == 0) { return; }
+        if (_pos + n > _cap) { _grow(n); }
+        Buffer.Copy(blk, 0, _buf, _pos, n);
+        _pos += n;
+    }
+
+    // Append raw bytes with no length prefix.
+    fn Raw(blk:block) {
+        if (is_nil(blk)) { return; }
+        let n:int = len(blk);
+        if (n == 0) { return; }
+        if (_pos + n > _cap) { _grow(n); }
+        Buffer.Copy(blk, 0, _buf, _pos, n);
+        _pos += n;
+    }
+}
+
+
+// =============================================================================
+// PbReader - bounded cursor over a block
+//
+// _end is the exclusive limit of the region being read. A submessage decode
+// narrows it and restores it afterwards, so nesting costs no allocation.
+// =============================================================================
+class PbReader
+{
+    let _buf:block = nil;
+    let _pos:int   = 0;
+    let _end:int   = 0;
+
+    fn Constructor(buf, offset:int|nil, length:int|nil) {
+        if (is_nil(buf)) { throw(1, "PbReader: buffer is nil"); }
+        buf = _pb_asBlock(buf);
+        _buf = buf;
+        _pos = 0;
+        if (offset != nil) { _pos = offset; }
+        _end = len(buf);
+        if (length != nil) { _end = _pos + length; }
+        if (_end > len(buf)) { _end = len(buf); }
+    }
+
+    fn Position():int { return _pos; }
+    fn Limit():int    { return _end; }
+    fn AtEnd():bool   { return _pos >= _end; }
+    fn Remaining():int { return _end - _pos; }
+
+    fn Seek(p:int) { _pos = p; }
+
+    // Narrow to a subregion and return the previous limit, for restoring.
+    fn PushLimit(length:int):int {
+        let prev:int = _end;
+        let e:int = _pos + length;
+        if (e > prev) { throw(2, "Protobuf: submessage length runs past its parent"); }
+        _end = e;
+        return prev;
+    }
+
+    fn PopLimit(prev:int) { _end = prev; }
+
+    fn VarInt():int {
+        let r = Buffer.ReadVarintAt(_buf, _pos);
+        let n:int = r[1];
+        if (n == 0 || _pos + n > _end) { throw(2, "Protobuf: truncated varint"); }
+        _pos += n;
+        return r[0];
+    }
+
+    fn ZigZag():int {
+        let v:int = VarInt();
+        return ((v >> 1) & 0x7FFFFFFFFFFFFFFF) ^ (0 - (v & 1));
+    }
+
+    fn Tag():int { return VarInt(); }
+
+    fn Fixed32():int {
+        if (_pos + 4 > _end) { throw(2, "Protobuf: truncated fixed32"); }
+        let v:int = Buffer.ReadU32At(_buf, _pos, false);
+        _pos += 4;
+        return v;
+    }
+
+    fn SFixed32():int {
+        if (_pos + 4 > _end) { throw(2, "Protobuf: truncated fixed32"); }
+        let v:int = Buffer.ReadI32At(_buf, _pos, false);
+        _pos += 4;
+        return v;
+    }
+
+    fn Fixed64():int {
+        if (_pos + 8 > _end) { throw(2, "Protobuf: truncated fixed64"); }
+        let v:int = Buffer.ReadU64At(_buf, _pos, false);
+        _pos += 8;
+        return v;
+    }
+
+    fn Float():float {
+        if (_pos + 4 > _end) { throw(2, "Protobuf: truncated float"); }
+        let v:float = Buffer.ReadFloat32At(_buf, _pos, false);
+        _pos += 4;
+        return v;
+    }
+
+    fn Double():float {
+        if (_pos + 8 > _end) { throw(2, "Protobuf: truncated double"); }
+        let v:float = Buffer.ReadFloat64At(_buf, _pos, false);
+        _pos += 8;
+        return v;
+    }
+
+    fn Str(n:int):string {
+        if (n < 0 || _pos + n > _end) { throw(2, "Protobuf: truncated string"); }
+        if (n == 0) { return ""; }
+        let s:string = Buffer.ToString(Buffer.Slice(_buf, _pos, n));
+        _pos += n;
+        return s;
+    }
+
+    fn Bytes(n:int):block {
+        if (n < 0 || _pos + n > _end) { throw(2, "Protobuf: truncated bytes"); }
+        let b:block = Buffer.Slice(_buf, _pos, n);
+        _pos += n;
+        return b;
+    }
+
+    // Consume one field's payload given its wire type.
+    fn Skip(wire:int) {
+        if (wire == 0) { VarInt(); return; }
+        if (wire == 1) { if (_pos + 8 > _end) { throw(2, "Protobuf: truncated fixed64"); } _pos += 8; return; }
+        if (wire == 5) { if (_pos + 4 > _end) { throw(2, "Protobuf: truncated fixed32"); } _pos += 4; return; }
+        if (wire == 2) {
+            let n:int = VarInt();
+            if (n < 0 || _pos + n > _end) { throw(2, "Protobuf: truncated length-delimited field"); }
+            _pos += n;
+            return;
+        }
+        throw(2, "Protobuf: unsupported wire type " + str(wire));
+    }
+
+    // Raw bytes of one field including its tag - for unknown-field retention.
+    fn SkipRaw(tagStart:int, wire:int):block {
+        Skip(wire);
+        return Buffer.Slice(_buf, tagStart, _pos - tagStart);
+    }
+}
+
+
+class ProtoParser
+{
+    let _toks:array  = nil;
+    let _pos:int     = 0;
+    let _file:string = "";
+
+    fn Constructor(source:string, filename:string|nil) {
+        if (is_nil(filename)) { _file = "<input>"; } else { _file = filename; }
+        // No keyword table: proto has no reserved words, so `message` and `map`
+        // are legal field names and must stay plain word tokens.
+        let lex = new Lexer();
+        lex.Word("a-zA-Z_", "a-zA-Z0-9_")
+           .Number()
+           .Quote("\"", "string")
+           .Quote("'", "string")
+           .LineComment("//")
+           .BlockComment("/*", "*/")
+           .Operators("{}()[]<>=;,./-+")
+           .Skip(" \t\n\r");
+        _toks = lex.Tokenize(source);
+        _pos  = 0;
+    }
+
+    // ---- cursor ----
+
+    fn AtEnd():bool { return _pos >= len(_toks); }
+
+    fn Peek(offset:int|nil) {
+        let i:int = _pos + (offset ?? 0);
+        if (i < 0 || i >= len(_toks)) { return nil; }
+        return _toks[i];
+    }
+
+    fn Next() {
+        let t = Peek(0);
+        if (is_nil(t)) { Fail("unexpected end of file"); }
+        _pos += 1;
+        return t;
+    }
+
+    fn Line():int {
+        let t = Peek(0);
+        if (is_nil(t)) {
+            if (len(_toks) == 0) { return 0; }
+            return _toks[len(_toks) - 1].line;
+        }
+        return t.line;
+    }
+
+    fn Fail(msg:string) {
+        throw(1, _file + ":" + str(Line()) + ": " + msg);
+    }
+
+    // True when the next token is this exact word or operator.
+    fn Is(v:string):bool {
+        let t = Peek(0);
+        if (is_nil(t)) { return false; }
+        if (t.type != "word" && t.type != "op") { return false; }
+        return t.val == v;
+    }
+
+    fn Accept(v:string):bool {
+        if (Is(v)) { _pos += 1; return true; }
+        return false;
+    }
+
+    fn Expect(v:string) {
+        if (!Accept(v)) {
+            let t = Peek(0);
+            let got:string = is_nil(t) ? "end of file" : ("'" + str(t.val) + "'");
+            Fail("expected '" + v + "' but found " + got);
+        }
+    }
+
+    fn Word():string {
+        let t = Next();
+        if (t.type != "word") { Fail("expected a name but found '" + str(t.val) + "'"); }
+        return t.val;
+    }
+
+    fn Str():string {
+        let t = Next();
+        if (t.type != "string") { Fail("expected a quoted string"); }
+        return t.val;
+    }
+
+    fn Int():int {
+        let neg:bool = false;
+        if (Accept("-")) { neg = true; }
+        else { Accept("+"); }
+        let t = Next();
+        if (t.type != "number") { Fail("expected a number but found '" + str(t.val) + "'"); }
+        let v:int = int(t.val);
+        return neg ? (0 - v) : v;
+    }
+
+    // A dotted type reference: `.pkg.Msg`, `Msg`, `Outer.Inner`.
+    fn TypeRef():string {
+        let name:string = "";
+        if (Accept(".")) { name = "."; }
+        name = name + Word();
+        while (Is(".")) {
+            // A '.' only continues the reference when a name follows it.
+            let after = Peek(1);
+            if (is_nil(after) || after.type != "word") { break; }
+            _pos += 1;
+            name = name + "." + Word();
+        }
+        return name;
+    }
+
+    // A label word only counts as a label when a type name follows it; proto
+    // lets a field be called `optional` or `repeated`.
+    fn _IsLabel(v:string):bool {
+        if (!Is(v)) { return false; }
+        let after = Peek(1);
+        if (is_nil(after)) { return false; }
+        return after.type == "word" || after.val == ".";
+    }
+
+    // ---- grammar ----
+
+    fn ParseFile() {
+        let schema = {
+            file:     _file,
+            syntax:   "proto2",
+            package:  "",
+            imports:  [],
+            messages: [],
+            enums:    [],
+            services: [],
+        };
+
+        while (!AtEnd()) {
+            if (Accept(";")) { continue; }
+
+            if (Accept("syntax")) {
+                Expect("=");
+                schema.syntax = Str();
+                Expect(";");
+                continue;
+            }
+            if (Accept("edition")) {
+                Fail("proto editions are not supported; use syntax = \"proto3\"");
+            }
+            if (Accept("package")) {
+                schema.package = TypeRef();
+                Expect(";");
+                continue;
+            }
+            if (Accept("import")) {
+                let kind:string = "";
+                if (Is("public") || Is("weak")) { kind = Word(); }
+                let path:string = Str();
+                Expect(";");
+                Array.Append(schema.imports, { path: path, kind: kind });
+                continue;
+            }
+            if (Accept("option"))  { _SkipOption(); continue; }
+            if (Accept("message")) { Array.Append(schema.messages, _Message(schema.package)); continue; }
+            if (Accept("enum"))    { Array.Append(schema.enums,    _Enum(schema.package));    continue; }
+            if (Accept("service")) { Array.Append(schema.services, _Service(schema.package)); continue; }
+            if (Is("extend")) { Fail("proto2 extensions are not supported"); }
+
+            let t = Peek(0);
+            Fail("unexpected '" + str(t.val) + "' at top level");
+        }
+
+        if (schema.syntax != "proto3") {
+            throw(1, _file + ": syntax is \"" + schema.syntax
+                   + "\"; Protogen generates proto3 only");
+        }
+        return schema;
+    }
+
+    fn _Message(prefix:string) {
+        let name:string = Word();
+        let fq:string   = (prefix == "") ? name : (prefix + "." + name);
+        Expect("{");
+
+        let m = {
+            name:          name,
+            fqName:        fq,
+            fields:        [],
+            oneofs:        [],
+            nested:        [],
+            enums:         [],
+            reservedNums:  [],
+            reservedNames: [],
+        };
+
+        while (!Accept("}")) {
+            if (AtEnd()) { Fail("unterminated message '" + name + "'"); }
+            if (Accept(";")) { continue; }
+            if (Accept("message"))  { Array.Append(m.nested, _Message(fq)); continue; }
+            if (Accept("enum"))     { Array.Append(m.enums,  _Enum(fq));    continue; }
+            if (Accept("option"))   { _SkipOption(); continue; }
+            if (Accept("reserved")) { _Reserved(m.reservedNums, m.reservedNames); continue; }
+            if (Accept("oneof"))    { _Oneof(m); continue; }
+            if (Is("extensions"))   { Fail("proto2 extension ranges are not supported"); }
+            if (Is("extend"))       { Fail("proto2 extensions are not supported"); }
+            if (Is("group"))        { Fail("proto2 groups are not supported"); }
+            Array.Append(m.fields, _Field(false));
+        }
+        return m;
+    }
+
+    // inOneof forbids a label, which proto does not allow inside a oneof.
+    fn _Field(inOneof:bool) {
+        let label:string = "singular";
+        if (!inOneof) {
+            if (_IsLabel("repeated"))      { Word(); label = "repeated"; }
+            else if (_IsLabel("optional")) { Word(); label = "optional"; }
+            else if (_IsLabel("required")) {
+                Fail("proto2 'required' is not supported");
+            }
+        }
+
+        // A group is `group Name = 1 { ... }` and appears where a type does, so
+        // it has to be caught here rather than at the start of a member.
+        if (Is("group")) { Fail("proto2 groups are not supported"); }
+
+        // map<K,V> - a field may also simply be named `map`, hence the '<' test.
+        if (Is("map")) {
+            let after = Peek(1);
+            if (!is_nil(after) && after.val == "<") {
+                if (label != "singular") { Fail("a map field cannot be '" + label + "'"); }
+                return _MapField();
+            }
+        }
+
+        let typeName:string = TypeRef();
+        let fname:string    = Word();
+        Expect("=");
+        let num:int = Int();
+        let opts    = _FieldOptions();
+        Expect(";");
+
+        return {
+            name:     fname,
+            num:      num,
+            label:    label,
+            typeName: typeName,
+            keyType:  nil,
+            valType:  nil,
+            oneof:    nil,
+            opts:     opts,
+        };
+    }
+
+    fn _MapField() {
+        Expect("map");
+        Expect("<");
+        let keyType:string = Word();
+        Expect(",");
+        let valType:string = TypeRef();
+        Expect(">");
+        let fname:string = Word();
+        Expect("=");
+        let num:int = Int();
+        let opts    = _FieldOptions();
+        Expect(";");
+
+        return {
+            name:     fname,
+            num:      num,
+            label:    "map",
+            typeName: nil,
+            keyType:  keyType,
+            valType:  valType,
+            oneof:    nil,
+            opts:     opts,
+        };
+    }
+
+    fn _Oneof(m) {
+        let oname:string = Word();
+        Expect("{");
+        let members:array = [];
+        while (!Accept("}")) {
+            if (AtEnd()) { Fail("unterminated oneof '" + oname + "'"); }
+            if (Accept(";")) { continue; }
+            if (Accept("option")) { _SkipOption(); continue; }
+            let f = _Field(true);
+            f.oneof = oname;
+            Array.Append(m.fields, f);
+            Array.Append(members, f.name);
+        }
+        Array.Append(m.oneofs, { name: oname, fields: members });
+    }
+
+    fn _Enum(prefix:string) {
+        let name:string = Word();
+        let fq:string   = (prefix == "") ? name : (prefix + "." + name);
+        Expect("{");
+
+        let e = {
+            name:       name,
+            fqName:     fq,
+            values:     [],
+            allowAlias: false,
+            reservedNums:  [],
+            reservedNames: [],
+        };
+
+        while (!Accept("}")) {
+            if (AtEnd()) { Fail("unterminated enum '" + name + "'"); }
+            if (Accept(";")) { continue; }
+            if (Accept("reserved")) { _Reserved(e.reservedNums, e.reservedNames); continue; }
+            if (Accept("option")) {
+                if (Is("allow_alias")) {
+                    Word();
+                    Expect("=");
+                    e.allowAlias = (Word() == "true");
+                    Expect(";");
+                } else {
+                    _SkipOption();
+                }
+                continue;
+            }
+            let vname:string = Word();
+            Expect("=");
+            let vnum:int = Int();
+            _FieldOptions();
+            Expect(";");
+            Array.Append(e.values, { name: vname, num: vnum });
+        }
+        return e;
+    }
+
+    fn _Service(prefix:string) {
+        let name:string = Word();
+        let fq:string   = (prefix == "") ? name : (prefix + "." + name);
+        Expect("{");
+
+        let svc = { name: name, fqName: fq, methods: [] };
+
+        while (!Accept("}")) {
+            if (AtEnd()) { Fail("unterminated service '" + name + "'"); }
+            if (Accept(";")) { continue; }
+            if (Accept("option")) { _SkipOption(); continue; }
+            Expect("rpc");
+
+            let mname:string = Word();
+            Expect("(");
+            let cstream:bool = _IsLabel("stream");
+            if (cstream) { Word(); }
+            let input:string = TypeRef();
+            Expect(")");
+            Expect("returns");
+            Expect("(");
+            let sstream:bool = _IsLabel("stream");
+            if (sstream) { Word(); }
+            let output:string = TypeRef();
+            Expect(")");
+
+            if (Accept("{")) {
+                while (!Accept("}")) {
+                    if (AtEnd()) { Fail("unterminated rpc '" + mname + "'"); }
+                    if (Accept("option")) { _SkipOption(); continue; }
+                    Next();
+                }
+            } else {
+                Expect(";");
+            }
+
+            Array.Append(svc.methods, {
+                name:         mname,
+                input:        input,
+                output:       output,
+                clientStream: cstream,
+                serverStream: sstream,
+            });
+        }
+        return svc;
+    }
+
+    // `reserved 2, 9 to 11, 15;` or `reserved "foo", "bar";`
+    fn _Reserved(nums:array, names:array) {
+        let t = Peek(0);
+        if (!is_nil(t) && t.type == "string") {
+            while (true) {
+                Array.Append(names, Str());
+                if (!Accept(",")) { break; }
+            }
+            Expect(";");
+            return;
+        }
+        while (true) {
+            let lo:int = Int();
+            let hi:int = lo;
+            if (Is("to")) {
+                Word();
+                if (Is("max")) { Word(); hi = 536870911; }
+                else           { hi = Int(); }
+            }
+            Array.Append(nums, [lo, hi]);
+            if (!Accept(",")) { break; }
+        }
+        Expect(";");
+    }
+
+    // Everything after the `option` keyword, up to and including its `;`.
+    // Option bodies are parsed only well enough to be stepped over - none are
+    // applied, so a custom option can never silently change the output.
+    fn _SkipOption() {
+        let depth:int = 0;
+        while (!AtEnd()) {
+            let t = Next();
+            if (t.type == "op") {
+                if (t.val == "{" || t.val == "[" || t.val == "(") { depth += 1; }
+                else if (t.val == "}" || t.val == "]" || t.val == ")") { depth -= 1; }
+                else if (t.val == ";" && depth <= 0) { return; }
+            }
+        }
+        Fail("unterminated option");
+    }
+
+    // `[packed = false, json_name = "x"]` - known keys are kept, the rest are
+    // parsed and dropped.
+    fn _FieldOptions() {
+        let opts = {};
+        if (!Accept("[")) { return opts; }
+
+        while (true) {
+            let key:string = "";
+            if (Accept("(")) {
+                // A custom option: (foo.bar) [.baz] - recorded under no name.
+                let d:int = 1;
+                while (d > 0 && !AtEnd()) {
+                    let t = Next();
+                    if (t.val == "(") { d += 1; }
+                    if (t.val == ")") { d -= 1; }
+                }
+                while (Accept(".")) { Word(); }
+                key = "";
+            } else {
+                key = Word();
+                while (Accept(".")) { key = key + "." + Word(); }
+            }
+            Expect("=");
+            let v = _OptionValue();
+            if (key != "") { opts[key] = v; }
+            if (!Accept(",")) { break; }
+        }
+        Expect("]");
+        return opts;
+    }
+
+    fn _OptionValue() {
+        if (Accept("{")) {
+            let d:int = 1;
+            while (d > 0 && !AtEnd()) {
+                let t = Next();
+                if (t.val == "{") { d += 1; }
+                if (t.val == "}") { d -= 1; }
+            }
+            return nil;
+        }
+        let t = Peek(0);
+        if (is_nil(t)) { Fail("expected an option value"); }
+        if (t.type == "string") { return Str(); }
+        if (t.type == "number" || t.val == "-" || t.val == "+") { return Int(); }
+        let w:string = Word();
+        while (Accept(".")) { w = w + "." + Word(); }
+        if (w == "true")  { return true; }
+        if (w == "false") { return false; }
+        return w;
+    }
+}
+
+
+// =============================================================================
+// Protogen - resolution and code generation
+// =============================================================================
+
+
+// Prepared descriptors live here rather than on the class: a class body holds
+// only consts, which cannot be reassigned.
+global _pb_prepCache = nil;
+
+// Descriptors registered for classes that have no static Descriptor() - the
+// runtime-defined case (Class.Define). Kept in a side table rather than attached
+// to the class: a schema's messages refer to each other, so a descriptor stored
+// ON the class it describes would close a reference cycle that is never
+// reclaimed. table -> class and table -> descriptor -> class has no way back.
+global _pb_registry = nil;
+
+// proto scalar type name -> Pb kind. Built once, on first use.
+global _pb_scalarKinds = nil;
+
+
+// =============================================================================
+// Pb - static facade: descriptor preparation, sizing, encoding, decoding
+// =============================================================================
+class Pb
+{
+    // Field types - protobuf's own FieldDescriptorProto.Type numbering, so a
+    // descriptor set read from protoc maps across unchanged. MAP is Flaris
+    // sugar: 19 is unused upstream, and on the wire it is the repeated
+    // key/value entry message the spec defines.
+    const DOUBLE   = 1;
+    const FLOAT    = 2;
+    const INT64    = 3;
+    const UINT64   = 4;
+    const INT32    = 5;
+    const FIXED64  = 6;
+    const FIXED32  = 7;
+    const BOOL     = 8;
+    const STRING   = 9;
+    const MESSAGE  = 11;
+    const BYTES    = 12;
+    const UINT32   = 13;
+    const ENUM     = 14;
+    const SFIXED32 = 15;
+    const SFIXED64 = 16;
+    const SINT32   = 17;
+    const SINT64   = 18;
+    const MAP      = 19;
+
+    const WIRE_VARINT = 0;
+    const WIRE_64     = 1;
+    const WIRE_LEN    = 2;
+    const WIRE_32     = 5;
+
+    const MAX_DEPTH     = 100;
+    const MAX_FIELD_NUM = 536870911;
+
+    // -------------------------------------------------------------------------
+    // Descriptor preparation
+    // -------------------------------------------------------------------------
+
+    // The wire type a field kind travels as.
+    fn static WireFor(kind:int):int {
+        if (kind == Pb.DOUBLE   || kind == Pb.FIXED64 || kind == Pb.SFIXED64) { return Pb.WIRE_64; }
+        if (kind == Pb.FLOAT    || kind == Pb.FIXED32 || kind == Pb.SFIXED32) { return Pb.WIRE_32; }
+        if (kind == Pb.STRING   || kind == Pb.BYTES   || kind == Pb.MESSAGE
+                                || kind == Pb.MAP)                            { return Pb.WIRE_LEN; }
+        return Pb.WIRE_VARINT;
+    }
+
+    // Prepared descriptors, keyed by class object (heap values hash by identity).
+    // Preparing the same class twice yields an equivalent result, so a fiber
+    // switch mid-prepare can only cost duplicate work, never a wrong descriptor.
+    fn static _Cache() {
+        if (is_nil(_pb_prepCache)) { _pb_prepCache = Collections.HashMap(); }
+        return _pb_prepCache;
+    }
+
+    // Resolve cls's Descriptor() into the flat form the codec walks: fields in
+    // declaration order with their tags precomputed, plus a field-number index
+    // for decoding and the oneof groupings.
+    // Register(cls, descriptor) - give a class its wire descriptor explicitly,
+    // for a class built at runtime by Class.Define which cannot carry a static
+    // Descriptor() method. Same descriptor shape as Descriptor() returns.
+    // Re-registering replaces the previous one and drops the prepared cache
+    // entry, so a schema can be reloaded without restarting.
+    fn static Register(cls, descriptor) {
+        if (is_nil(cls) || !Class.IsClass(cls)) {
+            throw(1, "Pb.Register: expected a message class");
+        }
+        if (is_nil(descriptor) || !is_object(descriptor)) {
+            throw(1, "Pb.Register: expected a descriptor object");
+        }
+        if (is_nil(_pb_registry)) { _pb_registry = Collections.HashMap(); }
+        _pb_registry.Set(cls, descriptor);
+        Pb._Cache().Delete(cls);
+        return cls;
+    }
+
+    // The value a field of this kind holds when absent - what Class.Define
+    // should use as the field's default.
+    fn static ZeroFor(kind:int) {
+        return Pb._ZeroFor(kind);
+    }
+
+    fn static Prepare(cls) {
+        if (is_nil(cls) || !Class.IsClass(cls)) {
+            throw(1, "Protobuf: expected a message class");
+        }
+        let cache = Pb._Cache();
+        let hit = cache.Get(cls);
+        if (!is_nil(hit)) { return hit; }
+
+        // A registered descriptor wins: a runtime-defined class has no method
+        // to carry one, and an explicit Register is a deliberate override.
+        let raw = nil;
+        if (!is_nil(_pb_registry)) { raw = _pb_registry.Get(cls); }
+        if (is_nil(raw)) {
+            if (!Class.HasMethod(cls, "Descriptor")) {
+                throw(1, "Protobuf: class '" + Class.GetName(cls)
+                       + "' has no static Descriptor() and none was registered"
+                       + " with Pb.Register");
+            }
+            raw = Class.Invoke(cls, "Descriptor");
+        }
+        if (is_nil(raw)) {
+            throw(1, "Protobuf: descriptor for '" + Class.GetName(cls) + "' is nil");
+        }
+
+        let names  = Object.Keys(raw);
+        let fields = [];
+        let byNum  = Collections.HashMap();
+        let oneofs = {};
+
+        let i:int = 0;
+        while (i < len(names)) {
+            let fname:string = names[i];
+            let spec = raw[fname];
+            i += 1;
+
+            let num:int = spec.num ?? 0;
+            if (num < 1 || num > Pb.MAX_FIELD_NUM) {
+                throw(1, "Protobuf: field '" + fname + "' has an out-of-range number " + str(num));
+            }
+            if (!is_nil(byNum.Get(num))) {
+                throw(1, "Protobuf: field number " + str(num) + " is used twice in "
+                       + Class.GetName(cls));
+            }
+
+            let kind:int = spec.kind ?? 0;
+            if (kind == 0) {
+                throw(1, "Protobuf: field '" + fname + "' has no kind");
+            }
+            let isMap:bool = (kind == Pb.MAP);
+            let rep:bool   = (spec.repeated == true);
+
+            if ((kind == Pb.MESSAGE || (isMap && spec.val == Pb.MESSAGE)) && is_nil(spec.msg)) {
+                throw(1, "Protobuf: field '" + fname + "' is a message but names no msg class");
+            }
+
+            // proto3 packs repeated numeric scalars by default; length-delimited
+            // element types can never be packed.
+            let wire:int = Pb.WireFor(kind);
+            let packable:bool = rep && !isMap && wire != Pb.WIRE_LEN;
+            let packed:bool = packable;
+            if (spec.packed != nil) { packed = (spec.packed == true) && packable; }
+
+            let oneof = spec.oneof;
+            if (!is_nil(oneof)) {
+                if (is_nil(oneofs[oneof])) { oneofs[oneof] = []; }
+                Array.Append(oneofs[oneof], fname);
+            }
+
+            let e = {
+                name:    fname,
+                num:     num,
+                kind:    kind,
+                wire:    wire,
+                tag:     (num << 3) | wire,
+                lenTag:  (num << 3) | Pb.WIRE_LEN,
+                rep:     rep,
+                isMap:   isMap,
+                packed:  packed,
+                packable: packable,
+                msg:     spec.msg,
+                keyKind: spec.key ?? Pb.STRING,
+                valKind: spec.val ?? Pb.STRING,
+                kTag:    (1 << 3) | Pb.WireFor(spec.key ?? Pb.STRING),
+                vTag:    (2 << 3) | Pb.WireFor(spec.val ?? Pb.STRING),
+                // Explicit presence: nil means absent and a zero value is still
+                // written. Message fields are always explicit.
+                explicit: (spec.optional == true) || !is_nil(oneof) || kind == Pb.MESSAGE,
+                oneof:   oneof,
+            };
+            Array.Append(fields, e);
+            byNum.Set(num, e);
+        }
+
+        // True when some field's length cannot be known until its content has
+        // been written - a submessage, a map entry or a packed run. _WriteMsg
+        // consumes ctx only inside exactly those branches, so when this is false
+        // the writing pass needs no sizing pass and no context at all.
+        let twoPass:bool = false;
+        let k:int = 0;
+        while (k < len(fields)) {
+            let fe = fields[k];
+            k += 1;
+            if (fe.isMap || fe.packed || fe.kind == Pb.MESSAGE) { twoPass = true; }
+        }
+
+        let prep = {
+            cls:        cls,
+            name:       Class.GetName(cls),
+            fields:     fields,
+            byNum:      byNum,
+            oneofs:     oneofs,
+            twoPass:    twoPass,
+            hasUnknown: Pb._HasField(cls, "_unknown"),
+        };
+        cache.Set(cls, prep);
+        return prep;
+    }
+
+    // The prepared descriptor of a message field's type. Deliberately NOT cached
+    // on the entry: for a self-recursive message that would make the entry point
+    // at the descriptor that owns it, and a reference cycle is never reclaimed.
+    // Prepare's own cache already makes this a single hashmap lookup.
+    fn static _PrepOf(e) {
+        return Pb.Prepare(e.msg);
+    }
+
+    fn static _HasField(cls, name:string):bool {
+        let probe = Pb._NewMessage(cls);
+        let f = Class.Fields(probe);
+        let i:int = 0;
+        while (i < len(f)) {
+            if (f[i] == name) { return true; }
+            i += 1;
+        }
+        return false;
+    }
+
+    // A message instance carrying only its declared field defaults. Constructor()
+    // is deliberately not run: a decoded message's state comes from the wire, and
+    // a constructor that demands arguments must not make a class undecodable.
+    fn static _NewMessage(cls) {
+        let inst = Class.Instantiate(Class.GetName(cls));
+        if (!is_nil(inst) && Class.Of(inst) == cls) { return inst; }
+        // The class is not reachable under that global name (imported, or
+        // shadowed by another of the same name) - fall back to the constructor.
+        inst = Class.New(cls);
+        if (is_nil(inst)) {
+            throw(1, "Protobuf: cannot instantiate '" + Class.GetName(cls) + "'");
+        }
+        return inst;
+    }
+
+    // -------------------------------------------------------------------------
+    // Defaults and sizes
+    // -------------------------------------------------------------------------
+
+    fn static _IsDefault(kind:int, v):bool {
+        if (is_nil(v)) { return true; }
+        if (kind == Pb.STRING) { return len(v) == 0; }
+        if (kind == Pb.BYTES)  { return len(v) == 0; }
+        if (kind == Pb.BOOL)   { return v == false; }
+        if (kind == Pb.MESSAGE) { return false; }
+        return v == 0;
+    }
+
+    fn static _ZeroFor(kind:int) {
+        if (kind == Pb.STRING) { return ""; }
+        if (kind == Pb.BYTES)  { return nil; }
+        if (kind == Pb.BOOL)   { return false; }
+        if (kind == Pb.DOUBLE || kind == Pb.FLOAT) { return 0.0; }
+        if (kind == Pb.MESSAGE) { return nil; }
+        return 0;
+    }
+
+    fn static _SizeVarint(v:int):int {
+        if (v < 0)                  { return 10; }
+        if (v < 0x80)               { return 1; }
+        if (v < 0x4000)             { return 2; }
+        if (v < 0x200000)           { return 3; }
+        if (v < 0x10000000)         { return 4; }
+        if (v < 0x800000000)        { return 5; }
+        if (v < 0x40000000000)      { return 6; }
+        if (v < 0x2000000000000)    { return 7; }
+        if (v < 0x100000000000000)  { return 8; }
+        return 9;
+    }
+
+    // Payload bytes for one scalar - no tag, no length prefix.
+    fn static _SizeScalar(kind:int, v):int {
+        if (kind == Pb.BOOL)     { return 1; }
+        if (kind == Pb.FLOAT || kind == Pb.FIXED32 || kind == Pb.SFIXED32)  { return 4; }
+        if (kind == Pb.DOUBLE || kind == Pb.FIXED64 || kind == Pb.SFIXED64) { return 8; }
+        if (kind == Pb.SINT32 || kind == Pb.SINT64) {
+            let n:int = v ?? 0;
+            return Pb._SizeVarint((n << 1) ^ (n >> 63));
+        }
+        if (kind == Pb.STRING) {
+            let n:int = len(v ?? "");
+            return Pb._SizeVarint(n) + n;
+        }
+        if (kind == Pb.BYTES) {
+            let n:int = 0;
+            if (!is_nil(v)) { n = len(v); }
+            return Pb._SizeVarint(n) + n;
+        }
+        return Pb._SizeVarint(v ?? 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Sizing pass
+    //
+    // Every length-delimited region needs its byte count before its bytes, so
+    // encoding is two passes. The sizing pass appends each computed length to
+    // ctx.sizes and each map's key order to ctx.keys; the writing pass walks the
+    // message in the identical order and consumes both queues by index. The
+    // traversals must therefore stay structurally identical - a branch added to
+    // one belongs in the other.
+    // -------------------------------------------------------------------------
+
+    fn static _NewCtx() {
+        return { sizes: [], idx: 0, keys: [], kidx: 0 };
+    }
+
+    fn static _SizeSub(ctx, v, e, depth:int):int {
+        let slot:int = len(ctx.sizes);
+        Array.Append(ctx.sizes, 0);
+        let sub:int = 0;
+        if (!is_nil(v)) { sub = Pb._SizeMsg(ctx, v, Pb._PrepOf(e), depth + 1); }
+        ctx.sizes[slot] = sub;
+        return sub;
+    }
+
+    fn static _SizeMsg(ctx, msg, prep, depth:int):int {
+        if (depth > Pb.MAX_DEPTH) {
+            throw(2, "Protobuf: message nests deeper than " + str(Pb.MAX_DEPTH) + " levels");
+        }
+        let total:int = 0;
+        let fs = prep.fields;
+        let i:int = 0;
+        while (i < len(fs)) {
+            let e = fs[i];
+            i += 1;
+            let v = Class.GetField(msg, e.name);
+
+            if (e.isMap) {
+                if (is_nil(v)) { continue; }
+                let keys = Object.Keys(v);
+                Array.Append(ctx.keys, keys);
+                let kTag:int = Pb._SizeVarint(e.kTag);
+                let vTag:int = Pb._SizeVarint(e.vTag);
+                let j:int = 0;
+                while (j < len(keys)) {
+                    let k:string = keys[j];
+                    j += 1;
+                    let slot:int = len(ctx.sizes);
+                    Array.Append(ctx.sizes, 0);
+                    let entry:int = kTag + Pb._SizeScalar(e.keyKind, Pb._MapKeyIn(e.keyKind, k)) + vTag;
+                    if (e.valKind == Pb.MESSAGE) {
+                        let sub:int = Pb._SizeSub(ctx, v[k], e, depth);
+                        entry += Pb._SizeVarint(sub) + sub;
+                    } else {
+                        entry += Pb._SizeScalar(e.valKind, v[k]);
+                    }
+                    ctx.sizes[slot] = entry;
+                    total += Pb._SizeVarint(e.lenTag) + Pb._SizeVarint(entry) + entry;
+                }
+                continue;
+            }
+
+            if (e.rep) {
+                if (is_nil(v) || len(v) == 0) { continue; }
+                let n:int = len(v);
+                if (e.packed) {
+                    let slot:int = len(ctx.sizes);
+                    Array.Append(ctx.sizes, 0);
+                    let payload:int = 0;
+                    let j:int = 0;
+                    while (j < n) { payload += Pb._SizeScalar(e.kind, v[j]); j += 1; }
+                    ctx.sizes[slot] = payload;
+                    total += Pb._SizeVarint(e.lenTag) + Pb._SizeVarint(payload) + payload;
+                } else {
+                    let j:int = 0;
+                    while (j < n) {
+                        total += Pb._SizeVarint(e.tag);
+                        if (e.kind == Pb.MESSAGE) {
+                            let sub:int = Pb._SizeSub(ctx, v[j], e, depth);
+                            total += Pb._SizeVarint(sub) + sub;
+                        } else {
+                            total += Pb._SizeScalar(e.kind, v[j]);
+                        }
+                        j += 1;
+                    }
+                }
+                continue;
+            }
+
+            if (is_nil(v)) { continue; }
+            if (!e.explicit && Pb._IsDefault(e.kind, v)) { continue; }
+
+            total += Pb._SizeVarint(e.tag);
+            if (e.kind == Pb.MESSAGE) {
+                let sub:int = Pb._SizeSub(ctx, v, e, depth);
+                total += Pb._SizeVarint(sub) + sub;
+            } else {
+                total += Pb._SizeScalar(e.kind, v);
+            }
+        }
+
+        if (prep.hasUnknown) {
+            let u = Class.GetField(msg, "_unknown");
+            if (!is_nil(u)) { total += len(u); }
+        }
+        return total;
+    }
+
+    // -------------------------------------------------------------------------
+    // Writing pass - mirrors _SizeMsg step for step
+    // -------------------------------------------------------------------------
+
+    fn static _NextSize(ctx):int {
+        let s:int = ctx.sizes[ctx.idx];
+        ctx.idx += 1;
+        return s;
+    }
+
+    fn static _WriteScalar(w, kind:int, v) {
+        if (kind == Pb.BOOL)     { w.VarInt(v == true ? 1 : 0); return; }
+        if (kind == Pb.FLOAT)    { w.Float(float(v ?? 0)); return; }
+        if (kind == Pb.DOUBLE)   { w.Double(float(v ?? 0)); return; }
+        if (kind == Pb.FIXED32 || kind == Pb.SFIXED32) { w.Fixed32(v ?? 0); return; }
+        if (kind == Pb.FIXED64 || kind == Pb.SFIXED64) { w.Fixed64(v ?? 0); return; }
+        if (kind == Pb.SINT32 || kind == Pb.SINT64)    { w.ZigZag(v ?? 0); return; }
+        if (kind == Pb.STRING)   { w.Str(v ?? ""); return; }
+        if (kind == Pb.BYTES)    { w.Bytes(v); return; }
+        w.VarInt(v ?? 0);
+    }
+
+    fn static _WriteSub(ctx, w, v, e, depth:int) {
+        let sub:int = Pb._NextSize(ctx);
+        w.VarInt(sub);
+        if (sub > 0) { Pb._WriteMsg(ctx, w, v, Pb._PrepOf(e), depth + 1); }
+    }
+
+    fn static _WriteMsg(ctx, w, msg, prep, depth:int) {
+        let fs = prep.fields;
+        let i:int = 0;
+        while (i < len(fs)) {
+            let e = fs[i];
+            i += 1;
+            let v = Class.GetField(msg, e.name);
+
+            if (e.isMap) {
+                if (is_nil(v)) { continue; }
+                let keys = ctx.keys[ctx.kidx];
+                ctx.kidx += 1;
+                let kTag:int = e.kTag;
+                let vTag:int = e.vTag;
+                let j:int = 0;
+                while (j < len(keys)) {
+                    let k:string = keys[j];
+                    j += 1;
+                    w.VarInt(e.lenTag);
+                    w.VarInt(Pb._NextSize(ctx));
+                    w.VarInt(kTag);
+                    Pb._WriteScalar(w, e.keyKind, Pb._MapKeyIn(e.keyKind, k));
+                    w.VarInt(vTag);
+                    if (e.valKind == Pb.MESSAGE) { Pb._WriteSub(ctx, w, v[k], e, depth); }
+                    else                         { Pb._WriteScalar(w, e.valKind, v[k]); }
+                }
+                continue;
+            }
+
+            if (e.rep) {
+                if (is_nil(v) || len(v) == 0) { continue; }
+                let n:int = len(v);
+                if (e.packed) {
+                    w.VarInt(e.lenTag);
+                    w.VarInt(Pb._NextSize(ctx));
+                    let j:int = 0;
+                    while (j < n) { Pb._WriteScalar(w, e.kind, v[j]); j += 1; }
+                } else {
+                    let j:int = 0;
+                    while (j < n) {
+                        w.VarInt(e.tag);
+                        if (e.kind == Pb.MESSAGE) { Pb._WriteSub(ctx, w, v[j], e, depth); }
+                        else                      { Pb._WriteScalar(w, e.kind, v[j]); }
+                        j += 1;
+                    }
+                }
+                continue;
+            }
+
+            if (is_nil(v)) { continue; }
+            if (!e.explicit && Pb._IsDefault(e.kind, v)) { continue; }
+
+            w.VarInt(e.tag);
+            if (e.kind == Pb.MESSAGE) { Pb._WriteSub(ctx, w, v, e, depth); }
+            else                      { Pb._WriteScalar(w, e.kind, v); }
+        }
+
+        if (prep.hasUnknown) {
+            let u = Class.GetField(msg, "_unknown");
+            if (!is_nil(u)) { w.Raw(u); }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Map keys
+    //
+    // A Flaris object has string keys, so an integral or bool map key lives in
+    // its decimal / "true" / "false" form - the same convention protobuf's
+    // canonical JSON mapping uses. These two convert in each direction.
+    // -------------------------------------------------------------------------
+
+    fn static _MapKeyIn(kind:int, k:string) {
+        if (kind == Pb.STRING) { return k; }
+        if (kind == Pb.BOOL)   { return k == "true"; }
+        return int(k);
+    }
+
+    fn static _MapKeyOut(kind:int, v):string {
+        if (kind == Pb.STRING) { return v ?? ""; }
+        if (kind == Pb.BOOL)   { return (v == true) ? "true" : "false"; }
+        return str(v ?? 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Decoding
+    // -------------------------------------------------------------------------
+
+    fn static _ReadScalar(r, kind:int) {
+        if (kind == Pb.BOOL)     { return r.VarInt() != 0; }
+        if (kind == Pb.INT32)    { return i32(r.VarInt()); }
+        if (kind == Pb.UINT32)   { return u32(r.VarInt()); }
+        if (kind == Pb.SINT32)   { return i32(r.ZigZag()); }
+        if (kind == Pb.SINT64)   { return r.ZigZag(); }
+        if (kind == Pb.FIXED32)  { return r.Fixed32(); }
+        if (kind == Pb.SFIXED32) { return r.SFixed32(); }
+        if (kind == Pb.FIXED64 || kind == Pb.SFIXED64) { return r.Fixed64(); }
+        if (kind == Pb.FLOAT)    { return r.Float(); }
+        if (kind == Pb.DOUBLE)   { return r.Double(); }
+        if (kind == Pb.STRING)   { return r.Str(r.VarInt()); }
+        if (kind == Pb.BYTES)    { return r.Bytes(r.VarInt()); }
+        return r.VarInt();
+    }
+
+    fn static _ReadMsg(r, msg, prep, depth:int) {
+        if (depth > Pb.MAX_DEPTH) {
+            throw(2, "Protobuf: message nests deeper than " + str(Pb.MAX_DEPTH) + " levels");
+        }
+        let unknown = nil;
+        while (!r.AtEnd()) {
+            let start:int = r.Position();
+            let tag:int   = r.Tag();
+            let num:int   = tag >> 3;
+            let wire:int  = tag & 7;
+            if (num < 1) { throw(2, "Protobuf: field number 0 is not valid"); }
+            if (wire == 3 || wire == 4) { throw(2, "Protobuf: groups are not supported"); }
+
+            let e = prep.byNum.Get(num);
+            // An unrecognised field, or one whose wire type contradicts the
+            // descriptor, is not decodable here - keep the bytes if the message
+            // retains unknowns, otherwise step over them.
+            if (is_nil(e) || !Pb._WireOk(e, wire)) {
+                if (prep.hasUnknown) {
+                    if (is_nil(unknown)) { unknown = new PbWriter(32); }
+                    unknown.Raw(r.SkipRaw(start, wire));
+                } else {
+                    r.Skip(wire);
+                }
+                continue;
+            }
+            Pb._ReadField(r, msg, prep, e, wire, depth);
+        }
+
+        if (!is_nil(unknown) && unknown.Position() > 0) {
+            let prev = Class.GetField(msg, "_unknown");
+            if (is_nil(prev)) {
+                Class.SetField(msg, "_unknown", unknown.ToBuffer());
+            } else {
+                let m = new PbWriter(len(prev) + unknown.Position());
+                m.Raw(prev);
+                m.Raw(unknown.ToBuffer());
+                Class.SetField(msg, "_unknown", m.ToBuffer());
+            }
+        }
+    }
+
+    // A packable repeated field legitimately arrives either packed (WIRE_LEN) or
+    // as one tag per element, so both are accepted for it.
+    fn static _WireOk(e, wire:int):bool {
+        if (wire == e.wire) { return true; }
+        return e.packable && wire == Pb.WIRE_LEN;
+    }
+
+    fn static _ReadField(r, msg, prep, e, wire:int, depth:int) {
+        if (e.isMap) { Pb._ReadMapEntry(r, msg, e, depth); return; }
+
+        if (e.rep) {
+            let arr = Class.GetField(msg, e.name);
+            if (is_nil(arr)) { arr = []; Class.SetField(msg, e.name, arr); }
+            if (e.kind == Pb.MESSAGE) {
+                Array.Append(arr, Pb._ReadSub(r, nil, e, depth));
+                return;
+            }
+            if (e.packable && wire == Pb.WIRE_LEN) {
+                let n:int = r.VarInt();
+                let prevLimit:int = r.PushLimit(n);
+                while (!r.AtEnd()) { Array.Append(arr, Pb._ReadScalar(r, e.kind)); }
+                r.PopLimit(prevLimit);
+            } else {
+                Array.Append(arr, Pb._ReadScalar(r, e.kind));
+            }
+            return;
+        }
+
+        if (e.kind == Pb.MESSAGE) {
+            // Repeated occurrences of a singular message field merge, per spec.
+            let cur = Class.GetField(msg, e.name);
+            if (!is_nil(cur) && Class.Of(cur) != e.msg) { cur = nil; }
+            Class.SetField(msg, e.name, Pb._ReadSub(r, cur, e, depth));
+        } else {
+            Class.SetField(msg, e.name, Pb._ReadScalar(r, e.kind));
+        }
+
+        if (!is_nil(e.oneof)) { Pb._ClearSiblings(msg, prep, e); }
+    }
+
+    // Read one length-delimited submessage into `into` (or a fresh instance).
+    fn static _ReadSub(r, into, e, depth:int) {
+        let n:int = r.VarInt();
+        let prevLimit:int = r.PushLimit(n);
+        let m = into;
+        if (is_nil(m)) { m = Pb._NewMessage(e.msg); }
+        Pb._ReadMsg(r, m, Pb._PrepOf(e), depth + 1);
+        r.PopLimit(prevLimit);
+        return m;
+    }
+
+    fn static _ReadMapEntry(r, msg, e, depth:int) {
+        let n:int = r.VarInt();
+        let prevLimit:int = r.PushLimit(n);
+
+        // An entry may omit a default key or value; the spec has the reader
+        // supply the zero value in that case.
+        let k = Pb._ZeroFor(e.keyKind);
+        let v = Pb._ZeroFor(e.valKind);
+        while (!r.AtEnd()) {
+            let tag:int  = r.Tag();
+            let num:int  = tag >> 3;
+            let wire:int = tag & 7;
+            if (num == 1 && wire == (e.kTag & 7)) {
+                k = Pb._ReadScalar(r, e.keyKind);
+            } else if (num == 2 && wire == (e.vTag & 7)) {
+                if (e.valKind == Pb.MESSAGE) { v = Pb._ReadSub(r, nil, e, depth); }
+                else                         { v = Pb._ReadScalar(r, e.valKind); }
+            } else {
+                r.Skip(wire);
+            }
+        }
+        r.PopLimit(prevLimit);
+
+        let m = Class.GetField(msg, e.name);
+        if (is_nil(m)) { m = {}; Class.SetField(msg, e.name, m); }
+        m[Pb._MapKeyOut(e.keyKind, k)] = v;
+    }
+
+    fn static _ClearSiblings(msg, prep, e) {
+        let group = prep.oneofs[e.oneof];
+        if (is_nil(group)) { return; }
+        let i:int = 0;
+        while (i < len(group)) {
+            if (group[i] != e.name) { Class.SetField(msg, group[i], nil); }
+            i += 1;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // .proto schemas at runtime
+    //
+    // A .proto file is DATA. Parsing it and defining classes from it needs no
+    // compiler, so this works on a runtime-only build: ship the .proto next to
+    // the signed bytecode and load it there.
+    // -------------------------------------------------------------------------
+
+    fn static _ScalarKinds() {
+        if (is_nil(_pb_scalarKinds)) {
+            _pb_scalarKinds = {
+                double:   Pb.DOUBLE,   float:    Pb.FLOAT,
+                int32:    Pb.INT32,    int64:    Pb.INT64,
+                uint32:   Pb.UINT32,   uint64:   Pb.UINT64,
+                sint32:   Pb.SINT32,   sint64:   Pb.SINT64,
+                fixed32:  Pb.FIXED32,  fixed64:  Pb.FIXED64,
+                sfixed32: Pb.SFIXED32, sfixed64: Pb.SFIXED64,
+                bool:     Pb.BOOL,     string:   Pb.STRING, bytes: Pb.BYTES,
+            };
+        }
+        return _pb_scalarKinds;
+    }
+
+    // Parse one .proto file's text into a plain-data schema. Inspect it with
+    // Json.Stringify, or hand it to DefineSchema.
+    fn static ParseProto(source:string, name:string|nil) {
+        let p = new ProtoParser(source, name);
+        return p.ParseFile();
+    }
+
+    // Parse a .proto and every file it imports. `includes` lists the directories
+    // searched; the file's own directory is always searched last. Imported
+    // schemas land in `schema.deps`.
+    fn static ParseProtoFile(path:string, includes:array|nil) {
+        let inc:array = includes ?? [Path.GetDirectoryName(path)];
+        let seen = {};
+        let root = Pb._ReadProto(path, seen);
+        let queue:array = [root];
+        let deps:array  = [];
+
+        let qi:int = 0;
+        while (qi < len(queue)) {
+            let cur = queue[qi];
+            qi += 1;
+            let i:int = 0;
+            while (i < len(cur.imports)) {
+                let imp = cur.imports[i];
+                i += 1;
+                let resolved = Pb._FindProto(imp.path, inc, cur.file);
+                if (is_nil(resolved)) {
+                    throw(1, cur.file + ": cannot find imported file '" + imp.path + "'");
+                }
+                imp.resolved = resolved;
+                if (seen[resolved] == true) { continue; }
+                let sub = Pb._ReadProto(resolved, seen);
+                Array.Append(queue, sub);
+                Array.Append(deps, sub);
+            }
+        }
+        // deps holds imports only - never root, which would make the schema
+        // self-referential and leak.
+        root.deps = deps;
+        return root;
+    }
+
+    fn static _ReadProto(path:string, seen:object) {
+        if (!File.Exists(path)) { throw(1, "Protobuf: no such .proto file '" + path + "'"); }
+        seen[path] = true;
+        let text = File.ReadText(path);
+        if (is_nil(text)) { throw(1, "Protobuf: cannot read '" + path + "'"); }
+        return Pb.ParseProto(text, path);
+    }
+
+    fn static _FindProto(rel:string, includes:array, fromPath:string) {
+        let i:int = 0;
+        while (i < len(includes)) {
+            let cand:string = Path.Combine(includes[i], rel);
+            if (File.Exists(cand)) { return cand; }
+            i += 1;
+        }
+        let sibling:string = Path.Combine(Path.GetDirectoryName(fromPath), rel);
+        if (File.Exists(sibling)) { return sibling; }
+        return nil;
+    }
+
+    // Build a class for every message in `schema` (and its imports) and register
+    // each one's descriptor. Returns a map of name -> class; an enum maps to a
+    // plain object of its values, so `types["Status"].ACTIVE` reads the way a
+    // Flaris enum would.
+    //
+    // Nested types flatten - `Outer.Inner` becomes `Outer_Inner` - because a
+    // Flaris class cannot nest. Classes are created first and descriptors
+    // registered second, so a message may reference one declared later, or
+    // itself.
+    fn static DefineSchema(schema) {
+        let files:array = [schema];
+        let deps:array  = schema.deps ?? [];
+        let di:int = 0;
+        while (di < len(deps)) { Array.Append(files, deps[di]); di += 1; }
+
+        let types = {};
+        let order:array = [];
+        let fi:int = 0;
+        while (fi < len(files)) {
+            let f = files[fi];
+            fi += 1;
+            let pkg:string = f.package ?? "";
+            let mi:int = 0;
+            while (mi < len(f.messages)) { Pb._CollectMsg(f.messages[mi], types, order, pkg); mi += 1; }
+            let ei:int = 0;
+            while (ei < len(f.enums)) { Pb._CollectEnum(f.enums[ei], types, order, pkg); ei += 1; }
+        }
+
+        // Pass 1: a class per message, an object per enum.
+        let out = {};
+        let i:int = 0;
+        while (i < len(order)) {
+            let t = order[i];
+            i += 1;
+            if (t.kind == "enum") {
+                let vals = {};
+                let vi:int = 0;
+                while (vi < len(t.node.values)) {
+                    vals[t.node.values[vi].name] = t.node.values[vi].num;
+                    vi += 1;
+                }
+                t.value = vals;
+            } else {
+                t.value = Class.Define(t.flat, Pb._FieldDefaults(t, types));
+            }
+            out[t.flat] = t.value;
+        }
+
+        // Pass 2: descriptors, now that every class exists.
+        i = 0;
+        while (i < len(order)) {
+            let t = order[i];
+            i += 1;
+            if (t.kind == "enum") { continue; }
+            Pb.Register(t.value, Pb._SpecFor(t, types));
+        }
+        return out;
+    }
+
+    // ParseProto + DefineSchema.
+    fn static LoadProto(source:string, name:string|nil) {
+        return Pb.DefineSchema(Pb.ParseProto(source, name));
+    }
+
+    // ParseProtoFile + DefineSchema.
+    fn static LoadProtoFile(path:string, includes:array|nil) {
+        return Pb.DefineSchema(Pb.ParseProtoFile(path, includes));
+    }
+
+    fn static _CollectMsg(m, types, order:array, pkg:string) {
+        Pb._AddType(types, order, { kind: "message", node: m, fqName: m.fqName, pkg: pkg });
+        let i:int = 0;
+        while (i < len(m.nested)) { Pb._CollectMsg(m.nested[i], types, order, pkg); i += 1; }
+        let j:int = 0;
+        while (j < len(m.enums)) { Pb._CollectEnum(m.enums[j], types, order, pkg); j += 1; }
+    }
+
+    fn static _CollectEnum(e, types, order:array, pkg:string) {
+        Pb._AddType(types, order, { kind: "enum", node: e, fqName: e.fqName, pkg: pkg });
+    }
+
+    fn static _AddType(types, order:array, t) {
+        if (!is_nil(types[t.fqName])) {
+            throw(1, "Protobuf: '" + t.fqName + "' is declared twice");
+        }
+        // Strip the package, then flatten the nesting: Outer.Inner -> Outer_Inner.
+        let n:string = t.fqName;
+        if (t.pkg != "" && String.StartsWith(n, t.pkg + ".")) {
+            n = String.Substr(n, len(t.pkg) + 1, len(n) - len(t.pkg) - 1);
+        }
+        t.flat = String.Replace(n, ".", "_");
+        t.value = nil;
+        types[t.fqName] = t;
+        Array.Append(order, t);
+    }
+
+    // proto's relative scoping: innermost enclosing scope outwards. A leading
+    // '.' means the reference is already fully qualified.
+    fn static _ResolveType(types, ref:string, scope:string) {
+        if (String.StartsWith(ref, ".")) {
+            return types[String.Substr(ref, 1, len(ref) - 1)];
+        }
+        let cur:string = scope;
+        while (true) {
+            let cand:string = (cur == "") ? ref : (cur + "." + ref);
+            let hit = types[cand];
+            if (!is_nil(hit)) { return hit; }
+            if (cur == "") { break; }
+            let dot:int = String.LastIndexOf(cur, ".");
+            if (dot < 0) { cur = ""; } else { cur = String.Substr(cur, 0, dot); }
+        }
+        return nil;
+    }
+
+    // A field's kind, plus the type entry when it names a message or enum.
+    fn static _KindOfField(t, f, types, typeName:string) {
+        let direct = Pb._ScalarKinds()[typeName];
+        if (!is_nil(direct)) { return { kind: direct, ref: nil }; }
+        let hit = Pb._ResolveType(types, typeName, t.fqName);
+        if (is_nil(hit)) {
+            throw(1, "Protobuf: " + t.fqName + "." + f.name
+                   + " refers to unknown type '" + typeName + "'");
+        }
+        if (hit.kind == "enum") { return { kind: Pb.ENUM, ref: hit }; }
+        return { kind: Pb.MESSAGE, ref: hit };
+    }
+
+    fn static _FieldDefaults(t, types) {
+        let fields = {};
+        let fs:array = t.node.fields;
+        let i:int = 0;
+        while (i < len(fs)) {
+            let f = fs[i];
+            i += 1;
+            if (f.label == "repeated" || f.label == "map"
+                || f.label == "optional" || !is_nil(f.oneof)) {
+                fields[f.name] = nil;
+                continue;
+            }
+            let info = Pb._KindOfField(t, f, types, f.typeName);
+            if (info.kind == Pb.MESSAGE)   { fields[f.name] = nil; }
+            else if (info.kind == Pb.ENUM) { fields[f.name] = 0; }
+            else                            { fields[f.name] = Pb._ZeroFor(info.kind); }
+        }
+        // Retain fields this schema does not describe, so a partial view of a
+        // message still re-encodes losslessly.
+        fields["_unknown"] = nil;
+        return fields;
+    }
+
+    fn static _SpecFor(t, types) {
+        let spec = {};
+        let seenNum = {};
+        let fs:array = t.node.fields;
+        let i:int = 0;
+        while (i < len(fs)) {
+            let f = fs[i];
+            i += 1;
+            if (f.num < 1 || f.num > Pb.MAX_FIELD_NUM) {
+                throw(1, "Protobuf: " + t.fqName + "." + f.name
+                       + " has field number " + str(f.num) + ", outside 1..536870911");
+            }
+            if (seenNum[str(f.num)] == true) {
+                throw(1, "Protobuf: " + t.fqName + " uses field number "
+                       + str(f.num) + " twice");
+            }
+            seenNum[str(f.num)] = true;
+
+            let e = { num: f.num };
+            if (f.label == "map") {
+                let keyKind = Pb._ScalarKinds()[f.keyType];
+                if (is_nil(keyKind) || keyKind == Pb.DOUBLE || keyKind == Pb.FLOAT
+                    || keyKind == Pb.BYTES) {
+                    throw(1, "Protobuf: " + t.fqName + "." + f.name
+                           + " has map key type '" + f.keyType
+                           + "'; protobuf allows only integral, bool and string keys");
+                }
+                let vi = Pb._KindOfField(t, f, types, f.valType);
+                e.kind = Pb.MAP;
+                e.key  = keyKind;
+                e.val  = vi.kind;
+                if (vi.kind == Pb.MESSAGE) { e.msg = vi.ref.value; }
+            } else {
+                let info = Pb._KindOfField(t, f, types, f.typeName);
+                e.kind = info.kind;
+                if (info.kind == Pb.MESSAGE) { e.msg = info.ref.value; }
+                if (f.label == "repeated") {
+                    e.repeated = true;
+                    if (f.opts.packed == false) { e.packed = false; }
+                } else if (!is_nil(f.oneof)) {
+                    e.oneof = f.oneof;
+                } else if (f.label == "optional") {
+                    e.optional = true;
+                }
+            }
+            spec[f.name] = e;
+        }
+        return spec;
+    }
+
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
+
+    // Wire bytes for `msg`. The buffer is sized exactly by the sizing pass, so
+    // encoding never reallocates.
+    fn static Encode(msg):block {
+        if (is_nil(msg) || !Class.IsInstance(msg)) {
+            throw(1, "Pb.Encode: expected a message instance");
+        }
+        let prep = Pb.Prepare(Class.Of(msg));
+        if (!prep.twoPass) {
+            let wd = new PbWriter(64);
+            Pb._WriteMsg(nil, wd, msg, prep, 0);
+            return wd.ToBuffer();
+        }
+        let ctx = Pb._NewCtx();
+        let total:int = Pb._SizeMsg(ctx, msg, prep, 0);
+        ctx.idx  = 0;
+        ctx.kidx = 0;
+        let w = new PbWriter(total > 0 ? total : 16);
+        Pb._WriteMsg(ctx, w, msg, prep, 0);
+        return w.ToBuffer();
+    }
+
+    // Byte length Encode would produce, without building the bytes.
+    fn static EncodedSize(msg):int {
+        if (is_nil(msg) || !Class.IsInstance(msg)) {
+            throw(1, "Pb.EncodedSize: expected a message instance");
+        }
+        return Pb._SizeMsg(Pb._NewCtx(), msg, Pb.Prepare(Class.Of(msg)), 0);
+    }
+
+    // A new instance of `cls` decoded from `bytes`.
+    fn static Decode(bytes, cls) {
+        let prep = Pb.Prepare(cls);
+        let msg  = Pb._NewMessage(cls);
+        if (is_nil(bytes)) { return msg; }
+        let blk:block = _pb_asBlock(bytes);
+        if (len(blk) > 0) { Pb._ReadMsg(new PbReader(blk, nil, nil), msg, prep, 0); }
+        return msg;
+    }
+
+    // Decode into an existing message, protobuf merge semantics: scalars
+    // overwrite, repeated fields append, submessages merge field by field.
+    // Returns `msg`.
+    fn static Merge(msg, bytes) {
+        if (is_nil(msg) || !Class.IsInstance(msg)) {
+            throw(1, "Pb.Merge: expected a message instance");
+        }
+        if (is_nil(bytes)) { return msg; }
+        let blk:block = _pb_asBlock(bytes);
+        if (len(blk) > 0) {
+            Pb._ReadMsg(new PbReader(blk, nil, nil), msg, Pb.Prepare(Class.Of(msg)), 0);
+        }
+        return msg;
+    }
+
+    // Varint length prefix followed by the message - the framing used to put
+    // several messages in one file or on one socket.
+    fn static EncodeDelimited(msg):block {
+        let body:block = Pb.Encode(msg);
+        let w = new PbWriter(len(body) + 10);
+        w.Bytes(body);
+        return w.ToBuffer();
+    }
+
+    // One length-prefixed message off a reader positioned at the length.
+    fn static DecodeDelimited(r, cls) {
+        let n:int = r.VarInt();
+        let prevLimit:int = r.PushLimit(n);
+        let msg = Pb._NewMessage(cls);
+        Pb._ReadMsg(r, msg, Pb.Prepare(cls), 0);
+        r.PopLimit(prevLimit);
+        return msg;
+    }
+
+    // One length-prefixed message off a stream, or nil at a clean end of input.
+    fn static ReadDelimited(s:stream, cls) {
+        let n = Stream.ReadVarint(s);
+        if (is_nil(n)) { return nil; }
+        if (n < 0) { throw(2, "Pb.ReadDelimited: negative length prefix"); }
+        if (n == 0) { return Pb._NewMessage(cls); }
+        let body:block = Stream.ReadBytes(s, n);
+        if (is_nil(body) || len(body) < n) {
+            throw(2, "Pb.ReadDelimited: stream ended inside a message");
+        }
+        return Pb.Decode(body, cls);
+    }
+
+    fn static WriteDelimited(s:stream, msg):bool {
+        let body:block = Pb.Encode(msg);
+        if (!Stream.WriteVarint(s, len(body))) { return false; }
+        if (len(body) == 0) { return true; }
+        return Stream.WriteBytes(s, body, len(body)) == len(body);
+    }
+
+    // The name of the set field in oneof `name`, or nil when none is set.
+    fn static WhichOneof(msg, name:string) {
+        let prep  = Pb.Prepare(Class.Of(msg));
+        let group = prep.oneofs[name];
+        if (is_nil(group)) { return nil; }
+        let i:int = 0;
+        while (i < len(group)) {
+            if (!is_nil(Class.GetField(msg, group[i]))) { return group[i]; }
+            i += 1;
+        }
+        return nil;
+    }
+
+    fn static ClearOneof(msg, name:string):bool {
+        let prep  = Pb.Prepare(Class.Of(msg));
+        let group = prep.oneofs[name];
+        if (is_nil(group)) { return false; }
+        let i:int = 0;
+        while (i < len(group)) {
+            Class.SetField(msg, group[i], nil);
+            i += 1;
+        }
+        return true;
+    }
+
+    // Field-by-field comparison. Encoded bytes are not compared: protobuf
+    // serialization is not canonical, and a map's key order in particular is
+    // not stable, so equal messages can encode to different bytes.
+    fn static Equals(a, b):bool {
+        if (is_nil(a) || is_nil(b)) { return is_nil(a) && is_nil(b); }
+        if (!Class.IsInstance(a) || !Class.IsInstance(b)) { return false; }
+        let cls = Class.Of(a);
+        if (Class.Of(b) != cls) { return false; }
+
+        let prep = Pb.Prepare(cls);
+        let fs   = prep.fields;
+        let i:int = 0;
+        while (i < len(fs)) {
+            let e = fs[i];
+            i += 1;
+            let va = Class.GetField(a, e.name);
+            let vb = Class.GetField(b, e.name);
+
+            if (e.isMap) {
+                let ka = is_nil(va) ? [] : Object.Keys(va);
+                let kb = is_nil(vb) ? [] : Object.Keys(vb);
+                if (len(ka) != len(kb)) { return false; }
+                let j:int = 0;
+                while (j < len(ka)) {
+                    let k:string = ka[j];
+                    j += 1;
+                    if (is_nil(vb) || is_nil(vb[k])) {
+                        if (!is_nil(va[k])) { return false; }
+                        continue;
+                    }
+                    if (!Pb._ValueEq(e.valKind, va[k], vb[k])) { return false; }
+                }
+                continue;
+            }
+
+            if (e.rep) {
+                let na:int = is_nil(va) ? 0 : len(va);
+                let nb:int = is_nil(vb) ? 0 : len(vb);
+                if (na != nb) { return false; }
+                let j:int = 0;
+                while (j < na) {
+                    if (!Pb._ValueEq(e.kind, va[j], vb[j])) { return false; }
+                    j += 1;
+                }
+                continue;
+            }
+
+            // Implicit-presence fields treat nil and the zero value as the same
+            // state, because that is exactly what the wire cannot tell apart.
+            if (!e.explicit) {
+                if (Pb._IsDefault(e.kind, va) && Pb._IsDefault(e.kind, vb)) { continue; }
+            }
+            if (!Pb._ValueEq(e.kind, va, vb)) { return false; }
+        }
+        return true;
+    }
+
+    fn static _ValueEq(kind:int, x, y):bool {
+        if (kind == Pb.MESSAGE) { return Pb.Equals(x, y); }
+        if (kind == Pb.BYTES) {
+            if (is_nil(x) || is_nil(y)) { return is_nil(x) && is_nil(y); }
+            return Buffer.Equals(x, y);
+        }
+        return x == y;
+    }
+
+    // Deep copy, via a wire round-trip.
+    fn static Clone(msg) {
+        if (is_nil(msg)) { return nil; }
+        return Pb.Decode(Pb.Encode(msg), Class.Of(msg));
+    }
+}
+
+export { Pb, PbWriter, PbReader, ProtoParser };
