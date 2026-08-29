@@ -32,6 +32,13 @@ if [[ -n "$CC" ]]; then
         "$CC" -O2 -o "bench_${b}_c" "bench_${b}.c" || warn "C: $b failed to build"
     done
 fi
+if [[ -n "$RUSTC" ]]; then
+    log "Compiling Rust ($RUSTC -O)..."
+    for b in fib sieve collatz; do
+        "$RUSTC" -O -o "bench_${b}_rs" "bench_${b}.rs" \
+            || warn "Rust: $b failed to build"
+    done
+fi
 if [[ -n "$GO" ]]; then
     log "Compiling Go..."
     for b in fib sieve collatz; do
@@ -46,21 +53,38 @@ if [[ -n "$NIM" ]]; then
             || warn "Nim: $b failed to build"
     done
 fi
+if [[ -n "$DOTNET" ]]; then
+    # PublishAot=false keeps this lane on RyuJIT: SDK 10 file-based apps publish
+    # native-AOT by default, which would measure a third AOT compiler rather
+    # than the managed-JIT tier this lane exists to represent.
+    log "Compiling C# (dotnet publish -c Release, RyuJIT)..."
+    for b in fib sieve collatz; do
+        "$DOTNET" publish "bench_${b}.cs" -c Release -o "csout_${b}" \
+            -p:PublishAot=false >/dev/null 2>&1 \
+            || warn "C#: $b failed to build"
+    done
+fi
 
 # ── run ──────────────────────────────────────────────────────────────────────
-LANGS=(c go nim py lua luajit js fls flsj)
+LANGS=(c rs go nim cs py lua luajit js node fls flsj)
 
 run_lang() {  # run_lang <bench> <lang>
     local b="$1" l="$2" f
     case "$l" in
       c)      f=$(bin_path "bench_${b}_c");   [[ -n "$f" ]] && run_one "$b" c   "$f" ;;
+      rs)     f=$(bin_path "bench_${b}_rs");  [[ -n "$f" ]] && run_one "$b" rs  "$f" ;;
       go)     f=$(bin_path "bench_${b}_go");  [[ -n "$f" ]] && run_one "$b" go  "$f" ;;
       nim)    f=$(bin_path "bench_${b}_nim"); [[ -n "$f" ]] && run_one "$b" nim "$f" ;;
+      # A framework-dependent apphost needs its .dll and runtimeconfig beside
+      # it, so this lane runs out of the publish directory rather than copying
+      # the launcher up next to the other binaries.
+      cs)     f=$(bin_path "csout_${b}/bench_${b}"); [[ -n "$f" ]] && run_one "$b" cs "$f" ;;
       py)     run_one "$b" py     "$PYTHON" "bench_${b}.py" ;;
       lua)    run_one "$b" lua    "$LUA"    "bench_${b}.lua" ;;
       luajit) f="bench_${b}.lua"; [[ -f "bench_${b}_jit.lua" ]] && f="bench_${b}_jit.lua"
               run_one "$b" luajit "$LUAJIT" "$f" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
+      node)   run_one "$b" node   "$NODE"   "bench_${b}_node.js" ;;
       # The JIT is on by default, so the plain-VM lane has to switch it OFF.
       fls)    run_one "$b" fls    "$FLARISVM" --strip --jit-disable "bench_${b}.fls" ;;
       flsj)   run_one "$b" flsj   "$FLARISVM" --strip "bench_${b}.fls" ;;
@@ -115,8 +139,10 @@ Interpretation of these numbers lives in [../README.md](../README.md).
 | Language | Version | Mode |
 | -------- | ------- | ---- |
 | C | $(tool_version "$CC" --version) | -O2 |
+| Rust | $(tool_version "$RUSTC" --version) | rustc -O |
 | Go | $(tool_version "$GO" version) | go build |
 | Nim | $(tool_version "$NIM" --version) | -d:release --opt:speed -O3 |
+| C# | .NET SDK $(tool_version "$DOTNET" --version) | -c Release, RyuJIT (not AOT) |
 | Python | $(tool_version "$PYTHON" --version) | CPython interpreted |
 | Lua | $(tool_version "$LUA" -v) | interpreted |
 | LuaJIT | $(tool_version "$LUAJIT" -v) | tracing JIT |
@@ -143,7 +169,8 @@ cat <<'SIEVE'
 
 Byte-array write-heavy inner loop. Tests memory bandwidth and array indexing
 overhead. Each language uses its typed byte buffer (C `uint8_t*`, Nim
-`seq[uint8]`, Python `bytearray`, JS `Uint8Array`, Lua table, Flaris `Buffer`).
+`seq[uint8]`, Rust `Vec<u8>`, C# `byte[]`, Python `bytearray`, JS
+`Uint8Array`, Lua table, Flaris `Buffer`).
 
 SIEVE
 

@@ -57,16 +57,32 @@ resolve_tool() {   # resolve_tool <VARNAME> <candidate...>
     return 1
 }
 
+# The C# lane builds with `dotnet publish <file>.cs`, which needs SDK 10's
+# file-based apps; an older SDK would need a csproj per benchmark, so it drops
+# the lane rather than carrying a second build path for it.
+require_dotnet_filebased() {
+    [[ -n "$DOTNET" ]] || return 0
+    local v
+    v=$("$DOTNET" --version 2>/dev/null | head -1) || true
+    if [[ ! "$v" =~ ^([0-9]+) ]] || (( ${BASH_REMATCH[1]} < 10 )); then
+        warn "dotnet ${v:-?} predates SDK 10 file-based apps - C# lane skipped"
+        DOTNET=""
+    fi
+}
+
 resolve_all_tools() {
     resolve_tool FLARISVM flarisvm || true
     resolve_tool CC       clang cc gcc          || true
+    resolve_tool RUSTC    rustc                 || true
     resolve_tool GO       go                    || true
     resolve_tool NIM      nim                   || true
+    resolve_tool DOTNET   dotnet                || true
     resolve_tool PYTHON   python3 python        || true
     resolve_tool LUA      lua lua5.4 lua5.3     || true
     resolve_tool LUAJIT   luajit                || true
     resolve_tool NODE     node nodejs           || true
     resolve_tool QJS      qjs quickjs           || true
+    require_dotnet_filebased
     detect_time_tool
 
     if [[ -z "$FLARISVM" ]]; then
@@ -79,8 +95,10 @@ resolve_all_tools() {
 report_missing_tools() {
     local missing=()
     [[ -z "$CC"     ]] && missing+=("C (clang/gcc)")
+    [[ -z "$RUSTC"  ]] && missing+=("Rust")
     [[ -z "$GO"     ]] && missing+=("Go")
     [[ -z "$NIM"    ]] && missing+=("Nim")
+    [[ -z "$DOTNET" ]] && missing+=("C# (.NET SDK 10+)")
     [[ -z "$PYTHON" ]] && missing+=("Python 3")
     [[ -z "$LUA"    ]] && missing+=("Lua")
     [[ -z "$LUAJIT" ]] && missing+=("LuaJIT")
@@ -240,8 +258,9 @@ emit_table() {  # emit_table <bench> <base_ms> <col_label> <mark_fastest:0|1> <l
 
 lang_name() { case "$1" in
                 c)    echo "C" ;;          go)     echo "Go" ;;
+                rs)   echo "Rust" ;;       cs)     echo "C#" ;;
                 nim)  echo "Nim" ;;        py)     echo "Python 3" ;;
-                lua)  echo "Lua 5.4" ;;    luajit) echo "LuaJIT 2.1" ;;
+                lua)  echo "Lua" ;;        luajit) echo "LuaJIT" ;;
                 js)   echo "QuickJS" ;;    node)   echo "Node/V8" ;;
                 fls)  echo "Flaris" ;;     flsj)   echo "Flaris JIT" ;;
                 *)    echo "$1" ;;
@@ -249,6 +268,7 @@ lang_name() { case "$1" in
 
 lang_detail() { case "$1" in
                   c)    echo "clang -O2" ;;         go)     echo "go build" ;;
+                  rs)   echo "rustc -O" ;;          cs)     echo ".NET JIT" ;;
                   nim)  echo "-d:release -O3" ;;    py)     echo "CPython" ;;
                   lua)  echo "interpreted" ;;       luajit) echo "tracing JIT" ;;
                   js)   echo "interpreted" ;;       node)   echo "V8" ;;

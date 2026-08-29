@@ -1,0 +1,334 @@
+// =============================================================================
+// Connect.fls - Connect RPC client for Flaris.
+// Version: 1.0
+//
+// Connect (connectrpc.com) is a gRPC-compatible RPC protocol whose unary calls
+// are plain HTTP/1.1: POST the protobuf message, get the protobuf message back.
+// No HTTP/2, no HPACK, no ALPN - so this runs on the existing Http client and
+// on the runtime-only build.
+//
+//   import { Pb }                    from library("Protobuf", "1.0");
+//   import { Connect, Code, ConnectError } from library("Connect", "1.0");
+//
+//   let api = Pb.LoadProtoFile("greet.proto", nil);
+//   let c   = new Connect("http://localhost:8080");
+//
+//   let req = Class.New(api["Greeter"].methods.SayHello.input);
+//   req.name = "world";
+//
+//   let rep = c.Call(api["Greeter"].methods.SayHello, req);
+//   Console.WriteLine(rep.text);
+//
+// The method descriptor comes from Protobuf's schema loader, so the .proto is
+// the only definition of the wire contract - there is no generated code and
+// nothing new becomes executable.
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+// Unary calls only - one request message, one response message. That is the
+// whole of what Connect does over HTTP/1.1 without an envelope reader; a call
+// whose descriptor says clientStream or serverStream is rejected up front
+// rather than silently mis-framed.
+//
+// This is a client. Serving Connect is a separate concern; the code/status
+// mapping and the error body are exposed as statics so a handler can share them.
+//
+// -----------------------------------------------------------------------------
+// Connect
+// -----------------------------------------------------------------------------
+//   new Connect(baseUrl:string, opts?)
+//       opts: { headers: object,      sent with every call
+//               timeoutMs: int }      Connect-Timeout-Ms, the server-side
+//                                     deadline; 0 or absent sends no header
+//
+//   Call(method, msg)            -> instance   the response message
+//   CallFull(method, msg)        -> { message, status, headers }
+//   Invoke(service, name, msg)   -> instance   same, looked up by method name
+//   Url(method)                  -> string     the absolute URL a call posts to
+//   With(headers)                -> Connect    a copy carrying extra headers
+//
+// A failed call raises ConnectError. `e.Code` is the Connect code (see `Code`),
+// `e.Error` the server's message, `e.Status` the HTTP status (0 if the request
+// never got a response), and `e.Details` the error body's `details` array or
+// nil. A response that arrives but cannot be decoded raises too - a call either
+// returns a message or raises.
+//
+// There is no client-side socket timeout: the underlying Http client does not
+// expose one. `timeoutMs` bounds the server's work, not the wait.
+//
+// Every call is its own connection - the Http client sends `Connection: close`
+// and does not pool - so a call costs a TCP handshake on top of the round trip.
+// That is fine for the request rates a fiber-scheduled VM reaches; it is worth
+// knowing before benchmarking against a pooled client.
+//
+// -----------------------------------------------------------------------------
+// Codes
+// -----------------------------------------------------------------------------
+// `Code` holds the 16 Connect/gRPC codes by name - Code.NotFound, Code.Internal,
+// … - numbered as the specification numbers them. Statics translate:
+//
+//   Connect.CodeName(code:int)           -> string   "resource_exhausted"
+//   Connect.CodeFromName(name:string)    -> int      0 if unknown
+//   Connect.HttpStatusFor(code:int)      -> int      the status a server sends
+//   Connect.CodeForHttpStatus(status)    -> int      for a non-Connect response
+//   Connect.ErrorBody(code, message)     -> string   the JSON body of an error
+//
+// =============================================================================
+
+import { Pb }   from library("Protobuf", "1.0");
+import { Http } from library("Http", "1.0");
+
+// The Connect/gRPC status codes, numbered by the specification. 0 is "no error"
+// and never appears on an error.
+global Code = {
+    Canceled:           1,
+    Unknown:            2,
+    InvalidArgument:    3,
+    DeadlineExceeded:   4,
+    NotFound:           5,
+    AlreadyExists:      6,
+    PermissionDenied:   7,
+    ResourceExhausted:  8,
+    FailedPrecondition: 9,
+    Aborted:            10,
+    OutOfRange:         11,
+    Unimplemented:      12,
+    Internal:           13,
+    Unavailable:        14,
+    DataLoss:           15,
+    Unauthenticated:    16,
+};
+
+// Wire names, indexed by code. Position 0 is unused.
+global _connectCodeNames:array = [
+    "",
+    "canceled", "unknown", "invalid_argument", "deadline_exceeded",
+    "not_found", "already_exists", "permission_denied", "resource_exhausted",
+    "failed_precondition", "aborted", "out_of_range", "unimplemented",
+    "internal", "unavailable", "data_loss", "unauthenticated",
+];
+
+global CONNECT_CONTENT_TYPE:string = "application/proto";
+
+// Every failure of a Connect call, whether the peer reported it or the request
+// never arrived. `.Code` is a Connect code, not a VM error code.
+class ConnectError : Exception {
+    let Status:int = 0;    // HTTP status, or 0 if there was no response
+    let Details    = nil;  // the error body's `details` array, or nil
+}
+
+class Connect {
+    let _base:string    = "";
+    let _headers        = nil;
+    let _timeoutMs:int  = 0;
+
+    // `baseUrl` is an origin, optionally with a path prefix
+    // ("http://h:8080", "https://h/api"). A trailing slash is dropped: the
+    // method path always begins with one.
+    fn Constructor(baseUrl:string, opts?) {
+        this._base = Connect._trimSlash(baseUrl);
+        this._headers = {};
+        if (opts != nil) {
+            if ("headers" in opts && opts.headers != nil) {
+                foreach (v, k in opts.headers) { this._headers[k] = Convert.ToString(v); }
+            }
+            if ("timeoutMs" in opts && opts.timeoutMs != nil) {
+                this._timeoutMs = int(opts.timeoutMs);
+            }
+        }
+    }
+
+    fn static _trimSlash(u:string):string {
+        var s:string = u;
+        while (len(s) > 0 && String.EndsWith(s, "/")) {
+            s = String.Substr(s, 0, len(s) - 1);
+        }
+        return s;
+    }
+
+    // A copy of this client with `headers` merged over its own. The original is
+    // untouched, so a per-call credential does not leak into later calls.
+    fn With(headers):instance {
+        let merged = {};
+        foreach (v, k in this._headers) { merged[k] = v; }
+        if (headers != nil) {
+            foreach (v, k in headers) { merged[k] = Convert.ToString(v); }
+        }
+        return new Connect(this._base, { headers: merged, timeoutMs: this._timeoutMs });
+    }
+
+    fn Url(method):string {
+        return this._base + method.path;
+    }
+
+    // The response message, or a raise. See CallFull for the rest of the reply.
+    fn Call(method, msg) {
+        return this.CallFull(method, msg).message;
+    }
+
+    // Look a method up on a service descriptor by name.
+    fn Invoke(service, name:string, msg) {
+        let m = service.methods[name];
+        if (is_nil(m)) {
+            throw new ConnectError(Code.Unimplemented,
+                "Connect: service '" + service.fqName + "' has no rpc '" + name + "'");
+        }
+        return this.Call(m, msg);
+    }
+
+    // The response message plus the HTTP status and headers it came with.
+    // Raises ConnectError on anything else.
+    fn CallFull(method, msg) {
+        if (method.clientStream || method.serverStream) {
+            throw new ConnectError(Code.Unimplemented,
+                "Connect: " + method.fqName + " is a streaming rpc; this client "
+              + "does unary calls only");
+        }
+
+        let hdrs = {};
+        foreach (v, k in this._headers) { hdrs[k] = v; }
+        hdrs["Connect-Protocol-Version"] = "1";
+        // The Http client cannot decompress a response, so ask for none.
+        hdrs["Accept-Encoding"] = "identity";
+        if (this._timeoutMs > 0) {
+            hdrs["Connect-Timeout-Ms"] = Convert.ToString(this._timeoutMs);
+        }
+
+        let body:string = Buffer.ToString(Pb.Encode(msg));
+        let url:string  = this.Url(method);
+        let res = Http.Request("POST", url, body, CONNECT_CONTENT_TYPE, hdrs);
+
+        if (res == nil) {
+            throw new ConnectError(Code.Unavailable,
+                "Connect: no response from " + url);
+        }
+        if (res.status != 200) {
+            throw Connect._errorFrom(res);
+        }
+
+        let ct:string = Connect._contentType(res);
+        if (ct != CONNECT_CONTENT_TYPE) {
+            let e = new ConnectError(Code.Internal,
+                "Connect: expected " + CONNECT_CONTENT_TYPE + " in the reply to "
+              + method.fqName + ", got '" + ct + "'");
+            e.Status = res.status;
+            throw e;
+        }
+
+        var decoded = nil;
+        try {
+            decoded = Pb.Decode(res.body ?? "", method.output);
+        } catch (ex) {
+            let e = new ConnectError(Code.Internal,
+                "Connect: " + method.fqName + " returned a body that does not "
+              + "decode as " + Class.Name(method.output) + ": " + ex.Error);
+            e.Status = res.status;
+            throw e;
+        }
+        return { message: decoded, status: res.status, headers: res.headers };
+    }
+
+    // Content-Type with any parameters ("; charset=utf-8") and case dropped.
+    fn static _contentType(res):string {
+        if (res.headers == nil || !("content-type" in res.headers)) { return ""; }
+        var ct:string = String.ToLower(String.Trim(res.headers["content-type"]));
+        let semi:int = String.IndexOf(ct, ";");
+        if (semi >= 0) { ct = String.Trim(String.Substr(ct, 0, semi)); }
+        return ct;
+    }
+
+    // A non-200 reply as a ConnectError. A Connect error body carries the code
+    // and message; anything else - a proxy's HTML, a plain 404 - falls back to
+    // what the HTTP status implies.
+    fn static _errorFrom(res) {
+        let ct:string   = Connect._contentType(res);
+        let body:string = res.body ?? "";
+        var code:int    = Connect.CodeForHttpStatus(res.status);
+        var msg:string  = "";
+        var details     = nil;
+
+        if (ct == "application/json" && len(body) > 0) {
+            // A body that is not the Connect error shape leaves the status
+            // mapping standing rather than failing the call a second time.
+            var j = nil;
+            try { j = Json.Parse(body); } catch (ex) { j = nil; }
+            if (!is_nil(j)) {
+                if ("code" in j && !is_nil(j.code)) {
+                    let c:int = Connect.CodeFromName(Convert.ToString(j.code));
+                    if (c != 0) { code = c; }
+                }
+                if ("message" in j && !is_nil(j.message)) {
+                    msg = Convert.ToString(j.message);
+                }
+                if ("details" in j) { details = j.details; }
+            }
+        }
+
+        if (msg == "") {
+            msg = "Connect: HTTP " + Convert.ToString(res.status)
+                + " (" + Connect.CodeName(code) + ")";
+        }
+        let e = new ConnectError(code, msg);
+        e.Status  = res.status;
+        e.Details = details;
+        return e;
+    }
+
+    // ---- codes -------------------------------------------------------------
+
+    fn static CodeName(code:int):string {
+        if (code < 1 || code >= len(_connectCodeNames)) {
+            return "code_" + Convert.ToString(code);
+        }
+        return _connectCodeNames[code];
+    }
+
+    // The code a wire name stands for, or 0 if it is not one of the sixteen.
+    fn static CodeFromName(name:string):int {
+        var i:int = 1;
+        while (i < len(_connectCodeNames)) {
+            if (_connectCodeNames[i] == name) { return i; }
+            i += 1;
+        }
+        return 0;
+    }
+
+    // The HTTP status a Connect server sends for a code.
+    fn static HttpStatusFor(code:int):int {
+        if (code == Code.Canceled)           { return 499; }
+        if (code == Code.InvalidArgument)    { return 400; }
+        if (code == Code.DeadlineExceeded)   { return 504; }
+        if (code == Code.NotFound)           { return 404; }
+        if (code == Code.AlreadyExists)      { return 409; }
+        if (code == Code.PermissionDenied)   { return 403; }
+        if (code == Code.ResourceExhausted)  { return 429; }
+        if (code == Code.FailedPrecondition) { return 400; }
+        if (code == Code.Aborted)            { return 409; }
+        if (code == Code.OutOfRange)         { return 400; }
+        if (code == Code.Unimplemented)      { return 501; }
+        if (code == Code.Unavailable)        { return 503; }
+        if (code == Code.Unauthenticated)    { return 401; }
+        return 500;   // Unknown, Internal, DataLoss and anything unrecognised
+    }
+
+    // The code implied by an HTTP status when the reply carries no Connect error
+    // body. This is not the inverse of HttpStatusFor - the specification maps
+    // the two directions independently.
+    fn static CodeForHttpStatus(status:int):int {
+        if (status == 400) { return Code.Internal; }
+        if (status == 401) { return Code.Unauthenticated; }
+        if (status == 403) { return Code.PermissionDenied; }
+        if (status == 404) { return Code.Unimplemented; }
+        if (status == 429) { return Code.Unavailable; }
+        if (status == 502 || status == 503 || status == 504) { return Code.Unavailable; }
+        return Code.Unknown;
+    }
+
+    // The JSON body a Connect server sends with an error status.
+    fn static ErrorBody(code:int, message:string):string {
+        return Json.Stringify({ code: Connect.CodeName(code), message: message });
+    }
+}
+
+export { Connect, ConnectError, Code, CONNECT_CONTENT_TYPE };

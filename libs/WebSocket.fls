@@ -300,6 +300,9 @@ class Ws {
     // --------------------------------------------------------
 }
 
+// How long _readExact waits for a frame that has not fully arrived yet.
+global WS_READ_WAIT_MS:int = 5000;
+
 class WebSocketClient {
     let host = nil; 
     let path = nil; 
@@ -532,13 +535,40 @@ class WebSocketClient {
         return Stream.WriteAll(this.sock, frame);
     }
 
+    // Read exactly `count` bytes, or nil if the peer stops first.
+    //
+    // Stream.ReadBytes is "up to count", not "exactly count". It comes up short
+    // whenever the rest of the frame has not arrived yet, and on a socket that
+    // is the common case rather than the rare one: any async call - including
+    // the WaitReadable in ReceiveWhenReady - leaves the socket permanently
+    // non-blocking, so SO_RCVTIMEO stops applying and a read returns EAGAIN the
+    // moment the next byte is still in flight. Treating that as a dead
+    // connection drops frames that were merely late; wait and keep reading.
+    fn _readExact(count:int) {
+        if (count == 0) { return Buffer.Create(0, 1); }
+        let out = Buffer.Create(count, 1);
+        var off:int = 0;
+        while (off < count) {
+            let chunk = Stream.ReadBytes(this.sock, count - off);
+            if (chunk == nil || len(chunk) == 0) {
+                // Nothing at all this time round: give the peer one bounded
+                // chance to catch up before declaring the connection dead.
+                if (Stream.WaitReadable(this.sock, WS_READ_WAIT_MS) != true) { return nil; }
+                continue;
+            }
+            Buffer.Copy(chunk, 0, out, off, len(chunk));
+            off += len(chunk);
+        }
+        return out;
+    }
+
     fn ReadFrame(): object {
         if (this.closed) {
             throw(Exception.InvalidState, "WebSocket already closed");
         }
 
-        let head = Stream.ReadBytes(this.sock, 2);
-        if (head == nil || len(head) < 2) {
+        let head = this._readExact(2);
+        if (head == nil) {
             this.closed = true;
             throw(Exception.IOError, "Failed to read WebSocket frame header");
         }
@@ -561,14 +591,14 @@ class WebSocketClient {
         if (len7 < 126) {
             payloadLen = len7;
         } else if (len7 == 126) {
-            let ext2 = Stream.ReadBytes(this.sock, 2);
-            if (ext2 == nil || len(ext2) < 2) {
+            let ext2 = this._readExact(2);
+            if (ext2 == nil) {
                 throw(Exception.IOError, "Failed to read extended payload length");
             }
             payloadLen = Ws.ReadU16BE(ext2, 0);
         } else {
-            let ext8 = Stream.ReadBytes(this.sock, 8);
-            if (ext8 == nil || len(ext8) < 8) {
+            let ext8 = this._readExact(8);
+            if (ext8 == nil) {
                 throw(Exception.IOError, "Failed to read extended payload length");
             }
             payloadLen = Ws.ReadU64BE(ext8, 0);
@@ -588,16 +618,16 @@ class WebSocketClient {
 
         let maskKey = nil;
         if (masked) {
-            maskKey = Stream.ReadBytes(this.sock, 4);
-            if (maskKey == nil || len(maskKey) < 4) {
+            maskKey = this._readExact(4);
+            if (maskKey == nil) {
                 throw(Exception.IOError, "Failed to read masking key");
             }
         }
 
         let payload = Buffer.Create(payloadLen, 1);
         if (payloadLen > 0) {
-            let raw = Stream.ReadBytes(this.sock, payloadLen);
-            if (raw == nil || len(raw) < payloadLen) {
+            let raw = this._readExact(payloadLen);
+            if (raw == nil) {
                 throw(Exception.IOError, "Failed to read frame payload");
             }
             Buffer.Copy(raw, 0, payload, 0, payloadLen);

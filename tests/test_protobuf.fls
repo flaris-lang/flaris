@@ -16,7 +16,10 @@ global _benchBytes:block  = nil;
 // constant live outside this repo, in flaris-lang/tools/protobuf-interop, so
 // that this suite stays self-contained: `./protobuf-interop alltypes emit`.
 global GOLD_ALLTYPES:string = "090000000000000cc0150000c03f18b5f693f088dcffffff0120ffffffffffffffffff0128d6ffffffffffffffff013100000000000100003dffffffff40014a1068c3a96c6c6fe286922077c3b6726c6462040001feff6880bcc1960b7df9ffffff8101f8ffffffffffffff8801ab0290018180808080808020a201080807120464656570aa0110038e029ea705ffffffffffffffffff01b2010161b20100b20103636363ba01020801ba01020802c201070a036f6e651001c201070a0374776f1002ca011008fdffffffffffffffff0112036e6567ca0107080a120374656ed201070a016b12020863fa010663686f73656e";
-
+// wkt.Event from tools/protobuf-interop (`./protobuf-interop wkt emit`):
+// every well-known type this library embeds, built by the Go runtime from
+// protocompile's own copies of those schemas.
+global GOLD_WKT:string = "0a056576742d31120b08808bd2bb061080e59a771a05080310f403222b0a080a016b12031a01760a0f0a016c120a32080a0220010a0208000a0e0a016e120911000000000000f83f2a070a0568656c6c6f320b0880ccbbbcdeffffffff013a020801420c0a0269640a066d6574612e6b4a240a1d747970652e676f6f676c65617069732e636f6d2f776b742e4576656e7412030001fe52110a071a05616c7068610a061a0462657461";
 fn check(label, got, expected) {
     if (got == expected) {
         Console.WriteLine("[PASS] ", label);
@@ -683,7 +686,9 @@ fn test_proto_define() {
       + "  Note note = 10;\n"
       + "}\n", "demo.proto");
 
-    check("define: types",        len(Object.Keys(t)), 4);
+    // Four types, each under both its short and its fully-qualified name.
+    check("define: types",        len(Object.Keys(t)), 8);
+    check("define: qualified",    t["Order"] == t["demo.Order"], true);
     check("define: enum object",  t["Status"].ACTIVE, 1);
     check("define: class",        Class.IsClass(t["Order"]), true);
     check("define: nested flat",  Class.IsClass(t["Order_Note"]), true);
@@ -802,9 +807,213 @@ fn test_proto_imports() {
           String.Contains(caught, "cannot find imported file"), true);
 }
 
+fn test_proto_services() {
+    let t = Pb.LoadProto(
+        "syntax = \"proto3\";\n"
+      + "package greet.v1;\n"
+      + "message Req { string name = 1; }\n"
+      + "message Rep { string text = 1; }\n"
+      + "service Greeter {\n"
+      + "  rpc SayHello (Req) returns (Rep);\n"
+      + "  rpc Feed (Req) returns (stream Rep) { option deprecated = true; }\n"
+      + "  rpc Chat (stream Req) returns (stream Rep);\n"
+      + "}\n", "greet.proto");
+
+    let g = t["Greeter"];
+    check("svc: in the type map",   is_nil(g), false);
+    check("svc: kind",              g.kind, "service");
+    check("svc: name",              g.name, "Greeter");
+    check("svc: fqName",            g.fqName, "greet.v1.Greeter");
+    check("svc: order as declared", Json.Stringify(g.order),
+                                    "[\"SayHello\",\"Feed\",\"Chat\"]");
+
+    let m = g.methods.SayHello;
+    check("rpc: name",          m.name, "SayHello");
+    check("rpc: service",       m.service, "Greeter");
+    check("rpc: fqName",        m.fqName, "greet.v1.Greeter.SayHello");
+    check("rpc: path",          m.path, "/greet.v1.Greeter/SayHello");
+    check("rpc: input class",   m.input  == t["Req"], true);
+    check("rpc: output class",  m.output == t["Rep"], true);
+    check("rpc: unary in",      m.clientStream, false);
+    check("rpc: unary out",     m.serverStream, false);
+
+    check("rpc: server stream", g.methods.Feed.serverStream, true);
+    check("rpc: opts skipped",  g.methods.Feed.clientStream, false);
+    check("rpc: bidi in",       g.methods.Chat.clientStream, true);
+    check("rpc: bidi out",      g.methods.Chat.serverStream, true);
+
+    // The classes a method names are the live ones - they encode.
+    let req = Class.New(m.input);
+    req.name = "world";
+    check("rpc: input encodes",  Pb.Decode(Pb.Encode(req), m.input).name, "world");
+    let rep = Class.New(m.output);
+    rep.text = "hi";
+    check("rpc: output encodes", Pb.Decode(Pb.Encode(rep), m.output).text, "hi");
+
+    // A type from another package resolves through the import graph.
+    writeProto("svc_common.proto",
+        "syntax = \"proto3\";\npackage common;\nmessage Empty {}\n");
+    let main:string = writeProto("svc_main.proto",
+        "syntax = \"proto3\";\n"
+      + "package api;\n"
+      + "import \"svc_common.proto\";\n"
+      + "message Out { int32 v = 1; }\n"
+      + "service Ping { rpc Do (common.Empty) returns (Out); }\n");
+    let it = Pb.LoadProtoFile(main, [TMPDIR]);
+    check("svc: imported input", it["Ping"].methods.Do.input == it["Empty"], true);
+    check("svc: local output",   it["Ping"].methods.Do.output == it["Out"], true);
+
+    // A service with no rpcs is legal and stays empty.
+    let e = Pb.LoadProto("syntax = \"proto3\";\nservice Nil {}\n", "e.proto");
+    check("svc: empty service",  len(e["Nil"].order), 0);
+}
+
+global WKT_PROTO:string =
+    "syntax = \"proto3\";\n"
+  + "package wkt;\n"
+  + "import \"google/protobuf/timestamp.proto\";\n"
+  + "import \"google/protobuf/duration.proto\";\n"
+  + "import \"google/protobuf/struct.proto\";\n"
+  + "import \"google/protobuf/wrappers.proto\";\n"
+  + "import \"google/protobuf/empty.proto\";\n"
+  + "import \"google/protobuf/field_mask.proto\";\n"
+  + "import \"google/protobuf/any.proto\";\n"
+  + "message Event {\n"
+  + "  string id = 1;\n"
+  + "  google.protobuf.Timestamp   at   = 2;\n"
+  + "  google.protobuf.Duration    took = 3;\n"
+  + "  google.protobuf.Struct      meta = 4;\n"
+  + "  google.protobuf.StringValue note = 5;\n"
+  + "  google.protobuf.Int64Value  size = 6;\n"
+  + "  google.protobuf.BoolValue   ok   = 7;\n"
+  + "  google.protobuf.FieldMask   mask = 8;\n"
+  + "  google.protobuf.Any         blob = 9;\n"
+  + "  google.protobuf.ListValue   tags = 10;\n"
+  + "}\n"
+  + "service Watcher { rpc Ping (google.protobuf.Empty) returns (Event); }\n";
+
+// Mirrors buildWkt() in tools/protobuf-interop/main.go.
+fn buildWktEvent(t) {
+    let e = Class.New(t["Event"]);
+    e.id = "evt-1";
+
+    let at = Class.New(t["Timestamp"]);
+    at.seconds = 1735689600; at.nanos = 250000000;
+    e.at = at;
+
+    let took = Class.New(t["Duration"]);
+    took.seconds = 3; took.nanos = 500;
+    e.took = took;
+
+    let lv = Class.New(t["ListValue"]);
+    lv.values = [wktValue(t, "bool_value", true), wktValue(t, "null_value", 0)];
+    let st = Class.New(t["Struct"]);
+    st.fields = {
+        "k": wktValue(t, "string_value", "v"),
+        "n": wktValue(t, "number_value", 1.5),
+        "l": wktValue(t, "list_value", lv),
+    };
+    e.meta = st;
+
+    let note = Class.New(t["StringValue"]); note.value = "hello";     e.note = note;
+    let size = Class.New(t["Int64Value"]);  size.value = -9000000000; e.size = size;
+    let ok   = Class.New(t["BoolValue"]);   ok.value = true;          e.ok = ok;
+
+    let mask = Class.New(t["FieldMask"]);   mask.paths = ["id", "meta.k"]; e.mask = mask;
+
+    let raw:block = Buffer.Create(3, 1);
+    Buffer.WriteU8At(raw, 0, 0); Buffer.WriteU8At(raw, 1, 1); Buffer.WriteU8At(raw, 2, 254);
+    let blob = Class.New(t["Any"]);
+    blob.type_url = "type.googleapis.com/wkt.Event";
+    blob.value    = raw;
+    e.blob = blob;
+
+    let tags = Class.New(t["ListValue"]);
+    tags.values = [wktValue(t, "string_value", "alpha"),
+                   wktValue(t, "string_value", "beta")];
+    e.tags = tags;
+    return e;
+}
+
+fn wktValue(t, field:string, val) {
+    let x = Class.New(t["Value"]);
+    Class.SetField(x, field, val);
+    return x;
+}
+
+fn test_well_known() {
+    // No file on disk anywhere: the standard imports are built in.
+    let t = Pb.LoadProto(WKT_PROTO, "wkt.proto");
+    check("wkt: own message",     is_nil(t["Event"]), false);
+    check("wkt: Timestamp",       is_nil(t["Timestamp"]), false);
+    check("wkt: qualified name",  is_nil(t["google.protobuf.Timestamp"]), false);
+    check("wkt: same class",      t["Timestamp"] == t["google.protobuf.Timestamp"], true);
+    check("wkt: Empty as rpc in", t["Watcher"].methods.Ping.input == t["Empty"], true);
+    check("wkt: service qualified", is_nil(t["wkt.Watcher"]), false);
+
+    // Decode what the Go runtime produced from its own copies of these schemas.
+    let gold = Pb.Decode(BitConverter.FromHex(GOLD_WKT), t["Event"]);
+    check("wkt: gold id",        gold.id, "evt-1");
+    check("wkt: gold seconds",   gold.at.seconds, 1735689600);
+    check("wkt: gold nanos",     gold.at.nanos, 250000000);
+    check("wkt: gold duration",  gold.took.nanos, 500);
+    check("wkt: gold wrapper",   gold.note.value, "hello");
+    check("wkt: gold int64",     gold.size.value, -9000000000);
+    check("wkt: gold bool",      gold.ok.value, true);
+    check("wkt: gold mask",      String.Join(gold.mask.paths, ","), "id,meta.k");
+    check("wkt: gold any url",   gold.blob.type_url, "type.googleapis.com/wkt.Event");
+    check("wkt: gold any bytes", len(gold.blob.value), 3);
+    check("wkt: gold list",      gold.tags.values[1].string_value, "beta");
+
+    // Struct is the hard one: a map to a recursive oneof, with an enum arm.
+    check("wkt: struct string", gold.meta.fields["k"].string_value, "v");
+    check("wkt: struct number", gold.meta.fields["n"].number_value, 1.5);
+    check("wkt: struct oneof",  Pb.WhichOneof(gold.meta.fields["n"], "kind"), "number_value");
+    let nested = gold.meta.fields["l"].list_value;
+    check("wkt: struct nested list", len(nested.values), 2);
+    check("wkt: struct bool arm",    nested.values[0].bool_value, true);
+    check("wkt: struct null arm",
+          Pb.WhichOneof(nested.values[1], "kind"), "null_value");
+    check("wkt: NullValue enum", t["NullValue"].NULL_VALUE, 0);
+
+    // Built here, it must equal what Go built there.
+    check("wkt: matches Go", Pb.Equals(buildWktEvent(t), gold), true);
+
+    // An import chain through two more built-ins, with a nested enum flattened.
+    let a = Pb.LoadProto("syntax = \"proto3\";\npackage z;\n"
+          + "import \"google/protobuf/api.proto\";\n"
+          + "message W { google.protobuf.Api api = 1; }\n", "z.proto");
+    check("wkt: transitive Api",    is_nil(a["Api"]), false);
+    check("wkt: transitive Type",   is_nil(a["Type"]), false);
+    check("wkt: transitive ctx",    is_nil(a["SourceContext"]), false);
+    check("wkt: nested enum flat",  a["Field_Kind"].TYPE_SINT64, 18);
+
+    // A schema of its own keeps the short name; the built-in stays reachable.
+    let c = Pb.LoadProto("syntax = \"proto3\";\npackage mine;\n"
+          + "import \"google/protobuf/struct.proto\";\n"
+          + "message Value { string mine = 1; }\n", "c.proto");
+    check("wkt: root wins short name", Pb._HasField(c["Value"], "mine"), true);
+    check("wkt: built-in still there",
+          Pb._HasField(c["google.protobuf.Value"], "string_value"), true);
+
+    // A copy on the include path wins over the built-in one.
+    let dir:string = Path.Combine(TMPDIR, "google");
+    Directory.Create(dir);
+    Directory.Create(Path.Combine(dir, "protobuf"));
+    File.WriteText(Path.Combine(Path.Combine(dir, "protobuf"), "empty.proto"),
+        "syntax = \"proto3\";\npackage google.protobuf;\n"
+      + "message Empty { string shadowed = 1; }\n");
+    let own:string = writeProto("wkt_shadow.proto",
+        "syntax = \"proto3\";\n"
+      + "import \"google/protobuf/empty.proto\";\n"
+      + "message M { google.protobuf.Empty e = 1; }\n");
+    let sh = Pb.LoadProtoFile(own, [TMPDIR]);
+    check("wkt: include path wins", Pb._HasField(sh["Empty"], "shadowed"), true);
+}
+
 fn test_proto_rejections() {
     rejects("proto2 rejected",
-        "syntax = \"proto2\";\nmessage M { optional int32 v = 1; }\n", "proto3 only");
+        "syntax = \"proto2\";\nmessage M { optional int32 v = 1; }\n", "only proto3 is supported");
     rejects("required rejected",
         "syntax = \"proto3\";\nmessage M { required int32 v = 1; }\n", "'required' is not supported");
     rejects("groups rejected",
@@ -829,6 +1038,22 @@ fn test_proto_rejections() {
         "syntax = \"proto3\";\nmessage M { int32 v = 1;\n", "unterminated message");
     rejects("missing semicolon",
         "syntax = \"proto3\";\nmessage M { int32 v = 1 }\n", "expected ';'");
+    rejects("rpc names an enum",
+        "syntax = \"proto3\";\nmessage M {}\nenum E { E_Z = 0; }\n"
+      + "service S { rpc Bad (E) returns (M); }\n", "which is an enum");
+    rejects("rpc names unknown type",
+        "syntax = \"proto3\";\nmessage M {}\n"
+      + "service S { rpc Bad (Nope) returns (M); }\n", "names unknown type 'Nope'");
+    rejects("rpc declared twice",
+        "syntax = \"proto3\";\nmessage M {}\n"
+      + "service S { rpc Go (M) returns (M); rpc Go (M) returns (M); }\n",
+        "declared twice in service");
+    rejects("descriptor.proto explained, not just missing",
+        "syntax = \"proto3\";\nimport \"google/protobuf/descriptor.proto\";\n"
+      + "message M { int32 v = 1; }\n", "is proto2");
+    rejects("service collides with a message",
+        "syntax = \"proto3\";\nmessage S {}\nservice S { rpc Go (S) returns (S); }\n",
+        "collides with another type");
 }
 
 // =============================================================================
@@ -923,6 +1148,8 @@ fn Main() {
     test_proto_define();
     test_proto_matches_static();
     test_proto_imports();
+    test_proto_services();
+    test_well_known();
     test_proto_rejections();
 
     Console.WriteLine("--- malformed input ---");

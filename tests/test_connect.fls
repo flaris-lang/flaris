@@ -1,0 +1,417 @@
+// test_connect.fls - Connect RPC client (libs/Connect.fls).
+//
+// Two modes, so one file holds both ends of a real call:
+//
+//   flarisvm tests/test_connect.fls serve --libs='./libs'    # the peer
+//   flarisvm tests/test_connect.fls       --libs='./libs'    # the tests
+//
+// tests/test_connect.sh runs both. Client and server must be separate
+// processes: the Http client blocks its fiber, so calling a server inside the
+// same VM deadlocks the scheduler.
+//
+// Everything the test needs it builds itself - the schema is a string in this
+// file, and the peer is the server mode below.
+
+// Connect first: importing a library that another library also imports warns
+// about a shadowed global unless the importer comes first.
+import { Connect, ConnectError, Code } from library("Connect", "1.0");
+import { Pb }                          from library("Protobuf", "1.0");
+import { HttpServer }                  from library("HttpServer", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+global PORT:int    = 8418;
+global BASE:string = "http://127.0.0.1:8418";
+
+global PROTO:string =
+    "syntax = \"proto3\";\n"
+  + "package greet.v1;\n"
+  + "message HelloRequest { string name = 1; int32 times = 2; }\n"
+  + "message HelloReply   { string text = 1; int32 count = 2; }\n"
+  + "message Kitchen {\n"
+  + "  double d = 1; float f = 2; int64 i64 = 3; uint64 u64 = 4; int32 i32 = 5;\n"
+  + "  fixed64 fx64 = 6; fixed32 fx32 = 7; bool b = 8; string s = 9;\n"
+  + "  bytes raw = 10; uint32 u32 = 11; sfixed32 sfx32 = 12; sfixed64 sfx64 = 13;\n"
+  + "  sint32 si32 = 14; sint64 si64 = 15; repeated int32 packed = 16;\n"
+  + "  map<string, int32> tags = 17; HelloRequest nested = 18;\n"
+  + "  oneof pick { string one = 19; int32 two = 20; }\n"
+  + "}\n"
+  + "service Greeter {\n"
+  + "  rpc SayHello (HelloRequest) returns (HelloReply);\n"
+  + "  rpc Boom     (HelloRequest) returns (HelloReply);\n"
+  + "  rpc Echo     (Kitchen)      returns (Kitchen);\n"
+  + "  rpc Wrong    (HelloRequest) returns (HelloReply);\n"
+  + "  rpc Garbage  (HelloRequest) returns (HelloReply);\n"
+  + "  rpc Chat     (stream HelloRequest) returns (stream HelloReply);\n"
+  + "}\n";
+
+global API = nil;
+
+fn check(label, got, expected) {
+    if (got == expected) {
+        Console.WriteLine("[PASS] ", label);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] ", label, " - got: ", got, " expected: ", expected);
+        failed += 1;
+    }
+}
+
+// =============================================================================
+// Server mode - a Connect peer built out of HttpServer
+// =============================================================================
+// Small enough to read in one sitting, which is the point: a Connect unary
+// endpoint is a POST that carries protobuf both ways.
+
+fn serve() {
+    let g   = API["Greeter"];
+    let srv = new HttpServer({ port: PORT });
+
+    srv.Post(g.methods.SayHello.path, fn(req, res) {
+        let m = Pb.Decode(req.body, g.methods.SayHello.input);
+        let out = Class.New(g.methods.SayHello.output);
+        out.text  = "hello, " + m.name;
+        out.count = m.times + 1;
+        res.Header("X-Interop", "flaris");
+        res.Header("X-Echo-Auth",    req.Header("Authorization", ""));
+        res.Header("X-Echo-Version", req.Header("Connect-Protocol-Version", ""));
+        res.Header("X-Echo-Timeout", req.Header("Connect-Timeout-Ms", "none"));
+        res.Bytes(Pb.Encode(out), "application/proto");
+    });
+
+    srv.Post(g.methods.Echo.path, fn(req, res) {
+        let m = Pb.Decode(req.body, g.methods.Echo.input);
+        res.Bytes(Pb.Encode(m), "application/proto");
+    });
+
+    srv.Post(g.methods.Boom.path, fn(req, res) {
+        let m = Pb.Decode(req.body, g.methods.Boom.input);
+        res.ContentType("application/json");
+        res.Text(Connect.ErrorBody(Code.ResourceExhausted,
+                                   "no greetings left for " + m.name),
+                 Connect.HttpStatusFor(Code.ResourceExhausted));
+    });
+
+    // 200, but not a protobuf reply.
+    srv.Post(g.methods.Wrong.path, fn(_req, res) {
+        res.Json({ text: "not protobuf" });
+    });
+
+    // 200 and the right content type, over bytes that are not a HelloReply.
+    srv.Post(g.methods.Garbage.path, fn(_req, res) {
+        let bad:block = Buffer.Create(3, 1);
+        Buffer.WriteU8At(bad, 0, 0x09);   // field 1, 64-bit - then nothing
+        Buffer.WriteU8At(bad, 1, 0x01);
+        Buffer.WriteU8At(bad, 2, 0x02);
+        res.Bytes(bad, "application/proto");
+    });
+
+    srv.Get("/healthz", fn(_req, res) { res.Text("ok"); });
+
+    Console.WriteLine("serving on " + BASE);
+    srv.Listen();
+}
+
+// =============================================================================
+// Offline - no peer involved
+// =============================================================================
+
+fn test_urls() {
+    let m = API["Greeter"].methods.SayHello;
+    check("url: plain base",
+        new Connect("http://h:8080").Url(m), "http://h:8080/greet.v1.Greeter/SayHello");
+    check("url: trailing slash dropped",
+        new Connect("http://h:8080/").Url(m), "http://h:8080/greet.v1.Greeter/SayHello");
+    check("url: repeated slashes dropped",
+        new Connect("http://h:8080///").Url(m), "http://h:8080/greet.v1.Greeter/SayHello");
+    check("url: path prefix kept",
+        new Connect("https://h/api").Url(m), "https://h/api/greet.v1.Greeter/SayHello");
+}
+
+fn test_codes() {
+    // Every code round-trips through its wire name.
+    let names:array = ["canceled", "unknown", "invalid_argument", "deadline_exceeded",
+                       "not_found", "already_exists", "permission_denied",
+                       "resource_exhausted", "failed_precondition", "aborted",
+                       "out_of_range", "unimplemented", "internal", "unavailable",
+                       "data_loss", "unauthenticated"];
+    var ok:bool = true;
+    var i:int = 0;
+    while (i < len(names)) {
+        let code:int = i + 1;
+        if (Connect.CodeName(code) != names[i]) { ok = false; }
+        if (Connect.CodeFromName(names[i]) != code) { ok = false; }
+        i += 1;
+    }
+    check("codes: all 16 round-trip", ok, true);
+    check("codes: named constant",    Connect.CodeName(Code.ResourceExhausted),
+                                      "resource_exhausted");
+    check("codes: unknown name is 0", Connect.CodeFromName("nonesuch"), 0);
+    check("codes: out of range",      Connect.CodeName(99), "code_99");
+
+    // The status a Connect server sends for each code.
+    check("status: canceled",            Connect.HttpStatusFor(Code.Canceled), 499);
+    check("status: unknown",             Connect.HttpStatusFor(Code.Unknown), 500);
+    check("status: invalid_argument",    Connect.HttpStatusFor(Code.InvalidArgument), 400);
+    check("status: deadline_exceeded",   Connect.HttpStatusFor(Code.DeadlineExceeded), 504);
+    check("status: not_found",           Connect.HttpStatusFor(Code.NotFound), 404);
+    check("status: already_exists",      Connect.HttpStatusFor(Code.AlreadyExists), 409);
+    check("status: permission_denied",   Connect.HttpStatusFor(Code.PermissionDenied), 403);
+    check("status: resource_exhausted",  Connect.HttpStatusFor(Code.ResourceExhausted), 429);
+    check("status: failed_precondition", Connect.HttpStatusFor(Code.FailedPrecondition), 400);
+    check("status: aborted",             Connect.HttpStatusFor(Code.Aborted), 409);
+    check("status: out_of_range",        Connect.HttpStatusFor(Code.OutOfRange), 400);
+    check("status: unimplemented",       Connect.HttpStatusFor(Code.Unimplemented), 501);
+    check("status: internal",            Connect.HttpStatusFor(Code.Internal), 500);
+    check("status: unavailable",         Connect.HttpStatusFor(Code.Unavailable), 503);
+    check("status: data_loss",           Connect.HttpStatusFor(Code.DataLoss), 500);
+    check("status: unauthenticated",     Connect.HttpStatusFor(Code.Unauthenticated), 401);
+
+    // The other direction, for a reply with no Connect error body. Deliberately
+    // not the inverse - 400 means internal here, and 404 means unimplemented.
+    check("http->code: 400", Connect.CodeForHttpStatus(400), Code.Internal);
+    check("http->code: 401", Connect.CodeForHttpStatus(401), Code.Unauthenticated);
+    check("http->code: 403", Connect.CodeForHttpStatus(403), Code.PermissionDenied);
+    check("http->code: 404", Connect.CodeForHttpStatus(404), Code.Unimplemented);
+    check("http->code: 429", Connect.CodeForHttpStatus(429), Code.Unavailable);
+    check("http->code: 503", Connect.CodeForHttpStatus(503), Code.Unavailable);
+    check("http->code: 418", Connect.CodeForHttpStatus(418), Code.Unknown);
+
+    check("error body", Connect.ErrorBody(Code.NotFound, "gone"),
+          "{\"code\":\"not_found\",\"message\":\"gone\"}");
+}
+
+fn test_rejected_before_the_wire() {
+    let g = API["Greeter"];
+    let c = new Connect("http://127.0.0.1:1");   // never contacted
+    let req = Class.New(g.methods.SayHello.input);
+
+    var code:int = 0;
+    var isConnect:bool = false;
+    try { c.Call(g.methods.Chat, req); }
+    catch (e) { code = e.Code; isConnect = e is ConnectError; }
+    check("streaming rpc refused",      code, Code.Unimplemented);
+    check("streaming raise is Connect", isConnect, true);
+
+    code = 0;
+    try { c.Invoke(g, "Nope", req); }
+    catch (e) { code = e.Code; }
+    check("unknown rpc name refused", code, Code.Unimplemented);
+}
+
+fn test_unreachable() {
+    let g = API["Greeter"];
+    // Port 1 is reserved and nothing listens on it, so this is a connect
+    // failure rather than a protocol one.
+    let c = new Connect("http://127.0.0.1:1");
+    let req = Class.New(g.methods.SayHello.input);
+    req.name = "x";
+
+    var code:int   = 0;
+    var status:int = -1;
+    try { c.Call(g.methods.SayHello, req); }
+    catch (e) { code = e.Code; status = e.Status; }
+    check("unreachable: code",   code, Code.Unavailable);
+    check("unreachable: status", status, 0);
+}
+
+// =============================================================================
+// Live - against the server mode
+// =============================================================================
+
+fn test_unary() {
+    let g = API["Greeter"];
+    let c = new Connect(BASE);
+
+    let req = Class.New(g.methods.SayHello.input);
+    req.name  = "world";
+    req.times = 7;
+
+    let rep = c.Call(g.methods.SayHello, req);
+    check("unary: text",  rep.text, "hello, world");
+    check("unary: count", rep.count, 8);
+
+    let full = c.CallFull(g.methods.SayHello, req);
+    check("unary: status",  full.status, 200);
+    check("unary: header",  full.headers["x-interop"], "flaris");
+    check("unary: message", full.message.text, "hello, world");
+
+    check("invoke by name", c.Invoke(g, "SayHello", req).text, "hello, world");
+
+    // Every call announces the protocol version; a deadline is sent only when
+    // one was asked for.
+    check("unary: protocol version", full.headers["x-echo-version"], "1");
+    check("unary: no deadline",      full.headers["x-echo-timeout"], "none");
+
+    let timed = new Connect(BASE, { timeoutMs: 2500 });
+    check("unary: deadline sent",
+          timed.CallFull(g.methods.SayHello, req).headers["x-echo-timeout"], "2500");
+
+    // An empty request is a valid message, not an absent body.
+    let bare = Class.New(g.methods.SayHello.input);
+    check("unary: empty request", c.Call(g.methods.SayHello, bare).text, "hello, ");
+}
+
+fn test_headers() {
+    let g = API["Greeter"];
+    let base = new Connect(BASE, { headers: { "X-Base": "1" } });
+    let auth = base.With({ "Authorization": "Bearer tok" });
+
+    let req = Class.New(g.methods.SayHello.input);
+    req.name = "h";
+
+    check("headers: With sends it",
+          auth.CallFull(g.methods.SayHello, req).headers["x-echo-auth"], "Bearer tok");
+    // The original is untouched: a per-call credential must not leak onward.
+    check("headers: original unchanged",
+          base.CallFull(g.methods.SayHello, req).headers["x-echo-auth"], "");
+}
+
+fn test_errors() {
+    let g = API["Greeter"];
+    let c = new Connect(BASE);
+    let req = Class.New(g.methods.SayHello.input);
+    req.name = "world";
+
+    var code:int    = 0;
+    var status:int  = 0;
+    var msg:string  = "";
+    try { c.Call(g.methods.Boom, req); }
+    catch (e) { code = e.Code; status = e.Status; msg = e.Error; }
+    check("error: code",    code, Code.ResourceExhausted);
+    check("error: status",  status, 429);
+    check("error: message", msg, "no greetings left for world");
+
+    // A route the server does not serve: a plain 404, no Connect error body.
+    code = 0; status = 0;
+    let missing = { path: "/greet.v1.Greeter/Absent", fqName: "greet.v1.Greeter.Absent",
+                    input: g.methods.SayHello.input, output: g.methods.SayHello.output,
+                    clientStream: false, serverStream: false };
+    try { c.Call(missing, req); }
+    catch (e) { code = e.Code; status = e.Status; }
+    check("error: 404 -> unimplemented", code, Code.Unimplemented);
+    check("error: 404 status",           status, 404);
+
+    // 200 with the wrong content type is not a reply this client will decode.
+    code = 0;
+    try { c.Call(g.methods.Wrong, req); }
+    catch (e) { code = e.Code; }
+    check("error: wrong content type", code, Code.Internal);
+
+    // 200, right content type, bytes that are not the message.
+    code = 0;
+    try { c.Call(g.methods.Garbage, req); }
+    catch (e) { code = e.Code; }
+    check("error: undecodable body", code, Code.Internal);
+}
+
+// A Connect body is arbitrary bytes: NULs, high bytes and multi-byte UTF-8 all
+// have to survive the HTTP round trip intact.
+fn test_binary_fidelity() {
+    let g = API["Greeter"];
+    let c = new Connect(BASE);
+
+    let k = Class.New(API["Kitchen"]);
+    k.d = -3.5; k.f = 1.5; k.i64 = -8500000000; k.u64 = -1; k.i32 = -1;
+    k.fx64 = 65536; k.fx32 = 4294967295; k.b = true;
+    k.s = "héllo 世 wörld";
+    k.u32 = 3000000000; k.sfx32 = -8; k.sfx64 = -9; k.si32 = 149; k.si64 = -75;
+    k.packed = [1, 2, 3];
+    k.tags = { "a": 1, "b": 2 };
+    k.two = 1234;
+
+    // Every byte value 0..255, so a NUL-terminated path anywhere would cut it.
+    let raw:block = Buffer.Create(256, 1);
+    var i:int = 0;
+    while (i < 256) { Buffer.WriteU8At(raw, i, i); i += 1; }
+    k.raw = raw;
+
+    let n = Class.New(API["HelloRequest"]);
+    n.name = "deep"; n.times = 8;
+    k.nested = n;
+
+    let back = c.Call(g.methods.Echo, k);
+    check("binary: round-trips whole", Pb.Equals(k, back), true);
+    check("binary: bytes length",      len(back.raw), 256);
+    check("binary: NUL survives",      Buffer.ReadU8At(back.raw, 0), 0);
+    check("binary: 0xFF survives",     Buffer.ReadU8At(back.raw, 255), 255);
+    check("binary: utf-8",             back.s, "héllo 世 wörld");
+    check("binary: oneof",             Pb.WhichOneof(back, "pick"), "two");
+    check("binary: nested",            back.nested.name, "deep");
+    check("binary: map",               back.tags["b"], 2);
+    check("binary: packed",            len(back.packed), 3);
+}
+
+// =============================================================================
+// Benchmark
+// =============================================================================
+
+fn bench(name:string, f:fn, n:int) {
+    f(); f(); f();
+
+    let t0:int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt:int = Time.Ticks() - t0;
+
+    let ms:float = Time.TicksToMs(dt);
+    let us:float = Time.TicksToUs(dt) / float(n);
+
+    Console.WriteLine(
+        String.PadRight(name, 42),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]), 9), "ms ",
+        String.PadLeft(String.FormatArray("{0:.2f}", [us]), 11), "us/op"
+    );
+}
+
+fn test_benchmark() {
+    let g = API["Greeter"];
+    let c = new Connect(BASE);
+    let m = g.methods.SayHello;
+    let req = Class.New(m.input);
+    req.name = "bench";
+
+    Console.WriteLine("");
+    Console.WriteLine("== Benchmark == (loopback, one process each side)");
+    bench("Url", fn() { c.Url(m); }, 20000);
+    bench("CodeName + CodeFromName",
+          fn() { Connect.CodeFromName(Connect.CodeName(Code.Aborted)); }, 20000);
+    bench("ErrorBody", fn() { Connect.ErrorBody(Code.NotFound, "gone"); }, 20000);
+    bench("unary round trip", fn() { c.Call(m, req); }, 300);
+}
+
+// =============================================================================
+
+fn Main() {
+    API = Pb.LoadProto(PROTO, "greet.proto");
+
+    let args:array = Os.Args();
+    if (len(args) > 0 && args[0] == "serve") {
+        serve();
+        return 0;
+    }
+
+    Console.WriteLine("--- offline ---");
+    test_urls();
+    test_codes();
+    test_rejected_before_the_wire();
+    test_unreachable();
+
+    Console.WriteLine("--- unary calls ---");
+    test_unary();
+    test_headers();
+    test_errors();
+    test_binary_fidelity();
+
+    test_benchmark();
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: ", passed, " passed, ", failed, " failed.");
+    if (failed == 0) {
+        Console.Ok("All tests passed.");
+        return 0;
+    } else {
+        Console.WriteLine("FAILURES DETECTED.");
+        return 1;
+    }
+}

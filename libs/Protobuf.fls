@@ -143,7 +143,9 @@
 //   LoadProtoFile(path, includes?)       -> object   same, resolving imports
 //   ParseProto(source:string, name?)     -> schema   parse only, as plain data
 //   ParseProtoFile(path, includes?)      -> schema   parse a file and its imports
-//   DefineSchema(schema)                 -> object   schema -> { name: class }
+//   DefineSchema(schema)                 -> object   schema -> { name: class },
+//                                                    plus a service descriptor
+//                                                    per `service` (see below)
 //
 // -----------------------------------------------------------------------------
 // Messages defined at runtime
@@ -190,12 +192,61 @@
 // the way a Flaris enum would. Every message gets an `_unknown` field, so a
 // partial schema still re-encodes losslessly.
 //
+// Every type is in the map twice: under its short name and under its fully
+// qualified one. Two packages can flatten to the same short name - a schema of
+// its own `Value` next to google.protobuf.Value - and then the short key goes to
+// the file you loaded rather than to whatever it imported. The qualified name
+// always resolves, so nothing is unreachable:
+//
+//   types["Value"]                    // yours
+//   types["google.protobuf.Value"]    // the built-in one
+//
+// -----------------------------------------------------------------------------
+// Well-known types
+// -----------------------------------------------------------------------------
+// The ten standard `google/protobuf/*.proto` schemas are built in, so importing
+// one needs no file on disk and no include path - which matters, because a real
+// schema usually imports at least one:
+//
+//   import "google/protobuf/timestamp.proto";
+//   message Event { string id = 1; google.protobuf.Timestamp at = 2; }
+//
+// Built in: any, api, duration, empty, field_mask, source_context, struct,
+// timestamp, type, wrappers - and whatever they import in turn. A copy on the
+// include path wins over the built-in one, so vendoring your own still works.
+// They are the canonical schemas with comments and file options stripped;
+// package, message, field name, number and type - everything the wire depends
+// on - are verbatim, and checked against the Go runtime.
+//
+// descriptor.proto is deliberately absent: it is proto2, which this parser
+// rejects on purpose. Importing it says so rather than reporting a missing file.
+//
+// Because these need no filesystem, LoadProto follows them for an inline schema
+// too; any other import still needs LoadProtoFile.
+//
 // Supported: package, import (public/weak), nested messages and enums,
 // singular / repeated / proto3 optional, oneof, map<K,V>, reserved, and
-// service/rpc including streaming (parsed into the schema; nothing binds it
-// yet). Field and file options parse but only `[packed = false]` changes
-// behaviour. proto2 - `required`, groups, extensions - and proto editions are
-// reported as errors rather than mis-read.
+// service/rpc including streaming. Field and file options parse but only
+// `[packed = false]` changes behaviour. proto2 - `required`, groups,
+// extensions - and proto editions are reported as errors rather than mis-read.
+//
+// A `service` lands in the same map as the messages, as data rather than a
+// class - it declares calls, it is not one:
+//
+//   let api = Pb.LoadProtoFile("greet.proto", nil);
+//   let m   = api["Greeter"].methods.SayHello;
+//   m.path            // "/greet.Greeter/SayHello"  - gRPC and Connect both
+//   m.input           // class Req                     address a method by this
+//   m.output          // class Rep
+//   m.clientStream    // false
+//   m.serverStream    // false
+//
+// `svc.order` lists the method names as declared, so a transport can walk a
+// service without relying on map order. A method names its service in
+// `m.service`; it does not hold it, because a back-reference would be a cycle.
+// Nothing here opens a socket - binding these to a wire protocol is a
+// transport's job. The Connect library is one: `Connect.Call(m, msg)` takes a
+// method descriptor straight from this map.
 //
 // ParseProto stops after parsing and hands back the schema as plain data, for
 // inspection (`Json.Stringify`) or for building something else from it.
@@ -628,7 +679,7 @@ class ProtoParser
 
         if (schema.syntax != "proto3") {
             throw(1, _file + ": syntax is \"" + schema.syntax
-                   + "\"; Protogen generates proto3 only");
+                   + "\"; only proto3 is supported");
         }
         return schema;
     }
@@ -948,6 +999,10 @@ global _pb_registry = nil;
 
 // proto scalar type name -> Pb kind. Built once, on first use.
 global _pb_scalarKinds = nil;
+
+// The standard google/protobuf schemas, so `import "google/protobuf/*.proto"`
+// resolves with no file on disk. Built once, on first use.
+global _pb_wellKnown = nil;
 
 
 // =============================================================================
@@ -1677,13 +1732,17 @@ class Pb
     }
 
     fn static _ReadProto(path:string, seen:object) {
-        if (!File.Exists(path)) { throw(1, "Protobuf: no such .proto file '" + path + "'"); }
         seen[path] = true;
+        let wk = Pb._WellKnown(path);
+        if (!is_nil(wk)) { return Pb.ParseProto(wk, path); }
+        if (!File.Exists(path)) { throw(1, "Protobuf: no such .proto file '" + path + "'"); }
         let text = File.ReadText(path);
         if (is_nil(text)) { throw(1, "Protobuf: cannot read '" + path + "'"); }
         return Pb.ParseProto(text, path);
     }
 
+    // A copy on the include path wins over the built-in one, so a project that
+    // vendors its own google/protobuf tree keeps using it.
     fn static _FindProto(rel:string, includes:array, fromPath:string) {
         let i:int = 0;
         while (i < len(includes)) {
@@ -1693,8 +1752,231 @@ class Pb
         }
         let sibling:string = Path.Combine(Path.GetDirectoryName(fromPath), rel);
         if (File.Exists(sibling)) { return sibling; }
+        if (!is_nil(Pb._WellKnown(rel))) { return rel; }
+        Pb._RejectProto2Import(rel);
         return nil;
     }
+
+    // The one standard import deliberately not built in, and the reason is worth
+    // saying: "file not found" would send the reader looking for a file that was
+    // never going to help.
+    fn static _RejectProto2Import(rel:string) {
+        if (rel == "google/protobuf/descriptor.proto") {
+            throw(1, "Protobuf: google/protobuf/descriptor.proto is proto2, which "
+                   + "this parser does not read; supply your own copy on the "
+                   + "include path if you need it");
+        }
+    }
+
+    // The built-in source for a `google/protobuf/*.proto` import, or nil if the
+    // path is not one of them.
+    fn static _WellKnown(path:string) {
+        return Pb._WellKnownSources()[path];
+    }
+
+    // The ten standard google/protobuf schemas, verbatim in package, message,
+    // field name, number and type - the wire contract. Comments and file-level
+    // options are stripped: neither reaches the wire, and they would be four
+    // times the size of the declarations. descriptor.proto is deliberately
+    // absent - it is proto2, which this parser rejects on purpose.
+    fn static _WellKnownSources() {
+        if (!is_nil(_pb_wellKnown)) { return _pb_wellKnown; }
+        _pb_wellKnown = {
+            "google/protobuf/any.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message Any {\n"
+                  + "string type_url = 1;\n"
+                  + "bytes value = 2;\n"
+                  + "}\n",
+            "google/protobuf/api.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "import \"google/protobuf/source_context.proto\";\n"
+                  + "import \"google/protobuf/type.proto\";\n"
+                  + "message Api {\n"
+                  + "string name = 1;\n"
+                  + "repeated Method methods = 2;\n"
+                  + "repeated Option options = 3;\n"
+                  + "string version = 4;\n"
+                  + "SourceContext source_context = 5;\n"
+                  + "repeated Mixin mixins = 6;\n"
+                  + "Syntax syntax = 7;\n"
+                  + "}\n"
+                  + "message Method {\n"
+                  + "string name = 1;\n"
+                  + "string request_type_url = 2;\n"
+                  + "bool request_streaming = 3;\n"
+                  + "string response_type_url = 4;\n"
+                  + "bool response_streaming = 5;\n"
+                  + "repeated Option options = 6;\n"
+                  + "Syntax syntax = 7;\n"
+                  + "}\n"
+                  + "message Mixin {\n"
+                  + "string name = 1;\n"
+                  + "string root = 2;\n"
+                  + "}\n",
+            "google/protobuf/duration.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message Duration {\n"
+                  + "int64 seconds = 1;\n"
+                  + "int32 nanos = 2;\n"
+                  + "}\n",
+            "google/protobuf/empty.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message Empty {}\n",
+            "google/protobuf/field_mask.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message FieldMask {\n"
+                  + "repeated string paths = 1;\n"
+                  + "}\n",
+            "google/protobuf/source_context.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message SourceContext {\n"
+                  + "string file_name = 1;\n"
+                  + "}\n",
+            "google/protobuf/struct.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message Struct {\n"
+                  + "map<string, Value> fields = 1;\n"
+                  + "}\n"
+                  + "message Value {\n"
+                  + "oneof kind {\n"
+                  + "NullValue null_value = 1;\n"
+                  + "double number_value = 2;\n"
+                  + "string string_value = 3;\n"
+                  + "bool bool_value = 4;\n"
+                  + "Struct struct_value = 5;\n"
+                  + "ListValue list_value = 6;\n"
+                  + "}\n"
+                  + "}\n"
+                  + "enum NullValue {\n"
+                  + "NULL_VALUE = 0;\n"
+                  + "}\n"
+                  + "message ListValue {\n"
+                  + "repeated Value values = 1;\n"
+                  + "}\n",
+            "google/protobuf/timestamp.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message Timestamp {\n"
+                  + "int64 seconds = 1;\n"
+                  + "int32 nanos = 2;\n"
+                  + "}\n",
+            "google/protobuf/type.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "import \"google/protobuf/any.proto\";\n"
+                  + "import \"google/protobuf/source_context.proto\";\n"
+                  + "message Type {\n"
+                  + "string name = 1;\n"
+                  + "repeated Field fields = 2;\n"
+                  + "repeated string oneofs = 3;\n"
+                  + "repeated Option options = 4;\n"
+                  + "SourceContext source_context = 5;\n"
+                  + "Syntax syntax = 6;\n"
+                  + "string edition = 7;\n"
+                  + "}\n"
+                  + "message Field {\n"
+                  + "enum Kind {\n"
+                  + "TYPE_UNKNOWN = 0;\n"
+                  + "TYPE_DOUBLE = 1;\n"
+                  + "TYPE_FLOAT = 2;\n"
+                  + "TYPE_INT64 = 3;\n"
+                  + "TYPE_UINT64 = 4;\n"
+                  + "TYPE_INT32 = 5;\n"
+                  + "TYPE_FIXED64 = 6;\n"
+                  + "TYPE_FIXED32 = 7;\n"
+                  + "TYPE_BOOL = 8;\n"
+                  + "TYPE_STRING = 9;\n"
+                  + "TYPE_GROUP = 10;\n"
+                  + "TYPE_MESSAGE = 11;\n"
+                  + "TYPE_BYTES = 12;\n"
+                  + "TYPE_UINT32 = 13;\n"
+                  + "TYPE_ENUM = 14;\n"
+                  + "TYPE_SFIXED32 = 15;\n"
+                  + "TYPE_SFIXED64 = 16;\n"
+                  + "TYPE_SINT32 = 17;\n"
+                  + "TYPE_SINT64 = 18;\n"
+                  + "}\n"
+                  + "enum Cardinality {\n"
+                  + "CARDINALITY_UNKNOWN = 0;\n"
+                  + "CARDINALITY_OPTIONAL = 1;\n"
+                  + "CARDINALITY_REQUIRED = 2;\n"
+                  + "CARDINALITY_REPEATED = 3;\n"
+                  + "}\n"
+                  + "Kind kind = 1;\n"
+                  + "Cardinality cardinality = 2;\n"
+                  + "int32 number = 3;\n"
+                  + "string name = 4;\n"
+                  + "string type_url = 6;\n"
+                  + "int32 oneof_index = 7;\n"
+                  + "bool packed = 8;\n"
+                  + "repeated Option options = 9;\n"
+                  + "string json_name = 10;\n"
+                  + "string default_value = 11;\n"
+                  + "}\n"
+                  + "message Enum {\n"
+                  + "string name = 1;\n"
+                  + "repeated EnumValue enumvalue = 2;\n"
+                  + "repeated Option options = 3;\n"
+                  + "SourceContext source_context = 4;\n"
+                  + "Syntax syntax = 5;\n"
+                  + "string edition = 6;\n"
+                  + "}\n"
+                  + "message EnumValue {\n"
+                  + "string name = 1;\n"
+                  + "int32 number = 2;\n"
+                  + "repeated Option options = 3;\n"
+                  + "}\n"
+                  + "message Option {\n"
+                  + "string name = 1;\n"
+                  + "Any value = 2;\n"
+                  + "}\n"
+                  + "enum Syntax {\n"
+                  + "SYNTAX_PROTO2 = 0;\n"
+                  + "SYNTAX_PROTO3 = 1;\n"
+                  + "SYNTAX_EDITIONS = 2;\n"
+                  + "}\n",
+            "google/protobuf/wrappers.proto":
+                "syntax = \"proto3\";\n"
+                  + "package google.protobuf;\n"
+                  + "message DoubleValue {\n"
+                  + "double value = 1;\n"
+                  + "}\n"
+                  + "message FloatValue {\n"
+                  + "float value = 1;\n"
+                  + "}\n"
+                  + "message Int64Value {\n"
+                  + "int64 value = 1;\n"
+                  + "}\n"
+                  + "message UInt64Value {\n"
+                  + "uint64 value = 1;\n"
+                  + "}\n"
+                  + "message Int32Value {\n"
+                  + "int32 value = 1;\n"
+                  + "}\n"
+                  + "message UInt32Value {\n"
+                  + "uint32 value = 1;\n"
+                  + "}\n"
+                  + "message BoolValue {\n"
+                  + "bool value = 1;\n"
+                  + "}\n"
+                  + "message StringValue {\n"
+                  + "string value = 1;\n"
+                  + "}\n"
+                  + "message BytesValue {\n"
+                  + "bytes value = 1;\n"
+                  + "}\n",
+        };
+        return _pb_wellKnown;
+    }
+
 
     // Build a class for every message in `schema` (and its imports) and register
     // each one's descriptor. Returns a map of name -> class; an enum maps to a
@@ -1741,7 +2023,13 @@ class Pb
             } else {
                 t.value = Class.Define(t.flat, Pb._FieldDefaults(t, types));
             }
-            out[t.flat] = t.value;
+            // Two packages may flatten to the same short name - a schema of its
+            // own `Value` alongside google.protobuf.Value, say. The short key
+            // goes to whoever claims it first, and `order` puts the root file's
+            // types before its imports', so the root file wins. The qualified
+            // name always resolves, so nothing becomes unreachable.
+            if (is_nil(out[t.flat])) { out[t.flat] = t.value; }
+            if (t.fqName != t.flat)  { out[t.fqName] = t.value; }
         }
 
         // Pass 2: descriptors, now that every class exists.
@@ -1752,12 +2040,114 @@ class Pb
             if (t.kind == "enum") { continue; }
             Pb.Register(t.value, Pb._SpecFor(t, types));
         }
+
+        // Pass 3: services, whose methods point at the classes just built.
+        fi = 0;
+        while (fi < len(files)) {
+            let f = files[fi];
+            fi += 1;
+            let pkg:string = f.package ?? "";
+            let si:int = 0;
+            while (si < len(f.services)) {
+                let s = f.services[si];
+                si += 1;
+                if (!is_nil(types[s.fqName])) {
+                    throw(1, "Protobuf: '" + s.fqName + "' collides with another "
+                           + "type of the same name");
+                }
+                let svc = Pb._DefineService(s, types, pkg);
+                if (is_nil(out[s.name])) { out[s.name] = svc; }
+                if (s.fqName != s.name)  { out[s.fqName] = svc; }
+            }
+        }
         return out;
     }
 
-    // ParseProto + DefineSchema.
+    // One service as a plain object: methods by name, plus `order` to walk them
+    // as declared. A method names its service rather than holding it - the
+    // back-reference would close a cycle, and cycles are never reclaimed.
+    fn static _DefineService(s, types, pkg:string) {
+        let methods = {};
+        let order:array = [];
+        let i:int = 0;
+        while (i < len(s.methods)) {
+            let m = s.methods[i];
+            i += 1;
+            if (!is_nil(methods[m.name])) {
+                throw(1, "Protobuf: rpc '" + m.name + "' is declared twice in "
+                       + "service '" + s.fqName + "'");
+            }
+            methods[m.name] = {
+                name:         m.name,
+                service:      s.name,
+                fqName:       s.fqName + "." + m.name,
+                // The RPC path gRPC and Connect both address a method by.
+                path:         "/" + s.fqName + "/" + m.name,
+                input:        Pb._ResolveMsg(types, m.input,  pkg, s.fqName, m.name),
+                output:       Pb._ResolveMsg(types, m.output, pkg, s.fqName, m.name),
+                clientStream: m.clientStream,
+                serverStream: m.serverStream,
+            };
+            Array.Append(order, m.name);
+        }
+        return {
+            kind:    "service",
+            name:    s.name,
+            fqName:  s.fqName,
+            methods: methods,
+            order:   order,
+        };
+    }
+
+    // The class an rpc's input/output names. Only a message is legal there.
+    fn static _ResolveMsg(types, ref:string, scope:string, svc:string, method:string) {
+        let t = Pb._ResolveType(types, ref, scope);
+        if (is_nil(t)) {
+            throw(1, "Protobuf: rpc " + svc + "." + method
+                   + " names unknown type '" + ref + "'");
+        }
+        if (t.kind != "message") {
+            throw(1, "Protobuf: rpc " + svc + "." + method + " names '" + ref
+                   + "', which is an enum; an rpc takes and returns messages");
+        }
+        return t.value;
+    }
+
+    // ParseProto + DefineSchema. There is no file to resolve imports against,
+    // so only the built-in google/protobuf ones are followed; any other import
+    // is left alone and its types simply stay unknown. Use LoadProtoFile when
+    // the schema imports a file of your own.
     fn static LoadProto(source:string, name:string|nil) {
-        return Pb.DefineSchema(Pb.ParseProto(source, name));
+        let root = Pb.ParseProto(source, name);
+        root.deps = Pb._WellKnownDeps(root);
+        return Pb.DefineSchema(root);
+    }
+
+    // Every built-in schema reachable from `root`, transitively, parsed once
+    // each. Nothing points back at root, so the schema stays acyclic.
+    fn static _WellKnownDeps(root) {
+        let deps:array  = [];
+        let seen        = {};
+        let queue:array = [root];
+        let qi:int = 0;
+        while (qi < len(queue)) {
+            let cur = queue[qi];
+            qi += 1;
+            let i:int = 0;
+            while (i < len(cur.imports)) {
+                let path:string = cur.imports[i].path;
+                i += 1;
+                if (seen[path] == true) { continue; }
+                let src = Pb._WellKnown(path);
+                if (is_nil(src)) { Pb._RejectProto2Import(path); continue; }
+                seen[path] = true;
+                cur.imports[i - 1].resolved = path;
+                let sub = Pb.ParseProto(src, path);
+                Array.Append(queue, sub);
+                Array.Append(deps, sub);
+            }
+        }
+        return deps;
     }
 
     // ParseProtoFile + DefineSchema.

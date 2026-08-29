@@ -142,27 +142,39 @@ there; every language other than Flaris itself is optional and simply omitted if
 it is not installed.
 
 On integer kernels (fib, sieve, collatz) Flaris lands in two different tiers
-depending on whether the JIT is on — averaged against C on an Apple M2,
-VM 1.0.0.9:
+depending on whether the JIT is on — averaged against C on an Apple M5,
+VM 1.0.2.0:
 
 | Runtime | avg ×C |
 | ------- | -----: |
 | C (clang -O2) | 1.0x |
-| Go | 1.4x |
-| Nim | 2.0x |
-| **Flaris `--jit`** | **2.6x** |
-| LuaJIT 2.1 | 4.8x |
-| **Flaris** (bytecode VM) | **23.5x** |
-| Lua 5.4 | 24.5x |
-| Python 3 | 43.5x |
-| QuickJS | 60.4x |
+| Rust (rustc -O) | 1.0x |
+| C# (.NET, RyuJIT) | 1.4x |
+| Go | 1.5x |
+| Nim | 2.1x |
+| **Flaris `--jit`** | **2.5x** |
+| LuaJIT | 4.3x |
+| Node/V8 | 5.7x |
+| Lua | 14.7x |
+| **Flaris** (bytecode VM) | **20.2x** |
+| QuickJS | 25.8x |
+| Python 3 | 65.7x |
+
+Two rows in that table need a caveat. C# is the closest architectural
+comparison here — a statically typed managed runtime whose method JIT is meant
+to reach native speed, which is what Flaris `--jit` is attempting — and at 1.4×
+it is ahead of Flaris and of both Go and Nim. And Node/V8's average is dragged
+down almost entirely by collatz, where JavaScript's doubles cost it 12×; on fib
+and sieve V8 runs level with Flaris `--jit`. Rust and C# take part in the
+integer kernels only.
 
 On workloads that spend their time in the C builtins the picture shifts up a
-tier: parsing an 18 MB JSON document, Flaris is 1.3× behind Node/V8 and ahead of
-CPython, Go and Nim; scanning 9.8 MB for dates with a regex it is second only to
-V8, ahead of Nim and CPython. Peak memory is measured too: best in the field on
-buffers and strings, and mid-field on large object graphs — 208 MB parsing that
-JSON document, against Node's 231 MB and Go's 100 MB.
+tier: parsing an 18 MB JSON document, Flaris is 1.5× behind Node/V8 and ahead of
+Go, CPython and Nim; scanning 9.8 MB for dates with a regex it is second only to
+V8, ahead of QuickJS, Nim, CPython and Go. Peak memory is measured too: 20 MB
+for the string build against Node's 149 MB, 17 MB for the 10 M-element sieve
+against Lua's 238 MB, and mid-field on large object graphs — 208 MB parsing that
+JSON document, against Node's 216 MB and Go's 103 MB.
 
 Full numbers, methodology and the caveats that matter are in
 [bench/README.md](bench/README.md), with dated snapshots in
