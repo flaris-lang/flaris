@@ -23,24 +23,54 @@
 // the only definition of the wire contract - there is no generated code and
 // nothing new becomes executable.
 //
+// Serving is the same library:
+//
+//   Connect.Serve(srv, api["Greeter"], {
+//       SayHello: fn(msg, call) {
+//           let out = Class.New(call.method.output);
+//           out.text = "hello, " + msg.name;
+//           return out;
+//       }
+//   });
+//
 // -----------------------------------------------------------------------------
 // Scope
 // -----------------------------------------------------------------------------
-// Unary calls only - one request message, one response message. That is the
-// whole of what Connect does over HTTP/1.1 without an envelope reader; a call
-// whose descriptor says clientStream or serverStream is rejected up front
-// rather than silently mis-framed.
+// Unary calls only, both directions - one request message, one response
+// message. Calls are synchronous: an async client exists in outline (the
+// request/response split below is what it needs) but is not shipped, because a
+// call nested inside async methods does not yet complete - see the async-method
+// receiver fix in vm/vm.c for the first half of that story. That is the whole of what Connect does over HTTP/1.1 without an
+// envelope reader; a call whose descriptor says clientStream or serverStream is
+// rejected up front rather than silently mis-framed.
 //
-// This is a client. Serving Connect is a separate concern; the code/status
-// mapping and the error body are exposed as statics so a handler can share them.
+// -----------------------------------------------------------------------------
+// Serving
+// -----------------------------------------------------------------------------
+//   Connect.Serve(srv, service, impls, opts?)  -> int   methods mounted
+//       srv    anything with Post(path, fn(req, res)) - HttpServer, say. It is
+//              a parameter rather than an import so a program that only makes
+//              calls never loads an HTTP server.
+//       impls  { MethodName: fn(msg, call) -> reply }
+//       opts   { requireVersion: bool }  demand Connect-Protocol-Version: 1
+//
+// `call` carries { method, codec, headers, header(name, value) }. A handler
+// returns the reply message, or throws a ConnectError to fail with a chosen
+// code; any other exception becomes Code.Internal, so a peer learns that the
+// call failed but nothing about how the server is built.
+//
+// Only implemented methods are mounted. An unknown procedure is a 404, which
+// Connect already reads as Unimplemented - the same thing connect-go does - and
+// it leaves the path free for a handler you register yourself.
 //
 // -----------------------------------------------------------------------------
 // Connect
 // -----------------------------------------------------------------------------
 //   new Connect(baseUrl:string, opts?)
 //       opts: { headers: object,      sent with every call
-//               timeoutMs: int }      Connect-Timeout-Ms, the server-side
+//               timeoutMs: int,       Connect-Timeout-Ms, the server-side
 //                                     deadline; 0 or absent sends no header
+//               codec: string }       "proto" (default) or "json"
 //
 //   Call(method, msg)            -> instance   the response message
 //   CallFull(method, msg)        -> { message, status, headers }
@@ -61,6 +91,25 @@
 // and does not pool - so a call costs a TCP handshake on top of the round trip.
 // That is fine for the request rates a fiber-scheduled VM reaches; it is worth
 // knowing before benchmarking against a pooled client.
+//
+// -----------------------------------------------------------------------------
+// Codecs
+// -----------------------------------------------------------------------------
+// Connect names the content type after the codec - "application/" + its name -
+// so the same protocol carries either encoding:
+//
+//   let c = new Connect(url, { codec: "json" });   // application/json
+//
+// "proto" is the default and the compact one. "json" is protobuf's canonical
+// JSON mapping (Pb.ToJson / Pb.FromJson), which is what to reach for when the
+// peer enables JSON only, or when a call has to be readable in a log or
+// reproducible with curl:
+//
+//   curl -H 'Content-Type: application/json' -H 'Connect-Protocol-Version: 1' \
+//        -d '{"name":"world"}' http://host/greet.v1.Greeter/SayHello
+//
+// The error body is JSON in both codecs - that is the protocol, not the codec -
+// so error handling does not change with this setting.
 //
 // -----------------------------------------------------------------------------
 // Codes
@@ -110,6 +159,7 @@ global _connectCodeNames:array = [
 ];
 
 global CONNECT_CONTENT_TYPE:string = "application/proto";
+global CONNECT_CONTENT_TYPE_JSON:string = "application/json";
 
 // Every failure of a Connect call, whether the peer reported it or the request
 // never arrived. `.Code` is a Connect code, not a VM error code.
@@ -122,6 +172,7 @@ class Connect {
     let _base:string    = "";
     let _headers        = nil;
     let _timeoutMs:int  = 0;
+    let _codec:string   = "proto";
 
     // `baseUrl` is an origin, optionally with a path prefix
     // ("http://h:8080", "https://h/api"). A trailing slash is dropped: the
@@ -135,6 +186,14 @@ class Connect {
             }
             if ("timeoutMs" in opts && opts.timeoutMs != nil) {
                 this._timeoutMs = int(opts.timeoutMs);
+            }
+            if ("codec" in opts && opts.codec != nil) {
+                let c:string = Convert.ToString(opts.codec);
+                if (c != "proto" && c != "json") {
+                    throw new ConnectError(Code.InvalidArgument,
+                        "Connect: codec must be \"proto\" or \"json\", got '" + c + "'");
+                }
+                this._codec = c;
             }
         }
     }
@@ -155,7 +214,8 @@ class Connect {
         if (headers != nil) {
             foreach (v, k in headers) { merged[k] = Convert.ToString(v); }
         }
-        return new Connect(this._base, { headers: merged, timeoutMs: this._timeoutMs });
+        return new Connect(this._base, { headers: merged, timeoutMs: this._timeoutMs,
+                                         codec: this._codec });
     }
 
     fn Url(method):string {
@@ -180,6 +240,37 @@ class Connect {
     // The response message plus the HTTP status and headers it came with.
     // Raises ConnectError on anything else.
     fn CallFull(method, msg) {
+        let p = this._prepare(method, msg);
+        return Connect._finish(method, p,
+                               Http.Request("POST", p.url, p.body, p.ctype, p.hdrs));
+    }
+
+    // Async twins of Call / CallFull / Invoke. Same contract, same raises: only
+    // the transport differs, so a caller that awaits gets the identical result.
+    // These are what let a client talk to a server in the *same* VM - the
+    // synchronous path blocks its fiber and would starve the server.
+    fn async CallFullAsync(method, msg) {
+        let p = this._prepare(method, msg);
+        let res = await Http.RequestAsync("POST", p.url, p.body, p.ctype, p.hdrs);
+        return Connect._finish(method, p, res);
+    }
+
+    fn async CallAsync(method, msg) {
+        let full = await this.CallFullAsync(method, msg);
+        return full.message;
+    }
+
+    fn async InvokeAsync(service, name:string, msg) {
+        let m = service.methods[name];
+        if (is_nil(m)) {
+            throw new ConnectError(Code.Unimplemented,
+                "Connect: service '" + service.fqName + "' has no rpc '" + name + "'");
+        }
+        return await this.CallAsync(m, msg);
+    }
+
+    // Everything a call needs before the HTTP request, shared by both engines.
+    fn _prepare(method, msg) {
         if (method.clientStream || method.serverStream) {
             throw new ConnectError(Code.Unimplemented,
                 "Connect: " + method.fqName + " is a streaming rpc; this client "
@@ -189,28 +280,40 @@ class Connect {
         let hdrs = {};
         foreach (v, k in this._headers) { hdrs[k] = v; }
         hdrs["Connect-Protocol-Version"] = "1";
-        // The Http client cannot decompress a response, so ask for none.
+        // Connect has its own compression negotiation; leave the HTTP layer out
+        // of it rather than have two mechanisms disagree.
         hdrs["Accept-Encoding"] = "identity";
         if (this._timeoutMs > 0) {
             hdrs["Connect-Timeout-Ms"] = Convert.ToString(this._timeoutMs);
         }
 
-        let body:string = Buffer.ToString(Pb.Encode(msg));
-        let url:string  = this.Url(method);
-        let res = Http.Request("POST", url, body, CONNECT_CONTENT_TYPE, hdrs);
+        // The codec names the content type: application/proto or
+        // application/json, per Connect's "application/" + codec-name rule.
+        let json:bool    = (this._codec == "json");
+        let ctype:string = json ? CONNECT_CONTENT_TYPE_JSON : CONNECT_CONTENT_TYPE;
+        return {
+            json:  json,
+            ctype: ctype,
+            body:  json ? Pb.ToJson(msg) : Buffer.ToString(Pb.Encode(msg)),
+            url:   this.Url(method),
+            hdrs:  hdrs
+        };
+    }
 
+    // Turn an HTTP response into a message, or the right ConnectError.
+    fn static _finish(method, p, res) {
         if (res == nil) {
             throw new ConnectError(Code.Unavailable,
-                "Connect: no response from " + url);
+                "Connect: no response from " + p.url);
         }
         if (res.status != 200) {
             throw Connect._errorFrom(res);
         }
 
         let ct:string = Connect._contentType(res);
-        if (ct != CONNECT_CONTENT_TYPE) {
+        if (ct != p.ctype) {
             let e = new ConnectError(Code.Internal,
-                "Connect: expected " + CONNECT_CONTENT_TYPE + " in the reply to "
+                "Connect: expected " + p.ctype + " in the reply to "
               + method.fqName + ", got '" + ct + "'");
             e.Status = res.status;
             throw e;
@@ -218,7 +321,8 @@ class Connect {
 
         var decoded = nil;
         try {
-            decoded = Pb.Decode(res.body ?? "", method.output);
+            decoded = p.json ? Pb.FromJson(res.body ?? "{}", method.output)
+                             : Pb.Decode(res.body ?? "", method.output);
         } catch (ex) {
             let e = new ConnectError(Code.Internal,
                 "Connect: " + method.fqName + " returned a body that does not "
@@ -273,6 +377,127 @@ class Connect {
         e.Status  = res.status;
         e.Details = details;
         return e;
+    }
+
+    // ---- serving -----------------------------------------------------------
+
+    // Mount the rpcs of `service` that `impls` implements, dispatching to
+    // `impls[name]`. Returns the number of methods mounted. A method with no
+    // implementation is left unrouted: an unknown procedure is a 404, which
+    // Connect reads as Unimplemented anyway.
+    //
+    //   Connect.Serve(srv, api["Greeter"], {
+    //       SayHello: fn(msg, call) {
+    //           let out = Class.New(call.method.output);
+    //           out.text = "hello, " + msg.name;
+    //           return out;
+    //       }
+    //   });
+    //
+    // `srv` is taken as a parameter rather than imported: a program that only
+    // makes calls should not have to load an HTTP server, and anything exposing
+    // Post(path, fn(req, res)) works here.
+    //
+    // A handler returns the reply message, or throws a ConnectError to fail the
+    // call with a specific code. Any other exception becomes Code.Internal -
+    // the peer learns the call failed, not how the server is built.
+    //
+    // `call` carries { method, codec, headers, header(name, value) }: the
+    // descriptor being served, which encoding the caller used, the request
+    // headers, and a way to add response headers.
+    fn static Serve(srv, service, impls, opts?) {
+        if (is_nil(service) || is_nil(service.methods)) {
+            throw new ConnectError(Code.InvalidArgument,
+                "Connect.Serve: expected a service descriptor from Pb.LoadProto");
+        }
+        let requireVersion:bool = (opts != nil) && (opts.requireVersion == true);
+        var mounted:int = 0;
+        var i:int = 0;
+        while (i < len(service.order)) {
+            let name:string = service.order[i];
+            i += 1;
+            let m = service.methods[name];
+            let impl = (impls == nil) ? nil : impls[name];
+            // Only what is actually implemented gets a route. An unmounted
+            // procedure answers 404, which Connect already reads as
+            // Unimplemented - the same thing connect-go does - and it leaves
+            // the path free for a caller that wants to handle it itself.
+            if (is_nil(impl)) { continue; }
+            srv.Post(m.path, Connect._handlerFor(m, impl, requireVersion));
+            mounted += 1;
+        }
+        return mounted;
+    }
+
+    // One rpc's HTTP handler. Closes over the method descriptor and the
+    // implementation so the returned function needs nothing else.
+    fn static _handlerFor(m, impl, requireVersion:bool) {
+        return fn(req, res) {
+            // Streaming is not implemented, and answering one as if it were
+            // unary would corrupt the exchange rather than fail it.
+            if (m.clientStream || m.serverStream) {
+                Connect._writeError(res, Code.Unimplemented,
+                    "Connect: " + m.fqName + " is a streaming rpc; this server "
+                  + "does unary calls only");
+                return;
+            }
+            if (requireVersion && req.Header("Connect-Protocol-Version", "") != "1") {
+                Connect._writeError(res, Code.InvalidArgument,
+                    "Connect: missing Connect-Protocol-Version: 1");
+                return;
+            }
+
+            let ct:string = String.ToLower(req.Header("Content-Type", "") ?? "");
+            let json:bool = String.Contains(ct, "json");
+            if (!json && !String.Contains(ct, "proto")) {
+                // 415 in HTTP terms; the protocol still wants a Connect error
+                // body, so the caller reads one shape whatever went wrong.
+                Connect._writeError(res, Code.InvalidArgument,
+                    "Connect: unsupported Content-Type '" + ct
+                  + "'; expected application/proto or application/json");
+                return;
+            }
+
+            try {
+                let msg = json ? Pb.FromJson(req.Text() ?? "{}", m.input)
+                               : Pb.Decode(req.body ?? "", m.input);
+                // `header` lets a handler add response metadata without handing
+                // it the response object, which it must not write to itself.
+                let reply = impl(msg, {
+                    method:  m,
+                    codec:   (json ? "json" : "proto"),
+                    headers: req.headers,
+                    header:  fn(name, value) { res.Header(name, value); }
+                });
+                if (is_nil(reply)) {
+                    Connect._writeError(res, Code.Internal,
+                        "Connect: " + m.fqName + " returned no message");
+                    return;
+                }
+                if (json) {
+                    res.ContentType(CONNECT_CONTENT_TYPE_JSON);
+                    res.Text(Pb.ToJson(reply), 200);
+                } else {
+                    res.Bytes(Pb.Encode(reply), CONNECT_CONTENT_TYPE, 200);
+                }
+            } catch (e) {
+                // A ConnectError carries the code the handler chose; anything
+                // else is a fault in the server and says only that.
+                if (e is ConnectError) {
+                    Connect._writeError(res, e.Code, e.Error);
+                } else {
+                    Connect._writeError(res, Code.Internal,
+                        "Connect: " + m.fqName + " failed: " + str(e.Error));
+                }
+            }
+        };
+    }
+
+    // An error reply: the status the code maps to, and the JSON body the
+    // protocol defines - the same shape in either codec.
+    fn static _writeError(res, code:int, message:string) {
+        res.ContentType(CONNECT_CONTENT_TYPE_JSON);
+        res.Text(Connect.ErrorBody(code, message), Connect.HttpStatusFor(code));
     }
 
     // ---- codes -------------------------------------------------------------
@@ -331,4 +556,4 @@ class Connect {
     }
 }
 
-export { Connect, ConnectError, Code, CONNECT_CONTENT_TYPE };
+export { Connect, ConnectError, Code, CONNECT_CONTENT_TYPE, CONNECT_CONTENT_TYPE_JSON };

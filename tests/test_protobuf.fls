@@ -12,14 +12,31 @@ global _benchMsg:instance = nil;
 global _benchBytes:block  = nil;
 
 // Reference bytes for AllTypes, produced by the Go protobuf runtime
-// (google.golang.org/protobuf v1.36). The schema and the tool that emits this
-// constant live outside this repo, in flaris-lang/tools/protobuf-interop, so
-// that this suite stays self-contained: `./protobuf-interop alltypes emit`.
+// (google.golang.org/protobuf v1.36) from the schema defined below. Embedded as
+// a constant so this suite needs nothing but flarisvm and libs/ to run: the
+// bytes are the reference implementation's answer, frozen.
 global GOLD_ALLTYPES:string = "090000000000000cc0150000c03f18b5f693f088dcffffff0120ffffffffffffffffff0128d6ffffffffffffffff013100000000000100003dffffffff40014a1068c3a96c6c6fe286922077c3b6726c6462040001feff6880bcc1960b7df9ffffff8101f8ffffffffffffff8801ab0290018180808080808020a201080807120464656570aa0110038e029ea705ffffffffffffffffff01b2010161b20100b20103636363ba01020801ba01020802c201070a036f6e651001c201070a0374776f1002ca011008fdffffffffffffffff0112036e6567ca0107080a120374656ed201070a016b12020863fa010663686f73656e";
-// wkt.Event from tools/protobuf-interop (`./protobuf-interop wkt emit`):
-// every well-known type this library embeds, built by the Go runtime from
-// protocompile's own copies of those schemas.
-global GOLD_WKT:string = "0a056576742d31120b08808bd2bb061080e59a771a05080310f403222b0a080a016b12031a01760a0f0a016c120a32080a0220010a0208000a0e0a016e120911000000000000f83f2a070a0568656c6c6f320b0880ccbbbcdeffffffff013a020801420c0a0269640a066d6574612e6b4a240a1d747970652e676f6f676c65617069732e636f6d2f776b742e4576656e7412030001fe52110a071a05616c7068610a061a0462657461";
+// The same message as GOLD_ALLTYPES, in canonical proto3 JSON, as Go's
+// protojson writes it.
+global GOLD_JSON:string = "{\"fDouble\":-3.5,\"fFloat\":1.5,\"fInt64\":\"-1234567890123\",\"fUint64\":\"18446744073709551615\",\"fInt32\":-42,\"fFixed64\":\"1099511627776\",\"fFixed32\":4294967295,\"fBool\":true,\"fString\":\"héllo→ wörld\",\"fBytes\":\"AAH+/w==\",\"fUint32\":3000000000,\"fSfixed32\":-7,\"fSfixed64\":\"-8\",\"fSint32\":-150,\"fSint64\":\"-9007199254740993\",\"inner\":{\"n\":7,\"note\":\"deep\"},\"nums\":[3,270,86942,-1],\"strs\":[\"a\",\"\",\"ccc\"],\"inners\":[{\"n\":1},{\"n\":2}],\"mSi\":{\"one\":1,\"two\":2},\"mIs\":{\"-3\":\"neg\",\"10\":\"ten\"},\"mSm\":{\"k\":{\"n\":99}},\"cStr\":\"chosen\"}";
+
+// wkt.Event: every well-known type this library embeds, in one message, built
+// by the Go runtime from Google's own copies of those schemas. Decoding this
+// compares the library's embedded well-known definitions against the originals
+// rather than against a second copy of themselves.
+global GOLD_WKT:string = "0a056576742d31120b08808bd2bb061080e59a771a05080310f403222b0a080a016b12031a01760a0f0a016c120a32080a0220010a0208000a0e0a016e120911000000000000f83f2a070a0568656c6c6f320b0880ccbbbcdeffffffff013a020801420c0a0269640a066d6574612e6b4a280a1d747970652e676f6f676c65617069732e636f6d2f776b742e4576656e7412070a05696e6e657252110a071a05616c7068610a061a0462657461";
+
+// demo.Order, from the Go runtime. Its schema reaches the corners AllTypes does
+// not: a cross-file import, an enum with a negative value, an aliased enum,
+// reserved numbers and names, all three map key types, packed and unpacked
+// repeated on one message, and field names that are Flaris keywords.
+global GOLD_ORDER:string = "0a056f72642d37100118ffffffffffffffffff0122130a0353454b10d20918ceffffffffffffffff012802320e01feffffffffffffffff01e0a712400740f8ffffffffffffffff014a01614a004a017a521a0a0376617412130a0353454b10d20918ceffffffffffffffff015a1008ffffffffffffffffff0112036e65675a08080912046e696e65620408001002620408011001680072026b7778018001058a010b0a05736b752d30100118028a010b0a05736b752d3110021802a8012a";
+
+// The same message as canonical proto3 JSON, as Go's protojson writes it.
+// Compared by decoding rather than by string: Go marshals map keys in sorted
+// order and ToJson emits them in field order, so the texts differ while the
+// messages do not.
+global GOLD_ORDER_JSON:string = "{\"adjustments\":{\"vat\":{\"currency\":\"SEK\",\"nanos\":-50,\"units\":\"1234\"}},\"class\":\"kw\",\"discount\":0,\"flags\":{\"false\":2,\"true\":1},\"id\":\"ord-7\",\"invoiceId\":\"42\",\"let\":5,\"lineIds\":[\"1\",\"-2\",\"300000\"],\"lines\":[{\"kind\":\"DIGITAL\",\"qty\":1,\"sku\":\"sku-0\"},{\"kind\":\"DIGITAL\",\"qty\":2,\"sku\":\"sku-1\"}],\"loose\":[7,-8],\"notes\":{\"-1\":\"neg\",\"9\":\"nine\"},\"region\":\"US\",\"return\":true,\"status\":\"ACTIVE\",\"tags\":[\"a\",\"\",\"z\"],\"temp\":\"FREEZING\",\"total\":{\"currency\":\"SEK\",\"nanos\":-50,\"units\":\"1234\"}}";
 fn check(label, got, expected) {
     if (got == expected) {
         Console.WriteLine("[PASS] ", label);
@@ -36,7 +53,7 @@ fn checkHex(label:string, got:block, expectedHex:string) {
 
 
 // =============================================================================
-// Message classes - mirror interop.proto in flaris-lang/tools/protobuf-interop
+// Message classes - the schema the golden vectors above were built from
 // =============================================================================
 
 class Inner {
@@ -268,6 +285,128 @@ fn test_interop_reencode() {
 // =============================================================================
 // Presence, oneof, maps, recursion, unknown fields
 // =============================================================================
+
+// The schema behind GOLD_ORDER. Both files are written out and loaded through
+// ParseProtoFile so the import is a real cross-file resolution rather than two
+// messages in one string.
+fn test_interop_kitchen() {
+    writeProto("common.proto",
+        "syntax = \"proto3\";\n"
+      + "package demo.common;\n"
+      + "message Money {\n"
+      + "  string currency = 1;\n"
+      + "  int64  units    = 2;\n"
+      + "  int32  nanos    = 3;\n"
+      + "}\n"
+      + "enum Region { REGION_UNSPECIFIED = 0; EU = 1; US = 2; }\n");
+    let kitchen:string = writeProto("kitchen.proto",
+        "syntax = \"proto3\";\n"
+      + "package demo;\n"
+      + "import \"common.proto\";\n"
+      + "option java_package = \"com.example.demo\";\n"
+      + "enum Status { STATUS_UNKNOWN = 0; ACTIVE = 1; RETIRED = 2; }\n"
+      + "enum Temperature { ZERO = 0; FREEZING = -1; WARM = 1; }\n"
+      + "enum Alias { option allow_alias = true; A_UNSET = 0; A_FIRST = 1; A_ONE = 1; }\n"
+      + "message Order {\n"
+      + "  reserved 7, 100 to 110;\n"
+      + "  reserved \"legacy_note\";\n"
+      + "  string  id      = 1;\n"
+      + "  Status  status  = 2;\n"
+      + "  Temperature temp = 3;\n"
+      + "  common.Money        total  = 4;\n"
+      + "  .demo.common.Region region = 5;\n"
+      + "  repeated int64  line_ids = 6 [packed = true];\n"
+      + "  repeated int32  loose    = 8 [packed = false];\n"
+      + "  repeated string tags     = 9;\n"
+      + "  map<string, common.Money> adjustments = 10;\n"
+      + "  map<int64, string>        notes       = 11;\n"
+      + "  map<bool, int32>          flags       = 12;\n"
+      + "  optional int32 discount = 13;\n"
+      + "  string class  = 14;\n"
+      + "  bool   return = 15;\n"
+      + "  int32  let    = 16;\n"
+      + "  message Line { string sku = 1; int32 qty = 2; Kind kind = 3; }\n"
+      + "  enum Kind { KIND_UNSPECIFIED = 0; PHYSICAL = 1; DIGITAL = 2; }\n"
+      + "  repeated Line lines = 17;\n"
+      + "  oneof payment { string card_token = 20; int64 invoice_id = 21; Line barter = 22; }\n"
+      + "}\n"
+      + "message Empty {}\n"
+      + "service OrderService {\n"
+      + "  rpc Get(Order) returns (Order);\n"
+      + "  rpc Watch(Order) returns (stream Order);\n"
+      + "  rpc Upload(stream Order) returns (Empty);\n"
+      + "  rpc Chat(stream Order) returns (stream Order) { option deprecated = true; }\n"
+      + "}\n");
+
+    let t = Pb.DefineSchema(Pb.ParseProtoFile(kitchen, [TMPDIR]));
+
+    // Enum shapes: positive-only becomes an enum, a negative value forces a
+    // class of consts, and allow_alias lets two names share a number.
+    check("kitchen: enum positive",  t["Status"].ACTIVE, 1);
+    check("kitchen: enum negative",  t["Temperature"].FREEZING, -1);
+    check("kitchen: enum alias",     t["Alias"].A_FIRST == t["Alias"].A_ONE, true);
+    check("kitchen: nested flat",    Class.IsClass(t["Order_Line"]), true);
+    check("kitchen: nested enum",    t["Order_Kind"].DIGITAL, 2);
+    check("kitchen: imported type",  Class.IsClass(t["Money"]), true);
+
+    let o = Pb.Decode(BitConverter.FromHex(GOLD_ORDER), t["Order"]);
+
+    check("kitchen: string",         o.id, "ord-7");
+    check("kitchen: enum field",     o.status, 1);
+    check("kitchen: negative enum",  o.temp, -1);
+
+    // Cross-file: the message came from common.proto, reached both relatively
+    // and fully qualified.
+    check("kitchen: import msg",     o.total.currency, "SEK");
+    check("kitchen: import int64",   o.total.units, 1234);
+    check("kitchen: import int32",   o.total.nanos, -50);
+    check("kitchen: import enum",    o.region, 2);
+
+    check("kitchen: packed",         Json.Stringify(o.line_ids), "[1,-2,300000]");
+    check("kitchen: unpacked",       Json.Stringify(o.loose), "[7,-8]");
+    check("kitchen: repeated string", Json.Stringify(o.tags), "[\"a\",\"\",\"z\"]");
+
+    // Three map key types on one message; non-string keys are stringified.
+    check("kitchen: map<string,msg>", o.adjustments["vat"].units, 1234);
+    check("kitchen: map<int64,str>",  o.notes["9"], "nine");
+    check("kitchen: map<int64> neg",  o.notes["-1"], "neg");
+    check("kitchen: map<bool,int32>", o.flags["true"], 1);
+    check("kitchen: map<bool> false", o.flags["false"], 2);
+
+    // proto3 optional: an explicit zero has presence and must survive a decode.
+    check("kitchen: optional zero",   o.discount, 0);
+
+    // Field names that are Flaris keywords: reachable by name, not by syntax.
+    check("kitchen: field 'class'",   Class.GetField(o, "class"), "kw");
+    check("kitchen: field 'return'",  Class.GetField(o, "return"), true);
+    check("kitchen: field 'let'",     Class.GetField(o, "let"), 5);
+
+    check("kitchen: nested repeated", o.lines[1].sku, "sku-1");
+    check("kitchen: nested enum val", o.lines[1].kind, 2);
+
+    // oneof: the set member reads, the others stay nil.
+    check("kitchen: oneof set",       o.invoice_id, 42);
+    check("kitchen: oneof unset",     is_nil(o.card_token), true);
+
+    // reserved names never become fields.
+    check("kitchen: reserved name",   is_nil(Class.GetField(o, "legacy_note")), true);
+
+    // Re-encoding must produce a message Go would call equal.
+    check("kitchen: re-encode",       Pb.Equals(Pb.Decode(Pb.Encode(o), t["Order"]), o), true);
+
+    // And Go's protojson output reads back to the same message.
+    check("kitchen: protojson in",    Pb.Equals(Pb.FromJson(GOLD_ORDER_JSON, t["Order"]), o), true);
+    check("kitchen: json round-trip", Pb.Equals(Pb.FromJson(Pb.ToJson(o), t["Order"]), o), true);
+
+    // Every rpc shape, with input/output resolved to the live classes.
+    let svc = t["OrderService"];
+    check("kitchen: rpc input",       svc.methods.Get.input == t["Order"], true);
+    check("kitchen: rpc output",      svc.methods.Upload.output == t["Empty"], true);
+    check("kitchen: rpc path",        svc.methods.Get.path, "/demo.OrderService/Get");
+    check("kitchen: server stream",   svc.methods.Watch.serverStream, true);
+    check("kitchen: client stream",   svc.methods.Upload.clientStream, true);
+    check("kitchen: bidi",            svc.methods.Chat.clientStream && svc.methods.Chat.serverStream, true);
+}
 
 fn test_presence() {
     let o = new Opt();
@@ -892,7 +1031,7 @@ global WKT_PROTO:string =
   + "}\n"
   + "service Watcher { rpc Ping (google.protobuf.Empty) returns (Event); }\n";
 
-// Mirrors buildWkt() in tools/protobuf-interop/main.go.
+// Builds the same message GOLD_WKT holds, field for field.
 fn buildWktEvent(t) {
     let e = Class.New(t["Event"]);
     e.id = "evt-1";
@@ -921,11 +1060,13 @@ fn buildWktEvent(t) {
 
     let mask = Class.New(t["FieldMask"]);   mask.paths = ["id", "meta.k"]; e.mask = mask;
 
-    let raw:block = Buffer.Create(3, 1);
-    Buffer.WriteU8At(raw, 0, 0); Buffer.WriteU8At(raw, 1, 1); Buffer.WriteU8At(raw, 2, 254);
+    // An Any carries a serialized message of the type its URL names - JSON
+    // expands it, so arbitrary bytes would not survive the round trip.
+    let innerEv = Class.New(t["Event"]);
+    innerEv.id = "inner";
     let blob = Class.New(t["Any"]);
     blob.type_url = "type.googleapis.com/wkt.Event";
-    blob.value    = raw;
+    blob.value    = Pb.Encode(innerEv);
     e.blob = blob;
 
     let tags = Class.New(t["ListValue"]);
@@ -962,7 +1103,8 @@ fn test_well_known() {
     check("wkt: gold bool",      gold.ok.value, true);
     check("wkt: gold mask",      String.Join(gold.mask.paths, ","), "id,meta.k");
     check("wkt: gold any url",   gold.blob.type_url, "type.googleapis.com/wkt.Event");
-    check("wkt: gold any bytes", len(gold.blob.value), 3);
+    check("wkt: gold any inner",
+          Pb.Decode(gold.blob.value, t["Event"]).id, "inner");
     check("wkt: gold list",      gold.tags.values[1].string_value, "beta");
 
     // Struct is the hard one: a map to a recursive oneof, with an enum arm.
@@ -996,6 +1138,22 @@ fn test_well_known() {
     check("wkt: built-in still there",
           Pb._HasField(c["google.protobuf.Value"], "string_value"), true);
 
+    // The well-known types have their own JSON forms; these are the exact
+    // strings Go's protojson produces for the same message.
+    let ev = buildWktEvent(t);
+    let j:string = Pb.ToJson(ev);
+    check("wkt json: timestamp", String.Contains(j, "\"at\":\"2025-01-01T00:00:00.250Z\""), true);
+    check("wkt json: duration",  String.Contains(j, "\"took\":\"3.000000500s\""), true);
+    check("wkt json: wrapper",   String.Contains(j, "\"note\":\"hello\""), true);
+    check("wkt json: int64 wrapper", String.Contains(j, "\"size\":\"-9000000000\""), true);
+    check("wkt json: field mask", String.Contains(j, "\"mask\":\"id,meta.k\""), true);
+    check("wkt json: struct",    String.Contains(j, "\"meta\":{"), true);
+    check("wkt json: null arm",  String.Contains(j, "null"), true);
+    check("wkt json: list",      String.Contains(j, "\"tags\":[\"alpha\",\"beta\"]"), true);
+    check("wkt json: any @type",
+          String.Contains(j, "\"@type\":\"type.googleapis.com/wkt.Event\""), true);
+    check("wkt json: round-trips", Pb.Equals(Pb.FromJson(j, t["Event"]), ev), true);
+
     // A copy on the include path wins over the built-in one.
     let dir:string = Path.Combine(TMPDIR, "google");
     Directory.Create(dir);
@@ -1009,6 +1167,50 @@ fn test_well_known() {
       + "message M { google.protobuf.Empty e = 1; }\n");
     let sh = Pb.LoadProtoFile(own, [TMPDIR]);
     check("wkt: include path wins", Pb._HasField(sh["Empty"], "shadowed"), true);
+}
+
+fn test_json() {
+    let m = Pb.Decode(BitConverter.FromHex(GOLD_ALLTYPES), AllTypes);
+
+    // Encoding is the canonical mapping: camelCase names, 64-bit as strings,
+    // bytes as base64, enums by name, defaults omitted.
+    check("json: matches Go's protojson", Pb.ToJson(m), GOLD_JSON);
+
+    // And it reads its own output back to the same message.
+    check("json: round-trips", Pb.Equals(Pb.FromJson(Pb.ToJson(m), AllTypes), m), true);
+
+    // uint64 is stored signed but must read and write unsigned.
+    check("json: unsigned 64-bit out", String.Contains(GOLD_JSON, "\"18446744073709551615\""), true);
+    let u = Pb.FromJson("{\"fUint64\":\"18446744073709551615\"}", AllTypes);
+    check("json: unsigned 64-bit in", u.f_uint64, -1);
+    let u2 = Pb.FromJson("{\"fUint64\":\"9223372036854775808\"}", AllTypes);
+    check("json: 2^63 boundary", u2.f_uint64, -9223372036854775807 - 1);
+
+    // A parser must accept what a writer never emits.
+    let alt = Pb.FromJson("{\"f_int32\":7,\"fInt64\":-5,\"fBool\":true}", AllTypes);
+    check("json: proto name accepted", alt.f_int32, 7);
+    check("json: 64-bit as number",    alt.f_int64, -5);
+
+    // Non-finite doubles are quoted strings, both ways.
+    let nf = Pb.FromJson("{\"fDouble\":\"-Infinity\"}", AllTypes);
+    check("json: -Infinity in",  Math.IsFinite(nf.f_double), false);
+    check("json: NaN out", String.Contains(Pb.ToJson(Pb.FromJson("{\"fDouble\":\"NaN\"}", AllTypes)),
+                                           "\"NaN\""), true);
+
+    // An unknown member is an error, not something to skip silently.
+    var caught:bool = false;
+    try { Pb.FromJson("{\"nope\":1}", AllTypes); } catch (e) { caught = true; }
+    check("json: unknown field rejected", caught, true);
+
+    // null leaves a field unset rather than writing a zero.
+    let nz = Pb.FromJson("{\"fInt32\":null}", AllTypes);
+    check("json: null leaves default", Pb.ToJson(nz), "{}");
+
+    // Options.
+    let small = new Spec1();
+    small.a = 0;
+    check("json: defaults omitted",  Pb.ToJson(small), "{}");
+    check("json: emitDefaults",      Pb.ToJson(small, { emitDefaults: true }), "{\"a\":0}");
 }
 
 fn test_proto_rejections() {
@@ -1128,6 +1330,7 @@ fn Main() {
     Console.WriteLine("--- interop with the Go protobuf runtime ---");
     test_interop_decode();
     test_interop_reencode();
+    test_interop_kitchen();
 
     Console.WriteLine("--- semantics ---");
     test_presence();
@@ -1150,6 +1353,7 @@ fn Main() {
     test_proto_imports();
     test_proto_services();
     test_well_known();
+    test_json();
     test_proto_rejections();
 
     Console.WriteLine("--- malformed input ---");

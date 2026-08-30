@@ -1,16 +1,15 @@
-// test_connect.fls - Connect RPC client (libs/Connect.fls).
+// test_connect.fls - Connect RPC, client and server (libs/Connect.fls).
 //
-// Two modes, so one file holds both ends of a real call:
+//   flarisvm tests/test_connect.fls --libs='./libs'
 //
-//   flarisvm tests/test_connect.fls serve --libs='./libs'    # the peer
-//   flarisvm tests/test_connect.fls       --libs='./libs'    # the tests
+// One process, one file, no external tools. The server is started in this VM
+// with ListenAsync() and the client calls it with the async API: the
+// synchronous client blocks its fiber on socket reads, which would starve the
+// server and hang. The offline tests below still use the synchronous path -
+// they never reach a server, so nothing can starve.
 //
-// tests/test_connect.sh runs both. Client and server must be separate
-// processes: the Http client blocks its fiber, so calling a server inside the
-// same VM deadlocks the scheduler.
-//
-// Everything the test needs it builds itself - the schema is a string in this
-// file, and the peer is the server mode below.
+// Everything the test needs it builds itself: the schema is a string in this
+// file and the peer is Connect.Serve, so both halves are the library's own.
 
 // Connect first: importing a library that another library also imports warns
 // about a shadowed global unless the importer comes first.
@@ -21,8 +20,9 @@ import { HttpServer }                  from library("HttpServer", "1.0");
 global passed = 0;
 global failed = 0;
 
-global PORT:int    = 8418;
-global BASE:string = "http://127.0.0.1:8418";
+// Port 0 lets the OS pick: no fixed port to collide with a stale listener,
+// and BASE is only known once the server is up.
+global BASE:string = "";
 
 global PROTO:string =
     "syntax = \"proto3\";\n"
@@ -64,41 +64,41 @@ fn check(label, got, expected) {
 // Small enough to read in one sitting, which is the point: a Connect unary
 // endpoint is a POST that carries protobuf both ways.
 
-fn serve() {
+// The peer is built with the library's own Connect.Serve, so these tests
+// exercise both halves against each other: the client here talks to the server
+// there, and neither side hand-rolls the protocol.
+
+fn startServer() {
     let g   = API["Greeter"];
-    let srv = new HttpServer({ port: PORT });
+    let srv = new HttpServer({ port: 0, idleTimeoutMs: 2000, readTimeoutMs: 4000 });
 
-    srv.Post(g.methods.SayHello.path, fn(req, res) {
-        let m = Pb.Decode(req.body, g.methods.SayHello.input);
-        let out = Class.New(g.methods.SayHello.output);
-        out.text  = "hello, " + m.name;
-        out.count = m.times + 1;
-        res.Header("X-Interop", "flaris");
-        res.Header("X-Echo-Auth",    req.Header("Authorization", ""));
-        res.Header("X-Echo-Version", req.Header("Connect-Protocol-Version", ""));
-        res.Header("X-Echo-Timeout", req.Header("Connect-Timeout-Ms", "none"));
-        res.Bytes(Pb.Encode(out), "application/proto");
+    Connect.Serve(srv, g, {
+        SayHello: fn(msg, call) {
+            let out = Class.New(call.method.output);
+            out.text  = "hello, " + msg.name;
+            out.count = msg.times + 1;
+            call.header("X-Interop", "flaris");
+            call.header("X-Echo-Auth",    Object.TryGet(call.headers, "authorization", ""));
+            call.header("X-Echo-Version", Object.TryGet(call.headers, "connect-protocol-version", ""));
+            call.header("X-Echo-Timeout", Object.TryGet(call.headers, "connect-timeout-ms", "none"));
+            return out;
+        },
+        Echo: fn(msg, call) { return msg; },
+        Boom: fn(msg, call) {
+            throw new ConnectError(Code.ResourceExhausted,
+                                   "no greetings left for " + msg.name);
+        }
+        // Wrong and Garbage are deliberately absent: an unimplemented rpc must
+        // answer Unimplemented, and the malformed-reply cases are served raw
+        // below because no correct server would produce them.
     });
 
-    srv.Post(g.methods.Echo.path, fn(req, res) {
-        let m = Pb.Decode(req.body, g.methods.Echo.input);
-        res.Bytes(Pb.Encode(m), "application/proto");
-    });
-
-    srv.Post(g.methods.Boom.path, fn(req, res) {
-        let m = Pb.Decode(req.body, g.methods.Boom.input);
-        res.ContentType("application/json");
-        res.Text(Connect.ErrorBody(Code.ResourceExhausted,
-                                   "no greetings left for " + m.name),
-                 Connect.HttpStatusFor(Code.ResourceExhausted));
-    });
-
-    // 200, but not a protobuf reply.
+    // 200 with a body the client asked for in neither codec.
     srv.Post(g.methods.Wrong.path, fn(_req, res) {
         res.Json({ text: "not protobuf" });
     });
 
-    // 200 and the right content type, over bytes that are not a HelloReply.
+    // 200, right content type, bytes that are not a HelloReply.
     srv.Post(g.methods.Garbage.path, fn(_req, res) {
         let bad:block = Buffer.Create(3, 1);
         Buffer.WriteU8At(bad, 0, 0x09);   // field 1, 64-bit - then nothing
@@ -109,8 +109,11 @@ fn serve() {
 
     srv.Get("/healthz", fn(_req, res) { res.Text("ok"); });
 
-    Console.WriteLine("serving on " + BASE);
-    srv.Listen();
+    // ListenAsync returns as soon as the socket is bound, handing back the
+    // port the OS chose; the accept loop runs on its own fiber from here.
+    let port:int = srv.ListenAsync();
+    BASE = "http://127.0.0.1:" + str(port);
+    return srv;
 }
 
 // =============================================================================
@@ -220,7 +223,7 @@ fn test_unreachable() {
 // Live - against the server mode
 // =============================================================================
 
-fn test_unary() {
+fn async test_unary() {
     let g = API["Greeter"];
     let c = new Connect(BASE);
 
@@ -228,16 +231,17 @@ fn test_unary() {
     req.name  = "world";
     req.times = 7;
 
-    let rep = c.Call(g.methods.SayHello, req);
+    let rep = await c.CallAsync(g.methods.SayHello, req);
     check("unary: text",  rep.text, "hello, world");
     check("unary: count", rep.count, 8);
 
-    let full = c.CallFull(g.methods.SayHello, req);
+    let full = await c.CallFullAsync(g.methods.SayHello, req);
     check("unary: status",  full.status, 200);
     check("unary: header",  full.headers["x-interop"], "flaris");
     check("unary: message", full.message.text, "hello, world");
 
-    check("invoke by name", c.Invoke(g, "SayHello", req).text, "hello, world");
+    let byName = await c.InvokeAsync(g, "SayHello", req);
+    check("invoke by name", byName.text, "hello, world");
 
     // Every call announces the protocol version; a deadline is sent only when
     // one was asked for.
@@ -245,15 +249,16 @@ fn test_unary() {
     check("unary: no deadline",      full.headers["x-echo-timeout"], "none");
 
     let timed = new Connect(BASE, { timeoutMs: 2500 });
-    check("unary: deadline sent",
-          timed.CallFull(g.methods.SayHello, req).headers["x-echo-timeout"], "2500");
+    let timedFull = await timed.CallFullAsync(g.methods.SayHello, req);
+    check("unary: deadline sent", timedFull.headers["x-echo-timeout"], "2500");
 
     // An empty request is a valid message, not an absent body.
     let bare = Class.New(g.methods.SayHello.input);
-    check("unary: empty request", c.Call(g.methods.SayHello, bare).text, "hello, ");
+    let bareRep = await c.CallAsync(g.methods.SayHello, bare);
+    check("unary: empty request", bareRep.text, "hello, ");
 }
 
-fn test_headers() {
+fn async test_headers() {
     let g = API["Greeter"];
     let base = new Connect(BASE, { headers: { "X-Base": "1" } });
     let auth = base.With({ "Authorization": "Bearer tok" });
@@ -261,14 +266,45 @@ fn test_headers() {
     let req = Class.New(g.methods.SayHello.input);
     req.name = "h";
 
-    check("headers: With sends it",
-          auth.CallFull(g.methods.SayHello, req).headers["x-echo-auth"], "Bearer tok");
+    let authFull = await auth.CallFullAsync(g.methods.SayHello, req);
+    check("headers: With sends it", authFull.headers["x-echo-auth"], "Bearer tok");
     // The original is untouched: a per-call credential must not leak onward.
-    check("headers: original unchanged",
-          base.CallFull(g.methods.SayHello, req).headers["x-echo-auth"], "");
+    let baseFull = await base.CallFullAsync(g.methods.SayHello, req);
+    check("headers: original unchanged", baseFull.headers["x-echo-auth"], "");
 }
 
-fn test_errors() {
+fn async test_json_codec() {
+    let g = API["Greeter"];
+    let c = new Connect(BASE, { codec: "json" });
+
+    let req = Class.New(g.methods.SayHello.input);
+    req.name = "world"; req.times = 7;
+
+    let full = await c.CallFullAsync(g.methods.SayHello, req);
+    check("json: content type", full.headers["content-type"], "application/json");
+    check("json: text",         full.message.text, "hello, world");
+    check("json: count",        full.message.count, 8);
+
+    // The error body is JSON either way, so this must not change.
+    var code:int = 0;
+    try { await c.CallAsync(g.methods.Boom, req); } catch (e) { code = e.Code; }
+    check("json: error code", code, Code.ResourceExhausted);
+
+    // Every field type over JSON, compared as a message.
+    let k = buildKitchen();
+    let back = await c.CallAsync(g.methods.Echo, k);
+    check("json: echo round-trips", Pb.Equals(k, back), true);
+    check("json: echo bytes",       len(back.raw), 256);
+    check("json: echo utf-8",       back.s, "héllo 世 wörld");
+    check("json: echo uint64",      back.u64, -1);
+
+    // A codec name the protocol does not define is refused up front.
+    var caught:bool = false;
+    try { new Connect(BASE, { codec: "cbor" }); } catch (e) { caught = true; }
+    check("json: unknown codec refused", caught, true);
+}
+
+fn async test_errors() {
     let g = API["Greeter"];
     let c = new Connect(BASE);
     let req = Class.New(g.methods.SayHello.input);
@@ -277,7 +313,7 @@ fn test_errors() {
     var code:int    = 0;
     var status:int  = 0;
     var msg:string  = "";
-    try { c.Call(g.methods.Boom, req); }
+    try { await c.CallAsync(g.methods.Boom, req); }
     catch (e) { code = e.Code; status = e.Status; msg = e.Error; }
     check("error: code",    code, Code.ResourceExhausted);
     check("error: status",  status, 429);
@@ -288,30 +324,28 @@ fn test_errors() {
     let missing = { path: "/greet.v1.Greeter/Absent", fqName: "greet.v1.Greeter.Absent",
                     input: g.methods.SayHello.input, output: g.methods.SayHello.output,
                     clientStream: false, serverStream: false };
-    try { c.Call(missing, req); }
+    try { await c.CallAsync(missing, req); }
     catch (e) { code = e.Code; status = e.Status; }
     check("error: 404 -> unimplemented", code, Code.Unimplemented);
     check("error: 404 status",           status, 404);
 
     // 200 with the wrong content type is not a reply this client will decode.
     code = 0;
-    try { c.Call(g.methods.Wrong, req); }
+    try { await c.CallAsync(g.methods.Wrong, req); }
     catch (e) { code = e.Code; }
     check("error: wrong content type", code, Code.Internal);
 
     // 200, right content type, bytes that are not the message.
     code = 0;
-    try { c.Call(g.methods.Garbage, req); }
+    try { await c.CallAsync(g.methods.Garbage, req); }
     catch (e) { code = e.Code; }
     check("error: undecodable body", code, Code.Internal);
 }
 
 // A Connect body is arbitrary bytes: NULs, high bytes and multi-byte UTF-8 all
 // have to survive the HTTP round trip intact.
-fn test_binary_fidelity() {
-    let g = API["Greeter"];
-    let c = new Connect(BASE);
-
+// One message touching every field type, shared by the binary and JSON checks.
+fn buildKitchen() {
     let k = Class.New(API["Kitchen"]);
     k.d = -3.5; k.f = 1.5; k.i64 = -8500000000; k.u64 = -1; k.i32 = -1;
     k.fx64 = 65536; k.fx32 = 4294967295; k.b = true;
@@ -330,8 +364,15 @@ fn test_binary_fidelity() {
     let n = Class.New(API["HelloRequest"]);
     n.name = "deep"; n.times = 8;
     k.nested = n;
+    return k;
+}
 
-    let back = c.Call(g.methods.Echo, k);
+fn async test_binary_fidelity() {
+    let g = API["Greeter"];
+    let c = new Connect(BASE);
+    let k = buildKitchen();
+
+    let back = await c.CallAsync(g.methods.Echo, k);
     check("binary: round-trips whole", Pb.Equals(k, back), true);
     check("binary: bytes length",      len(back.raw), 256);
     check("binary: NUL survives",      Buffer.ReadU8At(back.raw, 0), 0);
@@ -364,7 +405,7 @@ fn bench(name:string, f:fn, n:int) {
     );
 }
 
-fn test_benchmark() {
+fn async test_benchmark() {
     let g = API["Greeter"];
     let c = new Connect(BASE);
     let m = g.methods.SayHello;
@@ -372,24 +413,36 @@ fn test_benchmark() {
     req.name = "bench";
 
     Console.WriteLine("");
-    Console.WriteLine("== Benchmark == (loopback, one process each side)");
+    Console.WriteLine("== Benchmark == (loopback, client and server in one VM)");
     bench("Url", fn() { c.Url(m); }, 20000);
     bench("CodeName + CodeFromName",
           fn() { Connect.CodeFromName(Connect.CodeName(Code.Aborted)); }, 20000);
     bench("ErrorBody", fn() { Connect.ErrorBody(Code.NotFound, "gone"); }, 20000);
-    bench("unary round trip", fn() { c.Call(m, req); }, 300);
+
+    // The round trip has to await, so it cannot go through bench()'s plain
+    // callback and times its own loop instead.
+    var sink:int = 0;
+    iter (w from 0 to 2) { let warm = await c.CallAsync(m, req); sink += len(warm.text); }
+
+    let t0:int = Time.Ticks();
+    iter (i from 0 to 299) {
+        let r = await c.CallAsync(m, req);
+        sink += len(r.text);
+    }
+    let dt:int = Time.Ticks() - t0;
+    Console.WriteLine(
+        String.PadRight("unary round trip", 42),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 9), "ms ",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / 300.0]), 11), "us/op");
 }
 
 // =============================================================================
 
-fn Main() {
+fn async Main() {
     API = Pb.LoadProto(PROTO, "greet.proto");
 
-    let args:array = Os.Args();
-    if (len(args) > 0 && args[0] == "serve") {
-        serve();
-        return 0;
-    }
+    // The peer runs in this VM, on its own fiber.
+    let srv = startServer();
 
     Console.WriteLine("--- offline ---");
     test_urls();
@@ -398,12 +451,15 @@ fn Main() {
     test_unreachable();
 
     Console.WriteLine("--- unary calls ---");
-    test_unary();
-    test_headers();
-    test_errors();
-    test_binary_fidelity();
+    await test_unary();
+    await test_headers();
+    await test_errors();
+    await test_binary_fidelity();
+    await test_json_codec();
 
-    test_benchmark();
+    await test_benchmark();
+
+    srv.Stop(2000);
 
     Console.WriteLine("");
     Console.WriteLine("Results: ", passed, " passed, ", failed, " failed.");

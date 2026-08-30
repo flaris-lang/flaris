@@ -83,6 +83,11 @@
 //       cacheControl   Cache-Control header            (default none)
 //       gzip           serve a precompressed "<file>.gz" sidecar to clients
 //                      that accept gzip                (default false)
+//       brotli         same for "<file>.br"            (default false)
+//       zstd           same for "<file>.zst"           (default false)
+//                      Tried best-ratio-first: br, zstd, gzip. Serving one
+//                      needs no codec here - the client decodes it - so brotli
+//                      and zstd work even though this VM implements neither.
 //   .Listen()                  - bind and serve; blocks the calling fiber
 //   .ListenAsync()             - bind, then serve on a fiber; returns at once
 //   .Stop(timeoutMs?)          - stop accepting, then wait for the requests
@@ -1853,7 +1858,9 @@ class HttpServer
             followSymlinks: Object.TryGet(o, "followSymlinks", false),
             // Off by default: when no sidecars exist it would only add a stat
             // syscall to every request.
-            gzip:         Object.TryGet(o, "gzip",         false)
+            gzip:         Object.TryGet(o, "gzip",         false),
+            brotli:       Object.TryGet(o, "brotli",       false),
+            zstd:         Object.TryGet(o, "zstd",         false)
         });
         return this;
     }
@@ -2197,14 +2204,30 @@ class HttpServer
                 // original, send that instead. Compressing per request would
                 // cost far more - Deflate runs about 11 MB/s, which in a
                 // cooperative VM stalls every other connection too.
-                if (m.gzip) {
+                if (m.brotli || m.zstd || m.gzip) {
                     let ae = String.ToLower(req.Header("Accept-Encoding", "") ?? "");
-                    if (String.Contains(ae, "gzip")) {
-                        let gzPath = fileFull + ".gz";
-                        let gzSt   = _fileStat(gzPath);
-                        if (gzSt != nil && !gzSt.IsDir && gzSt.Modified >= st.Modified) {
+                    // Best ratio first. Serving a sidecar needs no codec here at
+                    // all - the client decodes it - so brotli and zstd cost
+                    // nothing beyond the lookup, even though this VM implements
+                    // neither.
+                    var enc:array = [];
+                    if (m.brotli) { Array.Append(enc, "br");   }
+                    if (m.zstd)   { Array.Append(enc, "zstd"); }
+                    if (m.gzip)   { Array.Append(enc, "gzip"); }
+                    var ei:int = 0;
+                    while (ei < len(enc)) {
+                        let name:string = enc[ei];
+                        ei += 1;
+                        if (!String.Contains(ae, name)) { continue; }
+                        let ext:string = (name == "br") ? ".br"
+                                       : ((name == "zstd") ? ".zst" : ".gz");
+                        let sPath:string = fileFull + ext;
+                        let sSt = _fileStat(sPath);
+                        // Older than the original means stale: serve the real
+                        // file rather than yesterday's bytes.
+                        if (sSt != nil && !sSt.IsDir && sSt.Modified >= st.Modified) {
                             // Content-Type stays that of the real file.
-                            res._sendFile(gzPath, gzSt, HttpStatus.MimeFor(fileFull), "gzip");
+                            res._sendFile(sPath, sSt, HttpStatus.MimeFor(fileFull), name);
                             return true;
                         }
                     }

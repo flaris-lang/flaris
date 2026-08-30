@@ -88,6 +88,7 @@
 // --------------------------------------------------------
 
 import { HttpUtil } from library("HttpUtil", "1.0");
+import { Inflate }  from library("Deflate", "1.0");
 
 global Status = {
     OK:                 200,
@@ -287,20 +288,60 @@ class Http {
         req = req + "Connection: close\r\n";
         req = req + "User-Agent: Flaris/1.0\r\n";
         req = req + "Accept: */*\r\n";
+        // Ask for gzip unless the caller set its own policy. Without it every
+        // server sends identity and the transfer is several times larger than
+        // it needs to be; _decodeBody puts it back.
+        if (!Http._hasHeader(userHeaders, "accept-encoding")) {
+            req = req + "Accept-Encoding: gzip\r\n";
+        }
         if (userHeaders != nil) {
             foreach (val, key in userHeaders) {
                 req = req + key + ": " + Convert.ToString(val) + "\r\n";
             }
         }
-        if (body != nil && len(body) > 0) {
+        // A caller that named a content type gets it even when the body is
+        // empty: an empty body is not the same as no body, and a protocol like
+        // Connect sends a zero-length message that still has to be typed.
+        let bodyLen:int = (body == nil) ? 0 : len(body);
+        if (bodyLen > 0 || contentType != nil) {
             let ct = contentType;
             if (ct == nil) { ct = ContentType.Binary; }
             req = req + "Content-Type: " + ct + "\r\n";
-            req = req + "Content-Length: " + Convert.ToString(len(body)) + "\r\n";
+            req = req + "Content-Length: " + Convert.ToString(bodyLen) + "\r\n";
         }
         req = req + "\r\n";
         if (body != nil && len(body) > 0) { req = req + body; }
         return req;
+    }
+
+    // Case-insensitive presence test over a caller's header object.
+    fn static _hasHeader(headers, name:string):bool {
+        if (headers == nil) { return false; }
+        foreach (val, key in headers) {
+            if (String.ToLower(key) == name) { return true; }
+        }
+        return false;
+    }
+
+    // Undo Content-Encoding. Only gzip/deflate are decoded - they are what this
+    // client asks for. A body in an encoding we never requested is handed back
+    // untouched rather than silently mangled: the caller can still read the
+    // header and deal with it.
+    fn static _decodeBody(hdrs, body) {
+        if (body == nil || len(body) == 0) { return body; }
+        if (hdrs == nil || !("content-encoding" in hdrs)) { return body; }
+        let enc:string = String.ToLower(String.Trim(hdrs["content-encoding"]));
+        if (enc == "gzip" || enc == "x-gzip") {
+            let out = Inflate.Gzip(body);
+            return (out == nil) ? body : Buffer.ToString(out);
+        }
+        if (enc == "deflate") {
+            // "deflate" on the wire is usually zlib-wrapped, but raw deflate is
+            // common enough that Auto is the safe reader.
+            let out = Inflate.Auto(body);
+            return (out == nil) ? body : Buffer.ToString(out);
+        }
+        return body;
     }
 
     // Resolve a Location header against the current origin. Absolute URLs pass
@@ -460,7 +501,7 @@ class Http {
                     }
                 } else {
                     // --- normal response ---
-                    let responseBody = Http._readBody(s, hdrs, tr);
+                    let responseBody = Http._decodeBody(hdrs, Http._readBody(s, hdrs, tr));
                     tr.close(s);
                     response = {
                         status:     status,
@@ -533,9 +574,9 @@ class Http {
 
     // Async twin of _request. Suspends the calling fiber (instead of blocking the
     // whole scheduler) at each connect/write/read by awaiting the transport's
-    // *Async closures - so several requests overlap. Only https:// hops run async;
-    // a downgrade redirect to http:// finishes on the sync engine (rare, and the
-    // plain transport has no async reads).
+    // *Async closures - so several requests overlap, and a client can share a VM
+    // with a server without either starving the other. Both schemes have async
+    // closures, so no hop falls back to the synchronous engine.
     fn static async _requestAsync(method, url, body, contentType, userHeaders, tlsTransport) {
         let curUrl    = url;
         let curMethod = method;
@@ -610,7 +651,8 @@ class Http {
                         curBody   = nil;
                     }
                 } else {
-                    let responseBody = await Http._readBodyAsync(s, hdrs, tr);
+                    let responseBody = Http._decodeBody(hdrs,
+                                           await Http._readBodyAsync(s, hdrs, tr));
                     tr.close(s);
                     response = {
                         status:     status,

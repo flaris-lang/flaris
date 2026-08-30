@@ -134,10 +134,18 @@
 //   Equals(a:instance, b:instance)       -> bool     wire-canonical comparison
 //   Clone(msg:instance)                  -> instance deep copy via a round-trip
 //
-//   Register(cls:class, descriptor)      -> class    give a class its descriptor
-//                                                    explicitly (see below)
+//   Register(cls, descriptor, fqName?)   -> class    give a class its descriptor
+//                                                    explicitly (see below);
+//                                                    fqName is the protobuf name
+//                                                    ("pkg.Msg"), which only JSON
+//                                                    needs
+//   ClassFor(fqName:string)              -> class    the class registered under
+//                                                    a fully-qualified name
 //   ZeroFor(kind:int)                    -> any      the value a field of this
 //                                                    kind holds when absent
+//
+//   ToJson(msg:instance, opts?)          -> string   canonical proto3 JSON
+//   FromJson(text:string, cls:class)     -> instance parse canonical proto3 JSON
 //
 //   LoadProto(source:string, name?)      -> object   .proto text -> { name: class }
 //   LoadProtoFile(path, includes?)       -> object   same, resolving imports
@@ -146,6 +154,43 @@
 //   DefineSchema(schema)                 -> object   schema -> { name: class },
 //                                                    plus a service descriptor
 //                                                    per `service` (see below)
+//
+// -----------------------------------------------------------------------------
+// JSON
+// -----------------------------------------------------------------------------
+// `ToJson` / `FromJson` implement protobuf's canonical proto3 JSON mapping - the
+// same bytes Go's protojson, protobuf-java and protobuf-es produce, so a message
+// written here reads anywhere:
+//
+//   Console.WriteLine(Pb.ToJson(person));   // {"name":"Ada","userId":"42"}
+//   let p = Pb.FromJson(text, Person);
+//
+// The mapping is the specification, not a house style: field names become
+// lowerCamelCase (or whatever `json_name` says), 64-bit integers become strings
+// because a JSON number cannot hold them, bytes become base64, enums become
+// their value name, NaN and the infinities become quoted strings, and a field
+// holding its default is left out entirely.
+//
+// The well-known types have their own forms - a Timestamp is an RFC 3339 string,
+// a Duration is "1.5s", a wrapper is the bare value, a Struct is a plain JSON
+// object, a FieldMask is a comma-separated list, and an Any is its contents with
+// an "@type" member added.
+//
+// Reading is deliberately more permissive than writing, as the specification
+// requires: either spelling of a field name, an enum by name or by number, and a
+// 64-bit integer as a string or a number are all accepted. A member the message
+// does not declare is an error rather than something skipped silently, and a
+// JSON null leaves a field at its default.
+//
+//   opts: { emitDefaults, useProtoNames, useEnumNumbers }
+//
+// Two limits worth knowing. `Any` is resolved through a process-wide table of
+// fully-qualified names, so loading two schemas that define the same message
+// name leaves the one registered last - `Pb.ClassFor(name)` reports which.
+// And a float is written in the shortest form that reads back identically,
+// found by trial rather than by a shortest-round-trip primitive the VM does not
+// have; outside the range fixed-point renders sensibly it falls back to a full
+// 17-digit form, which is exact but longer than other implementations print.
 //
 // -----------------------------------------------------------------------------
 // Messages defined at runtime
@@ -266,6 +311,7 @@
 // =============================================================================
 
 
+import { Util }  from library("Util", "1.0");
 import { Lexer } from library("Lexer", "1.0");
 
 
@@ -1004,6 +1050,14 @@ global _pb_scalarKinds = nil;
 // resolves with no file on disk. Built once, on first use.
 global _pb_wellKnown = nil;
 
+// class -> fully-qualified protobuf name, for the JSON layer's well-known-type
+// dispatch. Only populated for classes registered with one.
+global _pb_fqNames = nil;
+
+// The reverse: fully-qualified name -> class, so an Any's type URL can be
+// resolved back to the message it names.
+global _pb_byName = nil;
+
 
 // =============================================================================
 // Pb - static facade: descriptor preparation, sizing, encoding, decoding
@@ -1070,7 +1124,10 @@ class Pb
     // Descriptor() method. Same descriptor shape as Descriptor() returns.
     // Re-registering replaces the previous one and drops the prepared cache
     // entry, so a schema can be reloaded without restarting.
-    fn static Register(cls, descriptor) {
+    // `fqName` is the message's fully-qualified protobuf name
+    // ("google.protobuf.Timestamp"). It is optional and only JSON needs it: the
+    // well-known types have their own JSON forms and are recognised by name.
+    fn static Register(cls, descriptor, fqName?) {
         if (is_nil(cls) || !Class.IsClass(cls)) {
             throw(1, "Pb.Register: expected a message class");
         }
@@ -1079,8 +1136,22 @@ class Pb
         }
         if (is_nil(_pb_registry)) { _pb_registry = Collections.HashMap(); }
         _pb_registry.Set(cls, descriptor);
+        if (!is_nil(fqName)) {
+            if (is_nil(_pb_fqNames)) { _pb_fqNames = Collections.HashMap(); }
+            _pb_fqNames.Set(cls, fqName);
+            if (is_nil(_pb_byName)) { _pb_byName = Collections.HashMap(); }
+            _pb_byName.Set(fqName, cls);
+        }
         Pb._Cache().Delete(cls);
         return cls;
+    }
+
+    // The class registered under a fully-qualified protobuf name, or nil.
+    // DefineSchema registers every message it builds, so a loaded .proto makes
+    // its types resolvable here - which is what expanding an Any needs.
+    fn static ClassFor(fqName:string) {
+        if (is_nil(_pb_byName)) { return nil; }
+        return _pb_byName.Get(fqName);
     }
 
     // The value a field of this kind holds when absent - what Class.Define
@@ -1177,6 +1248,12 @@ class Pb
                 // written. Message fields are always explicit.
                 explicit: (spec.optional == true) || !is_nil(oneof) || kind == Pb.MESSAGE,
                 oneof:   oneof,
+                // JSON: the name proto3 canonical JSON uses, and the enum's
+                // value names when the field is one. Both are absent from a
+                // hand-written descriptor that predates them, and both have
+                // legal fallbacks, so neither is required.
+                jsonName:   spec.jsonName ?? Pb._JsonCamel(fname),
+                enumValues: spec.enumValues,
             };
             Array.Append(fields, e);
             byNum.Set(num, e);
@@ -1194,6 +1271,15 @@ class Pb
             if (fe.isMap || fe.packed || fe.kind == Pb.MESSAGE) { twoPass = true; }
         }
 
+        let byJson = Collections.HashMap();
+        var bi:int = 0;
+        while (bi < len(fields)) {
+            let fe = fields[bi];
+            bi += 1;
+            byJson.Set(fe.jsonName, fe);
+            byJson.Set(fe.name, fe);        // the proto name is accepted too
+        }
+
         let prep = {
             cls:        cls,
             name:       Class.GetName(cls),
@@ -1201,10 +1287,34 @@ class Pb
             byNum:      byNum,
             oneofs:     oneofs,
             twoPass:    twoPass,
+            byJson:     byJson,
             hasUnknown: Pb._HasField(cls, "_unknown"),
+            fqName:     is_nil(_pb_fqNames) ? nil : _pb_fqNames.Get(cls),
         };
         cache.Set(cls, prep);
         return prep;
+    }
+
+    // proto's field-name -> JSON-name rule: drop underscores, and uppercase a
+    // lowercase letter that followed one. Matches protobuf's own JSONCamelCase,
+    // including its quirks - "a__b" is "aB", and a letter already uppercase is
+    // left alone.
+    fn static _JsonCamel(name:string):string {
+        var out:string = "";
+        var up:bool = false;
+        var i:int = 0;
+        while (i < len(name)) {
+            let c = name[i];                             // a char, not an int
+            i += 1;
+            if (c == 95) { up = true; continue; }        // '_'
+            if (up && c >= 97 && c <= 122) {             // 'a'..'z'
+                out = out + Char.FromInt(Convert.ToInt(c) - 32);
+            } else {
+                out = out + c;
+            }
+            up = false;
+        }
+        return out;
     }
 
     // The prepared descriptor of a message field's type. Deliberately NOT cached
@@ -2038,7 +2148,7 @@ class Pb
             let t = order[i];
             i += 1;
             if (t.kind == "enum") { continue; }
-            Pb.Register(t.value, Pb._SpecFor(t, types));
+            Pb.Register(t.value, Pb._SpecFor(t, types), t.fqName);
         }
 
         // Pass 3: services, whose methods point at the classes just built.
@@ -2268,10 +2378,15 @@ class Pb
                 e.key  = keyKind;
                 e.val  = vi.kind;
                 if (vi.kind == Pb.MESSAGE) { e.msg = vi.ref.value; }
+                if (vi.kind == Pb.ENUM)    { e.enumValues = vi.ref.value; }
             } else {
                 let info = Pb._KindOfField(t, f, types, f.typeName);
                 e.kind = info.kind;
                 if (info.kind == Pb.MESSAGE) { e.msg = info.ref.value; }
+                // The value names, for JSON: proto3 JSON writes an enum by name.
+                // A hand-written descriptor may omit this and still encode - JSON
+                // then falls back to the number, which is also legal.
+                if (info.kind == Pb.ENUM) { e.enumValues = info.ref.value; }
                 if (f.label == "repeated") {
                     e.repeated = true;
                     if (f.opts.packed == false) { e.packed = false; }
@@ -2292,6 +2407,659 @@ class Pb
 
     // Wire bytes for `msg`. The buffer is sized exactly by the sizing pass, so
     // encoding never reallocates.
+    // The parsed form of a well-known type, or nil when `cls` is not one.
+    fn static _JsonReadWellKnown(jv, cls, prep, o, depth:int) {
+        let n:string = prep.fqName;
+        if (!String.StartsWith(n, "google.protobuf.")) { return nil; }
+        let t:string = String.Substr(n, 16, len(n) - 16);
+
+        if (t == "Timestamp" || t == "Duration") {
+            let msg = Pb._NewMessage(cls);
+            let parts = (t == "Timestamp") ? Pb._ParseTimestamp(Convert.ToString(jv))
+                                           : Pb._ParseDuration(Convert.ToString(jv));
+            Class.SetField(msg, "seconds", parts.seconds);
+            Class.SetField(msg, "nanos",   parts.nanos);
+            return msg;
+        }
+        if (t == "Empty") { return Pb._NewMessage(cls); }
+        if (t == "FieldMask") {
+            let msg = Pb._NewMessage(cls);
+            let raw:string = Convert.ToString(jv);
+            let paths:array = [];
+            if (raw != "") {
+                let segs:array = String.Split(raw, ",");
+                var i:int = 0;
+                while (i < len(segs)) {
+                    // JSON carries camelCase paths; the message stores proto ones.
+                    let dotted:array = String.Split(segs[i], ".");
+                    var outSeg:array = [];
+                    var j:int = 0;
+                    while (j < len(dotted)) {
+                        Array.Append(outSeg, Pb._JsonSnake(dotted[j]));
+                        j += 1;
+                    }
+                    Array.Append(paths, String.Join(outSeg, "."));
+                    i += 1;
+                }
+            }
+            Class.SetField(msg, "paths", paths);
+            return msg;
+        }
+        // Struct, Value and ListValue refer to each other. Resolve those through
+        // this message's own descriptor, never through the global name table:
+        // two loaded schemas each define a google.protobuf.Value, and the table
+        // holds only the one registered last.
+        if (t == "Struct") {
+            let msg = Pb._NewMessage(cls);
+            let fields = {};
+            let vcls = prep.byNum.Get(1).msg;
+            foreach (v, k in jv) { fields[k] = Pb._JsonRead(v, vcls, o, depth + 1); }
+            Class.SetField(msg, "fields", fields);
+            return msg;
+        }
+        if (t == "ListValue") {
+            let msg = Pb._NewMessage(cls);
+            let vcls = prep.byNum.Get(1).msg;
+            let arr:array = [];
+            var i:int = 0;
+            while (i < len(jv)) {
+                Array.Append(arr, Pb._JsonRead(jv[i], vcls, o, depth + 1));
+                i += 1;
+            }
+            Class.SetField(msg, "values", arr);
+            return msg;
+        }
+        if (t == "Value") {
+            let msg = Pb._NewMessage(cls);
+            if (is_nil(jv))                     { Class.SetField(msg, "null_value", 0); }
+            else if (jv == true || jv == false) { Class.SetField(msg, "bool_value", jv); }
+            else if (Type.Is(jv, Type.String))  { Class.SetField(msg, "string_value", jv); }
+            else if (is_array(jv)) {
+                Class.SetField(msg, "list_value",
+                    Pb._JsonRead(jv, prep.byNum.Get(6).msg, o, depth + 1));
+            } else if (is_object(jv)) {
+                Class.SetField(msg, "struct_value",
+                    Pb._JsonRead(jv, prep.byNum.Get(5).msg, o, depth + 1));
+            } else {
+                Class.SetField(msg, "number_value", float(jv));
+            }
+            return msg;
+        }
+        if (t == "Any") {
+            if (!is_object(jv) || is_nil(jv["@type"])) {
+                throw(1, "Pb.FromJson: an Any needs an \"@type\" member");
+            }
+            let url:string = Convert.ToString(jv["@type"]);
+            let slash:int  = String.LastIndexOf(url, "/");
+            let tname:string = (slash < 0) ? url
+                             : String.Substr(url, slash + 1, len(url) - slash - 1);
+            let icls = Pb.ClassFor(tname);
+            if (is_nil(icls)) {
+                throw(1, "Pb.FromJson: Any names '" + tname + "', which no loaded "
+                       + "schema defines");
+            }
+            let iprep = Pb.Prepare(icls);
+            var inner = nil;
+            if (!is_nil(jv["value"]) && !is_nil(iprep.fqName)
+                && String.StartsWith(iprep.fqName, "google.protobuf.")) {
+                inner = Pb._JsonRead(jv["value"], icls, o, depth + 1);
+            } else {
+                let body = {};
+                foreach (v, k in jv) { if (k != "@type") { body[k] = v; } }
+                inner = Pb._JsonRead(body, icls, o, depth + 1);
+            }
+            let msg = Pb._NewMessage(cls);
+            Class.SetField(msg, "type_url", url);
+            Class.SetField(msg, "value", Pb.Encode(inner));
+            return msg;
+        }
+        if (t == "DoubleValue" || t == "FloatValue" || t == "Int64Value"
+            || t == "UInt64Value" || t == "Int32Value" || t == "UInt32Value"
+            || t == "BoolValue" || t == "StringValue" || t == "BytesValue") {
+            let msg = Pb._NewMessage(cls);
+            let e = prep.byNum.Get(1);
+            Class.SetField(msg, "value", Pb._JsonValue(jv, e.kind, e, o, depth));
+            return msg;
+        }
+        return nil;
+    }
+
+    // "2025-01-01T00:00:00.250Z" -> { seconds, nanos }. An explicit +hh:mm or
+    // -hh:mm offset is accepted and folded into the seconds, as the spec asks.
+    fn static _ParseTimestamp(sIn:string) {
+        var s:string = sIn;
+        var offset:int = 0;
+        if (String.EndsWith(s, "Z") || String.EndsWith(s, "z")) {
+            s = String.Substr(s, 0, len(s) - 1);
+        } else {
+            let plus:int = String.LastIndexOf(s, "+");
+            var minus:int = String.LastIndexOf(s, "-");
+            if (minus < 10) { minus = -1; }          // the date's own hyphens
+            let at:int = (plus > minus) ? plus : minus;
+            if (at > 0) {
+                let tz:string = String.Substr(s, at + 1, len(s) - at - 1);
+                let hh:int = Convert.ParseInt(String.Substr(tz, 0, 2)) ?? 0;
+                let mm:int = Convert.ParseInt(String.Substr(tz, 3, 2)) ?? 0;
+                offset = hh * 3600 + mm * 60;
+                if (String.Substr(s, at, 1) == "+") { offset = -offset; }
+                s = String.Substr(s, 0, at);
+            }
+        }
+        var nanos:int = 0;
+        let dot:int = String.IndexOf(s, ".");
+        if (dot >= 0) {
+            nanos = Pb._FracNanos(String.Substr(s, dot + 1, len(s) - dot - 1));
+            s = String.Substr(s, 0, dot);
+        }
+        let secs = Time.Parse(s, "ISO");
+        if (is_nil(secs)) {
+            throw(1, "Pb.FromJson: '" + sIn + "' is not an RFC 3339 timestamp");
+        }
+        return { seconds: secs + offset, nanos: nanos };
+    }
+
+    // "-3.000000500s" -> { seconds, nanos }, both carrying the sign.
+    fn static _ParseDuration(sIn:string) {
+        if (!String.EndsWith(sIn, "s")) {
+            throw(1, "Pb.FromJson: a Duration must end in 's', got '" + sIn + "'");
+        }
+        var s:string = String.Substr(sIn, 0, len(sIn) - 1);
+        var neg:bool = false;
+        if (String.StartsWith(s, "-")) { neg = true; s = String.Substr(s, 1, len(s) - 1); }
+        var nanos:int = 0;
+        let dot:int = String.IndexOf(s, ".");
+        if (dot >= 0) {
+            nanos = Pb._FracNanos(String.Substr(s, dot + 1, len(s) - dot - 1));
+            s = String.Substr(s, 0, dot);
+        }
+        let secs = Convert.ParseInt(s == "" ? "0" : s);
+        if (is_nil(secs)) {
+            throw(1, "Pb.FromJson: '" + sIn + "' is not a Duration");
+        }
+        if (neg) { return { seconds: -secs, nanos: -nanos }; }
+        return { seconds: secs, nanos: nanos };
+    }
+
+    // A fractional-second string, right-padded to nanosecond precision.
+    fn static _FracNanos(frac:string):int {
+        var d:string = frac;
+        while (len(d) < 9) { d = d + "0"; }
+        if (len(d) > 9) { d = String.Substr(d, 0, 9); }
+        return Convert.ParseInt(d) ?? 0;
+    }
+
+    // The inverse of _JsonCamel, for a FieldMask path coming back from JSON.
+    fn static _JsonSnake(name:string):string {
+        var out:string = "";
+        var i:int = 0;
+        while (i < len(name)) {
+            let c = name[i];
+            i += 1;
+            if (c >= 65 && c <= 90) { out = out + "_" + Char.FromInt(Convert.ToInt(c) + 32); }
+            else                    { out = out + c; }
+        }
+        return out;
+    }
+
+    // Canonical proto3 JSON -> a message of `cls`. Accepts either spelling of a
+    // field name, an enum as its name or its number, and a 64-bit integer as a
+    // string or a number - all of which the specification requires a parser to
+    // take, even though a writer only ever emits one of each.
+    fn static FromJson(text:string, cls, opts?) {
+        let v = Json.Parse(text);
+        if (is_nil(v)) { throw(1, "Pb.FromJson: not valid JSON"); }
+        return Pb._JsonRead(v, cls, Pb._JsonOpts(opts), 0);
+    }
+
+    fn static _JsonRead(jv, cls, o, depth:int) {
+        if (depth > Pb.MAX_DEPTH) {
+            throw(2, "Pb.FromJson: nesting deeper than " + str(Pb.MAX_DEPTH) + " levels");
+        }
+        let prep = Pb.Prepare(cls);
+        if (!is_nil(prep.fqName)) {
+            let wk = Pb._JsonReadWellKnown(jv, cls, prep, o, depth);
+            if (!is_nil(wk)) { return wk; }
+        }
+        if (!is_object(jv)) {
+            throw(1, "Pb.FromJson: expected a JSON object for "
+                   + (prep.fqName ?? prep.name));
+        }
+
+        let msg = Pb._NewMessage(cls);
+        foreach (val, key in jv) {
+            let e = prep.byJson.Get(key);
+            if (is_nil(e)) {
+                throw(1, "Pb.FromJson: " + (prep.fqName ?? prep.name)
+                       + " has no field '" + key + "'");
+            }
+            if (is_nil(val)) { continue; }      // JSON null leaves it unset
+
+            if (e.isMap) {
+                let m = {};
+                foreach (mv, mk in val) {
+                    m[mk] = Pb._JsonValue(mv, e.valKind, e, o, depth);
+                }
+                Class.SetField(msg, e.name, m);
+            } else if (e.rep) {
+                let arr:array = [];
+                var i:int = 0;
+                while (i < len(val)) {
+                    Array.Append(arr, Pb._JsonValue(val[i], e.kind, e, o, depth));
+                    i += 1;
+                }
+                Class.SetField(msg, e.name, arr);
+            } else {
+                Class.SetField(msg, e.name, Pb._JsonValue(val, e.kind, e, o, depth));
+                if (!is_nil(e.oneof)) { Pb._ClearSiblings(msg, prep, e); }
+            }
+        }
+        return msg;
+    }
+
+    fn static _JsonValue(jv, kind:int, e, o, depth:int) {
+        if (kind == Pb.MESSAGE) {
+            if (is_nil(jv)) { return nil; }
+            return Pb._JsonRead(jv, e.msg, o, depth + 1);
+        }
+        if (kind == Pb.BOOL)   { return (jv == true); }
+        if (kind == Pb.STRING) { return Convert.ToString(jv); }
+        if (kind == Pb.BYTES) {
+            let b = Util.Base64DecodeBlock(Convert.ToString(jv));
+            if (is_nil(b)) { throw(1, "Pb.FromJson: field '" + e.name
+                                   + "' is not valid base64"); }
+            return b;
+        }
+        if (kind == Pb.ENUM) {
+            if (Type.Is(jv, Type.String)) {
+                if (!is_nil(e.enumValues) && !is_nil(e.enumValues[jv])) {
+                    return int(e.enumValues[jv]);
+                }
+                throw(1, "Pb.FromJson: '" + jv + "' is not a value of the enum on '"
+                       + e.name + "'");
+            }
+            return int(jv);
+        }
+        if (kind == Pb.DOUBLE || kind == Pb.FLOAT) {
+            if (Type.Is(jv, Type.String)) {
+                if (jv == "NaN")       { return Math.NaN; }
+                if (jv == "Infinity")  { return Math.Infinity; }
+                if (jv == "-Infinity") { return -Math.Infinity; }
+                let f = Convert.ParseFloat(jv);
+                if (is_nil(f)) { throw(1, "Pb.FromJson: '" + jv + "' is not a number"); }
+                return f;
+            }
+            return float(jv);
+        }
+        if (kind == Pb.UINT64 || kind == Pb.FIXED64) {
+            return Pb._ParseUnsigned(Convert.ToString(jv));
+        }
+        // Every remaining kind is an integer; a JSON string form is legal too.
+        if (Type.Is(jv, Type.String)) {
+            let n = Convert.ParseInt(jv);
+            if (is_nil(n)) { throw(1, "Pb.FromJson: '" + jv + "' is not an integer"); }
+            return n;
+        }
+        return int(jv);
+    }
+
+    // A decimal string that may exceed int64, as the two's-complement value the
+    // unsigned kinds are stored in.
+    fn static _ParseUnsigned(s:string):int {
+        let direct = Convert.ParseInt(s);
+        if (!is_nil(direct) && direct >= 0) { return direct; }
+        if (String.StartsWith(s, "-")) {
+            if (is_nil(direct)) { throw(1, "Pb.FromJson: '" + s + "' is out of range"); }
+            return direct;
+        }
+        let diff:string = Pb._DecSub("18446744073709551616", s);
+        // 2^63 is the one value that cannot be reached by negating a positive.
+        if (diff == "9223372036854775808") { return -9223372036854775807 - 1; }
+        let d = Convert.ParseInt(diff);
+        if (is_nil(d)) { throw(1, "Pb.FromJson: '" + s + "' is out of range for a 64-bit field"); }
+        return -d;
+    }
+
+    // =========================================================================
+    // JSON - proto3's canonical mapping
+    // =========================================================================
+    // Field names become lowerCamelCase, 64-bit integers become strings (a JSON
+    // number cannot hold them), bytes become base64, enums become their value
+    // name, and a field holding its default is omitted. All of that is the
+    // specification, not a choice; the options below cover the parts the
+    // specification leaves to the caller.
+
+    fn static _JsonOpts(opts) {
+        return {
+            emitDefaults:   (opts != nil) && (opts.emitDefaults == true),
+            useProtoNames:  (opts != nil) && (opts.useProtoNames == true),
+            useEnumNumbers: (opts != nil) && (opts.useEnumNumbers == true),
+        };
+    }
+
+    // A message as canonical proto3 JSON.
+    fn static ToJson(msg, opts?):string {
+        if (is_nil(msg) || !Class.IsInstance(msg)) {
+            throw(1, "Pb.ToJson: expected a message instance");
+        }
+        let parts:array = [];
+        Pb._JsonMsg(parts, msg, Pb.Prepare(Class.Of(msg)), Pb._JsonOpts(opts), 0);
+        return String.Join(parts, "");
+    }
+
+    fn static _JsonMsg(out:array, msg, prep, o, depth:int) {
+        if (depth > Pb.MAX_DEPTH) {
+            throw(2, "Pb.ToJson: nesting deeper than " + str(Pb.MAX_DEPTH) + " levels");
+        }
+        // The well-known types are not objects in JSON - a Timestamp is a
+        // string, a wrapper is the bare value, a Struct is a plain object.
+        if (!is_nil(prep.fqName) && Pb._JsonWellKnown(out, msg, prep, o, depth)) {
+            return;
+        }
+        Array.Append(out, "{");
+        var first:bool = true;
+        let fs = prep.fields;
+        var i:int = 0;
+        while (i < len(fs)) {
+            let e = fs[i];
+            i += 1;
+            let v = Class.GetField(msg, e.name);
+
+            // Absent is absent: a oneof member that is not the set one, an
+            // optional field never assigned, an empty list or map.
+            if (is_nil(v)) { continue; }
+            if (e.isMap && len(Object.Keys(v)) == 0 && !o.emitDefaults) { continue; }
+            if (e.rep && !e.isMap && len(v) == 0 && !o.emitDefaults) { continue; }
+            if (!e.rep && !e.isMap && !e.explicit && !o.emitDefaults
+                && Pb._IsDefault(e.kind, v)) { continue; }
+
+            if (!first) { Array.Append(out, ","); }
+            first = false;
+            Array.Append(out, Json.Stringify(o.useProtoNames ? e.name : e.jsonName));
+            Array.Append(out, ":");
+
+            if (e.isMap) {
+                Pb._JsonMap(out, v, e, o, depth);
+            } else if (e.rep) {
+                Array.Append(out, "[");
+                var j:int = 0;
+                while (j < len(v)) {
+                    if (j > 0) { Array.Append(out, ","); }
+                    Pb._JsonOne(out, v[j], e.kind, e, o, depth);
+                    j += 1;
+                }
+                Array.Append(out, "]");
+            } else {
+                Pb._JsonOne(out, v, e.kind, e, o, depth);
+            }
+        }
+        Array.Append(out, "}");
+    }
+
+    // Writes the special JSON form for a well-known type and returns true, or
+    // returns false for anything else so the caller falls back to an object.
+    fn static _JsonWellKnown(out:array, msg, prep, o, depth:int):bool {
+        let n:string = prep.fqName;
+        if (!String.StartsWith(n, "google.protobuf.")) { return false; }
+        let t:string = String.Substr(n, 16, len(n) - 16);
+
+        if (t == "Timestamp") {
+            Array.Append(out, Json.Stringify(Pb._JsonTimestamp(
+                int(Class.GetField(msg, "seconds") ?? 0),
+                int(Class.GetField(msg, "nanos") ?? 0))));
+            return true;
+        }
+        if (t == "Duration") {
+            Array.Append(out, Json.Stringify(Pb._JsonDuration(
+                int(Class.GetField(msg, "seconds") ?? 0),
+                int(Class.GetField(msg, "nanos") ?? 0))));
+            return true;
+        }
+        if (t == "Empty") { Array.Append(out, "{}"); return true; }
+
+        if (t == "FieldMask") {
+            let paths = Class.GetField(msg, "paths") ?? [];
+            let camel:array = [];
+            var i:int = 0;
+            while (i < len(paths)) {
+                // Each dotted segment camel-cases independently.
+                let segs:array = String.Split(paths[i], ".");
+                var outSeg:array = [];
+                var j:int = 0;
+                while (j < len(segs)) { Array.Append(outSeg, Pb._JsonCamel(segs[j])); j += 1; }
+                Array.Append(camel, String.Join(outSeg, "."));
+                i += 1;
+            }
+            Array.Append(out, Json.Stringify(String.Join(camel, ",")));
+            return true;
+        }
+
+        // Struct / Value / ListValue map onto plain JSON.
+        if (t == "Struct") {
+            let fields = Class.GetField(msg, "fields") ?? {};
+            Array.Append(out, "{");
+            var first:bool = true;
+            foreach (v, k in fields) {
+                if (!first) { Array.Append(out, ","); }
+                first = false;
+                Array.Append(out, Json.Stringify(k));
+                Array.Append(out, ":");
+                Pb._JsonMsg(out, v, Pb.Prepare(Class.Of(v)), o, depth + 1);
+            }
+            Array.Append(out, "}");
+            return true;
+        }
+        if (t == "ListValue") {
+            let vals = Class.GetField(msg, "values") ?? [];
+            Array.Append(out, "[");
+            var i2:int = 0;
+            while (i2 < len(vals)) {
+                if (i2 > 0) { Array.Append(out, ","); }
+                Pb._JsonMsg(out, vals[i2], Pb.Prepare(Class.Of(vals[i2])), o, depth + 1);
+                i2 += 1;
+            }
+            Array.Append(out, "]");
+            return true;
+        }
+        if (t == "Value") {
+            let set:string = Pb.WhichOneof(msg, "kind");
+            if (is_nil(set) || set == "null_value") { Array.Append(out, "null"); return true; }
+            let v = Class.GetField(msg, set);
+            if (set == "number_value") { Array.Append(out, Pb._JsonFloat(float(v))); return true; }
+            if (set == "string_value") { Array.Append(out, Json.Stringify(v)); return true; }
+            if (set == "bool_value")   { Array.Append(out, (v == true) ? "true" : "false"); return true; }
+            Pb._JsonMsg(out, v, Pb.Prepare(Class.Of(v)), o, depth + 1);
+            return true;
+        }
+
+        if (t == "Any") {
+            let url:string = Class.GetField(msg, "type_url") ?? "";
+            let slash:int  = String.LastIndexOf(url, "/");
+            let tname:string = (slash < 0) ? url
+                             : String.Substr(url, slash + 1, len(url) - slash - 1);
+            let cls = Pb.ClassFor(tname);
+            if (is_nil(cls)) {
+                throw(1, "Pb.ToJson: Any names '" + tname + "', which no loaded "
+                       + "schema defines - load it, or register it with Pb.Register");
+            }
+            let innerPrep = Pb.Prepare(cls);
+            let inner = Pb.Decode(Class.GetField(msg, "value") ?? "", cls);
+            let sub:array = [];
+            let special:bool = !is_nil(innerPrep.fqName)
+                             && Pb._JsonWellKnown(sub, inner, innerPrep, o, depth + 1);
+            if (!special) { Pb._JsonMsg(sub, inner, innerPrep, o, depth + 1); }
+            let body:string = String.Join(sub, "");
+            Array.Append(out, "{");
+            Array.Append(out, Json.Stringify("@type"));
+            Array.Append(out, ":");
+            Array.Append(out, Json.Stringify(url));
+            if (special) {
+                // A type with its own JSON form cannot be spliced into the
+                // object, so it goes under "value" - the specification's rule.
+                Array.Append(out, ",\"value\":");
+                Array.Append(out, body);
+            } else if (body != "{}") {
+                Array.Append(out, ",");
+                Array.Append(out, String.Substr(body, 1, len(body) - 2));
+            }
+            Array.Append(out, "}");
+            return true;
+        }
+
+        // The wrappers are just their `value` field.
+        if (t == "DoubleValue" || t == "FloatValue" || t == "Int64Value"
+            || t == "UInt64Value" || t == "Int32Value" || t == "UInt32Value"
+            || t == "BoolValue" || t == "StringValue" || t == "BytesValue") {
+            let e = prep.byNum.Get(1);
+            Pb._JsonOne(out, Class.GetField(msg, "value"), e.kind, e, o, depth);
+            return true;
+        }
+        return false;
+    }
+
+    // RFC 3339 in UTC with 0, 3, 6 or 9 fractional digits - the precision the
+    // value actually needs, which is what the specification asks for.
+    fn static _JsonTimestamp(secs:int, nanos:int):string {
+        let base:string = Time.Format(secs, "%Y-%m-%dT%H:%M:%S");
+        return base + Pb._JsonFrac(nanos) + "Z";
+    }
+
+    fn static _JsonDuration(secs:int, nanos:int):string {
+        var sign:string = "";
+        var sv:int = secs;
+        var nv:int = nanos;
+        if (sv < 0 || nv < 0) { sign = "-"; sv = -sv; nv = -nv; }
+        return sign + Convert.ToString(sv) + Pb._JsonFrac(nv) + "s";
+    }
+
+    // "" / ".mmm" / ".uuuuuu" / ".nnnnnnnnn" - trailing zero groups dropped.
+    fn static _JsonFrac(nanos:int):string {
+        if (nanos == 0) { return ""; }
+        var d:string = Convert.ToString(nanos);
+        while (len(d) < 9) { d = "0" + d; }
+        if (String.EndsWith(d, "000000")) { return "." + String.Substr(d, 0, 3); }
+        if (String.EndsWith(d, "000"))    { return "." + String.Substr(d, 0, 6); }
+        return "." + d;
+    }
+
+    fn static _JsonMap(out:array, v, e, o, depth:int) {
+        Array.Append(out, "{");
+        var first:bool = true;
+        // Map keys are always JSON strings, whatever the key type is on the wire.
+        foreach (val, k in v) {
+            if (!first) { Array.Append(out, ","); }
+            first = false;
+            Array.Append(out, Json.Stringify(k));
+            Array.Append(out, ":");
+            Pb._JsonOne(out, val, e.valKind, e, o, depth);
+        }
+        Array.Append(out, "}");
+    }
+
+    fn static _JsonOne(out:array, v, kind:int, e, o, depth:int) {
+        if (kind == Pb.MESSAGE) {
+            if (is_nil(v)) { Array.Append(out, "null"); return; }
+            Pb._JsonMsg(out, v, Pb._PrepOf(e), o, depth + 1);
+            return;
+        }
+        if (kind == Pb.BOOL)   { Array.Append(out, (v == true) ? "true" : "false"); return; }
+        if (kind == Pb.STRING) { Array.Append(out, Json.Stringify(v ?? "")); return; }
+        if (kind == Pb.BYTES)  { Array.Append(out, Json.Stringify(Util.Base64Encode(v))); return; }
+
+        if (kind == Pb.ENUM) {
+            let n:int = int(v ?? 0);
+            if (!o.useEnumNumbers && !is_nil(e.enumValues)) {
+                // The name, when the descriptor knows it. A number with no name
+                // stays a number - that is what the specification says to do
+                // with a value the schema does not list.
+                foreach (num, name in e.enumValues) {
+                    if (num == n) { Array.Append(out, Json.Stringify(name)); return; }
+                }
+            }
+            Array.Append(out, Convert.ToString(n));
+            return;
+        }
+
+        // 64-bit integers do not survive a JSON number, so they go as strings.
+        if (kind == Pb.UINT64 || kind == Pb.FIXED64) {
+            Array.Append(out, Json.Stringify(Pb._UnsignedDec(int(v ?? 0))));
+            return;
+        }
+        if (kind == Pb.INT64 || kind == Pb.SINT64 || kind == Pb.SFIXED64) {
+            Array.Append(out, Json.Stringify(Convert.ToString(int(v ?? 0))));
+            return;
+        }
+        if (kind == Pb.DOUBLE || kind == Pb.FLOAT) {
+            Array.Append(out, Pb._JsonFloat(float(v ?? 0.0)));
+            return;
+        }
+        Array.Append(out, Convert.ToString(int(v ?? 0)));
+    }
+
+    // A uint64 held in a signed 64-bit slot, as its unsigned decimal string.
+    // The top half of the range is negative here, and 2^64 does not fit in an
+    // int, so the conversion is done on the digits: 2^64 minus the magnitude.
+    fn static _UnsignedDec(v:int):string {
+        if (v >= 0) { return Convert.ToString(v); }
+        let mag:string = String.Substr(Convert.ToString(v), 1,
+                                       len(Convert.ToString(v)) - 1);
+        return Pb._DecSub("18446744073709551616", mag);
+    }
+
+    // a - b for non-negative decimal strings, where a >= b.
+    fn static _DecSub(a:string, b:string):string {
+        var out:string = "";
+        var borrow:int = 0;
+        var i:int = len(a) - 1;
+        var j:int = len(b) - 1;
+        while (i >= 0) {
+            let da:int = Convert.ToInt(a[i]) - 48;
+            let db:int = (j >= 0) ? (Convert.ToInt(b[j]) - 48) : 0;
+            var d:int = da - db - borrow;
+            if (d < 0) { d += 10; borrow = 1; } else { borrow = 0; }
+            out = Char.FromInt(48 + d) + out;
+            i -= 1;
+            j -= 1;
+        }
+        var k:int = 0;
+        while (k < len(out) - 1 && out[k] == 48) { k += 1; }
+        return String.Substr(out, k, len(out) - k);
+    }
+
+    // The shortest decimal form that reads back as the same double, which is
+    // what canonical JSON emits. Flaris can format fixed-point or full %.17g but
+    // has no shortest-round-trip primitive, so try increasing precision and stop
+    // at the first that survives a round trip. Outside the range fixed-point
+    // renders sensibly, fall back to %.17g - still exact, just longer.
+    fn static _JsonFloat(v:float):string {
+        // The three non-finite values are quoted strings in proto3 JSON - a
+        // bare NaN or Infinity is not valid JSON.
+        if (Math.IsNaN(v))    { return "\"NaN\""; }
+        if (!Math.IsFinite(v)) { return (v < 0.0) ? "\"-Infinity\"" : "\"Infinity\""; }
+
+        let mag:float = (v < 0.0) ? -v : v;
+        if (mag >= 1.0e-4 && mag < 1.0e16) {
+            var p:int = 1;
+            while (p <= 17) {
+                let cand:string = String.FormatArray("{0:." + str(p) + "f}", [v]);
+                // flaris-ignore[float-eq]
+                if (!is_nil(cand) && Convert.ParseFloat(cand) == v) {
+                    return Pb._TrimFloat(cand);
+                }
+                p += 1;
+            }
+        }
+        return Convert.ToString(v);
+    }
+
+    // Drop a trailing ".0" and any trailing zeros a fixed-point render added.
+    fn static _TrimFloat(s:string):string {
+        if (!String.Contains(s, ".")) { return s; }
+        var out:string = s;
+        while (String.EndsWith(out, "0")) { out = String.Substr(out, 0, len(out) - 1); }
+        if (String.EndsWith(out, ".")) { out = String.Substr(out, 0, len(out) - 1); }
+        return out;
+    }
+
     fn static Encode(msg):block {
         if (is_nil(msg) || !Class.IsInstance(msg)) {
             throw(1, "Pb.Encode: expected a message instance");
