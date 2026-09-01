@@ -61,7 +61,11 @@ import { Signals } from library("Signals", "1.0");
 class Audio : Signals {
 
     // ============================================================
-    //  JIT kernels
+    //  Inner loops
+    //
+    //  The element-wise work behind the public methods below. Each takes
+    //  typed [float] arrays plus plain scalars and calls nothing, so it
+    //  reads as a plain numeric loop over samples.
     // ============================================================
 
     fn _aud_gain_kernel(sig: [float], out: [float], n: int, linear: float): int {
@@ -481,19 +485,14 @@ class Audio : Signals {
     // Normalize: scale all samples so the peak absolute value = 1.0.
     // Returns the array unchanged if the peak is 0 (silence).
     fn Normalize(signal:array) : array {
-        let n   = len(signal);
-        let out = Array.Subset(signal, 0, n);
-        var peak: float = 0.0;
-        iter(i from 0 to n-1) {
-            var v: float = out[i];
-            if (v < 0.0) v = 0.0 - v;
-            if (v > peak) peak = v;
-        }
-        if (peak == 0) return out;
-        let scale: float = 1.0 / peak;
-        iter(i from 0 to n-1) {
-            out[i] = out[i] * scale;
-        }
+        let n = len(signal);
+        if (n == 0) return [];
+        // Two passes over the samples: find the peak, then scale by 1/peak.
+        // Both are inherited from Signals, so every Signals subclass shares them.
+        let peak: float  = this._sig_peak_kernel(signal, n);
+        let out: [float] = Array.Create(n, Type.Float);
+        if (peak <= 0.0) return out;    // silence: an all-zero signal of the same length
+        this._sig_normalize_kernel(signal, out, n, peak);
         return out;
     }
 
@@ -513,11 +512,9 @@ class Audio : Signals {
     // Length of the result = min(len(a), len(b)).
     fn Mix(a:array, b:array, weight:float) : array {
         let n   = int(Math.Min(len(a), len(b)));
-        let out = Array.Create(n);
+        let out: [float] = Array.Create(n, Type.Float);
         let wa: float = 1.0 - weight;
-        iter(i from 0 to n-1) {
-            out[i] = a[i] * wa + b[i] * weight;
-        }
+        this._sig_mix_kernel(a, b, out, n, wa, weight);
         return out;
     }
 }

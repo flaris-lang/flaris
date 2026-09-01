@@ -91,11 +91,16 @@ class BigInt {
     // ----------------------------------------------------------------
 
     // Flaris `/` always returns float; use this for integer division.
-    fn static _idiv(a, b): int { return Convert.ToInt(a / b); }
+    fn static _idiv(a:int, b:int): int { return Convert.ToInt(a / b); }
 
     fn static _make(sign, limbs) { return { sign: sign, limbs: limbs }; }
-    fn static _zero()            { return { sign: 1,    limbs: [0] }; }
-    fn static _one()             { return { sign: 1,    limbs: [1] }; }
+    // Class invariant: a limb array is always built with Array.Create(n, Type.Int)
+    // so that it is an [int] - the parameter type the _addL/_subL/_mulL/_cmpL
+    // family declares. A [] literal, Array.Append or Array.Subset would give an
+    // untyped array that still works but costs on every later call; see
+    // "Typed arrays: how an array becomes one" in doc/reference.md.
+    fn static _zero() { var ls = Array.Create(1, Type.Int); return { sign: 1, limbs: ls }; }
+    fn static _one()  { var ls = Array.Create(1, Type.Int); ls[0] = 1; return { sign: 1, limbs: ls }; }
     fn static _isZeroL(ls: [int]): bool { return len(ls) == 1 && ls[0] == 0; }
 
     fn static _trim(ls: [int]): [int] {
@@ -104,7 +109,12 @@ class BigInt {
         return ls;
     }
 
-    fn static _copyL(ls: [int]): [int] { return Array.Subset(ls, 0, len(ls)); }
+    fn static _copyL(ls: [int]): [int] {
+        var n = len(ls);
+        var r = Array.Create(n, Type.Int);
+        iter (i from 0 to n - 1) { r[i] = ls[i]; }
+        return r;
+    }
 
     fn static _cmpL(a: [int], b: [int]): int {
         var na = len(a); var nb = len(b);
@@ -120,25 +130,25 @@ class BigInt {
     fn static _addL(a: [int], b: [int]): [int] {
         var na = len(a); var nb = len(b);
         var n = na > nb ? na : nb;
-        var r = []; var carry = 0;
+        var r = Array.Create(n + 1, Type.Int); var carry = 0;
         iter (i from 0 to n - 1) {
             var s = (i < na ? a[i] : 0) + (i < nb ? b[i] : 0) + carry;
-            Array.Append(r, s % BigInt._BASE);
-            carry = BigInt._idiv(s, BigInt._BASE);
+            r[i] = s % _BASE;
+            carry = BigInt._idiv(s, _BASE);
         }
-        if (carry > 0) Array.Append(r, carry);
-        return r;
+        r[n] = carry;
+        return r;                       // untrimmed - the caller trims
     }
 
     fn static _subL(a: [int], b: [int]): [int] {    // precondition: a >= b (absolute)
         var na = len(a); var nb = len(b);
-        var r = []; var borrow = 0;
+        var r = Array.Create(na, Type.Int); var borrow = 0;
         iter (i from 0 to na - 1) {
             var d = a[i] - (i < nb ? b[i] : 0) - borrow;
-            if (d < 0) { d = d + BigInt._BASE; borrow = 1; } else { borrow = 0; }
-            Array.Append(r, d);
+            if (d < 0) { d = d + _BASE; borrow = 1; } else { borrow = 0; }
+            r[i] = d;
         }
-        return BigInt._trim(r);
+        return r;                       // untrimmed - the caller trims
     }
 
     // Divide `ls` by a small int in place, most-significant limb first, carrying
@@ -156,7 +166,7 @@ class BigInt {
         var rem = 0;
         var i = top;
         while (i >= 0) {
-            let cur = rem * BigInt._BASE + ls[i];
+            let cur = rem * _BASE + ls[i];
             ls[i] = BigInt._idiv(cur, d);
             rem   = cur % d;
             i -= 1;
@@ -166,35 +176,39 @@ class BigInt {
         return { top: t, r: rem };
     }
 
-    // limbs * m + add, in one pass. The inverse direction of _divSmallL, and
-    // the reason FromHex/FromBytes no longer pay a full _mulL per input digit.
-    fn static _mulSmallAddL(ls, m: int, add: int) {
+    // limbs * m + add, in one pass - the inverse direction of _divSmallL.
+    // FromHex/FromBytes fold in one input digit at a time with this, instead of
+    // a full _mulL per digit.
+    fn static _mulSmallAddL(ls: [int], m: int, add: int): [int] {
         let n = len(ls);
-        let r = Array.Create(n + 1);
+        let r = Array.Create(n + 1, Type.Int);
         var carry = add;
         iter (i from 0 to n - 1) {
             let cur = ls[i] * m + carry;
-            r[i]  = cur % BigInt._BASE;
-            carry = BigInt._idiv(cur, BigInt._BASE);
+            r[i]  = cur % _BASE;
+            carry = BigInt._idiv(cur, _BASE);
         }
         r[n] = carry;
-        return (carry == 0 && n > 0) ? Array.Subset(r, 0, n) : r;
+        if (carry == 0 && n > 0) { Array.RemoveAt(r, n); }   // no carry out: drop the spare top limb
+        return r;
     }
 
     fn static _mulL(a: [int], b: [int]): [int] {
         var na = len(a); var nb = len(b);
-        var r = Array.Create(na + nb);
-        Array.Fill(r, 0);
+        // Schoolbook multiplication in two passes: accumulate every partial
+        // product into r first, then propagate the carries once across the whole
+        // result. Type.Int gives a zero-filled [int] to accumulate into.
+        var r = Array.Create(na + nb, Type.Int);
         iter (i from 0 to na - 1) {
             iter (j from 0 to nb - 1) {
                 r[i + j] = r[i + j] + a[i] * b[j];
             }
         }
         iter (i from 0 to na + nb - 2) {
-            r[i + 1] = r[i + 1] + BigInt._idiv(r[i], BigInt._BASE);
-            r[i] = r[i] % BigInt._BASE;
+            r[i + 1] = r[i + 1] + BigInt._idiv(r[i], _BASE);
+            r[i] = r[i] % _BASE;
         }
-        return BigInt._trim(r);
+        return r;
     }
 
     // Binary-lifting division. Returns { q, r } as raw limb arrays.
@@ -209,16 +223,16 @@ class BigInt {
         while (BigInt._cmpL(ms[len(ms) - 1], a) <= 0) {
             var last  = ms[len(ms) - 1];
             var lastf = fs[len(fs) - 1];
-            Array.Append(ms, BigInt._addL(last,  last));
-            Array.Append(fs, BigInt._addL(lastf, lastf));
+            Array.Append(ms, BigInt._trim(BigInt._addL(last,  last)));
+            Array.Append(fs, BigInt._trim(BigInt._addL(lastf, lastf)));
         }
 
         var q = [0]; var r = BigInt._copyL(a);
         var idx = len(ms) - 1;
         while (idx >= 0) {
             if (BigInt._cmpL(r, ms[idx]) >= 0) {
-                r = BigInt._subL(r, ms[idx]);
-                q = BigInt._addL(q, fs[idx]);
+                r = BigInt._trim(BigInt._subL(r, ms[idx]));
+                q = BigInt._trim(BigInt._addL(q, fs[idx]));
             }
             idx -= 1;
         }
@@ -232,7 +246,7 @@ class BigInt {
         var i = len(ls) - 1;
         while (i >= 0) {
             var orig = ls[i];
-            ls[i] = BigInt._idiv(orig, 2) + carry * BigInt._HALFBASE;
+            ls[i] = BigInt._idiv(orig, 2) + carry * _HALFBASE;
             carry = orig % 2;
             i -= 1;
         }
@@ -253,8 +267,13 @@ class BigInt {
         if (v == 0) { return BigInt._zero(); }
         var sign = v < 0 ? -1 : 1;
         var u = v < 0 ? -v : v;
-        var ls = [];
-        while (u > 0) { Array.Append(ls, u % BigInt._BASE); u = BigInt._idiv(u, BigInt._BASE); }
+        // Count the limbs first so the array is created at its final size and
+        // stays an [int] - see the invariant at _zero above.
+        var n = 0; var t = u;
+        while (t > 0) { n += 1; t = BigInt._idiv(t, _BASE); }
+        var ls = Array.Create(n, Type.Int);
+        var i = 0;
+        while (u > 0) { ls[i] = u % _BASE; i += 1; u = BigInt._idiv(u, _BASE); }
         return { sign: sign, limbs: ls };
     }
 
@@ -270,7 +289,7 @@ class BigInt {
         if (len(s) == 0 || s == "0") { return BigInt._zero(); }
 
         // Parse right-to-left in groups of 6 decimal digits.
-        var n = len(s); var ls = []; var j = n;
+        var n = len(s); var ls = Array.Create(0, Type.Int); var j = n;
         while (j > 0) {
             var start = j - 6; if (start < 0) start = 0;
             var v = Convert.ParseInt(String.Substr(s, start, j - start));
@@ -312,7 +331,7 @@ class BigInt {
         var ls = n.limbs; var res = 0; var base = 1;
         iter (i from 0 to len(ls) - 1) {
             res = res + ls[i] * base;
-            base = base * BigInt._BASE;
+            base = base * _BASE;
         }
         return n.sign == -1 ? -res : res;
     }
@@ -352,19 +371,19 @@ class BigInt {
 
     fn static Add(a, b) {
         if (a.sign == b.sign) {
-            return BigInt._make(a.sign, BigInt._addL(a.limbs, b.limbs));
+            return BigInt._make(a.sign, BigInt._trim(BigInt._addL(a.limbs, b.limbs)));
         }
         var c = BigInt._cmpL(a.limbs, b.limbs);
         if (c == 0) { return BigInt._zero(); }
-        if (c  > 0) { return BigInt._make(a.sign, BigInt._subL(a.limbs, b.limbs)); }
-        return BigInt._make(b.sign, BigInt._subL(b.limbs, a.limbs));
+        if (c  > 0) { return BigInt._make(a.sign, BigInt._trim(BigInt._subL(a.limbs, b.limbs))); }
+        return BigInt._make(b.sign, BigInt._trim(BigInt._subL(b.limbs, a.limbs)));
     }
 
     fn static Sub(a, b)  { return BigInt.Add(a, BigInt.Neg(b)); }
 
     fn static Mul(a, b) {
         if (BigInt.IsZero(a) || BigInt.IsZero(b)) { return BigInt._zero(); }
-        return BigInt._make(a.sign == b.sign ? 1 : -1, BigInt._mulL(a.limbs, b.limbs));
+        return BigInt._make(a.sign == b.sign ? 1 : -1, BigInt._trim(BigInt._mulL(a.limbs, b.limbs)));
     }
 
     // Integer division, truncates toward zero. Returns nil for division by zero.

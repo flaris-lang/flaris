@@ -109,10 +109,16 @@ class CSV {
         }
     }
 
-    // Parse one field from cursor. Returns the field string and leaves the
-    // cursor on the trailing delimiter or line ending. The cursor fields are
-    // hoisted into locals so the per-byte loop does no property lookups.
-    fn static _parseField(c, delimB:int, quoteB:int): string {
+    // Parse one field from the cursor. Returns the field string and leaves the
+    // cursor on the trailing delimiter or line ending.
+    //
+    // The scan moves run to run rather than byte by byte: String.IndexOfAnyFrom
+    // finds the next delimiter, CR or LF that ends an unquoted field, and
+    // String.IndexOfFrom the next quote inside a quoted one, so each stretch of
+    // ordinary text is copied out in a single Substr. stopSet (the delimiter
+    // plus CR and LF) and quoteS are assembled once per parse by the caller and
+    // passed down, since they are the same for every field in the document.
+    fn static _parseField(c, quoteB:int, stopSet:string, quoteS:string): string {
         let src = c.s;
         let n   = c.n;
         let p   = c.p;
@@ -124,23 +130,25 @@ class CSV {
             let out = "";
             let runStart = p;
             while (true) {
-                if (p >= n) {
-                    out += String.Substr(src, runStart, p - runStart);
+                let q = String.IndexOfFrom(src, quoteS, p);
+                if (q < 0) {
+                    let tail = String.Substr(src, runStart, n - runStart);
+                    out += tail;
+                    p = n;
                     break;
                 }
-                if (src[p] == quoteB) {
-                    if (p + 1 < n and src[p + 1] == quoteB) {
-                        // Escaped quote: keep the run plus one quote byte.
-                        out += String.Substr(src, runStart, p - runStart + 1);
-                        p += 2;
-                        runStart = p;
-                    } else {
-                        out += String.Substr(src, runStart, p - runStart);
-                        p += 1;
-                        break;
-                    }
+                p = q;
+                if (p + 1 < n and src[p + 1] == quoteB) {
+                    // Escaped quote: keep the run plus one quote byte.
+                    let run = String.Substr(src, runStart, p - runStart + 1);
+                    out += run;
+                    p += 2;
+                    runStart = p;
                 } else {
+                    let run = String.Substr(src, runStart, p - runStart);
+                    out += run;
                     p += 1;
+                    break;
                 }
             }
             c.p = p;
@@ -149,23 +157,20 @@ class CSV {
 
         // Unquoted field - read until delimiter, CR, LF, or end.
         let start = p;
-        while (p < n) {
-            let b = src[p];
-            if (b == delimB or b == 10 or b == 13) break;
-            p += 1;
-        }
+        let stop  = String.IndexOfAnyFrom(src, stopSet, p);
+        p = (stop < 0) ? n : stop;
         c.p = p;
         return String.Substr(src, start, p - start);
     }
 
     // Parse one complete row. Returns array of field strings, or nil at EOF.
-    fn static _parseRow(c, delimB:int, quoteB:int) {
+    fn static _parseRow(c, delimB:int, quoteB:int, stopSet:string, quoteS:string) {
         let src = c.s;
         let n   = c.n;
         if (c.p >= n) return nil;
         let row = [];
         while (true) {
-            let field = CSV._parseField(c, delimB, quoteB);
+            let field = CSV._parseField(c, quoteB, stopSet, quoteS);
             Array.Append(row, field);
             let p = c.p;
             if (p >= n) break;
@@ -240,6 +245,8 @@ class CSV {
         let delimB   = CSV._optByte(delim);
         let quoteB   = CSV._optByte(quote);
         let commentB = (comment != nil) ? CSV._optByte(comment) : -1;
+        let stopSet  = delim + "\r\n";
+        let quoteS   = quote;
 
         let c     = CSV._cur(src);
         let hdrs  = nil;
@@ -264,7 +271,7 @@ class CSV {
                 continue;
             }
 
-            let row = CSV._parseRow(c, delimB, quoteB);
+            let row = CSV._parseRow(c, delimB, quoteB, stopSet, quoteS);
             if (row == nil) break;
 
             if (doTrim) {
@@ -308,7 +315,7 @@ class CSV {
         let d = (delim != nil) ? delim : ",";
         let q = (quote != nil) ? quote : "\"";
         let c = CSV._cur(line);
-        let row = CSV._parseRow(c, CSV._optByte(d), CSV._optByte(q));
+        let row = CSV._parseRow(c, CSV._optByte(d), CSV._optByte(q), d + "\r\n", q);
         return (row != nil) ? row : [];
     }
 

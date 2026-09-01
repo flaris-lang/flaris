@@ -7,6 +7,10 @@ import { Inflate, Deflate } from library("Deflate", "1.0");
 
 global testsRun    = 0;
 global testsFailed = 0;
+// NTFS has no POSIX mode bits (every file stats as 0666) and reserves
+// symlink creation for privileged accounts, so the checks that assert on
+// either are skipped rather than asserting something Windows cannot do.
+global isWindows   = Os.Name() == "Windows";
 
 fn check(cond, msg) {
     testsRun = testsRun + 1;
@@ -229,15 +233,17 @@ fn test_path_containment() {
     check(ZipReader.SafeName("")       == nil, "SafeName rejects empty");
 
     // A symlinked directory already on disk redirects an innocent-looking name.
-    Directory.Ensure(root + "/outside");
-    Directory.Ensure(root + "/dest2");
-    File.CreateSymlink(root + "/outside", root + "/dest2/logs");
-    let w2 = Archive.Create();
-    w2.Add("logs/app.txt", "through a symlink");
-    let r2 = Archive.Open(w2.Build());
-    checkEq(r2.ExtractAll(root + "/dest2"), 0, "symlinked parent blocks the write");
-    checkEq(r2.SkippedUnsafe(), 1, "symlink traversal counted as unsafe");
-    check(!File.Exists(root + "/outside/app.txt"), "nothing written through the symlink");
+    if (!isWindows) {
+        Directory.Ensure(root + "/outside");
+        Directory.Ensure(root + "/dest2");
+        File.CreateSymlink(root + "/outside", root + "/dest2/logs");
+        let w2 = Archive.Create();
+        w2.Add("logs/app.txt", "through a symlink");
+        let r2 = Archive.Open(w2.Build());
+        checkEq(r2.ExtractAll(root + "/dest2"), 0, "symlinked parent blocks the write");
+        checkEq(r2.SkippedUnsafe(), 1, "symlink traversal counted as unsafe");
+        check(!File.Exists(root + "/outside/app.txt"), "nothing written through the symlink");
+    }
 
     Directory.DeleteAll(root);
 }
@@ -291,7 +297,7 @@ fn test_metadata() {
     checkEq(r.ExtractAll(out), 3, "all three entries extracted");
     let st = File.Stat(out + "/script.sh");
     check(st != nil, "extracted script stat");
-    if (st != nil) { checkEq(st.Mode & 511, 493, "executable bit restored as 0755"); }
+    if (st != nil && !isWindows) { checkEq(st.Mode & 511, 493, "executable bit restored as 0755"); }
     let st2 = File.Stat(out + "/plain.txt");
     if (st2 != nil) { checkEq(st2.Modified, stamp - (stamp % 2), "mtime restored on disk"); }
     Directory.DeleteAll(out);
@@ -312,9 +318,11 @@ fn test_mode_sanitising() {
     let a = File.Stat(out + "/suid");
     let b = File.Stat(out + "/ww");
     let c = File.Stat(out + "/tight");
-    if (a != nil) { checkEq(a.Mode & 4095, 493, "setuid stripped, exec kept (0755)"); }
-    if (b != nil) { checkEq(b.Mode & 4095, 420, "group/other write dropped (0644)"); }
-    if (c != nil) { checkEq(c.Mode & 4095, 384, "restrictive 0600 preserved"); }
+    if (!isWindows) {
+        if (a != nil) { checkEq(a.Mode & 4095, 493, "setuid stripped, exec kept (0755)"); }
+        if (b != nil) { checkEq(b.Mode & 4095, 420, "group/other write dropped (0644)"); }
+        if (c != nil) { checkEq(c.Mode & 4095, 384, "restrictive 0600 preserved"); }
+    }
     Directory.DeleteAll(out);
 }
 
@@ -348,7 +356,7 @@ fn test_add_directory() {
 
     var exec = 0;
     foreach (e in r.List()) { if ((e.Mode & 73) != 0) { exec = exec + 1; } }
-    checkEq(exec, 1, "only the executable file carries an exec bit");
+    if (!isWindows) { checkEq(exec, 1, "only the executable file carries an exec bit"); }
 
     // Extract into a destination that does not exist yet, nested two deep.
     let out = "/tmp/flaris_zip_tree_out/nested";

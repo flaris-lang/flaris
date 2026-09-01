@@ -2034,7 +2034,7 @@ Min-heap: `Dequeue()` always returns the smallest value.
 | `q.IsEmpty()` | `true` if queue has no elements. |
 | `q.Size()` | Number of elements. |
 | `q.Clear()` | Remove all elements. |
-| `q.ToArray()` | Return values as array ordered lowest-to-highest priority. |
+| `q.ToArray()` | Return the queued entries as an array of `{ Value, Priority }` objects, in the heap's internal order (**not** sorted - drain with `Dequeue` for priority order). |
 
 #### MaxPriorityQueue - `Collections.MaxPriorityQueue() - object`
 
@@ -4491,6 +4491,47 @@ A function that uses an unsupported construct is simply not JIT-compiled - it ru
 Callable builtins require every argument to be a JIT value (typed scalar, string, block, or typed array); optional trailing arguments may be omitted exactly as in interpreted code. The core builtins `len(x)`, `int(x)`, and `float(x)` are also JIT-lowered.
 
 The practical rule remains: **assemble complex data structures in normal interpreter code; pass typed arrays, blocks, and scalars into JIT functions that do the heavy computation**.
+
+#### Typed arrays: how an array becomes one
+
+A `[int]` / `[float]` / `[char]` / `[bool]` parameter is re-checked **at the native entry**: if the array that arrives is not internally typed, the call silently takes the interpreter path. The function still shows as `✓` under `--check` — it did compile — but nothing calls the compiled version. There is no error and no warning, and `type()` reports `Type.Array` either way, so the only symptom is that the code runs at interpreted speed.
+
+What an array is born as decides this, and it is not visible afterwards:
+
+| How the array is created | Typed? |
+| --- | --- |
+| `Array.Create(n, Type.Int)` (with an element type) | **yes** |
+| `Array.Create(n)` (no element type) | no |
+| `[]`, then `Array.Append(...)` | no |
+| `[1, 2, 3]` — a literal | no |
+| `Array.Append` / `Array.RemoveAt` / element writes on an already-typed array | yes — mutation preserves it |
+| `Array.Subset(src, ...)` of a `[float]` array | yes |
+| `Array.Subset(src, ...)` of an `[int]` / `[char]` / `[bool]` array | **no** |
+| `Array.Concat(src, [])` — of any typed array | **no** |
+
+The split in the last three rows is the element type, not the operation.
+`Array.Create(n, Type.Float)` returns a *flat* `double[]`, a representation
+`Array.Subset` carries across; the other element types are boxed arrays wearing a
+type tag, and `Array.Subset` hands back an untagged one. `Array.Concat` drops the
+tag in every case.
+
+So an empty accumulator that must stay typed is `Array.Create(0, Type.Int)`, not
+`[]`; copying a `[float]` with `Array.Subset` is safe, and copying an `[int]`
+means `Array.Create` plus a loop.
+
+```flaris
+fn sumL(a: [int]): int {
+    var s = 0;
+    iter (i from 0 to len(a) - 1) { s += a[i]; }
+    return s;
+}
+
+var fast = Array.Create(n, Type.Int);        // native: ~2 ms over 2000 x 2000
+var slow = [];                                // same function, interpreted:
+iter (i from 0 to n - 1) { Array.Append(slow, i); }   // ~19 ms - 9x slower
+```
+
+The two calls are indistinguishable in the source and in `type()`. If a typed-array function is not delivering the speed-up you expect, this is the first thing to check.
 
 ### Structuring code for JIT
 

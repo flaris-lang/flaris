@@ -1,9 +1,10 @@
 // StringBuilder.fls - Efficient mutable string builder for Flaris.
 // Version: 1.0
 //
-// Accumulates string parts in an array; the final string is materialised
-// only when ToString(), Insert(), Remove(), or Replace() is called.
-// All Append* methods return this for chaining. O(1) per append.
+// Accumulates into a single string buffer. An append costs the length of the
+// piece, not of the text already collected, so assembling a large string one
+// piece at a time stays linear overall. All Append* methods return this, so
+// calls chain: sb.Append(name).Append(": ").AppendLine(value).
 //
 // Usage:
 //   import { StringBuilder } from library("StringBuilder", "1.0");
@@ -52,8 +53,7 @@
 //   Clear()                 - reset to empty
 
 class StringBuilder {
-    let _len: int = 0; 
-    let _parts = nil; 
+    let _buf = "";
 
     // -------------------------------------------------------------------------
     // Construction
@@ -61,13 +61,15 @@ class StringBuilder {
 
     // initial - optional starting string (any type, coerced via str()).
     fn Constructor(initial) {
-        this._parts = [];
-        this._len   = 0;
-
+        this._buf = "";
         if (initial != nil) {
+            // Every append here assigns the piece to a local and then concatenates
+            // that local, in two steps. That is the form described under "Building
+            // strings in a loop" in doc/reference.md as the one that extends the
+            // buffer instead of rebuilding it - worth keeping when editing, and
+            // worth copying in your own string loops.
             let s = str(initial);
-            Array.Append(this._parts, s);
-            this._len = String.Length(s);
+            this._buf += s;
         }
     }
 
@@ -78,16 +80,13 @@ class StringBuilder {
     // Append any value - coerced to string.
     fn Append(value) {
         let s = str(value);
-        Array.Append(this._parts, s);
-        this._len += String.Length(s);
+        this._buf += s;
         return this;
     }
 
     // Append a char value without calling str() (avoids quoting artefacts).
     fn AppendChar(c:char) {
-        let s = "" + c;   // concat with empty string gives a 1-char string
-        Array.Append(this._parts, s);
-        this._len += 1;
+        this._buf += c;
         return this;
     }
 
@@ -95,21 +94,18 @@ class StringBuilder {
     fn AppendLine(value) {
         if (value != nil) {
             let s = str(value);
-            Array.Append(this._parts, s);
-            this._len += String.Length(s);
+            this._buf += s;
         }
-        Array.Append(this._parts, "\n");
-        this._len += 1;
+        let nl = "\n";
+        this._buf += nl;
         return this;
     }
 
     // Append a repeated string n times.
     fn AppendRepeat(value, n:int) {
         if (n <= 0) return this;
-        let s = str(value);
-        let rep = String.Repeat(s, n);
-        Array.Append(this._parts, rep);
-        this._len += String.Length(rep);
+        let s = String.Repeat(str(value), n);
+        this._buf += s;
         return this;
     }
 
@@ -117,16 +113,14 @@ class StringBuilder {
     // Example: sb.AppendFormat("{0} is {1}", ["Flaris", 42]);
     fn AppendFormat(fmt:string, args:array) {
         let s = String.FormatArray(fmt, args);
-        Array.Append(this._parts, s);
-        this._len += String.Length(s);
+        this._buf += s;
         return this;
     }
 
     // Append each element of an array, separated by sep.
     fn AppendJoin(arr:array, sep:string) {
         let s = String.Join(arr, sep);
-        Array.Append(this._parts, s);
-        this._len += String.Length(s);
+        this._buf += s;
         return this;
     }
 
@@ -136,54 +130,39 @@ class StringBuilder {
 
     // Insert a value at byte position pos within the accumulated string.
     fn Insert(pos:int, value) {
-        let current = this._Materialise();
-        let s       = str(value);
-        let result  = String.Insert(current, pos, s);
-        this._parts = [result];
-        this._len   = String.Length(result);
+        this._buf = String.Insert(this._buf, pos, str(value));
         return this;
     }
 
     // Remove `length` bytes starting at byte position `start`.
     fn Remove(start:int, length:int) {
-        let current = this._Materialise();
-        let left    = String.Substr(current, 0, start);
-        let right   = String.Substr(current, start + length);
-        let result  = left + right;
-        this._parts = [result];
-        this._len   = String.Length(result);
+        let left  = String.Substr(this._buf, 0, start);
+        let right = String.Substr(this._buf, start + length);
+        this._buf = left + right;
         return this;
     }
 
     // Replace all occurrences of `old` with `new` in the accumulated string.
     fn Replace(old:string, news:string) {
-        let result  = String.Replace(this._Materialise(), old, news);
-        this._parts = [result];
-        this._len   = String.Length(result);
+        this._buf = String.Replace(this._buf, old, news);
         return this;
     }
 
     // Trim leading and trailing whitespace from the accumulated string.
     fn Trim() {
-        let result  = String.Trim(this._Materialise());
-        this._parts = [result];
-        this._len   = String.Length(result);
+        this._buf = String.Trim(this._buf);
         return this;
     }
 
     // Convert the whole buffer to uppercase.
     fn ToUpper() {
-        let result  = String.ToUpper(this._Materialise());
-        this._parts = [result];
-        this._len   = String.Length(result);
+        this._buf = String.ToUpper(this._buf);
         return this;
     }
 
     // Convert the whole buffer to lowercase.
     fn ToLower() {
-        let result  = String.ToLower(this._Materialise());
-        this._parts = [result];
-        this._len   = String.Length(result);
+        this._buf = String.ToLower(this._buf);
         return this;
     }
 
@@ -193,8 +172,7 @@ class StringBuilder {
 
     // Reset to empty without allocating a new object.
     fn Clear() {
-        this._parts = [];
-        this._len   = 0;
+        this._buf = "";
         return this;
     }
 
@@ -216,7 +194,9 @@ class StringBuilder {
     // Capacity hint
     // -------------------------------------------------------------------------
 
-    // Pre-reserve capacity hint (no-op - arrays grow dynamically, documents API).
+    // Capacity hint: accepted and ignored, since the buffer grows on demand.
+    // Kept so code written against a StringBuilder API that needs one ports over
+    // unchanged.
     fn EnsureCapacity(_n:int) : instance { return this; }
 
     // -------------------------------------------------------------------------
@@ -225,44 +205,32 @@ class StringBuilder {
 
     // Return true if the accumulated content contains `s`.
     fn Contains(s:string) : bool {
-        return String.Contains(this.ToString(), s);
+        return String.Contains(this._buf, s);
     }
 
     // Return byte index of first occurrence of `s`, or -1 if not found.
     fn IndexOf(s:string) : int {
-        return String.IndexOf(this.ToString(), s);
+        return String.IndexOf(this._buf, s);
     }
 
     // -------------------------------------------------------------------------
     // Query / terminal
     // -------------------------------------------------------------------------
 
-    // Current byte length of all accumulated content (O(1) - no join needed).
+    // Current byte length of the accumulated content.
     fn GetLength() {
-        return this._len;
+        return String.Length(this._buf);
     }
 
     fn IsEmpty() {
-        return this._len == 0;
+        return String.Length(this._buf) == 0;
     }
 
-    // Materialise and return the final string.  This is the only allocation.
+    // The content accumulated so far. The returned string is a snapshot and is
+    // safe to hold on to: appending to this builder afterwards does not change a
+    // string already handed out.
     fn ToString() {
-        return this._Materialise();
-    }
-
-    // -------------------------------------------------------------------------
-    // Internal helpers
-    // -------------------------------------------------------------------------
-
-    // Join all parts into a single string and collapse the backing array.
-    // Called by any operation that needs random-access into the content.
-    fn _Materialise() {
-        if (len(this._parts) == 0) return "";
-        if (len(this._parts) == 1) return this._parts[0];
-        let result  = String.Join(this._parts, "");
-        this._parts = [result];          // collapse - next append stays fast
-        return result;
+        return this._buf;
     }
 }
 

@@ -4,7 +4,7 @@
 // Usage:
 //   import { Template } from library("Template", "1.0");
 //
-//   // Compile once, render many times (preferred for hot paths)
+//   // Compile once, render many times - the cheaper way to render repeatedly
 //   let t = Template.Parse("Hello, {{name}}! You have {{count}} messages.");
 //   Console.WriteLine(t.Render({ name: "Alice", count: 3 }));
 //
@@ -81,14 +81,22 @@ class Template {
     // =========================================================================
     // Parser - produces an AST (array of node objects)
     //
-    // Node shapes:
-    //   { t:"x",       v:"..." }                      literal text
-    //   { t:"var",     path:[...] }                   escaped variable
-    //   { t:"raw",     path:[...] }                   unescaped variable
-    //   { t:"if",      path:[...], thn:[...], els:[...] }
-    //   { t:"unless",  path:[...], body:[...] }
-    //   { t:"each",    path:[...], body:[...] }
-    //   { t:"partial", name:"..." }                   partial reference
+    // Node shapes. Every AST node carries two tags for the same thing: `t`, a
+    // readable name that keeps a dumped AST self-describing, and `k`, the small
+    // integer _render switches on. A new node kind has to set both.
+    //
+    //   k = 0 text   1 var   2 raw   3 if   4 unless   5 partial   6 each
+    //
+    //   { t:"x",       k:0, v:"..." }                 literal text
+    //   { t:"var",     k:1, path:[...] }              escaped variable
+    //   { t:"raw",     k:2, path:[...] }              unescaped variable
+    //   { t:"if",      k:3, path:[...], thn:[...], els:[...] }
+    //   { t:"unless",  k:4, path:[...], body:[...] }
+    //   { t:"each",    k:6, path:[...], body:[...] }
+    //   { t:"partial", k:5, name:"..." }              partial reference
+    //
+    // The tags the parser consumes itself - "comment", "else", "end_if",
+    // "end_each", "end_unless" - never reach the AST and carry no `k`.
     //
     // _parseBlock returns { nodes:[...], stop: nil | "else" | "end_if" | "end_each" | "end_unless" }
     // =========================================================================
@@ -98,12 +106,12 @@ class Template {
         while (c.p < c.n) {
             let tagPos = Template._find(c.s, "{{", c.p);
             if (tagPos < 0) {
-                Array.Append(nodes, { t: "x", v: String.Substr(c.s, c.p) });
+                Array.Append(nodes, { t: "x", k: 0, v: String.Substr(c.s, c.p) });
                 c.p = c.n;
                 break;
             }
             if (tagPos > c.p) {
-                Array.Append(nodes, { t: "x", v: String.Substr(c.s, c.p, tagPos - c.p) });
+                Array.Append(nodes, { t: "x", k: 0, v: String.Substr(c.s, c.p, tagPos - c.p) });
             }
             c.p = tagPos;
 
@@ -118,13 +126,13 @@ class Template {
                     let else_r = Template._parseBlock(c);
                     els = else_r.nodes;
                 }
-                Array.Append(nodes, { t: "if", path: tag.path, thn: then_r.nodes, els: els });
+                Array.Append(nodes, { t: "if", k: 3, path: tag.path, thn: then_r.nodes, els: els });
             } else if (tag.t == "unless") {
                 let body_r = Template._parseBlock(c);
-                Array.Append(nodes, { t: "unless", path: tag.path, body: body_r.nodes });
+                Array.Append(nodes, { t: "unless", k: 4, path: tag.path, body: body_r.nodes });
             } else if (tag.t == "each") {
                 let body_r = Template._parseBlock(c);
-                Array.Append(nodes, { t: "each", path: tag.path, body: body_r.nodes });
+                Array.Append(nodes, { t: "each", k: 6, path: tag.path, body: body_r.nodes });
             } else if (tag.t == "else" or tag.t == "end_if" or tag.t == "end_each" or tag.t == "end_unless") {
                 return { nodes: nodes, stop: tag.t };
             }
@@ -145,13 +153,13 @@ class Template {
         if (closePos < 0) {
             let v = String.Substr(c.s, c.p - (raw ? 3 : 2));
             c.p = c.n;
-            return { t: "x", v: v };
+            return { t: "x", k: 0, v: v };
         }
 
         let inner = String.Trim(String.Substr(c.s, c.p, closePos - c.p));
         c.p = closePos + String.Length(closeStr);
 
-        if (raw)                                   return { t: "raw",     path: Template._splitPath(inner) };
+        if (raw)                                   return { t: "raw",     k: 2, path: Template._splitPath(inner) };
         if (String.StartsWith(inner, "!"))         return { t: "comment" };
         if (inner == "#else")                      return { t: "else" };
         if (inner == "/if")                        return { t: "end_if" };
@@ -160,8 +168,8 @@ class Template {
         if (String.StartsWith(inner, "#if "))      return { t: "if",     path: Template._splitPath(String.Trim(String.Substr(inner, 4))) };
         if (String.StartsWith(inner, "#unless "))  return { t: "unless", path: Template._splitPath(String.Trim(String.Substr(inner, 8))) };
         if (String.StartsWith(inner, "#each "))    return { t: "each",   path: Template._splitPath(String.Trim(String.Substr(inner, 6))) };
-        if (String.StartsWith(inner, "> "))        return { t: "partial", name: String.Trim(String.Substr(inner, 2)) };
-        return { t: "var", path: Template._splitPath(inner) };
+        if (String.StartsWith(inner, "> "))        return { t: "partial", k: 5, name: String.Trim(String.Substr(inner, 2)) };
+        return { t: "var", k: 1, path: Template._splitPath(inner) };
     }
 
     // "user.name" - ["user", "name"],  "." - ["."],  "title" - ["title"]
@@ -187,36 +195,37 @@ class Template {
         iter (i from 0 to len(nodes) - 1) {
             let node = nodes[i];
 
-            if (node.t == "x") {
+            let k = node.k;
+            if (k == 0) {
                 Array.Append(parts, node.v);
 
-            } else if (node.t == "var") {
+            } else if (k == 1) {
                 let val = Template._resolve(node.path, ctx);
                 if (val != nil) Array.Append(parts, Template._escape(str(val)));
 
-            } else if (node.t == "raw") {
+            } else if (k == 2) {
                 let val = Template._resolve(node.path, ctx);
                 if (val != nil) Array.Append(parts, str(val));
 
-            } else if (node.t == "if") {
+            } else if (k == 3) {
                 if (Template._truthy(Template._resolve(node.path, ctx))) {
                     Template._render(node.thn, ctx, parts);
                 } else {
                     Template._render(node.els, ctx, parts);
                 }
 
-            } else if (node.t == "unless") {
+            } else if (k == 4) {
                 if (!Template._truthy(Template._resolve(node.path, ctx))) {
                     Template._render(node.body, ctx, parts);
                 }
 
-            } else if (node.t == "partial") {
+            } else if (k == 5) {
                 let partial = Template.GetPartial(node.name);
                 if (partial != nil) {
                     Template._render(partial._nodes, ctx, parts);
                 }
 
-            } else if (node.t == "each") {
+            } else if (k == 6) {
                 let items = Template._resolve(node.path, ctx);
                 if (items != nil and type(items) == Type.Array) {
                     let count = len(items);
@@ -311,9 +320,9 @@ class Template {
 
     // HTML-escape: & < > " '
     fn static _escape(s:string) {
-        if (!String.Contains(s, "&") and !String.Contains(s, "<") and
-            !String.Contains(s, ">") and !String.Contains(s, "\"") and
-            !String.Contains(s, "'")) return s;
+        // Most values contain none of the five, so a single scan for any of
+        // them hands the string back untouched without running one Replace.
+        if (String.IndexOfAnyFrom(s, "&<>\"'", 0) < 0) return s;
         s = String.Replace(s, "&",  "&amp;");
         s = String.Replace(s, "<",  "&lt;");
         s = String.Replace(s, ">",  "&gt;");

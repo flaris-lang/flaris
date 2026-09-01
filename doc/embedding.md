@@ -32,9 +32,9 @@ to the same shape:
 ```
 flaris-lib/
 ├── include/
-│   ├── flaris.h          # the embedding API - the only header you include
-│   └── vm/ffi_object.h   # FfiObject, the value type crossing the boundary
-└── lib/                  # the static and shared library
+│   ├── flaris.h       # the embedding API - the only header you include
+│   └── ffi_object.h   # FfiObject, the value type crossing the boundary
+└── lib/               # the static and shared library
 ```
 
 Two headers, and `flaris.h` is self-contained: it declares the whole API in
@@ -68,7 +68,31 @@ cc host.c flaris-lib/lib/libflaris.a -Iflaris-lib/include -o host \
    -lws2_32 -lbcrypt -liphlpapi -lsecur32 -lcrypt32
 ```
 
-`flaris.h` is the only header you include; it pulls in `vm/ffi_object.h` itself.
+`flaris.h` is the only header you include; it pulls in `ffi_object.h` from
+beside it.
+
+**Linking the shared library instead.** The shared library exports exactly what
+this document describes - the thirteen `Flaris*` functions plus
+`flarisConfigDefaults` - and nothing else; the VM's internals are hidden, so no
+future release can break you by moving one. On Windows, add `-DFLARIS_DLL` when
+you build against `flaris.dll`, so the declarations become `dllimport`:
+
+```bash
+cc host.c -DFLARIS_DLL flaris-lib/lib/libflaris.dll.a -Iflaris-lib/include -o host
+```
+
+macOS and Linux need no define, but they do need an rpath, or the executable will
+not find the library beside it at launch:
+
+```bash
+# macOS
+cc host.c flaris-lib/lib/libflaris.dylib -Iflaris-lib/include \
+   -Wl,-rpath,@executable_path -o host
+
+# Linux
+cc host.c flaris-lib/lib/libflaris.so -Iflaris-lib/include \
+   -Wl,-rpath,'$ORIGIN' -o host
+```
 
 ---
 

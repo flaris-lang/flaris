@@ -56,7 +56,7 @@ renumbers every following opcode, and `MIN_SUPPORTED_BYTECODE_VERSION` is bumped
 in the same change. New opcodes **appended before `OP_LAST`** keep all prior
 numbers stable and only bump `SYS_VERSION` (older VMs reject the newer files via
 the version ceiling; 1.0.0.9 appended `OP_CONCAT_N` and `OP_NIL_LOCAL`, 1.0.2.0
-appended `OP_CALL_WITH_THIS`, all this way). A loader MUST
+appended `OP_CALL_WITH_THIS` and `OP_OBJ_ARITH_L`, all this way). A loader MUST
 reject a chunk whose version is below the floor or above its own `SYS_VERSION`.
 
 ---
@@ -1030,6 +1030,14 @@ index from end). Traps: `NullPointer`, `IndexOutOfBounds`.
 **`OP_SET_OBJ_LL`** `<obj:u8> <key:u16> <src:u8>` — 5 bytes. Stack `→`.
 `local[obj].key = local[src]`, zero stack; same checks.
 
+**`OP_OBJ_ARITH_L`** `<obj:u8> <key:u16> <aop:u8> <src:u8>` — 6 bytes. Stack `→`.
+`local[obj].key aop= local[src]`, zero stack; same checks as `OP_SET_OBJ_LL`.
+The compound-assign counterpart of that opcode and the non-`this` sibling of
+`OP_THIS_ARITH_L`. It exists so a string `+=` can append in place: the generic
+`DUP`/`GET_PROPERTY`/`<op>`/`SET_PROPERTY` sequence reads the field onto the
+stack, giving it a second reference, which makes an in-place append illegal and
+the surrounding loop quadratic.
+
 ### 7.10 `this` access
 
 `this` is `local[0]` of a method frame. All `this.*` forms raise
@@ -1657,7 +1665,7 @@ instruction). Any opcode ≥ 175 MUST be rejected.
 | 84 | 0x54 | `OP_THIS_ARITH_L` | 172 | 0xAC | `OP_CONCAT_N` |
 | 85 | 0x55 | `OP_THIS_ARITH_C` | 173 | 0xAD | `OP_NIL_LOCAL` |
 | 86 | 0x56 | `OP_LOCAL_ARR_LC` | 174 | 0xAE | `OP_CALL_WITH_THIS` |
-| 87 | 0x57 | `OP_LOCAL_ARR_LL` | — | — | — |
+| 87 | 0x57 | `OP_LOCAL_ARR_LL` | 175 | 0xAF | `OP_OBJ_ARITH_L` |
 
 ## Appendix B. Machine limits and named constants
 
