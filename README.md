@@ -1,8 +1,8 @@
 # Flaris standard libraries
 
 The standard libraries, examples, documentation and benchmarks for
-**[Flaris](https://www.flaris-lang.org)** — a lightweight, fiber-based scripting
-language that compiles to portable bytecode and runs on an embeddable C11 VM.
+**[Flaris](https://www.flaris-lang.org)** — an embeddable, fiber-based async
+scripting language that compiles to portable bytecode and runs on a compact C11 VM.
 
 Everything here is MIT licensed and written in Flaris itself, so the libraries
 double as a decent read if you want to see what the language looks like in

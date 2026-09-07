@@ -50,6 +50,7 @@ The Flaris VM binary is `flarisvm`.
 | `flarisvm --format-check <file.fls>` | Exit 1 if the file is not already formatted (prints nothing on success) |
 | `flarisvm -Wno-<name> …` | Silence one analyzer warning, e.g. `-Wno-unused-symbol` - see [R12](#r12---static-analyzer) |
 | `flarisvm -Werror …` | Treat any analyzer warning as an error |
+| `flarisvm -Werror=<name> …` | Fail the compile on one warning, e.g. `-Werror=no-effect` - see [R12](#r12---static-analyzer) |
 | `flarisvm -w …` | Silence all analyzer warnings |
 | `flarisvm --diagnostics json …` | Emit diagnostics as a JSON array on stdout |
 | `flarisvm --version` | Print version string |
@@ -95,7 +96,7 @@ flarisvm --format-write src/app.fls   # rewrite in place
 
 | Flag | Effect                                           |
 |------|--------------------------------------------------|
-| `--no-opt` | Disable compiler optimizations                   |
+| `--no-opt` | Disable the optional compiler optimizations (dead-branch removal, loop-invariant hoisting, inlining, fused instructions, tail-call elimination). Constant folding and enum lowering always run. Output never differs from the default - see *What the compiler optimizes* in R7 |
 | `--strip` | Disable debug symbols (smaller, faster bytecode) |
 | `--small` | Extra size optimizations for compiled `.flx`; also removes string symbol names |
 | `--no-verify` | Disable FFI library (Ffi.Load) SHA-256 checks    |
@@ -104,7 +105,8 @@ flarisvm --format-write src/app.fls   # rewrite in place
 
 | Flag | Effect |
 |------|--------|
-| `--unsafe` | Enable unsafe code and FFI |
+| `--unsafe` | Enable unsafe code and FFI (raw memory, `Os.Kill`, plain-http imports, FFI) |
+| `--allow-ffi` | Enable `Ffi.*` only, leaving the rest of `--unsafe` refused |
 | `--mem` | Memory report at shutdown: peak RSS, slab footprint, peak/total object counts, heap bytes, block regions, and leak count. Exits non-zero if leaks are detected. |
 | `--stats` | Print VM statistics after execution (implies `--time`) |
 | `--time` | Print timing report |
@@ -259,9 +261,12 @@ a security sandbox for *malicious* input.
   are the primary defenses.
 - **The JIT widens the trust surface.** JIT-compiled functions omit the runtime
   type checks the interpreter performs, so a *tampered* `.flx` run with the JIT on can
-  crash or corrupt memory where the interpreter would raise a clean error. Do not
-  run untrusted bytecode with `--jit-disable`.
+  crash or corrupt memory where the interpreter would raise a clean error. The
+  embedded JIT code is structurally validated at load and rejected if malformed,
+  but that check does not type-verify it. **Run untrusted bytecode with
+  `--jit-disable`**, which ignores the embedded JIT code entirely.
 - `--unsafe` grants FFI and raw-memory access; never combine it with untrusted code.
+- `--allow-ffi` grants FFI alone, so a script that only needs a plugin does not also get raw memory, `Os.Kill` and plain-http imports. `--unsafe` implies it.
 
 #### Bytecode verification
 
@@ -292,7 +297,11 @@ function (see *Limits*). A chunk that fails any check is refused at load time; a
 invalid instruction encountered at run time raises `Exception.IllegalInstruction`
 (code `16`), a hard failure. These guarantees hold for the interpreter; the JIT
 omits the interpreter's runtime type checks and so widens the trust surface as
-noted above.
+noted above - the embedded JIT code gets its own structural validation at load
+(unknown opcodes, operands past the end, jump targets off an instruction
+boundary, out-of-range registers, tags, widths and table indexes are all
+refused, and the function then runs interpreted), but that is containment of
+malformed input, not verification of hostile input.
 
 ### Bundle files
 
@@ -370,7 +379,7 @@ OS loader ignores it and a plain file copy still works.
   `--sign`, `--no-opt`, `--strip`.
 - **Runtime settings are chosen at embed time.** A self-contained binary hands
   every CLI argument to the script, so flags meant for the VM are recorded in the
-  settings block instead: give `--jit-disable`, `--unsafe`, or any VM limit (`--stack=`,
+  settings block instead: give `--jit-disable`, `--unsafe`, `--allow-ffi`, or any VM limit (`--stack=`,
   `--slabs=`, `--fibers=`, `--frames=`, `--fifo=`, `--io-threads=`) alongside
   `--embed` and the binary applies them on every start. Nothing is on by
   default - an embedded program gets JIT or unsafe/FFI mode only if you opted in
@@ -473,7 +482,18 @@ How source text is broken into tokens (the numeric/float literal forms are
 detailed under [Type Limits](#type-limits)).
 
 **Encoding.** Source is UTF-8. A leading UTF-8 BOM (`EF BB BF`) is skipped.
+Bidirectional control characters (`U+202A`–`U+202E`, `U+2066`–`U+2069`) are
+rejected anywhere in the source, comments and strings included, because they
+can make the rendered text differ from the compiled text ("Trojan Source").
 Identifiers are ASCII: a leading `_`/letter followed by `_`/letters/digits.
+An identifier or numeric literal longer than 1024 bytes is a compile error.
+Line numbers count LF; a CR that is not part of CRLF is plain whitespace.
+Columns in diagnostics are 1-based **byte** offsets, so a tab or a multi-byte
+character counts as its byte width.
+
+**Diagnostics.** A malformed token is reported as `file:line:col: message`
+like any parse error, and parsing continues, so one run can report several
+lexical errors. The formatter refuses to rewrite a file it cannot tokenize.
 
 **Comments.**
 
@@ -483,43 +503,111 @@ Identifiers are ASCII: a leading `_`/letter followed by `_`/letters/digits.
 /* block /* comments */ nest */   // fully balanced
 ```
 
+Because block comments nest, every `/*` needs its own `*/`; a block comment
+that is still open at end of input is a compile error.
+
 **Numeric literals.** Decimal, `0x`/`0X` hex, `0b`/`0B` binary, `0o`/`0O` octal,
 and floats with a fractional part and/or `e`/`E` exponent (optional `+`/`-`).
 A digit is required on both sides of the decimal point (`0.5`/`5.0`, never `.5`
 or `5.`). `_` digit separators are allowed in every base and in the fraction and
 exponent (`0xFF_FF`, `0b1010_1010`, `1_000.000_5`); they are removed before the
-value is parsed.
+value is parsed, and must sit between digits or directly after the radix prefix
+(`1_`, `1__0` and `1.5_` are errors, `0x_FF` is fine). The lexer rejects, with
+a column: a digit outside the radix (`0b2`, `0o8`), a prefix with no digits
+(`0x`), a letter glued to a number (`123abc`, `1e` without exponent digits),
+and a float beyond the 64-bit range (`1e400`; a value too small to represent
+becomes `0.0`). An integer outside `int64` is reported by the compiler with the
+literal's text; `-9223372036854775808` itself is valid.
 
-**String literals.** `"..."` (single line) and `"""..."""` (triple-quoted,
-spans newlines, verbatim - no escape processing). Inside `"..."` a backslash at
-end of line is a line continuation (the newline is dropped). A raw newline
-inside `"..."` is an error - use `\n`, a line continuation, or `"""..."""`.
-Recognised escapes:
+**String literals.** Three forms:
 
-- `\n` `\r` `\t` `\b` `\f` - control characters (newline, return, tab, backspace, form-feed)
+- `"..."` - single line, escapes processed. A backslash at end of line is a
+  line continuation (the newline is dropped); a raw newline is an error - use
+  `\n`, a line continuation, or a raw string.
+- `"""..."""` - raw: no escape processing. An opener of N (≥ 3) quotes closes
+  only on a run of exactly N quotes, so `""""..."""" ` can hold `"""` inside; a
+  run of N or more quotes in the content is an error. CRLF line endings inside
+  the literal are folded to LF, so the value is the same on every platform.
+  When the opener is followed only by a newline and the closer sits on its own
+  line, the literal is **multi-line**: the whitespace before the closer is
+  stripped from every content line, the newline before the closer is dropped,
+  and a whitespace-only line becomes empty; a content line that does not start
+  with that indentation is a compile error. Any other layout is verbatim.
+- `$"..."` - interpolated: `{expr}` holes are evaluated and formatted (below).
+
+```js
+let json = """
+    {
+      "name": "Alice"
+    }
+    """;             // "{\n  \"name\": \"Alice\"\n}" - closer's indentation removed
+let t = """line1
+line2""";            // verbatim: "line1\nline2"
+```
+
+Recognised escapes in `"..."` and in the literal parts of `$"..."`:
+
+- `\n` `\r` `\t` `\b` `\f` `\a` `\v` - control characters (newline, return, tab, backspace, form-feed, bell, vertical tab)
 - `\\` `\"` `\'` - literal backslash, double quote, single quote
 - `\xHH` - one byte from two hex digits
 - `\uXXXX` - Unicode code point from exactly four hex digits (max `U+FFFF`)
 - `\u{H..H}` - Unicode code point from 1-6 hex digits, up to `U+10FFFF` (e.g. `\u{1F600}` for 😀)
 
 Both `\u` forms map a surrogate value to `U+FFFD`. Use `\u{...}` for code points
-above `U+FFFF` (emoji, etc.); the four-digit `\uXXXX` cannot reach them. An
-unknown escape keeps the character literally (`"\q"` is `q`). Because Flaris
-strings are NUL-terminated at runtime, a `\0` or `\x00` **in a string literal is
-a compile error** - put binary data in a `Buffer`. String literals are capped at
-64 KB of content.
+above `U+FFFF` (emoji, etc.); the four-digit `\uXXXX` cannot reach them. Any
+other escape, and a malformed `\x` or `\u` (`"\q"`, `"C:\users"`, `"\x4"`), is
+a compile error - write `\\` for a backslash, or put regexes and Windows paths
+in a raw `"""..."""` string. Because Flaris strings are NUL-terminated at
+runtime, a `\0` or `\x00` **in a string literal is a compile error** - put
+binary data in a `Buffer`. String literals are capped at 64 KB of content.
+
+**Interpolated strings.** `$"..."` compiles to a `String.Format` call: each
+hole `{expr}`, `{expr,alignment}`, `{expr:spec}` or `{expr,alignment:spec}`
+becomes a positional placeholder with the same alignment and spec (the spec
+grammar is `String.Format`'s: `X4`, `D3`, `F2`, `,-10`, ...). `{{` and `}}` are
+literal braces. A hole may hold any expression - calls, indexing, nested
+`"..."`, `'c'` and `$"..."` literals, even newlines - but it ends at the first
+top-level `,` or `:`, so parenthesize a ternary: `{(a ? b : c)}`. At most 15
+holes per literal (one call argument each). A literal with no holes is an
+ordinary string. `$"""..."""` is not supported.
+
+```js
+let n = 255; let f = 3.14159;
+$"n={n} hex={n:X4} f={f:F2} [{n,6}] {{literal}}"   // "n=255 hex=00FF f=3.14 [   255] {literal}"
+```
 
 **Char literals.** `'...'` holds exactly one Unicode code point: a raw UTF-8
 character (`'a'`, `'å'`, `'😄'`) or an escape (`'\n'`, `'\x41'`, `'å'`,
 `'\u{1F600}'`). Unlike strings, `'\0'` is valid - it is the code point 0, not an
-embedded NUL.
+embedded NUL. An empty literal (`''`), three bare quotes (write `'\''` for a
+quote), more than one code point (`'ab'`) and a surrogate (`'\u{D800}'`) are
+compile errors.
 
 **Keywords.** `fn` `async` `static` `inline` `let` `var` `const` `global`
-`if` `else` `for` `foreach` `iter` `from` `to` `while` `switch` `case`
+`if` `else` `for` `foreach` `iter` `from` `to` `while` `do` `switch` `case`
 `default` `break` `continue` `return` `yield` `await` `guard` `nil` `true`
-`false` `class` `this` `super` `new` `enum` `import` `export` `library`
+`false` `class` `this` `super` `new` `enum` `import` `export` `library` `as`
 `try` `catch` `finally` `throw` `breakpoint`. The words `and` `or` `in` `is`
-`as` are operators. (`var` is an alias for `let`.)
+are operators. (`var` is an alias for `let`.) Every keyword, plus the operator
+words `and` `or` `in` `is`, can be used as a property name after `.` and as
+an object-literal key (`o.default`, `o.class = 1`, `{ class: 1, default: 2,
+in: 3 }`). A smaller set of *contextual keywords* - `as` `default` `do`
+`from` `global` `inline` `iter` `library` `static` `to` - can also name a
+variable, parameter, function or class field. The one limit: at the start of
+a statement, `iter` `global` `do` `static` and `inline` still open their own
+construct, so `iter = 1;` or `global = 2;` cannot stand as a bare assignment
+(use `this.iter`, or another name, for that local), and inside a `switch` body
+a statement may not begin with `default`. A function may still be named
+`static` or `inline` (`fn static()`): a modifier word directly followed by `(`
+is the name. `guard` and every other keyword remain fully reserved as names.
+
+```js
+let o = { class: 1, default: 2, in: 3 };
+o.default = 5;
+o.class;
+
+fn Range(from: int, to: int) { return to - from; }
+```
 
 ### Runtime Types
 
@@ -583,7 +671,7 @@ Flaris integers are full signed 64-bit. Values within ±2⁶⁰ are stored as **
 | **Fast (no-alloc) range** | −1,152,921,504,606,846,976 to 1,152,921,504,606,846,975 (~±2⁶⁰) |
 | **Overflow behavior** | Wraps (no trap) |
 | **Division** | `int / int` → `int` (truncates toward zero); `float` if either operand is `float` |
-| **Power** | `int ^^ int` → `int` (negative exponent truncates toward zero: `2 ^^ -1` = 0); `float` if either operand is `float` |
+| **Power** | `int ^^ int` → `int`, exact in 64-bit integer arithmetic and wrapping on overflow like `*` (a negative exponent gives 0, except for the bases 1 and -1); `float` if either operand is `float` |
 
 Integer literals:
 
@@ -892,9 +980,19 @@ created (i.e., when the enclosing function executes the expression `fn(...) { ..
 
 #### What can be captured
 
-Both parameters and body-local variables of the immediately enclosing function are
-eligible for capture. Module-level globals are always accessible directly and are
+Both parameters and body-local variables are eligible for capture, at **any**
+enclosing depth - a lambda nested inside another lambda reaches the outermost
+function's variables too. Each level snapshots what the levels inside it read,
+so the value a nested closure sees is the one that was live when its enclosing
+closure was created. Module-level globals are always accessible directly and are
 not captured - they are read live from the global environment on each access.
+
+```js
+fn adderFactory(x) {
+    return fn() { return fn(n) { return x + n; }; };   // x reaches two levels down
+}
+Console.WriteLine(adderFactory(10)()(5));   // 15
+```
 
 #### Capture semantics
 
@@ -954,10 +1052,23 @@ fields for both.
 
 #### Capturing `this`
 
-An anonymous function created inside an instance method that references `this`
-captures the receiver too, so it can read/write fields (`this.field`) after the
-method has returned. A closure may capture at most **64** distinct outer
-variables.
+An anonymous function created inside an instance method captures the receiver
+too, so it can read and write fields (`this.field`) after the method has
+returned. It does so both when it writes `this` and when it names one of the
+class's **own** fields or methods with no receiver, which means the same thing
+inside a lambda as it does in the method body:
+
+```js
+class Counter {
+    var n = 0;
+    fn stepper() {
+        return fn() { n += 1; return n; };   // `n` is this.n, not a global
+    }
+}
+```
+
+A parameter or a `let` of the same name shadows the member, as always. A closure
+may capture at most **64** distinct outer variables.
 
 ---
 
@@ -1023,12 +1134,15 @@ invoked on the instance, so inside it
 Writing to an undeclared field is rejected the same way as in a method
 (`Sealed instance fields`, above). When the class is not visible in this
 compilation unit - imported, or constructed through a computed expression -
-its member set is unknown: bare assignments are compiled as field writes and
-left to the VM's runtime guard, and bare reads resolve as globals.
+its member set is unknown: every bare **write** is compiled as a field write
+and left to the VM's runtime guard, while bare **reads** resolve as globals.
+`n++` and `n--` are writes and follow that rule exactly like `n += 1`.
 
 The block runs as an ordinary call on the current fiber, so it may call, yield
 and raise; an exception thrown inside it propagates out of the `new`
-expression.
+expression. Because the block has a frame of its own, a call by the name of the
+function that *contains* the `new` is a plain call to that function - it does
+not re-enter the block.
 
 ### Inheritance and `super`
 
@@ -1071,9 +1185,9 @@ enum Status { Ok = 200, Created, Accepted, NotFound = 404, Gone }
 A trailing comma after the last member is allowed. `enum Name { }` is legal and
 declares an empty object.
 
-**Values must be plain non-negative integer literals.** An expression
-(`A = 1 + 2`), a reference to another member (`B = A`), or a negative literal
-(`A = -1`) is rejected at compile time - "Enum values must be integer literals".
+**Values must be integer literals, optionally negated (`A = -1`).** An expression
+(`A = 1 + 2`) or a reference to another member (`B = A`) is rejected at compile
+time - "Enum values must be integer literals".
 Values are `int32`; auto-numbering past `2147483647` wraps.
 
 **Enums are folded at compile time.** The declaration lowers to a `const`
@@ -1122,7 +1236,7 @@ Console.WriteLine(Color.Cyan);        // 11
   `Invalid assignment of const-object` (code 19) at run time.
 - Reading a member that does not exist yields `nil` rather than a compile-time
   error - member names are not checked against the declaration.
-- Duplicate member names are accepted silently; the first value wins.
+- A duplicate member name is a compile error.
 - There is no reverse mapping - `str(Color.Red)` is `"0"`, not `"Red"`.
 - `switch` over an enum is not checked for exhaustiveness (see
   [R12 - Static Analyzer](#r12---static-analyzer)).
@@ -1152,7 +1266,8 @@ switch (x) {
 // x == 1 -> "onetwoother"     x == 2 -> "twoother"     x == 9 -> "other"
 ```
 
-Consecutive labels with no statements between them share one body - that is the
+Consecutive labels with no statements between them share one body, and so do
+comma-separated labels (`case Square, Rect:`) - that is the
 idiomatic way to match several values without relying on fallthrough:
 
 ```js
@@ -1300,7 +1415,7 @@ Exposed as **static members of the `Exception` class** (`Exception.RuntimeError`
 | `Exception.GuardCheck` | `11` | `guard()` failed - value was nil |
 | `Exception.StackError` | `12` | Stack overflow / underflow / corruption |
 | *(reserved)* | `13` | Intentionally unused |
-| `Exception.UnsafeOperation` | `14` | Unsafe operation blocked (requires `--unsafe`) |
+| `Exception.UnsafeOperation` | `14` | Unsafe operation blocked (requires `--unsafe`, or `--allow-ffi` for `Ffi.*`) |
 | `Exception.NestingError` | `15` | Excessive recursion or nesting depth |
 | `Exception.IllegalInstruction` | `16` | Invalid bytecode instruction |
 | `Exception.ExecOutOfMemory` | `17` | Out of memory during execution |
@@ -1311,6 +1426,7 @@ Exposed as **static members of the `Exception` class** (`Exception.RuntimeError`
 | `Exception.TypeMismatch` | `22` | Value incompatible with a typed-array element type |
 | `Exception.AssertionFailed` | `23` | `Debug.Assert` / assertion failed |
 | `Exception.FieldUndeclared` | `24` | Write to an instance field not declared with `let`/`var` (see *Sealed instance fields*) |
+| `Exception.ModuleDenied` | `25` | A built-in module the embedding host withheld. Distinct from `UnsafeOperation`: no runtime switch enables it and only the host can change it (see the Embedding guide §10) |
 
 **Design notes:**
 
@@ -1327,26 +1443,45 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | Level | Category | Operators | Associativity |
 |-------|----------|-----------|---------------|
 | 1 | Primary | literals, identifiers, `(...)` | N/A |
-| 2 | Postfix | `obj.prop` `arr[i]` `fn(...)` `x++` `x--` | Left |
-| 3 | Prefix Unary | `+x` `-x` `!x` `~x` `await` `new` `guard()` | Right |
-| 4 | Multiplicative & Bitwise | `*` `/` `%` `^^` `<<` `>>` `&` `\|` `^` | Left |
-| 5 | Additive | `+` `-` | Left |
-| 6 | Comparison | `<` `<=` `>` `>=` | Left |
-| 7 | Equality | `==` `!=` `≈` `in` `is` | Left |
-| 8 | Logical AND | `&&` `and` | Left |
-| 9 | Logical OR | `\|\|` `or` | Left |
-| 10 | Null Coalescing | `??` | Left |
-| 11 | Conditional | `? :` | Right |
-| 12 | Assignment | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` `??=` `^^=` | Right |
+| 2 | Postfix | `obj.prop` `obj?.prop` `arr[i]` `arr?.[i]` `fn(...)` `x++` `x--` | Left |
+| 3 | Power | `^^` | Right |
+| 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` | Right |
+| 5 | Multiplicative & Bitwise | `*` `/` `%` `<<` `>>` `&` `\|` `^` | Left |
+| 6 | Additive | `+` `-` | Left |
+| 7 | Comparison | `<` `<=` `>` `>=` | Left |
+| 8 | Equality | `==` `!=` `≈` `in` `is` | Left |
+| 9 | Logical AND | `&&` `and` | Left |
+| 10 | Logical OR | `\|\|` `or` | Left |
+| 11 | Null Coalescing | `??` | Left |
+| 12 | Conditional | `? :` | Right |
+| 13 | Assignment | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` `??=` `^^=` | Right |
 
 **Key rules:**
+
+- `?.` and `?.[i]` are the null-conditional forms of `.` and `[i]`: when the
+  object is `nil` the whole postfix chain evaluates to `nil` instead of raising,
+  so `user?.address.city` is `nil` for a `nil` user and `cfg?.items?.[0] ?? 3`
+  falls through to `3`. A call on such a member (`obj?.method()`) is skipped the
+  same way.
+- An assignment is an expression whose value is the value stored: `a = b = 5`
+  sets both, `let c = (a = 3)` and `f(a = 4)` are legal. `++`/`--` are
+  statements and produce no value. Rule 1013 still rejects an assignment as an
+  `if`/`while`/`for` condition, where it is almost always a typo for `==`.
+- `++`/`--` apply to variables, fields and elements alike: `o.n++`, `a[i]--`.
+- `??=` assigns only when the target reads `nil`, and its right side is **not
+  evaluated at all** otherwise - on every target: `x ??= f()`, `o.k ??= f()`,
+  `a[i] ??= f()`, `this.field ??= f()` and a global alike. This is what makes
+  `cache[key] ??= expensive()` an idiom rather than a trap. The target
+  expression itself is evaluated once either way, so `items[next()] ??= v`
+  advances `next()` exactly once.
 
 - `&&` binds tighter than `||` - `a || b && c` means `a || (b && c)`. `and`/`or` are tokenizer aliases with identical precedence.
 - `&&` / `||` short-circuit and yield a **value, not always a bool**: `a && b` evaluates to `b`'s value when `a` is truthy, otherwise `false`; `a || b` evaluates to `true` when `a` is truthy, otherwise `b`'s value. (`nil` and `0` are falsy.)
 - Shifts operate on `int64` and mask the shift count to `& 63`, so a count `>= 64` wraps into range. `<<` is a logical left shift; `>>` is an **arithmetic** right shift (the sign bit is replicated), so `-8 >> 1` = -4.
 - `??` (null coalescing) is lower than all arithmetic - `x + y ?? z` means `(x + y) ?? z`.
-- Division `/` and power `^^` produce `int` when both operands are `int` (division truncates toward zero; a negative power truncates too, so `2 ^^ -1` = 0), and `float` when either operand is `float`. Force a float result with a float operand: `a / (b * 1.0)` or `float(a) / b`.
-- `^^` is exponentiation (`x ^^ y` = x raised to y).
+- `x in c` is containment. For an object it is property presence (`"name" in obj`), for an array it is an element equal to `x` (deep equality, same type: `1 in [1.0]` is `false`), and for a string it is a substring test: `"ab" in "xaby"` and `'a' in "xaby"` are `true`, `"zz" in "xaby"` is `false`, and the empty string is contained in every string. Any other combination is `false`.
+- Division `/` and power `^^` produce `int` when both operands are `int` (division truncates toward zero; an integer power is exact and wraps on overflow like `*`, and a negative exponent gives 0 except for the bases 1 and -1, so `2 ^^ -1` = 0), and `float` when either operand is `float`. Force a float result with a float operand: `a / (b * 1.0)` or `float(a) / b`.
+- `^^` is exponentiation (`x ^^ y` = x raised to y). It binds tighter than every other binary operator and than a prefix operator on its **left**, and it nests to the **right**, as in mathematics and as `**` does in Python: `2 * 3 ^^ 2` = 18, `2 ^^ 3 ^^ 2` = 512, `-2 ^^ 2` = -4 (write `(-2) ^^ 2` for 4). Its right operand is a unary expression, so `2 ^^ -1` parses.
 - `+` is **overloaded by operand type** and never a type error (see also
   [Operator operand checking](#operator-operand-checking)):
   - `number + number` - arithmetic (int lane unless an operand is `float`).
@@ -1400,7 +1535,7 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 
 | Limit | Value | Description |
 | ------- | ------- | ------------- |
-| Local variables per function | 128 | Maximum local variables per function |
+| Local variables per function | 128 | Slots per frame. Every declaration takes its own slot - including a shadowed one, each loop's variable, and the hidden cursors a `foreach`/`iter` needs - so a function with many loops reaches the limit before it has 128 named variables. |
 | Function call arguments | 16 | Maximum arguments in user function calls |
 
 ### Compiler and Parser
@@ -1408,7 +1543,12 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | Limit | Value | Description |
 |-------|-------|-------------|
 | AST nodes per compilation unit | 100,000 | |
-| Parser nesting depth | 256 | |
+| Parser nesting depth | 256 | Nested statements, expressions and type annotations in one construct. Each `.member` / `()` / `[]` step of a chain, each `else if` in a ladder and each operand of an operator chain (`a + b + c + …`, `s + "x" + …`) also counts, so a 257-step chain or ladder, or an expression whose operands and nesting together pass 256, is rejected with a compile error - split it into statements or build an array and `String.Join` it. This single budget is what bounds the compiler's own stack use: any accepted file compiles on a 512 KB thread. |
+| Syntax errors per unit | 100 | Diagnostics the parser reports before giving up on a file or `VM.Eval` unit. |
+| Syntax nodes per file | 250,000 | AST nodes one source file may produce. Imports are compiled separately and do not count; split a larger file into modules. |
+| Identifier / numeric literal length | 1,024 bytes | Compile error above (`MAX_TOKEN_LENGTH`) |
+| String literal content | 64 KB | `"..."` and `"""..."""` alike (`MAX_STRING_LITERAL_LEN`) |
+| Interpolation holes per `$"..."` | 15 | One `String.Format` argument each (`MAX_CALL_ARGUMENTS` − 1) |
 | Literal nesting depth | 64 | Max container nesting when building array/object literals (raises `Exception.NestingError`) |
 | Comparison depth | 1,024 | Max nesting for structural `==`/ordering of containers (raises `Exception.NestingError`; above the JSON depth cap, so parsed documents always compare) |
 | Clone depth | 512 | Max nesting for `Object.Clone`/`Array.Clone`; a deeper or **cyclic** value raises `Exception.NestingError` instead of overflowing the stack (above the JSON depth cap, so parsed documents always clone) |
@@ -1514,6 +1654,32 @@ Understanding how Flaris executes helps write fast, predictable programs.
 ### Execution Model
 
 Flaris compiles source to bytecode, then runs it on a stack-based VM. On ARM64 (`aarch64`) and x86-64, eligible functions are additionally compiled to native machine code at first call - see [R11](#r11---jit-compilation) for details. On other platforms the bytecode interpreter is the only execution tier.
+
+### What the compiler optimizes
+
+Every compile folds constants: arithmetic, comparisons and string concatenation
+on literals, `const` and enum member reads, ternaries and `switch` statements
+with a constant scrutinee. With optimizations on (the default) the compiler
+also removes `if`/`while`/`for`/`iter` bodies whose condition or range is a
+constant, moves loop-invariant pure expressions out of loops, rewrites
+`x = x + e` into `x += e`, replaces reads of a function-local `const` or of a
+`let` that is never assigned again with the number it was declared with,
+turns `x in [1, 2, 3]` into a chain of comparisons when `x` is known to have
+the elements' type, expands trivial single-expression functions at their call
+sites, fuses common instruction sequences, and eliminates tail calls.
+
+A method calling a sibling by its bare name (`helper(x)` rather than
+`this.helper(x)`) dispatches on the receiver directly - no bound method is
+built for the call, and none is released after it. The first execution
+records which member it resolved to, so later calls skip the lookup as well.
+This applies to a call written with `this.` too.
+
+None of this changes what a program prints, returns or raises. An expression
+is only moved out of a loop when it cannot raise - a division by a variable
+stays inside its guard - and an operator is only fused when the operand types
+are known. `--no-opt` exists for comparing output and debugging the compiler,
+not for changing behaviour; the only observable difference is that deep tail
+recursion needs the optimized build.
 
 ### Dynamic Typing and Runtime Checks
 
@@ -2327,8 +2493,8 @@ Runtime introspection and assertion tools. Available in all builds; overhead is 
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
-| **Assert** | `Assert(left:any, right:any, ?message:any) - bool` | Verify `left == right`. On mismatch prints both values (plus optional `message`) and a stack trace, then **aborts the VM** (`EXIT_CODE_ERR_ASSERT`) - not a catchable raise. Returns `true` when it holds. | — |
-| **AssertTrue** | `AssertTrue(condition:any, ?message:any) - bool` | Verify `condition` is truthy. On failure prints it (plus optional `message`) and a stack trace, then **aborts the VM**. Returns `true` when it holds. | — |
+| **Assert** | `Assert(left:any, right:any, ?message:any) - bool` | Verify `left == right`. On mismatch prints both values (plus optional `message`) and a stack trace, then **ends the program** - not a catchable raise. Inside a host application it raises instead, so the host keeps running. Returns `true` when it holds. | — |
+| **AssertTrue** | `AssertTrue(condition:any, ?message:any) - bool` | Verify `condition` is truthy. On failure prints it (plus optional `message`) and a stack trace, then **ends the program**. Inside a host application it raises instead, so the host keeps running. Returns `true` when it holds. | — |
 | **GuardAddress** | `GuardAddress(addr:int)` | Installs an allocator watchpoint that traps when `addr` is touched. | — |
 | **Here** | `Here(?label:string)` | Prints the current file, line, and function name to stdout (with an optional `label`). | — |
 | **Pool** | `Pool()` | Prints SLAB allocator statistics and a per-slab dump. | — |
@@ -2398,7 +2564,7 @@ Dynamic loading of native shared libraries (`.so`, `.dylib`). Requires `--unsafe
 | **SetCallback** | `SetCallback(handle:pointer, name:string, fn:fn) - bool` | Register a Flaris function as a named callback. The library must export `flaris_set_callback`. Callbacks are global - use a lib-specific prefix to avoid name collisions across plugins (e.g. `"mylib_ondata"`). | — |
 | **RemoveCallback** | `RemoveCallback(handle:pointer, name:string) - bool` | Unregister a previously registered callback by name without unloading the library. Useful for one-shot callbacks. | — |
 | **GetVersion** | `GetVersion(handle:pointer) - int` | Returns the plugin's version as a `uint32` in `0xMMmmppbb` format. Plugin must export `uint32_t flaris_version(void)`. Returns `0` if symbol not found. | — |
-| **Call** | `Call(handle:pointer, name:string, ...args) - any` | Resolve and call a named symbol in one step without allocating an `ffi_function` object. Accepts up to 4 extra arguments. Calls `dlsym` on every invocation - use `GetFunction` for hot paths. | — |
+| **Call** | `Call(handle:pointer, name:string, ...args) - any` | Resolve and call a named symbol in one step without allocating an `ffi_function` object. Accepts up to 4 extra arguments. The symbol lookup is cached per `(handle, name)`, but the call is still unvalidated - `GetFunction` with a signature is the safer and slightly faster form for hot paths. | — |
 | **CallAsync** | `CallAsync(fn:ffi_function, args:array) - any` | Runs a **pure** FFI function (from `GetFunction`) on the I/O thread pool so the calling fiber suspends instead of blocking the scheduler. Must be `await`ed. `args` is the call's argument array; block arguments are refused (they alias VM memory and cannot cross threads). The function must be side-effect-free with respect to the VM: no callbacks, no shared mutable state, thread-safe. A declared return type that does not match resolves to `nil`. | — |
 | **LastError** | `LastError() - string\|nil` | Text of the most recent `Load`/`GetFunction`/`Call` failure, or `nil` if the last one succeeded. Those three clear it on entry, so it always describes the most recent call. | — |
 | **LAZY** | `LAZY - int` | `dlopen` flag: resolve symbols on first use (the default). | — |
@@ -2455,7 +2621,7 @@ Types may be unioned with `|`. Zero-argument functions use `fn():return_type`.
 | `array` | Array |
 | `object` | Object |
 | `block` | Block (raw memory buffer) |
-| `pointer` / `ptr` | Pointer |
+| `pointer` / `ptr` | Opaque handle returned by a plugin. Script cannot construct one, so declaring `ptr` rejects an int passed in its place |
 | `function` / `fn` | Flaris function (does **not** match an FFI function - use `callable` or `ffi`) |
 | `builtin` | Builtin function |
 | `ffi` | FFI function |
@@ -3591,7 +3757,7 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **Empty** | `Empty - string` | Property: the empty string constant `""`. Not a function. | — |
 | **EndsWith** | `EndsWith(s:string, suffix:string) - bool` | `true` if `s` ends with `suffix`. | ✓ |
 | **EqualsIgnoreCase** | `EqualsIgnoreCase(a:string, b:string) - bool` | Case-insensitive equality. ASCII only (`A-Z` folds to `a-z`) and locale-independent, matching `ToLower`/`ToUpper`; non-ASCII bytes compare exactly, so `"Å"` and `"å"` are **not** equal. | ✓ |
-| **Format** | `Format(fmt:string, ...args) - string` | C#-style positional formatting: `{0}`, `{1,width}` (negative width = left-align), `{0:X4}`/`{0:x}` hex, `{0:D3}` zero-padded decimal, `{0:F2}` or `{0:.2f}` fixed-point (ints included: `{0:F2}` of `5` is `"5.00"`). `{{` and `}}` emit literal braces. The template is used **literally** - a source literal's escapes are already expanded by the compiler, so `fmt` is never unescaped again and a `\t` in e.g. a Windows path survives. `:X`/`:x`/`:D` require an int and yield `nil` otherwise; other specs fall back to the value's default rendering. Returns `nil` on a malformed template. At least 1 arg required. | — |
+| **Format** | `Format(fmt:string, ...args) - string` | C#-style positional formatting: `{0}`, `{1,width}` (negative width = left-align), `{0:X4}`/`{0:x}` hex, `{0:D3}` zero-padded decimal, `{0:F2}` or `{0:.2f}` fixed-point (ints included: `{0:F2}` of `5` is `"5.00"`). `{{` and `}}` emit literal braces. The template is used **literally** - a source literal's escapes are already expanded by the compiler, so `fmt` is never unescaped again and a `\t` in e.g. a Windows path survives. `:X`/`:x`/`:D` require an int and yield `nil` otherwise; other specs fall back to the value's default rendering. Returns `nil` on a malformed template. At least 1 arg required. Interpolated `$"...{x:X4}..."` literals compile to this call. | — |
 | **FormatArray** | `FormatArray(fmt:string, values:array) - string` | Like `Format`, but placeholder indices `{0}`, `{1}`, … refer to elements of `values`. Identical grammar and rendering - both share one engine. Returns `nil` on a malformed template or out-of-range index. | ✓ owned¹ |
 | **IndexOf** | `IndexOf(s:string, sub:string) - int` | Byte index of first occurrence of `sub`, or `-1`. | ✓ |
 | **IndexOfAnyFrom** | `IndexOfAnyFrom(s:string, charset:string, start:int) - int` | Byte index of the first character in `s` (starting from `start`) that appears anywhere in `charset`, or `-1`. Uses a single `strcspn` scan - efficient for finding the first of several possible delimiter characters. | ✓ |
@@ -3720,13 +3886,14 @@ Virtual machine introspection and control.
 | **CompactMemory** | `CompactMemory()` | Run memory compaction pass. | — |
 | **CurrentAllocations** | `CurrentAllocations() - int` | Current live allocation count. | — |
 | **Eval** | `Eval(src:string, ...args) - any` | Compile and immediately evaluate `src`. Tried first as an EXPRESSION (`Eval("40 + 2")` → `42`); if that fails to compile it is retried as a statement body, where an explicit `return` provides the result (`nil` otherwise). Extra call arguments are bound to `arg0..argN`: `Eval("arg0 * arg1", 6, 7)` → `42`. Max 10 KB; returns `nil` on compile failure (the process is never terminated by a bad `src`). Each `Eval` compiles as its own unit: it cannot reference host globals by name, but a `global` declaration in it can rebind an existing host global (warns on stderr). Eval'd code runs with full VM authority - never pass it untrusted input. | — |
-| **Exit** | `Exit(code:int) - nil` | Terminate VM with exit code. | — |
+| **Exit** | `Exit(code:int) - nil` | End the program with this exit code. Inside a host application it raises instead, reporting the code: a script choosing to stop does not stop the host. | — |
 | **GetFunctionInfo** | `GetFunctionInfo(fn:callable) - object` | Return an object describing a function. Accepts `function`, `builtin`, `ffi`, and bound methods. See field table below. | — |
 | **GetModuleInfo** | `GetModuleInfo(name:string) - object\|nil` | Return an object describing a built-in module. `Members` array contains `{Name, Signature}` per function; `Constants` array contains `{Name, Type, Value}` per constant. Returns `nil` if the module name is not found. | — |
 | **GetStartTimeMs** | `GetStartTimeMs() - int` | VM start time in milliseconds since epoch. | — |
 | **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the VM halts regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
 | **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
 | **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a non-function handler returns `false`. | — |
+| **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §10a. | — |
 | **PatchFunction** | `PatchFunction(original:fn, replacement:fn) - bool` | Replace function at runtime. Requires running unsafe-mode `--unsafe`. The replacement may be a Flaris-function, a builtin-function or a FFI-function. Pass `nil` as replacement to remove the patch. Caveats: call sites the compiler inlined (trivial single-`return` functions) and calls made from inside JIT-compiled functions bypass the patch; self-recursive calls inside the original body also keep calling the original. | — |
 | **PeakAllocations** | `PeakAllocations() - int` | Peak allocation count since VM start. | — |
 | **RaiseSignal** | `RaiseSignal(signum:int) - bool` | Send signal `signum` to the current process (`raise`). A handler registered via `OnSignal` runs on the next signal pump; an uncatchable signal takes the OS default effect. Returns `false` on an out-of-range number. | — |
@@ -3821,7 +3988,7 @@ With `--strip` (stripped):
 | `Debug.Pool()` | Memory slab statistics (requires `--unsafe`) |
 | `Debug.Value(v)` | Inspect value (type, ref-count, address) (requires `--unsafe`) |
 | `Debug.Assert(a, b)` | Equality check - aborts the VM on failure |
-| `Debug.AssertTrue(c)` | Truthiness check - aborts the VM on failure |
+| `Debug.AssertTrue(c)` | Truthiness check - ends the program on failure (raises inside a host) |
 | `Debug.GuardAddress(p)` | Watch memory address - traps on access (requires `--unsafe`) |
 | `Debug.StackPtr()` | Current stack depth as integer |
 | `Debug.Refs(o)` | External reference count of a value (requires `--unsafe`) |
@@ -4169,59 +4336,37 @@ while (i < limit) { ... }       // fused, 1 dispatch
 
 ---
 
-### Incrementing counters: prefer `++` over `+= 1` over `= x + 1`
+### Incrementing counters: all three forms compile the same
 
-Three ways to increment a counter produce meaningfully different instruction sequences:
+`i++`, `i += 1` and `i = i + 1` all compile to the same 2-byte, single-dispatch
+instruction: the compiler rewrites a self-assignment into its compound form
+before code generation. Pick whichever reads best.
 
 | Form | Encoding | Dispatches |
 | --- | --- | --- |
 | `i++` | 2 bytes | 1 |
-| `i += 1` | 4 bytes | 1 |
-| `i = i + 1` | 6 bytes (padded) | 3 |
+| `i += 1` | 2 bytes | 1 |
+| `i = i + 1` | 2 bytes | 1 |
 
-`i = i + 1` is peephole-optimized in-place, but the padding bytes that fill the freed space still execute as individual dispatches.
-
-`i++` is the most compact form - a 2-byte instruction with no arithmetic subcode. It is both the smallest encoding and the clearest signal to the compiler.
-
-```js
-// Best - 2 bytes, 1 dispatch
-while (i < n) {
-    process(arr[i]);
-    i++;
-}
-
-// Good - 4 bytes, 1 dispatch
-while (i < n) {
-    process(arr[i]);
-    i += 1;
-}
-
-// Avoid - 6 bytes padded, 3 dispatches
-while (i < n) {
-    process(arr[i]);
-    i = i + 1;
-}
-```
-
-The same rule applies to `--` and any compound-assign: `n += x` is always cheaper than `n = n + x`.
+The same holds for `--` and for any compound operator: `n += x`, `n = n + x`
+and, for a numeric `n` and `x`, `n = x + n` all produce the fused zero-stack
+instruction. The one form that stays a general assignment is `n = x + n` where
+either side may be a string or an array, because `+` does not commute there.
 
 ---
 
-### Compound assignment beats explicit assignment for all arithmetic
+### Compound assignment: zero stack traffic
 
-`n += x`, `n -= x`, `n *= x` etc. compile to a compact fused instruction (zero stack, 1 dispatch). Writing `n = n + x` instead forces the optimizer to patch the result in-place, leaving padding bytes that still dispatch individually.
+`n += x`, `n -= x`, `n *= x` etc. compile to a compact fused instruction (zero
+stack, 1 dispatch) when `x` is a local or a small literal. Larger right-hand
+sides are evaluated on the stack and folded into the local with one
+instruction, so the cost is the expression itself, not the assignment.
 
 ```js
-// Good - zero-stack, 1 dispatch
+// Zero-stack, 1 dispatch each
 sum += arr[i];
 n   *= factor;
-
-// Slower - fused + 1–3 padding dispatches depending on operand sizes
-sum = sum + arr[i];
-n   = n * factor;
 ```
-
-This matters most inside loops. The operand encoding determines how much padding remains after optimization.
 
 ---
 
@@ -4327,10 +4472,12 @@ The gain is proportional to call frequency. A function called 100 million times 
 
 A function marked `inline` (or a trivial expression-bodied function the compiler
 auto-inlines) has its body expanded into each call site, removing the call frame
-entirely. Arguments are evaluated once, in order, and bound to fresh temporaries;
-name collisions with caller locals, over-deep recursive inlining (past 8 levels),
-and arity mismatches fall back to a normal call, so inlining never changes
-behavior.
+entirely. Arguments are evaluated once, in order, and bound to fresh temporaries.
+The call site falls back to a normal call whenever expanding it could change
+what a name means or how often it runs: a name in the body that would collide
+with a caller local, or - at a call site inside a method - with a field or
+method of that class, over-deep recursive inlining (past 8 levels), and arity
+mismatches. Inlining therefore never changes behavior.
 
 ```js
 fn inline sq(x) { return x * x; }   // expands at each call site
@@ -4354,6 +4501,10 @@ fn sum(n, acc) {
     return sum(n - 1, acc + n);   // tail call - constant stack depth
 }
 ```
+
+A tail call into a function that has native code enters that code exactly
+like a plain call, so `return kernel(x);` costs nothing over
+`let r = kernel(x); return r;`.
 
 Note: a self tail call always re-enters the original function body; it is not
 affected by a later `VM.PatchFunction` override of that name.
@@ -4393,40 +4544,40 @@ All figures measured with `--strip` on M-series hardware. "Overhead" is the numb
 | `iter (i from 0 to N) { ... }` | 2 | fused increment+check + loop-back |
 | `while (i < N) { i++; }` | 3 | fused compare + compact increment + loop-back |
 | `while (i < N) { i += 1; }` | 3 | fused compare + compound assign + loop-back |
-| `while (i < N) { i = i + 1; }` | 5 | same + 2 padding dispatches |
+| `while (i < N) { i = i + 1; }` | 3 | same - the self-assignment compiles like `i++` |
 | `while (i < N) { ... }` without `--strip` | +1–3 | per body statement, debug tracking |
 | `obj.method()` per iteration | - | hash lookup each call |
 | `let fn = obj.method; fn()` per iteration | - | direct call; saves the lookup |
 
-The gap between the best and worst row above is 2.5×. On a 10 million-iteration loop that is the difference between 70 ms and 175 ms for a single counter pattern alone.
+The `iter` row saves one dispatch per iteration over the `while` rows, which is what separates the two functions in the example below; debug tracking without `--strip` costs more than either.
 
 ---
 
 ### Worked example: arithmetic benchmark
 
 ```js
-// Baseline - explicit assignments, no fusion (slowest)
-fn slow_sum(n) {
+// while loop - 4 dispatches per iteration
+fn while_sum(n) {
     let sum = 0;
     let i = 0;
-    while (i < n) {
-        sum = sum + i;   // padded, 3 dispatches
-        i = i + 1;       // padded, 3 dispatches
-    }
+    while (i < n) {      // fused compare+branch, 1 dispatch
+        sum = sum + i;   // fused, 1 dispatch (same as sum += i)
+        i = i + 1;       // fused, 1 dispatch (same as i++)
+    }                    // loop-back, 1 dispatch
     return sum;
 }
 
-// Optimized - compound assign + iter (fastest)
-fn fast_sum(n) {
+// iter loop - 3 dispatches per iteration
+fn iter_sum(n) {
     let sum = 0;
-    iter (i from 0 to n) {
-        sum += i;        // fused, 1 dispatch
-    }
+    iter (i from 0 to n) {   // fused increment+check, 1 dispatch
+        sum += i;            // fused, 1 dispatch
+    }                        // loop-back, 1 dispatch
     return sum;
 }
 ```
 
-`fast_sum` inner loop (with `--strip`): 3 dispatches per iteration for 2 meaningful operations - fused increment+check, compound assign, loop-back.
+Both assignment styles produce the same instructions; the saving comes from `iter` folding the counter's increment and bound check into one instruction.
 
 ---
 
@@ -4620,11 +4771,16 @@ Allowed exceptions:
 - Calls to other eligible functions become direct JIT-to-JIT calls when the callee returns a scalar; object-returning script callees keep the caller on the interpreter
 
 **Fibers and long JIT loops:** a JIT-compiled function runs as one native call and
-cannot be preempted mid-loop. Every loop back-edge decrements a scheduling counter;
-on expiry (every 10,000 iterations) the JIT pumps pending IO (timers, sockets,
-completions) and flags the fiber so it yields to other fibers as soon as the JIT
-call returns. Async work therefore keeps flowing during long numeric kernels, but a
-single very long JIT call still occupies the CPU until it finishes.
+cannot be preempted, mid-loop or otherwise. It occupies the CPU until it returns:
+no IO is pumped, no timer fires, and no other fiber runs for the duration. Loops
+that `await`, sleep, or do IO still yield at those points, and control returns to
+the scheduler as soon as the JIT call finishes - but a long pure-compute kernel
+holds the thread throughout.
+
+A per-back-edge scheduling check was measured and rejected: it costs 15-26% on
+loop-heavy kernels, which is more than the fairness is worth for a tier whose
+whole purpose is tight numeric loops. Split a very long computation across
+several calls if other fibers need to make progress while it runs.
 
 ```flaris
 fn sum_to(n: int) : int {
@@ -4668,15 +4824,15 @@ The reason on each `·` line names the first disqualifier and its line, so you c
 
 ### JIT IR in compiled .flx files
 
-The JIT is on by default at both ends. When you compile a `.flx`, the JIT code for every eligible function is embedded alongside the regular bytecode; without `--jit` at compile time, none is written:
+The JIT is on by default at both ends. When you compile a `.flx`, the JIT code for every eligible function is embedded alongside the regular bytecode; with `--jit-disable` at compile time, none is written:
 
 ```sh
-flarisvm --compile myfile.fls myfile.flx   # compile - embeds JIT code
-flarisvm --exec myfile.flx                 # execute - runs functions natively
-flarisvm    --exec myfile.flx              # execute - runs bytecode only (JIT code present but inactive)
+flarisvm --compile myfile.fls myfile.flx                # compile - embeds JIT code
+flarisvm --exec myfile.flx                              # execute - runs functions natively
+flarisvm --jit-disable --exec myfile.flx                # execute - bytecode only (JIT code present but inactive)
 ```
 
-The embedded JIT code is architecture-independent - the same `.flx` runs natively on any platform with a JIT backend, and stays fully portable: it is only activated when `--jit` is passed at run time; otherwise functions run on the bytecode interpreter. (Self-contained binaries built with `--embed` always run with the JIT active.)
+The embedded JIT code is architecture-independent - the same `.flx` runs natively on any platform with a JIT backend, and stays fully portable: `--jit-disable` at run time leaves it in the file but never compiles it, and functions run on the bytecode interpreter. (Self-contained binaries built with `--embed` record the setting chosen at embed time.)
 
 ### Supported operations
 
@@ -4946,11 +5102,12 @@ Results are wall-clock time on a single fiber. Workloads with tight integer loop
 
 ## R12 - Static Analyzer
 
-Between the parser and the optimizer, every compile runs a ten-pass static
+Between the parser and the optimizer, every compile runs an eight-pass static
 analyzer over the AST. It resolves names and types, reports problems, and
 decorates the tree with the facts the optimizer, code generator and JIT depend
-on (`resolved_fn_decl` drives inlining, purity stamps drive LICM, JIT
-eligibility drives native compilation).
+on: which declaration each call resolves to (inlining), which calls have no
+side effects (so a loop-invariant call can be hoisted), and which functions
+qualify for native compilation.
 
 The analyzer runs on every compile - `flarisvm file.fls`, `--compile`, `VM.Eval`, and
 module loading. It is not a separate lint step and cannot be skipped.
@@ -4972,11 +5129,12 @@ assert on compiler output in tests.
 
 A compile stops after **100 errors** and stops recording after **200
 warnings**; the remainder are counted and summarised. Compilation fails if any
-error was reported. Warnings never fail a compile.
+error was reported, or if any warning survives suppression under `-Werror`.
 
-Text interpolated into a diagnostic (identifiers, string-literal contents) has
-its control bytes escaped as `\xNN`, so source containing terminal escape
-sequences cannot repaint the terminal or forge compiler output.
+Text interpolated into a diagnostic (identifiers, string-literal contents, the
+file name) has its control bytes escaped as `\xNN`, so source or a path
+containing terminal escape sequences cannot repaint the terminal or forge
+compiler output.
 
 ### Error codes (1000+)
 
@@ -4988,32 +5146,33 @@ diagnostics.
 | 1000 | `type-error` | `TYPE_ERROR` | Operand, assignment or argument type mismatch |
 | 1001 | `arg-count` | `ARG_COUNT` | Wrong number of arguments to a function, method or constructor |
 | 1002 | `invalid-return` | `INVALID_RETURN` | A path can finish without returning a declared value, or `return;` where a value is required |
-| 1003 | `undefined-symbol` | `UNDEFINED_SYMBOL` | Name does not resolve - undefined variable, function, export or base class |
+| 1003 | `undefined-symbol` | `UNDEFINED_SYMBOL` | Name does not resolve - undefined variable, function, export or base class, or a member a built-in module does not have (`Math.Flor` suggests `Floor`; a read reports the same as a call) |
 | 1004 | `redeclaration` | `REDECLARATION` | Name already declared in this scope |
 | 1005 | `const-assign` | `CONST_ASSIGN` | Write to a `const` binding, or to one of its properties or elements |
 | 1006 | `invalid-control-flow` | `INVALID_CONTROL_FLOW` | `break`/`continue` outside a loop or switch, `return` outside a function, or control leaving a `finally` |
 | 1007 | `invalid-throw` | `INVALID_THROW` | Thrown value is not an `Exception` (or subclass) instance |
 | 1008 | — | `INVALID_CAST` | *Reserved* - a cast is an assertion and is not checked |
-| 1009 | — | `IMPORT_RESOLUTION` | *Reserved* - see [Reserved codes](#reserved-codes) |
+| 1009 | `import-resolution` | `IMPORT_RESOLUTION` | An imported name is not among the exports of a library whose compiled `.flx` was found - see [Reserved codes](#reserved-codes) for what is deliberately left to the loader |
 | 1010 | `class-this-usage` | `CLASS_THIS_USAGE` | `this` used outside an instance method |
 | 1011 | `async-await-misuse` | `ASYNC_AWAIT_MISUSE` | `await` outside an `async` function, or applied to a non-fiber |
 | 1012 | `missing-entry` | `MISSING_ENTRY` | The program has neither `fn Main` nor any `export` |
-| 1013 | `invalid-assign` | `INVALID_ASSIGN` | Assignment used where a value is required (e.g. `if (x = 1)`) |
+| 1013 | `invalid-assign` | `INVALID_ASSIGN` | Assignment used as an `if`/`while`/`for` condition (e.g. `if (x = 1)`) - almost always a typo for `==` |
 | 1014 | `undeclared-field` | `UNDECLARED_FIELD` | Member is not declared on a sealed instance - unknown field or method |
 | 1015 | `circular-inheritance` | `CIRCULAR_INHERITANCE` | A class extends itself through its base chain |
 | 1016 | `missing-receiver` | `MISSING_RECEIVER` | An instance method is called through the class name - call it on an instance, or declare it `fn static` |
+| 1017 | `division-by-zero` | `DIVISION_BY_ZERO` | `/` or `%` whose right operand is the literal `0` or `0.0` - both lanes raise at runtime, so the expression can never complete. A zero held in a variable is a runtime matter and is not reported |
 
 ### Warning codes (2000+)
 
 The **Name** column is the exact spelling accepted by `-Wno-<name>` and
 `// flaris-ignore[<name>]`, and the one emitted in JSON diagnostics. It is not
-always a mechanical kebab-casing of the symbol - `2002`, `2003` and `2010`
+always a mechanical kebab-casing of the symbol - `2002` and `2003`
 differ - so copy it from this column rather than deriving it.
 
 | Code | Name | Symbol | Meaning |
 | ---- | ---- | ------ | ------- |
 | 2000 | `unused-symbol` | `UNUSED_SYMBOL` | Declared but never read - local, parameter, global or import |
-| 2001 | `possible-nil-flow` | `POSSIBLE_NIL_FLOW` | A `guard` expression may be nil |
+| 2001 | `possible-nil-flow` | `POSSIBLE_NIL_FLOW` | A `guard` expression can only be nil, so the guard always raises. A value that *may* be nil is what `guard` is for and is not reported |
 | 2002 | `float-eq` | `FLOAT_EQ_SUGGEST_APPROX` | Exact `==`/`!=` on two floats; use the approximate operator `≈` |
 | 2003 | `oob-index` | `OOB_INDEX_POSSIBLE` | Constant index outside the bounds of an array literal |
 | 2004 | `infinite-loop` | `INFINITE_LOOP` | Constant-true loop with no `break`, `return` or `throw` |
@@ -5022,13 +5181,17 @@ differ - so copy it from this column rather than deriving it.
 | 2007 | — | `STYLE` | *Reserved* - no style rules are implemented |
 | 2008 | `shadowed-variable` | `SHADOWED_VARIABLE` | Declaration hides one in an enclosing scope |
 | 2009 | `empty-block` | `EMPTY_BLOCK` | Empty function, `if`, `else`, loop, `try`, `catch` or `finally` body |
-| 2010 | `type-change` | `TYPE_ERROR` | Assignment changes a variable's declared type |
-| 2011 | `no-effect` | `NO_EFFECT` | Expression statement with no effect (e.g. a bare literal) |
-| 2012 | `class-reserved-name` | `CLASS_RESERVED_NAME` | Method shadows a built-in instance property and can never be called |
+| 2010 | — | `TYPE_ERROR` | *Reserved* - a store outside a variable's declared type is error 1000 |
+| 2011 | `no-effect` | `NO_EFFECT` | Expression statement that only computes a value: a literal, a name, an operator, member, index or conditional expression, or an array/object literal built from such parts. A call is never reported, whatever its purity - a pure function may still raise, and `Type.Assert(v, "int");` is a call made for exactly that |
+| 2012 | — | `CLASS_RESERVED_NAME` | *Reserved* - instances have no built-in properties, so no method name is reserved |
 | 2013 | `duplicate-key` | `DUPLICATE_KEY` | Repeated key in an object literal - the first value is kept |
 | 2014 | `duplicate-case` | `DUPLICATE_CASE` | Repeated `case` value - only the first match runs |
 | 2015 | `override-mismatch` | `OVERRIDE_MISMATCH` | An override takes a different number of parameters than the method it replaces |
 | 2016 | `class-shadows-module` | `CLASS_SHADOWS_MODULE` | A non-static method is named after a built-in namespace *and* the class calls that namespace - the call resolves to the method and yields `nil` |
+| 2017 | `nil-argument` | `NIL_ARGUMENT` | A literal `nil` passed to a parameter of a user-declared function whose annotated type does not include nil - the VM passes it through, so this is a warning; declare the parameter `T\|nil` to accept it. Only the literal is reported (a variable holding nil may be a `let x = nil;` awaiting its store), and builtins are nil-safe and never reported |
+| 2018 | `mismatched-compare` | `MISMATCHED_COMPARE` | `==`, `!=` or an ordering between values that can never be equal: the numeric types (int, float, char, bool) compare with each other by value, `nil` with `nil`, and every other type only with its own kind - so `"5" == 5` is always false and `"5" != 5` always true. Only reported when both operand types are known; a comparison with `nil` is left to the nil rules |
+| 2019 | `self-assign` | `SELF_ASSIGN` | `x = x`, or the same member chain on both sides (`this.a = this.a`); compound stores (`x += x`) are not reported |
+| 2020 | `self-compare` | `SELF_COMPARE` | A name compared with itself (`x == x`, `x < x`) - the result is fixed. A float operand is not reported, because `f != f` is the NaN test |
 
 Every warning above (the *Reserved* codes excepted) is suppressible; **no error
 is**. A raw number works anywhere a name does, e.g. `-Wno-2000`.
@@ -5037,13 +5200,18 @@ is**. A raw number works anywhere a name does, e.g. `-Wno-2000`.
 
 Codes marked *Reserved* are never emitted. Their numbers stay retired rather
 than being reused, so tooling that matches on a code can rely on it never
-changing meaning.
+changing meaning. `2010` retired when a store outside a declared type became
+error 1000; `2012` retired with the built-in instance properties it warned
+about.
 
-`1009 IMPORT_RESOLUTION` is reserved rather than implemented because telling
-"this module does not exist" apart from "this module exports nothing" needs a
-resolver with no side effects, and the runtime's module resolver performs
-network fetches and version-pin enforcement - neither is acceptable during a
-compile. An unresolvable import is reported by the runtime loader instead.
+`1009 IMPORT_RESOLUTION` is deliberately narrow rather than reserved: it fires
+only when the dependency's compiled `.flx` is found locally and its export
+list, read from the file header, does not contain the imported name. Telling
+"this module does not exist" apart from "this module exports nothing" would
+need a resolver with no side effects, and the runtime's module resolver
+performs network fetches and version-pin enforcement - neither is acceptable
+during a compile - so an import that cannot be found, and every `http(s)://`
+import, is left to the runtime loader.
 
 ### Suppressing an unused-symbol warning
 
@@ -5085,10 +5253,12 @@ means the program is invalid and would not survive code generation.
 | ---- | ------ |
 | `-Wno-<name>` | Silence one warning across the whole compile, e.g. `-Wno-unused-symbol`. `<name>` is the **Name** column of the warning table above (or its raw number). An unknown or non-suppressible name is a hard error, so a typo cannot silently do nothing. |
 | `-Werror` | Any warning that survives suppression fails the compile |
+| `-Werror=<name>` | Fail the compile when that one warning is reported, e.g. `-Werror=no-effect`. The finding is still printed as a warning; only the verdict changes. Repeat the flag for several names |
 | `-w` | Silence all warnings |
 
-`-Wno-` rejects an unknown name, and refuses error codes, rather than silently
-doing nothing. All three flags also apply to `VM.Eval` and `VM.Compile`.
+`-Wno-` and `-Werror=` reject an unknown name, and refuse error codes, rather
+than silently doing nothing. All four flags also apply to `VM.Eval` and
+`VM.Compile`.
 
 ### Machine-readable diagnostics
 
@@ -5101,10 +5271,15 @@ flarisvm --compile app.fls app.flx --diagnostics json
 
 ```json
 [
-  {"severity":"warning","code":2000,"name":"unused-symbol","file":"app.fls","line":1,"column":1,"message":"Global 'unusedOne' is never read."},
+  {"severity":"warning","code":2000,"name":"unused-symbol","file":"app.fls","line":1,"column":1,"endLine":1,"endColumn":22,"message":"Global 'unusedOne' is never read."},
   {"severity":"error","code":1000,"name":"type-error","file":"app.fls","line":4,"column":29,"message":"Operator '-' does not accept string as its left operand."}
 ]
 ```
+
+`endLine` and `endColumn` are present when the analyzer knows the extent of
+the construct - declarations and most statements carry one; a diagnostic on an
+expression reports its start only. The range is half-open: the end is one past
+the last character.
 
 In this mode stdout carries nothing but the array - the usual summary and
 fingerprint lines are suppressed so the output can be piped straight into a
@@ -5117,6 +5292,7 @@ within a short edit distance:
 
 ```
 1003: 'totl' is not defined. Did you mean 'total'?
+1003: Module 'Math' has no member 'Flor'. Did you mean 'Floor'?
 1014: Class 'Counter' has no member 'cont'. Did you mean 'count'?
 ```
 
@@ -5133,6 +5309,13 @@ name, so the suggestion is reproducible.
   `break`/`continue` targeting a loop opened *inside* the `finally` is fine.
 - A function with a declared return type must return on every path. Falling off
   the end would yield nil, which a typed caller cannot detect.
+- An assignment may not be the whole condition of an `if`, `while` or `for`
+  (1013): `if (x = 1)` is almost always a typo for `==`, and wrapping it in
+  parentheses does not change that. An assignment as an *operand* of the
+  condition is fine, and is the sanctioned way to assign and test in one step:
+  `while ((n = Next()) != nil) { ... }`.
+- Control may not leave the init block of `new C(...) { ... }` via `return`,
+  `break` or `continue`: the block runs as the instance's own initializer.
 
 These rules apply inside **function literals** exactly as they do in named
 functions - a lambda body is its own control-flow scope.
