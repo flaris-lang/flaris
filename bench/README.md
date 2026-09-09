@@ -46,6 +46,14 @@ Runtimes are discovered on `PATH` and can each be overridden:
 | `PYTHON` | `python3`, `python` |
 | `LUA` | `lua`, `lua5.4`, `lua5.3` |
 | `LUAJIT` | `luajit` |
+| `LUAU` | `luau` |
+| `WREN` | `wren_cli`, `wren` |
+| `JANET` | `janet` |
+| `SQUIRREL` | `sq` |
+| `DUK` | `duk` |
+| `MICROPYTHON` | `micropython` |
+| `RUBY` | brew ruby, then `ruby` |
+| `PHP` | `php` |
 | `NODE` | `node`, `nodejs` |
 | `QJS` | `qjs`, `quickjs` |
 | `RUNS` | `3` (runs per benchmark; the median is reported) |

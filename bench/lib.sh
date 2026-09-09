@@ -80,6 +80,17 @@ resolve_all_tools() {
     resolve_tool PYTHON   python3 python        || true
     resolve_tool LUA      lua lua5.4 lua5.3     || true
     resolve_tool LUAJIT   luajit                || true
+    resolve_tool LUAU     luau                  || true
+    # The embeddable peer group: small VMs a host links into its own program,
+    # which is the category Flaris actually competes in.
+    resolve_tool WREN     wren_cli wren         || true
+    resolve_tool JANET    janet                 || true
+    resolve_tool SQUIRREL sq                    || true
+    resolve_tool DUK      duk                   || true
+    resolve_tool MICROPYTHON micropython        || true
+    # macOS ships an ancient system Ruby with no YJIT; prefer a real one.
+    resolve_tool RUBY     /opt/homebrew/opt/ruby/bin/ruby /usr/local/opt/ruby/bin/ruby ruby || true
+    resolve_tool PHP      php                   || true
     resolve_tool NODE     node nodejs           || true
     resolve_tool QJS      qjs quickjs           || true
     require_dotnet_filebased
@@ -102,6 +113,14 @@ report_missing_tools() {
     [[ -z "$PYTHON" ]] && missing+=("Python 3")
     [[ -z "$LUA"    ]] && missing+=("Lua")
     [[ -z "$LUAJIT" ]] && missing+=("LuaJIT")
+    [[ -z "$LUAU"   ]] && missing+=("Luau")
+    [[ -z "$WREN"   ]] && missing+=("Wren")
+    [[ -z "$JANET"  ]] && missing+=("Janet")
+    [[ -z "$SQUIRREL" ]] && missing+=("Squirrel")
+    [[ -z "$DUK"    ]] && missing+=("Duktape")
+    [[ -z "$MICROPYTHON" ]] && missing+=("MicroPython")
+    [[ -z "$RUBY"   ]] && missing+=("Ruby")
+    [[ -z "$PHP"    ]] && missing+=("PHP")
     [[ -z "$NODE"   ]] && missing+=("Node")
     [[ -z "$QJS"    ]] && missing+=("QuickJS")
     if (( ${#missing[@]} )); then
@@ -261,6 +280,12 @@ lang_name() { case "$1" in
                 rs)   echo "Rust" ;;       cs)     echo "C#" ;;
                 nim)  echo "Nim" ;;        py)     echo "Python 3" ;;
                 lua)  echo "Lua" ;;        luajit) echo "LuaJIT" ;;
+                luau) echo "Luau" ;;       luauc)  echo "Luau codegen" ;;
+                wren) echo "Wren" ;;       janet)  echo "Janet" ;;
+                nut)  echo "Squirrel" ;;   duk)    echo "Duktape" ;;
+                mpy)  echo "MicroPython" ;; rb)    echo "Ruby" ;;
+                rbj)  echo "Ruby YJIT" ;;  php)    echo "PHP" ;;
+                phpj) echo "PHP JIT" ;;
                 js)   echo "QuickJS" ;;    node)   echo "Node/V8" ;;
                 fls)  echo "Flaris" ;;     flsj)   echo "Flaris JIT" ;;
                 *)    echo "$1" ;;
@@ -271,6 +296,12 @@ lang_detail() { case "$1" in
                   rs)   echo "rustc -O" ;;          cs)     echo ".NET JIT" ;;
                   nim)  echo "-d:release -O3" ;;    py)     echo "CPython" ;;
                   lua)  echo "interpreted" ;;       luajit) echo "tracing JIT" ;;
+                  luau) echo "register VM, -O2" ;;  luauc)  echo "-O2 --codegen" ;;
+                  wren) echo "embeddable VM" ;;     janet)  echo "embeddable VM" ;;
+                  nut)  echo "embeddable VM" ;;     duk)    echo "embeddable VM, ES5.1" ;;
+                  mpy)  echo "embedded-target VM" ;; rb)    echo "CRuby, YJIT off" ;;
+                  rbj)  echo "CRuby + YJIT" ;;      php)    echo "Zend VM" ;;
+                  phpj) echo "Zend + tracing JIT" ;;
                   js)   echo "interpreted" ;;       node)   echo "V8" ;;
                   fls)  echo "bytecode VM, JIT off" ;; flsj)   echo "bytecode VM + JIT" ;;
                   *)    echo "" ;;
@@ -307,6 +338,25 @@ flaris_version() {
     [[ -n "$FLARISVM" ]] || { echo "unknown"; return; }
     "$FLARISVM" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 \
         || echo "unknown"
+}
+
+# Luau's CLI reports no version anywhere: not --version, not the REPL banner,
+# and _VERSION is the string "Luau" for Lua compatibility. Ask whatever
+# installed it, and say plainly when even that is unavailable rather than
+# inventing a number.
+luau_version() {
+    [[ -n "$LUAU" ]] || { echo "not installed"; return; }
+    local v=""
+    have brew && v=$(brew list --versions luau 2>/dev/null | awk '{print $2}')
+    echo "${v:-version not reported by the CLI}"
+}
+
+# Duktape's CLI has no version flag either - `duk -h` prints usage only.
+duk_version() {
+    [[ -n "$DUK" ]] || { echo "not installed"; return; }
+    local v=""
+    have brew && v=$(brew list --versions duktape 2>/dev/null | awk '{print $2}')
+    echo "${v:-version not reported by the CLI}"
 }
 
 tool_version() {  # tool_version <cmd> <version-args...>

@@ -66,7 +66,7 @@ if [[ -n "$DOTNET" ]]; then
 fi
 
 # ── run ──────────────────────────────────────────────────────────────────────
-LANGS=(c rs go nim cs py lua luajit js node fls flsj)
+LANGS=(c rs go nim cs py rb rbj php phpj lua luajit luau luauc wren janet nut duk mpy js node fls flsj)
 
 run_lang() {  # run_lang <bench> <lang>
     local b="$1" l="$2" f
@@ -83,6 +83,26 @@ run_lang() {  # run_lang <bench> <lang>
       lua)    run_one "$b" lua    "$LUA"    "bench_${b}.lua" ;;
       luajit) f="bench_${b}.lua"; [[ -f "bench_${b}_jit.lua" ]] && f="bench_${b}_jit.lua"
               run_one "$b" luajit "$LUAJIT" "$f" ;;
+      # Luau's two lanes mirror Flaris's own: the register VM alone, and the
+      # same VM with native code generation switched on. -O2 in both, because
+      # the CLI defaults to -O1 and nobody ships a game at -O1.
+      luau)   run_one "$b" luau   "$LUAU" -O2 "bench_${b}.luau" ;;
+      luauc)  run_one "$b" luauc  "$LUAU" -O2 --codegen "bench_${b}.luau" ;;
+      # The embeddable peer group - small VMs a host links into its own
+      # program, which is the category Flaris competes in.
+      wren)   run_one "$b" wren   "$WREN"     "bench_${b}.wren" ;;
+      janet)  run_one "$b" janet  "$JANET"    "bench_${b}.janet" ;;
+      nut)    run_one "$b" nut    "$SQUIRREL" "bench_${b}.nut" ;;
+      # Duktape is ES5.1, so it gets its own sources rather than the qjs ones.
+      duk)    run_one "$b" duk    "$DUK"      "bench_${b}_duk.js" ;;
+      # MicroPython's default heap is sized for a microcontroller; the sieve
+      # needs 10 MB of bytearray, so the unix port has to be told.
+      mpy)    run_one "$b" mpy    "$MICROPYTHON" -X heapsize=64M "bench_${b}_mpy.py" ;;
+      rb)     run_one "$b" rb     "$RUBY" --yjit-disable "bench_${b}.rb" ;;
+      rbj)    run_one "$b" rbj    "$RUBY" --yjit          "bench_${b}.rb" ;;
+      php)    run_one "$b" php    "$PHP" -d opcache.enable_cli=0 "bench_${b}.php" ;;
+      phpj)   run_one "$b" phpj   "$PHP" -d opcache.enable_cli=1 -d opcache.jit_buffer_size=64M \
+                                        -d opcache.jit=tracing "bench_${b}.php" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
       node)   run_one "$b" node   "$NODE"   "bench_${b}_node.js" ;;
       # The JIT is on by default, so the plain-VM lane has to switch it OFF.
@@ -146,6 +166,15 @@ Interpretation of these numbers lives in [../README.md](../README.md).
 | Python | $(tool_version "$PYTHON" --version) | CPython interpreted |
 | Lua | $(tool_version "$LUA" -v) | interpreted |
 | LuaJIT | $(tool_version "$LUAJIT" -v) | tracing JIT |
+| Luau | $(luau_version) | register VM, \`-O2\` |
+| Luau (codegen) | $(luau_version) | \`-O2 --codegen\`, native code generation |
+| Wren | $(tool_version "$WREN" --version) | embeddable VM |
+| Janet | $(tool_version "$JANET" -v) | embeddable VM |
+| Squirrel | $(tool_version "$SQUIRREL" -v) | embeddable VM |
+| Duktape | $(duk_version) | embeddable VM, ES5.1 |
+| MicroPython | $(tool_version "$MICROPYTHON" --version) | embedded-target VM, \`-X heapsize=64M\` |
+| Ruby | $(tool_version "$RUBY" --version) | CRuby; separate YJIT lane |
+| PHP | $(tool_version "$PHP" --version) | Zend VM; separate tracing-JIT lane |
 | Node | $(tool_version "$NODE" --version) | V8 |
 | QuickJS | $(tool_version "$QJS" --help) | interpreted |
 | Flaris | $(flaris_version) | bytecode VM (\`--strip\`) |
