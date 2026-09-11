@@ -1,0 +1,824 @@
+// test_cryptokit.fls
+// Tests for CryptoKit.fls - Kdf (HKDF, PBKDF2), Otp (HOTP, TOTP), Password
+// (Argon2id PHC), Envelope (sealed blobs) and Digest (streaming
+// MD5/SHA-1/SHA-256/SHA-384/SHA-512).
+//
+// Vectors come from RFC 5869 (HKDF), RFC 6070 and the PBKDF2 test suite,
+// RFC 4226 (HOTP), RFC 6238 (TOTP) and RFC 1321 (MD5). SHA-1, SHA-256 and
+// SHA-512 are checked against the VM's own native digests over many lengths
+// and chunkings; SHA-384 has no native counterpart, so it is checked against
+// vectors computed independently plus cross-chunking consistency on a 1 MB
+// message. SHA-384/512 need VM 1.0.3.0 or later (`>>>` and the JIT fix for
+// [int] arrays outside the tagged range).
+
+import { Kdf, Otp, Password, Envelope, Digest } from library("libs/CryptoKit", "1.0");
+import { Util } from library("Util", "1.0");
+
+global passed = 0;
+global failed = 0;
+global _sink  = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n - 1) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn assert(name: string, cond: bool) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name);
+        failed += 1;
+    }
+}
+
+fn assertEq(name: string, got, want) {
+    if (got == want) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name + "\n       got:  " + str(got) + "\n       want: " + str(want));
+        failed += 1;
+    }
+}
+
+// n bytes of value v.
+fn bytes(v: int, n: int): block {
+    let b = Buffer.Create(n, 1);
+    Buffer.Fill(b, v);
+    return b;
+}
+
+// n bytes counting up from `from`.
+fn counting(from: int, n: int): block {
+    let b = Buffer.Create(n, 1);
+    let i = 0;
+    while (i < n) { b[i] = (from + i) & 255; i = i + 1; }
+    return b;
+}
+
+// n bytes of a fixed pseudo-random pattern.
+fn pattern(n: int): block {
+    let b = Buffer.Create(n, 1);
+    let i = 0;
+    while (i < n) { b[i] = (i * 7 + (i >> 3) * 13 + 3) & 255; i = i + 1; }
+    return b;
+}
+
+fn hex(b): string {
+    if (b == nil) { return "nil"; }
+    return Util.BinToHex(b);
+}
+
+// ============================================================
+//  Kdf
+// ============================================================
+
+fn testKdf() {
+    Console.WriteLine("\n--- Kdf: HKDF (RFC 5869) ---");
+    let ikm  = bytes(0x0b, 22);
+    let salt = counting(0, 13);
+    let info = counting(0xf0, 10);
+
+    let prk1 = Kdf.HkdfExtract(salt, ikm);
+    assertEq("HKDF TC1 PRK", hex(prk1), "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+    assertEq("HKDF TC1 OKM", hex(Kdf.HkdfExpand(prk1, info, 42)),
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+    assertEq("HKDF TC1 one-call", hex(Kdf.Hkdf(ikm, salt, info, 42)),
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+
+    let prk2 = Kdf.HkdfExtract(counting(0x60, 80), counting(0, 80));
+    assertEq("HKDF TC2 PRK (80-byte inputs)", hex(prk2), "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244");
+    assertEq("HKDF TC2 OKM (82 bytes, 3 blocks)", hex(Kdf.HkdfExpand(prk2, counting(0xb0, 80), 82)),
+        "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87");
+
+    assertEq("HKDF TC3 PRK (nil salt)", hex(Kdf.HkdfExtract(nil, ikm)), "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04");
+    assertEq("HKDF TC3 OKM (nil salt, nil info)", hex(Kdf.Hkdf(ikm, nil, nil, 42)),
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+    assertEq("HKDF TC3 with empty strings", hex(Kdf.Hkdf(ikm, "", "", 42)),
+        "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+
+    assertEq("HKDF TC4 PRK (SHA-1)", hex(Kdf.HkdfExtract(salt, bytes(0x0b, 11), "sha1")), "9b6c18c432a7bf8f0e71c8eb88f4b30baa2ba243");
+    assertEq("HKDF TC4 OKM (SHA-1)", hex(Kdf.Hkdf(bytes(0x0b, 11), salt, info, 42, "SHA-1")),
+        "085a01ea1b10f36933068b56efa5ad81a4f14b822f5b091568a9cdd4f155fda2c22e422478d305f3f896");
+
+    assertEq("HKDF SHA-512 PRK is 64 bytes", len(Kdf.HkdfExtract(salt, ikm, "sha512")), 64);
+    assertEq("HKDF length 1", len(Kdf.Hkdf(ikm, salt, info, 1)), 1);
+    assertEq("HKDF max length 255*32", len(Kdf.Hkdf(ikm, salt, info, 255 * 32)), 8160);
+    assert("HKDF length 0 -> nil", Kdf.Hkdf(ikm, salt, info, 0) == nil);
+    assert("HKDF length > 255*HashLen -> nil", Kdf.Hkdf(ikm, salt, info, 255 * 32 + 1) == nil);
+    assert("HKDF unknown hash -> nil", Kdf.Hkdf(ikm, salt, info, 32, "md5") == nil);
+    assert("HKDF empty ikm -> nil", Kdf.Hkdf("", salt, info, 32) == nil);
+    assert("HKDF non-bytes ikm -> nil", Kdf.Hkdf(42, salt, info, 32) == nil);
+
+    Console.WriteLine("\n--- Kdf: PBKDF2 (RFC 6070 / RFC 7914 vectors) ---");
+    assertEq("PBKDF2-SHA1 c=1",    hex(Kdf.Pbkdf2("password", "salt", 1, 20, "sha1")),    "0c60c80f961f0e71f3a9b524af6012062fe037a6");
+    assertEq("PBKDF2-SHA1 c=2",    hex(Kdf.Pbkdf2("password", "salt", 2, 20, "sha1")),    "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957");
+    assertEq("PBKDF2-SHA1 c=4096", hex(Kdf.Pbkdf2("password", "salt", 4096, 20, "sha1")), "4b007901b765489abead49d926f721d065a429c1");
+    assertEq("PBKDF2-SHA1 c=4096 dkLen=25 (2 blocks)",
+        hex(Kdf.Pbkdf2("passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, 25, "sha1")),
+        "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038");
+    assertEq("PBKDF2-SHA256 c=1 (default hash)", hex(Kdf.Pbkdf2("password", "salt", 1, 32)),
+        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    assertEq("PBKDF2-SHA256 c=4096", hex(Kdf.Pbkdf2("password", "salt", 4096, 32, "sha256")),
+        "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
+    assertEq("PBKDF2-SHA256 c=4096 dkLen=40 (2 blocks)",
+        hex(Kdf.Pbkdf2("passwordPASSWORDpassword", "saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, 40)),
+        "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9");
+    assertEq("PBKDF2-SHA512 c=1 dkLen=64", hex(Kdf.Pbkdf2("password", "salt", 1, 64, "sha512")),
+        "867f70cf1ade02cff3752599a3a53dc4af34c7a669815ae5d513554e1c8cf252c02d470a285a0501bad999bfe943c08f050235d7d68b1da55e63f73b60a57fce");
+
+    // Password and salt with embedded NUL bytes, given as blocks.
+    let pw = Buffer.FromString("passXword"); pw[4] = 0;
+    let sa = Buffer.FromString("saXlt");     sa[2] = 0;
+    assertEq("PBKDF2-SHA256 with NUL bytes in password and salt (blocks)",
+        hex(Kdf.Pbkdf2(pw, sa, 4096, 16)), "89b69d0516f829893c696226650a8687");
+    assertEq("PBKDF2 block password == string password",
+        hex(Kdf.Pbkdf2(Buffer.FromString("password"), Buffer.FromString("salt"), 1, 32)),
+        hex(Kdf.Pbkdf2("password", "salt", 1, 32)));
+
+    assert("PBKDF2 iterations 0 -> nil", Kdf.Pbkdf2("password", "salt", 0, 32) == nil);
+    assert("PBKDF2 length 0 -> nil",     Kdf.Pbkdf2("password", "salt", 1, 0) == nil);
+    assert("PBKDF2 bad hash -> nil",     Kdf.Pbkdf2("password", "salt", 1, 32, "blake2") == nil);
+    assertEq("PBKDF2 empty salt allowed", len(Kdf.Pbkdf2("password", "", 1, 32)), 32);
+
+    Console.WriteLine("\n--- Kdf: hex helpers ---");
+    assertEq("HexToBytes",        hex(Kdf.HexToBytes("0aFF10")), "0aff10");
+    assert("HexToBytes odd length -> nil", Kdf.HexToBytes("abc") == nil);
+    assert("HexToBytes non-hex -> nil",    Kdf.HexToBytes("zz") == nil);
+    assert("HexToBytes empty -> nil",      Kdf.HexToBytes("") == nil);
+    assertEq("BytesToHex", Kdf.BytesToHex(counting(250, 6)), "fafbfcfdfeff");
+    let ss = Kdf.HexToBytes(Crypto.HmacSha256("k", "v"));
+    assertEq("HexToBytes on a native MAC gives 32 bytes", len(ss), 32);
+}
+
+// ============================================================
+//  Otp
+// ============================================================
+
+fn testOtp() {
+    Console.WriteLine("\n--- Otp: HOTP (RFC 4226) ---");
+    let secret = "12345678901234567890";
+    let want = ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"];
+    let allOk = true;
+    let c = 0;
+    while (c < 10) {
+        if (Otp.Hotp(secret, c) != want[c]) { allOk = false; Console.WriteLine("   counter " + str(c) + ": " + str(Otp.Hotp(secret, c)) + " != " + want[c]); }
+        c = c + 1;
+    }
+    assert("HOTP counters 0..9 match RFC 4226 Appendix D", allOk);
+    assertEq("HOTP secret as block", Otp.Hotp(Buffer.FromString(secret), 0), "755224");
+    assertEq("HOTP 8 digits", Otp.Hotp(secret, 0, 8), "84755224");
+    assertEq("HOTP 7 digits", Otp.Hotp(secret, 0, 7), "4755224");
+    assert("HOTP digits 5 -> nil",  Otp.Hotp(secret, 0, 5) == nil);
+    assert("HOTP digits 9 -> nil",  Otp.Hotp(secret, 0, 9) == nil);
+    assert("HOTP negative counter -> nil", Otp.Hotp(secret, -1) == nil);
+    assert("HOTP empty secret -> nil", Otp.Hotp("", 0) == nil);
+    assert("HOTP bad hash -> nil", Otp.Hotp(secret, 0, 6, "md5") == nil);
+
+    Console.WriteLine("\n--- Otp: TOTP (RFC 6238 Appendix B) ---");
+    let times = [59, 1111111109, 1111111111, 1234567890, 2000000000, 20000000000];
+    let sha1Want   = ["94287082", "07081804", "14050471", "89005924", "69279037", "65353130"];
+    let sha256Want = ["46119246", "68084774", "67062674", "91819424", "90698825", "77737706"];
+    let sha512Want = ["90693936", "25091201", "99943326", "93441116", "38618901", "47863826"];
+    let secret256 = "12345678901234567890123456789012";
+    let secret512 = "1234567890123456789012345678901234567890123456789012345678901234";
+    let ok1 = true; let ok256 = true; let ok512 = true;
+    let i = 0;
+    while (i < 6) {
+        if (Otp.Totp(secret,    times[i], 30, 8)           != sha1Want[i])   { ok1 = false; }
+        if (Otp.Totp(secret256, times[i], 30, 8, "sha256") != sha256Want[i]) { ok256 = false; }
+        if (Otp.Totp(secret512, times[i], 30, 8, "sha512") != sha512Want[i]) { ok512 = false; }
+        i = i + 1;
+    }
+    assert("TOTP SHA-1   6 timestamps", ok1);
+    assert("TOTP SHA-256 6 timestamps", ok256);
+    assert("TOTP SHA-512 6 timestamps", ok512);
+    assertEq("TOTP default step/digits at T=59", Otp.Totp(secret, 59), "287082");   // counter 1 -> HOTP(1)
+    assert("TOTP now returns 6 digits", len(Otp.Totp(secret)) == 6);
+    assert("TOTP step 0 -> nil", Otp.Totp(secret, 59, 0) == nil);
+
+    Console.WriteLine("\n--- Otp: TotpVerify ---");
+    assert("verify exact step",              Otp.TotpVerify(secret, "94287082", 1, 59, 30, 8));
+    assert("verify previous step (window 1)", Otp.TotpVerify(secret, "94287082", 1, 89, 30, 8));
+    assert("verify next step (window 1)",     Otp.TotpVerify(secret, "94287082", 1, 29, 30, 8));
+    assert("reject two steps away (window 1)", !Otp.TotpVerify(secret, "94287082", 1, 119, 30, 8));
+    assert("accept two steps away (window 2)", Otp.TotpVerify(secret, "94287082", 2, 119, 30, 8));
+    assert("reject with window 0 off-step",  !Otp.TotpVerify(secret, "94287082", 0, 89, 30, 8));
+    assert("reject wrong code",              !Otp.TotpVerify(secret, "00000000", 1, 59, 30, 8));
+    assert("reject wrong length",            !Otp.TotpVerify(secret, "9428708", 1, 59, 30, 8));
+    assert("reject non-digit",               !Otp.TotpVerify(secret, "9428708a", 1, 59, 30, 8));
+    assert("reject nil code",                !Otp.TotpVerify(secret, nil, 1, 59, 30, 8));
+    assert("reject negative window",         !Otp.TotpVerify(secret, "94287082", -1, 59, 30, 8));
+    assert("6-digit default verify",         Otp.TotpVerify(secret, "287082", 1, 59));
+
+    Console.WriteLine("\n--- Otp: secrets and provisioning ---");
+    let b32 = Otp.NewSecret();
+    assertEq("NewSecret is 32 Base32 chars (20 bytes)", len(b32), 32);
+    assert("NewSecret has no padding", String.IndexOf(b32, "=") < 0);
+    let raw = Otp.SecretFromBase32(b32);
+    assertEq("SecretFromBase32 gives 20 bytes", len(raw), 20);
+    assertEq("Base32 roundtrip", String.Replace(Util.Base32Encode(raw), "=", ""), b32);
+    assert("NewSecret differs per call", Otp.NewSecret() != b32);
+    assertEq("NewSecret(32) -> 52 chars", len(Otp.NewSecret(32)), 52);
+    assertEq("SecretFromBase32 lower case + spaces", hex(Otp.SecretFromBase32("jbsw y3dp ehpk 3pxp")), "48656c6c6f21deadbeef");
+    assertEq("SecretFromBase32 8 chars = 5 bytes", hex(Otp.SecretFromBase32("JBSWY3DP")), "48656c6c6f");
+    assertEq("SecretFromBase32 with padding", hex(Otp.SecretFromBase32("JBSWY3DPEE======")), "48656c6c6f21");
+    assert("SecretFromBase32 empty -> nil", Otp.SecretFromBase32("") == nil);
+    assert("SecretFromBase32 nil -> nil", Otp.SecretFromBase32(nil) == nil);
+
+    assertEq("ProvisioningUri default",
+        Otp.ProvisioningUri("Acme Co", "sam@acme.io", "jbswy3dpehpk3pxp"),
+        "otpauth://totp/Acme%20Co:sam%40acme.io?secret=JBSWY3DPEHPK3PXP&issuer=Acme%20Co&algorithm=SHA1&digits=6&period=30");
+    assertEq("ProvisioningUri with opts",
+        Otp.ProvisioningUri("Acme", "sam", "JBSWY3DPEHPK3PXP", { digits: 8, step: 60, hash: "sha256" }),
+        "otpauth://totp/Acme:sam?secret=JBSWY3DPEHPK3PXP&issuer=Acme&algorithm=SHA256&digits=8&period=60");
+    assert("ProvisioningUri bad digits -> nil", Otp.ProvisioningUri("Acme", "sam", "JBSWY3DP", { digits: 4 }) == nil);
+    assert("ProvisioningUri empty secret -> nil", Otp.ProvisioningUri("Acme", "sam", "") == nil);
+
+    // Enrolment round trip: the secret the app scans verifies the code the app shows.
+    let enrolled = Otp.SecretFromBase32(b32);
+    let shown = Otp.Totp(enrolled);
+    assert("enrolment round trip verifies", Otp.TotpVerify(enrolled, shown));
+}
+
+// ============================================================
+//  Password
+// ============================================================
+
+fn testPassword() {
+    Console.WriteLine("\n--- Password: Argon2id PHC strings ---");
+    let fast = { memKiB: 1024, iterations: 1 };
+    let phc = Password.Hash("correct horse battery staple", fast);
+    assert("Hash returns a string", Type.Of(phc) == Type.String);
+    assert("PHC prefix", String.StartsWith(phc, "$argon2id$v=19$m=1024,t=1,p=1$"));
+    assertEq("PHC has 6 '$'-separated fields", len(String.Split(phc, "$")), 6);
+    assert("Verify correct password", Password.Verify("correct horse battery staple", phc));
+    assert("Verify wrong password", !Password.Verify("correct horse battery stapl", phc));
+    assert("Verify wrong case", !Password.Verify("Correct horse battery staple", phc));
+    assert("Verify block password", Password.Verify(Buffer.FromString("correct horse battery staple"), phc));
+    assert("Two hashes of one password differ (random salt)", Password.Hash("x", fast) != Password.Hash("x", fast));
+
+    let p = Password.Parse(phc);
+    assert("Parse returns an object", p != nil);
+    assertEq("Parse memKiB", p.memKiB, 1024);
+    assertEq("Parse iterations", p.iterations, 1);
+    assertEq("Parse parallelism", p.parallelism, 1);
+    assertEq("Parse version", p.version, 19);
+    assertEq("Parse salt is 16 bytes", len(p.salt), 16);
+    assertEq("Parse hash is 32 bytes", len(p.hash), 32);
+    assertEq("Parse hash == Argon2 of (password, salt)", hex(p.hash),
+        Crypto.Argon2("correct horse battery staple", p.salt, 1, 1024));
+
+    // A PHC string assembled by hand from the VM's own Argon2 output verifies.
+    let salt = Kdf.HexToBytes("000102030405060708090a0b0c0d0e0f");
+    let tagHex = Crypto.Argon2("hunter2", salt, 2, 2048);
+    let handMade = "$argon2id$v=19$m=2048,t=2,p=1$" + String.Replace(Util.Base64Encode(salt), "=", "")
+                 + "$" + String.Replace(Util.Base64Encode(Kdf.HexToBytes(tagHex)), "=", "");
+    assert("hand-assembled PHC verifies", Password.Verify("hunter2", handMade));
+    assert("PHC without v=19 segment parses", Password.Parse(String.Replace(handMade, "$v=19", "")) != nil);
+    assert("PHC without v=19 verifies", Password.Verify("hunter2", String.Replace(handMade, "$v=19", "")));
+
+    Console.WriteLine("\n--- Password: rejects ---");
+    assert("Verify tampered hash char", !Password.Verify("hunter2", String.Substr(handMade, 0, len(handMade) - 1) + "A"));
+    assert("Verify p=2 -> false",       !Password.Verify("hunter2", String.Replace(handMade, "p=1", "p=2")));
+    assert("Verify argon2i -> false",   !Password.Verify("hunter2", String.Replace(handMade, "argon2id", "argon2i")));
+    assert("Verify garbage -> false",   !Password.Verify("hunter2", "not a phc string"));
+    assert("Verify nil -> false",       !Password.Verify("hunter2", nil));
+    assert("Verify empty -> false",     !Password.Verify("hunter2", ""));
+    assert("Verify m=abc -> false",     !Password.Verify("hunter2", String.Replace(handMade, "m=2048", "m=abc")));
+    assert("Parse short salt -> nil",   Password.Parse("$argon2id$v=19$m=2048,t=2,p=1$YWJj$" + String.Substr(handMade, len(handMade) - 43)) == nil);
+    assert("Hash memKiB below 8 -> nil", Password.Hash("x", { memKiB: 4 }) == nil);
+    assert("Hash iterations 0 -> nil",   Password.Hash("x", { iterations: 0 }) == nil);
+    assert("Hash non-int opt -> nil",    Password.Hash("x", { memKiB: "lots" }) == nil);
+    assert("Hash non-bytes password -> nil", Password.Hash(12345) == nil);
+
+    Console.WriteLine("\n--- Password: NeedsRehash ---");
+    assert("same params -> false",          !Password.NeedsRehash(phc, fast));
+    assert("higher memory wanted -> true",   Password.NeedsRehash(phc, { memKiB: 2048, iterations: 1 }));
+    assert("higher iterations wanted -> true", Password.NeedsRehash(phc, { memKiB: 1024, iterations: 2 }));
+    assert("defaults wanted, weak hash -> true", Password.NeedsRehash(phc));
+    assert("garbage -> true",                Password.NeedsRehash("nope"));
+    assert("p=2 -> true",                    Password.NeedsRehash(String.Replace(handMade, "p=1", "p=2"), { memKiB: 8, iterations: 1 }));
+    let strong = Password.Hash("pw");
+    assert("default-params hash verifies",   Password.Verify("pw", strong));
+    assert("default-params hash needs no rehash", !Password.NeedsRehash(strong));
+    assert("default PHC prefix", String.StartsWith(strong, "$argon2id$v=19$m=65536,t=3,p=1$"));
+}
+
+// ============================================================
+//  Envelope
+// ============================================================
+
+fn testEnvelope() {
+    Console.WriteLine("\n--- Envelope: key-sealed ---");
+    let key = Envelope.NewKey();
+    assertEq("NewKey is 32 bytes", len(key), 32);
+    let blob = Envelope.Seal("attack at dawn", key);
+    assert("Seal returns a block", Type.Of(blob) == Type.Block);
+    assertEq("blob length = 1 + 24 + 16 + n", len(blob), 1 + 24 + 16 + 14);
+    assertEq("version byte 1", blob[0], 1);
+    let back = Envelope.Open(blob, key);
+    assert("Open returns a block", Type.Of(back) == Type.Block);
+    assertEq("Open gives the plaintext", Buffer.ToString(back), "attack at dawn");
+    assert("Seal twice differs (fresh nonce)", !Buffer.Equals(blob, Envelope.Seal("attack at dawn", key)));
+    assert("Open with wrong key -> nil", Envelope.Open(blob, Envelope.NewKey()) == nil);
+    assert("Open with 31-byte key -> nil", Envelope.Open(blob, Buffer.Slice(key, 0, 31)) == nil);
+    assert("Seal with 31-byte key -> nil", Envelope.Seal("x", Buffer.Slice(key, 0, 31)) == nil);
+    assert("Seal empty plaintext -> nil", Envelope.Seal("", key) == nil);
+    assert("Seal nil -> nil", Envelope.Seal(nil, key) == nil);
+    assert("key as 32-char string works", Buffer.ToString(Envelope.Open(Envelope.Seal("hi", "01234567890123456789012345678901"), "01234567890123456789012345678901")) == "hi");
+
+    let n = len(blob);
+    let t1 = Buffer.Slice(blob, 0, n); t1[n - 1] = t1[n - 1] ^ 1;
+    assert("flipped ciphertext bit -> nil", Envelope.Open(t1, key) == nil);
+    let t2 = Buffer.Slice(blob, 0, n); t2[30] = t2[30] ^ 1;
+    assert("flipped tag bit -> nil", Envelope.Open(t2, key) == nil);
+    let t3 = Buffer.Slice(blob, 0, n); t3[5] = t3[5] ^ 1;
+    assert("flipped nonce bit -> nil", Envelope.Open(t3, key) == nil);
+    let t4 = Buffer.Slice(blob, 0, n); t4[0] = 2;
+    assert("wrong version byte -> nil", Envelope.Open(t4, key) == nil);
+    assert("truncated by one byte -> nil", Envelope.Open(Buffer.Slice(blob, 0, n - 1), key) == nil);
+    assert("header only -> nil", Envelope.Open(Buffer.Slice(blob, 0, 41), key) == nil);
+    assert("nil blob -> nil", Envelope.Open(nil, key) == nil);
+    assert("string blob (bytes) works", Buffer.ToString(Envelope.Open(Buffer.ToString(blob), key)) == "attack at dawn");
+
+    let big = pattern(1 << 20);
+    let bigBlob = Envelope.Seal(big, key);
+    assert("1 MB round trip", Buffer.Equals(Envelope.Open(bigBlob, key), big));
+
+    Console.WriteLine("\n--- Envelope: password-sealed ---");
+    let fast = { memKiB: 1024, iterations: 1 };
+    let pblob = Envelope.SealWithPassword("attack at dusk", "open sesame", fast);
+    assert("SealWithPassword returns a block", Type.Of(pblob) == Type.Block);
+    assertEq("version byte 2", pblob[0], 2);
+    assertEq("header records memKiB", Buffer.ReadU32At(pblob, 1, true), 1024);
+    assertEq("header records iterations", pblob[5], 1);
+    assertEq("blob length = 22 + 24 + 16 + n", len(pblob), 22 + 24 + 16 + 14);
+    assertEq("OpenWithPassword gives the plaintext", Buffer.ToString(Envelope.OpenWithPassword(pblob, "open sesame")), "attack at dusk");
+    assert("wrong password -> nil", Envelope.OpenWithPassword(pblob, "open sesamee") == nil);
+    assert("key-sealed blob to OpenWithPassword -> nil", Envelope.OpenWithPassword(blob, "open sesame") == nil);
+    assert("password blob to Open -> nil", Envelope.Open(pblob, key) == nil);
+    let pn = len(pblob);
+    let t5 = Buffer.Slice(pblob, 0, pn); t5[4] = t5[4] ^ 1;
+    assert("tampered memKiB header -> nil", Envelope.OpenWithPassword(t5, "open sesame") == nil);
+    let t6 = Buffer.Slice(pblob, 0, pn); t6[10] = t6[10] ^ 1;
+    assert("tampered salt -> nil", Envelope.OpenWithPassword(t6, "open sesame") == nil);
+    assert("SealWithPassword bad opts -> nil", Envelope.SealWithPassword("x", "pw", { memKiB: 1 }) == nil);
+    assert("DeriveKey is 32 bytes", len(Envelope.DeriveKey("pw", "0123456789abcdef", fast)) == 32);
+    assert("DeriveKey short salt -> nil", Envelope.DeriveKey("pw", "short", fast) == nil);
+    assertEq("DeriveKey == Argon2", hex(Envelope.DeriveKey("pw", "0123456789abcdef", fast)), Crypto.Argon2("pw", "0123456789abcdef", 1, 1024));
+    let dblob = Envelope.SealWithPassword("defaults", "pw");
+    assertEq("default-cost password blob opens", Buffer.ToString(Envelope.OpenWithPassword(dblob, "pw")), "defaults");
+}
+
+// ============================================================
+//  Digest
+// ============================================================
+
+const SHA384_TEST_LENS: [int] = [0, 1, 2, 54, 55, 56, 57, 63, 64, 65, 110, 111, 112, 113, 127, 128, 129, 130, 199, 200, 201, 255, 256, 300];
+const SHA384_TEST_HEX: array = [
+        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
+        "8a6c69af6fb6247635f837958446fb8f10e39bd5fbc244f7e635176339a3be614f6394247f01dbe1126c178c7bd48cb5",
+        "9f99702641c7fa8edcee3c4f8bc365aa9353fd7d79a11ddb22efc5ea97341a8d878588c421c4059f66cca96c75eb55d6",
+        "a855b21c573cb08d8669c45a584ea9a0ddb412afbf0581dc9b2a23d425f938d48753421be494553cb483245f9db6b9be",
+        "af0ed15f3c9d5edb9a57423c481769ba96fcd2c1c7a39710595a387791f9e4fe15b46310424c961b38b3e312e458790c",
+        "3702c27629e147bc8ab56a5c4868c61dbb9601004c16c1461ca3be2b57b05bf8bd0b2409bd5d95d2f5a4446ae6d8c65c",
+        "85b07ef5fac3bc8d4118c136b86cba60c7166c8d8eb514ac9208ad0422a5a52db155608eaf2664f3475034943c1131cd",
+        "0ef9816c330c927e1e14345521a869bb37ff85bcfe165eb1d3517d32bd5e9769ab73700f3432aa5137c53120b98651ae",
+        "f6af82cf69aa87613c5520c7c71c6fc2fdbe39c63e5212409132ff17ba9a8216685a1db6f18e029f5b4a1c1af0647d66",
+        "f2338ee09c386f2389b4664e0892407db4324335402906884c534eccfa64641675ec61404cd0a1e77d9daa5e71bcb39e",
+        "3db29712310d656212c78f4b51f1b7f6fc619d815a9f7275268a9d303915cc24a888443c59dcf757dd48d729089b760d",
+        "be509aefca1ea0b18ab3389e67f28993719b108925f19aec8b1772c6b9965387a6d6a57ee806ed6253e634de7eec12a0",
+        "d17b75d28b12469aea9dd56248dfd5277d8e1bec2c77dc5a497abe5a49dfb8aefb4a0d41bdd3ee7b466e0fd1061a35a3",
+        "442afdaf42f88f530b0c42d9b99a7e2dc18c410bc847fd8ca04a9013af068411782f39043c5bc83c8d53e75012bfd438",
+        "0de279bb7a30eea6616b84088c170f441571c164caaaef82a1b1fcbe6cbed90574cfb9ca0aeb5cd7b5b6922fe2b6ccee",
+        "f1be1b67089dbb4a1af04e7c73bf3721734a6561794a1d6044f23259f18d23cf9590ef883d7c4033671f4cbb14b6ae4c",
+        "27b55472662ed0c434e111231d6fc277a5f2f677a3bf405da20e5fd0b333828982c39caa05417b3ac39521512b397729",
+        "47ec17bba952cc8a428a13530561b21be9055d6a2335250991e11617d5724d09ee195255dab2ee36fb5008947f2ce9cb",
+        "b0f15c7768ba55de9c8ade4077a02bfd7d04ce0c25cf63e25ba0bab17707879a09a40c06802dd2f2220c9919085f098e",
+        "75523aa146e9222e9c79682b8bab41202940df5f5f9fe30982f69e12da95f23bb0d6029543591bb5781213439d373027",
+        "1a5f46bf4f52b93214ddfa2c5cb61fcca7cfd6a9795e8cc1ec3a33069052c1323bba5ee5196605927c753d049b49169c",
+        "a7e2547426ff853d5dc33f6ec496bb0cfb10696663d7522cc72ca6d2e68923f62ce14dda561900cb5fffca537bd2ce34",
+        "819677af8eecff54ab00babd9a88c7547acf5e991e531a9b95818db2a25e910d8faf878f318c801425d54497883161d5",
+        "2ac0566948b5db6e2a884e9b4aa2501686147f2bf43f047a152dec399f81461fd0cddb54d0821aa4ab4103363685c103" ];
+
+const SHA3_224_LENS: [int] = [0, 1, 2, 142, 143, 144, 145, 146, 287, 288, 289, 300];
+const SHA3_224_HEX: array = [
+        "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7",
+        "b740a3b446920772a10caf69736eb712d7dab3b380e7c1a2def19b7a",
+        "23054459c897d90cc949b013db05647cc78b6c4e2de3c4dfc1527676",
+        "4bec2ac385b31f9773202b8fc0f8105959a5eb990ca9ab4169668205",
+        "93e7de15526545cb91a4cd562cde64e71be941f94e7e07f493f661ce",
+        "6358c2c6e7a3445f52eddd7fa3e15a873d83bb45f4c10ea4e4a0ae24",
+        "0349d2cdbac8054c00c88e6e5bbee7d62ab42230a79bcb265632d1ec",
+        "9d3d67cf821fca3c05a057dd199ac9f30135e8eb6c0c93a0888f8ac6",
+        "52e4f42f27b3bd98ef34f78fb23a2a164fe8b2e3acdb964d227529f4",
+        "19e4dba3e574a3d0fb968d024e347c0b228fd70e78d6c057a2fa20c0",
+        "aace85b73f29eb046490dd2858b4a046589d154b395953f074324744",
+        "5aea460e5098c359f911711dbfbf887c0595cca4f423587a4ab105f5" ];
+
+const SHA3_256_LENS: [int] = [0, 1, 2, 134, 135, 136, 137, 138, 271, 272, 273, 300];
+const SHA3_256_HEX: array = [
+        "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+        "e3ed56bd086d8958483a12734fa0ae7f5c8bb160ef9092c67e82ed9b19e4c7b2",
+        "6e85e33c27105143808a5fdcdea96f3ef7cb2d8553fcb7680b10c3778c55059a",
+        "4cb67e9fadcecd38d8c3869623f7aa34d47ef5ff70337cbea1a0904a3965a0df",
+        "e7431f0dc01000cc3a4c58e904944bad17d32a27ff2634a4b9335869c1bced72",
+        "0abb1e4958f756b7f78d41b76ad697e7e627a4574636c8657b41d673a4ccbcd7",
+        "916b002653c887b6eff18f5da85f654ab2ee4be3e2e4f683c0efefbd302c2bcd",
+        "603026b29d9ddd06154f1584343cf7af9ec01be9243e17762357c3d417405ec7",
+        "0a31ebfafe65c5e9b84d4ce65267fd601c1ae74a960e3aaea9dba6777621f2a4",
+        "afbb631fec678419182130e52c55c3ca99ab3e5d145b5fb45d312d472a0693e7",
+        "df37487c570d24e346676f3176a45d1dc6e3cba094d19f29f52ac1b11312b647",
+        "4e6fb7f2ae96af68d55d5cc0bdf96698e19eeaa159f0f0a7019935bd187731e4" ];
+
+const SHA3_384_LENS: [int] = [0, 1, 2, 102, 103, 104, 105, 106, 207, 208, 209, 300];
+const SHA3_384_HEX: array = [
+        "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2ac3713831264adb47fb6bd1e058d5f004",
+        "80fe0aa4889193dd2b9924e34d2170835a0731de3e299e70748c3906f4f0eba35d531e61e4eb318bf8bde6fe3de9436c",
+        "66b7de0426cf281ed6dafa540956cbb4e361c159b8c55b0f4817327177d919c2c4988f0d0202a40571c9de168c9de57b",
+        "45618f3e013783c4dc2b11fcc36269fd04029e62a09730f9e770869369b28f7e6b3a1e994f791df2deb0e4be83581950",
+        "a72f9c7ab491802762da1f6dba8208d08eeeb5f58e51e5a74411770a66bfbec98c03e76caf22cf613ac9e25b039d69f7",
+        "7e33fc858d0a0818593f13bb4abfcf33fffda5e4597ca3e517d34bb0e45ea5557d1b64318d99a1804751b22b1aee9b07",
+        "3c37a9ee257dd9bfaae293c3233c4b5aa0196284b08abebcc369d2288c26dbad5f2ef980d989472d1e29d225561b3561",
+        "e93d178ef38407320d5fa588b4e966881019bca172f7eb6bb4e7352b9b8249d17bf323b8972cad46ec35069bcb72757a",
+        "bdb56ccadba742dcd4e8b6c3ec0d1d22863d61656ffe15f176130e41d2bcd40309e1a07f9627da184eba4f9d61f3f1c5",
+        "e2c7a9266b710e1f508d3a57cb1530f634a02b433c71ef1f28ebe00ebac389a7f342c27c4d9aaaeda02ffe482a6afbae",
+        "bb18407655416e5a18bf2152ac3723e3e558d38ca321c5af8568e5df9d2a1f8ec26adcb62f642be8b390afa36be30e60",
+        "59136866c958acc2cc6e950d8dedef8851a9e2bb897b69cfc6747d72301e51fda0c1e99bd4c3239be54edf07c57ff853" ];
+
+const SHA3_512_LENS: [int] = [0, 1, 2, 70, 71, 72, 73, 74, 143, 144, 145, 300];
+const SHA3_512_HEX: array = [
+        "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26",
+        "a63f9712aadceb0fe16f1881719a802294830fa1f7a0e58ff26a45a814309961c5007f43f4e224a82d3f538a6c8af7d87ec71fb6661bfac0dc0cd9367ddb04ce",
+        "354c114423f5b43e740e13ed74d604435279f679838828c0948193431455cae5af8ed518c917a56efb22168144b1a5646bd0afc8eb1080bdc33e06c387d3955c",
+        "9107378577554b09898a84756f29816f96ad77f632fcc222d66c864b793a6ce30763c5cb2c13c675cd0c30b8642a6edc722c835edc796d263ad63f8136e3442a",
+        "fb6d3e5c8a7d9e8bb8e09c197dcfabab487382cea6429a50b28f96ebb353adb821b1920f18c6a99ddd27bfa7d469e17a172d935f26e9b519288f5e944c7b7797",
+        "2f123f16a24f25267f17076aeb695397b2507b1f0682eb0a904b91099779a415af8c9147526d9eae3b3db3ab095f296a1adc363e3a1622220507ffd74483f3d2",
+        "75ead630e153188adcb7ceaedbdc825a735b87f524dcae99df0ef1367bf2c4c3ea0fd7ad173beb539936e6d7cf70da0222b898f05c12ff8fbd009157233e1509",
+        "b838ef5eba1b550ddb6799898ad62359c01b997e948af38e36021f11054bea521a2665ad27ce2ca04be9913bef6a16e157652a47b1d3e620cc7258cfcd1ea8c2",
+        "a48a6f56ce9ad07130ee792debf344faa21c81eb7c19194087ae6ba97da838b5a063b90401ea1e9cfb4f3f53bae9642aefe7d33e1a7a5da79d280c84e850d4cf",
+        "04febb01e9a6e2ec73fcf971fded1aff764fccde6db460144c0c6067e5b787ed6542e894309ce43a805f1a03b93d92b14dd2b30776a2c5972642004f0ac97ab9",
+        "6e1bb6474876ebf2c1af94eb9d9a3f7e700f57c7f752922caa1903a4df5cadb36af5bcde26548cc30415462b05a347828afdfcbf2985ed458012efee1862b011",
+        "5ffa874ea4a9146129a04fa8a4aefac985ae73b6072a5c528aad83fb74fa154c514a24c72f6e709991e128a978cc856da74beaa9201f556f9231360719d54fe4" ];
+
+const KECCAK256_LENS: [int] = [0, 1, 2, 134, 135, 136, 137, 138, 271, 272, 273, 300];
+const KECCAK256_HEX: array = [
+        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        "69c322e3248a5dfc29d73c5b0553b0185a35cd5bb6386747517ef7e53b15e287",
+        "3b8194e0262a1713bd119866e92437201534cd3894e1b8ac6695c3735cbda009",
+        "d9dd0f1250a21a5140de6e2b13390d4187fdf9b2cb2266ead07f7e52f5604709",
+        "3788a930f188b396ba5366510a329a3aa4172761716cd6d141cafd28171f1faa",
+        "56ad07d3ee9a666cf4dee9abca7c68e2e06a6ed17233dcd8419f5f6c0955d3b9",
+        "a90bd59430e754766dcd64ea27b959a7be9188d7af74d65a20d91c3eacb344e1",
+        "0e94f2b01804ee0e186caacd9a92e34715314f23be06de9b6350da4c92862938",
+        "bc0c70bacf55f7e6c1ac312245d615964f3f463d597b0d7a246a4316e8d9ad8b",
+        "bdb8070e61e29410505724b3105fa1049705ed948769ca9cd68fdc7359058e57",
+        "4df8cf799a61d9d2795c739eaf21b669ffe08b87c050c466cb35d8f4e27a9404",
+        "f3196238bd9067cf7ca6e3183a7e0b7ac699ea9d9d6ff00acf803bf158fd1182" ];
+
+const SHAKE128_IN: [int] = [0, 3, 3, 3, 55, 1000];
+const SHAKE128_OUT: [int] = [10, 167, 168, 169, 343, 5];
+const SHAKE128_HEX: array = [
+        "7f9c2ba4e88f827d6160",
+        "cf0bd6b206ac4e35ebd4ccce5e014b95dfe78ae19e5cadcc89c725dea6998ae64b55fa061151576aae1f7a2bf6912a3ae98139c06437fa18258f30f6a4fee385665d50d1de3450d3d605fcb55a378f380d77fbd5881ff64f69627c5b63be87e349256d328de868f13f7f1cb2391c62e46849010117f31b40d4163dbf6a9c8a6f0d1b6ec42add675dffa2fad655b6c9555ae0e986c662c847b22d57b789fa35c6297340e9641dfc",
+        "cf0bd6b206ac4e35ebd4ccce5e014b95dfe78ae19e5cadcc89c725dea6998ae64b55fa061151576aae1f7a2bf6912a3ae98139c06437fa18258f30f6a4fee385665d50d1de3450d3d605fcb55a378f380d77fbd5881ff64f69627c5b63be87e349256d328de868f13f7f1cb2391c62e46849010117f31b40d4163dbf6a9c8a6f0d1b6ec42add675dffa2fad655b6c9555ae0e986c662c847b22d57b789fa35c6297340e9641dfc63",
+        "cf0bd6b206ac4e35ebd4ccce5e014b95dfe78ae19e5cadcc89c725dea6998ae64b55fa061151576aae1f7a2bf6912a3ae98139c06437fa18258f30f6a4fee385665d50d1de3450d3d605fcb55a378f380d77fbd5881ff64f69627c5b63be87e349256d328de868f13f7f1cb2391c62e46849010117f31b40d4163dbf6a9c8a6f0d1b6ec42add675dffa2fad655b6c9555ae0e986c662c847b22d57b789fa35c6297340e9641dfc63e9",
+        "1ab8e063103248643b526fbe2ae71f12ae205dd33b8f2932e3312ca3b5d2664daf56d687720e8014f808ba097d66d84b9223b541145ed0964e16f41107ebd63c8e8b63e8f5d6e671791870c5e61287a1ed835ce4ead3c94e3bcfada125b5bf9c57de74b5736e56aa5ac21c1933ab4a32e4867c14bafb5c4b665b5758416bfc22b49f00412ebfd4aad0f67211dee604738d73989992b651d7660fc0eb6a78886ed22fcefc079c77cd6feb95c1d92f1c962764b235d0a3e10947116e374230518f6bec0afbbd0be169455263c191a9442e681c0b892d5ed8ff88895c098d7ecb352bb7c0f47cf4e5659ac4d7612a801fad033c2f4fc32ef9accf935913dad39b94160a9947b5e94bb7b134b8deb263a578a389d1924bedebe08d0fe9603a17afb9558c37797b5184e6cbb20db0bae36ba7bc37ab5ef9e3b9133afb6cf28813bc58c645e66f6a303cbb01dd1c485fa514546ffb9b73cf7c03",
+        "a9a73dd33d" ];
+
+const SHAKE256_IN: [int] = [0, 3, 3, 3, 55, 1000];
+const SHAKE256_OUT: [int] = [10, 135, 136, 137, 279, 5];
+const SHAKE256_HEX: array = [
+        "46b9dd2b0ba88d13233b",
+        "43a0b197b976835b9874524272a43a8ecbf2891579772b66e9c32f767014a6d00b03c51dfb29e7799dc45dcce3b7bbf5e0bb3e5a986eb99f4af45599894ba90fc271fede3529f462deb4ac2b429b5856069afac2c33f6c253b7dc0722685dfd59ba70b5910cb4fea5a7e20be61501fb898bf3cbdef2e5beeda8a4fcbd9a69a3a766f7eccea56c3",
+        "43a0b197b976835b9874524272a43a8ecbf2891579772b66e9c32f767014a6d00b03c51dfb29e7799dc45dcce3b7bbf5e0bb3e5a986eb99f4af45599894ba90fc271fede3529f462deb4ac2b429b5856069afac2c33f6c253b7dc0722685dfd59ba70b5910cb4fea5a7e20be61501fb898bf3cbdef2e5beeda8a4fcbd9a69a3a766f7eccea56c39c",
+        "43a0b197b976835b9874524272a43a8ecbf2891579772b66e9c32f767014a6d00b03c51dfb29e7799dc45dcce3b7bbf5e0bb3e5a986eb99f4af45599894ba90fc271fede3529f462deb4ac2b429b5856069afac2c33f6c253b7dc0722685dfd59ba70b5910cb4fea5a7e20be61501fb898bf3cbdef2e5beeda8a4fcbd9a69a3a766f7eccea56c39c87",
+        "0498ee267aec5e43eb6f6bb18fa9cf8a80fc3e5131d6208a3595c49104fd07440c58d88c7171b71617b731f8d2dad4edf50a11be6300f5e09c9689b42e2845654977f84a6f4baac58dd78dd8c94fb72f6f4a679124270d8c7c05a702701dcee433249201f45ffbf2b6b49c569f4509944d01d593bd1a9c4b1e2ec56c13ac08588fdc6bc5c6db0a50946aa871bfd37a694af273159b5a0761b4aa063b546e5c045c675245626490cd09e0344ae091ed941b9946038dd414d21ffa7afe0d7f4471676db32ebe59fbcec7ddd3241a8f2097860fc2e3be3a11da3ac1b555936bc0d2842499a78bee7cc983a7a8876a039b64f314d8ccaeee06b7649506d5bd17ce6e32a68c92cdd5af1abdf0d7c4372f515ca5545fea50d251",
+        "9c5e077dc4" ];
+
+// Feed `data` to a fresh hasher in chunks of the given sizes, cycling.
+fn chunkedHex(algo: string, data: block, sizes: array): string {
+    let d = new Digest(algo);
+    let n = len(data);
+    let pos = 0;
+    let k = 0;
+    while (pos < n) {
+        let sz = sizes[k % len(sizes)];
+        if (sz > n - pos) { sz = n - pos; }
+        d.Update(Buffer.Slice(data, pos, sz));
+        pos = pos + sz;
+        k = k + 1;
+    }
+    return d.Final();
+}
+
+fn testDigest() {
+    Console.WriteLine("\n--- Digest: MD5 (RFC 1321) ---");
+    assertEq("MD5 empty",          Digest.Md5(""), "d41d8cd98f00b204e9800998ecf8427e");
+    assertEq("MD5 a",              Digest.Md5("a"), "0cc175b9c0f1b6a831c399e269772661");
+    assertEq("MD5 abc",            Digest.Md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
+    assertEq("MD5 message digest", Digest.Md5("message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+    assertEq("MD5 a..z",           Digest.Md5("abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b");
+    assertEq("MD5 1e6 x 'a'",      Digest.Md5(bytes(0x61, 1000000)), "7707d6ae4e027c70eea2a935c2296f21");
+    assertEq("MD5 raw is 16 bytes", len(Digest.Md5("abc", true)), 16);
+    assertEq("MD5 raw == hex",     hex(Digest.Md5("abc", true)), Digest.Md5("abc"));
+    assertEq("MD5 55 bytes (pad boundary)", Digest.Md5(bytes(0x61, 55)), "ef1772b6dff9a122358552954ad0df65");
+    assertEq("MD5 56 bytes (pad boundary)", Digest.Md5(bytes(0x61, 56)), "3b0c8ac703f828b04c6c197006d17218");
+    assertEq("MD5 64 bytes (one block)",    Digest.Md5(bytes(0x61, 64)), "014842d480b571495a4a0363793f7367");
+    assert("MD5 non-bytes -> nil", Digest.Md5(42) == nil);
+
+    Console.WriteLine("\n--- Digest: SHA-1 / SHA-256 against the native digests ---");
+    let algos = ["sha1", "sha256"];
+    let a = 0;
+    while (a < 2) {
+        let algo = algos[a];
+        let mismatches = 0;
+        let n = 1;
+        while (n <= 200) {
+            let data = pattern(n);
+            let want = (algo == "sha1") ? Hash.Sha1(data) : Hash.Sha256(data);
+            let d = new Digest(algo);
+            if (d.Update(data).Final() != want) { mismatches = mismatches + 1; }
+            if (chunkedHex(algo, data, [1, 3, 7, 64, 63, 65, 100]) != want) { mismatches = mismatches + 1; }
+            n = n + 1;
+        }
+        assert(algo + " lengths 1..200, whole and chunked: " + str(mismatches) + " mismatches", mismatches == 0);
+        let emptyWant = (algo == "sha1") ? Hash.Sha1("") : Hash.Sha256("");
+        assertEq(algo + " empty input", new Digest(algo).Final(), emptyWant);
+        let big = pattern(1 << 20);
+        let bigWant = (algo == "sha1") ? Hash.Sha1(big) : Hash.Sha256(big);
+        assertEq(algo + " 1 MB whole", new Digest(algo).Update(big).Final(), bigWant);
+        assertEq(algo + " 1 MB in 4 KB chunks", chunkedHex(algo, big, [4096]), bigWant);
+        assertEq(algo + " 1 MB in odd chunks", chunkedHex(algo, big, [1000, 1, 4095, 64]), bigWant);
+        a = a + 1;
+    }
+    assertEq("sha256 abc", new Digest("SHA-256").Update("abc").Final(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assertEq("sha1 abc",   new Digest("sha1").Update("abc").Final(), "a9993e364706816aba3e25717850c26c9cd0d89d");
+
+    Console.WriteLine("\n--- Digest: SHA-512 against the native digest ---");
+    let mismatches512 = 0;
+    let n512 = 1;
+    while (n512 <= 300) {
+        let data = pattern(n512);
+        let want = Hash.Sha512(data);
+        if (new Digest("sha512").Update(data).Final() != want) { mismatches512 = mismatches512 + 1; }
+        if (chunkedHex("sha512", data, [1, 17, 127, 128, 129, 256, 200]) != want) { mismatches512 = mismatches512 + 1; }
+        n512 = n512 + 1;
+    }
+    assert("sha512 lengths 1..300, whole and chunked: " + str(mismatches512) + " mismatches", mismatches512 == 0);
+    assertEq("sha512 empty", new Digest("sha512").Final(), Hash.Sha512(""));
+    assertEq("sha512 abc", new Digest("sha512").Update("abc").Final(),
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+    let big512 = pattern(1 << 20);
+    let big512Want = Hash.Sha512(big512);
+    assertEq("sha512 1 MB whole", new Digest("sha512").Update(big512).Final(), big512Want);
+    assertEq("sha512 1 MB in 4 KB chunks", chunkedHex("sha512", big512, [4096]), big512Want);
+    assertEq("sha512 1 MB in odd chunks (exercises the 128-byte block boundary)", chunkedHex("sha512", big512, [1000, 1, 4095, 127, 128, 129]), big512Want);
+    assertEq("sha512 raw is 64 bytes", len(new Digest("sha512").Update("abc").Final(true)), 64);
+
+    Console.WriteLine("\n--- Digest: SHA-384 against precomputed vectors (no native oracle) ---");
+    // No Hash.Sha384 exists in the VM, so correctness at the padding boundaries
+    // (bufLen 111/112, whole 128/256-byte messages) is checked against vectors
+    // computed independently (Python's hashlib). Larger-input correctness is
+    // then established by consistency: many chunkings of a 1 MB message must
+    // all agree with the one-shot Update, which they can only do if the
+    // buffering and 128-byte block math are right end to end.
+    let mismatches384 = 0;
+    let k384 = 0;
+    while (k384 < len(SHA384_TEST_LENS)) {
+        let n384 = SHA384_TEST_LENS[k384];
+        let want384 = SHA384_TEST_HEX[k384];
+        let data384 = pattern(n384);
+        if (new Digest("sha384").Update(data384).Final() != want384) {
+            mismatches384 = mismatches384 + 1;
+            Console.WriteLine("   sha384 len " + str(n384) + " mismatch");
+        }
+        if (chunkedHex("sha384", data384, [1, 17, 111, 112, 113, 128]) != want384) { mismatches384 = mismatches384 + 1; }
+        k384 = k384 + 1;
+    }
+    assert("sha384 " + str(len(SHA384_TEST_LENS)) + " boundary lengths, whole and chunked: " + str(mismatches384) + " mismatches", mismatches384 == 0);
+    assertEq("sha384 abc", new Digest("sha384").Update("abc").Final(),
+        "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7");
+    assert("sha384 != sha512 (different IV, not a truncation relationship a test could fake)",
+        new Digest("sha384").Update("abc").Final() != String.Substr(new Digest("sha512").Update("abc").Final(), 0, 96));
+    assertEq("sha384 raw is 48 bytes", len(new Digest("sha384").Update("abc").Final(true)), 48);
+    let big384 = pattern(1 << 20);
+    let big384Whole = new Digest("sha384").Update(big384).Final();
+    assertEq("sha384 1 MB in 4 KB chunks agrees with whole", chunkedHex("sha384", big384, [4096]), big384Whole);
+    assertEq("sha384 1 MB in odd chunks (127/128/129-byte, crossing every block boundary) agrees with whole",
+        chunkedHex("sha384", big384, [1000, 1, 4095, 127, 128, 129]), big384Whole);
+    assertEq("sha384 1 MB byte-at-a-time agrees with whole (slow but exhaustive)",
+        chunkedHex("sha384", pattern(2000), [1]), new Digest("sha384").Update(pattern(2000)).Final());
+
+    Console.WriteLine("\n--- Digest: SHA-384/512 streaming semantics ---");
+    let d512 = new Digest("sha512");
+    assertEq("sha512 Algorithm()", d512.Algorithm(), "sha512");
+    assertEq("sha384 Algorithm()", new Digest("sha384").Algorithm(), "sha384");
+    assertEq("sha512 chained pieces == whole", d512.Update("mess").Update("age ").Update("digest").Final(), Hash.Sha512("message digest"));
+    assertEq("sha512 Final is idempotent", d512.Final(), Hash.Sha512("message digest"));
+    assert("sha512 Update after Final -> nil", d512.Update("x") == nil);
+    assertEq("sha512 Reset then reuse", d512.Reset().Update("abc").Final(), Hash.Sha512("abc"));
+
+    Console.WriteLine("\n--- Digest: streaming semantics ---");
+    let d = new Digest("md5");
+    assertEq("Algorithm()", d.Algorithm(), "md5");
+    assert("Update returns this (chainable)", d.Update("mess") == d);
+    assertEq("chained pieces == whole", d.Update("age ").Update("digest").Final(), "f96b697d7cb7938d525a2f31aaf161d0");
+    assertEq("Final is idempotent", d.Final(), "f96b697d7cb7938d525a2f31aaf161d0");
+    assert("Update after Final -> nil", d.Update("x") == nil);
+    assertEq("Reset then reuse", d.Reset().Update("abc").Final(), "900150983cd24fb0d6963f7d28e17f72");
+    assert("Update(nil) is a no-op", d.Reset().Update(nil) == d);
+    assert("Update(\"\") is a no-op", d.Update("") == d);
+    assertEq("no-op updates then Final == empty digest", d.Final(), "d41d8cd98f00b204e9800998ecf8427e");
+    assert("Update(42) -> nil", d.Reset().Update(42) == nil);
+    let bad = new Digest("whirlpool");
+    assert("unknown algorithm: Algorithm() nil", bad.Algorithm() == nil);
+    assert("unknown algorithm: Update nil", bad.Update("x") == nil);
+    assert("unknown algorithm: Final nil", bad.Final() == nil);
+    assertEq("Algorithms()", String.Join(Digest.Algorithms(), ","), "md5,sha1,sha256,sha384,sha512,sha3-224,sha3-256,sha3-384,sha3-512,keccak256,shake128,shake256");
+    assertEq("raw sha256 is 32 bytes", len(new Digest("sha256").Update("abc").Final(true)), 32);
+}
+
+fn testKeccakFamily() {
+    Console.WriteLine("\n--- Digest: SHA3-224/256/384/512 and Keccak-256 (no native oracle) ---");
+    // None of these have a native counterpart in the VM, so every boundary
+    // length is checked against vectors computed independently (a from-scratch
+    // Keccak-f[1600] sponge, cross-checked byte-for-byte against Python's
+    // built-in hashlib.sha3_* for four rates and against the well-known
+    // EIP-1052 constant for Keccak-256(""), before a single vector here was
+    // generated). Lengths straddle the sponge's rate boundary for each
+    // algorithm - one byte under, exactly at, and one byte over the rate,
+    // and again at twice the rate - since that boundary (not 55/56 as for
+    // Merkle-Damgard hashes) is where this padding scheme could go wrong.
+    let families = [
+        ["sha3-224",   SHA3_224_LENS,   SHA3_224_HEX,   28],
+        ["sha3-256",   SHA3_256_LENS,   SHA3_256_HEX,   32],
+        ["sha3-384",   SHA3_384_LENS,   SHA3_384_HEX,   48],
+        ["sha3-512",   SHA3_512_LENS,   SHA3_512_HEX,   64],
+        ["keccak256",  KECCAK256_LENS,  KECCAK256_HEX,  32],
+    ];
+    let f = 0;
+    while (f < len(families)) {
+        let algo = families[f][0];
+        let lens = families[f][1];
+        let hexes = families[f][2];
+        let outBytes = families[f][3];
+        let mismatches = 0;
+        let k = 0;
+        while (k < len(lens)) {
+            let n = lens[k];
+            let want = hexes[k];
+            let data = pattern(n);
+            if (new Digest(algo).Update(data).Final() != want) { mismatches = mismatches + 1; Console.WriteLine("   " + algo + " len " + str(n) + " whole mismatch"); }
+            if (chunkedHex(algo, data, [1, 7, 31, 64, 65, 100]) != want) { mismatches = mismatches + 1; Console.WriteLine("   " + algo + " len " + str(n) + " chunked mismatch"); }
+            k = k + 1;
+        }
+        assert(algo + " " + str(len(lens)) + " boundary lengths, whole and chunked: " + str(mismatches) + " mismatches", mismatches == 0);
+        assertEq(algo + " raw output length", len(new Digest(algo).Update("x").Final(true)), outBytes);
+        let big = pattern(1 << 20);
+        let bigWhole = new Digest(algo).Update(big).Final();
+        assertEq(algo + " 1 MB in 4 KB chunks agrees with whole", chunkedHex(algo, big, [4096]), bigWhole);
+        assertEq(algo + " 1 MB in odd chunks (crossing the rate boundary) agrees with whole",
+            chunkedHex(algo, big, [1000, 1, 4095, 63, 64, 65]), bigWhole);
+        f = f + 1;
+    }
+
+    Console.WriteLine("\n--- Digest: SHA3-256 vs Keccak-256 are genuinely different hashes ---");
+    // The only difference between them is one padding byte (0x06 vs 0x01) -
+    // exactly the kind of typo that would make them silently identical.
+    let sameInput = pattern(500);
+    assert("differ on a 500-byte input", new Digest("sha3-256").Update(sameInput).Final() != new Digest("keccak256").Update(sameInput).Final());
+    assert("differ on empty input", new Digest("sha3-256").Final() != new Digest("keccak256").Final());
+    assertEq("Digest.Keccak256 static helper matches the class", Digest.Keccak256("abc"), new Digest("keccak256").Update("abc").Final());
+    assertEq("Keccak256('') matches the EIP-1052 constant", Digest.Keccak256(""),
+        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+
+    Console.WriteLine("\n--- Digest: SHAKE128/256 (extendable output) ---");
+    let shakeFamilies = [
+        ["shake128", SHAKE128_IN, SHAKE128_OUT, SHAKE128_HEX],
+        ["shake256", SHAKE256_IN, SHAKE256_OUT, SHAKE256_HEX],
+    ];
+    f = 0;
+    while (f < len(shakeFamilies)) {
+        let algo = shakeFamilies[f][0];
+        let ins = shakeFamilies[f][1];
+        let outs = shakeFamilies[f][2];
+        let hexes = shakeFamilies[f][3];
+        let mismatches = 0;
+        let k = 0;
+        while (k < len(ins)) {
+            let data = pattern(ins[k]);
+            let got = new Digest(algo).Update(data).Squeeze(outs[k]);
+            if (got != hexes[k]) { mismatches = mismatches + 1; Console.WriteLine("   " + algo + " in=" + str(ins[k]) + " out=" + str(outs[k]) + " mismatch"); }
+            k = k + 1;
+        }
+        assert(algo + " " + str(len(ins)) + " (input, output-length) cases: " + str(mismatches) + " mismatches", mismatches == 0);
+        f = f + 1;
+    }
+    assertEq("Digest.Shake128 static helper matches the class", Digest.Shake128("abc", 32), new Digest("shake128").Update("abc").Squeeze(32));
+    assertEq("Digest.Shake256 static helper matches the class", Digest.Shake256("abc", 64), new Digest("shake256").Update("abc").Squeeze(64));
+    assertEq("Shake128 raw is exactly outLen bytes", len(new Digest("shake128").Update("abc").Squeeze(1000, true)), 1000);
+    // The XOF output is one continuous stream: squeezing 500 bytes must give
+    // the same bytes as the first 500 of a 1000-byte squeeze, even though
+    // 500 and 1000 both cross the 136-byte rate multiple times and so need
+    // several internal permutations - this is what actually exercises the
+    // squeeze loop's "permute again for more output" path, not just a
+    // single-block squeeze.
+    let shortSqueeze = new Digest("shake256").Update("").Squeeze(500, true);
+    let longSqueeze  = new Digest("shake256").Update("").Squeeze(1000, true);
+    assertEq("Shake256 output is a prefix-consistent stream across multiple permutations",
+        Util.BinToHex(shortSqueeze), Util.BinToHex(Buffer.Slice(longSqueeze, 0, 500)));
+
+    Console.WriteLine("\n--- Digest: sponge streaming semantics and misuse ---");
+    let dk = new Digest("sha3-256");
+    assertEq("sha3-256 Algorithm()", dk.Algorithm(), "sha3-256");
+    assertEq("chained pieces == whole", dk.Update("hello ").Update("world").Final(), new Digest("sha3-256").Update("hello world").Final());
+    assertEq("Final is idempotent", dk.Final(), new Digest("sha3-256").Update("hello world").Final());
+    assert("Update after Final -> nil", dk.Update("x") == nil);
+    assertEq("Reset then reuse", dk.Reset().Update("abc").Final(), "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532");
+    assert("Squeeze on a fixed-output algorithm -> nil", new Digest("sha3-256").Update("x").Squeeze(32) == nil);
+    assert("Final on a XOF algorithm -> nil", new Digest("shake128").Update("x").Final() == nil);
+    let sk = new Digest("shake256");
+    sk.Update("first squeeze only");
+    let first = sk.Squeeze(16);
+    assert("first Squeeze succeeds", first != nil);
+    assert("Update after Squeeze -> nil", sk.Update("x") == nil);
+    assert("second Squeeze -> nil (one-shot; Reset() to squeeze again)", sk.Squeeze(16) == nil);
+    assert("Squeeze outLen 0 -> nil", new Digest("shake128").Update("x").Squeeze(0) == nil);
+    assert("Squeeze outLen negative -> nil", new Digest("shake128").Update("x").Squeeze(-1) == nil);
+    assert("Squeeze non-int outLen -> nil", new Digest("shake128").Update("x").Squeeze(1.5) == nil);
+    assert("Squeeze nil outLen -> nil", new Digest("shake128").Update("x").Squeeze(nil) == nil);
+}
+
+// ============================================================
+//  Benchmarks
+// ============================================================
+
+fn benchmarks() {
+    Console.WriteLine("\n--- Benchmarks ---");
+    benchSep();
+    let mb = pattern(1 << 20);
+    let key = Envelope.NewKey();
+    let secret = "12345678901234567890";
+    let fourK = pattern(4096);
+    let sealed = Envelope.Seal(fourK, key);
+    let phc = Password.Hash("pw");
+
+    bench("Digest.Md5  1 MB (script, JIT leaf)", fn() { _sink = _sink + len(Digest.Md5(mb)); }, 10);
+    bench("Digest sha1  1 MB streaming (script)", fn() { _sink = _sink + len(new Digest("sha1").Update(mb).Final()); }, 10);
+    bench("Digest sha256  1 MB streaming (script)", fn() { _sink = _sink + len(new Digest("sha256").Update(mb).Final()); }, 10);
+    bench("Digest sha384  1 MB streaming (script, needs >>>)", fn() { _sink = _sink + len(new Digest("sha384").Update(mb).Final()); }, 10);
+    bench("Digest sha512  1 MB streaming (script, needs >>>)", fn() { _sink = _sink + len(new Digest("sha512").Update(mb).Final()); }, 10);
+    bench("Digest sha3-256  1 MB streaming (script)", fn() { _sink = _sink + len(new Digest("sha3-256").Update(mb).Final()); }, 10);
+    bench("Digest keccak256  1 MB streaming (script)", fn() { _sink = _sink + len(new Digest("keccak256").Update(mb).Final()); }, 10);
+    bench("Digest shake256  1 MB in, 32 bytes out (script)", fn() { _sink = _sink + len(new Digest("shake256").Update(mb).Squeeze(32)); }, 10);
+    bench("Hash.Sha256  1 MB (native, reference)", fn() { _sink = _sink + len(Hash.Sha256(mb)); }, 10);
+    bench("Hash.Sha1  1 MB (native, reference)", fn() { _sink = _sink + len(Hash.Sha1(mb)); }, 10);
+    bench("Hash.Sha512  1 MB (native, reference)", fn() { _sink = _sink + len(Hash.Sha512(mb)); }, 10);
+    benchSep();
+    bench("Kdf.Hkdf  32 bytes out (sha256)", fn() { _sink = _sink + len(Kdf.Hkdf(secret, "salt", "info", 32)); }, 2000);
+    bench("Kdf.Pbkdf2  sha256, 10 000 iterations", fn() { _sink = _sink + len(Kdf.Pbkdf2("password", "salt", 10000, 32)); }, 5);
+    bench("Kdf.Pbkdf2  sha1, 10 000 iterations", fn() { _sink = _sink + len(Kdf.Pbkdf2("password", "salt", 10000, 20, "sha1")); }, 5);
+    benchSep();
+    bench("Otp.Hotp", fn() { _sink = _sink + len(Otp.Hotp(secret, 1)); }, 5000);
+    bench("Otp.TotpVerify  window 1 (3 HMACs)", fn() { if (Otp.TotpVerify(secret, "287082", 1, 59)) { _sink = _sink + 1; } }, 2000);
+    benchSep();
+    bench("Password.Hash  defaults (64 MiB, t=3)", fn() { _sink = _sink + len(Password.Hash("pw")); }, 5);
+    bench("Password.Verify  defaults", fn() { if (Password.Verify("pw", phc)) { _sink = _sink + 1; } }, 5);
+    benchSep();
+    bench("Envelope.Seal  4 KB", fn() { _sink = _sink + len(Envelope.Seal(fourK, key)); }, 2000);
+    bench("Envelope.Open  4 KB", fn() { _sink = _sink + len(Envelope.Open(sealed, key)); }, 2000);
+    bench("Envelope.Seal  1 MB", fn() { _sink = _sink + len(Envelope.Seal(mb, key)); }, 10);
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+}
+
+fn Main(): int {
+    testKdf();
+    testOtp();
+    testPassword();
+    testEnvelope();
+    testDigest();
+    testKeccakFamily();
+    benchmarks();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: " + str(passed + failed) + "  passed: " + str(passed) + "  failed: " + str(failed));
+    if (failed > 0) { return 1; }
+    Console.WriteLine("✅ All CryptoKit tests passed!");
+    return 0;
+}

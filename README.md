@@ -91,6 +91,9 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 **Web & network** — `Http`, `Https`, `HttpServer`, `HttpUtil`, `Router`,
 `WebSocket`, `Jwt`
 
+**Security** — `CryptoKit` (HKDF, PBKDF2, TOTP/HOTP, Argon2id password hashing,
+sealed blobs, streaming MD5/SHA-1/SHA-256/SHA-384/SHA-512/SHA-3/Keccak-256/SHAKE)
+
 **Data stores** — `SQLite`, `Postgres`, `Redis`
 
 **System & tooling** — `Argparse`, `Process`, `Logger`, `Datetime`, `Promise`,
