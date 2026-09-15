@@ -1,0 +1,10 @@
+const n = 200000;
+const keys = [];
+for (let i = 0; i < n; i++) keys.push("key" + i);
+const t0 = Date.now();
+const m = new Map();
+for (let i = 0; i < n; i++) m.set(keys[i], i);
+let total = 0;
+for (let p = 0; p < 3; p++) for (let i = 0; i < n; i++) total += m.get(keys[i]);
+console.log("result: " + total);
+console.log("elapsed: " + (Date.now() - t0) + " ms");

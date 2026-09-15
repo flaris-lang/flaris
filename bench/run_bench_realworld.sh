@@ -24,10 +24,10 @@ REPORT="${BENCH_REPORT:-$BENCH_ROOT/results/$(date +%Y-%m-%d)-$(machine_slug)-re
 
 cd "$BENCH_ROOT/realworld"
 
-# Lua and LuaJIT ship no stdlib JSON and only Lua patterns rather than full
-# regex, so they take part in the string benchmark only.
+# The Lua family ships no stdlib JSON and only Lua patterns rather than full
+# regex, so Lua, LuaJIT and Luau take part in the string benchmark only.
 JSON_LANGS=(py node js go nim fls flsj)
-STR_LANGS=(py node js lua luajit go nim fls flsj)
+STR_LANGS=(py node js lua luajit luau luauc go nim fls flsj)
 REGEX_LANGS=(py node js go nim fls flsj)
 
 # ── input data ───────────────────────────────────────────────────────────────
@@ -62,6 +62,8 @@ run_lang() {  # run_lang <bench> <lang>
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
       lua)    run_one "$b" lua    "$LUA"    "bench_${b}.lua" ;;
       luajit) run_one "$b" luajit "$LUAJIT" "bench_${b}.lua" ;;
+      luau)   run_one "$b" luau   "$LUAU" -O2 "bench_${b}.luau" ;;
+      luauc)  run_one "$b" luauc  "$LUAU" -O2 --codegen "bench_${b}.luau" ;;
       go)     f=$(bin_path "bench_${b}_go");  [[ -n "$f" ]] && run_one "$b" go  "$f" ;;
       nim)    f=$(bin_path "bench_${b}_nim"); [[ -n "$f" ]] && run_one "$b" nim "$f" ;;
       # The JIT is on by default, so the plain-VM lane has to switch it OFF.

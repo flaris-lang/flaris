@@ -46,6 +46,14 @@ Runtimes are discovered on `PATH` and can each be overridden:
 | `PYTHON` | `python3`, `python` |
 | `LUA` | `lua`, `lua5.4`, `lua5.3` |
 | `LUAJIT` | `luajit` |
+| `LUAU` | `luau` |
+| `WREN` | `wren_cli`, `wren` |
+| `JANET` | `janet` |
+| `SQUIRREL` | `sq` |
+| `DUK` | `duk` |
+| `MICROPYTHON` | `micropython` |
+| `RUBY` | brew ruby, then `ruby` |
+| `PHP` | `php` |
 | `NODE` | `node`, `nodejs` |
 | `QJS` | `qjs`, `quickjs` |
 | `RUNS` | `3` (runs per benchmark; the median is reported) |
@@ -81,6 +89,7 @@ bench/
 | `fib` | `fib(38)`, ~126 M recursive calls | function-call overhead, branch prediction |
 | `sieve` | Sieve of Eratosthenes, N = 10 M | byte-array indexing, memory bandwidth |
 | `collatz` | Collatz step counts, n = 1…1 M | integer arithmetic with irregular branching |
+| `tailcall` | self-recursive `tailsum`, depth 2,000,000 | tail-call elimination - who has it, who doesn't |
 | `json` | parse an 18 MB / 300k-record array, 5× | JSON parser plus object materialisation |
 | `strbuild` | grow a string by 1 M small appends | string append strategy |
 | `regex` | scan a 9.8 MB corpus for dates, 5× | regex engine throughput |
@@ -88,7 +97,12 @@ bench/
 Every language must produce the same `result:` integer for a given benchmark.
 The runners cross-check this after each pass and warn loudly on any
 disagreement, which is what catches a "fast" implementation that quietly does
-less work.
+less work. `tailcall` is the one benchmark where a language can legitimately
+be absent instead of disagreeing: a runtime with no tail-call elimination is
+expected to exhaust its call stack before printing a result at all, and it is
+then left out of that table exactly like a language that was never
+installed - see the benchmark's own section in a results snapshot for which
+languages that is expected to happen to.
 
 ## Timing and memory
 

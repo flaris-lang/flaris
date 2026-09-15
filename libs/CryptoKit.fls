@@ -1,0 +1,1424 @@
+// CryptoKit.fls - protocol-level building blocks over the VM's Hash and Crypto natives.
+// Version: 1.0
+//
+// The VM ships the primitives: SHA-1/256/512 and BLAKE2 digests, HMAC, Ed25519,
+// X25519, XChaCha20-Poly1305, Argon2id and a CSPRNG. What it does not ship is
+// the protocol layer that applications actually call. This library is that
+// layer, written entirely on top of the natives, plus a streaming digest engine
+// for the cases a one-shot native cannot cover.
+//
+//   Kdf       HKDF (RFC 5869) and PBKDF2 (RFC 8018) over HMAC-SHA1/256/512.
+//   Otp       HOTP (RFC 4226) and TOTP (RFC 6238), Base32 secrets and
+//             otpauth:// provisioning URIs for authenticator apps.
+//   Password  Argon2id password hashing in the PHC string format
+//             ($argon2id$v=19$m=..,t=..,p=1$salt$hash) with Verify/NeedsRehash.
+//   Envelope  Authenticated encryption as one self-describing blob
+//             (XChaCha20-Poly1305), keyed by a 32-byte key or by a password.
+//   Digest    Streaming MD5 / SHA-1 / SHA-256 / SHA-384 / SHA-512 (Update/Final)
+//             and one-shot MD5 for legacy interop (S3 ETags, Content-MD5, HTTP
+//             Digest auth).
+//
+// Usage:
+//   import { Kdf, Otp, Password, Envelope, Digest } from library("CryptoKit", "1.0");
+//
+//   let key  = Kdf.Hkdf(shared, salt, "app v1 enc", 32);      // block(32)
+//   let dk   = Kdf.Pbkdf2("password", salt, 600000, 32);      // block(32)
+//   let code = Otp.Totp(secret);                              // "492039"
+//   let ok   = Otp.TotpVerify(secret, userInput);             // bool, +/-1 step
+//   let phc  = Password.Hash("hunter2");                      // "$argon2id$v=19$..."
+//   let good = Password.Verify("hunter2", phc);               // bool
+//   let blob = Envelope.Seal("secret text", key);             // block
+//   let back = Envelope.Open(blob, key);                      // block | nil
+//   let etag = Digest.Md5(fileBytes);                         // 32-hex
+//   let d = new Digest("sha256"); d.Update(a); d.Update(b); let hex = d.Final();
+//
+// Conventions:
+//   - Byte inputs are a string or a 1-byte-element block (Buffer.FromString,
+//     Buffer.Create(n, 1), Crypto.RandomBytes, Buffer.Slice). A string is read
+//     as its raw bytes and may hold any byte value, including NUL.
+//   - Derived keys, raw digests and sealed blobs come back as blocks; text
+//     digests come back as lowercase hex.
+//   - Bad input returns nil (false from a verifier). Nothing here raises -
+//     except where noted: a class method whose parameter has an explicit
+//     type (":int" etc.) raises an uncatchable native exception if the
+//     caller passes a value of a different type, instead of the compile-time
+//     error a free function with the same annotation gets. Every place that
+//     matters leaves the parameter untyped and checks Type.Of() itself.
+//   - Hash selectors are "sha1", "sha256" or "sha512" (case-insensitive).
+//     Kdf defaults to sha256. Otp defaults to sha1, which is what RFC 6238 and
+//     every authenticator app assume.
+//   - Every comparison of a secret-derived value goes through
+//     Crypto.ConstantTimeEquals.
+//
+// ---------------------------------------------------------------------------
+//  Kdf
+// ---------------------------------------------------------------------------
+//
+//   Kdf.HkdfExtract(salt, ikm, hash?)            -> block (PRK, HashLen bytes)
+//   Kdf.HkdfExpand(prk, info, length, hash?)     -> block (length bytes) | nil
+//   Kdf.Hkdf(ikm, salt, info, length, hash?)     -> block (length bytes) | nil
+//   Kdf.Pbkdf2(password, salt, iterations, length, hash?) -> block | nil
+//
+//   HKDF turns a shared secret (for example Crypto.X25519Shared, which the VM
+//   hands you as raw hex) into as many independent keys as you need:
+//
+//     let ss   = Kdf.HexToBytes(Crypto.X25519Shared(mySk, peerPk));
+//     let encK = Kdf.Hkdf(ss, nil, "chat v1 encrypt", 32);
+//     let macK = Kdf.Hkdf(ss, nil, "chat v1 mac", 32);
+//
+//   salt may be nil or empty (HKDF then uses HashLen zero bytes, per the RFC);
+//   info may be nil or empty. length is 1..255*HashLen.
+//
+//   PBKDF2 exists for interoperability with systems that already store PBKDF2
+//   hashes. For new password storage use Password (Argon2id). Cost is one
+//   native HMAC per iteration: 600 000 iterations of HMAC-SHA256 take about
+//   half a second.
+//
+//   Kdf.HexToBytes(hex) -> block | nil and Kdf.BytesToHex(block) -> string are
+//   exported because every native digest and MAC speaks hex while every key
+//   consumer wants bytes.
+//
+// ---------------------------------------------------------------------------
+//  Otp
+// ---------------------------------------------------------------------------
+//
+//   Otp.Hotp(secret, counter, digits?, hash?)               -> string | nil
+//   Otp.Totp(secret, time?, step?, digits?, hash?)          -> string | nil
+//   Otp.TotpVerify(secret, code, window?, time?, step?, digits?, hash?) -> bool
+//   Otp.NewSecret(bytes?)                                   -> string (Base32)
+//   Otp.SecretFromBase32(text)                              -> block | nil
+//   Otp.ProvisioningUri(issuer, account, secretBase32, opts?) -> string
+//
+//   secret is the RAW key bytes (string or block). Authenticator apps show the
+//   key as Base32; convert with SecretFromBase32 first. digits is 6..8
+//   (default 6), step is the period in seconds (default 30), time is a Unix
+//   timestamp (default Time.Now()). TotpVerify accepts codes from the window
+//   steps before and after the current one (default 1, i.e. three codes) and
+//   compares in constant time. A code of the wrong length or with a non-digit
+//   is rejected before any HMAC runs.
+//
+//   Enrolment:
+//     let b32 = Otp.NewSecret();                          // store this
+//     let uri = Otp.ProvisioningUri("Acme", "sam@acme.io", b32);
+//     // hand `uri` to QRCode.fls; the app scans it
+//   Login:
+//     let ok = Otp.TotpVerify(Otp.SecretFromBase32(b32), userInput);
+//
+//   ProvisioningUri opts: { digits, step, hash }. The URI follows the
+//   otpauth:// key-URI format that Google Authenticator, Authy, 1Password and
+//   the rest read; issuer and account are percent-encoded.
+//
+// ---------------------------------------------------------------------------
+//  Password
+// ---------------------------------------------------------------------------
+//
+//   Password.Hash(password, opts?)        -> string (PHC) | nil
+//   Password.Verify(password, phc)        -> bool
+//   Password.NeedsRehash(phc, opts?)      -> bool
+//   Password.Parse(phc)                   -> object | nil
+//
+//   Hash draws a 16-byte salt from the CSPRNG, runs Argon2id and returns the
+//   PHC string every other Argon2 implementation reads and writes:
+//
+//     $argon2id$v=19$m=65536,t=3,p=1$<salt b64>$<hash b64>
+//
+//   opts: { memKiB (default 65536 = 64 MiB), iterations (default 3) }. The VM
+//   runs Argon2id with one lane, so p is always 1 and a PHC string with p != 1
+//   cannot be verified here (Verify returns false). Tag length is 32 bytes.
+//   NeedsRehash is true when the stored parameters are below opts (or the
+//   defaults), or the string does not parse - call it after a successful login
+//   and re-Hash when it says so. Parse returns { memKiB, iterations,
+//   parallelism, version, salt:block, hash:block }.
+//
+// ---------------------------------------------------------------------------
+//  Envelope
+// ---------------------------------------------------------------------------
+//
+//   Envelope.NewKey()                                 -> block (32 random bytes)
+//   Envelope.Seal(plain, key)                         -> block | nil
+//   Envelope.Open(sealed, key)                        -> block | nil
+//   Envelope.SealWithPassword(plain, password, opts?) -> block | nil
+//   Envelope.OpenWithPassword(sealed, password)       -> block | nil
+//   Envelope.DeriveKey(password, salt, opts?)         -> block (32) | nil
+//
+//   Crypto.Encrypt hands back cipher, nonce and tag as three values. Seal packs
+//   them into one blob you can write to a file, a database column or a wire:
+//
+//     v1 (key):      [0x01][nonce 24][tag 16][ciphertext]
+//     v2 (password): [0x02][memKiB u32 BE][iterations u8][salt 16][nonce 24][tag 16][ciphertext]
+//
+//   Open verifies the tag before returning anything; a wrong key, a wrong
+//   password, a flipped bit or a truncated blob all give nil. plain must be at
+//   least one byte (the native AEAD rejects an empty message). The password
+//   forms derive the key with Argon2id (opts as for Password.Hash) and record
+//   the parameters in the header, so a blob stays readable after you raise the
+//   defaults. Open returns bytes; Buffer.ToString(bytes) gives the text back.
+//
+// ---------------------------------------------------------------------------
+//  Digest
+// ---------------------------------------------------------------------------
+//
+//   Digest.Md5(data, raw?)              -> string (32-hex) | block (16) | nil
+//   Digest.Keccak256(data, raw?)        -> string (64-hex) | block (32) | nil
+//   Digest.Shake128(data, outLen, raw?) -> string (2*outLen hex) | block (outLen) | nil
+//   Digest.Shake256(data, outLen, raw?) -> string (2*outLen hex) | block (outLen) | nil
+//   Digest.Algorithms()                 -> ["md5", "sha1", "sha256", "sha384", "sha512",
+//                                            "sha3-224", "sha3-256", "sha3-384", "sha3-512",
+//                                            "keccak256", "shake128", "shake256"]
+//   new Digest(algo)                    -> streaming hasher
+//     .Update(data)                     -> this (chainable); nil after Final/Squeeze
+//     .Final(raw?)                      -> string hex | block; idempotent; nil for SHAKE
+//     .Squeeze(outLen, raw?)            -> string hex | block; SHAKE128/256 only, one-shot
+//     .Reset()                          -> this
+//     .Algorithm()                      -> "md5" | "sha1" | ... | "shake256"
+//
+//   The native digests are one-shot: the whole input must be in memory. The
+//   streaming form hashes a download, an upload or a socket stream chunk by
+//   chunk with a state no bigger than one block. MD5 is provided here, and
+//   only here, for protocols that still require it; it is not a security
+//   primitive and the VM deliberately does not offer it. Every compression
+//   function is a typed leaf the JIT compiles to native code: MD5 runs at
+//   about three quarters of the native SHA-256's speed, SHA-1 and SHA-256 at
+//   about a third, SHA-384/512 similarly (the wider block amortizes better).
+//   SHA-3/Keccak/SHAKE run a from-scratch, non-unrolled Keccak-f[1600] and
+//   are about ten times slower than native SHA-256 - correct, but not the
+//   algorithm to reach for when only speed matters and SHA-2 is acceptable.
+//
+//   SHA-384/512 use 64-bit words and the `>>>` operator; the whole Keccak
+//   family additionally stores its 25-lane state in a flat `[int]` array
+//   outside the tagged +-2^60 range. Both need VM 1.0.3.0 or later - a JIT
+//   bug before that release corrupted such values round-tripped through a
+//   typed `[int]` array. SHA-384 is SHA-512 with different starting values
+//   and the output cut to the first 48 bytes.
+//
+//   Keccak-256 is the pre-standardization Keccak, still what "keccak256"
+//   means in Ethereum and most blockchain tooling: the exact same
+//   permutation as SHA3-256, differing only in one padding byte (0x01
+//   instead of NIST's 0x06 domain separator), which makes it a genuinely
+//   different 32-byte hash, not an alias - do not use it expecting SHA3-256,
+//   or vice versa. SHAKE128/256 are extendable-output functions: pick any
+//   output length with Squeeze, which (unlike Final) can only be called once
+//   per instance - Reset() first for a different length.
+//
+// ===========================================================================
+
+import { Util } from library("Util", "1.0");
+
+const M32 = 0xFFFFFFFF;
+
+const HASH_SHA1   = 1;
+const HASH_SHA256 = 2;
+const HASH_SHA512 = 3;
+
+const DIGEST_MD5    = 1;
+const DIGEST_SHA1   = 2;
+const DIGEST_SHA256 = 3;
+const DIGEST_SHA384 = 4;
+const DIGEST_SHA512 = 5;
+const DIGEST_SHA3_224 = 6;
+const DIGEST_SHA3_256 = 7;
+const DIGEST_SHA3_384 = 8;
+const DIGEST_SHA3_512 = 9;
+const DIGEST_KECCAK256 = 10;
+const DIGEST_SHAKE128 = 11;
+const DIGEST_SHAKE256 = 12;
+
+const ARGON_DEFAULT_MEM  = 65536;   // KiB (64 MiB), the VM's own default
+const ARGON_DEFAULT_ITER = 3;
+const ARGON_MIN_MEM      = 8;       // Argon2 requires >= 8*p KiB
+const ARGON_MAX_MEM      = 1048576; // the VM caps at 1 GiB
+const ARGON_SALT_BYTES   = 16;
+
+const ENVELOPE_V1 = 1;              // key-sealed
+const ENVELOPE_V2 = 2;              // password-sealed
+const NONCE_BYTES = 24;
+const TAG_BYTES   = 16;
+const KEY_BYTES   = 32;
+
+// ---------------------------------------------------------------------------
+//  Shared helpers
+// ---------------------------------------------------------------------------
+
+// "sha1" | "sha256" | "sha512" (any case) -> HASH_*; nil -> dflt; unknown -> 0.
+fn _hashId(name, dflt: int): int {
+    if (name == nil) { return dflt; }
+    if (Type.Of(name) != Type.String) { return 0; }
+    let n = String.ToLower(name);
+    if (n == "sha256" || n == "sha-256") { return HASH_SHA256; }
+    if (n == "sha1"   || n == "sha-1")   { return HASH_SHA1; }
+    if (n == "sha512" || n == "sha-512") { return HASH_SHA512; }
+    return 0;
+}
+
+fn _hashName(id: int): string {
+    if (id == HASH_SHA256) { return "SHA256"; }
+    if (id == HASH_SHA512) { return "SHA512"; }
+    return "SHA1";
+}
+
+fn _hashLen(id: int): int {
+    if (id == HASH_SHA256) { return 32; }
+    if (id == HASH_SHA512) { return 64; }
+    return 20;
+}
+
+// HMAC over the selected hash; key and data are string|block. Hex out.
+fn _hmacHex(id: int, key, data): string {
+    if (id == HASH_SHA256) { return Crypto.HmacSha256(key, data); }
+    if (id == HASH_SHA512) { return Crypto.HmacSha512(key, data); }
+    return Crypto.HmacSha1(key, data);
+}
+
+// True for the byte-carrying types this library accepts.
+fn _isBytes(x): bool {
+    let t = Type.Of(x);
+    return t == Type.String || t == Type.Block;
+}
+
+// Byte length of a string|block; 0 for nil.
+fn _byteLen(x): int {
+    if (x == nil) { return 0; }
+    return len(x);
+}
+
+// string|block -> block. Strings are copied; blocks pass through. Empty or
+// nil gives nil because the VM has no zero-length block.
+fn _toBlock(x): block {
+    if (x == nil) { return nil; }
+    if (Type.Of(x) == Type.Block) { return len(x) > 0 ? x : nil; }
+    if (Type.Of(x) != Type.String || len(x) == 0) { return nil; }
+    return Buffer.FromString(x);
+}
+
+// Decode 2*n lowercase/uppercase hex chars of `hex` into out[0..n).
+// A typed leaf: string, block and int parameters, no allocation.
+fn _hexInto(hex: string, out: block, n: int) {
+    let k: int = 0;
+    let j: int = 0;
+    while (k < n) {
+        let c1: int = hex[j] & 255;
+        let c2: int = hex[j + 1] & 255;
+        let hi: int = c1 > 57 ? ((c1 | 32) - 87) : (c1 - 48);
+        let lo: int = c2 > 57 ? ((c2 | 32) - 87) : (c2 - 48);
+        out[k] = (hi << 4) | lo;
+        k = k + 1;
+        j = j + 2;
+    }
+}
+
+fn _hexToBlock(hex): block {
+    if (hex == nil || Type.Of(hex) != Type.String) { return nil; }
+    let n = len(hex);
+    if (n == 0 || (n & 1) != 0) { return nil; }
+    let i = 0;
+    while (i < n) {
+        if (!Char.IsXDigit(hex[i])) { return nil; }
+        i = i + 1;
+    }
+    let out = Buffer.Create(n / 2, 1);
+    _hexInto(hex, out, n / 2);
+    return out;
+}
+
+// Unpadded Base64 (PHC strings use it).
+fn _b64NoPad(b: block): string {
+    let s = Util.Base64Encode(b);
+    let n = len(s);
+    while (n > 0 && s[n - 1] == '=') { n = n - 1; }
+    return String.Substr(s, 0, n);
+}
+
+fn _b64Decode(s: string): block {
+    if (s == nil || len(s) == 0) { return nil; }
+    let padded = s;
+    while ((len(padded) & 3) != 0) { padded = padded + "="; }
+    return Util.Base64DecodeBlock(padded);
+}
+
+// Parse an unsigned decimal; nil on anything else.
+fn _parseUInt(s) {
+    if (s == nil || Type.Of(s) != Type.String || len(s) == 0 || len(s) > 12) { return nil; }
+    let i = 0;
+    let v = 0;
+    while (i < len(s)) {
+        if (!Char.IsDigit(s[i])) { return nil; }
+        v = v * 10 + (s[i] - '0');
+        i = i + 1;
+    }
+    return v;
+}
+
+// An optional int option: dflt when absent, nil when present but not an int.
+fn _optInt(v, dflt: int) {
+    if (v == nil) { return dflt; }
+    if (Type.Of(v) != Type.Int) { return nil; }
+    return v;
+}
+
+fn _argonParams(opts) {
+    let m = _optInt(opts == nil ? nil : opts.memKiB, ARGON_DEFAULT_MEM);
+    let t = _optInt(opts == nil ? nil : opts.iterations, ARGON_DEFAULT_ITER);
+    if (m == nil || t == nil) { return nil; }
+    if (m < ARGON_MIN_MEM || m > ARGON_MAX_MEM || t < 1 || t > 255) { return nil; }
+    return { memKiB: m, iterations: t };
+}
+
+// RFC 3986 percent-encoding: unreserved bytes pass, everything else is %XX.
+fn _pctEncode(s: string): string {
+    let out = "";
+    let i = 0;
+    while (i < len(s)) {
+        let c = s[i];
+        if (Char.IsAlNum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
+            out = out + c;
+        } else {
+            let piece = "%" + String.Format("{0:X2}", c & 255);
+            out = out + piece;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Kdf
+// ---------------------------------------------------------------------------
+
+// The PBKDF2 inner loop, one leaf per hash so that the HMAC call is the
+// initializer of a local (the form the JIT lowers). Each round feeds the
+// previous MAC back in and XORs it into t; u and t are HashLen blocks.
+fn _xorHexInto(h: string, u: block, t: block, hlen: int) {
+    let k: int = 0;
+    let j: int = 0;
+    while (k < hlen) {
+        let c1: int = h[j] & 255;
+        let c2: int = h[j + 1] & 255;
+        let hi: int = c1 > 57 ? ((c1 | 32) - 87) : (c1 - 48);
+        let lo: int = c2 > 57 ? ((c2 | 32) - 87) : (c2 - 48);
+        let v: int = (hi << 4) | lo;
+        u[k] = v;
+        t[k] = (t[k] ^ v) & 255;
+        k = k + 1;
+        j = j + 2;
+    }
+}
+
+fn _pbkdf2RoundsSha1(pw: string, u: block, t: block, rounds: int) {
+    let r: int = 0;
+    while (r < rounds) {
+        let h: string = Crypto.HmacSha1(pw, u);
+        _xorHexInto(h, u, t, 20);
+        r = r + 1;
+    }
+}
+
+fn _pbkdf2RoundsSha256(pw: string, u: block, t: block, rounds: int) {
+    let r: int = 0;
+    while (r < rounds) {
+        let h: string = Crypto.HmacSha256(pw, u);
+        _xorHexInto(h, u, t, 32);
+        r = r + 1;
+    }
+}
+
+fn _pbkdf2RoundsSha512(pw: string, u: block, t: block, rounds: int) {
+    let r: int = 0;
+    while (r < rounds) {
+        let h: string = Crypto.HmacSha512(pw, u);
+        _xorHexInto(h, u, t, 64);
+        r = r + 1;
+    }
+}
+
+class Kdf {
+
+    fn static HexToBytes(hex): block { return _hexToBlock(hex); }
+
+    fn static BytesToHex(b): string {
+        if (b == nil || Type.Of(b) != Type.Block) { return nil; }
+        return Util.BinToHex(b);
+    }
+
+    // HKDF-Extract: PRK = HMAC(salt, IKM). Empty/nil salt = HashLen zero bytes.
+    fn static HkdfExtract(salt, ikm, hash?): block {
+        let id = _hashId(hash, HASH_SHA256);
+        if (id == 0 || !_isBytes(ikm) || len(ikm) == 0) { return nil; }
+        let key = salt;
+        if (_byteLen(salt) == 0) {
+            key = Buffer.Create(_hashLen(id), 1);
+            Buffer.Fill(key, 0);
+        } else if (!_isBytes(salt)) {
+            return nil;
+        }
+        return _hexToBlock(_hmacHex(id, key, ikm));
+    }
+
+    // HKDF-Expand: OKM = T(1) | T(2) | ...  with T(i) = HMAC(PRK, T(i-1) | info | i).
+    fn static HkdfExpand(prk, info, length: int, hash?): block {
+        let id = _hashId(hash, HASH_SHA256);
+        if (id == 0 || !_isBytes(prk) || len(prk) == 0) { return nil; }
+        let hlen = _hashLen(id);
+        if (length < 1 || length > 255 * hlen) { return nil; }
+        let infoB = nil;
+        if (info != nil) {
+            if (!_isBytes(info)) { return nil; }
+            infoB = _toBlock(info);
+        }
+        let infoLen = _byteLen(infoB);
+
+        let okm = Buffer.Create(length, 1);
+        let written = 0;
+        let prev = nil;
+        let i = 1;
+        while (written < length) {
+            let prevLen = (prev == nil) ? 0 : hlen;
+            let msg = Buffer.Create(prevLen + infoLen + 1, 1);
+            if (prevLen > 0) { Buffer.Copy(prev, 0, msg, 0, hlen); }
+            if (infoLen > 0) { Buffer.Copy(infoB, 0, msg, prevLen, infoLen); }
+            msg[prevLen + infoLen] = i;
+            let t = _hexToBlock(_hmacHex(id, prk, msg));
+            let take = length - written;
+            if (take > hlen) { take = hlen; }
+            Buffer.Copy(t, 0, okm, written, take);
+            written = written + take;
+            prev = t;
+            i = i + 1;
+        }
+        return okm;
+    }
+
+    fn static Hkdf(ikm, salt, info, length: int, hash?): block {
+        let prk = Kdf.HkdfExtract(salt, ikm, hash);
+        if (prk == nil) { return nil; }
+        return Kdf.HkdfExpand(prk, info, length, hash);
+    }
+
+    // PBKDF2: DK = T(1) | T(2) | ...  with T(i) = U1 ^ U2 ^ ... ^ Uc,
+    // U1 = HMAC(P, S | INT32BE(i)), Uj = HMAC(P, Uj-1).
+    fn static Pbkdf2(password, salt, iterations: int, length: int, hash?): block {
+        let id = _hashId(hash, HASH_SHA256);
+        if (id == 0 || !_isBytes(password) || !_isBytes(salt)) { return nil; }
+        if (iterations < 1 || length < 1) { return nil; }
+        let hlen = _hashLen(id);
+        if (length > 4294967295 * hlen) { return nil; }
+
+        // The typed leaf takes the password as a string so it stays JIT-eligible;
+        // a block is re-read as bytes (NUL survives).
+        let pw = (Type.Of(password) == Type.String) ? password : Buffer.ToString(password);
+        let saltLen = len(salt);
+        let saltB = _toBlock(salt);
+
+        let dk = Buffer.Create(length, 1);
+        let u = Buffer.Create(hlen, 1);
+        let t = Buffer.Create(hlen, 1);
+        let s1 = Buffer.Create(saltLen + 4, 1);
+        if (saltLen > 0) { Buffer.Copy(saltB, 0, s1, 0, saltLen); }
+
+        let written = 0;
+        let i = 1;
+        while (written < length) {
+            Buffer.WriteU32At(s1, saltLen, i, true);
+            _hexInto(_hmacHex(id, pw, s1), u, hlen);
+            Buffer.Copy(u, 0, t, 0, hlen);
+            if (id == HASH_SHA256)      { _pbkdf2RoundsSha256(pw, u, t, iterations - 1); }
+            else if (id == HASH_SHA512) { _pbkdf2RoundsSha512(pw, u, t, iterations - 1); }
+            else                        { _pbkdf2RoundsSha1(pw, u, t, iterations - 1); }
+            let take = length - written;
+            if (take > hlen) { take = hlen; }
+            Buffer.Copy(t, 0, dk, written, take);
+            written = written + take;
+            i = i + 1;
+        }
+        return dk;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Otp
+// ---------------------------------------------------------------------------
+
+class Otp {
+
+    // HOTP(K, C): dynamic truncation of HMAC(K, C as 8-byte big-endian).
+    fn static Hotp(secret, counter: int, digits?, hash?): string {
+        let id = _hashId(hash, HASH_SHA1);
+        let d = (digits == nil) ? 6 : digits;
+        if (id == 0 || Type.Of(d) != Type.Int || d < 6 || d > 8) { return nil; }
+        if (!_isBytes(secret) || len(secret) == 0 || counter < 0) { return nil; }
+
+        let msg = Buffer.Create(8, 1);
+        Buffer.WriteU64At(msg, 0, counter, true);
+        let mac = _hexToBlock(_hmacHex(id, secret, msg));
+        let n = len(mac);
+        let off = mac[n - 1] & 15;
+        let bin = ((mac[off] & 127) << 24)
+                | ((mac[off + 1] & 255) << 16)
+                | ((mac[off + 2] & 255) << 8)
+                |  (mac[off + 3] & 255);
+        let code = bin % (10 ^^ d);
+        return String.PadLeft(str(code), d, '0');
+    }
+
+    // TOTP = HOTP(K, floor(time / step)).
+    fn static Totp(secret, time?, step?, digits?, hash?): string {
+        let t = (time == nil) ? Time.Now() : time;
+        let s = (step == nil) ? 30 : step;
+        if (Type.Of(t) != Type.Int || Type.Of(s) != Type.Int || s < 1 || t < 0) { return nil; }
+        return Otp.Hotp(secret, t / s, digits, hash);
+    }
+
+    // True when `code` matches any step in [now - window, now + window].
+    fn static TotpVerify(secret, code, window?, time?, step?, digits?, hash?): bool {
+        let w = (window == nil) ? 1 : window;
+        let d = (digits == nil) ? 6 : digits;
+        let t = (time == nil) ? Time.Now() : time;
+        let s = (step == nil) ? 30 : step;
+        if (Type.Of(w) != Type.Int || w < 0 || w > 100) { return false; }
+        if (Type.Of(d) != Type.Int || Type.Of(t) != Type.Int || Type.Of(s) != Type.Int) { return false; }
+        if (s < 1 || t < 0) { return false; }
+        if (code == nil || Type.Of(code) != Type.String || len(code) != d) { return false; }
+        let i = 0;
+        while (i < d) {
+            if (!Char.IsDigit(code[i])) { return false; }
+            i = i + 1;
+        }
+        let counter = t / s;
+        let ok = false;
+        let k = 0 - w;
+        while (k <= w) {
+            let c = counter + k;
+            if (c >= 0) {
+                let expect = Otp.Hotp(secret, c, d, hash);
+                if (expect != nil && Crypto.ConstantTimeEquals(expect, code)) { ok = true; }
+            }
+            k = k + 1;
+        }
+        return ok;
+    }
+
+    // A fresh random secret as unpadded Base32 (20 bytes = 160 bits by default,
+    // which is what RFC 4226 recommends and what authenticator apps expect).
+    fn static NewSecret(bytes?): string {
+        let n = (bytes == nil) ? 20 : bytes;
+        if (Type.Of(n) != Type.Int || n < 10 || n > 64) { return nil; }
+        let s = Util.Base32Encode(Crypto.RandomBytes(n));
+        let m = len(s);
+        while (m > 0 && s[m - 1] == '=') { m = m - 1; }
+        return String.Substr(s, 0, m);
+    }
+
+    // Base32 text as shown to the user (any case, spaces and dashes allowed,
+    // padding optional) -> raw key bytes.
+    fn static SecretFromBase32(text): block {
+        if (text == nil || Type.Of(text) != Type.String) { return nil; }
+        let clean = "";
+        let i = 0;
+        while (i < len(text)) {
+            let c = text[i];
+            if (c != ' ' && c != '-' && c != '=') {
+                clean = clean + Char.ToUpper(c);
+            }
+            i = i + 1;
+        }
+        if (len(clean) == 0) { return nil; }
+        while ((len(clean) & 7) != 0) { clean = clean + "="; }
+        return Util.Base32DecodeBlock(clean);
+    }
+
+    // otpauth://totp/<issuer>:<account>?secret=..&issuer=..&algorithm=..&digits=..&period=..
+    fn static ProvisioningUri(issuer, account, secretBase32, opts?): string {
+        if (issuer == nil || account == nil || secretBase32 == nil) { return nil; }
+        if (Type.Of(issuer) != Type.String || Type.Of(account) != Type.String) { return nil; }
+        if (Type.Of(secretBase32) != Type.String || len(secretBase32) == 0) { return nil; }
+        let d = _optInt(opts == nil ? nil : opts.digits, 6);
+        let s = _optInt(opts == nil ? nil : opts.step, 30);
+        let hashName = (opts == nil) ? nil : opts.hash;
+        let id = _hashId(hashName, HASH_SHA1);
+        if (d == nil || s == nil || id == 0 || d < 6 || d > 8 || s < 1) { return nil; }
+
+        let secret = String.Replace(String.ToUpper(secretBase32), "=", "");
+        let label = _pctEncode(issuer) + ":" + _pctEncode(account);
+        return "otpauth://totp/" + label
+             + "?secret=" + secret
+             + "&issuer=" + _pctEncode(issuer)
+             + "&algorithm=" + _hashName(id)
+             + "&digits=" + str(d)
+             + "&period=" + str(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Password
+// ---------------------------------------------------------------------------
+
+// "$argon2id$v=19$m=65536,t=3,p=1$<salt>$<hash>" -> fields, or nil.
+// The "v=19" segment is optional (some encoders omit it).
+fn _parsePhc(phc) {
+    if (phc == nil || Type.Of(phc) != Type.String || len(phc) > 512) { return nil; }
+    let parts = String.Split(phc, "$");
+    // parts[0] is the empty string before the leading '$'
+    if (len(parts) < 5 || parts[0] != "" || parts[1] != "argon2id") { return nil; }
+    let idx = 2;
+    let version = 19;
+    if (String.StartsWith(parts[idx], "v=")) {
+        version = _parseUInt(String.Substr(parts[idx], 2));
+        if (version == nil) { return nil; }
+        idx = idx + 1;
+    }
+    if (len(parts) != idx + 3) { return nil; }
+
+    let m = nil; let t = nil; let p = nil;
+    let kvs = String.Split(parts[idx], ",");
+    let i = 0;
+    while (i < len(kvs)) {
+        let kv = String.Split(kvs[i], "=");
+        if (len(kv) != 2) { return nil; }
+        let v = _parseUInt(kv[1]);
+        if (v == nil) { return nil; }
+        if (kv[0] == "m") { m = v; }
+        else if (kv[0] == "t") { t = v; }
+        else if (kv[0] == "p") { p = v; }
+        else { return nil; }
+        i = i + 1;
+    }
+    if (m == nil || t == nil || p == nil) { return nil; }
+    let salt = _b64Decode(parts[idx + 1]);
+    let hash = _b64Decode(parts[idx + 2]);
+    if (salt == nil || hash == nil || len(salt) < 8) { return nil; }
+    return { memKiB: m, iterations: t, parallelism: p, version: version, salt: salt, hash: hash };
+}
+
+class Password {
+
+    fn static Hash(password, opts?): string {
+        if (!_isBytes(password)) { return nil; }
+        let a = _argonParams(opts);
+        if (a == nil) { return nil; }
+        let salt = Crypto.RandomBytes(ARGON_SALT_BYTES);
+        let hex = Crypto.Argon2(password, salt, a.iterations, a.memKiB);
+        let tag = _hexToBlock(hex);
+        if (tag == nil) { return nil; }
+        return "$argon2id$v=19$m=" + str(a.memKiB) + ",t=" + str(a.iterations) + ",p=1$"
+             + _b64NoPad(salt) + "$" + _b64NoPad(tag);
+    }
+
+    fn static Verify(password, phc): bool {
+        if (!_isBytes(password)) { return false; }
+        let p = _parsePhc(phc);
+        if (p == nil) { return false; }
+        if (p.version != 19 || p.parallelism != 1 || len(p.hash) != 32) { return false; }
+        if (p.memKiB < ARGON_MIN_MEM || p.memKiB > ARGON_MAX_MEM || p.iterations < 1) { return false; }
+        let hex = Crypto.Argon2(password, p.salt, p.iterations, p.memKiB);
+        let tag = _hexToBlock(hex);
+        if (tag == nil) { return false; }
+        return Crypto.ConstantTimeEquals(tag, p.hash);
+    }
+
+    // True when the stored hash is weaker than opts (or the defaults), or is
+    // not one this library can verify.
+    fn static NeedsRehash(phc, opts?): bool {
+        let a = _argonParams(opts);
+        if (a == nil) { return true; }
+        let p = _parsePhc(phc);
+        if (p == nil) { return true; }
+        if (p.version != 19 || p.parallelism != 1 || len(p.hash) != 32) { return true; }
+        return p.memKiB < a.memKiB || p.iterations < a.iterations;
+    }
+
+    fn static Parse(phc) { return _parsePhc(phc); }
+}
+
+// ---------------------------------------------------------------------------
+//  Envelope
+// ---------------------------------------------------------------------------
+
+// nonce | tag | cipher appended to `out` at `off`; returns total length.
+fn _sealInto(plain, key, out: block, off: int): bool {
+    let n = len(plain);
+    let r = Crypto.Encrypt(plain, n, key);
+    if (!r.Ok) { return false; }
+    let tag = Buffer.Create(TAG_BYTES, 1);
+    _hexInto(r.Tag, tag, TAG_BYTES);
+    Buffer.Copy(r.Nonce, 0, out, off, NONCE_BYTES);
+    Buffer.Copy(tag, 0, out, off + NONCE_BYTES, TAG_BYTES);
+    Buffer.Copy(r.Cipher, 0, out, off + NONCE_BYTES + TAG_BYTES, n);
+    return true;
+}
+
+fn _openFrom(sealed: block, key, off: int): block {
+    let total = len(sealed);
+    let n = total - off - NONCE_BYTES - TAG_BYTES;
+    if (n < 1) { return nil; }
+    let nonce  = Buffer.Slice(sealed, off, NONCE_BYTES);
+    let tag    = Util.BinToHex(Buffer.Slice(sealed, off + NONCE_BYTES, TAG_BYTES));
+    let cipher = Buffer.Slice(sealed, off + NONCE_BYTES + TAG_BYTES, n);
+    let d = Crypto.Decrypt(cipher, n, key, nonce, tag);
+    if (!d.Ok) { return nil; }
+    return d.Plain;
+}
+
+class Envelope {
+
+    fn static NewKey(): block { return Crypto.RandomBytes(KEY_BYTES); }
+
+    fn static Seal(plain, key): block {
+        if (!_isBytes(plain) || len(plain) < 1) { return nil; }
+        if (!_isBytes(key) || len(key) != KEY_BYTES) { return nil; }
+        let out = Buffer.Create(1 + NONCE_BYTES + TAG_BYTES + len(plain), 1);
+        out[0] = ENVELOPE_V1;
+        if (!_sealInto(plain, key, out, 1)) { return nil; }
+        return out;
+    }
+
+    fn static Open(sealed, key): block {
+        let b = _toBlock(sealed);
+        if (b == nil || !_isBytes(key) || len(key) != KEY_BYTES) { return nil; }
+        if (len(b) < 1 + NONCE_BYTES + TAG_BYTES + 1 || b[0] != ENVELOPE_V1) { return nil; }
+        return _openFrom(b, key, 1);
+    }
+
+    // Argon2id(password, salt) -> 32-byte key. opts as for Password.Hash.
+    fn static DeriveKey(password, salt, opts?): block {
+        if (!_isBytes(password) || !_isBytes(salt) || len(salt) < 8) { return nil; }
+        let a = _argonParams(opts);
+        if (a == nil) { return nil; }
+        return _hexToBlock(Crypto.Argon2(password, salt, a.iterations, a.memKiB));
+    }
+
+    fn static SealWithPassword(plain, password, opts?): block {
+        if (!_isBytes(plain) || len(plain) < 1 || !_isBytes(password)) { return nil; }
+        let a = _argonParams(opts);
+        if (a == nil) { return nil; }
+        let salt = Crypto.RandomBytes(ARGON_SALT_BYTES);
+        let key = _hexToBlock(Crypto.Argon2(password, salt, a.iterations, a.memKiB));
+        if (key == nil) { return nil; }
+        let hdr = 1 + 4 + 1 + ARGON_SALT_BYTES;
+        let out = Buffer.Create(hdr + NONCE_BYTES + TAG_BYTES + len(plain), 1);
+        out[0] = ENVELOPE_V2;
+        Buffer.WriteU32At(out, 1, a.memKiB, true);
+        out[5] = a.iterations;
+        Buffer.Copy(salt, 0, out, 6, ARGON_SALT_BYTES);
+        if (!_sealInto(plain, key, out, hdr)) { return nil; }
+        return out;
+    }
+
+    fn static OpenWithPassword(sealed, password): block {
+        let b = _toBlock(sealed);
+        if (b == nil || !_isBytes(password)) { return nil; }
+        let hdr = 1 + 4 + 1 + ARGON_SALT_BYTES;
+        if (len(b) < hdr + NONCE_BYTES + TAG_BYTES + 1 || b[0] != ENVELOPE_V2) { return nil; }
+        let m = Buffer.ReadU32At(b, 1, true);
+        let t = b[5] & 255;
+        if (m < ARGON_MIN_MEM || m > ARGON_MAX_MEM || t < 1) { return nil; }
+        let salt = Buffer.Slice(b, 6, ARGON_SALT_BYTES);
+        let key = _hexToBlock(Crypto.Argon2(password, salt, t, m));
+        if (key == nil) { return nil; }
+        return _openFrom(b, key, hdr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Digest - streaming MD5 / SHA-1 / SHA-256 / SHA-384 / SHA-512 / SHA-3 / Keccak / SHAKE
+// ---------------------------------------------------------------------------
+//
+// Two families, both compiled to native code as typed leaves over
+// (state, data, offset, block count, scratch):
+//
+//   Merkle-Damgard (MD5, SHA-1, SHA-256, SHA-384, SHA-512): 32-bit words live
+//   in 64-bit ints and are masked with M32 after every add or left shift;
+//   `x ^ M32` is the 32-bit complement. SHA-384/512 use real 64-bit words
+//   (no masking - overflow is the correct behaviour) and `>>>` for the
+//   logical right shifts a rotate needs.
+//
+//   Keccak sponge (SHA3-224/256/384/512, Keccak-256, SHAKE128/256): a 25-lane
+//   (5x5x64-bit) state permuted by Keccak-f[1600] (function _keccakF below),
+//   absorbing "rate" bytes at a time (_keccakAbsorb) and squeezing the output
+//   the same way. The five algorithms share one permutation and differ only
+//   in rate, output length, and a one-byte padding constant - see the class
+//   Constructor. KECCAK_RC (round constants) and KECCAK_ROT (per-lane rotate
+//   amounts, flattened to the same x+5*y index as the state) are the two
+//   fixed tables the standard defines; both are reproduced here from a
+//   Python reference implementation that was cross-checked byte-for-byte
+//   against Python's own hashlib (sha3_224/256/384/512, shake_128/256) and
+//   against the EIP-1052 constant for Keccak-256("") before anything below
+//   was written from it - see tests/test_cryptokit.fls for the vectors that
+//   resulted. Unrolling the rho/pi step to remove its two runtime `%5`
+//   operations is the obvious next speedup, not yet done.
+
+global MD5_S: [int] = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21 ];
+
+global MD5_K: [int] = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391 ];
+
+global SHA256_K: [int] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 ];
+
+global SHA512_K: [int] = [
+    4794697086780616226, 8158064640168781261, -5349999486874862801, -1606136188198331460,
+    4131703408338449720, 6480981068601479193, -7908458776815382629, -6116909921290321640,
+    -2880145864133508542, 1334009975649890238, 2608012711638119052, 6128411473006802146,
+    8268148722764581231, -9160688886553864527, -7215885187991268811, -4495734319001033068,
+    -1973867731355612462, -1171420211273849373, 1135362057144423861, 2597628984639134821,
+    3308224258029322869, 5365058923640841347, 6679025012923562964, 8573033837759648693,
+    -7476448914759557205, -6327057829258317296, -5763719355590565569, -4658551843659510044,
+    -4116276920077217854, -3051310485924567259, 489312712824947311, 1452737877330783856,
+    2861767655752347644, 3322285676063803686, 5560940570517711597, 5996557281743188959,
+    7280758554555802590, 8532644243296465576, -9096487096722542874, -7894198246740708037,
+    -6719396339535248540, -6333637450476146687, -4446306890439682159, -4076793802049405392,
+    -3345356375505022440, -2983346525034927856, -860691631967231958, 1182934255886127544,
+    1847814050463011016, 2177327727835720531, 2830643537854262169, 3796741975233480872,
+    4115178125766777443, 5681478168544905931, 6601373596472566643, 7507060721942968483,
+    8399075790359081724, 8693463985226723168, -8878714635349349518, -8302665154208450068,
+    -8016688836872298968, -6606660893046293015, -4685533653050689259, -4147400797238176981,
+    -3880063495543823972, -3348786107499101689, -1523767162380948706, -757361751448694408,
+    500013540394364858, 748580250866718886, 1242879168328830382, 1977374033974150939,
+    2944078676154940804, 3659926193048069267, 4368137639120453308, 4836135668995329356,
+    5532061633213252278, 6448918945643986474, 6902733635092675308, 7801388544844847127 ];
+
+global SHA512_IV: [int] = [
+    7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935,
+    5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809 ];
+
+global SHA384_IV: [int] = [
+    -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257,
+    7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076 ];
+
+global KECCAK_RC: [int] = [
+    1, 32898, -9223372036854742902, -9223372034707259392,
+    32907, 2147483649, -9223372034707259263, -9223372036854743031,
+    138, 136, 2147516425, 2147483658,
+    2147516555, -9223372036854775669, -9223372036854742903, -9223372036854743037,
+    -9223372036854743038, -9223372036854775680, 32778, -9223372034707292150,
+    -9223372034707259263, -9223372036854742912, 2147483649, -9223372034707259384 ];
+
+global KECCAK_ROT: [int] = [
+    0, 1, 62, 28,
+    27, 36, 44, 6,
+    55, 20, 3, 10,
+    43, 25, 39, 41,
+    45, 15, 21, 8,
+    18, 2, 61, 56,
+    14 ];
+
+// MD5 over `count` 64-byte blocks of data starting at off. h = 4 words, W = 16 scratch.
+fn _md5Blocks(h: [int], data: block, off: int, count: int, W: [int], K: [int], S: [int]) {
+    let a0: int = h[0]; let b0: int = h[1]; let c0: int = h[2]; let d0: int = h[3];
+    let n: int = 0;
+    while (n < count) {
+        let p: int = off + n * 64;
+        let j: int = 0;
+        while (j < 16) { W[j] = Buffer.ReadU32At(data, p + j * 4, false); j = j + 1; }
+        let A: int = a0; let B: int = b0; let C: int = c0; let D: int = d0;
+        let r: int = 0;
+        while (r < 64) {
+            let F: int = 0;
+            let g: int = 0;
+            if (r < 16)      { F = (B & C) | ((B ^ M32) & D);   g = r; }
+            else if (r < 32) { F = (D & B) | ((D ^ M32) & C);   g = (5 * r + 1) & 15; }
+            else if (r < 48) { F = B ^ C ^ D;                   g = (3 * r + 5) & 15; }
+            else             { F = C ^ (B | (D ^ M32));         g = (7 * r) & 15; }
+            F = (F + A + K[r] + W[g]) & M32;
+            A = D; D = C; C = B;
+            let s: int = S[r];
+            B = (B + (((F << s) | (F >> (32 - s))) & M32)) & M32;
+            r = r + 1;
+        }
+        a0 = (a0 + A) & M32; b0 = (b0 + B) & M32; c0 = (c0 + C) & M32; d0 = (d0 + D) & M32;
+        n = n + 1;
+    }
+    h[0] = a0; h[1] = b0; h[2] = c0; h[3] = d0;
+}
+
+// SHA-1 over `count` blocks. h = 5 words, W = 80 scratch.
+fn _sha1Blocks(h: [int], data: block, off: int, count: int, W: [int]) {
+    let h0: int = h[0]; let h1: int = h[1]; let h2: int = h[2]; let h3: int = h[3]; let h4: int = h[4];
+    let n: int = 0;
+    while (n < count) {
+        let p: int = off + n * 64;
+        let t: int = 0;
+        while (t < 16) { W[t] = Buffer.ReadU32At(data, p + t * 4, true); t = t + 1; }
+        while (t < 80) {
+            let x: int = W[t - 3] ^ W[t - 8] ^ W[t - 14] ^ W[t - 16];
+            W[t] = ((x << 1) | (x >> 31)) & M32;
+            t = t + 1;
+        }
+        let a: int = h0; let b: int = h1; let c: int = h2; let d: int = h3; let e: int = h4;
+        t = 0;
+        while (t < 80) {
+            let f: int = 0;
+            let k: int = 0;
+            if (t < 20)      { f = (b & c) | ((b ^ M32) & d);       k = 0x5a827999; }
+            else if (t < 40) { f = b ^ c ^ d;                       k = 0x6ed9eba1; }
+            else if (t < 60) { f = (b & c) | (b & d) | (c & d);     k = 0x8f1bbcdc; }
+            else             { f = b ^ c ^ d;                       k = 0xca62c1d6; }
+            let temp: int = ((((a << 5) | (a >> 27)) & M32) + f + e + k + W[t]) & M32;
+            e = d;
+            d = c;
+            c = ((b << 30) | (b >> 2)) & M32;
+            b = a;
+            a = temp;
+            t = t + 1;
+        }
+        h0 = (h0 + a) & M32; h1 = (h1 + b) & M32; h2 = (h2 + c) & M32; h3 = (h3 + d) & M32; h4 = (h4 + e) & M32;
+        n = n + 1;
+    }
+    h[0] = h0; h[1] = h1; h[2] = h2; h[3] = h3; h[4] = h4;
+}
+
+// SHA-256 over `count` blocks. h = 8 words, W = 64 scratch.
+fn _sha256Blocks(h: [int], data: block, off: int, count: int, W: [int], K: [int]) {
+    let n: int = 0;
+    while (n < count) {
+        let p: int = off + n * 64;
+        let t: int = 0;
+        while (t < 16) { W[t] = Buffer.ReadU32At(data, p + t * 4, true); t = t + 1; }
+        while (t < 64) {
+            let w15: int = W[t - 15];
+            let w2: int  = W[t - 2];
+            let s0: int = (((w15 >> 7) | (w15 << 25)) ^ ((w15 >> 18) | (w15 << 14)) ^ (w15 >> 3)) & M32;
+            let s1: int = (((w2 >> 17) | (w2 << 15)) ^ ((w2 >> 19) | (w2 << 13)) ^ (w2 >> 10)) & M32;
+            W[t] = (W[t - 16] + s0 + W[t - 7] + s1) & M32;
+            t = t + 1;
+        }
+        let a: int = h[0]; let b: int = h[1]; let c: int = h[2]; let d: int = h[3];
+        let e: int = h[4]; let f: int = h[5]; let g: int = h[6]; let hh: int = h[7];
+        t = 0;
+        while (t < 64) {
+            let S1: int = (((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7))) & M32;
+            let ch: int = (e & f) ^ ((e ^ M32) & g);
+            let T1: int = (hh + S1 + ch + K[t] + W[t]) & M32;
+            let S0: int = (((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10))) & M32;
+            let maj: int = (a & b) ^ (a & c) ^ (b & c);
+            let T2: int = (S0 + maj) & M32;
+            hh = g; g = f; f = e;
+            e = (d + T1) & M32;
+            d = c; c = b; b = a;
+            a = (T1 + T2) & M32;
+            t = t + 1;
+        }
+        h[0] = (h[0] + a) & M32; h[1] = (h[1] + b) & M32; h[2] = (h[2] + c) & M32; h[3] = (h[3] + d) & M32;
+        h[4] = (h[4] + e) & M32; h[5] = (h[5] + f) & M32; h[6] = (h[6] + g) & M32; h[7] = (h[7] + hh) & M32;
+        n = n + 1;
+    }
+}
+
+// SHA-512/384 over `count` 128-byte blocks. h = 8 words, W = 80 scratch,
+// K = SHA512_K. Rotates use `>>>` (logical shift), so this needs a VM with the
+// tagged-range fix for [int] arrays (1.0.3.0+) - see the header note above.
+fn _sha512Blocks(h: [int], data: block, off: int, count: int, W: [int], K: [int]) {
+    let n: int = 0;
+    while (n < count) {
+        let p: int = off + n * 128;
+        let t: int = 0;
+        while (t < 16) { W[t] = Buffer.ReadU64At(data, p + t * 8, true); t = t + 1; }
+        while (t < 80) {
+            let w15: int = W[t - 15];
+            let w2: int  = W[t - 2];
+            let s0: int = ((w15 >>> 1) | (w15 << 63)) ^ ((w15 >>> 8) | (w15 << 56)) ^ (w15 >>> 7);
+            let s1: int = ((w2 >>> 19) | (w2 << 45)) ^ ((w2 >>> 61) | (w2 << 3)) ^ (w2 >>> 6);
+            W[t] = W[t - 16] + s0 + W[t - 7] + s1;
+            t = t + 1;
+        }
+        let a: int = h[0]; let b: int = h[1]; let c: int = h[2]; let d: int = h[3];
+        let e: int = h[4]; let f: int = h[5]; let g: int = h[6]; let hh: int = h[7];
+        t = 0;
+        while (t < 80) {
+            let S1: int = ((e >>> 14) | (e << 50)) ^ ((e >>> 18) | (e << 46)) ^ ((e >>> 41) | (e << 23));
+            let ch: int = (e & f) ^ ((~e) & g);
+            let T1: int = hh + S1 + ch + K[t] + W[t];
+            let S0: int = ((a >>> 28) | (a << 36)) ^ ((a >>> 34) | (a << 30)) ^ ((a >>> 39) | (a << 25));
+            let maj: int = (a & b) ^ (a & c) ^ (b & c);
+            let T2: int = S0 + maj;
+            hh = g; g = f; f = e; e = d + T1; d = c; c = b; b = a; a = T1 + T2;
+            t = t + 1;
+        }
+        h[0] = h[0] + a; h[1] = h[1] + b; h[2] = h[2] + c; h[3] = h[3] + d;
+        h[4] = h[4] + e; h[5] = h[5] + f; h[6] = h[6] + g; h[7] = h[7] + hh;
+        n = n + 1;
+    }
+}
+
+// Keccak-f[1600]: 24 rounds over a 25-lane (5x5x64-bit) state, index x + 5*y.
+// C/D are 5-lane scratch, B is 25-lane scratch. RC/ROT are the fixed tables
+// above. This is the permutation shared by SHA3-224/256/384/512, Keccak-256
+// (the pre-standardization, Ethereum-style hash - same permutation, different
+// padding byte) and SHAKE128/256. Needs `>>>` and flat [int] arrays (1.0.3.0+).
+fn _keccakF(state: [int], C: [int], D: [int], B: [int], RC: [int], ROT: [int]) {
+    let rnd: int = 0;
+    while (rnd < 24) {
+        // theta: column parity, then mix each column into its two neighbours
+        let x: int = 0;
+        while (x < 5) { C[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20]; x = x + 1; }
+        x = 0;
+        while (x < 5) {
+            let cxp1: int = C[(x + 1) % 5];
+            D[x] = C[(x + 4) % 5] ^ ((cxp1 << 1) | (cxp1 >>> 63));
+            x = x + 1;
+        }
+        x = 0;
+        while (x < 5) {
+            let y: int = 0;
+            while (y < 5) { let i: int = x + 5 * y; state[i] = state[i] ^ D[x]; y = y + 1; }
+            x = x + 1;
+        }
+        // rho (per-lane rotate) + pi (lane permutation), fused into one pass
+        x = 0;
+        while (x < 5) {
+            let y: int = 0;
+            while (y < 5) {
+                let i: int = x + 5 * y;
+                let r: int = ROT[i];
+                let v: int = state[i];
+                let rotated: int = (r == 0) ? v : ((v << r) | (v >>> (64 - r)));
+                B[y + 5 * ((2 * x + 3 * y) % 5)] = rotated;
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        // chi: nonlinear mix within each row
+        x = 0;
+        while (x < 5) {
+            let y: int = 0;
+            while (y < 5) {
+                let i: int = x + 5 * y;
+                let b1: int = B[((x + 1) % 5) + 5 * y];
+                let b2: int = B[((x + 2) % 5) + 5 * y];
+                state[i] = B[i] ^ ((~b1) & b2);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        // iota: break the round symmetry
+        state[0] = state[0] ^ RC[rnd];
+        rnd = rnd + 1;
+    }
+}
+
+// Sponge absorb: XOR `count` `laneCount*8`-byte blocks of `data` (starting at
+// `off`) into the rate portion of `state`, permuting after each. laneCount is
+// rate/8 (9/13/17/18/21 for the five rates this library uses).
+fn _keccakAbsorb(state: [int], data: block, off: int, count: int, laneCount: int, C: [int], D: [int], B: [int], RC: [int], ROT: [int]) {
+    let n: int = 0;
+    while (n < count) {
+        let p: int = off + n * (laneCount * 8);
+        let i: int = 0;
+        while (i < laneCount) { state[i] = state[i] ^ Buffer.ReadU64At(data, p + i * 8, false); i = i + 1; }
+        _keccakF(state, C, D, B, RC, ROT);
+        n = n + 1;
+    }
+}
+
+// Write up to 8 little-endian bytes of `lane` into out[off..off+n) - used to
+// squeeze a partial lane (the last few bytes of an odd-length XOF request).
+fn _writeLaneBytes(out: block, off: int, lane: int, n: int) {
+    let i: int = 0;
+    while (i < n) { out[off + i] = (lane >>> (8 * i)) & 255; i = i + 1; }
+}
+
+class Digest {
+    let _algo = 0;          // DIGEST_*
+    let _h = nil;           // [int] state words (4/5/8 for MD5/SHA-1/SHA-2, 25 lanes for Keccak)
+    let _w = nil;           // [int] message schedule scratch (Keccak: unused)
+    let _c = nil;           // [int](5) Keccak theta scratch; nil for non-Keccak
+    let _d = nil;           // [int](5) Keccak theta scratch; nil for non-Keccak
+    let _b = nil;           // [int](25) Keccak rho/pi scratch; nil for non-Keccak
+    let _buf = nil;         // block(_blockSize): bytes not yet compressed
+    let _bufLen = 0;
+    let _total = 0;         // bytes hashed so far (a 64-bit byte count; see Final)
+    let _result = nil;      // block: cached raw digest once Final ran
+    let _finished = false;  // true once Final or Squeeze has run; blocks further Update
+    let _blockSize = 64;    // 64 for MD5/SHA-1/SHA-256; 128 for SHA-384/512; the sponge
+                             // "rate" in bytes for the Keccak family (72/104/136/144/168)
+    let _lenBytes = 8;      // Merkle-Damgard trailing length field: 8 or 16 bytes
+    let _outWords = 0;      // how many _h words Final emits (Merkle-Damgard family)
+    let _wordBytes = 4;     // bytes per emitted word: 4 or 8 (Merkle-Damgard family)
+    let _sponge = false;    // true for SHA3-*/Keccak256/SHAKE* (a Keccak sponge, not Merkle-Damgard)
+    let _padByte = 0;       // sponge domain-separation + first pad bit: 0x06 SHA3, 0x01 Keccak256, 0x1F SHAKE
+    let _outBytes = 0;      // fixed sponge output length in bytes; 0 for SHAKE (use Squeeze)
+
+    fn Constructor(algo) {
+        let name = (algo == nil || Type.Of(algo) != Type.String) ? "" : String.ToLower(algo);
+        if (name == "md5") {
+            this._algo = DIGEST_MD5; this._h = Array.Create(4, Type.Int); this._w = Array.Create(16, Type.Int);
+            this._blockSize = 64; this._lenBytes = 8; this._outWords = 4; this._wordBytes = 4;
+        } else if (name == "sha1" || name == "sha-1") {
+            this._algo = DIGEST_SHA1; this._h = Array.Create(5, Type.Int); this._w = Array.Create(80, Type.Int);
+            this._blockSize = 64; this._lenBytes = 8; this._outWords = 5; this._wordBytes = 4;
+        } else if (name == "sha256" || name == "sha-256") {
+            this._algo = DIGEST_SHA256; this._h = Array.Create(8, Type.Int); this._w = Array.Create(64, Type.Int);
+            this._blockSize = 64; this._lenBytes = 8; this._outWords = 8; this._wordBytes = 4;
+        } else if (name == "sha384" || name == "sha-384") {
+            this._algo = DIGEST_SHA384; this._h = Array.Create(8, Type.Int); this._w = Array.Create(80, Type.Int);
+            this._blockSize = 128; this._lenBytes = 16; this._outWords = 6; this._wordBytes = 8;
+        } else if (name == "sha512" || name == "sha-512") {
+            this._algo = DIGEST_SHA512; this._h = Array.Create(8, Type.Int); this._w = Array.Create(80, Type.Int);
+            this._blockSize = 128; this._lenBytes = 16; this._outWords = 8; this._wordBytes = 8;
+        } else if (name == "sha3-224" || name == "sha3_224") {
+            this._algo = DIGEST_SHA3_224; this._blockSize = 144; this._padByte = 0x06; this._outBytes = 28; this._sponge = true;
+        } else if (name == "sha3-256" || name == "sha3_256") {
+            this._algo = DIGEST_SHA3_256; this._blockSize = 136; this._padByte = 0x06; this._outBytes = 32; this._sponge = true;
+        } else if (name == "sha3-384" || name == "sha3_384") {
+            this._algo = DIGEST_SHA3_384; this._blockSize = 104; this._padByte = 0x06; this._outBytes = 48; this._sponge = true;
+        } else if (name == "sha3-512" || name == "sha3_512") {
+            this._algo = DIGEST_SHA3_512; this._blockSize = 72; this._padByte = 0x06; this._outBytes = 64; this._sponge = true;
+        } else if (name == "keccak256" || name == "keccak-256" || name == "keccak_256") {
+            this._algo = DIGEST_KECCAK256; this._blockSize = 136; this._padByte = 0x01; this._outBytes = 32; this._sponge = true;
+        } else if (name == "shake128" || name == "shake-128" || name == "shake_128") {
+            this._algo = DIGEST_SHAKE128; this._blockSize = 168; this._padByte = 0x1F; this._outBytes = 0; this._sponge = true;
+        } else if (name == "shake256" || name == "shake-256" || name == "shake_256") {
+            this._algo = DIGEST_SHAKE256; this._blockSize = 136; this._padByte = 0x1F; this._outBytes = 0; this._sponge = true;
+        } else { this._algo = 0; }
+        if (this._sponge) {
+            this._h = Array.Create(25, Type.Int);
+            this._c = Array.Create(5, Type.Int);
+            this._d = Array.Create(5, Type.Int);
+            this._b = Array.Create(25, Type.Int);
+        }
+        this._buf = Buffer.Create(this._blockSize < 1 ? 1 : this._blockSize, 1);
+        this.Reset();
+    }
+
+    fn static Algorithms(): array {
+        return ["md5", "sha1", "sha256", "sha384", "sha512",
+                "sha3-224", "sha3-256", "sha3-384", "sha3-512", "keccak256", "shake128", "shake256"];
+    }
+
+    // One-shot MD5. hex by default; raw = true gives the 16 bytes.
+    fn static Md5(data, raw?) {
+        let d = new Digest("md5");
+        if (d.Update(data) == nil) { return nil; }
+        return d.Final(raw);
+    }
+
+    // One-shot Keccak-256 (Ethereum-style: same permutation as SHA3-256, the
+    // 0x01 pre-standardization padding byte instead of NIST's 0x06 - a
+    // genuinely different 32-byte hash from SHA3-256, not a naming variant).
+    fn static Keccak256(data, raw?) {
+        let d = new Digest("keccak256");
+        if (d.Update(data) == nil) { return nil; }
+        return d.Final(raw);
+    }
+
+    // One-shot SHAKE128/256 extendable-output hash: outLen bytes of output.
+    fn static Shake128(data, outLen, raw?) {
+        let d = new Digest("shake128");
+        if (d.Update(data) == nil) { return nil; }
+        return d.Squeeze(outLen, raw);
+    }
+    fn static Shake256(data, outLen, raw?) {
+        let d = new Digest("shake256");
+        if (d.Update(data) == nil) { return nil; }
+        return d.Squeeze(outLen, raw);
+    }
+
+    fn Algorithm(): string {
+        if (this._algo == DIGEST_MD5) { return "md5"; }
+        if (this._algo == DIGEST_SHA1) { return "sha1"; }
+        if (this._algo == DIGEST_SHA256) { return "sha256"; }
+        if (this._algo == DIGEST_SHA384) { return "sha384"; }
+        if (this._algo == DIGEST_SHA512) { return "sha512"; }
+        if (this._algo == DIGEST_SHA3_224) { return "sha3-224"; }
+        if (this._algo == DIGEST_SHA3_256) { return "sha3-256"; }
+        if (this._algo == DIGEST_SHA3_384) { return "sha3-384"; }
+        if (this._algo == DIGEST_SHA3_512) { return "sha3-512"; }
+        if (this._algo == DIGEST_KECCAK256) { return "keccak256"; }
+        if (this._algo == DIGEST_SHAKE128) { return "shake128"; }
+        if (this._algo == DIGEST_SHAKE256) { return "shake256"; }
+        return nil;
+    }
+
+    fn Reset(): Digest {
+        this._bufLen = 0;
+        this._total = 0;
+        this._result = nil;
+        this._finished = false;
+        if (this._sponge) {
+            let i = 0; while (i < 25) { this._h[i] = 0; i = i + 1; }
+        } else if (this._algo == DIGEST_MD5) {
+            this._h[0] = 0x67452301; this._h[1] = 0xefcdab89; this._h[2] = 0x98badcfe; this._h[3] = 0x10325476;
+        } else if (this._algo == DIGEST_SHA1) {
+            this._h[0] = 0x67452301; this._h[1] = 0xefcdab89; this._h[2] = 0x98badcfe; this._h[3] = 0x10325476; this._h[4] = 0xc3d2e1f0;
+        } else if (this._algo == DIGEST_SHA256) {
+            this._h[0] = 0x6a09e667; this._h[1] = 0xbb67ae85; this._h[2] = 0x3c6ef372; this._h[3] = 0xa54ff53a;
+            this._h[4] = 0x510e527f; this._h[5] = 0x9b05688c; this._h[6] = 0x1f83d9ab; this._h[7] = 0x5be0cd19;
+        } else if (this._algo == DIGEST_SHA384) {
+            let i = 0; while (i < 8) { this._h[i] = SHA384_IV[i]; i = i + 1; }
+        } else if (this._algo == DIGEST_SHA512) {
+            let i = 0; while (i < 8) { this._h[i] = SHA512_IV[i]; i = i + 1; }
+        }
+        return this;
+    }
+
+    fn _compress(data, off: int, count: int) {
+        if (this._algo == DIGEST_MD5)         { _md5Blocks(this._h, data, off, count, this._w, MD5_K, MD5_S); }
+        else if (this._algo == DIGEST_SHA1)   { _sha1Blocks(this._h, data, off, count, this._w); }
+        else if (this._algo == DIGEST_SHA256) { _sha256Blocks(this._h, data, off, count, this._w, SHA256_K); }
+        else if (this._algo == DIGEST_SHA384 || this._algo == DIGEST_SHA512) { _sha512Blocks(this._h, data, off, count, this._w, SHA512_K); }
+        else if (this._sponge) { _keccakAbsorb(this._h, data, off, count, this._blockSize / 8, this._c, this._d, this._b, KECCAK_RC, KECCAK_ROT); }
+    }
+
+    // Feed more bytes (string or block). Returns this, or nil after Final,
+    // after Squeeze, or on an unusable argument.
+    fn Update(data): Digest {
+        if (this._algo == 0 || this._finished) { return nil; }
+        if (data == nil) { return this; }
+        if (!_isBytes(data)) { return nil; }
+        let n = len(data);
+        if (n == 0) { return this; }
+        let b = _toBlock(data);
+        let pos = 0;
+
+        let bs = this._blockSize;
+        if (this._bufLen > 0) {
+            let fill = bs - this._bufLen;
+            if (fill > n) { fill = n; }
+            Buffer.Copy(b, 0, this._buf, this._bufLen, fill);
+            this._bufLen = this._bufLen + fill;
+            pos = fill;
+            if (this._bufLen == bs) {
+                this._compress(this._buf, 0, 1);
+                this._bufLen = 0;
+            }
+        }
+        let full = (n - pos) / bs;
+        if (full > 0) {
+            this._compress(b, pos, full);
+            pos = pos + full * bs;
+        }
+        let rem = n - pos;
+        if (rem > 0) {
+            Buffer.Copy(b, pos, this._buf, 0, rem);
+            this._bufLen = rem;
+        }
+        this._total = this._total + n;
+        return this;
+    }
+
+    // Pad the buffered tail to exactly one rate-sized block (Keccak's
+    // multi-rate pad10*1: `_padByte` at the first pad position, 0x80 at the
+    // last byte of the block - the same byte when they coincide, which XOR
+    // handles for free) and absorb it. Unlike Merkle-Damgard padding this
+    // never needs a second block: the sponge carries no length field, so
+    // there is always room for at least the pad byte plus the 0x80 in the
+    // `_bufLen`..`_blockSize`-1 gap.
+    fn _padAbsorb() {
+        let bs = this._blockSize;
+        let tail = Buffer.Create(bs, 1);
+        Buffer.Fill(tail, 0);
+        if (this._bufLen > 0) { Buffer.Copy(this._buf, 0, tail, 0, this._bufLen); }
+        tail[this._bufLen] = tail[this._bufLen] ^ this._padByte;
+        tail[bs - 1] = tail[bs - 1] ^ 0x80;
+        this._compress(tail, 0, 1);
+    }
+
+    // Finish: pad, compress, and return the digest as hex (raw = true: block).
+    // Calling it again returns the same digest; Update after it returns nil.
+    // For SHAKE128/256 (arbitrary output length) this always returns nil -
+    // use Squeeze(outLen) instead.
+    // The RFC length field is 8 bytes (MD5/SHA-1/SHA-256) or 16 bytes
+    // (SHA-384/512); the message length is tracked as a 64-bit byte count, so
+    // the top 8 bytes of a 16-byte field are always zero - true for any
+    // message that fits in memory or on disk.
+    fn Final(raw?) {
+        if (this._algo == 0) { return nil; }
+        if (this._algo == DIGEST_SHAKE128 || this._algo == DIGEST_SHAKE256) { return nil; }
+        this._finished = true;
+        if (this._result == nil) {
+            if (this._sponge) {
+                this._padAbsorb();
+                let outBytes = this._outBytes;
+                let out = Buffer.Create(outBytes, 1);
+                let got = 0; let lane = 0;
+                while (got < outBytes) {
+                    let take = outBytes - got; if (take > 8) { take = 8; }
+                    _writeLaneBytes(out, got, this._h[lane], take);
+                    got = got + take; lane = lane + 1;
+                }
+                this._result = out;
+            } else {
+                let bs = this._blockSize;
+                let lb = this._lenBytes;
+                let tail = Buffer.Create(bs * 2, 1);
+                Buffer.Fill(tail, 0);
+                if (this._bufLen > 0) { Buffer.Copy(this._buf, 0, tail, 0, this._bufLen); }
+                tail[this._bufLen] = 0x80;
+                let padLen = (this._bufLen < bs - lb) ? bs : bs * 2;
+                let bits = this._total * 8;
+                let bigEndian = this._algo != DIGEST_MD5;
+                if (lb == 16) { Buffer.WriteU64At(tail, padLen - 16, 0, true); }
+                Buffer.WriteU64At(tail, padLen - 8, bits, bigEndian);
+                this._compress(tail, 0, padLen / bs);
+
+                let words = this._outWords;
+                let wb = this._wordBytes;
+                let out = Buffer.Create(words * wb, 1);
+                let i = 0;
+                while (i < words) {
+                    if (wb == 8) { Buffer.WriteU64At(out, i * 8, this._h[i], bigEndian); }
+                    else         { Buffer.WriteU32At(out, i * 4, this._h[i], bigEndian); }
+                    i = i + 1;
+                }
+                this._result = out;
+            }
+        }
+        if (raw == true) { return this._result; }
+        return Util.BinToHex(this._result);
+    }
+
+    // SHAKE128/256 only: squeeze exactly outLen bytes of extendable output
+    // (hex by default; raw = true gives the block). One-shot, like Final -
+    // Update afterward returns nil, and a second Squeeze call (even with a
+    // different outLen) returns nil rather than silently returning unrelated
+    // output; Reset() first if a different length is needed. outLen beyond
+    // the rate (168 bytes for SHAKE128, 136 for SHAKE256) runs the
+    // permutation again to produce more output, exactly as the standard
+    // defines - there is no length limit here beyond a sanity cap.
+    fn Squeeze(outLen, raw?) {
+        if (this._algo != DIGEST_SHAKE128 && this._algo != DIGEST_SHAKE256) { return nil; }
+        if (this._finished) { return nil; }
+        // outLen is deliberately untyped: a typed `int` parameter on a class
+        // method (static or instance) raises an uncatchable native exception
+        // when given a value of any other type instead of the compile-time
+        // error a free function gets or a value this method could check and
+        // reject - see the note in the header. Checking the type ourselves,
+        // on an untyped parameter, is what keeps "bad input returns nil" true.
+        if (outLen == nil || Type.Of(outLen) != Type.Int || outLen < 1 || outLen > 16777216) { return nil; }
+        this._finished = true;
+        this._padAbsorb();
+        let laneCount = this._blockSize / 8;
+        let out = Buffer.Create(outLen, 1);
+        let got = 0;
+        while (got < outLen) {
+            let i = 0;
+            while (i < laneCount && got < outLen) {
+                let take = outLen - got; if (take > 8) { take = 8; }
+                _writeLaneBytes(out, got, this._h[i], take);
+                got = got + take;
+                i = i + 1;
+            }
+            if (got < outLen) { _keccakF(this._h, this._c, this._d, this._b, KECCAK_RC, KECCAK_ROT); }
+        }
+        if (raw == true) { return out; }
+        return Util.BinToHex(out);
+    }
+}
+
+export { Kdf, Otp, Password, Envelope, Digest };

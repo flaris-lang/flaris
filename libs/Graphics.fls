@@ -111,6 +111,7 @@ class Raster {
     fn static OpGlyph():int     { return 7; }
     fn static OpFilter():int    { return 8; }
     fn static OpRing():int      { return 9; }
+    fn static OpStampDot():int  { return 10; } // r<=0 stamp: point only, no circle math
 
     // Row replication pays off once a fill spans the full stride and is more
     // than a few rows; below that the per-call overhead beats the kernel.
@@ -350,7 +351,7 @@ class Raster {
     fn _emitStamp(s:object, x0:int, y0:int, x1:int, y1:int, r:int, col:int) {
         if (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
-        _arena[p]      = Raster.OpStamp();
+        if (r <= 0) { _arena[p] = Raster.OpStampDot(); } else { _arena[p] = Raster.OpStamp(); }
         _arena[p + 1]  = Raster.CmdStamp();
         _arena[p + 2]  = s.off;
         _arena[p + 3]  = s.w;
@@ -1109,7 +1110,8 @@ class Raster {
         if (op == 6) { return 5; }
         if (op == 7) { return 6; }
         if (op == 8) { return 7; }
-        return 8;
+        if (op == 9) { return 8; }
+        return 9;
     }
 
     fn Flush() {
@@ -1136,7 +1138,8 @@ class Raster {
                 else if (cls == 5) { Buffer.ProcessEvent(Raster._kernelScale, _arena, _cap, p, id); }
                 else if (cls == 6) { Buffer.ProcessEvent(Raster._kernelGlyph, _arena, _cap, p, id); }
                 else if (cls == 7) { Buffer.ProcessEvent(Raster._kernelFilter, _arena, _cap, p, id); }
-                else               { Buffer.ProcessEvent(Raster._kernelRing,   _arena, _cap, p, id); }
+                else if (cls == 8) { Buffer.ProcessEvent(Raster._kernelRing,   _arena, _cap, p, id); }
+                else               { Buffer.ProcessEvent(Raster._kernelStampDot, _arena, _cap, p, id); }
                 Event.WaitFor([id]);
             } else {
                 if (cls == 1)      { Raster._kernelRect(_arena, _cap, p); }
@@ -1146,7 +1149,8 @@ class Raster {
                 else if (cls == 5) { Raster._kernelScale(_arena, _cap, p); }
                 else if (cls == 6) { Raster._kernelGlyph(_arena, _cap, p); }
                 else if (cls == 7) { Raster._kernelFilter(_arena, _cap, p); }
-                else               { Raster._kernelRing(_arena, _cap, p); }
+                else if (cls == 8) { Raster._kernelRing(_arena, _cap, p); }
+                else               { Raster._kernelStampDot(_arena, _cap, p); }
             }
             p = q;
             done = done + run;
@@ -1553,6 +1557,9 @@ class Raster {
     //
     // Sample positions use exact rational rounding (half away from zero) rather
     // than a floating-point accumulator, so a long segment cannot drift.
+    // r>0 only - a zero/negative radius record is routed to _kernelStampDot
+    // instead (see _emitStamp), so this kernel carries only the circle-fill
+    // path and fits under the 64-register JIT cap.
     fn static _kernelStamp(b:block, _blen:int, start:int):int {
         let n = b[0];
         var i = 0;
@@ -1589,57 +1596,98 @@ class Raster {
                     if (nb >= 0) { cy = y0 + (nb + steps) / (steps * 2); }
                     else         { cy = y0 - ((0 - nb) + steps) / (steps * 2); }
                 }
-                if (rr <= 0) {
-                    if (cx >= 0 && cx < cw && cy >= 0 && cy < ch) {
-                        let o = dst + cy * stride + cx;
-                        if (sa == 255) {
-                            b[o] = col;
-                        } else {
-                            let d = b[o];
-                            var rb = (d & 0x00FF00FF) * ia + srb;
-                            rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                            var gg = ((d >> 8) & 0xFF) * ia + sg;
-                            gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                            var aa = ((d >> 24) & 0xFF) * ia + 127;
-                            aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                            b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
-                        }
-                    }
-                } else {
-                    var half = 0;
-                    var dyy = 0 - rr;
-                    while (dyy <= rr) {
-                        let d2 = r2 - dyy * dyy;
-                        while ((half + 1) * (half + 1) <= d2) { half = half + 1; }
-                        while (half > 0 && half * half > d2) { half = half - 1; }
-                        let yy = cy + dyy;
-                        if (yy >= 0 && yy < ch) {
-                            {
-                                var xa = cx - half;
-                                var xb = cx + half;
-                                if (xa < 0) { xa = 0; }
-                                if (xb >= cw) { xb = cw - 1; }
-                                let ro = dst + yy * stride;
-                                var xj = xa;
-                                while (xj <= xb) {
-                                    let o = ro + xj;
-                                    if (sa == 255) {
-                                        b[o] = col;
-                                    } else {
-                                        let d = b[o];
-                                        var rb = (d & 0x00FF00FF) * ia + srb;
-                                        rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                                        var gg = ((d >> 8) & 0xFF) * ia + sg;
-                                        gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                                        var aa = ((d >> 24) & 0xFF) * ia + 127;
-                                        aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                                        b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
-                                    }
-                                    xj = xj + 1;
+                var half = 0;
+                var dyy = 0 - rr;
+                while (dyy <= rr) {
+                    let d2 = r2 - dyy * dyy;
+                    while ((half + 1) * (half + 1) <= d2) { half = half + 1; }
+                    while (half > 0 && half * half > d2) { half = half - 1; }
+                    let yy = cy + dyy;
+                    if (yy >= 0 && yy < ch) {
+                        {
+                            var xa = cx - half;
+                            var xb = cx + half;
+                            if (xa < 0) { xa = 0; }
+                            if (xb >= cw) { xb = cw - 1; }
+                            let ro = dst + yy * stride;
+                            var xj = xa;
+                            while (xj <= xb) {
+                                let o = ro + xj;
+                                if (sa == 255) {
+                                    b[o] = col;
+                                } else {
+                                    let d = b[o];
+                                    var rb = (d & 0x00FF00FF) * ia + srb;
+                                    rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                                    var gg = ((d >> 8) & 0xFF) * ia + sg;
+                                    gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                                    var aa = ((d >> 24) & 0xFF) * ia + 127;
+                                    aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                                    b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
                                 }
+                                xj = xj + 1;
                             }
                         }
-                        dyy = dyy + 1;
+                    }
+                    dyy = dyy + 1;
+                }
+                k = k + 1;
+            }
+            p = p + sz;
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // r<=0 companion to _kernelStamp: point-only stamps (no circle math), so
+    // this kernel is a fraction of the register footprint.
+    fn static _kernelStampDot(b:block, _blen:int, start:int):int {
+        let n = b[0];
+        var i = 0;
+        var p = start;
+        while (i < n) {
+            let sz     = b[p + 1];
+            let dst    = b[p + 2];
+            let stride = b[p + 3];
+            let col    = b[p + sz - 1];
+            let cw = b[p + 4]; let ch = b[p + 5];
+            let x0 = b[p + 6]; let y0 = b[p + 7];
+            let x1 = b[p + 8]; let y1 = b[p + 9];
+            let sa  = (col >> 24) & 0xFF;
+            let ia  = 255 - sa;
+            let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
+            let sg  = ((col >> 8) & 0xFF) * sa + 127;
+            let ddx = x1 - x0;
+            let ddy = y1 - y0;
+            var adx = ddx; if (adx < 0) { adx = 0 - adx; }
+            var ady = ddy; if (ady < 0) { ady = 0 - ady; }
+            var steps = adx;
+            if (ady > adx) { steps = ady; }
+            var k = 0;
+            while (k <= steps) {
+                var cx = x0;
+                var cy = y0;
+                if (steps > 0) {
+                    var na = ddx * k * 2;
+                    if (na >= 0) { cx = x0 + (na + steps) / (steps * 2); }
+                    else         { cx = x0 - ((0 - na) + steps) / (steps * 2); }
+                    var nb = ddy * k * 2;
+                    if (nb >= 0) { cy = y0 + (nb + steps) / (steps * 2); }
+                    else         { cy = y0 - ((0 - nb) + steps) / (steps * 2); }
+                }
+                if (cx >= 0 && cx < cw && cy >= 0 && cy < ch) {
+                    let o = dst + cy * stride + cx;
+                    if (sa == 255) {
+                        b[o] = col;
+                    } else {
+                        let d = b[o];
+                        var rb = (d & 0x00FF00FF) * ia + srb;
+                        rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
+                        var gg = ((d >> 8) & 0xFF) * ia + sg;
+                        gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
+                        var aa = ((d >> 24) & 0xFF) * ia + 127;
+                        aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
+                        b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
                     }
                 }
                 k = k + 1;

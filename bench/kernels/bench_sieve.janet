@@ -1,0 +1,23 @@
+# bench_sieve.janet - Sieve of Eratosthenes, N=10,000,000
+(defn sieve [N]
+  (def flags (buffer/new-filled (+ N 1) 1))
+  (put flags 0 0)
+  (put flags 1 0)
+  (def pmax (math/floor (math/sqrt N)))
+  (var p 2)
+  (while (<= p pmax)
+    (when (= (get flags p) 1)
+      (var i (* p p))
+      (while (<= i N) (put flags i 0) (+= i p)))
+    (++ p))
+  (var count 0)
+  (var i 2)
+  (while (<= i N) (when (= (get flags i) 1) (++ count)) (++ i))
+  count)
+
+(def N 10000000)
+(def t0 (os/clock))
+(def result (sieve N))
+(def elapsed (math/floor (* 1000 (- (os/clock) t0))))
+(print "result: " result)
+(print "elapsed: " elapsed " ms")

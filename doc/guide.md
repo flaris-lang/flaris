@@ -67,6 +67,18 @@ The `flarisvm` executable is how you run Flaris programs.
 flarisvm script.fls
 ```
 
+**Scripts.** A file that starts with `#!` (a shebang line) is a script: its
+top-level statements run as the body of a synthesized `Main()`, so there is no
+`Main` to write. `fn`, `class` and `import` declarations may appear anywhere in
+the file, before or after statements; a `const`, `enum`, `global` or `export`
+that follows the first statement belongs to `Main`.
+
+```sh
+#!/usr/bin/env flarisvm
+Console.WriteLine(greet("world"));
+fn greet(name) { return "hello, " + name; }
+```
+
 **Compile to bytecode** (for distribution):
 
 ```sh
@@ -294,6 +306,14 @@ Flaris source files are UTF-8 encoded. Identifiers use ASCII letters, digits, an
 | `breakpoint` | Debug pause |
 | `in` | Membership test / foreach iterator |
 
+**Keywords as names:** any keyword can follow `.` or label an object-literal
+key (`o.default`, `{ class: 1, default: 2 }`), and a subset - `as`, `default`,
+`do`, `from`, `global`, `inline`, `iter`, `library`, `static`, `to` - can even
+name a variable, parameter, function or class field, e.g.
+`fn Range(from: int, to: int) { return to - from; }`. Exception: at the start
+of a statement, `iter`, `global`, `do`, `static` and `inline` still begin
+their own construct, so `iter = 1;` there is not a valid assignment.
+
 ### Literals
 
 **Nil and Booleans:**
@@ -326,13 +346,20 @@ false
 
 ```js
 "hello\nworld 🐱"        // single-line with escape sequences
-"""
-multi-line string
-preserves formatting
-"""
+"""line1
+line2"""                 // raw: no escapes, verbatim
+let json = """
+    { "ok": true }
+    """;                 // raw multi-line: closer's indentation stripped, no final newline
+let n = 42;
+$"n = {n}, hex = {n:X4}" // interpolated: holes take String.Format specs
 ```
 
-Escape sequences: `\n`, `\r`, `\t`, `\"`, `\\`, `\xNN`, `\uNNNN`
+Escape sequences: `\n`, `\r`, `\t`, `\b`, `\f`, `\a`, `\v`, `\"`, `\'`, `\\`,
+`\xNN`, `\uNNNN`, `\u{N..N}`; anything else after a backslash is a compile
+error, so write `"\\d+"` or `"""\d+"""` for a regex. In `$"..."` write `{{` and
+`}}` for literal braces and parenthesize a ternary inside a hole. The
+reference's *Lexical Structure* has the full rules.
 
 **Character literals** (single Unicode codepoint):
 
@@ -362,7 +389,7 @@ Escape sequences: `\n`, `\r`, `\t`, `\"`, `\\`, `\xNN`, `\uNNNN`
 +  -  *  /  %  ^^        // ^^ is power
 
 // Bitwise
-&  |  ^  ~  <<  >>
+&  |  ^  ~  <<  >>  >>>
 
 // Logical
 &&  ||  !
@@ -373,7 +400,7 @@ and  or       // aliases for &&  ||
 
 // Assignment + compound
 =  +=  -=  *=  /=  %=  ^^=
-&=  |=  ^=  <<=  >>=  ??=
+&=  |=  ^=  <<=  >>=  >>>=  ??=
 
 // Special
 ??      // null coalescing
@@ -488,6 +515,18 @@ let x = 1;
 Console.WriteLine(x);        // 1
 ```
 
+A loop header is a scope of its own, so the loop variable does not outlive the
+loop and the next loop is free to reuse the name:
+
+```js
+for (let i = 0; i < 3; i++) { }
+for (let i = 0; i < 3; i++) { }   // a second `i`, not a redeclaration
+// i is not accessible here
+```
+
+The same applies to `iter` and `foreach` variables, and to a `catch` block's
+error variable.
+
 ### Globals
 
 Top-level declarations are module globals - visible anywhere in the file and shared across all fibers:
@@ -536,7 +575,7 @@ fn label(l) {
 }
 ```
 
-Values must be plain non-negative integer literals - `A = 1 + 2`, `B = A` and
+Values must be integer literals, optionally negative - `A = 1 + 2` and `B = A`
 `A = -1` are all rejected. Declare an enum at the top level or inside a
 function, and `export` it like any other symbol.
 
@@ -733,9 +772,11 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 **Arithmetic:** `+` `-` `*` `/` `%` `^^` 
 
 - `/` yields float if any term is float, else int
-- `^^` is exponentiation: `2 ^^ 3` - `8`
+- `^^` is exponentiation: `2 ^^ 3` - `8`. It binds tightest and nests to the right: `2 * 3 ^^ 2` is `18`, `2 ^^ 3 ^^ 2` is `512`, and `-2 ^^ 2` is `-4`
+- An assignment is an expression: `a = b = 5` sets both, `let c = (a = 3)` stores and reads `3`. It is still an error as an `if`/`while` condition.
+- `++`/`--` work on variables, fields and elements: `i++`, `o.n++`, `a[i]--`
 
-**Bitwise:** `&` `|` `^` `~` `<<` `>>` (and, or, xor, not, shl, shr)
+**Bitwise:** `&` `|` `^` `~` `<<` `>>` `>>>` (and, or, xor, not, shl, arithmetic shr, logical shr)
 
 **Comparison:** `==` `!=` `<` `<=` `>` `>=` `is`
 
@@ -794,6 +835,15 @@ user.name;    // nil (safe)
 user.items;   // nil (safe)
 ```
 
+**Null-conditional access.** `obj?.prop` and `arr?.[i]` yield `nil` instead of
+raising when `obj` or `arr` is `nil`, and the rest of the chain is skipped:
+
+```js
+let city = user?.address.city;        // nil when user is nil
+let first = cfg?.items?.[0] ?? "none"; // "none" when cfg or items is nil
+conn?.Close();                        // no call when conn is nil
+```
+
 ## Indexing
 
 ```js
@@ -838,17 +888,18 @@ Note:
 | Level | Operators | Associativity |
 | ------- | ----------- |--------------- |
 | 1 | Literals, variables, `()` | - |
-| 2 | `()` call, `[]` index, `.` member | Left |
-| 3 | `-` `!` `~` `await` `yield` (prefix) | Right |
-| 4 | `*` `/` `%` `^^` `&` `\|` `^` `<<` `>>` | Left |
-| 5 | `+` `-` | Left |
-| 6 | `<` `<=` `>` `>=` | Left |
-| 7 | `==` `!=` `is` `in` | Left |
-| 8 | `&&` | Left |
-| 9 | `\|\|` | Left |
-| 10 | `??` | Left |
-| 11 | `?:` (ternary) | Right |
-| 12 | `=` `+=` etc. (assignment) | Right |
+| 2 | `()` call, `[]` index, `.` member, `?.` / `?.[]` null-conditional | Left |
+| 3 | `^^` (power) | Right |
+| 4 | `+` `-` `!` `~` `++` `--` `await` `new` `guard` (prefix) | Right |
+| 5 | `*` `/` `%` `&` `\|` `^` `<<` `>>` `>>>` | Left |
+| 6 | `+` `-` | Left |
+| 7 | `<` `<=` `>` `>=` | Left |
+| 8 | `==` `!=` `is` `in` | Left |
+| 9 | `&&` | Left |
+| 10 | `\|\|` | Left |
+| 11 | `??` | Left |
+| 12 | `?:` (ternary) | Right |
+| 13 | `=` `+=` etc. (assignment) | Right |
 
 When in doubt, use parentheses.
 
@@ -1052,6 +1103,17 @@ try {
     Console.WriteLine("Code:", err.Code);
 } finally {
     cleanup();   // always runs: normal exit, exception, return, break, continue
+}
+```
+
+A `try` may have a `finally` and no `catch`: the block runs and the exception
+continues outward.
+
+```js
+try {
+    process();
+} finally {
+    cleanup();   // runs, then the exception (if any) keeps propagating
 }
 ```
 
@@ -1290,9 +1352,9 @@ flarisvm --embed app.fls app --bundle
 
 ## 7. Functions
 
-Functions are first-class values created with `fn`. Modifiers `static` or `async` is placed between `fn` and `name`.
+Functions are first-class values created with `fn`. The modifiers `static`, `async` and `inline` go either before `fn` or between `fn` and the name.
 
-`fn <static> <async> <inline> name(<args:?type) ?:type`
+`<static> <async> <inline> fn name(<args:?type) ?:type` or `fn <static> <async> <inline> name(...)`
 
 **Argument limit** - functions accept up to 16. For larger configurations, pass an object:
 
@@ -1456,6 +1518,10 @@ let add = fn(a, b) => a + b;
 fn square(x) => x * x;   // also works as named function
 ```
 
+The body is one expression, so a `{` after `=>` opens an **object literal**, not a
+block: `fn(x) => { v: x }` returns an object. Use a full `fn(x) { ... }` body when
+you need statements. A named arrow function is a declaration and ends with `;`.
+
 ## Recursion
 
 ```js
@@ -1467,14 +1533,14 @@ fn factorial(n) {
 
 ## Function Modifiers
 
-Modifiers come after `fn`:
+Modifiers go before `fn` or right after it - both spellings mean the same:
 
 ```js
-fn async load() { ... }         // async fiber
-fn static helper() { ... }      // class-level (no this)
+async fn load() { ... }         // async fiber
+static fn helper() { ... }      // class-level (no this)
 fn inline calc(x) => x * 2;    // hint to inline
 
-fn static async fetch(url) { ... }  // combine modifiers
+static async fn fetch(url) { ... }  // combine modifiers
 ```
 
 `inline` is a hint: the compiler expands the body at each call site when it can
@@ -1951,7 +2017,7 @@ Fibers are lightweight cooperatively-scheduled execution contexts. They allow co
 
 **Key properties:**
 
-- No preemption - a fiber runs until it yields, awaits, returns, or sleeps
+- Cooperative with a safety net - a fiber runs until it yields, awaits, returns or sleeps, or until its scheduling quantum expires and the scheduler re-queues it behind the other ready fibers
 - No data races by default
 - Cooperative scheduling
 
@@ -2185,7 +2251,7 @@ Console.WriteLine(await outer(5));  // 11
 - Fibers don't run until resumed - create + schedule explicitly
 - Detached fibers have no one to deliver an exception to - an uncaught one ends
   the VM. Catch inside the fiber (an awaited fiber can hand it to its awaiter)
-- There is no preemption - `yield` in tight loops affects all fibers
+- A tight loop only hands over when its quantum expires - `yield` explicitly where latency matters
 - `yield` outside a fiber context is an error
 
 ---
@@ -2405,7 +2471,7 @@ if (tmp) { ... }
 
 **Fix**
 
-- Convert explicitly - `(int)x`, `Convert.ToInt(s)`. Note that `<<`, `>>`, `&`,
+- Convert explicitly - `(int)x`, `Convert.ToInt(s)`. Note that `<<`, `>>`, `>>>`, `&`,
   `|` and `^` run on integers only and never widen to float. `+` is never
   reported: it falls back to string concatenation for any operand pair.
 
@@ -3470,7 +3536,7 @@ flarispm add https://example.com/MyLib.flx --key <ed25519-pubkey-hex>
 
 Git/source packages are compiled locally and left unsigned on purpose - a signature applied at install time would attest to *you*, not the publisher - so they rely on the git ref plus fingerprint instead. To enforce signatures at runtime, trust the publisher's key (`flarisvm --import-key <name> <pubkey>`) and run with `--require-signed`.
 
-**A `.flx` is executable code, not a sandbox.** It can touch the filesystem, spawn processes, and (with `--unsafe`) call FFI and raw memory - so only run bytecode you trust, and pin third-party libraries to a known hash. Note that `--jit` (JIT) widens the trust surface: JIT-compiled code omits the interpreter's runtime type checks, so never enable `--jit` on untrusted bytecode. See Reference R1 "Security model".
+**A `.flx` is executable code, not a sandbox.** It can touch the filesystem, spawn processes, and (with `--unsafe`) call FFI and raw memory - so only run bytecode you trust, and pin third-party libraries to a known hash. Note that the JIT widens the trust surface: JIT-compiled code omits the interpreter's runtime type checks, so run untrusted bytecode with `--jit-disable`. See Reference R1 "Security model".
 
 ---
 

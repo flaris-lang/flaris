@@ -36,23 +36,50 @@ The `Ffi` module lets Flaris scripts call functions inside native shared librari
 **What FFI is for:**
 - Performance-critical native routines (SIMD, compression, hashing)
 - Platform or hardware-specific APIs
-- Existing C libraries you don't want to rewrite
+- Wrapping an existing C library you don't want to rewrite
 - Large binary data processing
 
 **What FFI is not for:**
 - Per-element inner loops (marshalling overhead is non-trivial)
 
+**Flaris does not call arbitrary C functions.** Every function it can call has
+the one signature `FfiObject f(FfiObject *args, int argc)`, so an existing
+library is reached through a small shim you compile against `ffi_object.h` -
+one exported wrapper per entry point you want (`ffi/sqlite_ffi.c` is a worked
+example). Calling `libcurl` or `libc` directly, without that shim, is not
+supported.
+
 ---
 
 ## 2. Security Model
 
-FFI is **disabled by default**. It must be explicitly enabled:
+FFI is **disabled by default**. It must be explicitly enabled, with one of two
+flags:
 
 ```bash
-flarisvm --unsafe script.fls
+flarisvm --allow-ffi script.fls    # Ffi.* only
+flarisvm --unsafe    script.fls    # Ffi.* and everything else below
 ```
 
-Without `--unsafe`, every `Ffi.*` call raises `Exception.UnsafeOperation` at runtime.
+Without either, every `Ffi.*` call raises `Exception.UnsafeOperation` at runtime.
+
+**Prefer `--allow-ffi`.** `--unsafe` is a single switch over five separate
+capabilities, so granting FFI with it also grants the other four:
+
+| capability | granted by `--allow-ffi` | granted by `--unsafe` |
+|---|---|---|
+| `Ffi.*` - load and call native code | yes | yes |
+| `Memory.*`, `Buffer.GetAddress` - read/write any address | no | yes |
+| `Os.Kill` - signal any process | no | yes |
+| `import` over plain `http://` | no | yes |
+| raw JIT entry points | no | yes |
+
+A script that needs a database plugin needs the first row and none of the rest.
+`--unsafe` keeps its existing meaning and still implies `--allow-ffi`, so
+existing command lines, `.flx` embed headers and `cfg.unsafe` are unaffected.
+
+Neither flag makes a plugin safe: native code runs in your process with your
+privileges, and `--allow-ffi` only narrows what the *script* around it may do.
 
 **Library fingerprinting.** When signature checks are on (default), `Ffi.Load` computes the SHA-256 of the library file on every load and compares it to the hash you provide. A mismatch raises `Exception.ChecksumError` and the library is not loaded. This prevents tampered or swapped libraries from being loaded silently.
 
@@ -229,8 +256,57 @@ When you call an FFI function, Flaris converts each argument from a VM value to 
 | `object` | `FFIVAL_OBJECT` | `object.pairs` / `object.length` | Deep-copied key-value pairs |
 | `block` | `FFIVAL_BLOCK` | `block.memory` / `block.block_size` / `block.block_count` | **Pointer into VM memory** - do not free |
 | - | `FFIVAL_TABLE` | `table.col_names` / `table.cells` / `table.ncols` / `table.nrows` | Return-only rowset; arrives in script code as an array of objects |
+| `pointer` | `FFIVAL_POINTER` | `pointer.addr` / `pointer.tag` | Opaque handle owned by the plugin; the VM copies it and never dereferences or frees it |
 
-**Unsupported types** (`fiber`, `function`, `class`, `instance`, `stream`, `pointer`) are passed as `FFIVAL_NIL`. If your function receives an unexpected nil, check that you passed a supported type.
+**Unsupported types** (`fiber`, `function`, `class`, `instance`, `stream`) are passed as `FFIVAL_NIL`. If your function receives an unexpected nil, check that you passed a supported type.
+
+### Opaque handles
+
+A plugin that owns a resource - a database connection, a decoder context, a
+socket - returns it as `FFIVAL_POINTER`. Script can hold the handle and pass it
+back, but cannot dereference it, do arithmetic on it, or **create** one: there
+is no pointer literal and no conversion into `pointer`. Declaring the parameter
+as `ptr` therefore turns what used to be a segfault into a catchable exception:
+
+```js
+let open  = Ffi.GetFunction(lib, "db_open",  "fn(string):ptr");
+let query = Ffi.GetFunction(lib, "db_query", "fn(ptr, string):array");
+let close = Ffi.GetFunction(lib, "db_close", "fn(ptr):bool");
+
+let db = open("app.db");
+query(db, "select 1");
+query(12345, "select 1");   // raises - an int is not a pointer
+close(db);
+```
+
+Before this existed the only way to return a handle was to cast it to `int`,
+which made every handle forgeable from any number.
+
+`tag` is a plugin-chosen type id carried with the address, so a plugin handed
+the wrong *kind* of handle can reject it rather than casting blind. The VM only
+copies the tag; the plugin decides what it means.
+
+```c
+#define TAG_DB 0x44425F31u   /* any nonzero constant, one per handle type */
+
+FfiObject db_open(FfiObject *args, int argc) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(AS_STRING(args[0]), &db) != SQLITE_OK) return ffi_nil();
+    return ffi_pointer(db, TAG_DB);
+}
+
+FfiObject db_close(FfiObject *args, int argc) {
+    REQUIRE_ARGC(1);
+    if (!FFI_PTR_IS(args[0], TAG_DB)) return ffi_bool(0);  /* wrong handle type */
+    sqlite3_close((sqlite3 *)AS_POINTER(args[0]));
+    return ffi_bool(1);
+}
+```
+
+**The plugin owns the lifetime.** The VM frees nothing when the handle goes out
+of scope, so a plugin that hands out handles must expose a close entry point,
+and script must call it. A handle used after close is a use-after-free the VM
+cannot detect - keep the tag check, but note it cannot catch this case.
 
 **Strings** are passed zero-copy: `string.data` points at the live Flaris string (marked with the `FFI_FLAG_BORROWED` flag bit). It is valid for the duration of the call only - `memcpy` the bytes if you need them after your function returns, and never `free()` or write through the pointer. The container structure of **arrays and objects** (element and pair nodes) is still built per call and freed by the VM after the function returns, so large nested structures have proportional marshalling cost.
 
@@ -990,8 +1066,9 @@ The offloaded function must be **pure**: it sees only its `FfiObject` arguments,
 must not call back into Flaris, must not touch shared mutable state, and must be
 thread-safe (several calls can run at once). Internally it may use as many
 threads as it likes, as long as it returns one `FfiObject`. This is the plugin
-author's contract; a function that illegally calls back is caught by the
-callback trampoline's thread check rather than corrupting the VM.
+author's contract; a function that calls back anyway is refused by the callback
+trampoline - the dispatch is dropped and a warning printed - rather than being
+allowed to touch VM state from the worker.
 
 Two rules the runtime enforces: arguments marshal as **owned copies** (so the
 worker never reads VM memory), and **block arguments are refused** — blocks alias
@@ -1016,11 +1093,19 @@ undefined behaviour rather than a clean error. Every plugin must therefore invok
 FLARIS_PLUGIN_ABI()          // exports flaris_abi_version()
 ```
 
-`Ffi.Load` checks it. A plugin reporting a version this runtime does not know is
-refused with `Exception.ChecksumError` and a message naming both versions. A
-library exporting nothing is loaded with a warning, because it cannot be told
-apart from a shared library that was never a plugin - but every Flaris plugin is
-expected to carry the macro, and that leniency may be removed.
+`Ffi.Load` checks it. A plugin reporting a version **newer** than this runtime
+knows is refused with `Exception.ChecksumError` and a message naming both
+versions - it may set a struct member the runtime cannot see. An **older**
+version is accepted: revisions only append, so an old plugin's fields all still
+mean what they meant, and it needs no rebuild. A library exporting nothing is
+loaded with a warning, because it cannot be told apart from a shared library
+that was never a plugin - but every Flaris plugin is expected to carry the
+macro, and that leniency may be removed.
+
+| ABI | change |
+|-----|--------|
+| 1 | initial |
+| 2 | `FFIVAL_POINTER` (opaque handles). Appended to the enum, and its union member fits inside the existing `table` member, so `sizeof(FfiObject)` is unchanged and v1 plugins keep working unmodified. |
 
 This is separate from `Ffi.GetVersion` / `flaris_version`, which reports *your
 plugin's* own version and is yours to define; the ABI version describes the
@@ -1029,7 +1114,8 @@ marshalling contract and is owned by the runtime.
 ### Guarantees and limits
 
 - **One thread.** All marshalling runs on the VM thread. A plugin must call `flaris_dispatch` (the callback trampoline) only from the thread that called into it - never from a thread it spawned. Nothing in the marshalling layer is locked.
-- **Handles.** `Ffi.Load` handles stay valid for the lifetime of the process. Passing anything that did not come from `Ffi.Load` - including a pointer from another module, such as an `HttpUtil` server handle - raises rather than being handed to `dlsym`.
+- **Handles.** `Ffi.Load` handles stay valid for the lifetime of the process. Passing anything that did not come from `Ffi.Load` - including a plugin's own `FFIVAL_POINTER` handle - raises rather than being handed to `dlsym`.
+- **Handle lifetime is the plugin's.** The VM never frees what an `FFIVAL_POINTER` points at, and has no way to know when script drops the last reference. A plugin handing out handles must expose a close entry point; using a handle after close is a use-after-free the runtime cannot detect.
 - **Exceptions.** A Flaris callback that raises unwinds the native frames back to the `Ffi` call that entered the plugin, and the exception continues to propagate in script. Native code between those two points does **not** get to clean up: destructors, `free` calls and locks in the abandoned C frames are skipped. Keep callback-invoking C code free of state that needs unwinding.
 - **Crashes are fatal.** There is no signal handler. A plugin that segfaults, aborts or corrupts the heap takes the whole VM down; no exception is raised and no diagnostic is produced.
 - **No raw C ABI.** A plugin function must have the shape `FfiObject f(FfiObject *args, int argc)`. You cannot point `Ffi.GetFunction` at an arbitrary C function such as `sqlite3_open` - it needs a shim compiled against `ffi_object.h` (see `ffi/sqlite_ffi.c`).
@@ -1039,7 +1125,7 @@ marshalling contract and is owned by the runtime.
 - Callbacks are synchronous - the plugin blocks until the Flaris function returns.
 - Callbacks cannot be called from a thread other than the one running the VM.
 - The Flaris function must be a plain `fn` - not an async function or fiber.
-- A maximum of `MAX_CALL_ARGUMENTS` (16) arguments can be passed per callback invocation.
+- A maximum of 16 arguments can be passed per callback invocation.
 
 ---
 
