@@ -1125,7 +1125,7 @@ marshalling contract and is owned by the runtime.
 - Callbacks are synchronous - the plugin blocks until the Flaris function returns.
 - Callbacks cannot be called from a thread other than the one running the VM.
 - The Flaris function must be a plain `fn` - not an async function or fiber.
-- A maximum of `MAX_CALL_ARGUMENTS` (16) arguments can be passed per callback invocation.
+- A maximum of 16 arguments can be passed per callback invocation.
 
 ---
 

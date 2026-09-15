@@ -389,7 +389,7 @@ reference's *Lexical Structure* has the full rules.
 +  -  *  /  %  ^^        // ^^ is power
 
 // Bitwise
-&  |  ^  ~  <<  >>
+&  |  ^  ~  <<  >>  >>>
 
 // Logical
 &&  ||  !
@@ -400,7 +400,7 @@ and  or       // aliases for &&  ||
 
 // Assignment + compound
 =  +=  -=  *=  /=  %=  ^^=
-&=  |=  ^=  <<=  >>=  ??=
+&=  |=  ^=  <<=  >>=  >>>=  ??=
 
 // Special
 ??      // null coalescing
@@ -776,7 +776,7 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 - An assignment is an expression: `a = b = 5` sets both, `let c = (a = 3)` stores and reads `3`. It is still an error as an `if`/`while` condition.
 - `++`/`--` work on variables, fields and elements: `i++`, `o.n++`, `a[i]--`
 
-**Bitwise:** `&` `|` `^` `~` `<<` `>>` (and, or, xor, not, shl, shr)
+**Bitwise:** `&` `|` `^` `~` `<<` `>>` `>>>` (and, or, xor, not, shl, arithmetic shr, logical shr)
 
 **Comparison:** `==` `!=` `<` `<=` `>` `>=` `is`
 
@@ -891,7 +891,7 @@ Note:
 | 2 | `()` call, `[]` index, `.` member, `?.` / `?.[]` null-conditional | Left |
 | 3 | `^^` (power) | Right |
 | 4 | `+` `-` `!` `~` `++` `--` `await` `new` `guard` (prefix) | Right |
-| 5 | `*` `/` `%` `&` `\|` `^` `<<` `>>` | Left |
+| 5 | `*` `/` `%` `&` `\|` `^` `<<` `>>` `>>>` | Left |
 | 6 | `+` `-` | Left |
 | 7 | `<` `<=` `>` `>=` | Left |
 | 8 | `==` `!=` `is` `in` | Left |
@@ -2017,7 +2017,7 @@ Fibers are lightweight cooperatively-scheduled execution contexts. They allow co
 
 **Key properties:**
 
-- No preemption - a fiber runs until it yields, awaits, returns, or sleeps
+- Cooperative with a safety net - a fiber runs until it yields, awaits, returns or sleeps, or until its scheduling quantum expires and the scheduler re-queues it behind the other ready fibers
 - No data races by default
 - Cooperative scheduling
 
@@ -2251,7 +2251,7 @@ Console.WriteLine(await outer(5));  // 11
 - Fibers don't run until resumed - create + schedule explicitly
 - Detached fibers have no one to deliver an exception to - an uncaught one ends
   the VM. Catch inside the fiber (an awaited fiber can hand it to its awaiter)
-- There is no preemption - `yield` in tight loops affects all fibers
+- A tight loop only hands over when its quantum expires - `yield` explicitly where latency matters
 - `yield` outside a fiber context is an error
 
 ---
@@ -2471,7 +2471,7 @@ if (tmp) { ... }
 
 **Fix**
 
-- Convert explicitly - `(int)x`, `Convert.ToInt(s)`. Note that `<<`, `>>`, `&`,
+- Convert explicitly - `(int)x`, `Convert.ToInt(s)`. Note that `<<`, `>>`, `>>>`, `&`,
   `|` and `^` run on integers only and never widen to float. `+` is never
   reported: it falls back to string concatenation for any operand pair.
 

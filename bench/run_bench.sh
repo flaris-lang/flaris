@@ -28,26 +28,26 @@ cd "$BENCH_ROOT/kernels"
 # ── compile ──────────────────────────────────────────────────────────────────
 if [[ -n "$CC" ]]; then
     log "Compiling C ($CC -O2)..."
-    for b in fib sieve collatz; do
+    for b in fib sieve collatz tailcall; do
         "$CC" -O2 -o "bench_${b}_c" "bench_${b}.c" || warn "C: $b failed to build"
     done
 fi
 if [[ -n "$RUSTC" ]]; then
     log "Compiling Rust ($RUSTC -O)..."
-    for b in fib sieve collatz; do
+    for b in fib sieve collatz tailcall; do
         "$RUSTC" -O -o "bench_${b}_rs" "bench_${b}.rs" \
             || warn "Rust: $b failed to build"
     done
 fi
 if [[ -n "$GO" ]]; then
     log "Compiling Go..."
-    for b in fib sieve collatz; do
+    for b in fib sieve collatz tailcall; do
         "$GO" build -o "bench_${b}_go" "bench_${b}.go" || warn "Go: $b failed to build"
     done
 fi
 if [[ -n "$NIM" ]]; then
     log "Compiling Nim (-d:release --opt:speed -O3)..."
-    for b in fib sieve collatz; do
+    for b in fib sieve collatz tailcall; do
         "$NIM" c -d:release --opt:speed --passC:"-O3" --hints:off --warnings:off \
             -o:"bench_${b}_nim" "bench_${b}.nim" >/dev/null 2>&1 \
             || warn "Nim: $b failed to build"
@@ -58,7 +58,7 @@ if [[ -n "$DOTNET" ]]; then
     # native-AOT by default, which would measure a third AOT compiler rather
     # than the managed-JIT tier this lane exists to represent.
     log "Compiling C# (dotnet publish -c Release, RyuJIT)..."
-    for b in fib sieve collatz; do
+    for b in fib sieve collatz tailcall; do
         "$DOTNET" publish "bench_${b}.cs" -c Release -o "csout_${b}" \
             -p:PublishAot=false >/dev/null 2>&1 \
             || warn "C#: $b failed to build"
@@ -67,6 +67,13 @@ fi
 
 # ── run ──────────────────────────────────────────────────────────────────────
 LANGS=(c rs go nim cs py rb rbj php phpj lua luajit luau luauc wren janet nut duk mpy js node fls flsj)
+
+# Tail-call elimination is a language/compiler property, not something every
+# lane here has - a smaller, deliberately curated set rather than LANGS, so a
+# language we didn't implement this for is simply never attempted (no bogus
+# "failed" warning) instead of being conflated with one that crashed for the
+# reason this benchmark exists to show.
+TAILCALL_LANGS=(c rs go nim cs py lua luajit js node fls flsj)
 
 run_lang() {  # run_lang <bench> <lang>
     local b="$1" l="$2" f
@@ -118,9 +125,12 @@ log "Running sieve(N=10M)..."
 for l in "${LANGS[@]}"; do run_lang sieve "$l"; done
 log "Running collatz(N=1M)..."
 for l in "${LANGS[@]}"; do run_lang collatz "$l"; done
+log "Running tailcall(depth=2,000,000)..."
+for l in "${TAILCALL_LANGS[@]}"; do run_lang tailcall "$l"; done
 
 log "Checking result consistency..."
 for b in fib sieve collatz; do check_bench "$b" "${LANGS[@]}"; done
+check_bench tailcall "${TAILCALL_LANGS[@]}"
 
 # Mean of a language's three ×C ratios, as "<sortkey> <display>". A language
 # with no usable ratio yields a key that sorts last instead of first.
@@ -141,6 +151,7 @@ kernel_avg() {   # kernel_avg <lang>
 FIB_BASE=$(get_ms fib c);     [[ "$FIB_BASE"  == "N/A" ]] && FIB_BASE=$(min_ms fib "${LANGS[@]}")
 SIEVE_BASE=$(get_ms sieve c); [[ "$SIEVE_BASE" == "N/A" ]] && SIEVE_BASE=$(min_ms sieve "${LANGS[@]}")
 COLL_BASE=$(get_ms collatz c);[[ "$COLL_BASE"  == "N/A" ]] && COLL_BASE=$(min_ms collatz "${LANGS[@]}")
+TAILCALL_BASE=$(get_ms tailcall c); [[ "$TAILCALL_BASE" == "N/A" ]] && TAILCALL_BASE=$(min_ms tailcall "${TAILCALL_LANGS[@]}")
 
 {
 cat <<HEADER
@@ -215,6 +226,35 @@ COLLATZ
 
 emit_table collatz "$COLL_BASE" "vs C" 0 "${LANGS[@]}"
 
+cat <<'TAILCALL'
+### 4. Tail-call elimination - self-recursive `tailsum(n, acc)`, depth 2,000,000
+
+A tail call in tail position, summing 1..2,000,000 through 2 million recursive
+calls with no other work per frame. This is not primarily a throughput test:
+it is a test of whether a language/runtime can take this call shape without
+growing its call stack at all, and the table below is as much about who is
+*in* it as about the times.
+
+A language without tail-call elimination is expected to exhaust its call
+stack partway through and is silently absent from the table - the same
+"never reported as a zero or a failure" convention this suite already uses
+for a language that isn't installed. That absence is the finding for this
+benchmark, not a harness bug. C, Rust, Nim (via their C/LLVM backend's
+sibling-call optimization at this optimization level) and Lua/LuaJIT (which
+specify proper tail calls in the language itself) are expected to complete
+in well under a second; Go survives by growing its goroutine stack rather
+than via tail-call elimination, which is a different mechanism reaching the
+same result; C#, Python and Node/V8 are expected to be absent, since RyuJIT,
+CPython and V8 do not eliminate this call. Flaris appears twice and is
+expected to complete both ways: the JIT compiles a self-recursive tail call
+to a native loop-back branch with no call instruction and no stack growth,
+and the interpreter reuses the call frame for a tail call independently of
+the JIT.
+
+TAILCALL
+
+emit_table tailcall "$TAILCALL_BASE" "vs C" 0 "${TAILCALL_LANGS[@]}"
+
 cat <<'SUMMARY'
 ### Kernel summary
 
@@ -267,6 +307,17 @@ if [[ -n "$TIME_TOOL_MODE" ]]; then
     done
     echo "═══════════════════════════════════════════════════════════"
 fi
+
+echo ""
+echo "═══════════════════════════════════════════════════════════"
+echo "  TAIL-CALL ELIMINATION  tailsum(2000000, 0)  (ms, absent = no TCO)"
+echo "═══════════════════════════════════════════════════════════"
+printf "  %-12s %10s\n" "Language" "time"
+for l in "${TAILCALL_LANGS[@]}"; do
+    t=$(get_ms tailcall "$l"); [[ "$t" == "N/A" ]] && continue
+    printf '%s\t  %-12s %8s ms\n' "$t" "$(lang_name "$l")" "$t"
+done | sort -n | cut -f2-
+echo "═══════════════════════════════════════════════════════════"
 
 # ── hand off to the real-world half, appending to the same snapshot ──────────
 if [[ -x "$BENCH_ROOT/run_bench_realworld.sh" ]]; then

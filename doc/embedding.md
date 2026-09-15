@@ -20,7 +20,8 @@ process, with nothing copied between them.
 - [9. Native modules: your C functions, called from script](#9-native-modules-your-c-functions-called-from-script)
 - [10. Restricting what a script can reach](#10-restricting-what-a-script-can-reach)
 - [10a. Signals from the script](#10a-signals-from-the-script)
-- [10b. Embedding from C#](#10b-embedding-from-c)
+- [10b. Stopping a running script](#10b-stopping-a-running-script)
+- [10c. Embedding from C#](#10c-embedding-from-c)
 - [11. Driving the scheduler](#11-driving-the-scheduler)
 - [12. Errors and diagnostics](#12-errors-and-diagnostics)
 - [13. Limits and what is not supported](#13-limits-and-what-is-not-supported)
@@ -113,11 +114,17 @@ static const char *SCRIPT =
 
 int main(void)
 {
-    if (FlarisInit(NULL) != FLARIS_OK)
+    if (FlarisInitVM(NULL) != FLARIS_OK)
         return 1;
 
-    if (FlarisLoadSource(SCRIPT, "greet.fls") != FLARIS_OK) {
-        FlarisShutdown(1);
+    FlarisContext *ctx;
+    if (FlarisCreateContext(NULL, &ctx) != FLARIS_OK) {
+        FlarisShutdownVM(1);
+        return 1;
+    }
+
+    if (FlarisLoadSourceText(ctx, SCRIPT, "greet.fls") != FLARIS_OK) {
+        FlarisShutdownVM(1);
         return 1;
     }
 
@@ -125,7 +132,7 @@ int main(void)
     FlarisValue result;
     char err[256];
 
-    int rc = FlarisCallV("Greet", args, 1, &result, err, sizeof err);
+    int rc = FlarisCall(ctx, "Greet", args, 1, &result, err, sizeof err);
     if (rc == FLARIS_OK) {
         size_t len = 0;
         const char *text = FlarisAsString(result, &len);
@@ -135,8 +142,8 @@ int main(void)
         printf("error: %s\n", err);
     }
 
-    FlarisReleaseValue(args[0]);   /* FlarisCallV borrows; you still own it */
-    FlarisShutdown(0);
+    FlarisReleaseValue(args[0]);   /* FlarisCall borrows; you still own it */
+    FlarisShutdownVM(0);           /* destroys any context you left behind */
     return 0;
 }
 ```
@@ -148,14 +155,19 @@ $ ./host
 hello, world
 ```
 
-Three things in that program are worth naming now, because everything else
+Four things in that program are worth naming now, because everything else
 builds on them.
+
+A **context** is one script's own global environment. Scripts are loaded into a
+context and called through it, and what one defines is invisible to every other
+— two scripts that both declare `config` no longer overwrite each other.
+Section 6a is about them.
 
 `FlarisValue` is an **opaque handle** to a value living inside the VM. It is a
 single word; you never dereference it, and every read goes through a function
 like `FlarisAsString`. Nothing is copied when one crosses the boundary.
 
-`FlarisCallV` **borrows** its arguments — you built them, you release them.
+`FlarisCall` **borrows** its arguments — you built them, you release them.
 The **result is yours**, and `FlarisReleaseValue` is how you drop it.
 
 Every entry point returns a status code rather than aborting. A script that
@@ -184,7 +196,7 @@ flarisvm --compile game.fls game.flx
 Then load it at runtime:
 
 ```c
-FlarisLoadFile("game.flx");
+FlarisLoadBytecode(ctx, "game.flx");
 ```
 
 A script you load this way is a **library of functions**, not a program. Give it
@@ -209,36 +221,43 @@ document intent.
 ## 4. Lifecycle
 
 ```
-FlarisInit(&cfg)
+FlarisInitVM(&cfg)
       │
-      ├─ FlarisLoadFile("game.flx")     ← or FlarisLoadSource(...)
+      ├─ FlarisCreateContext(&opt, &ctx)   ← one per script; as many as you like
+      │      │
+      │      ├─ FlarisLoadBytecode(ctx, "game.flx")   ← or FlarisLoadSource(...)
+      │      ├─ FlarisCall(ctx, "Update", ...)        ← as often as you like
+      │      │
+      │      └─ FlarisDestroyContext(ctx)  ← optional; shutdown reclaims it
       │
-      ├─ FlarisCallV(...)               ← as often as you like
-      ├─ FlarisPump(0)                  ← if the script uses timers/fibers/IO
+      ├─ FlarisPump(NULL, 0)               ← if a script uses timers/fibers/IO
       │
-FlarisShutdown(0)
+FlarisShutdownVM(0)
 ```
 
-`FlarisShutdown` releases everything and leaves your process able to start a
-fresh VM, so reloading a script means shutting down and initialising again. It
-is idempotent: calling it twice, or without a matching init, does nothing.
+`FlarisShutdownVM` releases everything — including any context you did not
+destroy yourself — and leaves your process able to start a fresh VM. It is
+idempotent: calling it twice, or without a matching init, does nothing.
+
+Reloading **one** script no longer means restarting the VM: destroy its context
+and create a new one.
 
 ---
 
 ## 5. Configuration
 
-Pass `NULL` to `FlarisInit` for defaults, or fill in a `FlarisConfig`:
+Pass `NULL` to `FlarisInitVM` for defaults, or fill in a `FlarisConfig`:
 
 ```c
 FlarisConfig cfg = flarisConfigDefaults;
 cfg.installSignals = FLARIS_OFF;         /* keep your own signal handlers */
 cfg.startIoPool    = FLARIS_OFF;         /* stay single-threaded          */
-cfg.unsafe         = FLARIS_ON;          /* the script may use Ffi/Memory */
+cfg.grantCaps      = FLARIS_CAP_UNSAFE;  /* the script may use Ffi/Memory */
 cfg.maxFibers      = 64;                 /* power of two                  */
 cfg.stackSize      = 8192;
 cfg.libsPath       = "/opt/myapp/scripts";
 
-if (FlarisInit(&cfg) != FLARIS_OK) {
+if (FlarisInitVM(&cfg) != FLARIS_OK) {
     /* a value was rejected - nothing was initialised */
 }
 ```
@@ -251,9 +270,8 @@ rejected rather than read as a default.
 
 | Switch | Default | What it does |
 |--------|---------|--------------|
-| `installSignals` | on | Installs the VM's `SIGINT`/`SIGSEGV` handlers. Off leaves yours alone — a fault inside the VM then reaches *you*. |
+| `installSignals` | on | Installs the VM's handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1` and `SIGUSR2` (and ignores `SIGPIPE`), so a script can receive them through `VM.OnSignal`. A signal no script handler has claimed ends the process at once with exit code 128 + signal number, nothing torn down. Off leaves your handlers alone. The VM installs no `SIGSEGV` handler either way — a fault inside it reaches *you*. |
 | `startIoPool` | on | Starts the I/O worker threads. Off keeps your process single-threaded; I/O still completes, inline on the VM thread. |
-| `unsafe` | **off** | Allows `Ffi.*`, raw `Memory` access and `Buffer` addresses. Off, those raise at runtime. This is the `--unsafe` flag. |
 | `jit` | on | Native code generation. |
 | `optimizations` | on | Constant folding and peephole passes. |
 | `debugInfo` | on | Keeps line numbers and names, so stack traces are useful. |
@@ -262,66 +280,187 @@ rejected rather than read as a default.
 | `verbose` | off | Emits the VM's own progress chatter at `FLARIS_LOG_INFO`. |
 | `colors` | auto | ANSI colour in diagnostics. Irrelevant once you set a log handler. |
 
-> **`unsafe` is a trust decision.** It lets a script load native code into your
-> process via `Ffi` and read or write raw addresses via `Memory`. Leave it off
-> for scripts you do not control.
+### Capabilities
+
+What a script may *do* is a bitmask rather than a switch, set with
+`cfg.grantCaps` and `cfg.denyCaps` (deny is applied after grant, so a bit in
+both is withheld):
+
+| Capability | Default | What it allows |
+|------------|---------|----------------|
+| `FLARIS_CAP_UNSAFE` | off | `Ffi.*`, raw `Memory` access and `Buffer` addresses. Implies `FLARIS_CAP_FFI`. |
+| `FLARIS_CAP_FFI` | off | `Ffi.*` alone, without the rest of `UNSAFE`. |
+| `FLARIS_CAP_IMPORT_LOCAL` | **on** | `import` may resolve from disk and `libsPath`. |
+| `FLARIS_CAP_IMPORT_REMOTE` | off | `import` may fetch over `https://`. |
+| `FLARIS_CAP_IMPORT_INSECURE` | off | ...and over plain `http://` too. Needs `REMOTE` as well. |
+
+> **`FLARIS_CAP_UNSAFE` is a trust decision.** It lets a script load native code
+> into your process via `Ffi` and read or write raw addresses via `Memory`.
+> Leave it off for scripts you do not control.
+
+> **The import capabilities are the other one.** A script that may fetch and run
+> code from a URL is only as trustworthy as that URL. The default is local
+> imports only; the `flarisvm` command grants `IMPORT_REMOTE` itself, because it
+> runs what the user chose to run.
 
 ### Limits
 
 | Limit | Default | Range |
 |-------|---------|-------|
-| `stackSize` | 4096 | 65–65535 value-stack slots |
-| `fifoSize` | 1024 | power of two, ≤ 1024 |
+| `stackSize` | 4096 | 64–65535 value-stack slots |
+| `fifoSizeCfg` | 1024 | power of two, 8–1024 |
 | `maxSlabs` | 1024 | object-pool ceiling |
-| `maxFibers` | 256 | power of two, ≤ 1024 |
+| `maxFibers` | 256 | power of two, 2–1024 |
 | `maxFrames` | 64 | 8–1024 call frames per fiber |
 | `ioThreads` | 0 | 0 scales to the CPU count; ≤ 16 |
 | `libsPath` | none | Where `import` looks, `;`-separated. **Borrowed** — must outlive the VM. |
 
+`stackSize`, `maxFrames` and the scheduling quantum can additionally be narrowed
+per context — see section 6a.
+
 Every limit reads `0` as "keep the default", so you set only what you care
-about. An out-of-range value makes `FlarisInit` **fail** rather than being
+about. An out-of-range value makes `FlarisInitVM` **fail** rather than being
 quietly clamped, and nothing is initialised when it does.
 
 ---
 
 ## 6. Loading code
 
+Code is loaded **into a context**:
+
 ```c
-FlarisLoadFile("game.flx");            /* bytecode - the shipping path */
-FlarisLoadFile("game.fls");            /* source, compiled on load     */
-FlarisLoadSource(text, "<host>");      /* source from memory           */
-FlarisRunFile("program.fls");          /* ... and call Main(), returning its code */
+FlarisLoadBytecode(ctx, "game.flx");        /* bytecode - the shipping path */
+FlarisLoadSource(ctx, "game.fls");          /* source file, compiled on load */
+FlarisLoadSourceText(ctx, text, "<host>");  /* source from memory            */
+
+FlarisRunFile("program.fls");               /* ... and call Main(), returning its code */
 ```
 
-`FlarisLoadFile` chooses by extension: `.flx` is loaded as bytecode, anything
-else is compiled as source.
+The three loaders run the script's **top level** — global initialisers and
+function definitions — and stop. They do not call `Main` and do not require the
+script to have one. `FlarisRunFile` is the odd one out: it takes no context, is
+about to call `Main`, so it insists on one, and returns its exit code instead of
+exiting your process. It is what the `flarisvm` command uses.
 
-All three loaders run the script's **top level** — global initialisers and
-function definitions — and stop. They do not call `Main`, and `FlarisLoadSource`
-does not require the script to have one. `FlarisRunFile` is the exception: it is
-about to call `Main`, so it insists on one and returns its exit code instead of
-exiting your process.
+A runtime-only build has no compiler, so `FlarisLoadBytecode` is the only one of
+the three it can use.
 
-Load one script per VM. To swap scripts, call `FlarisShutdown` and initialise
-again.
+### A top level runs to the end, but may not suspend
+
+However long a global initialiser takes, it finishes: the scheduling quantum
+does not truncate it. What it may **not** do is suspend. A top level that calls
+`Fiber.Sleep`, awaits, or blocks on I/O returns `FLARIS_ERR_SUSPENDED` and is
+abandoned where it stopped, because the fiber it runs on is not one the
+scheduler can resume. Whatever it had already defined stays defined.
+
+Do the waiting inside a function you call, not at the top level.
+
+Load as many scripts as you like — one per context. To swap one, destroy its
+context and create another; the rest of the VM keeps running.
+
+---
+
+## 6a. Contexts
+
+A context is one script's own global environment — a child of the VM's. What a
+script defines in one is invisible to every other, so two scripts that both
+declare `config`, or both define `Init`, no longer overwrite each other.
+
+```c
+FlarisContext *game, *plugin;
+FlarisCreateContext(NULL, &game);       /* NULL options = the VM's own authority */
+FlarisLoadBytecode(game, "game.flx");
+
+FlarisOptions opt = flarisOptionsDefaults;
+opt.deniedModules = FLARIS_MOD_FILE | FLARIS_MOD_NET | FLARIS_MOD_OS;
+opt.maxFrames     = 32;
+FlarisCreateContext(&opt, &plugin);
+FlarisLoadBytecode(plugin, "untrusted.flx");
+```
+
+Both scripts now run in one VM, on one thread, sharing one object pool — but not
+one namespace, not one set of privileges, and not one budget.
+
+### What a context isolates
+
+**Names and authority. Not resources.** A context is cheap — about 0.15 KB and a
+fraction of a microsecond to create — because it is an environment and a policy,
+nothing more. The object pool, the I/O slots, the fiber ceiling and the timer
+table are all VM-wide and shared. A context cannot be given its own heap.
+
+### Authority
+
+`FlarisOptions` narrows what a context may do, relative to the VM's own
+settings:
+
+| Field | Effect |
+|-------|--------|
+| `grantCaps` / `denyCaps` | `FLARIS_CAP_*`, deny applied after grant |
+| `deniedModules` | `FLARIS_MOD_*`, **added** to what the VM already denies |
+
+The host may grant a context more than the VM's default — it is C in your own
+process, and there is nothing it could not have set at `FlarisInitVM` anyway. A
+**script** can never widen anything: a fiber it spawns inherits its creator's
+authority and may only narrow from there.
+
+### Budgets
+
+The same struct narrows what a context's fibers get to *run* with:
+
+| Field | Default | Range |
+|-------|---------|-------|
+| `stackSize` | the VM's | 64 .. the VM's |
+| `maxFrames` | the VM's | 8 .. the VM's |
+| `quantum` | 10000 | any positive count of scheduling checkpoints |
+
+Unlike the capability masks, these **narrow only**: a value larger than the VM's
+own is rejected with `FLARIS_ERR_INIT` rather than granted, because the fiber a
+host call runs on is shared and was allocated once at the VM's size.
+
+`maxFrames` is the one that decides how much an untrusted script can pin. A call
+frame carries the locals array, so it costs about a kilobyte: at the default of
+64 a fiber holds roughly 69 KB of frames, at 1024 over a megabyte. Exceeding it
+raises a catchable stack exception in that context and leaves every other
+context untouched.
+
+`quantum` is **advisory, not a sandbox** — `Fiber.SetQuantum` lets a script
+raise its own slice up to ten times the default. Use it to share a frame budget
+between cooperating scripts, not to contain a hostile one.
+
+### Ownership, and what dies with a context
+
+Plain data you receive from a context — numbers, strings, arrays, objects — is
+yours and outlives it. Anything **callable** does not: a function from a
+destroyed context, or an instance of a class it defined, still exists as a value
+but the environment its body needs is gone. Call into a context while it lives
+and let it keep its own functions.
+
+`FlarisDestroyContext` cancels every fiber the context's code spawned and
+removes every timer, signal handler and file watch it registered, then releases
+its environment. Nothing it left behind can run afterwards.
+
+It returns `FLARIS_ERR_BUSY`, and destroys nothing, if the context's own code is
+on the stack — a native module reached from one of its fibers cannot destroy the
+context underneath itself. Return from the call and destroy it then.
+
+You do not have to destroy contexts at all: `FlarisShutdownVM` reclaims any you
+leave behind.
 
 ---
 
 ## 7. Calling into Flaris
 
-There are three ways to call in, and they differ only in how you name the
-callee:
+`FlarisCall` names the callee by string, in a context:
 
-| | when |
-|---|---|
-| `FlarisCallV(name, ...)` | a global, named by string |
-| `FlarisCallValue(fn, ...)` | a value you hold — a resolved global, a callback the script gave you, a bound method |
-| `FlarisNew(class, ...)` | construct an instance, running its constructor |
+```c
+int FlarisCall(FlarisContext *ctx, const char *fnName,
+               const FlarisValue *args, int argc,
+               FlarisValue *outResult, char *errBuf, size_t errSize);
+```
 
-All three **borrow** their arguments: you built them, you release them, and the
-same values may be passed to several calls. All three hand back an **owned**
-result you release with `FlarisReleaseValue`, or `NULL` to have it released for
-you.
+It **borrows** its arguments: you built them, you release them, and the same
+values may be passed to several calls. It hands back an **owned** result you
+release with `FlarisReleaseValue`, or `NULL` to have it released for you.
 
 
 ```c
@@ -329,7 +468,7 @@ FlarisValue args[2] = { FlarisString("player"), FlarisInt(3) };
 FlarisValue result;
 char err[256];
 
-int rc = FlarisCallV("Damage", args, 2, &result, err, sizeof err);
+int rc = FlarisCall(ctx, "Damage", args, 2, &result, err, sizeof err);
 if (rc == FLARIS_OK) {
     printf("hp now %lld\n", (long long)FlarisAsInt(result));
     FlarisReleaseValue(result);
@@ -346,28 +485,41 @@ FlarisReleaseValue(args[1]);   /* a small int allocates nothing; releasing it
 | `FLARIS_ERR_NOTFOUND` | no such function in the loaded script |
 | `FLARIS_ERR_NOT_FN` | the name exists but is not a function |
 | `FLARIS_ERR_SUSPENDED` | the function suspended (see below) |
+| `FLARIS_ERR_INTERRUPTED` | `FlarisInterrupt` stopped it (section 10b) |
 | `FLARIS_ERR_ARGS` | bad argument count, or more than 32 arguments |
 
-`FlarisHasFunction("Damage")` reports whether a name is callable — useful when
-the script decides which hooks it implements:
+`FlarisHasFunction(ctx, "Damage")` reports whether a name is callable — useful
+when the script decides which hooks it implements:
 
 ```c
-if (FlarisHasFunction("OnPlayerJoin")) {
+if (FlarisHasFunction(ctx, "OnPlayerJoin")) {
     FlarisValue a = FlarisString(playerName);
-    FlarisCallV("OnPlayerJoin", &a, 1, NULL, err, sizeof err);
+    FlarisCall(ctx, "OnPlayerJoin", &a, 1, NULL, err, sizeof err);
     FlarisReleaseValue(a);
 }
 ```
 
 Passing `NULL` for `outResult` is fine — the return value is released for you.
 
+Pass at most `FLARIS_MAX_CALL_ARGS` (16) arguments; a longer list is refused
+with `FLARIS_ERR_ARGS` rather than truncated.
+
 **Native code is used.** A function the JIT compiled (the `jit` switch, on by
 default) runs its native code when called this way; only the argument
 marshalling is interpreted, the same as for a call made from script code.
 
+**Calls may nest.** A native module reached from a `FlarisCall` may itself call
+`FlarisCall` — the boundary runs on one reserved fiber, and a nested call works
+above the outer one's frames and leaves them exactly as it found them. The same
+holds for a native module invoked while `FlarisLoadSourceText` runs a top level.
+
 **A called function must run to completion.** If it yields or awaits, the call
-returns `FLARIS_ERR_SUSPENDED`, because nothing above it can resume it. For work
-that suspends, have the script start a fiber and drive `FlarisPump` instead.
+returns `FLARIS_ERR_SUSPENDED`, because nothing above it can resume it; its
+half-finished frames are unwound rather than left on the reserved fiber. For work
+that suspends, have the script start a fiber and drive `FlarisPump` instead —
+note that *spawning* a fiber suspends the caller too, so a function whose whole
+job is `Fiber.Run(...)` reports `FLARIS_ERR_SUSPENDED` even though it did
+exactly what you wanted. The fiber is queued either way.
 
 ---
 
@@ -486,30 +638,16 @@ object to lend you.
 Scalars — nil, bool, small ints, chars — allocate nothing, so retaining and
 releasing them is free. You still write the calls; they simply cost nothing.
 
-### Resolving once
+### Calling by name is the only way in
 
-`FlarisCallV` hashes the name and walks the global environment on every call.
-For anything called repeatedly — a per-frame `Update`, a per-request handler —
-resolve it once and keep the value:
+`FlarisCall` hashes the name and looks it up in the context's environment on
+every call. There is deliberately no "resolve once and keep the callable"
+variant: a callable is only meaningful inside the context whose environment its
+body needs, so handing one back to the host would hand back something that dies
+when the context does.
 
-```c
-FlarisValue update = FlarisGetFunction("Update");   /* owned */
-
-while (running) {
-    FlarisValue dt = FlarisFloat(delta);
-    FlarisCallValue(update, &dt, 1, NULL, err, sizeof err);
-    FlarisReleaseValue(dt);
-}
-
-FlarisReleaseValue(update);
-```
-
-Measured on the boundary suite, that is 17.1 ns per call by name against
-9.2 ns through a held value.
-
-`FlarisIsCallable` tells you whether a value can be called as it stands. It is
-false for a method that still needs a receiver — see section 9 for
-`FlarisGetMethod`.
+The lookup is a hash and a probe, not a walk of a global table. Measured on the
+boundary suite it is well under the cost of the call itself.
 
 ---
 
@@ -575,17 +713,17 @@ static const char *SCRIPT =
 
 int main(void)
 {
-    if (FlarisInit(NULL) != FLARIS_OK)
+    if (FlarisInitVM(NULL) != FLARIS_OK)
         return 1;
 
     /* BEFORE loading: the compiler type-checks Device.* from this table. */
     if (FlarisRegisterModule("Device", DEVICE, 3) != FLARIS_OK) {
-        FlarisShutdown(1);
+        FlarisShutdownVM(1);
         return 1;
     }
 
     if (FlarisLoadSource(SCRIPT, "control.fls") != FLARIS_OK) {
-        FlarisShutdown(1);
+        FlarisShutdownVM(1);
         return 1;
     }
 
@@ -593,7 +731,7 @@ int main(void)
     FlarisValue out;
     char err[256];
 
-    if (FlarisCallV("Sample", &pin, 1, &out, err, sizeof err) == FLARIS_OK) {
+    if (FlarisCall(ctx, "Sample", &pin, 1, &out, err, sizeof err) == FLARIS_OK) {
         printf("read %.2f\n", FlarisAsFloat(out));
         FlarisReleaseValue(out);
     } else {
@@ -601,7 +739,7 @@ int main(void)
     }
 
     FlarisReleaseValue(pin);
-    FlarisShutdown(0);
+    FlarisShutdownVM(0);
     return 0;
 }
 ```
@@ -697,12 +835,14 @@ cfg.deniedModules = FLARIS_MOD_FILE | FLARIS_MOD_DIRECTORY |
                     FLARIS_MOD_FILEWATCH |
                     FLARIS_MOD_NET  | FLARIS_MOD_OS |
                     FLARIS_MOD_FFI  | FLARIS_MOD_BUFFER | FLARIS_MOD_MEMORY;
-cfg.allowTls = FLARIS_OFF;
-FlarisInit(&cfg);
+FlarisInitVM(&cfg);
 ```
 
+The same mask on `FlarisOptions.deniedModules` denies modules for one context
+only, on top of whatever the VM already withholds — see section 6a.
+
 A call into a denied module raises `Exception.UnsafeOperation`, which the script
-can catch and your `FlarisCallV` sees as `FLARIS_ERR_RAISED`. Nothing else about
+can catch and your `FlarisCall` sees as `FLARIS_ERR_RAISED`. Nothing else about
 the script changes, and an allowed module costs nothing — the check is a bit
 test on an operand the call already carries.
 
@@ -711,9 +851,10 @@ The constants are `FLARIS_MOD_` plus the module name in upper case:
 on, one for each of the 32 built-in modules. They are positional, so recompile
 against the header you ship with.
 
-TLS is the one capability that is not a module — it is reached through `Net` and
-`Stream` — so it has its own switch, `cfg.allowTls`. Turning it off also refuses
-`https://` module imports.
+TLS is not separately gated. A client speaking `https://` is doing what `Net`
+and `Stream` are for; if a script should not reach the network, deny those
+modules. What does need its own gate is a script's ability to **load more code**,
+which is what the `FLARIS_CAP_IMPORT_*` capabilities in section 5 are for.
 
 ### What this is, and what it is not
 
@@ -725,10 +866,18 @@ The unit is the **whole module**. Denying `FLARIS_MOD_OS` removes `Os.Execute`
 and `Os.Spawn`, and also `Os.Args` and `Os.Arch`, which only report the
 environment. It errs towards denying more.
 
-And it bounds **capability, not consumption**. There is no interrupt, timeout or
-instruction budget: a script with every module denied can still loop forever and
-your `FlarisCallV` will not return. If you are running code you do not trust,
-that is the gap to plan around — run it in a process you can kill.
+And it bounds **capability, not consumption**. A script with every module denied
+can still loop forever. `FlarisInterrupt` (section 10b) is what stops it, and it
+is the piece you have to wire up yourself — a deadline, a step budget, a signal
+handler; the VM has no timeout of its own.
+
+Per-context budgets (section 6a) do not close this either. `maxFrames` bounds
+recursion depth, and `quantum` bounds how long a *fiber* holds the scheduler
+before the next one runs — neither bounds a straight loop inside a single call.
+Memory is the gap that remains: allocation is pooled VM-wide rather than charged
+per context, so a script that allocates without bound reaches the VM's pool
+limit rather than a limit of its own. If you are running code you do not trust
+at all, that is still the reason to run it in a process you can kill.
 
 ---
 
@@ -769,14 +918,81 @@ Use a native module when you want types and a real name; use this when you want
 a channel that is always there.
 
 **It is cooperative.** It fires only where the script chose to call it, so it is
-not a way to stop a script that never returns. There is no such facility — see
-section 13.
+not a way to stop a script that never returns. `FlarisInterrupt` is — see the
+next section.
 
 ---
 
-## 10b. Embedding from C#
+## 10b. Stopping a running script
 
-`libflaris` is a plain C shared library with 52 exported symbols, all prefixed
+```c
+void FlarisInterrupt(FlarisContext *ctx);
+```
+
+Stops whatever `ctx` is running. Every fiber that context owns unwinds as soon
+as it reaches a checkpoint: its `finally` blocks run, no `catch` in the script
+is offered the exception, and a call in progress returns
+`FLARIS_ERR_INTERRUPTED` with the reason in `errBuf`.
+
+This is the piece that makes an untrusted script bounded in time. The VM has no
+timeout of its own, deliberately — a deadline that suits a game frame does not
+suit a batch job — so you set the policy and call this when it is exceeded:
+
+```c
+// A watchdog thread. FlarisInterrupt is one store to a flag, which is why it
+// may be called from a thread that is not the VM's, and from a signal handler.
+static void *Watchdog(void *arg)
+{
+    Deadline *d = arg;
+    while (!Elapsed(d))
+        Nap(5);
+    FlarisInterrupt(d->ctx);
+    return NULL;
+}
+
+int rc = FlarisCall(ctx, "Render", args, 2, &out, err, sizeof err);
+if (rc == FLARIS_ERR_INTERRUPTED)
+    Log("script exceeded its budget: %s", err);
+```
+
+The same call works from inside one of your own native module functions, which
+is how a step budget is written without a second thread: count the calls, and
+interrupt when the count is exceeded.
+
+**It reaches a loop that yields nothing.** The check rides on the same
+per-instruction checkpoint the scheduler uses, so an endless `while (true)`
+stops within a few thousand instructions — including inside a `FlarisCall`,
+where the scheduler itself is switched off.
+
+**What it does not cut short** is a single native call. If your own module
+blocks for a minute, it blocks for a minute; the interrupt is taken when control
+returns to the interpreter. The same is true of a **JIT-compiled** loop, which
+runs as one native call with no checkpoints in it — set `jit = FLARIS_OFF` on
+any context whose scripts have to stay interruptible.
+
+**The script cannot refuse.** `catch` never sees it, and the exception is
+re-raised past every handler until the fiber ends. `finally` still runs, so a
+script that holds a file or a lock releases it on the way out.
+
+**The request is latched.** It stays set until your next `FlarisCall` or
+`FlarisLoad*` on that context, so every fiber still queued in it stops too, not
+only the one that was running. `FlarisPump` deliberately does *not* clear it —
+that is what lets you pump the interrupted fibers to their end:
+
+```c
+FlarisInterrupt(ctx);
+while (FlarisHasWork(ctx))
+    FlarisPump(ctx, 0);   // their finally blocks run here
+```
+
+Safe to call when nothing is running, and safe to call repeatedly. A context
+that was interrupted is not damaged: the next call runs normally.
+
+---
+
+## 10c. Embedding from C#
+
+`libflaris` is a plain C shared library with 51 exported symbols, all prefixed
 `Flaris`, and no other public surface. That makes it a direct P/Invoke target —
 no C++ name mangling, no wrapper layer, no generated glue.
 
@@ -797,7 +1013,7 @@ compile time, and `StringMarshalling.Utf8` gives you the UTF-8 the API expects:
 
 ```csharp
 [LibraryImport("flaris", StringMarshalling = StringMarshalling.Utf8)]
-public static partial int FlarisLoadSource(string source, string name);
+public static partial int FlarisLoadSourceText(IntPtr ctx, string source, string name);
 ```
 
 **Callbacks must be `[UnmanagedCallersOnly]`, not delegates.** A delegate needs
@@ -826,9 +1042,12 @@ public unsafe struct FlarisNative
 }                                                                    // 56 bytes
 ```
 
-`FlarisConfig` is 80 bytes and needs no attributes beyond
-`LayoutKind.Sequential` — every field is an `int`, `uint`, `ushort`, `ulong` or
-pointer, in declaration order.
+`FlarisConfig` is 80 bytes and `FlarisOptions` 32, and neither needs attributes
+beyond `LayoutKind.Sequential` — every field is an `int`, `uint`, `ushort`,
+`ulong` or pointer, in declaration order.
+
+**A `FlarisContext *` is just an opaque pointer.** Hold it as `IntPtr`; every
+loading and calling entry point takes one as its first argument.
 
 ### Registering a module of C# functions
 
@@ -842,7 +1061,9 @@ fns[0].Required   = 1;
 fns[0].Flags      = FlarisNative.JitSafe;
 
 FlarisRegisterModule("Device", fns, 1);
-FlarisLoadSource("fn Sample(p: int): float { return Device.Read(p); }", "s");
+
+FlarisCreateContext(IntPtr.Zero, out IntPtr ctx);
+FlarisLoadSourceText(ctx, "fn Sample(p: int): float { return Device.Read(p); }", "s");
 ```
 
 The script calls `Device.Read(p)` and your C# method runs. The name pointer must
@@ -861,7 +1082,7 @@ rather than an unwind through native frames.
 ### The constraint that matters most
 
 The threading rule in section 13 applies unchanged: **every call must come from
-the thread that called `FlarisInit`**. In C# that means no `async` continuation
+the thread that called `FlarisInitVM`**. In C# that means no `async` continuation
 that might resume elsewhere, and no `Task.Run` around a call. If your
 application is `async`, marshal Flaris work onto a single dedicated thread and
 keep it there.
@@ -883,7 +1104,7 @@ cadence:
 
 ```c
 while (running) {
-    FlarisPump(0);          /* 0 = every fiber that is ready right now */
+    FlarisPump(NULL, 0);    /* NULL = every context; 0 = every fiber ready now */
     RenderFrame();
 }
 ```
@@ -891,27 +1112,53 @@ while (running) {
 Bound the work per frame so a busy script cannot stall you:
 
 ```c
-FlarisPump(4);              /* at most four fibers this frame */
+FlarisPump(NULL, 4);        /* at most four fibers this frame */
 ```
 
-**The VM owns it.** `FlarisRunToCompletion` runs until nothing can become ready
-again, sleeping while fibers wait — what the `flarisvm` command does:
+Pass a context instead of `NULL` to decide *whose* work advances. Only the
+fibers that context spawned get CPU; every other context's stay queued exactly
+where they were:
 
 ```c
-FlarisCallV("Start", NULL, 0, NULL, err, sizeof err);
+FlarisPump(untrusted, 2);   /* the plugin gets two fibers' worth of this frame */
+FlarisPump(engine, 0);      /* your own scripts run to the end of their queue */
+```
+
+One thing stays VM-wide either way: signals, I/O completions and due timers are
+delivered on every pump, because otherwise this context's own I/O would never be
+reaped. So a file watch or an async completion belonging to a *different*
+context can still fire during a per-context pump. What the context bounds is
+which fibers run, not which completions arrive.
+
+**The VM owns it.** `FlarisRunToCompletion` runs until nothing can become ready
+again — no queued fiber, no live timer, no claimed event, no in-flight I/O —
+sleeping while fibers wait rather than spinning:
+
+```c
+FlarisCall(ctx, "Start", NULL, 0, NULL, err, sizeof err);
 FlarisRunToCompletion();
 ```
 
-`FlarisHasWork()` is true while a queued fiber, a live timer, a claimed event or
-an in-flight I/O operation could still make progress — the termination condition
-for a loop of your own:
+It is the only entry point in the library that blocks, and it blocks for as long
+as the scripts keep working: a script that never finishes never returns. It is
+VM-wide by nature — it has to wait on every context's I/O to know that none of
+them can make progress.
+
+`FlarisHasWork(NULL)` is true while a queued fiber, a live timer, a claimed
+event or an in-flight I/O operation could still make progress — the termination
+condition for a loop of your own:
 
 ```c
-while (FlarisHasWork()) {
-    if (FlarisPump(0) == 0)
+while (FlarisHasWork(NULL)) {
+    if (FlarisPump(NULL, 0) == 0)
         SleepMilliseconds(1);      /* nothing was ready - your call how to idle */
 }
 ```
+
+`FlarisHasWork(ctx)` answers the same question about one context: an unfinished
+fiber it owns — queued, sleeping or parked on I/O — or a timer it armed. That
+answer costs a walk of the live-fiber registry where the VM-wide form is a few
+counter reads, so call it once per loop iteration rather than per fiber.
 
 Because `FlarisPump` never sleeps, a loop with no idle of its own can spin
 thousands of times before a 1 ms timer comes due. That is deliberate: the VM
@@ -929,7 +1176,7 @@ buffer:
 
 ```c
 char err[256];
-int rc = FlarisCallV("Risky", NULL, 0, &result, err, sizeof err);
+int rc = FlarisCall(ctx, "Risky", NULL, 0, &result, err, sizeof err);
 
 if (rc == FLARIS_ERR_RAISED)
     LogWarning("script error: %s", err);      /* e.g. "7: inventory full" */
@@ -944,7 +1191,7 @@ the message entirely. `rc` still tells you the call raised, so a host that only
 branches on failure and never shows the text can use it:
 
 ```c
-int rc = FlarisCallV("Risky", NULL, 0, &result, NULL, 0);  /* no message built */
+int rc = FlarisCall(ctx, "Risky", NULL, 0, &result, NULL, 0);  /* no message built */
 ```
 
 That is worth doing only where raises are frequent enough to matter — building
@@ -975,13 +1222,21 @@ decision to stop is not a decision that your application should stop:
 
 Two things are outside that guarantee, and both are yours to control:
 
-- **Allocator exhaustion is fatal.** If the object pool hits `cfg.maxSlabs` or
-  the system refuses memory, the VM reports and exits — object allocation has no
-  failure return, so there is nothing to unwind to. Size `maxSlabs` for your
+- **Allocator exhaustion is fatal only as a last resort.** When the object pool
+  hits `cfg.maxSlabs`, the allocation raises `Exception.OutOfMemory` out of a
+  small reserve kept for exactly that, so the script (and your `FlarisCall`)
+  sees an ordinary raise. Only when that reserve is itself spent, or the system
+  refuses memory outright, does the VM report and exit. Size `maxSlabs` for your
   workload; the default ceiling is 1024 slabs.
-- **The signal handlers are opt-out.** With `installSignals` left on, the VM's
-  `SIGSEGV`/`SIGINT` handlers end the process the way any such handler does. Set
-  `cfg.installSignals = FLARIS_OFF` to keep your own.
+- **The signal handlers are opt-out.** With `installSignals` left on, a
+  `SIGINT`, `SIGTERM` or `SIGHUP` that no script handler has claimed ends the
+  process immediately (exit code 128 + signal number) with nothing torn down. Set
+  `cfg.installSignals = FLARIS_OFF` to keep your own. The VM never handles
+  `SIGSEGV`: a fault inside it reaches your handler, or the default.
+  `FlarisShutdownVM` puts the dispositions it replaced back, so a signal after
+  shutdown reaches whatever handler you had before — the VM's handler never runs
+  against a torn-down VM. `SIGPIPE` is the exception: the VM leaves it ignored,
+  since a stray write to a closed peer should not kill your process either.
 
 ### Routing the VM's own output
 
@@ -1003,7 +1258,7 @@ ANSI escapes; it is valid only for the duration of the call, so copy it if you
 keep it. Levels are `FLARIS_LOG_ERROR`, `FLARIS_LOG_WARNING`, `FLARIS_LOG_INFO`
 and `FLARIS_LOG_VERBOSE`. Pass `NULL` to go back to stderr.
 
-You may set the handler before `FlarisInit`, so even startup diagnostics reach
+You may set the handler before `FlarisInitVM`, so even startup diagnostics reach
 it. Compilation diagnostics go through it too, which is how you capture why a
 script failed to compile.
 
@@ -1015,12 +1270,12 @@ still goes to stdout; redirect that by your own means if you need to.
 ## 13. Limits and what is not supported
 
 **One VM per process.** VM state is process-wide, so there is no handle type and
-no way to hold two VMs at once. `FlarisShutdown` makes the process reusable,
+no way to hold two VMs at once. `FlarisShutdownVM` makes the process reusable,
 which covers reloading a script, but not isolating several scripts from each
 other.
 
 **One thread.** Every function here must be called from the thread that called
-`FlarisInit`. Fibers are cooperative and run on that thread; the I/O worker
+`FlarisInitVM`. Fibers are cooperative and run on that thread; the I/O worker
 threads never touch VM state.
 
 **One script per VM.** Loading a second script into a live VM is not supported;
@@ -1032,20 +1287,27 @@ that registers those exact names, and the standalone `flarisvm --compile` cannot
 compile a script that calls one, because it does not know your module. Compile
 such scripts from your own host, at load.
 
-**No resource limits.** There is no way to interrupt a running script, cap its
-CPU time or bound its allocations. `FlarisCallV` runs the callee to completion.
-Section 10 covers what this means for untrusted code.
+**No memory budget per context.** Allocations come from a VM-wide pool, so one
+context cannot be given its own ceiling; a script that allocates without bound
+exhausts the VM's pool, which raises rather than aborting, but does so for
+everyone. Recursion depth and scheduler share are bounded per context (section
+6a), and a runaway loop is stoppable (section 10b); memory is not yet.
+
+**A JIT-compiled loop cannot be stopped.** Native code runs as one C call with
+no checkpoints in it, so neither the scheduler nor `FlarisInterrupt` reaches a
+loop inside it. Set `jit = FLARIS_OFF` for any context whose scripts must stay
+interruptible.
 
 **A malformed `.flx` is refused, not survived halfway.** The bytecode reader
-abandons the whole load on the first inconsistency — `FlarisLoadFile` returns
-`FLARIS_ERR_COMPILE` and nothing from that file is defined. It does not attempt
+abandons the whole load on the first inconsistency — `FlarisLoadBytecode`
+returns `FLARIS_ERR_COMPILE` and nothing from that file is defined. It does not attempt
 partial recovery, so a damaged file is never half-loaded.
 
 An [FFI plugin](https://www.flaris-lang.org/doc/ffi.md) remains the alternative
 when the code you want to reach lives in a shared library you do not compile
 against: the script loads and calls it through `Ffi`, which requires
-`cfg.unsafe = FLARIS_ON` and is refused outright when `FLARIS_MOD_FFI` is
-denied. A native module needs neither.
+`FLARIS_CAP_FFI` (or `FLARIS_CAP_UNSAFE`, which implies it) and is refused
+outright when `FLARIS_MOD_FFI` is denied. A native module needs neither.
 
 ---
 
@@ -1057,30 +1319,34 @@ Everything below is declared in `flaris.h`.
 
 | Function | Description |
 |----------|-------------|
-| `int FlarisInit(const FlarisConfig *cfg)` | Start the VM. `NULL` means defaults. `FLARIS_OK` or `FLARIS_ERR_INIT`. |
-| `void FlarisShutdown(int code)` | Release everything; idempotent. `code` only reaches an attached debugger. |
+| `int FlarisInitVM(const FlarisConfig *cfg)` | Start the VM. `NULL` means defaults. `FLARIS_OK` or `FLARIS_ERR_INIT`. |
+| `void FlarisShutdownVM(int code)` | Release everything; idempotent. `code` only reaches an attached debugger. |
 | `void FlarisSetArgs(int argc, char **argv)` | Make argv visible to `Os.Args`. Borrows `argv`. |
 | `void FlarisSetLogHandler(FlarisLogFn fn, void *userData)` | Route VM diagnostics to `fn`; `NULL` restores stderr. |
+
+### Contexts
+
+| Function | Description |
+|----------|-------------|
+| `int FlarisCreateContext(const FlarisOptions *opt, FlarisContext **out)` | Create one. `NULL` options means the VM's own authority. |
+| `int FlarisDestroyContext(FlarisContext *ctx)` | Cancel its fibers, drop its timers/watches/handlers, release it. `FLARIS_ERR_BUSY` from inside its own code. |
+| `const FlarisOptions flarisOptionsDefaults` | All-zero: the VM's authority and budgets. |
 
 ### Loading
 
 | Function | Description |
 |----------|-------------|
-| `int FlarisLoadSource(const char *source, const char *name)` | Compile a string and run its top level. `name` labels diagnostics. |
-| `int FlarisLoadFile(const char *path)` | Load a `.flx`, or compile a `.fls`, and run its top level. |
-| `int FlarisRunFile(const char *path)` | Load and call `Main()`, returning its exit code. |
+| `int FlarisLoadSourceText(ctx, const char *source, const char *name)` | Compile a string into `ctx` and run its top level. `name` labels diagnostics. |
+| `int FlarisLoadSource(ctx, const char *path)` | The same, reading `.fls` from a path. Not in a runtime-only build. |
+| `int FlarisLoadBytecode(ctx, const char *path)` | Load `.flx` into `ctx` and run its top level. |
+| `int FlarisRunFile(const char *path)` | No context: load and call `Main()`, returning its exit code. |
 
 ### Calling
 
 | Function | Description |
 |----------|-------------|
-| `int FlarisCallV(name, args, argc, outResult, errBuf, errSize)` | Call a global by name. Borrows `args`; the result is owned. |
-| `int FlarisCallValue(fn, args, argc, outResult, errBuf, errSize)` | Call a callable value you hold. |
-| `int FlarisNew(className, args, argc, outResult, errBuf, errSize)` | Construct a class instance, running its constructor. |
-| `FlarisValue FlarisGetFunction(const char *name)` | Resolve a global once. **Owned** — release it. |
-| `FlarisValue FlarisGetMethod(obj, const char *name)` | A method bound to its receiver. **Owned.** |
-| `int FlarisIsCallable(FlarisValue v)` | 1 if the value can be called as it stands. |
-| `int FlarisHasFunction(const char *name)` | 1 if the name is callable. |
+| `int FlarisCall(ctx, name, args, argc, outResult, errBuf, errSize)` | Call a function in `ctx` by name. Borrows `args`; the result is owned. |
+| `int FlarisHasFunction(ctx, const char *name)` | 1 if the name is callable in `ctx`. |
 
 ### Signals from the script
 
@@ -1093,7 +1359,10 @@ Everything below is declared in `flaris.h`.
 | Field | Description |
 |-------|-------------|
 | `uint64_t FlarisConfig.deniedModules` | Bitmask of `FLARIS_MOD_*`. 0 (the default) allows everything. |
-| `int FlarisConfig.allowTls` | `FLARIS_OFF` refuses TLS connections, including `https://` imports. |
+| `uint32_t FlarisConfig.grantCaps` / `.denyCaps` | `FLARIS_CAP_*`; deny is applied after grant. |
+| `uint64_t FlarisOptions.deniedModules` | Per context, **added** to what the VM denies. |
+| `uint32_t FlarisOptions.grantCaps` / `.denyCaps` | Per context, relative to the VM's authority. |
+| `uint32_t FlarisOptions.stackSize` / `uint16_t .maxFrames` / `int32_t .quantum` | Per-context budgets. Narrow only — a larger value is rejected. |
 
 ### Native modules
 
@@ -1130,9 +1399,10 @@ an owned value; readers return borrowed data valid while the value is.
 
 | Function | Description |
 |----------|-------------|
-| `int FlarisPump(int maxFibers)` | One non-blocking pass; returns fibers run. Never sleeps. |
-| `int FlarisHasWork(void)` | True while anything could still make progress. |
-| `void FlarisRunToCompletion(void)` | Run until quiescent, sleeping as needed. |
+| `int FlarisPump(FlarisContext *ctx, int maxFibers)` | One non-blocking pass; returns fibers run. Never sleeps. `ctx` NULL drives every context. |
+| `void FlarisInterrupt(FlarisContext *ctx)` | Stop what `ctx` is running: its fibers unwind through their `finally` blocks and a call in progress returns `FLARIS_ERR_INTERRUPTED`. One store to a flag, so it is safe from a signal handler or another thread. |
+| `int FlarisHasWork(FlarisContext *ctx)` | True while anything could still make progress; `ctx` NULL asks about the whole VM. |
+| `void FlarisRunToCompletion(void)` | Run until quiescent, sleeping as needed. Blocks; VM-wide. |
 
 ### Status codes
 
@@ -1149,3 +1419,4 @@ an owned value; readers return borrowed data valid while the value is.
 | `FLARIS_ERR_NOTFOUND` | -12 | No such function |
 | `FLARIS_ERR_REGISTERED` | -13 | That module name is already taken |
 | `FLARIS_ERR_COLLISION` | -14 | Two names share a 32-bit hash; rename one |
+| `FLARIS_ERR_BUSY` | -15 | The context is running its own code; it cannot be destroyed now |
