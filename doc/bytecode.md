@@ -44,7 +44,7 @@ optional JIT IR side-channel (a conforming VM may ignore it; see §3.7).
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `SYS_VERSION` / `CHUNK_VERSION` | `0x01000300` (1.0.3.0) | version written into produced chunks |
+| `SYS_VERSION` / `CHUNK_VERSION` | `0x01000400` (1.0.4.0) | version written into produced chunks |
 | `MIN_SUPPORTED_BYTECODE_VERSION` | `0x01000300` (1.0.3.0) | oldest chunk version a loader MUST accept |
 | `DEFAULT_LIB_VERSION` | `0x01000000` | default module version when unspecified |
 
@@ -57,7 +57,8 @@ in the same change. New opcodes **appended before `OP_LAST`** keep all prior
 numbers stable and only bump `SYS_VERSION` (older VMs reject the newer files via
 the version ceiling; 1.0.0.9 appended `OP_CONCAT_N` and `OP_NIL_LOCAL`, 1.0.2.0
 appended `OP_CALL_WITH_THIS` and `OP_OBJ_ARITH_L`, all this way; 1.0.3.0 inserted
-`OP_USHR` after `OP_SHR` and raised the floor to 1.0.3.0). A loader MUST
+`OP_USHR` after `OP_SHR` and raised the floor to 1.0.3.0; 1.0.4.0 added the
+optional import-table chunk section, §5.5, bumping only `SYS_VERSION`). A loader MUST
 reject a chunk whose version is below the floor or above its own `SYS_VERSION`.
 
 ---
@@ -419,7 +420,7 @@ Magic is the four ASCII bytes `FLS2`. Total header size: 192 bytes
 | 4 | 4 | `version` | u32 | **library version**, packed `0xMMmmppbb` (major.minor.patch.build). Default `0x01000000` (1.0.0.0). Informational: not validated at load |
 | 8 | 4 | `compilerVersion` | u32 | **bytecode version** = `SYS_VERSION`. Loader MUST enforce `MIN_SUPPORTED_BYTECODE_VERSION ≤ compilerVersion ≤ SYS_VERSION` |
 | 12 | 32 | `name` | UTF-8 | NUL-terminated output basename *without extension*, ≤ 31 chars. Part of the signed/fingerprinted bytes: renaming the output changes the fingerprint |
-| 44 | 4 | `flags` | u32 | bit 0 = `FLAG_BUNDLE`; all other bits reserved (write 0) |
+| 44 | 4 | `flags` | u32 | bit 0 = `FLAG_BUNDLE`; all other bits reserved: writers set them to 0 and a reader MUST reject a file with any other bit set |
 | 48 | 8 | `entry` | u64 | xxHash64 of the entry function name — `0xC6783A229050BEDC` (`"Main"`) if present, `0` for a library with no entry point |
 | 56 | 4 | `mainSectionStart` | u32 | absolute offset; MUST be 192 for non-bundles, `192 + 2 + depCount·152` for bundles |
 | 60 | 4 | `stringPoolStart` | u32 | = `mainSectionStart` in the current writer |
@@ -427,12 +428,12 @@ Magic is the four ASCII bytes `FLS2`. Total header size: 192 bytes
 | 68 | 4 | `codeStart` | u32 | = `stringPoolEnd` in the current writer |
 | 72 | 4 | `codeEnd` | u32 | = `mainSectionEnd` in the current writer |
 | 76 | 4 | `mainSectionEnd` | u32 | |
-| 80 | 2 | — | | reserved, zero |
+| 80 | 2 | — | | reserved; MUST be zero, a reader MUST reject nonzero |
 | 82 | 1 | `sigAlg` | u8 | 0 = unsigned, 1 = retired legacy Ed25519 (MUST be rejected), 2 = Ed25519 (§5.3). Any other value MUST be rejected |
-| 83 | 1 | — | | reserved, zero |
+| 83 | 1 | — | | reserved; MUST be zero, a reader MUST reject nonzero |
 | 84 | 32 | `pubkey` | raw | Ed25519 public key; all-zero when unsigned |
 | 116 | 64 | `signature` | raw | Ed25519 signature; all-zero when unsigned |
-| 180 | 12 | — | | reserved, zero |
+| 180 | 12 | — | | reserved; MUST be zero, a reader MUST reject nonzero |
 
 The four section-offset pairs are validated for ordering
 (`mainSectionStart ≤ stringPoolStart ≤ stringPoolEnd ≤ codeStart ≤ codeEnd ≤
@@ -486,7 +487,7 @@ than once in the region's value tree:
 u16   count                (0 … 65535)
 count × {
     u8    isStatic         (informational; reader ignores it)
-    u64   hash             (xxHash64 of body; TRUSTED by the reader, not recomputed)
+    u64   hash             (xxHash64 of body; the reader recomputes it and MUST reject a mismatch)
     u32   len              (MUST be < MAX_STRING_SIZE)
     u8[len] body           (no NUL terminator)
 }
@@ -516,7 +517,7 @@ A *chunk* is one function body (the top level is a chunk too). On the wire:
 | 1 | 4 | version u32 | MUST satisfy `MIN_SUPPORTED_BYTECODE_VERSION ≤ v ≤ CHUNK_VERSION` |
 | 5 | 2 | consts u16 | MUST be ≤ `MAX_CONST_COUNT` (16384) |
 | 7 | 4 | codelen u32 | MUST be ≥ 1 and ≤ `MAX_CODE_SIZE` (10 MiB) |
-| 11 | 2 | flags u16 | bit 0 `CHUNK_FLAG_DBG`, bit 1 `CHUNK_FLAG_HAS_JIT_IR` |
+| 11 | 2 | flags u16 | bit 0 `CHUNK_FLAG_DBG`, bit 1 `CHUNK_FLAG_HAS_JIT_IR`, bit 2 `CHUNK_FLAG_HAS_IMPORTS`; any other bit MUST be rejected |
 
 **Chunk body**, immediately following:
 
@@ -529,6 +530,12 @@ A *chunk* is one function body (the top level is a chunk too). On the wire:
    VM MAY skip it entirely. The stored `regCount` MUST NOT be trusted (the
    reference VM recomputes it from the IR); semantically invalid IR is dropped
    (the function runs interpreted) and is *not* a load error.
+5. if `CHUNK_FLAG_HAS_IMPORTS`: `u16 count`, then `count ×` `{ u16 len;
+   u8[len] name; u16 len; u8[len] version; u16 len; u8[len] pin }` — one
+   record per top-level `import ... from library(name, version[, pin])`
+   declaration, in source order, `pin` empty when unpinned. Lengths MUST be
+   below 512 / 64 / 80 respectively. Only a top-level chunk carries the
+   section; it is what a bundler resolves dependencies from.
 
 `--strip` removes the debug section (clears `CHUNK_FLAG_DBG`) and suppresses
 the `OP_DBG_*` opcodes in code. There is no separate line table: source lines
@@ -548,13 +555,13 @@ the value's `ObjectType` bit (§4.1). Exception: a pool reference (§5.4) is
 | `VAL_FLOAT` `0x04` | f64 (IEEE 754 bits, LE) |
 | `VAL_INT` `0x08` | i64 |
 | `VAL_STRING` `0x10` | `u64 hash` + `u32 len` + `u8[len]` body. `len ≥ MAX_STRING_SIZE` MUST be rejected. If `len > 0` the reader recomputes the hash (stored hash ignored); if `len == 0` the stored hash is preserved — this is the **hash-only key** form |
-| `VAL_OBJECT` `0x20` | `u32 count` (< `MAX_ITEMS`), then `count ×` { key value — MUST decode to a string; value }. The writer emits pairs sorted by key hash for byte-deterministic output |
-| `VAL_ARRAY` `0x40` | `u32 length` (< `MAX_ITEMS`) + `u8 flat`. `flat = 1`: `length × f64` (flat float array, §4.1); `flat = 2`: `length × i64` (flat int array); `flat = 0`: `length` nested values |
+| `VAL_OBJECT` `0x20` | `u32 count` (< `MAX_ITEMS`), then `count ×` { key value — MUST decode to a string; value }. The writer emits pairs in insertion order, so a constant object keeps its source key order and identical source gives identical bytes |
+| `VAL_ARRAY` `0x40` | `u32 length` (< `MAX_ITEMS`) + `u8 flat`. `flat = 1`: `length × f64` (flat float array, §4.1); `flat = 2`: `length × i64` (flat int array); `flat = 0`: `length` nested values. Any other `flat` value MUST be rejected |
 | `VAL_BOOL` `0x80` | u8 (0/1) |
 | `VAL_BLOCK` `0x100` | none — blocks do not serialize; reads back as `nil` |
 | `VAL_FUNCTION` `0x10000` | `u8 arity` + `u8 localCount` + `u32 flags` + `u32 returnType` + `16 × u32 argsTypes` + name (value-key, may be the nil sentinel) + **nested chunk** (§5.5, recursive). Reader MUST clamp `localCount ≤ 128`, `arity ≤ 16`, clear flags `FUNC_FLAG_IS_CLONE` + `FUNC_FLAG_ENV_OWNED`, and re-derive `FUNC_FLAG_TYPED_PARAMS` itself |
 | `VAL_BUILTIN_FUNCTION` / `VAL_MODULE` / `VAL_EXCEPTION` / `VAL_BOUND_METHOD` / `VAL_POINTER` | none — read back as `nil` |
-| `VAL_CLASS` `0x1000000` | `u32 ownCount` (≤ `MAX_ITEMS`) + `u64 protoHash` (base-class name hash, 0 = none) + name (must be string) + `ownCount ×` { `u8 kind` (0 field / 1 method / 2 const; > 2 MUST be rejected), member name (must decode to string), member value }. Function members are back-linked to the class as owner |
+| `VAL_CLASS` `0x1000000` | `u32 ownCount` (≤ 65535) + `u64 protoHash` (base-class name hash, 0 = none) + name (must be string) + `ownCount ×` { `u8 kind` (0 field / 1 method / 2 const; > 2 MUST be rejected), member name (must decode to string), member value }. Function members are back-linked to the class as owner |
 | any other tag | MUST be rejected |
 
 **Value-keys** (object keys, class member names, function names) are ordinary
@@ -1505,17 +1512,22 @@ through into the loop body.
 Stack `→`. Runs once per counted `iter` loop. Both `local[slot]` (start)
 and `local[endSlot]` (end) MUST be ints, else `InvalidArgs`; either may be
 heap-boxed, so the endpoints are not limited to the tagged-int range. If
-`start > end`, jumps to `exit` (empty range). Otherwise, a span wider than
+`start >= end`, jumps to `exit` (empty range - the source range's upper
+bound is exclusive, so `start == end` is already empty). Otherwise, a
+span wider than
 `MAX_ITER_SPAN` (2⁶⁰ steps) raises `InvalidArgs` — the *width* is refused,
 never the magnitude, so a short range at any magnitude is legal.
 
 **`OP_ITER_NEXT`** `<slot:u8> <endSlot:u8> <body:addr:u16>` — 5 bytes.
 Stack `→`. If `local[slot] < local[endSlot]`: increments the slot and
 jumps to the absolute `body` address (quantum-checked back-edge);
-otherwise falls through. Net effect: the loop variable takes every value
-from start to end **inclusive**. When both bounds are tagged ints the
-increment is a pure immediate rewrite; if either is boxed, the step goes
-through a boxed lane that releases the outgoing counter. Traps: —
+otherwise falls through. The test is inclusive against the STORED bound,
+which is one less than the source range's upper bound — a counted loop
+decrements it once at entry (§ `OP_DEC_LOCAL`), so the language's
+exclusive `to` costs nothing per iteration. When both bounds are tagged
+ints the increment is a pure immediate rewrite; if either is boxed, the
+step goes through a boxed lane that releases the outgoing counter.
+Traps: —
 
 ### 7.17 Type operations
 
@@ -1591,8 +1603,8 @@ All ten require `local[blk]` to be a block, else `TypeMismatch`. Reads
 sign-extend the block's element (element size 1/2/4/8 bytes; other sizes →
 `RuntimeError`) and push an int; writes truncate an int to the element
 size. Negative indices count from the end. Out-of-bounds raises
-`IndexOutOfBounds`; every access is additionally validated against the
-block's registered memory region (guard failure raises).
+`IndexOutOfBounds`. The payload is VM-owned memory bounded by the block's
+own length, so no further address check is made.
 
 **`OP_GET_BLK_LC`** `<blk:u8> <idx:u8>` — 3 bytes. Push `blk[idx-literal]`.
 **`OP_GET_BLK_LL`** `<blk:u8> <idx:u8>` — 3 bytes. Push
@@ -1649,9 +1661,10 @@ left-associative cascade of `OP_CONCAT`. Traps: —
 ## 8. Loader validation
 
 Validation is **fail-closed**: anything not explicitly modeled is rejected.
-In the reference implementation every load-time rejection terminates the
-process with exit code 4 (`EXIT_CODE_ERR_FILE`) — malformed bytecode is never
-surfaced as a catchable runtime exception. Two deliberate exceptions to
+The reference loader reports a rejection to its caller: the command-line VM
+exits with code 4 (`EXIT_CODE_ERR_FILE`), an embedding host receives a failed
+load status. Malformed bytecode is never surfaced as a catchable runtime
+exception. Two deliberate exceptions to
 "reject": a malformed **bundled dependency** is skipped with an error (the
 outer program still loads), and a malformed **JIT IR section** is dropped (the
 function runs interpreted).
@@ -1669,6 +1682,10 @@ function runs interpreted).
 7. Main-section length ≥ 1 and ≤ `MAX_CODE_SIZE` (10 MiB).
 8. Every read is bounds-checked overflow-safely (compare `n > size − pos`,
    never `pos + n > size`); a short read is fatal.
+9. `flags` has no bit set other than `FLAG_BUNDLE`; the reserved bytes at
+   offsets 80, 83 and 180 are zero.
+10. Bundles: `mainSectionStart == 194 + entryCount·152`, so the main section
+    follows the TOC directly.
 
 ### 8.2 Deserialization level
 
@@ -1680,6 +1697,8 @@ function runs interpreted).
   `kind ≤ 2`; object keys, class names and member names must be strings;
   unknown type tag fatal. Function `arity`/`localCount` are clamped (not
   rejected) and function flags sanitized (§5.6).
+- Every declared length or count must also fit in the bytes that remain in
+  the buffer, checked before any allocation is sized from it.
 
 ### 8.3 `ValidateChunk`
 
@@ -2232,8 +2251,8 @@ Only reachable in an embedding that registers its own native modules
 | Code | Opcode(s) | Comment |
 | --- | --- | --- |
 | `foreach (item in arr) { ... }` | `OP_FOREACH` | Also works over strings (by byte), objects/instances (by map entry). |
-| `iter (i from 0 to 10) { ... }` (loop entry, once) | `OP_ITER_BEGIN` | |
-| `iter (i from 0 to 10) { ... }` (back-edge, per iteration) | `OP_ITER_NEXT` | |
+| `iter (i from 0 to 11) { ... }` (loop entry, once) | `OP_ITER_BEGIN` | |
+| `iter (i from 0 to 11) { ... }` (back-edge, per iteration) | `OP_ITER_NEXT` | |
 
 ### D.17 Type operations (§7.17)
 

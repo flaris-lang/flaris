@@ -15,8 +15,8 @@
 // Usage:
 //   import { Modem } from library("Modem", "1.0");
 //
-//   let m = Modem.Open("/dev/ttyUSB2", 115200);
-//   if (m == nil) { ... }
+//   let m = new Modem("/dev/ttyUSB2");  // takes the port and keeps it
+//   if (!m.IsOpen()) { Console.WriteLine(m.Error()); return 1; }
 //
 //   let sim = m.SimStatus();            // { state, pinRetries, pukRetries }
 //   if (sim.state == "pin") { m.UnlockPin("1234"); }
@@ -27,12 +27,32 @@
 //
 //   m.OnMessage(fn(sms) { Console.WriteLine(sms.sender + ": " + sms.text); });
 //   m.Poll(1000);                       // service URCs while otherwise idle
+//   m.Close();                          // gives the port back
 //
-// Nothing here raises. Every call returns a result object carrying `ok` and,
-// when ok is false, an `error` string and an `errorKind` naming the class of
-// failure ("timeout", "port", "modem", "usage"). A timeout is reported as a
-// timeout rather than as a failure, because on a modem those are not the same
-// thing - see SendMessage.
+// The instance owns the port for its whole life - there is no open/close
+// dance around each command, and while it is alive no second instance in this
+// process can take the same path out from under it. `new Modem(port, baud)`
+// picks the rate, `new Modem(port, baud, { portWaitMs: 5000 })` queues behind
+// a live holder instead of failing fast, and `new Modem(at)` wraps an AT that
+// somebody else made. Modem.Open()/Modem.Attach() still work and still answer
+// nil on failure, for code written against them.
+//
+// Nothing here raises - not the constructor either. Every call returns a
+// result object carrying `ok` and, when ok is false, an `error` string and an
+// `errorKind` naming the class of failure ("timeout", "port", "modem",
+// "usage"). A timeout is reported as a timeout rather than as a failure,
+// because on a modem those are not the same thing - see SendMessage. A port
+// that could not be taken gives a working object in a closed state rather than
+// a nil or an exception: IsOpen() is false, Error() says why, and every
+// command answers { ok: false, errorKind: "port" }. Checking is therefore
+// worth doing early, but forgetting it costs a clear failure, not a crash.
+//
+// Concurrency: every wait in this library parks the calling fiber rather than
+// the OS thread, so a command in flight never stops other fibers from running,
+// and no call needs an async spelling to stay out of the way. AT.SendAsync()
+// and friends add the other half - a handle to a command that is already
+// running, collected later with .Await() - for the commands that take minutes
+// (+COPS=? is the usual one). See the comment above SendAsync.
 //
 // SAFETY - read before using UnlockPin:
 //   A SIM allows three PIN attempts before it locks to PUK, and ten PUK
@@ -47,18 +67,29 @@
 // Testing without hardware: tests/fake_modem.py answers AT commands on a
 // pseudo-terminal, and Stream.OpenSerial cannot tell it from a real device.
 // tests/test_modem.sh drives the library against it through the awkward cases -
-// a line split across two reads, a URC racing a reply, a silent modem, a
-// PUK-locked card. No modem, and no --unsafe: the whole library runs sandboxed.
+// a line split across two reads, a URC racing a reply, a silent modem, a bare
+// ERROR and a +CME ERROR, two instances contending for one port, and a waiter
+// taking the port over when the holder closes. No modem, and no --unsafe: the
+// whole library runs sandboxed.
+//
+//   VM=/path/to/flarisvm bash tests/test_modem.sh
 //
 // Baud is passed straight through to Stream.OpenSerial - no rate list is baked
 // in here, because which rates are usable is a property of the VM build and the
 // driver, not of this library. A rate the platform will not take comes back as
-// a nil from Open rather than as an exception. 115200 is the safe default for
-// control commands; 460800 and 921600 are what modules want for bulk data.
+// a closed instance (or a nil from the Open factories) rather than as an
+// exception. 115200 is the safe default for control commands; 460800 and
+// 921600 are what modules want for bulk data.
 //
 // Exported classes:
-//   AT    - Open / Attach / Send / SendPrompt / OnUrc / OnTrace / Poll / Close
-//   Modem - device    : Open / Attach / Info / At / Poll / Close
+//   AT      - port     : Acquire / Open / Attach / Close / IsOpen / Error /
+//                        Port / OwnsPort
+//             commands : Send / SendPrompt / Poll
+//             async    : SendAsync / SendPromptAsync / PollAsync -> Pending
+//             hooks    : OnUrc / OnTrace
+//   Pending - a command in flight: IsDone / Await / Handle
+//   Modem - device    : new Modem(port|at, baud?, opts?) / Open / Attach /
+//                       Info / At / Poll / Close / IsOpen / Error / Port
 //           identity  : Imei / Imsi / Iccid / OwnNumber
 //                       (+ static ValidateImei; there is no IMEI setter,
 //                        see the note on ValidateImei)
@@ -133,7 +164,7 @@ global _gsmExtEnc = nil;
 fn _gsmTables(): int {
     if (_gsmEnc != nil) return 0;
     let enc = { };
-    iter (i from 0 to 127) { enc[str(_GSM_BASIC[i])] = i; }
+    iter (i from 0 to 128) { enc[str(_GSM_BASIC[i])] = i; }
     let ext = { };
     var j = 0;
     while (j < len(_GSM_EXT)) {
@@ -210,7 +241,7 @@ fn _gsm7Pack(septets: array, fillBits: int): block {
     Buffer.Fill(out, 0);
 
     var bit = fillBits;
-    iter (i from 0 to n - 1) {
+    iter (i from 0 to n) {
         let v = septets[i] & 127;
         let byteIx = bit / 8;
         let shift  = bit % 8;
@@ -230,7 +261,7 @@ fn _gsm7Unpack(data: block, count: int, fillBits: int): array {
     let out = [];
     let nOct = len(data);
     var bit = fillBits;
-    iter (i from 0 to count - 1) {
+    iter (i from 0 to count) {
         let byteIx = bit / 8;
         let shift  = bit % 8;
         if (byteIx >= nOct) break;
@@ -277,7 +308,7 @@ fn _ucs2Bytes(text: string): block {
         i = String.Utf8CpNext(text, i);
     }
     let b = Buffer.Create(len(out) == 0 ? 1 : len(out), 1);
-    iter (k from 0 to len(out) - 1) { Buffer.WriteU8At(b, k, out[k]); }
+    iter (k from 0 to len(out)) { Buffer.WriteU8At(b, k, out[k]); }
     return len(out) == 0 ? Buffer.FromString("") : Buffer.Slice(b, 0, len(out));
 }
 
@@ -404,7 +435,7 @@ fn _buildSubmit(number: string, text: string, ref: int, opts): array {
 
     let nParts = len(chunks);
     let out = [];
-    iter (p from 0 to nParts - 1) {
+    iter (p from 0 to nParts) {
         let multi = nParts > 1;
         // TP-MTI=1 (SUBMIT) | TP-VPF=2 (relative) | UDHI when concatenated |
         // TP-SRR when a delivery report was asked for.
@@ -553,7 +584,7 @@ fn _parseUdhConcat(ud: block, udhLen: int): object {
 // timezone is quarter-hours with the sign in bit 3 of its first nibble.
 fn _decodeTimestamp(ts: block): object {
     let v = [];
-    iter (i from 0 to 6) {
+    iter (i from 0 to 7) {
         let b = Buffer.ReadU8At(ts, i);
         Array.Append(v, ((b & 15) * 10) + ((b >> 4) & 15));
     }
@@ -634,6 +665,129 @@ fn _isTerminator(line: string): bool {
         || String.StartsWith(line, "+CMS ERROR:");
 }
 
+// -- port-level serialization -------------------------------------------
+//
+// AT._acquire()/_release() below already serialize multiple Send() calls
+// on *one* open instance with a FIFO polled via Fiber.Sleep(2) (see the
+// comment on _acquire) - correct, and deliberately not a Mutex, since a
+// bare blocking primitive can't yield back to the scheduler the way
+// Fiber.Sleep does. That protection is scoped to a single instance,
+// though: two separate AT.Open()/new Modem() calls on the *same port*
+// have no coordination between them at all, and two concurrent AT
+// exchanges on the same physical UART corrupt each other's reads - the
+// modem answers one command at a time regardless of which Flaris object
+// asked. This is the same FIFO pattern, one level up: keyed by port path
+// instead of by instance, held for the whole open..Close() session (not
+// just the open call) since that is the actual span during which two
+// instances must not both be talking to the port.
+//
+// Scope, so nobody expects more of it than it gives: this is in-process
+// only. Another *process* on the same tty - ModemManager, a stray probe,
+// a second Flaris run - is invisible to it, and so is the same device
+// reached by two names (/dev/ttyUSB3 and a by-id symlink key
+// separately). Cross-process exclusion is an O_EXCL lock file and is a
+// separate thing; this closes the hole the library itself can create.
+global _portQueues = {};   // port path -> FIFO of acquisition tokens
+
+// The token is a fresh object, not Fiber.Id(). Ids repeat - one fiber
+// that opens the same port twice appends its own id twice, and then
+// `q[0] != me` is already false for its *first* entry, so the second
+// open walks straight in and both instances drive the port. Objects
+// compare by identity, so every acquisition is distinct no matter who
+// makes it. An array would not do: arrays compare by value, so two
+// empty ones are equal.
+//
+// waitMs is how long to queue behind a live holder before giving up.
+// 0 (the default the callers pass) means fail fast, which keeps open's
+// promise to return promptly rather than parking on a session that may
+// never end; a caller that would rather wait its turn asks for it.
+// Returns the token, or nil if the port stayed busy.
+fn _portAcquire(port: string, waitMs: int) {
+    let me = {};
+    if (_portQueues[port] == nil) { _portQueues[port] = []; }
+    let q = _portQueues[port];
+    Array.Append(q, me);
+    let deadline = Time.Millis() + (waitMs < 0 ? 0 : waitMs);
+    while (q[0] != me) {
+        if (waitMs >= 0 && Time.Millis() >= deadline) {
+            _portRelease(port, me);
+            return nil;
+        }
+        Fiber.Sleep(2);
+    }
+    return me;
+}
+
+// Removes this acquisition's own entry wherever it sits, rather than
+// whatever is at the head: a waiter that timed out is not the holder and
+// must not pop the holder's turn, and a second Close() on an instance
+// that already released finds nothing to remove instead of stealing the
+// next waiter's place.
+fn _portRelease(port: string, tok): int {
+    if (tok == nil) { return 0; }
+    let q = _portQueues[port];
+    if (q == nil) { return 0; }
+    var i = 0;
+    while (i < len(q)) {
+        if (q[i] == tok) { Array.RemoveAt(q, i); return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// A command in flight, handed back by AT's *Async entry points.
+//
+//   let p = at.SendAsync("AT+COPS=?", 120000);
+//   ... other work, other fibers ...
+//   let r = p.Await();          // the usual { ok, lines, error, ... } object
+//
+// It keeps the result in a slot of its own rather than letting the caller read
+// the fiber's return value, because a fiber that has *already finished* hands
+// back nil: Fiber.Await and an attached Fiber.Resume both answer null once
+// Fiber.IsDone is true, though doc/reference.md says a finished fiber returns
+// its value at once. Measured on VM 1.0.4.0, 2026-09-18. That is exactly the
+// case "start it, do something else, collect it later" runs into, so the
+// result is captured on the way out instead. A captured object is shared by
+// reference, so the fiber writes into the same slot this side reads.
+//
+// When the VM stops losing that value, Await() below keeps working unchanged.
+class Pending {
+    let _f    = nil;
+    let _box  = nil;
+    let _fail = nil;      // what Await() answers if the slot stayed empty
+
+    fn Constructor(f, box, onFail) {
+        this._f    = f;
+        this._box  = box;
+        this._fail = onFail;
+    }
+
+    fn IsDone(): bool { return Fiber.IsDone(this._f); }
+
+    // The fiber itself, for Fiber.Cancel or Fiber.CancelIo on a command that
+    // has stopped being worth waiting for. Not named Fiber(): a method of that
+    // name shadows the Fiber namespace for the whole class, and this class
+    // calls Fiber.IsDone.
+    //
+    // Cancelling is the one way to make Await() answer something the modem
+    // never said - it gives the fallback result below. Cancel the fiber while
+    // another fiber sits in Await() and that fiber receives
+    // Exception.Cancelled, which no catch can see; that is the VM's rule for
+    // cancellation, not something this library can soften.
+    fn Handle() { return this._f; }
+
+    // Parks the calling fiber until the command finishes - other fibers keep
+    // running - and returns what it produced: the usual result object for
+    // SendAsync/SendPromptAsync, the URC count for PollAsync. Safe to call
+    // more than once, and safe to call after the command has already finished.
+    fn Await() {
+        if (!Fiber.IsDone(this._f)) { Fiber.Await(this._f); }
+        let r = this._box["result"];
+        if (r == nil) { return this._fail; }
+        return r;
+    }
+}
+
 class AT {
     let _s      = nil;
     let _owned  = false;      // true when Open() made the stream and must close it
@@ -648,6 +802,11 @@ class AT {
     let _inCmd  = false;
     let _cmdPrefix = nil;     // reply prefix of the command in flight
     let _draining = false;
+    let _portTok = nil;       // this instance's place in _portQueues[_port]
+    let _err    = nil;        // why the port is not open, for Error()
+    let _resync = false;      // a command was abandoned; the stream is suspect
+    let _resyncUntil = 0;     // ... and its reply was owed until this time
+    let _sentCmd = false;     // the command in flight reached the wire
 
     fn Constructor(stream, port: string, owned: bool) {
         this._s     = stream;
@@ -662,21 +821,69 @@ class AT {
         this._inCmd = false;
         this._cmdPrefix = nil;
         this._draining = false;
+        this._portTok = nil;
+        this._err   = (stream == nil) ? "port is not open" : nil;
+        this._resync = false;
+        this._resyncUntil = 0;
+        this._sentCmd = false;
     }
 
-    // Open a serial port and put the modem in a known state: echo off, verbose
-    // errors on. `opts.init` false skips that, for a device that is mid-session.
-    fn static Open(port: string, baud: int, opts?) {
+    // Take ownership of a serial port and put the modem in a known state: echo
+    // off, verbose errors on. `opts.init` false skips that, for a device that
+    // is mid-session. `opts.portWaitMs` is how long to queue behind another
+    // instance that already holds this port; the default, 0, fails fast.
+    //
+    // Always returns an AT - never nil - so a caller has something to ask why.
+    // A failed open comes back closed, with IsOpen() false, Error() set, and
+    // every Send() answering the ordinary { ok: false, errorKind: "port" }
+    // instead of crashing on a nil handle. Open() below is the thin nil-on-
+    // failure wrapper the original API promised.
+    fn static Acquire(port: string, baud: int, opts?) {
+        // Claims this port path for the whole session - released in Close(),
+        // not here, since the window that must not overlap with another
+        // instance is Acquire()..Close(), not just this call. Any early return
+        // below (no stream, an exception) must release again immediately,
+        // since no Close() will ever come for a session that never started.
+        let waitMs = (opts != nil && ("portWaitMs" in opts)) ? opts["portWaitMs"] : 0;
+        let tok = _portAcquire(port, waitMs);
+        if (tok == nil) { return AT._unopened(port, "port is busy: another AT instance holds it"); }
+
         // Stream.OpenSerial does not agree with itself across VM versions about
         // an unusable baud rate: older builds raise, newer ones hand the value
         // to the driver. This library promises never to raise, so both shapes
-        // come back as nil and the caller checks one thing.
+        // come back as a closed instance and the caller checks one thing.
         var s = nil;
         try { s = Stream.OpenSerial(port, baud); }
-        catch (e) { return nil; }
-        if (s == nil) return nil;
+        catch (e) {
+            _portRelease(port, tok);
+            return AT._unopened(port, "cannot open port: " + e.Error);
+        }
+        if (s == nil) {
+            _portRelease(port, tok);
+            return AT._unopened(port, "cannot open port");
+        }
         let at = new AT(s, port, true);
+        at._portTok = tok;
         if (opts == nil || !("init" in opts) || opts["init"] == true) { at.Init(); }
+        return at;
+    }
+
+    // The original contract: nil when the port could not be taken. Kept because
+    // callers written against it check one thing, and because `if (at == nil)`
+    // reads better than a two-step at a call site that has nothing to say about
+    // the reason.
+    fn static Open(port: string, baud: int, opts?) {
+        let at = AT.Acquire(port, baud, opts);
+        if (at.IsOpen()) { return at; }
+        return nil;
+    }
+
+    // A closed instance that remembers why. It holds no stream and no place in
+    // the port queue, so Close() on it is a no-op and it can never release a
+    // turn it does not have.
+    fn static _unopened(port: string, err: string) {
+        let at = new AT(nil, port, false);
+        at._err = err;
         return at;
     }
 
@@ -707,6 +914,18 @@ class AT {
 
     fn IsOpen(): bool { return this._s != nil && !this._gone; }
     fn Port(): string { return this._port; }
+
+    // Why the port is not usable, or nil while it is. Set when Acquire() could
+    // not take the port, when Close() gave it up, and when the device vanished
+    // mid-session - the three ways IsOpen() turns false.
+    fn Error() {
+        if (this._gone) { return "port went away"; }
+        return this._err;
+    }
+
+    // True while this instance holds its port path against other instances in
+    // this process. False for Attach(), which borrows somebody else's stream.
+    fn OwnsPort(): bool { return this._portTok != nil; }
 
     // -- reading ----------------------------------------------------------
     //
@@ -862,6 +1081,63 @@ class AT {
         return 0;
     }
 
+    // -- recovering from an abandoned command ------------------------------
+    //
+    // A command that was unwound before it read its reply - Fiber.Cancel on a
+    // Pending.Handle(), a supervisor giving up - leaves that reply in the
+    // stream. The modem sent it; nobody took it. The next command then reads
+    // the *previous* command's answer and every command after it is off by
+    // one, each reporting ok with somebody else's data. That is far worse than
+    // an error: AT+CGMM comes back with the IMEI and nothing looks wrong.
+    // Measured on an EM060K-GL, 2026-09-18.
+    //
+    // So an abandoned command marks the stream suspect, and the next one
+    // resynchronises first: throw away everything buffered and everything the
+    // port still has to say, then round-trip a bare AT and read until its OK.
+    // Only once that OK arrives is the stream known to be aligned again.
+    //
+    // Anything discarded here is lost, URCs included. A message notification
+    // that lands in this window is gone. That is the right trade - a URC that
+    // may actually be a fragment of a stale reply is not worth keeping - but
+    // it is a reason to cancel commands sparingly rather than routinely.
+    fn _resyncPort(): bool {
+        this._resync = false;
+        if (this._s == nil) { return false; }
+
+        // What is owed is one reply, and a reply ends in a terminator - OK,
+        // ERROR, +CME/+CMS ERROR. Discarding up to and including that line is
+        // exactly what realigns the stream, and it stops as soon as the line
+        // arrives rather than guessing at a quiet period. Draining "whatever
+        // is buffered" is not enough: at the moment of a cancel the reply has
+        // usually not been sent yet.
+        this._buf = "";
+        this._lines = [];
+        var quietSince = Time.Millis();
+        while (Time.Millis() < this._resyncUntil) {
+            foreach (line in this._lines) {
+                if (_isTerminator(line)) {
+                    this._buf = "";
+                    this._lines = [];
+                    return true;
+                }
+            }
+            this._lines = [];
+            if (this._pump(100)) {
+                quietSince = Time.Millis();
+            } else {
+                if (this._gone) { break; }
+                // A modem that has begun answering finishes promptly. Silence
+                // this long after an abandoned command means nothing is
+                // coming, and waiting out a 120-second budget would stall the
+                // caller for no reason.
+                if (Time.Millis() - quietSince > 2000) { break; }
+            }
+        }
+        this._buf = "";
+        this._lines = [];
+        return false;
+    }
+
     fn _fail(kind: string, msg: string): object {
         return { ok: false, lines: [], error: msg, errorKind: kind,
                  cme: nil, cms: nil, final: nil };
@@ -883,13 +1159,31 @@ class AT {
         if (String.IndexOfAnyFrom(cmd, "\r\n", 0) >= 0) {
             return this._fail("usage", "command contains CR or LF");
         }
+        // The release has to survive an unwind, not just a normal return. A
+        // fiber cancelled mid-command - Fiber.Cancel on a Pending.Handle(), a
+        // supervisor giving up on a modem that stopped answering - is unwound
+        // at the point it is parked, which is inside _exchange. Without the
+        // finally, its id stays at the head of _queue for good and every later
+        // command on this instance waits behind a fiber that no longer exists.
         this._acquire();
-        this._inCmd = true;
-        this._cmdPrefix = AT._replyPrefix(cmd);
-        let r = this._exchange(cmd, timeoutMs, nil);
-        this._inCmd = false;
-        this._cmdPrefix = nil;
-        this._release();
+        var r = nil;
+        var done = false;
+        try {
+            if (this._resync) { this._resyncPort(); }
+            this._inCmd = true;
+            this._cmdPrefix = AT._replyPrefix(cmd);
+            r = this._exchange(cmd, timeoutMs, nil);
+            done = true;
+        } finally {
+            // An unwind here means this command never read its reply, so the
+            // next one must resynchronise before it trusts the stream - but
+            // only if it reached the wire at all, since nothing is owed for a
+            // command that was never sent.
+            if (!done && this._sentCmd) { this._resync = true; }
+            this._inCmd = false;
+            this._cmdPrefix = nil;
+            this._release();
+        }
         this._drain();
         return r;
     }
@@ -899,26 +1193,107 @@ class AT {
     // line terminator, so it can only be recognised in the raw byte buffer.
     fn SendPrompt(cmd: string, payload: string, timeoutMs?): object {
         if (this._s == nil) { return this._fail("port", "port is closed"); }
+        // Released under a finally for the same reason as Send() above.
         this._acquire();
-        this._inCmd = true;
-        this._cmdPrefix = AT._replyPrefix(cmd);
-        let r = this._exchange(cmd, timeoutMs, payload);
-        this._inCmd = false;
-        this._cmdPrefix = nil;
-        this._release();
+        var r = nil;
+        var done = false;
+        try {
+            if (this._resync) { this._resyncPort(); }
+            this._inCmd = true;
+            this._cmdPrefix = AT._replyPrefix(cmd);
+            r = this._exchange(cmd, timeoutMs, payload);
+            done = true;
+        } finally {
+            if (!done && this._sentCmd) { this._resync = true; }
+            this._inCmd = false;
+            this._cmdPrefix = nil;
+            this._release();
+        }
         this._drain();
         return r;
+    }
+
+    // -- async entry points -------------------------------------------------
+    //
+    // Every wait in this library already parks the calling *fiber*, not the OS
+    // thread: Stream.WaitReadable suspends without `await` (so _pump yields
+    // while the modem thinks), and _acquire polls with Fiber.Sleep. A Send()
+    // on one fiber therefore never stops the others from running, and every
+    // Modem method is non-blocking in that sense with no async spelling at all.
+    //
+    // What these add is a handle - the command runs while the caller carries
+    // on, and the result is collected later:
+    //
+    //   let p = at.SendAsync("AT+COPS=?", 120000);   // a scan takes minutes
+    //   ... other work, other fibers ...
+    //   let r = p.Await();                           // the usual result object
+    //
+    // They start the fiber before handing it back, deliberately. An `async fn`
+    // returns a *cold* fiber here - it does not run until something awaits or
+    // resumes it - so an async-spelled SendAsync would do nothing until the
+    // Await, which is the opposite of what the name promises. Fiber.New plus a
+    // detached Resume means the command is genuinely in flight on return.
+    //
+    // They hand back a Pending rather than the fiber because a finished
+    // fiber's return value is lost - see the comment on Pending.
+    //
+    // These are the only async surface the library needs, because every Modem
+    // method funnels through Send()/SendPrompt(). A whole Modem call goes in
+    // the background the same way, with no library support at all - though it
+    // needs the same slot trick to get its result back out:
+    //
+    //   let box = { r: nil };
+    //   let f = Fiber.New(fn() { box["r"] = m.SendMessage(nr, txt); return 0; });
+    //   Fiber.Resume(f, true);
+    //   if (!Fiber.IsDone(f)) { Fiber.Await(f); }
+    //   let sms = box["r"];
+    //
+    // A modem answers one command at a time, so two outstanding SendAsync
+    // calls on the same port do not overlap - the second waits in _acquire.
+    // Async buys the rest of the program its fiber back; it cannot buy
+    // parallelism the device does not have.
+    fn SendAsync(cmd: string, timeoutMs?) {
+        let self = this;                 // a lambda cannot capture `this`
+        let box  = { result: nil };      // ... but it shares a captured object
+        let f = Fiber.New(fn() { box["result"] = self.Send(cmd, timeoutMs); return 0; });
+        Fiber.Resume(f, true);           // detached: in flight on return
+        return new Pending(f, box, this._fail("port", "command did not complete"));
+    }
+
+    fn SendPromptAsync(cmd: string, payload: string, timeoutMs?) {
+        let self = this;
+        let box  = { result: nil };
+        let f = Fiber.New(fn() { box["result"] = self.SendPrompt(cmd, payload, timeoutMs); return 0; });
+        Fiber.Resume(f, true);
+        return new Pending(f, box, this._fail("port", "command did not complete"));
+    }
+
+    // Service URCs on their own fiber for `ms`, so an idle loop does not have
+    // to choose between reading the port and doing something else. Await()
+    // gives the number of URCs dispatched.
+    fn PollAsync(ms: int) {
+        let self = this;
+        let box  = { result: nil };
+        let f = Fiber.New(fn() { box["result"] = self.Poll(ms); return 0; });
+        Fiber.Resume(f, true);
+        return new Pending(f, box, 0);
     }
 
     fn _exchange(cmd: string, timeoutMs, payload): object {
         let budget = (timeoutMs == nil || timeoutMs <= 0) ? _timeoutFor(cmd) : timeoutMs;
         var deadline = Time.Millis() + budget;
 
+        // Published for _resyncPort: if this command is abandoned, its reply is
+        // owed until `deadline`, and only if it actually reached the wire.
+        this._sentCmd = false;
+        this._resyncUntil = deadline;
+
         if (this._trace != nil) { this._trace("tx", _redact(cmd)); }
         if (!Stream.WriteString(this._s, cmd + "\r")) {
             if (!Stream.IsOpen(this._s)) { this._gone = true; return this._fail("port", "port went away"); }
             return this._fail("port", "write failed");
         }
+        this._sentCmd = true;
 
         if (payload != nil) {
             let pr = this._awaitPrompt(deadline);
@@ -988,9 +1363,17 @@ class AT {
         }
     }
 
+    // Idempotent: closing twice, or closing an instance that never opened, is
+    // a no-op rather than an error. The token is what says whether this
+    // instance holds the port - not _owned or _s - so Attach() (no token) can
+    // never release a turn it does not have, and a second Close() finds its
+    // token already gone instead of popping the next waiter's place.
     fn Close(): int {
         if (this._s != nil && this._owned) { Stream.Close(this._s); }
+        _portRelease(this._port, this._portTok);
+        this._portTok = nil;
         this._s = nil;
+        if (this._err == nil) { this._err = "port is closed"; }
         return 0;
     }
 }
@@ -1106,7 +1489,7 @@ fn _joinConcat(msgs: array): array {
     foreach (key in order) {
         let g = groups[key];
         let parts = [];
-        iter (i from 0 to g.total - 1) {
+        iter (i from 0 to g.total) {
             if (g.slots[i] != nil) { Array.Append(parts, g.slots[i]); }
         }
         Array.Append(out, { index: g.index, sender: g.sender, when: g.when,
@@ -1236,8 +1619,32 @@ class Modem {
     let _onReg2 = nil;
     let _reg = nil;       // most recent registration state seen
 
-    fn Constructor(at) {
-        this._at = at;
+    // Two ways in, told apart by what the first argument is.
+    //
+    //   new Modem("/dev/ttyUSB2")             - takes the port and keeps it
+    //   new Modem("/dev/ttyUSB2", 921600)     - ... at a given rate
+    //   new Modem("/dev/ttyUSB2", 115200, { portWaitMs: 5000 })
+    //   new Modem(at)                         - wraps an AT somebody else made
+    //
+    // Owning the port is the point of the first form: the instance holds the
+    // handle for its whole life, so there is no open/close dance around each
+    // command and no second instance can talk over it (see the port queue
+    // above). Close() gives it up; nothing else has to.
+    //
+    // A constructor cannot return nil and this library never raises, so a port
+    // that could not be taken produces a working object in a closed state -
+    // IsOpen() false, Error() saying why, and every command answering the
+    // ordinary { ok: false, errorKind: "port" } result rather than crashing on
+    // a nil handle. Checking is therefore optional, not mandatory:
+    //
+    //   let m = new Modem("/dev/ttyUSB2");
+    //   if (!m.IsOpen()) { Console.WriteLine(m.Error()); return 1; }
+    fn Constructor(arg, baud?, opts?) {
+        if (type(arg) == Type.String) {
+            this._at = AT.Acquire(arg, (baud == nil) ? 115200 : baud, opts);
+        } else {
+            this._at = (arg == nil) ? AT._unopened("<none>", "no AT transport") : arg;
+        }
         this._ref = 0;
         this._parts = { };
         this._vendor = "";
@@ -1251,10 +1658,12 @@ class Modem {
         this._wireUrcs();
     }
 
+    // The original factories. Open() still answers nil when the port could not
+    // be taken, for callers that check one thing and do not care why.
     fn static Open(port: string, baud: int, opts?) {
-        let at = AT.Open(port, baud, opts);
-        if (at == nil) return nil;
-        return new Modem(at);
+        let m = new Modem(port, baud, opts);
+        if (!m.IsOpen()) { return nil; }
+        return m;
     }
 
     fn static Attach(at) {
@@ -1263,6 +1672,16 @@ class Modem {
     }
 
     fn At() { return this._at; }
+
+    // -- port state --------------------------------------------------------
+
+    fn IsOpen(): bool { return this._at.IsOpen(); }
+
+    // nil while the port is usable; otherwise why it is not - it could not be
+    // taken, it was closed, or the device went away mid-session.
+    fn Error() { return this._at.Error(); }
+
+    fn Port(): string { return this._at.Port(); }
 
     // ---- codec, exposed --------------------------------------------------
 
@@ -1977,7 +2396,7 @@ class Modem {
         }
         // Luhn over the first 14, checked against the 15th.
         var sum = 0;
-        iter (i from 0 to 13) {
+        iter (i from 0 to 14) {
             var d = _toInt(String.Substr(imei, i, 1));
             // Every second digit counting from the right of the 14 - which is
             // every odd index here - is doubled.
@@ -2183,7 +2602,7 @@ class Modem {
                 let lo = _toInt(String.Left(part, dash));
                 let hi = _toInt(String.Substr(part, dash + 1));
                 if (lo != nil && hi != nil && hi >= lo && hi - lo < 128) {
-                    iter (v from lo to hi) { Array.Append(out, { level: v, name: _cfunName(v) }); }
+                    iter (v from lo to hi + 1) { Array.Append(out, { level: v, name: _cfunName(v) }); }
                 }
             } else {
                 let v = _toInt(part);
@@ -2407,7 +2826,7 @@ class Modem {
                     let cid = _toInt(a[0]);
                     // foreach binds each element as a const, so the slot is
                     // reached by index rather than through the loop variable.
-                    iter (k from 0 to len(contexts) - 1) {
+                    iter (k from 0 to len(contexts)) {
                         if (contexts[k].cid == cid) { contexts[k].address = _unquote(a[1]); }
                     }
                 }

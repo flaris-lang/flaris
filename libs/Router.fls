@@ -54,7 +54,8 @@
 //       Dotfiles (.env, .git, ...) and symlinks leaving the root are refused
 //       by default; ".well-known" stays reachable for ACME and security.txt.
 //   .NotFound(handler)          - custom 404 handler
-//   .Listen(port, opts?)        - start blocking HTTP server; opts pass through
+//   .Listen(port, opts?)        - serve; blocks the calling fiber while requests
+//                                 are handled concurrently. opts pass through
 //                                 to HttpServer (tls, streamBodies, timeouts...)
 //   .OnAccess(handler)          - fn(entry) per completed request; pair with
 //                                 HttpStatus.CombinedLogLine(entry)
@@ -71,7 +72,15 @@
 //   Note: global middleware also runs for unmatched routes, so CORS preflight
 //   (OPTIONS) and logging apply even without a registered handler.
 //
-//   handler signature:  fn(req) → response
+//   handler signature:  fn(req) → response, plain or `fn async`. An async
+//                       handler's fiber is awaited before middleware sees its
+//                       response, so `await` inside one lets other requests
+//                       run meanwhile:
+//                         fn async upstream(req) {
+//                             let r = await Https.GetAsync("https://api.example.com/x");
+//                             return Response.Json(r.body);
+//                         }
+//                         app.Get("/upstream", upstream);
 //   req object:  { method, path, rawPath, params, query, headers, cookies,
 //                  form, peer, secure, body }
 //   cookies:     parsed Cookie header (empty when the request sent none)
@@ -93,6 +102,9 @@
 //   fn(req, next) → response
 //   Call next(req) to continue the chain; return early to short-circuit.
 //   Can modify req before and/or response after calling next(req).
+//   next(req) always returns the finished response - never a fiber, even when
+//   the handler behind it is async - so do not `await` it. A middleware may
+//   itself be `fn async`.
 //
 // Response (static builders):
 //   Response.Json(data, status?)      - Content-Type: application/json
@@ -136,6 +148,10 @@
 // =============================================================================
 
 import { HttpServer } from library("HttpServer", "1.0");
+
+// A stage declared `fn async` returns its fiber; wait for it so every caller -
+// the next middleware out, or the server - gets a finished response.
+fn _settled(v) { return Type.IsFiber(v) ? Fiber.Await(v) : v; }
 import { Jwt } from library("Jwt", "1.0");
 import { Logger } from library("Logger", "1.0");
 
@@ -232,13 +248,13 @@ class _Pipeline
 
     fn Run(req) {
         if (_index >= len(_chain)) {
-            return _terminal(req);
+            return _settled(_terminal(req));
         }
         let entry = _chain[_index];
         _index++;
-        return entry.handler(req, fn(r) {
+        return _settled(entry.handler(req, fn(r) {
             return this.Run(r);
-        });
+        }));
     }
 }
 
@@ -677,14 +693,14 @@ class Router
             // set, so the handler's own choice survives.
             let hdrs = r.headers ?? {};
             let keys = Object.Keys(hdrs);
-            iter (i from 0 to len(keys) - 1) {
+            iter (i from 0 to len(keys)) {
                 res.Header(keys[i], hdrs[keys[i]]);
             }
             // Cookies are applied before the body is written, and go out as
             // one Set-Cookie line each rather than overwriting one another.
             let cookies = Object.TryGet(r, "cookies", nil);
             if (cookies != nil) {
-                iter (ci from 0 to len(cookies) - 1) {
+                iter (ci from 0 to len(cookies)) {
                     let ck = cookies[ci];
                     if (Object.TryGet(ck, "clear", false)) {
                         res.ClearCookie(ck.name, ck.opts);
@@ -1203,7 +1219,7 @@ class JwtMiddleware
     }
 
     fn Handle(req, next) {
-        iter (si from 0 to len(_skipPaths) - 1) {
+        iter (si from 0 to len(_skipPaths)) {
             if (req.path == _skipPaths[si]) { return next(req); }
         }
 
@@ -1219,18 +1235,19 @@ class JwtMiddleware
 
         let token = String.Substr(auth, len(prefix), len(auth) - len(prefix));
 
-        // Signature *and* claims. VerifyHS256 on its own checks only the
-        // signature, so a token that expired months ago still verifies - which
-        // makes every issued token a credential that never expires, including
-        // any that have leaked.
-        if (!Jwt.VerifyHS256WithClaims(token, _secret, _claimOpts)) {
+        // Decode ONCE. Decoding is the expensive half of a verify (base64 plus
+        // two JSON parses), and this used to pay it twice: once inside
+        // VerifyHS256WithClaims and again to read the payload for req.jwt.
+        let decoded = _jwt.Decode(token);
+
+        // Signature *and* claims. Checking the signature alone would let a
+        // token that expired months ago still verify - which makes every issued
+        // token a credential that never expires, including any that have leaked.
+        if (!Jwt.VerifyDecodedHS256(decoded, _secret, _claimOpts)) {
             return Response.Error(401, "Invalid or expired token");
         }
 
-        let decoded = _jwt.Decode(token);
-        if (decoded != nil) {
-            req.jwt = decoded.payload;
-        }
+        req.jwt = decoded.payload;
         return next(req);
     }
 }

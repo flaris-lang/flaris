@@ -634,10 +634,46 @@ fn test_virtual_hosts() {
 }
 
 // ---------------------------------------------------------------------------
+// Async stages: a handler or middleware declared `fn async` is awaited inside
+// the pipeline, so plain middleware and the server always see a finished response.
+fn async asyncBody(v) { Fiber.Sleep(1); return v; }
+fn async asyncRoute(_r) { let v = await asyncBody("A"); return Response.Text(v, nil); }
+fn async asyncMw(r, next) {
+    await asyncBody(0);
+    let resp = next(r);                 // already settled - never a fiber
+    resp.headers["X-Async-Mw"] = "1";
+    return resp;
+}
+
+fn test_async_stages() {
+    Console.WriteLine("== async stages ==");
+    let app  = new Router();
+    let seenA = { status: 0, fiber: false };
+    app.Use(fn(r, next) {
+        let resp = next(r);
+        seenA.fiber  = Type.IsFiber(resp);
+        seenA.status = resp.status;
+        return resp;
+    });
+    app.Get("/a", asyncRoute);
+    let g = app.Group("/g");
+    g.Use(asyncMw);
+    g.Get("/x", fn(_r) { return Response.Text("GX", nil); });
+
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/a"))), "A", "async handler's response is settled before it is returned");
+    check(!seenA.fiber, "plain middleware never sees a fiber from next()");
+    checkEq(seenA.status, 200, "plain middleware sees the async handler's real status");
+    let rx = app._dispatch(mkReq("GET", "/g/x"));
+    checkEq(bodyOf(rx), "GX", "async middleware runs the rest of the chain");
+    checkEq(rx.headers["X-Async-Mw"], "1", "async middleware can amend the response");
+    return 0;
+}
+
 fn Main() {
     Console.WriteLine("=== Router dispatch tests ===");
     test_matching();
     test_middleware();
+    test_async_stages();
     test_headers_and_request();
     test_jwt_auth();
     test_rate_limit();
@@ -660,10 +696,10 @@ fn Main() {
     // -----------------------------------------------------------------------
     Console.WriteLine("\n=== Router dispatch benchmarks ===");
     let app = new Router();
-    iter (i from 0 to 49) {
+    iter (i from 0 to 50) {
         app.Get("/bench/" + str(i), fn(_r) { return Response.Text("b", nil); });
     }
-    iter (i from 0 to 49) {
+    iter (i from 0 to 50) {
         app.Get("/dyn/" + str(i) + "/:id", fn(_r) { return Response.Text("d", nil); });
     }
     app.Use(fn(r, next) { return next(r); });
@@ -671,17 +707,17 @@ fn Main() {
 
     let n = 20000;
     let t0 = Time.Ticks();
-    iter (i from 0 to n - 1) { _sink = _sink + String.Length(app._dispatch(mkReq("GET", "/bench/49")).body); }
+    iter (i from 0 to n) { _sink = _sink + String.Length(app._dispatch(mkReq("GET", "/bench/49")).body); }
     Console.WriteLine("fixed route, last of 50   ",
         String.FormatArray("{0:.3f}", [Time.TicksToUs(Time.Ticks() - t0) / float(n)]), " us/dispatch");
 
     let t1 = Time.Ticks();
-    iter (i from 0 to n - 1) { _sink = _sink + String.Length(app._dispatch(mkReq("GET", "/dyn/49/7")).body); }
+    iter (i from 0 to n) { _sink = _sink + String.Length(app._dispatch(mkReq("GET", "/dyn/49/7")).body); }
     Console.WriteLine("param route, last of 50   ",
         String.FormatArray("{0:.3f}", [Time.TicksToUs(Time.Ticks() - t1) / float(n)]), " us/dispatch");
 
     let t2 = Time.Ticks();
-    iter (i from 0 to n - 1) { _sink = _sink + app._dispatch(mkReq("GET", "/missing")).status; }
+    iter (i from 0 to n) { _sink = _sink + app._dispatch(mkReq("GET", "/missing")).status; }
     Console.WriteLine("unmatched (404)           ",
         String.FormatArray("{0:.3f}", [Time.TicksToUs(Time.Ticks() - t2) / float(n)]), " us/dispatch");
     Console.WriteLine("_sink=", _sink);

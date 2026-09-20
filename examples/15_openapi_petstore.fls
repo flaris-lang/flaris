@@ -1,0 +1,140 @@
+// 15_openapi_petstore.fls
+// A small JSON API with a generated OpenAPI document and interactive docs.
+//
+//   flarisvm ./examples/15_openapi_petstore.fls --libs='./libs'
+//
+// then open http://localhost:8090/docs in a browser. The page lists every
+// operation, lets you fill in parameters and bodies, and sends real requests
+// to this server. The raw document is at http://localhost:8090/openapi.json.
+//
+// Every route below is registered through the OpenApi facade, so the
+// documentation and the handlers cannot drift apart. The "/health" route is
+// registered on the Router directly and picked up by Discover().
+
+import { Router, Response, LoggerMiddleware } from library("Router", "1.0");
+import { OpenApi }                            from library("OpenApi", "1.0");
+
+class Pet {
+    let id:int      = 0;
+    let name:string = "";
+    let tag         = nil;
+    let price:float = 0.0;
+}
+
+// In-memory store keyed by id.
+global gPets   = {};
+global gNextId = 1;
+
+fn addPet(name:string, tag, price:float) {
+    let p = new Pet();
+    p.id    = gNextId;
+    p.name  = name;
+    p.tag   = tag;
+    p.price = price;
+    gPets[str(p.id)] = p;
+    gNextId += 1;
+    return p;
+}
+
+fn notFound(id) {
+    return Response.Json({ code: 404, message: "No pet with id " + str(id) }, 404);
+}
+
+fn Main() {
+    addPet("Rex",   "dog", 120.0);
+    addPet("Tom",   "cat", 80.5);
+    addPet("Nemo",  nil,   12.25);
+
+    let app = new Router();
+    app.Use(fn(req, next) { return (new LoggerMiddleware()).Handle(req, next); });
+
+    let api = OpenApi.For(app, {
+        title:       "Pet Store",
+        version:     "1.0.0",
+        description: "A demo API written in Flaris. Use **Send request** on any operation to call it."
+    });
+    api.Server("http://localhost:8090", "Local development");
+    api.Tag("pets", "Everything about pets");
+
+    // Schemas: one inferred from the class, two written as shorthand.
+    api.SchemaOf("Pet", new Pet(), {
+        descriptions: { id: "Assigned by the server", tag: "Free-form grouping label" },
+        example: true
+    });
+    api.Schema("NewPet", { name: "string", "tag?": "string", price: "float" });
+    api.Schema("Error",  { code: "int", message: "string" });
+
+    api.SecurityScheme("apiKey", OpenApi.ApiKey("X-Api-Key"));
+
+    let pets = api.Group("/pets", "pets");
+
+    pets.Get("/", {
+        summary: "List pets",
+        query:   { tag: { type: "string?", description: "Only pets with this tag" },
+                   limit: { type: "int?", description: "Maximum number of pets to return" } },
+        responses: { "200": "[Pet]" }
+    }, fn(req) {
+        let out = [];
+        let tag   = req.query.tag ?? nil;
+        let limit = (req.query.limit != nil) ? int(req.query.limit) : 1000;
+        foreach (p in Object.Values(gPets)) {
+            if (tag != nil && p.tag != tag) { continue; }
+            if (len(out) >= limit) { break; }
+            Array.Append(out, p);
+        }
+        Array.SortBy(out, fn(p) => p.id);
+        return Response.Json(out);
+    });
+
+    pets.Post("/", {
+        summary:     "Add a pet",
+        description: "Creates a pet and returns it with its new id. Requires an API key - any value works in this demo.",
+        body:        "NewPet",
+        security:    ["apiKey"],
+        responses:   { "201": "Pet", "400": "Error", "401": "Error" }
+    }, fn(req) {
+        if (req.headers["X-Api-Key"] == nil) {
+            return Response.Json({ code: 401, message: "X-Api-Key header required" }, 401);
+        }
+        let body = Json.Parse(req.body);
+        if (body == nil || !Type.IsString(body.name) || body.name == "") {
+            return Response.Json({ code: 400, message: "name is required" }, 400);
+        }
+        let price = (body.price == nil) ? 0.0 : float(body.price);
+        return Response.Json(addPet(body.name, body.tag ?? nil, price), 201);
+    });
+
+    pets.Get("/:id", {
+        summary:   "Fetch one pet",
+        params:    { id: { type: "int", description: "Pet id", example: 1 } },
+        responses: { "200": "Pet", "404": "Error" }
+    }, fn(req) {
+        let p = Object.TryGet(gPets, req.params.id, nil);
+        return (p == nil) ? notFound(req.params.id) : Response.Json(p);
+    });
+
+    pets.Delete("/:id", {
+        summary:   "Remove a pet",
+        params:    { id: "int" },
+        security:  ["apiKey"],
+        responses: { "204": nil, "401": "Error", "404": "Error" }
+    }, fn(req) {
+        if (req.headers["X-Api-Key"] == nil) {
+            return Response.Json({ code: 401, message: "X-Api-Key header required" }, 401);
+        }
+        if (!Object.HasKey(gPets, req.params.id)) { return notFound(req.params.id); }
+        Object.Delete(gPets, req.params.id);
+        return Response.NoContent();
+    });
+
+    // Registered on the Router only; Discover() documents it from the route table.
+    app.Get("/health", fn(_r) { return Response.Json({ ok: true, pets: Object.Count(gPets) }); });
+    api.Discover();
+
+    api.Serve();          // GET /openapi.json and GET /docs
+    app.Get("/", fn(_r) { return Response.Redirect("/docs", 302); });
+
+    Console.WriteLine("Docs:     http://localhost:8090/docs");
+    Console.WriteLine("Document: http://localhost:8090/openapi.json");
+    app.Listen(8090);
+}

@@ -274,7 +274,7 @@ flarisvm --exec app.flx
 
 ## 3. Lexical Structure
 
-Flaris source files are UTF-8 encoded. Identifiers use ASCII letters, digits, and underscores: `[A-Za-z_][A-Za-z0-9_]*`.
+Flaris source files are UTF-8 encoded and must not contain NUL bytes. Identifiers use ASCII letters, digits, and underscores: `[A-Za-z_][A-Za-z0-9_]*`.
 
 ### Keywords
 
@@ -1356,6 +1356,9 @@ Functions are first-class values created with `fn`. The modifiers `static`, `asy
 
 `<static> <async> <inline> fn name(<args:?type) ?:type` or `fn <static> <async> <inline> name(...)`
 
+The same modifiers work on an anonymous function, where the name is simply
+absent: `fn async (x) { ... }` or `async fn (x) { ... }`.
+
 **Argument limit** - functions accept up to 16. For larger configurations, pass an object:
 
 ```js
@@ -1506,6 +1509,25 @@ Array.Select([1, 2, 3], fn(x) { return x * 2; });
 ```
 
 Note: type annotations **are supported** on anonymous functions as well.
+
+An anonymous function can be `async`, with the modifier on either side of `fn`.
+It behaves exactly like a named async function: calling it returns a fiber, and
+`await` works inside its body. This matters for callback-shaped code - a route
+handler, an event callback - where the function is written inline at the point
+it is passed:
+
+```js
+app.Get("/report", fn async (req) {
+    let r = await Https.GetAsync("https://api.example.com/report");
+    return Response.Json(r.body);
+});
+
+let load = async fn (path) { return await File.ReadTextAsync(path); };
+let text = await load("/etc/hosts");
+```
+
+`static` is not allowed on an anonymous function - it describes a class member,
+and there is nothing for it to attach to here.
 
 ## Arrow Functions
 
@@ -2154,6 +2176,21 @@ Fiber.Sleep(500);   // sleep 500ms, non-blocking for other fibers
 ```
 
 Other fibers continue to run while one is sleeping.
+
+### Waiting from a plain function
+
+`await` is only allowed inside an `async` function. `Fiber.Await` does the same thing as a call, so code that is not async - a request handler chain, a callback - can still wait for a fiber without blocking the VM:
+
+```js
+fn async fetch(url) { return await Https.GetAsync(url); }
+
+fn handler(req) {                                // not async
+    let r = Fiber.Await(fetch(req.query.url));   // parks this fiber only
+    return r.body;
+}
+```
+
+It also accepts the `nil` an `*Async` built-in returns, so `Fiber.Await(File.ReadTextAsync(path))` reads a file from a plain function. An exception that escapes the awaited fiber is raised at the `Fiber.Await` call.
 
 ### Error Handling
 

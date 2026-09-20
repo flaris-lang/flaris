@@ -1,0 +1,212 @@
+// test_modem.fls
+// Tests for Modem.fls against tests/fake_modem.py on a pseudo-terminal.
+//
+// Started by tests/test_modem.sh, which brings the fake modem up and passes
+// its tty path as the first argument. The focus is the parts that only go
+// wrong against a device: port ownership between two instances, the state a
+// failed open leaves behind, line framing, URCs, and the async entry points.
+//
+//   bash tests/test_modem.sh
+
+import { AT, Modem } from library("libs/Modem", "1.0");
+
+global passed = 0;
+global failed = 0;
+global urcSeen = 0;
+
+fn assert(name: string, cond: bool) {
+    if (cond) {
+        Console.WriteLine("[PASS] " + name);
+        passed += 1;
+    } else {
+        Console.WriteLine("[FAIL] " + name);
+        failed += 1;
+    }
+}
+
+fn section(name: string) {
+    Console.WriteLine("");
+    Console.WriteLine("--- " + name + " ---");
+}
+
+fn Main() {
+    let argv = Os.Args();
+    if (len(argv) < 1) {
+        Console.WriteLine("usage: test_modem.fls <tty>   (run tests/test_modem.sh instead)");
+        return 2;
+    }
+    let port = argv[0];
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Modem test suite - " + port);
+    Console.WriteLine("================================================");
+
+    // ---- ownership: one instance holds the port ------------------------
+    section("Port ownership");
+
+    let m = new Modem(port);
+    assert("new Modem(port) opens", m.IsOpen());
+    assert("Error() is nil while open", m.Error() == nil);
+    assert("Port() reports the path", m.Port() == port);
+    assert("the instance owns the port", m.At().OwnsPort());
+
+    // A second instance on the same path must not get in: two AT exchanges
+    // on one UART corrupt each other's reads.
+    let m2 = new Modem(port);
+    assert("second instance is refused", !m2.IsOpen());
+    assert("  and says why", m2.Error() != nil && String.Contains(m2.Error(), "busy"));
+    assert("  and owns nothing", !m2.At().OwnsPort());
+
+    // The refused instance is still a usable object - no nil handle to crash on.
+    let dead = m2.SignalInfo();
+    assert("a refused instance answers ok:false", !dead["ok"]);
+    assert("  with errorKind \"port\"", dead["errorKind"] == "port");
+    m2.Close();                                  // must not release m's turn
+    assert("closing a refused instance leaves the holder alone", m.IsOpen());
+
+    // ---- talking to the device ------------------------------------------
+    section("AT exchange");
+
+    let info = m.Info();
+    assert("Info() reads the manufacturer", info["ok"] && info["manufacturer"] == "Quectel");
+    assert("  and the model", info["model"] == "EG25-G");
+
+    // +CSQ arrives split across two writes - the case Stream.ReadLine loses.
+    let sig = m.SignalInfo();
+    assert("SignalInfo() reassembles a split line", sig["ok"] && sig["rssi"] == 23);
+
+    let at = m.At();
+    assert("an unknown command is a modem error", !at.Send("AT+NOPE", 2000)["ok"]);
+    let cme = at.Send("AT+CMEFAIL", 2000);
+    assert("+CME ERROR is reported as a modem error", !cme["ok"] && cme["errorKind"] == "modem");
+    assert("  and carries the text", cme["cme"] != nil);
+    let slow = at.Send("AT+AWKWARD", 300);
+    assert("a silent modem times out", !slow["ok"] && slow["errorKind"] == "timeout");
+
+    // ---- async entry points ----------------------------------------------
+    section("Async");
+
+    // SendAsync hands back a command that is already running, so the caller
+    // keeps its own fiber while it is in flight.
+    let p = at.SendAsync("AT+CGMR", 2000);
+    assert("SendAsync returns before the command finishes", !p.IsDone());
+    var spins = 0;
+    while (!p.IsDone() && spins < 500) { Fiber.Sleep(2); spins += 1; }
+    assert("  and it runs while the caller does something else", spins > 0);
+    let pr = p.Await();
+    assert("  Await() gives the result object even once finished", pr["ok"]);
+    assert("  with the reply lines", len(pr["lines"]) > 0 && String.Contains(pr["lines"][0], "EG25"));
+
+    // Await() on a command still in flight parks instead of polling.
+    let p2 = at.SendAsync("AT+CGMM", 2000);
+    let pr2 = p2.Await();
+    assert("Await() on a running command parks and returns", pr2["ok"] && pr2["lines"][0] == "EG25-G");
+    assert("Await() twice gives the same result", p2.Await()["lines"][0] == "EG25-G");
+
+    // A cancelled command answers a result object, not a nil to index into.
+    let p3 = at.SendAsync("AT+AWKWARD", 5000);
+    Fiber.Cancel(p3.Handle());
+    var cs = 0;
+    while (!p3.IsDone() && cs < 500) { Fiber.Sleep(2); cs += 1; }
+    let pr3 = p3.Await();
+    assert("a cancelled command still answers a result", pr3 != nil && !pr3["ok"]);
+    assert("  with errorKind \"port\"", pr3["errorKind"] == "port");
+    // The cancelled fiber was unwound while holding the command queue. Without
+    // the finally in Send() its id stays at the head and this never returns.
+    assert("  and the instance still takes commands", at.Send("AT+CGMM", 1500)["ok"]);
+
+    // A command abandoned mid-reply leaves its answer in the stream. Unless
+    // the next command resynchronises, every command after it is off by one -
+    // reporting ok, with the previous command's data.
+    let p4 = at.SendAsync("AT+SLOW", 5000);
+    Fiber.Sleep(30);                             // it answers at 400ms
+    assert("the slow command is still in flight", !p4.IsDone());
+    Fiber.Cancel(p4.Handle());
+    var ds = 0;
+    while (!p4.IsDone() && ds < 500) { Fiber.Sleep(2); ds += 1; }
+    let after1 = at.Send("AT+CGMI", 3000);
+    let after2 = at.Send("AT+CGMM", 3000);
+    assert("after a cancel, the next command gets its own reply",
+           after1["ok"] && after1["lines"][0] == "Quectel");
+    assert("  and so does the one after that",
+           after2["ok"] && after2["lines"][0] == "EG25-G");
+
+    // PollAsync answers the URC count.
+    let pp = at.PollAsync(50);
+    assert("PollAsync answers a count", type(pp.Await()) == Type.Int);
+
+    // A whole Modem call backgrounded the same way, with no library support.
+    let box = { r: nil };
+    let g = Fiber.New(fn() { box["r"] = m.SignalInfo(); return 0; });
+    Fiber.Resume(g, true);
+    if (!Fiber.IsDone(g)) { Fiber.Await(g); }
+    assert("a Modem call runs on a fiber of its own", box["r"]["ok"] && box["r"]["rssi"] == 23);
+
+    // ---- URCs --------------------------------------------------------------
+    section("URCs");
+
+    // A prefix Modem does not already claim: URC dispatch is first-match-wins,
+    // so a handler for +CMTI would sit behind the library's own and never fire.
+    m.At().OnUrc("+QIND", fn(_line, _args) { urcSeen += 1; });
+    let mid = at.Send("AT+URCMID", 2000);
+    assert("a URC racing a reply does not break the reply", mid["ok"]);
+    m.Poll(200);
+    assert("  and is dispatched afterwards", urcSeen == 1);
+
+    // ---- releasing the port ------------------------------------------------
+    section("Close and re-open");
+
+    m.Close();
+    assert("Close() reports the port closed", !m.IsOpen());
+    assert("  with a reason", m.Error() != nil);
+    m.Close();                                   // idempotent, and must not
+    m.Close();                                   // steal the next waiter's turn
+
+    let m3 = new Modem(port);
+    assert("the port can be taken again after Close()", m3.IsOpen());
+    assert("  and works", m3.Info()["ok"]);
+
+    // A caller that would rather wait its turn than fail fast. With a live
+    // holder and a short budget it still gives up.
+    let busy = new Modem(port, 115200, { portWaitMs: 50 });
+    assert("portWaitMs gives up on a holder that stays", !busy.IsOpen());
+
+    // ... but a waiter with a budget gets in the moment the holder closes.
+    // This is what the FIFO is for, so it is worth testing on a real port and
+    // not just on the queue.
+    let slot = { m: nil, tried: false };
+    let w = Fiber.New(fn() {
+        slot["m"] = new Modem(port, 115200, { portWaitMs: 5000 });
+        slot["tried"] = true;
+        return 0;
+    });
+    Fiber.Resume(w, true);
+    Fiber.Sleep(60);                             // let it queue up behind m3
+    assert("a waiter stays out while the port is held", !slot["tried"]);
+    assert("  and the holder is unaffected", m3.Info()["ok"]);
+
+    m3.Close();                                  // hand the port over
+    if (!Fiber.IsDone(w)) { Fiber.Await(w); }
+    assert("the waiter gets in once the holder closes", slot["m"].IsOpen());
+    assert("  and can drive the modem", slot["m"].SignalInfo()["rssi"] == 23);
+    slot["m"].Close();
+
+    // ---- back-compat --------------------------------------------------------
+    section("Back-compat factories");
+
+    let a1 = AT.Open(port, 115200);
+    assert("AT.Open() still returns an instance", a1 != nil && a1.IsOpen());
+    let a2 = AT.Open(port, 115200);
+    assert("AT.Open() still returns nil when busy", a2 == nil);
+    a1.Close();
+
+    let mo = Modem.Open(port, 115200);
+    assert("Modem.Open() still works", mo != nil && mo.IsOpen());
+    mo.Close();
+
+    Console.WriteLine("");
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Results: " + passed + " passed, " + failed + " failed");
+    Console.WriteLine("================================================");
+    if (failed == 0) { return 0; }
+    return 1;
+}

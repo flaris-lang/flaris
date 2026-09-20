@@ -7,6 +7,10 @@ import { Router, Response, JwtMiddleware, JwtSign, LoggerMiddleware, CorsMiddlew
 global secret = "test-secret-key";
 global app    = nil;
 
+// An async route: the router awaits its fiber before middleware sees the response.
+fn async asyncWork(v) { Fiber.Sleep(1); return v; }
+fn async asyncHello(_req) { let v = await asyncWork("async-hello"); return Response.Text(v, nil); }
+
 // ============================================================
 // Benchmarks - network-free: route registration + direct
 // dispatch of a mock request object (no sockets, no server).
@@ -20,9 +24,9 @@ fn benchRouter() {
 
     // Route-table construction: register 50 routes on a fresh router.
     let t0 = Time.Ticks();
-    iter (n from 0 to regIters - 1) {
+    iter (n from 0 to regIters) {
         let r = new Router();
-        iter (i from 0 to nRoutes - 1) {
+        iter (i from 0 to nRoutes) {
             r.Get("/bench/" + str(i) + "/:id", fn(_req) {
                 return Response.Json({ok: true}, nil);
             });
@@ -33,14 +37,14 @@ fn benchRouter() {
 
     // Matching + dispatch: mock request against the worst-case (last) route.
     let r2 = new Router();
-    iter (i from 0 to nRoutes - 1) {
+    iter (i from 0 to nRoutes) {
         r2.Get("/bench/" + str(i) + "/:id", fn(_req) {
             return Response.Json({ok: true}, nil);
         });
     }
     let iters = 1000;
     let t1 = Time.Ticks();
-    iter (i from 0 to iters - 1) {
+    iter (i from 0 to iters) {
         let req = { method: "GET", path: "/bench/49/123",
                     params: nil, query: {}, headers: {}, body: "" };
         let _resp = r2._dispatch(req);
@@ -55,7 +59,7 @@ fn Main() {
     app = new Router();
     global logMw  = new LoggerMiddleware();
     global corsMw = new CorsMiddleware("*");
-    global jwtMw  = new JwtMiddleware(secret, ["/auth/login", "/health"]);
+    global jwtMw  = new JwtMiddleware(secret, ["/auth/login", "/health", "/async"]);
 
     app.Use(fn(req, next) { return logMw.Handle(req, next); });
     app.Use(fn(req, next) { return corsMw.Handle(req, next); });
@@ -85,6 +89,8 @@ fn Main() {
         let token = JwtSign({sub: body.username, role: "user"}, secret, 3600);
         return Response.Json({token: token}, nil);
     });
+
+    app.Get("/async", asyncHello);
 
     // --- Protected routes via route group ---
 

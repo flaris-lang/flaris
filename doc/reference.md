@@ -131,7 +131,7 @@ convention) forces plain output.
 | 1 | Tokenizer error |
 | 2 | Compile error (bad source on the CLI or in a compiled unit) |
 | 3 | Assert failure (`Assert`/`AssertEq` or an internal invariant) |
-| 4 | File error (missing or unreadable source/bytecode) |
+| 4 | File error: missing or unreadable source or bytecode, or a `.flx` refused by validation, signature or trust checks |
 | 5 | Debugger quit (`q`) |
 | 6 | Reserved (analyzer failures currently surface as code 2) |
 | 7 | Fingerprint/pin mismatch on a signed or pinned import |
@@ -481,7 +481,7 @@ cat app.fls | flarisvm --compile - /tmp/app.flx && flarisvm --exec - < /tmp/app.
 How source text is broken into tokens (the numeric/float literal forms are
 detailed under [Type Limits](#type-limits)).
 
-**Encoding.** Source is UTF-8. A leading UTF-8 BOM (`EF BB BF`) is skipped.
+**Encoding.** Source is UTF-8. A leading UTF-8 BOM (`EF BB BF`) is skipped. A NUL byte anywhere in the file is an error: everything after it would otherwise be compiled away while a reader of the file still sees it.
 Bidirectional control characters (`U+202A`–`U+202E`, `U+2066`–`U+2069`) are
 rejected anywhere in the source, comments and strings included, because they
 can make the rendered text differ from the compiled text ("Trojan Source").
@@ -2073,13 +2073,13 @@ Low-level binary memory operations. A buffer is `count` elements × `size` bytes
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **ChangeToString** | `ChangeToString(buf:block) - bool` | Reinterprets buffer in-place as `string`. Destructive - original block handle is invalid after call. | — |
+| **ChangeToString** | `ChangeToString(buf:block) - bool` | Reinterprets the buffer in place as a `string` whose length ends at the first NUL byte (the whole extent when there is none; the block is then grown by one byte for the terminator, so an address from `GetAddress` is stale afterwards). Destructive - the block handle is a string after the call. | — |
 | **Copy** | `Copy(src:block, srcOff:int, dst:block, dstOff:int, len:int) - bool` | Copies `len` bytes from `src` to `dst`. Offsets in bytes. Bounds-checked. | ✓ |
-| **CopyBytesToArray** | `CopyBytesToArray(buf:block, arr:array, offset:int) - bool` | Writes `len(buf)` raw bytes from `buf` into `arr` starting at `offset`. Existing elements are updated in-place; elements past the current array length are appended. Optional `offset` defaults to 0. | — |
+| **CopyBytesToArray** | `CopyBytesToArray(buf:block, arr:array, offset?:int) - bool` | Writes `len(buf)` raw bytes from `buf` into `arr` starting at `offset`. Existing elements are updated in-place; elements past the current array length are appended. Optional `offset` defaults to 0. | — |
 | **CopyStringAt** | `CopyStringAt(buf:block, offset:int, s:string, n:int) - bool` | Copies `n` bytes of `s` into `buf` at byte `offset`. `n` defaults to `len(s)`. Bounds-checked against the full byte extent (`count × size`); returns `false` if `offset + n` exceeds it, or on a non-block/non-string. | ✓ |
 | **WriteVarintAt** | `WriteVarintAt(buf:block, offset:int, value:int) - int` | Writes `value` as an unsigned LEB128 varint (protobuf-style: 7 bits/byte, high bit = continuation, max 10 bytes). Returns the byte count written, or 0 if it would not fit. Zigzag-encode signed values first: `(n << 1) ^ (n >> 63)`. | ✓ |
 | **ReadVarintAt** | `ReadVarintAt(buf:block, offset:int) - array` | Reads an unsigned LEB128 varint at `offset`. Returns `[value, bytesRead]`; `bytesRead` is 0 on out-of-range or malformed/truncated input (never reads past the block). | — |
-| **Create** | `Create(count:int, size:int) - block` | Allocates new buffer: `count` elements, `size` bytes each (`size` in 1–255). `nil` if `count <= 0` or `size` is outside 1–255. | ✓ owned¹ |
+| **Create** | `Create(count:int, size:int) - block` | Allocates new buffer: `count` elements, `size` bytes each (`size` in 1–255). `nil` if `count <= 0`, `count` is above 2^32-1, or `size` is outside 1–255; raises when the allocation exceeds the 2 GiB cap or fails. | ✓ owned¹ |
 | **Fill** | `Fill(buf:block, value:int) - bool` | Fills entire buffer with byte `value` (0–255). Mutates. | ✓ |
 | **ProcessCallback** | `ProcessCallback(fn:function, buf:block, len:int, blocksize:int, cb:function) - nil` | Processes `buf` with your worker function `fn(buf, len, blocksize)`, then calls `cb(buf, result)` when finished. Returns immediately. Runs on another CPU core when `fn` is simple enough (see the note below), otherwise runs normally — same result either way. | ✓ |
 | **ProcessEvent** | `ProcessEvent(fn:function, buf:block, len:int, blocksize:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Start several and wait for them all with `Event.WaitFor([ids])`. See the note below. | ✓ |
@@ -2088,6 +2088,7 @@ Low-level binary memory operations. A buffer is `count` elements × `size` bytes
 | **GetAddress** | `GetAddress(buf:block) - int` | Returns raw memory address as integer (for FFI/Memory API use). **Requires `--unsafe`** (unsafe mode); returns raw pointers, so it is gated like the `Memory.*` API. | ✓ |
 | **FillRange** | `FillRange(buf:block, offset:int, length:int, value:int) - bool` | Sets `length` bytes starting at byte `offset` to byte `value` (0–255). Bounds-checked against the full backing span (`count × size`). `false` on a bad value or out-of-range span. | ✓ |
 | **IndexOf** | `IndexOf(buf:block, needle:int\|string, start?:int) - int` | Byte offset of the first match at or after `start` (default 0), or `-1`. `needle` is a byte (int 0–255) or a byte substring (string; empty string matches at `start`). | ✓ |
+| **LastIndexOf** | `LastIndexOf(buf:block, needle:int\|string, start?:int) - int` | Byte offset of the last match that begins at or before `start` (default: the end), or `-1`. Same `needle` forms as `IndexOf`; an empty string matches at `min(start, extent)`. | ✓ |
 | **Compare** | `Compare(a:block, b:block) - int` | `memcmp`-style ordering (`-1`/`0`/`1`) over the two backing byte spans; the shorter buffer sorts first when one is a prefix of the other. `nil` if either argument is not a block. | ✓ |
 | **Equals** | `Equals(a:block, b:block) - bool` | `true` if both backing spans are the same byte length and byte-for-byte equal. | ✓ |
 | **ReadI8At** | `ReadI8At(buf:block, offset:int) - int` | Reads a sign-extended signed byte at `offset`. `0` if out of bounds. | ✓ |
@@ -2098,22 +2099,25 @@ Low-level binary memory operations. A buffer is `count` elements × `size` bytes
 | **WriteFloat32At** | `WriteFloat32At(buf:block, offset:int, value:float, bigEndian?:bool) - bool` | Stores an IEEE 32-bit float at byte `offset`. Optional `bigEndian` defaults to `false`. `false` if out of bounds. | ✓ |
 | **WriteFloat64At** | `WriteFloat64At(buf:block, offset:int, value:float, bigEndian?:bool) - bool` | Stores an IEEE 64-bit double at byte `offset`. Optional `bigEndian` defaults to `false`. `false` if out of bounds. | ✓ |
 | **ReadU8At** | `ReadU8At(buf:block, offset:int) - int` | Reads one byte at `offset`. Returns 0 if out of bounds. | ✓ |
-| **ReadU16At** | `ReadU16At(buf:block, offset:int, bigEndian:bool) - int` | Reads 2-byte unsigned integer at `offset`. Optional `bigEndian` defaults to `false` (little-endian). Returns 0 if out of bounds. | ✓ |
-| **ReadU32At** | `ReadU32At(buf:block, offset:int, bigEndian:bool) - int` | Reads 4-byte unsigned integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
-| **ReadU64At** | `ReadU64At(buf:block, offset:int, bigEndian:bool) - int` | Reads 8-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
-| **Reserve** | `Reserve(buf:block, capacity:int) - bool` | Ensures `buf` holds at least `capacity` **elements** (`capacity × size` bytes). Grows the buffer in-place via `realloc` if needed; the block object is mutated and `len(buf)` reflects the new element count. No-op if already large enough; `false` on a non-block or zero capacity. | — |
+| **ReadU16At** | `ReadU16At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 2-byte unsigned integer at `offset`. Optional `bigEndian` defaults to `false` (little-endian). Returns 0 if out of bounds. | ✓ |
+| **ReadU32At** | `ReadU32At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 4-byte unsigned integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
+| **ReadU64At** | `ReadU64At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 8-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
+| **Reserve** | `Reserve(buf:block, capacity:int) - bool` | Ensures `buf` holds at least `capacity` **elements** (`capacity × size` bytes). Grows the buffer in-place via `realloc` if needed; the block object is mutated and `len(buf)` reflects the new element count. No-op if already large enough; `false` on a non-block, a capacity outside 1..2^32-1, or a failed grow (the block is left untouched). | — |
 | **Slice** | `Slice(buf:block, offset:int, count:int) - block` | Returns new buffer: `count` elements starting at element index `offset`. | ✓ owned¹ |
-| **StringToArray** | `StringToArray(s:string, arr:array, offset:int) - int` | Writes the raw UTF-8 bytes of `s` directly into `arr` at `offset` without allocating an intermediate block. Returns the number of bytes written (`len(s)`). Optional `offset` defaults to 0. | — |
-| **ToArray** | `ToArray(buf:block, offset:int, count:int) - object` | Returns object with array of integers from buffer elements. Element size must be 1, 2, 4, or 8. | — |
+| **StringToArray** | `StringToArray(s:string, arr:array, offset?:int) - int` | Writes the raw UTF-8 bytes of `s` directly into `arr` at `offset` without allocating an intermediate block. Returns the number of bytes written (`len(s)`), or 0 when nothing could be written (not an array, a negative `offset`, or an `offset` past the end). Optional `offset` defaults to 0. | — |
+| **ToArray** | `ToArray(buf:block, offset?:int, count?:int) - [int]` | A flat `[int]` array of the unsigned element values, `count` elements from element `offset` (`offset` defaults to 0, `count` to the rest). Element size must be 1, 2, 4, or 8; `nil` on a bad range. | ✓ owned¹ |
 | **ToString** | `ToString(buf:block) - string` | Copies the raw bytes of `buf` into a new string. Non-destructive - block remains valid. Total bytes read = `count × size`. | ✓ owned¹ |
 | **WriteU8At** | `WriteU8At(buf:block, offset:int, v:int) - bool` | Writes `v & 0xFF` at byte `offset`. Returns `false` if out of bounds. | ✓ |
-| **WriteU16At** | `WriteU16At(buf:block, offset:int, v:int, bigEndian:bool) - bool` | Writes 2-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
-| **WriteU32At** | `WriteU32At(buf:block, offset:int, v:int, bigEndian:bool) - bool` | Writes 4-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
-| **WriteU64At** | `WriteU64At(buf:block, offset:int, v:int, bigEndian:bool) - bool` | Writes 8-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
+| **WriteU16At** | `WriteU16At(buf:block, offset:int, v:int, bigEndian?:bool) - bool` | Writes 2-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
+| **WriteU32At** | `WriteU32At(buf:block, offset:int, v:int, bigEndian?:bool) - bool` | Writes 4-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
+| **WriteU64At** | `WriteU64At(buf:block, offset:int, v:int, bigEndian?:bool) - bool` | Writes 8-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
 | **Fill16** | `Fill16(buf:block, value:int, bigEndian?:bool) - int` | Fills the whole buffer with the 2-byte encoding of `value` repeated. Returns the number of 2-byte units written; a trailing partial unit is left unchanged. Optional `bigEndian` defaults to `false`. | ✓ |
 | **Fill32** | `Fill32(buf:block, value:int, bigEndian?:bool) - int` | Like `Fill16` with a 4-byte value. | ✓ |
 | **Fill64** | `Fill64(buf:block, value:int, bigEndian?:bool) - int` | Like `Fill16` with an 8-byte value. | ✓ |
-| **FillPattern** | `FillPattern(buf:block, pattern:block) - int` | Tiles `pattern`'s bytes across the whole buffer extent (the last copy is truncated to fit). Returns the number of bytes written (the buffer extent), or `0` on a non-block or empty pattern. | ✓ |
+| **Swap16** | `Swap16(buf:block) - int` | Reverses the byte order of every whole 2-byte unit across the buffer in place (endianness conversion of a whole buffer). Returns the number of units swapped; a trailing partial unit is left unchanged. `0` on a non-block. | ✓ |
+| **Swap32** | `Swap32(buf:block) - int` | Like `Swap16` with 4-byte units. | ✓ |
+| **Swap64** | `Swap64(buf:block) - int` | Like `Swap16` with 8-byte units. | ✓ |
+| **FillPattern** | `FillPattern(buf:block, pattern:block\|string) - int` | Tiles the pattern's bytes (a block or a string) across the whole buffer extent (the last copy is truncated to fit). Returns the number of bytes written (the buffer extent), or `0` on a bad type or an empty pattern. | ✓ |
 | **Reverse** | `Reverse(buf:block) - bool` | Reverses the buffer's elements in place (each element is `size` bytes; a byte buffer is reversed byte-for-byte). `false` on a non-block. | ✓ |
 | **CopyWithin** | `CopyWithin(buf:block, destOff:int, srcOff:int, length:int) - bool` | Moves `length` bytes within the same buffer from byte `srcOff` to byte `destOff` (memmove; the spans may overlap). Bounds-checked against the byte extent; `false` if out of range. | ✓ |
 | **Concat** | `Concat(a:block, b:block) - block` | Returns a new byte block (element size 1) holding `a`'s bytes followed by `b`'s bytes (each buffer's full extent). `nil` on a non-block. | ✓ owned¹ |
@@ -2735,6 +2739,7 @@ Cooperative green-thread creation, communication, and lifecycle management.
 | **Id** | `Id() - int` | Returns current fiber's integer ID. | — |
 | **MessageCount** | `MessageCount(f:fiber) - int` | Number of messages currently queued in `f`'s mailbox. | — |
 | **IsDone** | `IsDone(f:fiber) - bool` | `true` if fiber has completed or been cancelled. | — |
+| **Await** | `Await(x:any) - any` | The `await` operator as a call, so a plain (non-`async`) function can wait too. Parks the calling fiber until fiber `x` finishes and returns its value; an exception that escaped `x` is raised here instead. A fiber that has already finished returns its value at once, and one that has not started yet (an `async` call, `Fiber.New`) is started. Passing the `nil` that an `*Async` builtin returns waits for that operation's result, so `Fiber.Await(Stream.ReadLineAsync(s))` reads a line without `await`. Waiting on the current fiber raises. | — |
 | **New** | `New(func:fn ) - fiber` | Create a new fiber (not yet started). | — |
 | **Resume** | `Resume(f:fiber\|nil, detached?:bool) - any` | Schedule `f` to run and yield self. Default (attached): the caller parks until `f` yields/finishes and that value is routed back. `detached=true`: the caller just suspends and `f` runs independently. Passing `nil` (or a finished `f`) returns `nil`. The resume value is delivered later by the scheduler. | — |
 | **Run** | `Run(func:fn ) - int` | Create and immediately start a detached fiber. Returns its integer ID. | — |
@@ -2752,6 +2757,7 @@ All `Fiber` functions where the fiber is the first argument can be called direct
 let f = Fiber.New(fn() { /* ... */ });
 f.Resume()            // same as Fiber.Resume(f)
 f.IsDone()            // same as Fiber.IsDone(f)
+f.Await()             // same as Fiber.Await(f)
 f.Status()            // same as Fiber.Status(f)
 f.Cancel()            // same as Fiber.Cancel(f)
 f.HasMessage()        // same as Fiber.HasMessage(f)
@@ -2789,8 +2795,8 @@ File read, write, and metadata operations.
 | **ReadLink** | `ReadLink(path:string) - string` | The target a symbolic link points to (the raw stored target, not a resolved path), or `nil` if not a symlink / unreadable. POSIX only - `nil` on Windows. | — |
 | **ReadText** | `ReadText(path:string) - string` | Read entire file as UTF-8 string. | — |
 | **ReadTextAsync** | `ReadTextAsync(path:string) - fiber` | Non-blocking `ReadText`. Use with `await`. Other fibers run while the file is read. | — |
-| **Sha256** | `Sha256(path:string, raw?:bool) - string` | Compute SHA-256 of file contents. Optional `raw` for binary output. | — |
-| **Sha256Async** | `Sha256Async(path:string, raw?:bool) - fiber` | Non-blocking `Sha256`. Use with `await`; resolves to the hex string (or 32-byte block if `raw`), or `nil` if the file can't be opened. | — |
+| **Sha256** | `Sha256(path:string, raw?:bool) - string` | Compute SHA-256 of file contents. Optional `raw` for binary output. `nil` if the file cannot be opened or hashed (an unseekable FIFO, for example). | — |
+| **Sha256Async** | `Sha256Async(path:string, raw?:bool) - fiber` | Non-blocking `Sha256`. Use with `await`; resolves to the hex string (or 32-byte block if `raw`), or `nil` if the file can't be opened or hashed. | — |
 | **SetMode** | `SetMode(path:string, mode:int) - bool` | Set permission bits (POSIX `chmod`, low `07777` of `mode`). On Windows only the write bit is honored. `nil` if it can't be applied. | — |
 | **SetModifiedTime** | `SetModifiedTime(path:string, unixSeconds:int) - bool` | Set the file's modification time to a Unix timestamp; access time is preserved where the platform allows. `nil` on failure. | — |
 | **Size** | `Size(path:string) - int` | File size in bytes, or `nil` if the file can't be opened. | — |
@@ -3086,45 +3092,45 @@ Namespace: **`Memory`**
 
 Unsafe raw memory access. Requires `--unsafe` flag. `ptr` = `int\|string\|block\|pointer` (any pointer-like value - see legend).
 
-> **Region requirement.** Every access is guarded: the `[ptr, ptr+width)` span must lie inside a **registered** region, otherwise the call returns `nil`/no-op (or raises `Forbidden/Invalid memory-access`). Registered regions come from `Memory.Alloc`, `Memory.Pin`, or a `block`'s backing store (`Buffer.Create`/`GetAddress`). A plain `string` address is **not** registered, so passing a bare string is rejected — copy it into a block (`Buffer.FromString`) or `Pin` its address first.
+> **Region requirement.** Every access is guarded: the `[ptr, ptr+width)` span must lie inside a **registered** region, otherwise the call raises `Forbidden/Invalid memory-access` and yields `nil`/no-op. Registered regions come from `Memory.Alloc`, `Memory.Pin`, or a `block`'s backing store (`Buffer.Create`/`GetAddress`). A plain `string` address is **not** registered, so passing a bare string is rejected — copy it into a block (`Buffer.FromString`) or `Pin` its address first.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
 | **Alloc** | `Alloc(size:int) - int` | Allocate `size` bytes; returns the raw address. `nil` if `size <= 0` or exceeds the 2 GiB per-allocation cap. Caller must `Free`. | — |
-| **BitClear** | `BitClear(ptr:int\|string\|block\|pointer, bit:int) - nil` | Clear bit `bit` at address. | ✓ `--unsafe` |
-| **BitSet** | `BitSet(ptr:int\|string\|block\|pointer, bit:int) - nil` | Set bit `bit` at address. | ✓ `--unsafe` |
-| **BitTest** | `BitTest(ptr:int\|string\|block\|pointer, bit:int) - int` | Return 0 or 1 for bit at address. | ✓ `--unsafe` |
-| **BitToggle** | `BitToggle(ptr:int\|string\|block\|pointer, bit:int) - nil` | Toggle bit at address. | ✓ `--unsafe` |
-| **Compare** | `Compare(a:int\|string\|block\|pointer, b:int\|string\|block\|pointer, len:int) - int` | memcmp of `len` bytes. Returns <0, 0, >0. | ✓ `--unsafe` |
+| **BitClear** | `BitClear(ptr:int\|string\|block\|pointer, bit:int, offset?:int) - nil` | Clear bit `bit & 7` of the byte at `ptr`(+`offset`). | ✓ `--unsafe` |
+| **BitSet** | `BitSet(ptr:int\|string\|block\|pointer, bit:int, offset?:int) - nil` | Set bit `bit & 7` of the byte at `ptr`(+`offset`). | ✓ `--unsafe` |
+| **BitTest** | `BitTest(ptr:int\|string\|block\|pointer, bit:int, offset?:int) - bool` | `true` if bit `bit & 7` of the byte at `ptr`(+`offset`) is set. | ✓ `--unsafe` |
+| **BitToggle** | `BitToggle(ptr:int\|string\|block\|pointer, bit:int, offset?:int) - nil` | Flip bit `bit & 7` of the byte at `ptr`(+`offset`). | ✓ `--unsafe` |
+| **Compare** | `Compare(a:int\|string\|block\|pointer, b:int\|string\|block\|pointer, len:int) - int` | `memcmp(a, b)` over `len` bytes: negative when `a` sorts first, 0 when equal, positive otherwise. Region-guarded. | ✓ `--unsafe` |
 | **Copy** | `Copy(dst:int\|string\|block\|pointer, src:int\|string\|block\|pointer, len:int) - nil` | `memcpy` `len` bytes — the spans must **not** overlap (use `Move` if they might). Region-guarded. | ✓ `--unsafe` |
 | **Move** | `Move(dst:int\|string\|block\|pointer, src:int\|string\|block\|pointer, len:int) - nil` | `memmove` `len` bytes; the `dst` and `src` spans **may** overlap. Region-guarded. | ✓ `--unsafe` |
 | **Fill** | `Fill(addr:int\|string\|block\|pointer, value:int, len:int) - nil` | Set `len` bytes at `addr` to byte `value` (0–255). Region-guarded; `nil`/no-op out of region or on a bad value. | ✓ `--unsafe` |
-| **Free** | `Free(addr:int) - nil` | Free previously allocated memory. | — |
+| **Free** | `Free(addr:int) - nil` | Release a region returned by `Alloc`. Any other address - a block's backing store, a `Pin`ned region, an interior pointer - raises `Forbidden/Invalid memory-access` and is left untouched. | — |
 | **IsLittleEndian** | `IsLittleEndian() - bool` | `true` if host is little-endian. | — |
-| **Pin** | `Pin(addr:int, size:int) - int` | Register an externally-owned region (e.g. an FFI buffer) so the peek/poke guards accept it; returns `addr`. Does not allocate or take ownership. **Must be paired with `Unpin`** — a region left pinned at exit is reported as a leaked block region (and fails under `--mem`). | — |
-| **Process** | `Process(addr:int, size:int, chunkSize:int, func:fn ) - bool` | Iterate memory in chunks calling `fn(ptr, len)`. | — |
+| **Pin** | `Pin(addr:int, size:int) - int` | Register an externally-owned region (e.g. an FFI buffer) so the peek/poke guards accept it; returns `addr`. `nil` for `addr <= 0`, a `size` that is not below the 2 GiB per-allocation cap, or a span that wraps around. Does not allocate or take ownership; the caller vouches for the memory (a pinned span nothing backs is a wild read). **Must be paired with `Unpin`** — a region left pinned at exit is reported as a leaked block region (and fails under `--mem`). | — |
+| **Process** | `Process(addr:int, len:int, elemSize:int, fn:function) - bool` | In-place map: for each of `len` elements of `elemSize` (1/2/4/8) bytes at `addr`, calls `fn(value:int, index:int)` and stores the integer it returns back, truncated to the element width. `false` on a bad size or length, an unregistered span, or a builtin `fn` that cannot take two arguments; `nil` if `fn` raised. At most 16 MB per call. | — |
 | **ProcessCallback** | `ProcessCallback(fn, address:int, start:int, len:int, cb)` | Processes a raw memory range with your worker function `fn(address, start, len)` (which reads/writes it via `Memory.Read*`/`Write*`), then calls `cb(address, result)` when finished. Runs on another CPU core when `fn` is simple enough (only `Memory.Read*`/`Write*` on that address, plain number math, no calls or allocations) — otherwise runs normally, same result. **Don't allocate or free memory while the job is running.** | ✓ `--unsafe` |
 | **ProcessEvent** | `ProcessEvent(fn, address:int, start:int, len:int, eventId:int)` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ `--unsafe` |
 | **Read8** | `Read8(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 1 byte at ptr+offset. | ✓ `--unsafe` |
-| **Read16** | `Read16(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 2 bytes (little-endian). | ✓ `--unsafe` |
-| **Read32** | `Read32(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 4 bytes (little-endian). | ✓ `--unsafe` |
-| **Read64** | `Read64(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 8 bytes (little-endian). | ✓ `--unsafe` |
-| **ReadBytes** | `ReadBytes(ptr:int\|string\|block\|pointer, offset?:int) - block` | Read a NUL-terminated byte run at `ptr`(+`offset`) into a new block (excluding the terminator). The scan is bounded to the registered region. `nil` out of region or with no terminator inside it. | ✓ owned¹ `--unsafe` |
+| **Read16** | `Read16(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 2 bytes, host byte order (little-endian on every supported target). | ✓ `--unsafe` |
+| **Read32** | `Read32(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 4 bytes, host byte order (little-endian on every supported target). | ✓ `--unsafe` |
+| **Read64** | `Read64(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 8 bytes, host byte order (little-endian on every supported target). | ✓ `--unsafe` |
+| **ReadBytes** | `ReadBytes(ptr:int\|string\|block\|pointer, offset?:int) - block` | Read a NUL-terminated byte run at `ptr`(+`offset`) into a new block (excluding the terminator). The scan is bounded to the registered region. Raises `Forbidden/Invalid memory-access` outside every registered region; `nil` when no terminator lies inside it. | ✓ owned¹ `--unsafe` |
 | **ReadFloat32** | `ReadFloat32(ptr:int\|string\|block\|pointer, offset?:int) - float` | Read IEEE-754 single. | ✓ `--unsafe` |
 | **ReadFloat64** | `ReadFloat64(ptr:int\|string\|block\|pointer, offset?:int) - float` | Read IEEE-754 double. | ✓ `--unsafe` |
-| **ReadString** | `ReadString(ptr:int\|string\|block\|pointer, offset?:int) - string` | Read a NUL-terminated string from `ptr`(+`offset`). The scan is bounded to the registered region (never runs off the allocation). `nil` out of region or with no terminator inside it. | ✓ owned¹ `--unsafe` |
-| **Swap16** | `Swap16(v:int) - int` | Byte-swap 16-bit value. | ✓ `--unsafe` |
-| **Swap32** | `Swap32(v:int) - int` | Byte-swap 32-bit value. | ✓ `--unsafe` |
-| **Swap64** | `Swap64(v:int) - int` | Byte-swap 64-bit value. | ✓ `--unsafe` |
-| **Unpin** | `Unpin(addr:int) - bool` | Remove a region previously registered with `Pin`; returns `true` if it was tracked. Does not free the underlying memory. | — |
+| **ReadString** | `ReadString(ptr:int\|string\|block\|pointer, offset?:int) - string` | Read a NUL-terminated string from `ptr`(+`offset`). The scan is bounded to the registered region (never runs off the allocation). Raises `Forbidden/Invalid memory-access` outside every registered region; `nil` when no terminator lies inside it. | ✓ owned¹ `--unsafe` |
+| **Swap16** | `Swap16(v:int) - int` | Byte-swap 16-bit value. No `--unsafe` needed. | ✓ |
+| **Swap32** | `Swap32(v:int) - int` | Byte-swap 32-bit value. No `--unsafe` needed. | ✓ |
+| **Swap64** | `Swap64(v:int) - int` | Byte-swap 64-bit value. No `--unsafe` needed. | ✓ |
+| **Unpin** | `Unpin(addr:int) - bool` | Remove a region previously registered with `Pin`; returns `true` if it was tracked. A block's backing store or an `Alloc` region is left alone (`false`). Does not free the underlying memory. | — |
 | **Write8** | `Write8(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 1 byte. | ✓ `--unsafe` |
-| **Write16** | `Write16(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 2 bytes (little-endian). | ✓ `--unsafe` |
-| **Write32** | `Write32(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 4 bytes (little-endian). | ✓ `--unsafe` |
-| **Write64** | `Write64(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 8 bytes (little-endian). | ✓ `--unsafe` |
-| **WriteBytes** | `WriteBytes(ptr:int\|string\|block\|pointer, s:string, offset?:int) - nil` | Write `s`'s bytes (WITHOUT a NUL terminator) at `ptr`(+`offset`). The byte count comes from `strlen`, so an embedded NUL truncates. Region-guarded. | ✓ `--unsafe` |
+| **Write16** | `Write16(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 2 bytes, host byte order. | ✓ `--unsafe` |
+| **Write32** | `Write32(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 4 bytes, host byte order. | ✓ `--unsafe` |
+| **Write64** | `Write64(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 8 bytes, host byte order. | ✓ `--unsafe` |
+| **WriteBytes** | `WriteBytes(ptr:int\|string\|block\|pointer, s:string, offset?:int) - nil` | Write all `len(s)` bytes of `s` (no NUL terminator) at `ptr`(+`offset`). Region-guarded. | ✓ `--unsafe` |
 | **WriteFloat32** | `WriteFloat32(ptr:int\|string\|block\|pointer, value:float, offset?:int) - nil` | Write IEEE-754 single. | ✓ `--unsafe` |
 | **WriteFloat64** | `WriteFloat64(ptr:int\|string\|block\|pointer, value:float, offset?:int) - nil` | Write IEEE-754 double. | ✓ `--unsafe` |
-| **WriteString** | `WriteString(ptr:int\|string\|block\|pointer, s:string, offset?:int) - nil` | Write `s`'s bytes plus a NUL terminator at `ptr`(+`offset`). Region-guarded. | ✓ `--unsafe` |
+| **WriteString** | `WriteString(ptr:int\|string\|block\|pointer, s:string, offset?:int) - nil` | Write all `len(s)` bytes of `s` plus a NUL terminator at `ptr`(+`offset`). Region-guarded. | ✓ `--unsafe` |
 
 ---
 
@@ -3752,7 +3758,7 @@ while (true) {
 | **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy data from `src` to `dst`. Optional byte limit. | — |
 | **Flush** | `Flush(s:stream) - bool` | Flush write buffer (`fsync` for files, `tcdrain` for serial, no-op for sockets). | — |
 | **IsOpen** | `IsOpen(s:stream) - bool` | `true` if stream is still open. | — |
-| **LastError** | `LastError() - int` | Why the calling fiber's most recent async operation (`ReadAsync`, `WriteAsync`, `WaitReadable`) resolved to `nil`. `0` = it succeeded, so a `nil` with `LastError() == 0` means a clean end-of-file, not a failure. Per-fiber, so concurrent fibers never overwrite each other's reason. Codes: `1` timeout, `2` stream closed/invalid, `3` connection reset, `4` read exceeded the maximum block size, `5` descriptor cannot be multiplexed, `6` other OS error, `7` cancelled by `Fiber.CancelIo`. | — |
+| **LastError** | `LastError() - int` | Why the calling fiber's most recent async operation (`ReadAsync`, `ReadLineAsync`, `WriteAsync`, `WaitReadable`) - or a synchronous `ReadLine` - resolved to `nil` — or, where the call reports partial progress, why it stopped short. `0` = it succeeded, so a `nil` with `LastError() == 0` means a clean end-of-file, not a failure. Per-fiber, so concurrent fibers never overwrite each other's reason. Codes: `1` timeout, `2` stream closed/invalid, `3` connection reset, `4` the read hit a size limit - its own (2 GiB for a byte read, 256 MB for a line) or the 1 GiB shared between all in-flight async reads, `6` other OS error, `7` cancelled by `Fiber.CancelIo`. Code `5` is reserved and no longer produced; the numbering is stable, so handle codes you do not know by falling through rather than by position. | — |
 | **Listen** | `Listen(proto:string, port:int, backlog?:int) - stream` | Create a listening socket. `proto`: `"tcp"` or `"udp"`. Binds a dual-stack IPv6 socket (`IPV6_V6ONLY=0`, so IPv4 clients connect too) and falls back to IPv4-only if v6 is unavailable. Sets `SO_REUSEADDR` and `SO_REUSEPORT`. `backlog` defaults to `128`. | — |
 | **LocalAddr** | `LocalAddr(s:stream) - string` | Local endpoint of a socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
 | **TlsLastError** | `TlsLastError() - string\|nil` | Why the last `ConnectTls`/`AcceptTls` failed (bad certificate, wrong password, handshake refused). Distinct from `LastError()`, which reports an integer io-error code: a TLS setup failure is a message with no errno. `nil` if none. | — |
@@ -3760,14 +3766,15 @@ while (true) {
 | **TlsServerAvailable** | `TlsServerAvailable() - bool` | `true` if this build can terminate TLS (`AcceptTls`). Narrower than having TLS at all: an old or stripped `libssl` may support clients but not servers. | — |
 | **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), or `"rw"` (read-write/create). Returns `nil` on failure. | — |
 | **OpenSerial** | `OpenSerial(port:string, baud:int, format?:string, flow?:string) - stream` | Open serial port in raw mode. Returns `nil` if the port cannot be opened. `format` is `[7\|8][N\|E\|O][1\|2]`, default `"8N1"` (databits, parity, stopbits). `flow` is `"none"` (default), `"rtscts"` (hardware RTS/CTS) or `"xonxoff"` (software). Flow control is always applied explicitly, so a port left in RTS/CTS by a previous opener is reset by `"none"`. **Baud:** on Linux any rate the C library names, `50`–`4000000` – including `230400`, `460800` and `921600` for LTE/PPP; on macOS/BSD any rate the driver accepts; on Windows any rate the driver accepts. An unsupported rate raises rather than silently running at the wrong speed. | — |
-| **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it. Sockets use `MSG_PEEK`; files read one byte and rewind. Returns `nil` at EOF, on error, or for a pipe/serial stream (which have no non-destructive read). | — |
+| **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it. Returns `nil` at EOF, on error, or for a pipe/serial stream (which have no non-destructive read). | — |
 | **PeerAddr** | `PeerAddr(s:stream) - string` | Remote endpoint of a connected socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
 | **Pipe** | `Pipe() - array` | Create a pipe. Returns `[readStream, writeStream]`. | — |
 | **ReadAll** | `ReadAll(s:stream, limit?:int, timeout?:int) - block` | Read until EOF or `limit` bytes and return a `block`. On a file a short read ends the read; on a socket/pipe it reads until the peer closes (EOF) or, for a socket, the `timeout` fires (seconds, default 3) — bytes already read are returned, not discarded. Returns `nil` only on a hard I/O error. | — |
-| **ReadAsync** | `ReadAsync(s:stream, count?:int, timeout?:int, cb?:fn) - fiber` | Async read. `count > 0` completes once exactly `count` bytes have arrived; `count` omitted or `0` reads until EOF. `await` resolves to a `block`, or `nil`. A block can be shorter than `count` when EOF arrives first **or when the deadline fires after some bytes have arrived** — a timeout hands over what it already has rather than discarding it, so always check `len()`, and call `Stream.LastError()` (`1` = timed out) to tell a short block from a complete one. `nil` means nothing was received at all, or a hard error. `timeout` in ms; `<= 0` (default) = no deadline. With `cb`, `cb(block)` is invoked on completion and the awaited result is `nil`. | — |
+| **ReadAsync** | `ReadAsync(s:stream, count?:int, timeout?:int, cb?:fn) - fiber` | Async read. `count > 0` completes once exactly `count` bytes have arrived; `count` omitted or `0` reads until EOF. `await` resolves to a `block`, or `nil`. A block can be shorter than `count` when EOF arrives first **or when the deadline fires after some bytes have arrived** — a timeout hands over what it already has rather than discarding it, so always check `len()`, and call `Stream.LastError()` (`1` = timed out) to tell a short block from a complete one. `nil` means nothing was received at all, or a hard error. A read that is not bounded by `count` stops at 2 GiB and reports `Stream.LastError() == 4`, so a peer that never closes cannot grow it without limit. Those caps are per operation; a further 1 GiB ceiling applies to everything in flight at once, so opening more connections does not buy more buffer - a read that would cross it also reports `4`. `timeout` in ms; `<= 0` (default) = no deadline. With `cb`, `cb(block)` is invoked on completion and the awaited result is `nil`. | — |
 | **ReadByte** | `ReadByte(s:stream) - int` | Read one byte as integer. | — |
 | **ReadBytes** | `ReadBytes(s:stream, count:int) - block` | Read up to `count` bytes into a block. A short block is not an error: a peer close or a `SetTimeout` firing part-way keeps the bytes already read, so check `len()` and loop until you have `count`. `nil` only when nothing at all was read. | — |
-| **ReadLine** | `ReadLine(s:stream) - string` | Read until `\n`, stripping a preceding `\r` (so `\r\n` and `\n` both work). A lone `\r` and an embedded NUL are data, not terminators. Returns `""` at EOF. | — |
+| **ReadLine** | `ReadLine(s:stream) - string` | Read until `\n`, stripping a preceding `\r` (so `\r\n` and `\n` both work). A lone `\r` and an embedded NUL are data, not terminators. Nothing past the terminator is consumed, so a byte-oriented read may follow one directly. A blank line is `""`; end of file is `nil`, as it is for `ReadLineAsync`, so `while (line != nil)` terminates and a blank line inside the file does not end the loop. `nil` also comes back on error and if the line passes 256 MB - `Stream.LastError()` tells them apart (`0` = clean end of file, `4` = over the line cap, `6` = an OS error). On a socket that has been used with `WaitReadable` or an `*Async` call, a line that has not fully arrived parks the calling fiber - other fibers run - until it does, or until the read timeout set with `SetTimeout` passes (`nil`). | — |
+| **ReadLineAsync** | `ReadLineAsync(s:stream, timeout?:int, cb?:fn) - fiber` | Async counterpart of `ReadLine`. `await` resolves to one line with the terminator (and a preceding `\r`) stripped, or `nil` at EOF, on timeout, or on error. Like the synchronous call it consumes nothing past the terminator, so consecutive calls stay in step on a line protocol and a byte-oriented read may follow one directly. `timeout` in ms; `<= 0` (default) = no deadline. A stream that ends mid-line hands over the unterminated remainder, and the call after that is the `nil` for EOF - check `Stream.LastError()` (`0` = clean EOF, `1` = timed out, `4` = the line exceeded 256 MB). With `cb`, `cb(line)` is invoked on completion and the awaited result is `nil`. | — |
 | **ReadString** | `ReadString(s:stream, count:int) - string` | Read `count` bytes as string. Binary-safe: an embedded NUL is data, so the result is as long as what was read. `nil` at EOF with nothing read. | — |
 | **Seek** | `Seek(s:stream, pos:int, whence?:int) - bool` | Seek a file stream. `whence`: `0` from start (default), `1` from the current position, `2` from the end (`pos` may be negative). Returns `true` on success. | — |
 | **SendFile** | `SendFile(s:stream, path:string, offset?:int, count?:int) - int` | Zero-copy file-to-socket transfer. Uses `sendfile` on Linux and macOS/BSD; falls back to read/write loop on other targets (e.g. OpenWrt). Returns bytes sent. | — |
@@ -3781,9 +3788,9 @@ while (true) {
 | **Stdout** | `Stdout() - stream` | A `dup()` of the process stdout as a writable stream. Closing it leaves the real stdout open. | — |
 | **Tell** | `Tell(s:stream) - int` | Return current byte offset. | — |
 | **Truncate** | `Truncate(s:stream, size:int) - bool` | Grow or shrink the file to exactly `size` bytes (`ftruncate`). Returns `true` on success. | — |
-| **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. | — | **On a socket this leaves the descriptor non-blocking for good** (deliberately — async slots re-arm it, and a socket may have read and write armed at once). A later *synchronous* `ReadBytes`/`ReadString` on that socket therefore ignores `SetTimeout` and comes up short the moment the next byte is still in flight, so loop until you have what you need rather than treating one short read as a dead peer.
+| **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. | — | **On a socket this leaves the descriptor non-blocking for good** (deliberately — async slots re-arm it, and a socket may have read and write armed at once). A later *synchronous* `ReadBytes`/`ReadString` on that socket therefore ignores `SetTimeout` and comes up short the moment the next byte is still in flight, so loop until you have what you need rather than treating one short read as a dead peer. `ReadLine` is the exception: it parks until the rest of the line arrives.
 | **WriteAll** | `WriteAll(s:stream, data:string\|block) - bool` | Write all bytes, retrying on partial writes. | — |
-| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int), or `nil` on timeout/error. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. Use `Stream.LastError()` to tell a timeout from an I/O error. | — |
+| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int). **A deadline that fires part-way still resolves to a count** - the bytes already delivered - so compare it with `len(data)` rather than treating any int as success, and resume from that offset if you need the rest; `Stream.LastError()` reports `1` for the short case and `0` for a complete one. `nil` means nothing was delivered at all, or a hard I/O error, where no resume is possible. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. | — |
 | **WriteByte** | `WriteByte(s:stream, value:int) - bool` | Write single byte. Returns `true` on success, `false` on a write error. | — |
 | **WriteBytes** | `WriteBytes(s:stream, buf:block, count:int) - int` | Write `count` bytes from block; returns bytes written. | — |
 | **WriteString** | `WriteString(s:stream, s:string) - bool` | Write the string's bytes — all of them, including any embedded NUL. | — |
@@ -4422,9 +4429,9 @@ iter (i from 0 to n - 1) {
 
 Equivalent `while` costs at least 3 dispatches overhead (compare-jump + increment + loop-back). Use `iter` whenever the range is a fixed integer expression known at the loop head.
 
-`iter` allocates no iterator object. `i` is a local slot that starts at `from` and runs while `i <= to`.
+`iter` allocates no iterator object. `i` is a local slot that starts at `from` and runs while `i < to`.
 
-**Both bounds are inclusive.** `iter (i from 0 to 3)` runs four times, with `i` taking 0, 1, 2 and 3 - so walking a collection is `from 0 to len(x) - 1`, not `from 0 to len(x)`. A range whose start exceeds its end (`from 0 to -1`, which is what an empty collection produces) runs zero times.
+**The lower bound is inclusive, the upper bound exclusive** - the range is `[from, to)`. `iter (i from 0 to 3)` runs three times, with `i` taking 0, 1 and 2, so walking a collection is `from 0 to len(x)`. A range whose start is not below its end (`from 0 to 0`, which is what an empty collection produces) runs zero times. This is exactly the set of values `while (i < to) { ...; i++ }` covers.
 
 ---
 
@@ -4655,7 +4662,7 @@ All figures measured with `--strip` on M-series hardware. "Overhead" is the numb
 
 | Pattern | Overhead dispatches | Notes |
 | --- | --- | --- |
-| `iter (i from 0 to N) { ... }` | 2 | fused increment+check + loop-back |
+| `iter (i from 0 to N + 1) { ... }` | 2 | fused increment+check + loop-back |
 | `while (i < N) { i++; }` | 3 | fused compare + compact increment + loop-back |
 | `while (i < N) { i += 1; }` | 3 | fused compare + compound assign + loop-back |
 | `while (i < N) { i = i + 1; }` | 3 | same - the self-assignment compiles like `i++` |
@@ -4684,7 +4691,7 @@ fn while_sum(n) {
 // iter loop - 3 dispatches per iteration
 fn iter_sum(n) {
     let sum = 0;
-    iter (i from 0 to n) {   // fused increment+check, 1 dispatch
+    iter (i from 0 to n + 1) {   // fused increment+check, 1 dispatch
         sum += i;            // fused, 1 dispatch
     }                        // loop-back, 1 dispatch
     return sum;
@@ -4787,13 +4794,13 @@ means `Array.Create` plus a loop.
 ```flaris
 fn sumL(a: [int]): int {
     var s = 0;
-    iter (i from 0 to len(a) - 1) { s += a[i]; }
+    iter (i from 0 to len(a)) { s += a[i]; }
     return s;
 }
 
 var fast = Array.Create(n, Type.Int);        // native: ~2 ms over 2000 x 2000
 var slow = [];                                // same function, interpreted:
-iter (i from 0 to n - 1) { Array.Append(slow, i); }   // ~19 ms - 9x slower
+iter (i from 0 to n) { Array.Append(slow, i); }   // ~19 ms - 9x slower
 ```
 
 The two calls are indistinguishable in the source and in `type()`. If a typed-array function is not delivering the speed-up you expect, this is the first thing to check.
@@ -5128,7 +5135,10 @@ interpreter:
 Two constraints apply: `Memory.*` runs natively only when the address argument
 is a plain `int` (passing a `block`/`string`/`pointer` uses the interpreter), and
 the `Buffer.Read/Write` calls run natively in their little-endian form (the
-default) — passing the optional big-endian flag falls back to the interpreter.
+default). With the optional endianness flag given as a plain variable, field or
+literal the call still runs natively: a false flag takes the same inline path,
+a true flag the big-endian helper. Any other flag expression falls back to the
+interpreter.
 
 ```js
 fn count_upper(s: string, n: int): int {
@@ -5166,7 +5176,7 @@ When a JIT-compiled function is passed as a callback to one of the builtins belo
 | Method | Callback signature |
 | --- | --- |
 | `Memory.Process(addr, count, size, fn)` | `fn(val: int, idx: int): int` - rewrites each element |
-| `Buffer.ProcessCallback(fn, buf, len, blocksize, cb)` | `fn(val: int, idx: int): int` - rewrites each element |
+| `Buffer.ProcessCallback(fn, buf, len, blocksize, cb)` | `fn(buf: block, len: int, blocksize: int): int\|float` - whole-buffer kernel; the result reaches `cb(buf, result)` |
 
 The fast path is selected automatically at runtime unless `--jit-disable` is given, when the passed function is JIT-eligible. Otherwise (`--jit-disable`, or the function isn't eligible) the builtin falls back to the normal interpreter path transparently.
 
