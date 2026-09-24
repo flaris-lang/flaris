@@ -1113,8 +1113,9 @@ marshalling contract and is owned by the runtime.
 
 ### Guarantees and limits
 
-- **One thread.** All marshalling runs on the VM thread. A plugin must call `flaris_dispatch` (the callback trampoline) only from the thread that called into it - never from a thread it spawned. Nothing in the marshalling layer is locked.
-- **Handles.** `Ffi.Load` handles stay valid for the lifetime of the process. Passing anything that did not come from `Ffi.Load` - including a plugin's own `FFIVAL_POINTER` handle - raises rather than being handed to `dlsym`.
+- **One thread per VM.** All marshalling runs on the thread of the VM that made the call. A plugin must call `flaris_dispatch` (the callback trampoline) only from the thread that called into it - never from a thread it spawned. Nothing in the marshalling layer is locked, and it does not need to be: no two VMs share any of it.
+- **Several VMs, one library.** A host may run one VM per thread, and each loads libraries for itself. If two of them load the same library, they share the mapping but not the call: the plugin's own code can then run on two threads at once, so anything it keeps in globals has to be thread-safe. Callback registrations are never shared - a name a VM registers resolves only for that VM, so the same name may mean a different function in each.
+- **Handles.** An `Ffi.Load` handle stays valid for the lifetime of the VM that loaded it, and the library stays mapped for as long as any VM holds it. A handle belongs to that VM: passing it to another one, or passing anything that did not come from `Ffi.Load` at all - including a plugin's own `FFIVAL_POINTER` handle - raises instead of being used to resolve a symbol.
 - **Handle lifetime is the plugin's.** The VM never frees what an `FFIVAL_POINTER` points at, and has no way to know when script drops the last reference. A plugin handing out handles must expose a close entry point; using a handle after close is a use-after-free the runtime cannot detect.
 - **Exceptions.** A Flaris callback that raises unwinds the native frames back to the `Ffi` call that entered the plugin, and the exception continues to propagate in script. Native code between those two points does **not** get to clean up: destructors, `free` calls and locks in the abandoned C frames are skipped. Keep callback-invoking C code free of state that needs unwinding.
 - **Crashes are fatal.** There is no signal handler. A plugin that segfaults, aborts or corrupts the heap takes the whole VM down; no exception is raised and no diagnostic is produced.
@@ -1123,7 +1124,7 @@ marshalling contract and is owned by the runtime.
 ### Limitations
 
 - Callbacks are synchronous - the plugin blocks until the Flaris function returns.
-- Callbacks cannot be called from a thread other than the one running the VM.
+- Callbacks cannot be called from a thread other than the one running the VM that registered them.
 - The Flaris function must be a plain `fn` - not an async function or fiber.
 - A maximum of 16 arguments can be passed per callback invocation.
 

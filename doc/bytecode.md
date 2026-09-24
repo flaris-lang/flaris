@@ -936,6 +936,12 @@ without an intermediate string.
 **`OP_ARITH_IMM8`** `<aop:u8> <imm:i8>` — 3 bytes. Stack `v → r`.
 `r = v aop imm`.
 
+**`OP_ARITH_IMM16`** `<aop:u8> <imm:i16>` — 4 bytes. Stack `v → r`.
+`r = v aop imm`, the 16-bit twin of `OP_ARITH_IMM8` for constants that do not
+fit a byte. The immediate is sign-extended, so the bitwise operators only ever
+carry a non-negative mask; a wider constant falls back to a push plus a
+separate operator.
+
 **`OP_ARITH_L_IMM8`** `<slot:u8> <aop:u8> <imm:i8>` — 4 bytes. Stack `→ r`.
 `r = local[slot] aop imm` — the `GET_LOCAL`-free form of `ARITH_IMM8`, so it
 pushes rather than replacing TOS. Same value semantics as the pair it
@@ -1587,9 +1593,6 @@ Present only in non-stripped chunks; all are semantically transparent.
 **`OP_DBG_LINE`** `<line:u16>` — 3 bytes. Sets the frame's current source
 line (stack traces, debugger line stepping). Traps: —
 
-**`OP_DBG_FUNC_NAME`** `<idx:const:u16>` — 3 bytes. Sets the frame's
-function-name string. Traps: —
-
 **`OP_DBG_FILE_NAME`** `<idx:const:u16>` — 3 bytes. Sets the chunk's
 source-file name. Traps: —
 
@@ -1783,103 +1786,105 @@ Dense numbering for the current opcode set. `OP_LAST` = 198
 
 | # | Hex | Mnemonic | # | Hex | Mnemonic |
 | --- | --- | --- | --- | --- | --- |
-| 0 | 0x00 | `OP_NOP` | 97 | 0x61 | `OP_TAIL_SELF` |
-| 1 | 0x01 | `OP_CONSTANT` | 98 | 0x62 | `OP_TAIL_CALL` |
-| 2 | 0x02 | `OP_NIL` | 99 | 0x63 | `OP_RETURN` |
-| 3 | 0x03 | `OP_TRUE` | 100 | 0x64 | `OP_RETURN_NONE` |
-| 4 | 0x04 | `OP_FALSE` | 101 | 0x65 | `OP_RETURN_NIL` |
-| 5 | 0x05 | `OP_ONE` | 102 | 0x66 | `OP_RETURN_L` |
-| 6 | 0x06 | `OP_NEG_ONE` | 103 | 0x67 | `OP_FN` |
-| 7 | 0x07 | `OP_IMM8` | 104 | 0x68 | `OP_FN_CAPTURE` |
-| 8 | 0x08 | `OP_IMM16` | 105 | 0x69 | `OP_YIELD` |
-| 9 | 0x09 | `OP_IMM32` | 106 | 0x6A | `OP_AWAIT` |
-| 10 | 0x0A | `OP_IMM_CHAR` | 107 | 0x6B | `OP_THIS_INVOKE` |
-| 11 | 0x0B | `OP_POP` | 108 | 0x6C | `OP_BIND_THIS` |
-| 12 | 0x0C | `OP_DUP` | 109 | 0x6D | `OP_PUSH_BUILTIN` |
-| 13 | 0x0D | `OP_NEGATE` | 110 | 0x6E | `OP_CALL0_BUILTIN` |
-| 14 | 0x0E | `OP_NOT` | 111 | 0x6F | `OP_CALL1_BUILTIN` |
-| 15 | 0x0F | `OP_BITWISE_NOT` | 112 | 0x70 | `OP_CALL2_BUILTIN` |
-| 16 | 0x10 | `OP_ADD` | 113 | 0x71 | `OP_CALL3_BUILTIN` |
-| 17 | 0x11 | `OP_SUBTRACT` | 114 | 0x72 | `OP_CALL4_BUILTIN` |
-| 18 | 0x12 | `OP_MULTIPLY` | 115 | 0x73 | `OP_CALL5_BUILTIN` |
-| 19 | 0x13 | `OP_DIVIDE` | 116 | 0x74 | `OP_TRY_BEGIN` |
-| 20 | 0x14 | `OP_MODULO` | 117 | 0x75 | `OP_TRY_END` |
-| 21 | 0x15 | `OP_POWER` | 118 | 0x76 | `OP_CATCH_BEGIN` |
-| 22 | 0x16 | `OP_BITWISE_AND` | 119 | 0x77 | `OP_CATCH_END` |
-| 23 | 0x17 | `OP_BITWISE_OR` | 120 | 0x78 | `OP_FINALLY_BEGIN` |
-| 24 | 0x18 | `OP_XOR` | 121 | 0x79 | `OP_FINALLY_END` |
-| 25 | 0x19 | `OP_SHL` | 122 | 0x7A | `OP_TRY_LEAVE` |
-| 26 | 0x1A | `OP_SHR` | 123 | 0x7B | `OP_THROW` |
-| 27 | 0x1B | `OP_USHR` | 124 | 0x7C | `OP_FOREACH` |
-| 28 | 0x1C | `OP_IS_NIL` | 125 | 0x7D | `OP_ITER_BEGIN` |
-| 29 | 0x1D | `OP_IS_NOT_NIL` | 126 | 0x7E | `OP_ITER_NEXT` |
-| 30 | 0x1E | `OP_EQUAL` | 127 | 0x7F | `OP_LEN` |
-| 31 | 0x1F | `OP_NOT_EQUAL` | 128 | 0x80 | `OP_TYPE` |
-| 32 | 0x20 | `OP_LESS` | 129 | 0x81 | `OP_IS_ARRAY` |
-| 33 | 0x21 | `OP_LESS_EQUAL` | 130 | 0x82 | `OP_IS_OBJECT` |
-| 34 | 0x22 | `OP_GREATER` | 131 | 0x83 | `OP_HAS_KEY` |
-| 35 | 0x23 | `OP_GREATER_EQUAL` | 132 | 0x84 | `OP_TO_STRING` |
-| 36 | 0x24 | `OP_APPROX_EQ` | 133 | 0x85 | `OP_TO_INT` |
-| 37 | 0x25 | `OP_CMP_IS` | 134 | 0x86 | `OP_TO_FLOAT` |
-| 38 | 0x26 | `OP_JUMP_IF_FALSE` | 135 | 0x87 | `OP_TO_CHAR` |
-| 39 | 0x27 | `OP_JUMP_IF_TRUE` | 136 | 0x88 | `OP_TO_I8` |
-| 40 | 0x28 | `OP_JUMP` | 137 | 0x89 | `OP_TO_U8` |
-| 41 | 0x29 | `OP_LOOP` | 138 | 0x8A | `OP_TO_I16` |
-| 42 | 0x2A | `OP_JUMP_TABLE` | 139 | 0x8B | `OP_TO_U16` |
-| 43 | 0x2B | `OP_CMP_JUMP_LL` | 140 | 0x8C | `OP_TO_I32` |
-| 44 | 0x2C | `OP_CMP_JUMP_LC` | 141 | 0x8D | `OP_TO_U32` |
-| 45 | 0x2D | `OP_DEFINE_GLOBAL` | 142 | 0x8E | `OP_EXPORT` |
-| 46 | 0x2E | `OP_GET_GLOBAL` | 143 | 0x8F | `OP_NEW` |
-| 47 | 0x2F | `OP_SET_GLOBAL` | 144 | 0x90 | `OP_SUPER` |
-| 48 | 0x30 | `OP_GET_LOCAL` | 145 | 0x91 | `OP_GUARD` |
-| 49 | 0x31 | `OP_SET_LOCAL` | 146 | 0x92 | `OP_DBG_LINE` |
-| 50 | 0x32 | `OP_GET_LOCAL0` | 147 | 0x93 | `OP_DBG_FUNC_NAME` |
-| 51 | 0x33 | `OP_GET_LOCAL1` | 148 | 0x94 | `OP_DBG_FILE_NAME` |
-| 52 | 0x34 | `OP_GET_LOCAL2` | 149 | 0x95 | `OP_DBG_BREAK` |
-| 53 | 0x35 | `OP_GET_LOCAL3` | 150 | 0x96 | `OP_GET_BLK_LC` |
-| 54 | 0x36 | `OP_SET_LOCAL0` | 151 | 0x97 | `OP_GET_BLK_LL` |
-| 55 | 0x37 | `OP_SET_LOCAL1` | 152 | 0x98 | `OP_GET_BLK_LI` |
-| 56 | 0x38 | `OP_SET_LOCAL2` | 153 | 0x99 | `OP_SET_BLK_LC` |
-| 57 | 0x39 | `OP_SET_LOCAL3` | 154 | 0x9A | `OP_SET_BLK_LL` |
-| 58 | 0x3A | `OP_INC_LOCAL` | 155 | 0x9B | `OP_SET_BLK_LLC` |
-| 59 | 0x3B | `OP_DEC_LOCAL` | 156 | 0x9C | `OP_SET_BLK_LLL` |
-| 60 | 0x3C | `OP_ARITH_LC` | 157 | 0x9D | `OP_LOCAL_BLK_LC` |
-| 61 | 0x3D | `OP_ARITH_LL` | 158 | 0x9E | `OP_LOCAL_BLK_LL` |
-| 62 | 0x3E | `OP_ARITH_L` | 159 | 0x9F | `OP_ARITH_BLK_LC` |
-| 63 | 0x3F | `OP_ARITH_IMM8` | 160 | 0xA0 | `OP_ARITH_BLK_LL` |
-| 64 | 0x40 | `OP_ARITH_L_IMM8` | 161 | 0xA1 | `OP_ARITH_BLK_IC` |
-| 65 | 0x41 | `OP_ARITH_LL_PUSH` | 162 | 0xA2 | `OP_ARITH_BLK_IL` |
-| 66 | 0x42 | `OP_GET_PROPERTY` | 163 | 0xA3 | `OP_CONCAT` |
-| 67 | 0x43 | `OP_SET_PROPERTY` | 164 | 0xA4 | `OP_ARITH_FMA_LLL` |
-| 68 | 0x44 | `OP_GET_INDEX` | 165 | 0xA5 | `OP_INVOKE_INSTANCE` |
-| 69 | 0x45 | `OP_SET_INDEX` | 166 | 0xA6 | `OP_CMP_JUMP_LC32` |
-| 70 | 0x46 | `OP_GET_ARR_LC` | 167 | 0xA7 | `OP_GET_LOCAL_PROP` |
-| 71 | 0x47 | `OP_GET_ARR_LL` | 168 | 0xA8 | `OP_GET_THIS_SLOT` |
-| 72 | 0x48 | `OP_GET_ARR_LI` | 169 | 0xA9 | `OP_SET_THIS_SLOT` |
-| 73 | 0x49 | `OP_GET_INDEX_LOCAL` | 170 | 0xAA | `OP_GET_THIS_CONST` |
-| 74 | 0x4A | `OP_SET_ARR_LC` | 171 | 0xAB | `OP_THIS_ARITH_SLOT_L` |
-| 75 | 0x4B | `OP_SET_ARR_LL` | 172 | 0xAC | `OP_THIS_ARITH_SLOT_C` |
-| 76 | 0x4C | `OP_SET_ARR_LLC` | 173 | 0xAD | `OP_THIS_INVOKE_SLOT` |
-| 77 | 0x4D | `OP_SET_ARR_LLL` | 174 | 0xAE | `OP_GET_THIS_ARR_L` |
-| 78 | 0x4E | `OP_SET_INDEX_LOCAL` | 175 | 0xAF | `OP_GET_THIS_ARR_SLOT_L` |
-| 79 | 0x4F | `OP_ARITH_ELC` | 176 | 0xB0 | `OP_SUPER_INVOKE` |
-| 80 | 0x50 | `OP_ARITH_ELL` | 177 | 0xB1 | `OP_CALL_GLOBAL` |
-| 81 | 0x51 | `OP_ARITH_EIC` | 178 | 0xB2 | `OP_CONCAT_N` |
-| 82 | 0x52 | `OP_ARITH_EIL` | 179 | 0xB3 | `OP_NIL_LOCAL` |
-| 83 | 0x53 | `OP_SET_OBJ_L` | 180 | 0xB4 | `OP_CALL_WITH_THIS` |
-| 84 | 0x54 | `OP_SET_OBJ_LL` | 181 | 0xB5 | `OP_OBJ_ARITH_L` |
-| 85 | 0x55 | `OP_GET_THIS_PROP` | 182 | 0xB6 | `OP_PUSH_HOST` |
-| 86 | 0x56 | `OP_SET_THIS_PROP` | 183 | 0xB7 | `OP_CALL0_HOST` |
-| 87 | 0x57 | `OP_THIS_ARITH_L` | 184 | 0xB8 | `OP_CALL1_HOST` |
-| 88 | 0x58 | `OP_THIS_ARITH_C` | 185 | 0xB9 | `OP_CALL2_HOST` |
-| 89 | 0x59 | `OP_LOCAL_ARR_LC` | 186 | 0xBA | `OP_CALL3_HOST` |
-| 90 | 0x5A | `OP_LOCAL_ARR_LL` | 187 | 0xBB | `OP_CALL4_HOST` |
-| 91 | 0x5B | `OP_BUILD_OBJECT` | 188 | 0xBC | `OP_CALL5_HOST` |
-| 92 | 0x5C | `OP_BUILD_ARRAY` | 189 | 0xBD | `OP_INVOKE_MEMBER` |
-| 93 | 0x5D | `OP_MAKE_CONST` | 190 | 0xBE | `OP_INVOKE_GLOBAL_CACHED` |
-| 94 | 0x5E | `OP_CALL` | 191 | 0xBF | `OP_TAIL_THIS_INVOKE` |
-| 95 | 0x5F | `OP_CALL_TYPED` | 192 | 0xC0 | `OP_TAIL_THIS_INVOKE_SLOT` |
-| 96 | 0x60 | `OP_CALL_SELF` | 193 | 0xC1 | `OP_SUPER_INVOKE_SLOT` |
+| 0 | 0x00 | `OP_NOP` | 99 | 0x63 | `OP_RETURN` |
+| 1 | 0x01 | `OP_CONSTANT` | 100 | 0x64 | `OP_RETURN_NONE` |
+| 2 | 0x02 | `OP_NIL` | 101 | 0x65 | `OP_RETURN_NIL` |
+| 3 | 0x03 | `OP_TRUE` | 102 | 0x66 | `OP_RETURN_L` |
+| 4 | 0x04 | `OP_FALSE` | 103 | 0x67 | `OP_FN` |
+| 5 | 0x05 | `OP_ONE` | 104 | 0x68 | `OP_FN_CAPTURE` |
+| 6 | 0x06 | `OP_NEG_ONE` | 105 | 0x69 | `OP_YIELD` |
+| 7 | 0x07 | `OP_IMM8` | 106 | 0x6A | `OP_AWAIT` |
+| 8 | 0x08 | `OP_IMM16` | 107 | 0x6B | `OP_THIS_INVOKE` |
+| 9 | 0x09 | `OP_IMM32` | 108 | 0x6C | `OP_BIND_THIS` |
+| 10 | 0x0A | `OP_IMM_CHAR` | 109 | 0x6D | `OP_PUSH_BUILTIN` |
+| 11 | 0x0B | `OP_POP` | 110 | 0x6E | `OP_CALL0_BUILTIN` |
+| 12 | 0x0C | `OP_DUP` | 111 | 0x6F | `OP_CALL1_BUILTIN` |
+| 13 | 0x0D | `OP_NEGATE` | 112 | 0x70 | `OP_CALL2_BUILTIN` |
+| 14 | 0x0E | `OP_NOT` | 113 | 0x71 | `OP_CALL3_BUILTIN` |
+| 15 | 0x0F | `OP_BITWISE_NOT` | 114 | 0x72 | `OP_CALL4_BUILTIN` |
+| 16 | 0x10 | `OP_ADD` | 115 | 0x73 | `OP_CALL5_BUILTIN` |
+| 17 | 0x11 | `OP_SUBTRACT` | 116 | 0x74 | `OP_TRY_BEGIN` |
+| 18 | 0x12 | `OP_MULTIPLY` | 117 | 0x75 | `OP_TRY_END` |
+| 19 | 0x13 | `OP_DIVIDE` | 118 | 0x76 | `OP_CATCH_BEGIN` |
+| 20 | 0x14 | `OP_MODULO` | 119 | 0x77 | `OP_CATCH_END` |
+| 21 | 0x15 | `OP_POWER` | 120 | 0x78 | `OP_FINALLY_BEGIN` |
+| 22 | 0x16 | `OP_BITWISE_AND` | 121 | 0x79 | `OP_FINALLY_END` |
+| 23 | 0x17 | `OP_BITWISE_OR` | 122 | 0x7A | `OP_TRY_LEAVE` |
+| 24 | 0x18 | `OP_XOR` | 123 | 0x7B | `OP_THROW` |
+| 25 | 0x19 | `OP_SHL` | 124 | 0x7C | `OP_FOREACH` |
+| 26 | 0x1A | `OP_SHR` | 125 | 0x7D | `OP_ITER_BEGIN` |
+| 27 | 0x1B | `OP_USHR` | 126 | 0x7E | `OP_ITER_NEXT` |
+| 28 | 0x1C | `OP_IS_NIL` | 127 | 0x7F | `OP_LEN` |
+| 29 | 0x1D | `OP_IS_NOT_NIL` | 128 | 0x80 | `OP_TYPE` |
+| 30 | 0x1E | `OP_EQUAL` | 129 | 0x81 | `OP_IS_ARRAY` |
+| 31 | 0x1F | `OP_NOT_EQUAL` | 130 | 0x82 | `OP_IS_OBJECT` |
+| 32 | 0x20 | `OP_LESS` | 131 | 0x83 | `OP_HAS_KEY` |
+| 33 | 0x21 | `OP_LESS_EQUAL` | 132 | 0x84 | `OP_TO_STRING` |
+| 34 | 0x22 | `OP_GREATER` | 133 | 0x85 | `OP_TO_INT` |
+| 35 | 0x23 | `OP_GREATER_EQUAL` | 134 | 0x86 | `OP_TO_FLOAT` |
+| 36 | 0x24 | `OP_APPROX_EQ` | 135 | 0x87 | `OP_TO_CHAR` |
+| 37 | 0x25 | `OP_CMP_IS` | 136 | 0x88 | `OP_TO_I8` |
+| 38 | 0x26 | `OP_JUMP_IF_FALSE` | 137 | 0x89 | `OP_TO_U8` |
+| 39 | 0x27 | `OP_JUMP_IF_TRUE` | 138 | 0x8A | `OP_TO_I16` |
+| 40 | 0x28 | `OP_JUMP` | 139 | 0x8B | `OP_TO_U16` |
+| 41 | 0x29 | `OP_LOOP` | 140 | 0x8C | `OP_TO_I32` |
+| 42 | 0x2A | `OP_JUMP_TABLE` | 141 | 0x8D | `OP_TO_U32` |
+| 43 | 0x2B | `OP_CMP_JUMP_LL` | 142 | 0x8E | `OP_EXPORT` |
+| 44 | 0x2C | `OP_CMP_JUMP_LC` | 143 | 0x8F | `OP_NEW` |
+| 45 | 0x2D | `OP_DEFINE_GLOBAL` | 144 | 0x90 | `OP_SUPER` |
+| 46 | 0x2E | `OP_GET_GLOBAL` | 145 | 0x91 | `OP_GUARD` |
+| 47 | 0x2F | `OP_SET_GLOBAL` | 146 | 0x92 | `OP_DBG_LINE` |
+| 48 | 0x30 | `OP_GET_LOCAL` | 147 | 0x93 | `OP_DBG_FILE_NAME` |
+| 49 | 0x31 | `OP_SET_LOCAL` | 148 | 0x94 | `OP_DBG_BREAK` |
+| 50 | 0x32 | `OP_GET_LOCAL0` | 149 | 0x95 | `OP_GET_BLK_LC` |
+| 51 | 0x33 | `OP_GET_LOCAL1` | 150 | 0x96 | `OP_GET_BLK_LL` |
+| 52 | 0x34 | `OP_GET_LOCAL2` | 151 | 0x97 | `OP_GET_BLK_LI` |
+| 53 | 0x35 | `OP_GET_LOCAL3` | 152 | 0x98 | `OP_SET_BLK_LC` |
+| 54 | 0x36 | `OP_SET_LOCAL0` | 153 | 0x99 | `OP_SET_BLK_LL` |
+| 55 | 0x37 | `OP_SET_LOCAL1` | 154 | 0x9A | `OP_SET_BLK_LLC` |
+| 56 | 0x38 | `OP_SET_LOCAL2` | 155 | 0x9B | `OP_SET_BLK_LLL` |
+| 57 | 0x39 | `OP_SET_LOCAL3` | 156 | 0x9C | `OP_LOCAL_BLK_LC` |
+| 58 | 0x3A | `OP_INC_LOCAL` | 157 | 0x9D | `OP_LOCAL_BLK_LL` |
+| 59 | 0x3B | `OP_DEC_LOCAL` | 158 | 0x9E | `OP_ARITH_BLK_LC` |
+| 60 | 0x3C | `OP_ARITH_LC` | 159 | 0x9F | `OP_ARITH_BLK_LL` |
+| 61 | 0x3D | `OP_ARITH_LL` | 160 | 0xA0 | `OP_ARITH_BLK_IC` |
+| 62 | 0x3E | `OP_ARITH_L` | 161 | 0xA1 | `OP_ARITH_BLK_IL` |
+| 63 | 0x3F | `OP_ARITH_IMM8` | 162 | 0xA2 | `OP_CONCAT` |
+| 64 | 0x40 | `OP_ARITH_L_IMM8` | 163 | 0xA3 | `OP_ARITH_FMA_LLL` |
+| 65 | 0x41 | `OP_ARITH_LL_PUSH` | 164 | 0xA4 | `OP_INVOKE_INSTANCE` |
+| 66 | 0x42 | `OP_GET_PROPERTY` | 165 | 0xA5 | `OP_CMP_JUMP_LC32` |
+| 67 | 0x43 | `OP_SET_PROPERTY` | 166 | 0xA6 | `OP_GET_LOCAL_PROP` |
+| 68 | 0x44 | `OP_GET_INDEX` | 167 | 0xA7 | `OP_GET_THIS_SLOT` |
+| 69 | 0x45 | `OP_SET_INDEX` | 168 | 0xA8 | `OP_SET_THIS_SLOT` |
+| 70 | 0x46 | `OP_GET_ARR_LC` | 169 | 0xA9 | `OP_GET_THIS_CONST` |
+| 71 | 0x47 | `OP_GET_ARR_LL` | 170 | 0xAA | `OP_THIS_ARITH_SLOT_L` |
+| 72 | 0x48 | `OP_GET_ARR_LI` | 171 | 0xAB | `OP_THIS_ARITH_SLOT_C` |
+| 73 | 0x49 | `OP_GET_INDEX_LOCAL` | 172 | 0xAC | `OP_THIS_INVOKE_SLOT` |
+| 74 | 0x4A | `OP_SET_ARR_LC` | 173 | 0xAD | `OP_GET_THIS_ARR_L` |
+| 75 | 0x4B | `OP_SET_ARR_LL` | 174 | 0xAE | `OP_GET_THIS_ARR_SLOT_L` |
+| 76 | 0x4C | `OP_SET_ARR_LLC` | 175 | 0xAF | `OP_SUPER_INVOKE` |
+| 77 | 0x4D | `OP_SET_ARR_LLL` | 176 | 0xB0 | `OP_CALL_GLOBAL` |
+| 78 | 0x4E | `OP_SET_INDEX_LOCAL` | 177 | 0xB1 | `OP_CONCAT_N` |
+| 79 | 0x4F | `OP_ARITH_ELC` | 178 | 0xB2 | `OP_NIL_LOCAL` |
+| 80 | 0x50 | `OP_ARITH_ELL` | 179 | 0xB3 | `OP_CALL_WITH_THIS` |
+| 81 | 0x51 | `OP_ARITH_EIC` | 180 | 0xB4 | `OP_OBJ_ARITH_L` |
+| 82 | 0x52 | `OP_ARITH_EIL` | 181 | 0xB5 | `OP_PUSH_HOST` |
+| 83 | 0x53 | `OP_SET_OBJ_L` | 182 | 0xB6 | `OP_CALL0_HOST` |
+| 84 | 0x54 | `OP_SET_OBJ_LL` | 183 | 0xB7 | `OP_CALL1_HOST` |
+| 85 | 0x55 | `OP_GET_THIS_PROP` | 184 | 0xB8 | `OP_CALL2_HOST` |
+| 86 | 0x56 | `OP_SET_THIS_PROP` | 185 | 0xB9 | `OP_CALL3_HOST` |
+| 87 | 0x57 | `OP_THIS_ARITH_L` | 186 | 0xBA | `OP_CALL4_HOST` |
+| 88 | 0x58 | `OP_THIS_ARITH_C` | 187 | 0xBB | `OP_CALL5_HOST` |
+| 89 | 0x59 | `OP_LOCAL_ARR_LC` | 188 | 0xBC | `OP_INVOKE_MEMBER` |
+| 90 | 0x5A | `OP_LOCAL_ARR_LL` | 189 | 0xBD | `OP_INVOKE_GLOBAL_CACHED` |
+| 91 | 0x5B | `OP_BUILD_OBJECT` | 190 | 0xBE | `OP_TAIL_THIS_INVOKE` |
+| 92 | 0x5C | `OP_BUILD_ARRAY` | 191 | 0xBF | `OP_TAIL_THIS_INVOKE_SLOT` |
+| 93 | 0x5D | `OP_MAKE_CONST` | 192 | 0xC0 | `OP_SUPER_INVOKE_SLOT` |
+| 94 | 0x5E | `OP_CALL` | 193 | 0xC1 | `OP_SET_THIS_ARR_L` |
+| 95 | 0x5F | `OP_CALL_TYPED` | 194 | 0xC2 | `OP_SET_THIS_ARR_SLOT_L` |
+| 96 | 0x60 | `OP_CALL_SELF` | 195 | 0xC3 | `OP_SET_THIS_ARR_LL` |
+| 97 | 0x61 | `OP_TAIL_SELF` | 196 | 0xC4 | `OP_SET_THIS_ARR_SLOT_LL` |
+| 98 | 0x62 | `OP_TAIL_CALL` | 197 | 0xC5 | `OP_ARITH_IMM16` |
 
 Opcodes added after the original 194-entry table (single-column continuation,
 rather than re-pairing the two-column layout above on every addition):
@@ -2287,8 +2292,7 @@ Present only in non-stripped chunks; every row below is emitted automatically, n
 | Code | Opcode(s) | Comment |
 | --- | --- | --- |
 | *(every source line)* | `OP_DBG_LINE` | |
-| *(every function, once)* | `OP_DBG_FUNC_NAME` | |
-| *(every chunk, once)* | `OP_DBG_FILE_NAME` | |
+| *(the top-level chunk, once)* | `OP_DBG_FILE_NAME` | Names the whole unit; nested chunks inherit it |
 | *(a line with a debugger breakpoint set)* | `OP_DBG_BREAK` | |
 
 ### D.20 Block (raw memory) fast paths (§7.20)

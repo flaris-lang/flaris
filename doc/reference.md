@@ -3746,17 +3746,39 @@ while (true) {
 }
 ```
 
+**Every kind of stream reads through the same buffer**, so a line read costs
+one system call per 4 KB whether the bytes come from a file, a pipe or a
+socket, and `Peek` works everywhere. Only a *file* holds its writes back as
+well: a socket, a pipe, a serial port or the console has someone on the other
+end waiting, and writes to those go straight through. What that means in
+practice is the same contract every buffered runtime has - if another handle or
+another process needs to see what you wrote to a file *now*, call `Flush`;
+`Close` and collection flush for you.
+
+**Async reads and writes work on every kind of stream** - sockets, pipes, files,
+the console, serial ports - and mean the same thing on every platform: the
+calling fiber parks, other fibers keep running, and the result arrives through
+`await`. How that is achieved differs underneath. Where the operating system can
+report readiness on a handle, waiting costs nothing and thousands of idle
+streams are cheap. Where it cannot - on Windows, for anything that is not a
+socket - the operation runs on an I/O worker instead, and **each outstanding
+read or write holds one worker for its whole duration**. The worker count is set
+with `--io-threads`; a Windows program that keeps many pipe or file operations in
+flight at once needs it raised to match, or the extra operations queue behind the
+ones already running. Sockets never pay this on any platform.
+
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Accept** | `Accept(s:stream) - stream` | Accept an incoming connection on a listening socket. Returns `nil` if no connection is pending. | — |
-| **Close** | `Close(s:stream) - bool` | Close the stream. Flushes first. | — |
+| **Close** | `Close(s:stream) - bool` | Close the stream. Pending output is delivered first, as `Flush` would; it does not wait for storage (see `Sync`). A stream that is dropped without being closed is flushed and closed when it is collected, so nothing written is lost either way. | — |
 | **Connect** | `Connect(proto:string, host:string, port:int) - stream` | Open socket. `proto`: `"tcp"` or `"udp"`. `host`: hostname or IP (v4/v6). Returns `nil` on failure. | — |
 | **ConnectAsync** | `ConnectAsync(proto:string, host:string, port:int) - fiber` | Non-blocking `Connect`: the DNS lookup and TCP handshake are offloaded to the io pool, so the fiber suspends instead of stalling the VM. Use with `await`; resolves to a socket stream, or `nil` on failure. Raises on a bad `proto`/`port`. | — |
 | **AcceptTls** | `AcceptTls(s:stream, options:object) - stream` | Terminate TLS on a socket `Accept` already returned; the result is an ordinary stream. **Takes ownership of `s`** - it is detached either way, so never `Close` it afterwards. `options`: `pkcs12File` + `password` (all platforms) or `certFile` + `keyFile` (PEM, OpenSSL only); `handshakeTimeoutMs` (default 10000) bounds the handshake *and* every later read/write; `requireClientCert` demands a client certificate, validated against the system trust store. `nil` on failure - reason via `TlsLastError()`. | — |
 | **ConnectTlsAsync** | `ConnectTlsAsync(host:string, port:int, options?:object) - fiber` | Async `ConnectTls`: DNS, the TCP handshake **and** the TLS handshake run on the I/O pool, so only the calling fiber suspends. `await` resolves to a stream, or `nil` on failure. Same `options` as `ConnectTls`. Prefer this in any client that must stay responsive - a TLS handshake is far more expensive than a plain connect. | — |
 | **ConnectTls** | `ConnectTls(host:string, port:int, options?:object) - stream` | Open a TLS connection as an ordinary stream. `options`: `insecure` skips certificate/hostname verification (trusted hosts only), `timeoutMs` (default 30000) bounds the connect and each later read/write, `sni` overrides the name sent and verified against the certificate. `nil` on failure - reason via `TlsLastError()`. | — |
 | **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy data from `src` to `dst`. Optional byte limit. | — |
-| **Flush** | `Flush(s:stream) - bool` | Flush write buffer (`fsync` for files, `tcdrain` for serial, no-op for sockets). | — |
+| **Flush** | `Flush(s:stream) - bool` | Deliver pending output to the operating system, so another handle, another process or a reader that outlives a crash of this one sees it. Cheap - one write of whatever has accumulated - so it is fine after every record where visibility matters, as a logger does. Only a file stream holds output back at all; sockets, pipes, serial ports and the console write through, and `Flush` on them is a no-op. Does not wait for the device: that is `Sync`. | — |
+| **Sync** | `Sync(s:stream) - bool` | `Flush`, then wait until the bytes are on the device - `fsync` for a file, `tcdrain` for a serial port, nothing for a socket or pipe. Milliseconds, a storage barrier: use it at a checkpoint, not after every write. | — |
 | **IsOpen** | `IsOpen(s:stream) - bool` | `true` if stream is still open. | — |
 | **LastError** | `LastError() - int` | Why the calling fiber's most recent async operation (`ReadAsync`, `ReadLineAsync`, `WriteAsync`, `WaitReadable`) - or a synchronous `ReadLine` - resolved to `nil` — or, where the call reports partial progress, why it stopped short. `0` = it succeeded, so a `nil` with `LastError() == 0` means a clean end-of-file, not a failure. Per-fiber, so concurrent fibers never overwrite each other's reason. Codes: `1` timeout, `2` stream closed/invalid, `3` connection reset, `4` the read hit a size limit - its own (2 GiB for a byte read, 256 MB for a line) or the 1 GiB shared between all in-flight async reads, `6` other OS error, `7` cancelled by `Fiber.CancelIo`. Code `5` is reserved and no longer produced; the numbering is stable, so handle codes you do not know by falling through rather than by position. | — |
 | **Listen** | `Listen(proto:string, port:int, backlog?:int) - stream` | Create a listening socket. `proto`: `"tcp"` or `"udp"`. Binds a dual-stack IPv6 socket (`IPV6_V6ONLY=0`, so IPv4 clients connect too) and falls back to IPv4-only if v6 is unavailable. Sets `SO_REUSEADDR` and `SO_REUSEPORT`. `backlog` defaults to `128`. | — |
@@ -3764,9 +3786,9 @@ while (true) {
 | **TlsLastError** | `TlsLastError() - string\|nil` | Why the last `ConnectTls`/`AcceptTls` failed (bad certificate, wrong password, handshake refused). Distinct from `LastError()`, which reports an integer io-error code: a TLS setup failure is a message with no errno. `nil` if none. | — |
 | **TlsPeerCert** | `TlsPeerCert(s:stream) - object\|nil` | The peer's leaf certificate as `{ sha256, subject }` (`sha256` = lowercase hex fingerprint of the DER cert). Use for pinning / trust-on-first-use. `nil` for a non-TLS stream or when unavailable. | — |
 | **TlsServerAvailable** | `TlsServerAvailable() - bool` | `true` if this build can terminate TLS (`AcceptTls`). Narrower than having TLS at all: an old or stripped `libssl` may support clients but not servers. | — |
-| **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), or `"rw"` (read-write/create). Returns `nil` on failure. | — |
+| **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), `"a"` (append/create) or `"rw"` (read-write/create). Returns `nil` on failure. Reads are buffered ahead and writes are held back, 4 KB each way, so reading or writing a byte at a time costs no more than reading or writing a chunk; see `Flush` for when held-back output becomes visible to others. | — |
 | **OpenSerial** | `OpenSerial(port:string, baud:int, format?:string, flow?:string) - stream` | Open serial port in raw mode. Returns `nil` if the port cannot be opened. `format` is `[7\|8][N\|E\|O][1\|2]`, default `"8N1"` (databits, parity, stopbits). `flow` is `"none"` (default), `"rtscts"` (hardware RTS/CTS) or `"xonxoff"` (software). Flow control is always applied explicitly, so a port left in RTS/CTS by a previous opener is reset by `"none"`. **Baud:** on Linux any rate the C library names, `50`–`4000000` – including `230400`, `460800` and `921600` for LTE/PPP; on macOS/BSD any rate the driver accepts; on Windows any rate the driver accepts. An unsupported rate raises rather than silently running at the wrong speed. | — |
-| **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it. Returns `nil` at EOF, on error, or for a pipe/serial stream (which have no non-destructive read). | — |
+| **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it, on any kind of stream. Waits for a byte exactly as a read would, and returns `nil` at EOF or on error. | — |
 | **PeerAddr** | `PeerAddr(s:stream) - string` | Remote endpoint of a connected socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
 | **Pipe** | `Pipe() - array` | Create a pipe. Returns `[readStream, writeStream]`. | — |
 | **ReadAll** | `ReadAll(s:stream, limit?:int, timeout?:int) - block` | Read until EOF or `limit` bytes and return a `block`. On a file a short read ends the read; on a socket/pipe it reads until the peer closes (EOF) or, for a socket, the `timeout` fires (seconds, default 3) — bytes already read are returned, not discarded. Returns `nil` only on a hard I/O error. | — |
@@ -4003,7 +4025,7 @@ Virtual machine introspection and control.
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Compile** | `Compile(src:string, arity?:int) - function\|nil` | Compile a STATEMENT body into a callable function. `src` becomes the body of a function taking `arity` parameters named `arg0..argN` (use `return` for the result). Max 10 KB; returns `nil` on compile failure. | — |
-| **CompactMemory** | `CompactMemory()` | Run memory compaction pass. | — |
+| **CompactMemory** | `CompactMemory()` | Run a memory compaction pass: dropped objects are reclaimed, empty object slabs go back to the OS, and so does every string-pool chunk whose strings have all been dropped. Cheap when there is nothing to return; call it after a burst of temporary strings a long-running program will not repeat. | — |
 | **CurrentAllocations** | `CurrentAllocations() - int` | Current live allocation count. | — |
 | **Eval** | `Eval(src:string, ...args) - any` | Compile and immediately evaluate `src`. Tried first as an EXPRESSION (`Eval("40 + 2")` → `42`); if that fails to compile it is retried as a statement body, where an explicit `return` provides the result (`nil` otherwise). Extra call arguments are bound to `arg0..argN`: `Eval("arg0 * arg1", 6, 7)` → `42`. Max 10 KB; returns `nil` on compile failure (the process is never terminated by a bad `src`). Each `Eval` compiles as its own unit: it cannot reference host globals by name, but a `global` declaration in it can rebind an existing host global (warns on stderr). Eval'd code runs with full VM authority - never pass it untrusted input. | — |
 | **Exit** | `Exit(code:int) - nil` | End the program with this exit code. Inside a host application it raises instead, reporting the code: a script choosing to stop does not stop the host. | — |
@@ -4011,7 +4033,7 @@ Virtual machine introspection and control.
 | **GetModuleInfo** | `GetModuleInfo(name:string) - object\|nil` | Return an object describing a built-in module. `Members` array contains `{Name, Signature}` per function; `Constants` array contains `{Name, Type, Value}` per constant. Returns `nil` if the module name is not found. | — |
 | **GetStartTimeMs** | `GetStartTimeMs() - int` | VM start time in milliseconds since epoch. | — |
 | **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the VM halts regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
-| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
+| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache), `StringPoolChunks`/`StringPoolBytes` (chunks the string pool currently holds and their size) and `StringPoolFree` (string bodies parked in the pool for reuse - what `CompactMemory` can give back once whole chunks are free). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
 | **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a non-function handler returns `false`. | — |
 | **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §10a. | — |
 | **PatchFunction** | `PatchFunction(original:fn, replacement:fn) - bool` | Replace function at runtime. Requires running unsafe-mode `--unsafe`. The replacement may be a Flaris-function, a builtin-function or a FFI-function. Pass `nil` as replacement to remove the patch. Caveats: call sites the compiler inlined (trivial single-`return` functions) and calls made from inside JIT-compiled functions bypass the patch; self-recursive calls inside the original body also keep calling the original. | — |
@@ -4051,8 +4073,7 @@ The compiler emits these opcodes when debug symbols are enabled (default; disabl
 | Opcode | Arguments | Purpose | When emitted |
 | ------ | --------- | ------- | ------------ |
 | `OP_DBG_LINE` | `u16 line` | Mark source line number | Before each statement |
-| `OP_DBG_FUNC_NAME` | `u16 const_idx` | Mark function name | At function entry |
-| `OP_DBG_FILE_NAME` | `u16 const_idx` | Mark source file | Once per compilation unit |
+| `OP_DBG_FILE_NAME` | `u16 const_idx` | Mark source file | Once, at the head of the unit |
 | `OP_DBG_BREAK` | `u16 code` | Breakpoint | At `breakpoint` statement |
 
 **Bytecode size overhead with debug symbols:** ~15%.
@@ -4068,7 +4089,6 @@ With debug symbols:
 
 ```bash
 [0000] OP_DBG_FILE_NAME    "main.fls"
-[0003] OP_DBG_FUNC_NAME    "compute"
 [0006] OP_DBG_LINE         line=2
 [0009] OP_GET_LOCAL        x
 [0011] OP_IMM8             2

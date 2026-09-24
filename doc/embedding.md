@@ -15,6 +15,7 @@ process, with nothing copied between them.
 - [4. Lifecycle](#4-lifecycle)
 - [5. Configuration](#5-configuration)
 - [6. Loading code](#6-loading-code)
+- [6a. Contexts](#6a-contexts)
 - [7. Calling into Flaris](#7-calling-into-flaris)
 - [8. Values and ownership](#8-values-and-ownership)
 - [9. Native modules: your C functions, called from script](#9-native-modules-your-c-functions-called-from-script)
@@ -24,6 +25,7 @@ process, with nothing copied between them.
 - [10c. Embedding from C#](#10c-embedding-from-c)
 - [11. Driving the scheduler](#11-driving-the-scheduler)
 - [12. Errors and diagnostics](#12-errors-and-diagnostics)
+- [12a. Threads: one VM per thread](#12a-threads-one-vm-per-thread)
 - [13. Limits and what is not supported](#13-limits-and-what-is-not-supported)
 - [14. API reference](#14-api-reference)
 
@@ -379,7 +381,8 @@ FlarisLoadBytecode(plugin, "untrusted.flx");
 ```
 
 Both scripts now run in one VM, on one thread, sharing one object pool — but not
-one namespace, not one set of privileges, and not one budget.
+one namespace, not one set of privileges, and not one budget. For scripts that
+should not share a thread or a pool either, see section 12a.
 
 ### What a context isolates
 
@@ -487,6 +490,7 @@ FlarisReleaseValue(args[1]);   /* a small int allocates nothing; releasing it
 | `FLARIS_ERR_SUSPENDED` | the function suspended (see below) |
 | `FLARIS_ERR_INTERRUPTED` | `FlarisInterrupt` stopped it (section 10b) |
 | `FLARIS_ERR_ARGS` | bad argument count, or more than 32 arguments |
+| `FLARIS_ERR_WRONG_THREAD` | `ctx` belongs to another VM (section 12a) |
 
 `FlarisHasFunction(ctx, "Damage")` reports whether a name is callable — useful
 when the script decides which hooks it implements:
@@ -1081,11 +1085,11 @@ rather than an unwind through native frames.
 
 ### The constraint that matters most
 
-The threading rule in section 13 applies unchanged: **every call must come from
-the thread that called `FlarisInitVM`**. In C# that means no `async` continuation
-that might resume elsewhere, and no `Task.Run` around a call. If your
-application is `async`, marshal Flaris work onto a single dedicated thread and
-keep it there.
+The threading rule in section 12a applies: **every call must come from the
+thread that called `FlarisInitVM`** for that VM. In C# that means no `async`
+continuation that might resume elsewhere, and no `Task.Run` around a call. If
+your application is `async`, marshal each VM's work onto a single dedicated
+thread and keep it there.
 
 Note also that a native module function running on the VM thread must not block
 for long: the scheduler is cooperative, so a C# method that waits stalls every
@@ -1267,19 +1271,98 @@ still goes to stdout; redirect that by your own means if you need to.
 
 ---
 
+## 12a. Threads: one VM per thread
+
+Everything up to here has described one VM. A host that wants parallelism starts
+more: **every thread that calls `FlarisInitVM` gets a VM of its own**, and any
+number of threads may do so.
+
+No function here takes a VM argument, because each one acts on the VM of the
+thread that calls it. The code that runs a single VM runs one per thread
+unchanged:
+
+```c
+static void *Worker(void *arg)
+{
+    FlarisConfig cfg = flarisConfigDefaults;
+    cfg.installSignals = FLARIS_OFF; /* let one thread own the process's signals */
+    cfg.ioThreads      = 2;          /* this VM's own I/O workers */
+    FlarisInitVM(&cfg);
+
+    FlarisContext *ctx;
+    FlarisCreateContext(NULL, &ctx);
+    FlarisLoadSource(ctx, (const char *)arg);
+
+    char err[256];
+    FlarisCall(ctx, "Run", NULL, 0, NULL, err, sizeof err);
+    while (FlarisHasWork(NULL))
+        FlarisPump(NULL, 0);
+
+    FlarisDestroyContext(ctx);
+    FlarisShutdownVM(0);
+    return NULL;
+}
+```
+
+### What is isolated
+
+Everything that makes a VM a VM. Two VMs share no objects, no globals, no
+classes, no fibers, no timers and no I/O workers, and nothing between them is
+locked on the calling path.
+
+Native modules are per VM too, which is the one thing that catches people out:
+call `FlarisRegisterModule` on **each** thread, after that thread's
+`FlarisInitVM`. Registering on one thread does not publish the module to the
+others.
+
+Values and contexts do not travel either. A `FlarisValue` belongs to the VM that
+made it and means nothing to another. A context belongs to the VM that created
+it, and handing one to the wrong thread returns `FLARIS_ERR_WRONG_THREAD` from
+every entry point that takes a context, rather than corrupting either side.
+Passing a `FlarisValue` across is *not* detected — copy what you need over as
+plain C data.
+
+`FlarisInterrupt` is the deliberate exception: it is one store to a flag, so a
+watchdog thread may aim it at any context (section 10b).
+
+### What is still shared, because the process has only one
+
+| Shared | What it means for you |
+|--------|-----------------------|
+| Signal dispositions | The first VM configured with `installSignals` on installs them; they are restored when the last such VM shuts down. Leave it on for one thread, or off everywhere and handle signals yourself. |
+| Compilation | Serialised across the process: two threads compiling at the same moment take turns. Compile once, or ship bytecode, rather than loading source in a hot loop on many threads. |
+| Libraries loaded through `Ffi` | The mapping is shared and stays loaded while any VM holds it, so the plugin's own code may run on several threads at once and its globals must be thread-safe. Callback registrations are *not* shared — a name each VM registers resolves only for that VM. |
+| `FlarisSetArgs` | One argv for the process; the last caller wins for every VM. |
+| `stdout` and `stderr` | Output from several VMs interleaves. A log handler is per VM (section 12), so set one on each thread to keep the VM's own diagnostics apart; a script's own printing is yours to redirect. |
+| The process | A native module or an FFI plugin that crashes takes every VM with it. |
+
+### Threads or contexts?
+
+They answer different questions, and they compose.
+
+- A **context** isolates names, authority and budgets inside one VM, on one
+  thread (section 6a). It costs about 0.15 KB and a fraction of a microsecond,
+  so it is the right tool for running several scripts that must not see each
+  other.
+- A **thread with its own VM** isolates everything else as well, adds
+  parallelism, and gives that script its own `maxSlabs` ceiling. It costs a
+  whole VM: its own object pool and its own workers.
+
+Untrusted code is a context question. Throughput, and a hard memory ceiling per
+script, are thread questions.
+
+---
+
 ## 13. Limits and what is not supported
 
-**One VM per process.** VM state is process-wide, so there is no handle type and
-no way to hold two VMs at once. `FlarisShutdownVM` makes the process reusable,
-which covers reloading a script, but not isolating several scripts from each
-other.
+**One VM per thread.** A thread holds at most one VM and there is no handle
+type, so every call acts on the calling thread's VM. Several scripts inside one
+VM are contexts (section 6a); several VMs are threads (section 12a). Neither a
+context nor a value crosses from one VM to another.
 
-**One thread.** Every function here must be called from the thread that called
-`FlarisInitVM`. Fibers are cooperative and run on that thread; the I/O worker
-threads never touch VM state.
-
-**One script per VM.** Loading a second script into a live VM is not supported;
-shut down and initialise again.
+**Fibers do not span threads.** Fibers are cooperative and run on their own VM's
+thread, so `Fiber.Run` buys concurrency, not parallelism. For parallelism, start
+a second VM on a second thread.
 
 **A native module is bound to the host that registers it.** Section 9 covers
 this in full: a `.flx` containing calls into your module runs only in a process
@@ -1290,7 +1373,8 @@ such scripts from your own host, at load.
 **No memory budget per context.** Allocations come from a VM-wide pool, so one
 context cannot be given its own ceiling; a script that allocates without bound
 exhausts the VM's pool, which raises rather than aborting, but does so for
-everyone. Recursion depth and scheduler share are bounded per context (section
+everyone in that VM. A script that must have its own ceiling needs its own VM on
+its own thread, where `maxSlabs` bounds it alone (section 12a). Recursion depth and scheduler share are bounded per context (section
 6a), and a runaway loop is stoppable (section 10b); memory is not yet.
 
 **A JIT-compiled loop cannot be stopped.** Native code runs as one C call with
@@ -1420,3 +1504,5 @@ an owned value; readers return borrowed data valid while the value is.
 | `FLARIS_ERR_REGISTERED` | -13 | That module name is already taken |
 | `FLARIS_ERR_COLLISION` | -14 | Two names share a 32-bit hash; rename one |
 | `FLARIS_ERR_BUSY` | -15 | The context is running its own code; it cannot be destroyed now |
+| `FLARIS_ERR_INTERRUPTED` | -16 | `FlarisInterrupt` stopped the call |
+| `FLARIS_ERR_WRONG_THREAD` | -17 | That context belongs to another VM (section 12a) |
