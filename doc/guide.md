@@ -20,10 +20,11 @@ Spec Revision: 2026-07-25
 7. [Functions](#7-functions)
 8. [Classes](#8-classes)
 9. [Fibers & Async](#9-fibers--async)
-10. [Analyzer & Diagnostics](#10-analyzer--diagnostics)
-11. [Debugging](#11-debugging)
-12. [10-Minute Tours](#12-10-minute-tours)
-13. [Package Manager (flarispm)](#13-package-manager-flarispm)
+10. [Working with JSON](#10-working-with-json)
+11. [Analyzer & Diagnostics](#11-analyzer--diagnostics)
+12. [Debugging](#12-debugging)
+13. [10-Minute Tours](#13-10-minute-tours)
+14. [Package Manager (flarispm)](#14-package-manager-flarispm)
 
 ---
 
@@ -1768,15 +1769,15 @@ class User {
 class FileHandle {
     let file = nil;
     fn Constructor(path) {
-        this.file = File.Open(path, "w");
+        this.file = Stream.Open(path, "w");
     }
 
     fn Write(text) {
-        File.Write(this.file, text);
+        Stream.WriteString(this.file, text);
     }
 
     fn Destructor() {
-        File.Close(this.file);
+        Stream.Close(this.file);
     }
 }
 
@@ -2156,6 +2157,7 @@ Several standard-library functions have an `Async` variant that offloads blockin
 | `File.WriteText(path, text)` | `File.WriteTextAsync(path, text)` | File |
 | `Net.ResolveDNS(host)` | `Net.ResolveDNSAsync(host)` | Net |
 | `Os.Execute(cmd)` | `Os.ExecuteAsync(cmd)` | Os |
+| `Os.WaitTimeout(pid, ms)` | `Os.WaitAsync(pid, ms?)` | Os |
 
 Usage - call with `await` inside an async function:
 
@@ -2293,7 +2295,121 @@ Console.WriteLine(await outer(5));  // 11
 
 ---
 
-## 10. Analyzer & Diagnostics
+## 10. Working with JSON
+
+The `Json` module is built in - no import. It follows the JSON standard strictly
+and never guesses: invalid input gives `nil`, and `Json.LastError()` tells you
+why and where.
+
+### Parse and serialize
+
+```flaris
+let order = Json.Parse("{\"id\": 7, \"items\": [{\"sku\": \"A1\", \"price\": 9.5}]}");
+Console.WriteLine(order.items[0].sku);          // A1
+
+let text = Json.Stringify(order);              // compact
+let pretty = Json.Stringify(order, true);      // 2-space indent
+let custom = Json.Stringify(order, { indent: 4, sortKeys: true });
+```
+
+Numbers keep their kind: `7` parses as an `int`, `9.5` as a `float`, and a
+float is written so it parses back as the same float (`1.0` stays `1.0`,
+`0.1` stays `0.1`). A value that has no JSON form - NaN, a function - becomes
+`null`.
+
+### When parsing fails
+
+`Parse` returns `nil` for invalid input - and also for the valid document
+`null`. When the difference matters, check the error:
+
+```flaris
+let v = Json.Parse(body);
+if (v == nil) {
+    let e = Json.LastError();
+    if (e != nil) {
+        Console.WriteLine("bad JSON at line ", e.line, ", column ", e.column, ": ", e.message);
+        return nil;
+    }
+}
+```
+
+A document that is valid but too large (over 4 million values, or a string
+over 128 MB) raises instead of returning `nil`, so it cannot pass as "no data".
+
+### Mapping JSON onto a class
+
+`Deserialize` fills the fields of a class by name - handy for request bodies
+and config files. Each value must fit the field's type, which is taken from the
+field's default:
+
+```flaris
+class Item {
+    let sku = "";
+    let price = 0.0;
+    let tags: [string] = nil;
+}
+
+let items = Json.Deserialize("[{\"sku\": \"A1\", \"price\": 9}]", Item);
+Console.WriteLine(type(items[0].price) == Type.Float); // true - an int fits a float field
+
+let bad = Json.Deserialize("{\"price\": \"cheap\"}", Item);
+Console.WriteLine(bad == nil, " ", Json.LastError().message);
+// true field 'price' expects a number, got a string
+```
+
+Unknown keys are ignored and missing ones keep their defaults; the constructor
+is not run. `Json.Stringify(instance)` writes the fields back out.
+
+### Reaching into a document
+
+Paths use JSONPath syntax (or a JSON Pointer when they start with `/`):
+
+```flaris
+let doc = Json.Parse(text);
+Json.Find("items[0].sku", doc);                // "A1"
+Json.Find("items[-1].price", doc);             // last item
+Json.Find("items[*].sku", doc);                // every sku, as an array
+Json.Find("$..price", doc);                    // every price, at any depth
+Json.Find("/items/0/sku", doc);                // JSON Pointer
+Json.Exists("items[*].discount", doc);         // false unless one has it
+
+Json.Set(doc, "meta.source", "import");        // creates `meta`
+Json.Remove(doc, "items[0]");
+```
+
+`Json.FastSelect(path, text)` answers a path straight from the text without
+building the whole tree - the fast choice for pulling one field out of a large
+response you otherwise do not need.
+
+### Changing documents
+
+```flaris
+// RFC 7386 merge-patch: null deletes, objects merge, the rest replaces
+Json.Merge(settings, { theme: "dark", beta: nil });
+
+// RFC 6902 JSON Patch: returns a patched copy, or nil if any step fails
+let next = Json.Patch(doc, [
+    { op: "replace", path: "/items/0/price", value: 8.5 },
+    { op: "add", path: "/items/-", value: { sku: "B2", price: 3.0 } }
+]);
+```
+
+`Set`, `Remove` and `Merge` change the value in place and refuse (raising
+`ConstAssign`) to touch a `const` or `Object.Freeze`d value; `Patch` works on
+a copy, so it can take a frozen one.
+
+### Canonical form, formatting, NDJSON
+
+- `Json.Canonicalize(v)` - RFC 8785 canonical JSON: the same bytes for equal
+  values however they were built, for hashing and signatures.
+- `Json.Format(text)` / `Json.Minify(text)` - re-lay out JSON text without
+  changing a single number or escape; `nil` if the text is not valid JSON.
+- `Json.ParseLines(text)` / `Json.StringifyLines(array)` - newline-delimited
+  JSON (one value per line), as used by log pipelines and streaming APIs.
+
+---
+
+## 11. Analyzer & Diagnostics
 
 After parsing, Flaris runs a semantic analyzer. It resolves names, builds scopes, validates language rules, and emits helpful errors and warnings before bytecode is generated.
 
@@ -2512,7 +2628,7 @@ if (tmp) { ... }
   `|` and `^` run on integers only and never widen to float. `+` is never
   reported: it falls back to string concatenation for any operand pair.
 
-## 11. Debugging
+## 12. Debugging
 
 Flaris debugging is built directly into the language and VM. No external debugger
 required - and no separate adapter process either: the VM speaks the Debug
@@ -2769,7 +2885,7 @@ flarisvm --exec app.flx
 
 ---
 
-## 12. 10-Minute Tours
+## 13. 10-Minute Tours
 
 These tours help you get productive quickly if you're coming from another language.
 
@@ -3145,7 +3261,7 @@ Think of Flaris as **a safe, dynamic VM - not a systems language**.
 
 ---
 
-## 13. Package Manager (flarispm)
+## 14. Package Manager (flarispm)
 
 `flarispm` is the official Flaris package manager - written entirely in Flaris itself. It installs third-party libraries from any public or private git repository (or from a direct `.flx` URL), compiles them to `.flx` bytecode, and places them in the per-user library directory (`~/.flaris/libs`, or `$FLARIS_LIBS`) where `flarisvm` resolves them automatically - no `--libs` flag needed.
 

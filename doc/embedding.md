@@ -1333,6 +1333,7 @@ watchdog thread may aim it at any context (section 10b).
 | Compilation | Serialised across the process: two threads compiling at the same moment take turns. Compile once, or ship bytecode, rather than loading source in a hot loop on many threads. |
 | Libraries loaded through `Ffi` | The mapping is shared and stays loaded while any VM holds it, so the plugin's own code may run on several threads at once and its globals must be thread-safe. Callback registrations are *not* shared — a name each VM registers resolves only for that VM. |
 | `FlarisSetArgs` | One argv for the process; the last caller wins for every VM. |
+| Environment and working directory | `Os.SetEnv` and `Os.Chdir` change them for the whole process: every VM, and every child process started afterwards, sees the change. `Os` serialises its own environment reads and writes and its process launches across threads; a native module or FFI plugin that calls `getenv`/`setenv` itself is outside that lock. Child processes themselves are per VM — `Os.KillChild` and the `Os` pipe calls accept only what that VM's `Os.Spawn` returned. |
 | `stdout` and `stderr` | Output from several VMs interleaves. A log handler is per VM (section 12), so set one on each thread to keep the VM's own diagnostics apart; a script's own printing is yours to redirect. |
 | The process | A native module or an FFI plugin that crashes takes every VM with it. |
 

@@ -249,7 +249,7 @@ later with `Crypto.Ed25519Verify`.
 
 A `.flx` is **executable code, not a sandboxed format**. Running one is equivalent
 to running a native program: it can read and write files, spawn processes
-(`Os.Run`), open sockets, and - with `--unsafe` - call arbitrary C via FFI and access raw
+(`Os.RunEx`, `Os.Execute`), open sockets, and - with `--unsafe` - call arbitrary C via FFI and access raw
 memory. On load the VM validates bytecode structure (validate chunks, JIT-IR
 validation, size/count caps) to contain *malformed* input safely, but it is **not**
 a security sandbox for *malicious* input.
@@ -629,7 +629,7 @@ These are the actual types values carry at runtime.
 | Type | Description |
 |------|-------------|
 | `array` | Dynamic, zero-indexed array. Max 10,000,000 elements. |
-| `object` | Hash-based dictionary with **string keys** (property names). Indexing with a non-string key (`o[42] = x`) raises. For int/char/float or other value keys use `Collections.HashMap` / `Collections.OrderedMap`. Max 10,000,000 properties. Property iteration order is not stable across processes (see `Json.Canonicalize` for a deterministic ordering). |
+| `object` | Hash-based dictionary with **string keys** (property names). Indexing with a non-string key (`o[42] = x`) raises. For int/char/float or other value keys use `Collections.HashMap` / `Collections.OrderedMap`. Max 10,000,000 properties. Properties iterate in insertion order, identically in every process (see `Json.Canonicalize` for an order independent of how the object was built). |
 | `exception` | Exception with code and message. |
 
 #### Structured Types
@@ -725,8 +725,8 @@ a method/property access on `5`). Mixed int + float operations always yield
 | Property | Value |
 |----------|-------|
 | **Encoding** | UTF-8 |
-| **Immutable** | Yes - mutation creates a new string |
-| **Indexing** | Byte-level (returns 1-byte string) |
+| **Mutability** | Every `String` function and operator returns a new string; only `s[i] = ch` writes in place, and that write is seen through every variable holding the same string (a literal is copied first, never modified) |
+| **Indexing** | Byte-level (`s[i]` returns the byte as a `char`) |
 | **Max size** | 256 MB |
 
 **UTF-8 Indexing Model**
@@ -1871,7 +1871,7 @@ Fibers are cooperatively scheduled - they never run unless resumed or awaited. N
 
 ### Strings
 
-Strings are immutable. Each concatenation allocates.
+`a + b` allocates a new string; `s += piece` appends in place only while `s` is the sole reference to its value.
 
 - Avoid repeated concatenation in loops.
 - Accumulate data first, convert to string once.
@@ -1945,7 +1945,7 @@ Each function table has a `JIT` column stating whether the function can be calle
 | **Strings & Text** | `String` | UTF-8 string operations |
 | | `Char` | Unicode character classification and conversion |
 | | `Regex` | POSIX extended regular expression matching |
-| | `Json` | JSON parse, serialize, and path query |
+| | `Json` | JSON parse, serialize, path query/mutation, patch, canonical form |
 | | `Convert` | Type conversion across all integer widths |
 | **Math & Encoding** | `Math` | Full mathematical library |
 | | `Random` | Seeded, deterministic PCG32 random streams |
@@ -2594,19 +2594,19 @@ Filesystem directory operations.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **Copy** | `Copy(src:string, dst:string) - bool` | Recursively copy directory `src` into `dst` (created if missing; existing `dst` is merged into). Symlinks are copied as links, never dereferenced. `false` if `src` is not a directory or any entry could not be copied. | — |
+| **Copy** | `Copy(src:string, dst:string) - bool` | Recursively copy directory `src` into `dst` (created if missing; existing `dst` is merged into). Symlinks are copied as links, never dereferenced; directory permission bits are applied once a directory's entries are in, so a read-only source copies. `false` if `src` is not a directory, `dst` is `src` or lies inside it, or any entry could not be copied. | — |
 | **Create** | `Create(path:string) - bool` | Create directory at `path`. Returns `false` if already exists. | — |
 | **CreateTemp** | `CreateTemp(prefix?:string) - string` | Atomically create a uniquely-named directory in the system temp dir and return its path (`mkdtemp`). Optional name prefix (default `"flaris"`) must not contain path separators. Not auto-removed - pair with `DeleteAll`. `nil` on failure. | — |
 | **Delete** | `Delete(path:string) - bool` | Delete directory (must be empty). | — |
 | **DeleteAll** | `DeleteAll(path:string) - bool` | Recursively delete a directory and everything under it (`rm -rf`). Symlinks are removed as links, never followed out of the tree. Refuses an empty path or the filesystem root. `true` only if every entry was removed. | — |
-| **Ensure** | `Ensure(path:string) - bool` | Create directory (and parents) if not exists; no-op if exists. | — |
+| **Ensure** | `Ensure(path:string) - bool` | Create directory (and parents) if not exists; no-op if exists. `true` when `path` is a directory afterwards, `false` otherwise (empty path, a file in the way, no permission). | — |
 | **Exists** | `Exists(path:string) - bool` | `true` if path exists and is a directory. | — |
 | **GetModifiedTime** | `GetModifiedTime(path:string) - int` | Returns Unix timestamp of last modification. | — |
 | **Glob** | `Glob(pattern:string, followSymlinks?:bool) - array` | Recursive glob: each `/`-separated segment supports `*`, `?`, and `[set]`; a bare `**` segment matches zero or more directory levels (`"src/**/*.fls"`). Returns matching paths (files and directories) relative to the current directory (or absolute if the pattern is). Case-sensitive; wildcards do not match a leading `.` (name the dot explicitly). Depth capped at 64. `followSymlinks` defaults to `true`; pass `false` to keep `**` from descending through symlinked directories (POSIX). Explicitly named path components are always followed - only `**` wildcard descent is affected. | — |
 | **List** | `List(path:string) - array` | Returns array of all entry names (files + dirs) in `path`. | — |
 | **Move** | `Move(src:string, dst:string) - bool` | Rename a directory (atomic within one filesystem; fails across filesystems with no copy+delete fallback). | — |
-| **ListDirs** | `ListDirs(path:string) - array` | Returns array of subdirectory names only. | — |
-| **ListFiles** | `ListFiles(path:string, filters?:string) - array` | Returns array of immediate **non-directory** entry names (`stat`'d to exclude subdirectories - the complement of `ListDirs`; use `List` for every entry regardless of kind). Optionally filtered by a comma-separated glob list (`"*.txt, *.md"` - full `*`/`?`/`[set]` wildcards, case-insensitive). Empty array if the directory can't be opened. Non-recursive. | — |
+| **ListDirs** | `ListDirs(path:string) - array` | Returns array of subdirectory names only (symlinks to directories included). | — |
+| **ListFiles** | `ListFiles(path:string, filters?:string) - array` | Returns array of immediate **non-directory** entry names (the complement of `ListDirs`; symlinks are followed and a broken one is left out; use `List` for every entry regardless of kind). Optionally filtered by a comma-separated glob list (`"*.txt, *.md"` - full `*`/`?`/`[set]` wildcards, case-insensitive, spaces around each pattern ignored). Empty array if the directory can't be opened. Non-recursive. | — |
 
 ---
 
@@ -2778,36 +2778,36 @@ File read, write, and metadata operations.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **AppendLines** | `AppendLines(path:string, lines:array) - bool` | Append array of strings as lines to file. | — |
-| **AppendText** | `AppendText(path:string, text:string) - bool` | Append text string to file. | — |
-| **Copy** | `Copy(src:string, dst:string) - bool` | Copy file from `src` to `dst`. | — |
-| **CopyAsync** | `CopyAsync(src:string, dst:string) - fiber` | Non-blocking `Copy`. Use with `await`; resolves to `true` on success / `nil` on error. Other fibers run while the file is copied. | — |
+| **AppendLines** | `AppendLines(path:string, lines:array) - bool` | As `WriteLines`, appending (the file is created if missing). | — |
+| **AppendText** | `AppendText(path:string, text:string) - bool` | Append text to the file (created if missing), bytes written verbatim. `false` if it can't be opened or written. | — |
+| **Copy** | `Copy(src:string, dst:string) - bool` | Copy file from `src` to `dst` (binary, overwriting `dst`). `false` on any open/read/write error, or when `src` and `dst` are the same file (including through a hard or symbolic link) - the file is left untouched. | — |
+| **CopyAsync** | `CopyAsync(src:string, dst:string) - fiber` | Non-blocking `Copy`. Use with `await`; resolves to `true` on success, `false` on error or when `src` and `dst` are the same file. Other fibers run while the file is copied. | — |
 | **CreateHardLink** | `CreateHardLink(target:string, linkPath:string) - bool` | Create a hard link at `linkPath` sharing `target`'s inode. `target` must exist and be on the same filesystem. | — |
 | **CreateSymlink** | `CreateSymlink(target:string, linkPath:string) - bool` | Create a symbolic link at `linkPath` pointing to `target` (need not exist). On Windows requires Developer Mode / admin. | — |
-| **Delete** | `Delete(path:string) - bool` | Delete file at `path`. | — |
+| **Delete** | `Delete(path:string) - bool` | Delete the file (or symbolic link) at `path`. `false` if it can't be removed - including for a directory, which takes `Directory.Delete`. | — |
 | **Exists** | `Exists(path:string) - bool` | `true` if path exists and is a regular file (symlinks followed). Directories report `false` - use `Directory.Exists`. | — |
 | **GetModifiedTime** | `GetModifiedTime(path:string) - int` | Returns Unix timestamp of last modification. | — |
-| **Lines** | `Lines(path:string, callback:fn) - int` | Stream the file line by line, calling `callback(line)` for each (trailing CR/LF stripped) without building an array - the memory-cheap alternative to `ReadLines` for large files. The callback may return `false` to stop early. Returns the number of lines processed, or `nil` if the file can't be opened or the callback raises. | — |
+| **Lines** | `Lines(path:string, callback:fn) - int` | Stream the file line by line, calling `callback(line)` for each (terminators stripped as `ReadLines` does) without building an array - the memory-cheap alternative to `ReadLines` for large files. The callback may return `false` to stop early. Returns the number of lines processed, or `nil` if the file can't be opened, a line passes 256 MB, or the callback raises. | — |
 | **Move** | `Move(src:string, dst:string) - bool` | Move/rename file. | — |
-| **ReadAllBytes** | `ReadAllBytes(path:string) - block` | Read entire file as binary block. | — |
-| **ReadAllBytesAsync** | `ReadAllBytesAsync(path:string) - fiber` | Non-blocking `ReadAllBytes`. Use with `await`. Other fibers run while the file is read. | — |
-| **ReadLines** | `ReadLines(path:string) - array` | Read file into array of strings (one per line). | — |
+| **ReadAllBytes** | `ReadAllBytes(path:string) - block` | Read the entire file as a byte block, to end of file - pipes and `/proc` files, whose reported size is 0, read in full. `nil` if it can't be opened or read, or passes 2 GiB. | — |
+| **ReadAllBytesAsync** | `ReadAllBytesAsync(path:string) - fiber` | Non-blocking `ReadAllBytes`. Use with `await`; resolves as `ReadAllBytes` returns. Other fibers run while the file is read. | — |
+| **ReadLines** | `ReadLines(path:string) - array` | Read file into array of strings (one per line). Lines end at `\n`; a `\r` right before it is stripped too, a lone `\r` is data - the rule `Stream.ReadLine` uses. Lines of any length stay whole. `nil` if the file can't be opened or a line passes 256 MB. | — |
 | **ReadLink** | `ReadLink(path:string) - string` | The target a symbolic link points to (the raw stored target, not a resolved path), or `nil` if not a symlink / unreadable. POSIX only - `nil` on Windows. | — |
-| **ReadText** | `ReadText(path:string) - string` | Read entire file as UTF-8 string. | — |
-| **ReadTextAsync** | `ReadTextAsync(path:string) - fiber` | Non-blocking `ReadText`. Use with `await`. Other fibers run while the file is read. | — |
+| **ReadText** | `ReadText(path:string) - string` | Read the entire file as a string, to end of file (pipes and `/proc` files included). Bytes are taken as they are - no encoding check or conversion. `nil` if it can't be opened or read, or passes 256 MB. | — |
+| **ReadTextAsync** | `ReadTextAsync(path:string) - fiber` | Non-blocking `ReadText`. Use with `await`; resolves as `ReadText` returns. Other fibers run while the file is read. | — |
 | **Sha256** | `Sha256(path:string, raw?:bool) - string` | Compute SHA-256 of file contents. Optional `raw` for binary output. `nil` if the file cannot be opened or hashed (an unseekable FIFO, for example). | — |
 | **Sha256Async** | `Sha256Async(path:string, raw?:bool) - fiber` | Non-blocking `Sha256`. Use with `await`; resolves to the hex string (or 32-byte block if `raw`), or `nil` if the file can't be opened or hashed. | — |
-| **SetMode** | `SetMode(path:string, mode:int) - bool` | Set permission bits (POSIX `chmod`, low `07777` of `mode`). On Windows only the write bit is honored. `nil` if it can't be applied. | — |
-| **SetModifiedTime** | `SetModifiedTime(path:string, unixSeconds:int) - bool` | Set the file's modification time to a Unix timestamp; access time is preserved where the platform allows. `nil` on failure. | — |
-| **Size** | `Size(path:string) - int` | File size in bytes, or `nil` if the file can't be opened. | — |
+| **SetMode** | `SetMode(path:string, mode:int) - bool` | Set permission bits (POSIX `chmod`, low `07777` of `mode`). On Windows only the write bit is honored. `false` if it can't be applied. | — |
+| **SetModifiedTime** | `SetModifiedTime(path:string, unixSeconds:int) - bool` | Set the file's modification time to a Unix timestamp; access time is preserved where the platform allows. `false` on failure. | — |
+| **Size** | `Size(path:string) - int` | Size in bytes of a regular file (symlinks followed). `nil` for anything else - missing, a directory, a device or pipe (which is never opened, so it can't block). | — |
 | **Stat** | `Stat(path:string) - object` | One-syscall metadata: `{Size, Modified, Accessed, Created, IsDir, IsFile, IsSymlink, Mode}`. Times are Unix timestamps; `Mode` is the permission bits (octal 7777 mask); `Created` uses birth time on macOS/BSD, else ctime. Returns `nil` if the path does not exist. A dangling symlink stats as the link itself. | — |
-| **Touch** | `Touch(path:string) - bool` | Create file if missing; set access + modification time to now (like POSIX `touch`). | — |
+| **Touch** | `Touch(path:string) - bool` | Create file if missing; set access + modification time to now (like POSIX `touch`). `false` on failure. | — |
 | **Truncate** | `Truncate(path:string, size:int) - bool` | Resize the file to exactly `size` bytes (extension zero-fills). `false` if `size` is negative or the file can't be resized. | — |
 | **WriteAllBytes** | `WriteAllBytes(path:string, data:string\|block) - bool` | Write binary data to file (overwrite). `false` on open/write failure. | — |
-| **WriteAtomic** | `WriteAtomic(path:string, data:string\|block) - bool` | Durable write: stream into a temp file in the same directory, `fsync`, then `rename()` over the target - a reader never sees a half-written file, and a crash leaves either the old or new content, never a truncated mix. `false` on any failure (temp file removed). Atomic only within one filesystem. | — |
-| **WriteLines** | `WriteLines(path:string, lines:array) - bool` | Write array of strings as lines (overwrite). `nil` on open/write failure. | — |
-| **WriteText** | `WriteText(path:string, text:string) - bool` | Write text string to file (overwrite). `nil` on open/write failure. | — |
-| **WriteTextAsync** | `WriteTextAsync(path:string, text:string) - fiber` | Non-blocking `WriteText`. Use with `await`. Other fibers run while the file is written. | — |
+| **WriteAtomic** | `WriteAtomic(path:string, data:string\|block) - bool` | Durable write: stream into a temp file in the same directory, `fsync`, then `rename()` over the target - a reader never sees a half-written file, and a crash leaves either the old or new content, never a truncated mix. An existing file keeps its permission bits; a new one gets the same mode `WriteText` would give it. `false` on any failure (temp file removed). Atomic only within one filesystem. | — |
+| **WriteLines** | `WriteLines(path:string, lines:array) - bool` | Write each string element followed by `\n` (overwrite); other elements are skipped. Written verbatim, so `\n` stays `\n` on Windows too. `false` on open/write failure, or for a typed `[int]`/`[float]` array. | — |
+| **WriteText** | `WriteText(path:string, text:string) - bool` | Write text to the file (overwrite), bytes written verbatim. `false` on open/write failure. | — |
+| **WriteTextAsync** | `WriteTextAsync(path:string, text:string) - fiber` | Non-blocking `WriteText`. Use with `await`; resolves to `true`, or `false` on failure. Other fibers run while the file is written. | — |
 
 ---
 
@@ -2815,7 +2815,7 @@ File read, write, and metadata operations.
 
 Namespace: **`FileWatch`**
 
-File and directory event monitoring. Up to 64 concurrent watchers. Uses `inotify` on Linux, `kqueue` on macOS/BSD, and `ReadDirectoryChangesW` on Windows. The callback fires on every scheduler tick where an event is pending - no fiber is blocked.
+File and directory event monitoring. Up to 64 concurrent watchers per VM. Uses `inotify` on Linux, `kqueue` on macOS/BSD, and `ReadDirectoryChangesW` on Windows. The callback fires on every scheduler tick where an event is pending - no fiber is blocked. It runs as its own call with the permissions of the fiber that opened the watch and must run to completion: to wait on something (`await`, `Fiber.Sleep`), start a fiber from the callback.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
@@ -2896,24 +2896,40 @@ CRC interoperability note:
 
 Namespace: **`Json`**
 
-JSON parsing, serialization, path-based query and mutation, and NDJSON.
+JSON parsing and serialization (RFC 8259), path query and mutation (JSONPath, RFC 9535 subset; JSON Pointer, RFC 6901), merge-patch (RFC 7386), JSON Patch (RFC 6902), canonical form (RFC 8785), NDJSON, reformatting, and mapping onto classes.
+
+**Parsing** is strict: no comments, no trailing commas, no leading zeros, strings must be valid UTF-8 with control characters escaped, `\u0000` is rejected (a Flaris string cannot hold NUL). A number without fraction or exponent is an `int` when it fits 64 bits, else a `float`; a float that underflows becomes `0.0`, one that overflows makes the document invalid. Duplicate object keys resolve last-wins. Malformed input returns `nil` - call `LastError` for the reason and position.
+
+**Serializing** writes floats in the shortest form that reads back exactly (`0.1`, `0.30000000000000004`, `1e+21`), and an integral float keeps `.0` (`1.0`) so it parses back as a float. NaN and ±Infinity have no JSON form and become `null`, as do values with none (functions, fibers, ...). Class instances serialize as objects of their declared fields. Number text never depends on the process locale.
+
+**Paths** (`Find`, `Exists`, `FastSelect`, `Set`, `Remove`): an optional `$`, then segments. `.name`, `["name"]` or `['name']` (quoted names have no escapes and may contain `.`, `[` or `*`; `["*"]` is the literal key `*`), `[n]` (negative counts from the end: `[-1]` is the last element), `*` or `[*]` (every member of an object or element of an array), `[start:end:step]` (a slice, RFC 9535 semantics, any part optional), and `..` before any of these for recursive descent (`$..price`: the node and all its descendants). The first `.` may be left out (`a.b`). A path that starts with `/` is a **JSON Pointer** instead (`/a/0/b~1c`, `~1` = `/`, `~0` = `~`; `-` addresses one past the last element). `$` or `""` alone is the root. At most 256 steps; a malformed path matches nothing.
+
+A path with a wildcard, slice or `..` can match many nodes: `Find` and `FastSelect` then return one flat array of the matches in document order (empty if none), and `Set` / `Remove` refuse it.
+
+**Limits.** Nesting is capped at 256 levels, a parse at 4,194,304 values, and a string (an input value or an output document) at 128 MB. A document that exceeds a size cap **raises** instead of returning `nil`, so a large valid document is never mistaken for missing data. Serializing never truncates: a reference cycle, nesting past the cap or output past 128 MB raises.
+
+**Frozen values.** `Set`, `Remove` and `Merge` raise `ConstAssign` when the object or array they would write is `const` or frozen with `Object.Freeze`, and leave it unchanged. `Patch` never writes its argument.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- |------------- | --- |
-| **Canonicalize** | `Canonicalize(value:any) - string` | Serialize to compact JSON with object (and instance) keys in a deterministic **sorted** order — for hashing/signing, where equal values must produce identical bytes (hashmap iteration order is not stable across processes). Keys ordered by UTF-8 byte value. Same cycle/depth guarantees as `Stringify`. | — |
-| **Deserialize** | `Deserialize(json:string, cls:class) - instance\|array` | Parse `json` and map it onto instances of `cls` by declared field name: an object yields one instance, an array of objects yields an array of instances. Unknown keys are ignored; absent fields keep their class defaults; inherited fields are included. The `Constructor` is **not** called - values are written directly to the field slots. Nested objects stay plain objects (fields are **not** recursively hydrated into their declared class type). Returns `nil` for malformed JSON, a scalar top level, or an array containing a non-object element. | — |
-| **Diff** | `Diff(a:object, b:object) - object` | Produce an RFC 7386 merge-patch such that `Merge(copy-of-a, patch)` yields `b`: changed/added keys carry b's value, removed keys map to `null`, nested objects recurse. `nil` if either argument is not an object. Cannot represent a key whose value in `b` is genuinely `null` (null means delete). | — |
-| **Exists** | `Exists(path:string, value:any) - bool` | `true` if path resolves to a node within `value` (a parsed object/array, or a class instance for key steps). | ✓ |
-| **FastSelect** | `FastSelect(path:string, json:string) - any` | Fast path extraction from raw JSON text (no full parse). Dot/bracket notation; `nil` if absent. On duplicate object keys it returns the last (matching `Parse`). | — |
-| **Find** | `Find(path:string, value:any) - any` | Navigate a parsed value by path. Supports wildcards (`*`, `[*]`). Returns the matched node or `nil`. Key steps descend into class instances (by field name); wildcards apply to plain objects/arrays only. | — |
-| **IsValid** | `IsValid(json:string) - bool` | `true` if the string is exactly one well-formed JSON document. Disambiguates the case `Parse` cannot (it returns `nil` for both invalid input and a literal `null`). | ✓ |
-| **Merge** | `Merge(target:object, patch:object) - bool` | Apply an RFC 7386 merge-patch to `target` **in place**: a `null` patch value deletes that key, an object value merges recursively, any other value (including arrays) replaces. `false` if either argument is not an object. Because `null` deletes, a patch cannot set a key to `null`. | — |
-| **Parse** | `Parse(json:string) - any` | Parse JSON string into a Flaris value (object/array/string/int/float/bool/nil). `nil` on malformed input. Duplicate object keys resolve last-wins; a `\u0000` escape is rejected (Flaris strings cannot hold an embedded NUL). Max depth 256; raises if the document exceeds an internal node cap. | — |
-| **ParseLines** | `ParseLines(text:string) - array` | Parse NDJSON / JSON Lines: one JSON value per line. Blank lines skipped; `nil` if any non-empty line is invalid. | — |
-| **Remove** | `Remove(root:object\|array, path:string) - bool` | Remove the value at `path` (object key or array index, in place). `false` on a missing node or type mismatch. | — |
-| **Set** | `Set(root:object\|array, path:string, value:any) - bool` | Set `value` at `path` in place, creating missing intermediate objects/arrays. `false` on a wrong-type intermediate (never clobbered) or an out-of-range array index (only append-at-length allowed). | — |
-| **Stringify** | `Stringify(value:any, pretty?:int) - string` | Serialize to JSON. Truthy `pretty` enables 2-space indenting. Non-finite floats (NaN/Inf) serialize as `null`. Class instances serialize as objects with every declared field (own + inherited) by name - the inverse of `Deserialize`. Raises (rather than emit malformed JSON) if `value` contains a reference cycle or nests past the depth cap. | — |
-| **StringifyLines** | `StringifyLines(array:array) - string` | Serialize each element as a compact JSON value on its own line (NDJSON); inverse of `ParseLines`. Raises if any element is cyclic or over-deep. | — |
+| **Canonicalize** | `Canonicalize(value:any) - string` | RFC 8785 (JCS) canonical JSON - compact, object and instance members sorted by UTF-16 code units, numbers in ECMAScript form (`1` for `1.0`, `1e+21`), lowercase `\u` escapes - so equal values give identical bytes for hashing and signing, and match other JCS implementations. Ints are written exactly, also beyond 2^53. Raises like `Stringify`. | — |
+| **Deserialize** | `Deserialize(json:string, cls:class) - instance\|array` | Parse `json` and map it onto instances of `cls` by declared field name: an object yields one instance, an array of objects yields an array of instances. Unknown keys are ignored; absent fields keep their class defaults; inherited fields are included. The `Constructor` is **not** called - values are written directly to the field slots. **Each value must fit the field's type, taken from its default:** an `int` field takes an int, a `float` field an int or float, a `string` field a string, a `bool` field a bool, an `[int]` / `[float]` field an array of ints / numbers (stored as a typed array); a field whose default is `nil` takes any value. A JSON `null` keeps the default. Nested objects stay plain objects. Returns `nil` for malformed JSON, a scalar top level, an array containing a non-object element, or a value that does not fit its field (`LastError` names the field). | — |
+| **Diff** | `Diff(a:object, b:object) - object` | Produce an RFC 7386 merge-patch such that `Merge(copy-of-a, patch)` yields `b`: changed/added keys carry b's value, removed keys map to `null`, nested objects recurse. `nil` if either argument is not an object. Cannot represent a key whose value in `b` is genuinely `null` (null means delete). Raises `NestingError` past the depth cap. | — |
+| **Exists** | `Exists(path:string, value:any) - bool` | `true` if `path` matches at least one node within `value` (a parsed object/array, or a class instance for name steps). Stops at the first match. | ✓ |
+| **FastSelect** | `FastSelect(path:string, json:string) - any` | `Find` on raw JSON text. Paths made of names, non-negative indices and wildcards are answered in one forward scan that parses only the matched values - the skipped parts are **not validated**, so malformed text elsewhere can still yield a result (use `Parse` + `Find` when the whole document must be valid). Other paths (negative index, slice, `..`) parse the whole text first. On duplicate keys a single-match path returns the last. | — |
+| **Find** | `Find(path:string, value:any) - any` | Navigate a parsed value by path. A single-match path returns the node or `nil`; a multi-match path returns an array of the matches. Name steps descend into class instances (by field name); wildcards and slices apply to plain objects and arrays. Raises `NestingError` if `..` meets a cyclic value. | — |
+| **Format** | `Format(json:string, indent?:int) - string` | Re-lay out JSON text with `indent` spaces per level (0-10, default 2), validating it as strictly as `Parse`. Strings and numbers are copied as written, so escapes, number spelling (`1.50`, `1e2`), key order and duplicate keys survive. `nil` for invalid input (see `LastError`). | — |
+| **IsValid** | `IsValid(json:string) - bool` | `true` if the string is exactly one well-formed JSON document. Disambiguates the case `Parse` cannot (it returns `nil` for both invalid input and a literal `null`). Sets `LastError` on `false`; returns `false` rather than raising past a size cap. | ✓ |
+| **LastError** | `LastError() - object\|nil` | Why the most recent failing `Parse`, `IsValid`, `ParseLines`, `Deserialize`, `Format`, `Minify` or `Patch` failed: `{message, line, column, offset}` - line and column 1-based (the column counts bytes), offset 0-based; all three `nil` for an error with no position (a `Deserialize` field mismatch, a `Patch` operation). `nil` after one of those functions succeeds. | — |
+| **Merge** | `Merge(target:object, patch:object) - bool` | Apply an RFC 7386 merge-patch to `target` **in place**: a `null` patch value deletes that key, an object value merges recursively, any other value (including arrays) replaces. `false` if either argument is not an object. All-or-nothing: raises `ConstAssign` (a frozen object would be written) or `NestingError` (the patch is too deep or cyclic) before changing anything. Because `null` deletes, a patch cannot set a key to `null`. | — |
+| **Minify** | `Minify(json:string) - string` | `Format` with indent 0: all insignificant whitespace removed. | — |
+| **Parse** | `Parse(json:string) - any` | Parse a JSON document into a Flaris value (object/array/string/int/float/bool/nil). `nil` on malformed input (see `LastError`); raises past the size caps. | — |
+| **ParseLines** | `ParseLines(text:string) - array` | Parse NDJSON / JSON Lines: one JSON value per line (`\n` or `\r\n`). Blank lines skipped; `nil` if any non-empty line is invalid (`LastError` gives its line in the whole text). Size caps apply per line and raise. | — |
+| **Patch** | `Patch(value:any, ops:array) - any` | Apply an RFC 6902 JSON Patch - operations `{op, path, value}` / `{op, from, path}` with `op` one of `add`, `remove`, `replace`, `move`, `copy`, `test`, paths as JSON Pointers - to a **deep copy** of `value` and return the copy; `value` itself is never changed (a frozen value can be patched). All-or-nothing: `nil` if any operation fails, with `LastError` naming it (`"operation 2: test failed"`). | — |
+| **Remove** | `Remove(root:object\|array, path:string) - bool` | Remove the value at `path` (object key or array element, in place). `false` on a missing node, a type mismatch or a multi-match path. | — |
+| **Set** | `Set(root:object\|array, path:string, value:any) - bool` | Set `value` at `path` in place, creating missing intermediate objects/arrays (a created array only takes index `0`). Replaces an existing array element or appends at exactly the length (`/list/-` appends). `false` on a multi-match path, a wrong-type intermediate (never clobbered) or an out-of-range index - and then nothing was created. | — |
+| **Stringify** | `Stringify(value:any, options?:int\|bool\|object) - string` | Serialize to JSON. A truthy int or bool indents by 2 spaces. An options object takes `indent` (0-10 spaces), `sortKeys` (members in UTF-16 key order), `escapeHtml` (`\u`-escape `<`, `>`, `&`, U+2028 and U+2029, safe inside an HTML `<script>`) and `ascii` (`\u`-escape every non-ASCII character; invalid UTF-8 becomes `\ufffd`). Raises for a reference cycle, nesting past the depth cap or output over 128 MB. | — |
+| **StringifyLines** | `StringifyLines(array:array) - string` | Serialize each element as a compact JSON value on its own line, each line ending in `\n` (JSON Lines); inverse of `ParseLines`. Raises like `Stringify`. | — |
 
 ---
 
@@ -3361,33 +3377,74 @@ Process, environment, and system interface. Functions marked **unsafe** require 
 | **Bits** | `Bits() - int` | Returns the pointer width of the platform in bits. Flaris ships 64-bit-only, so this currently always returns `64`. | — |
 | **Chdir** | `Chdir(path:string) - bool` | Change working directory. Process-global - affects every fiber. | — |
 | **GetCwd** | `GetCwd() - string` | Returns the current working directory, or `nil` if it cannot be read (e.g. the directory was removed, or its path exceeds 4096 bytes). Pairs with `Chdir`. | — |
-| **Exec** | `Exec(path:string, args?:array) - nil` | Replace the current process image with `path` via `execvp`. Only returns on error. Does not require `--unsafe`. | — |
-| **Execute** | `Execute(cmd:string, sha256?:string) - string` | Run a shell command via `popen`; returns stdout+stderr merged as a string. Returns `nil` on `popen` failure, output exceeding 16 MB, a `pclose` error, or a rejected `sha256` gate; the command's own non-zero exit status does **not** map to `nil` (the captured output is returned regardless). Does **not** require `--unsafe`. **The command string is passed directly to the shell with no escaping or sanitization - never pass untrusted or externally-supplied input** (command-injection risk). Pass `sha256` (64-char hex, case-insensitive) to run the command only if its leading binary matches that digest - see [Verifying the binary before it runs](#verifying-the-binary-before-it-runs). To run a program with separate arguments and no shell, use `Os.Spawn`/`Os.RunEx` (which capture output via `execvp`) or `Os.Exec` (which replaces the image). | — |
+| **Exec** | `Exec(path:string, args?:array) - nil` | Replace the current process image with `path` via `execvp` (searched on `PATH`). Buffered output is flushed first. Only returns on error. Does not require `--unsafe`. | — |
+| **Execute** | `Execute(cmd:string, sha256?:string) - string` | Run `cmd` as `sh -c cmd` (`cmd.exe /d /s /c "cmd"` on Windows, where line endings come back as `\n`); returns stdout and stderr merged into one string. Binary-safe. Returns `nil` when the shell cannot be started, the output exceeds 16 MB, or the `sha256` gate rejects the command; the command's own non-zero exit status does **not** map to `nil` (the captured output is returned regardless). Does **not** require `--unsafe`. **The command string is passed directly to the shell with no escaping or sanitization - never pass untrusted or externally-supplied input** (command-injection risk). Pass `sha256` (64-char hex, case-insensitive) to run the command only if its leading binary matches that digest - see [Verifying the binary before it runs](#verifying-the-binary-before-it-runs). To run a program with separate arguments and no shell, use `Os.Spawn`/`Os.RunEx` (which capture output via `execvp`) or `Os.Exec` (which replaces the image). | — |
 | **ExecuteAsync** | `ExecuteAsync(cmd:string, sha256?:string) - fiber` | Non-blocking `Execute`. Use with `await`. Other fibers run while the command runs. Same security warning and the same optional `sha256` gate as `Execute`; a rejected gate resolves the await to `nil`. | — |
-| **Getenv** | `Getenv(name:string) - string` | Read environment variable. Returns `nil` if not set. | — |
-| **GetArgValue** | `GetArgValue(name:string, default?:string) - string` | Extract value from CLI arg matching `name=value`. Returns `default` (or `nil`) if not found. | — |
-| **Gid** | `Gid() - int` | Returns the real group ID of the process. | — |
-| **IsRoot** | `IsRoot() - bool` | `true` if the process is running as root (UID 0). | — |
+| **GetEnv** | `GetEnv(name:string) - string` | Read environment variable. Returns `nil` if not set. | — |
+| **GetArgValue** | `GetArgValue(name:string, default?:string) - string` | Value of the first script argument of the form `name=value`. Leading dashes are ignored on both sides and a trailing `=` on `name` is optional, so `"port"`, `"--port"` and `"--port="` all find `--port=8080` — but none of them matches `--report=1`. Returns `default` (or `nil`) if not found. | — |
+| **Gid** | `Gid() - int` | Returns the real group ID of the process; `0` on Windows. | — |
+| **IsRoot** | `IsRoot() - bool` | `true` if the process is running as root (UID 0); on Windows, if it runs elevated (as administrator). | — |
 | **Kill** | `Kill(pid:int, signal:int) - bool` | Send a signal to a process. Use standard signal numbers (e.g. `15` for SIGTERM, `9` for SIGKILL). Requires `--unsafe`. | — |
 | **Name** | `Name() - string` | Returns OS name: `"Windows"`, `"Linux"` or `"macOS"`. | — |
 | **Pid** | `Pid() - int` | Returns the current process ID. | — |
-| **Ppid** | `Ppid() - int` | Returns the parent process ID. | — |
-| **Setenv** | `Setenv(name:string, value:string) - bool` | Set environment variable. | — |
+| **Ppid** | `Ppid() - int` | Returns the parent process ID; `0` on Windows. | — |
+| **SetEnv** | `SetEnv(name:string, value:string) - bool` | Set environment variable. Process-wide: child processes started afterwards inherit it. | — |
+| **UnsetEnv** | `UnsetEnv(name:string) - bool` | Remove an environment variable. `true` once it is not set (also when it never was); `false` for an empty name or one containing `=`. | — |
+| **ShellQuote** | `ShellQuote(s:string) - string` | Quote `s` as a single word for `Execute`'s shell, so untrusted text can be passed as one argument: `Os.Execute("grep -- " + Os.ShellQuote(pattern) + " log.txt")`. On Linux and macOS a safe word comes back unchanged and anything else is single-quoted. On Windows `cmd.exe` expands `%VAR%` even inside quotes and cannot escape `"` there, so a string containing `%`, `"`, CR or LF returns `nil` - pass such values with `RunEx` instead. | — |
+| **Which** | `Which(name:string) - string` | Full path of the program `name` would start, or `nil`. A name containing a path separator is checked as given; otherwise each absolute directory on `PATH` is searched (plus the `PATHEXT` extensions on Windows). Relative `PATH` entries, including an empty one, are skipped, so a program planted in the working directory is never picked. | — |
 | **Sleep** | `Sleep(ms:int) - bool` | Sleep current OS thread for `ms` milliseconds. Blocks all fibers - prefer `Fiber.Sleep`. | — |
 | **TempDir** | `TempDir() - string` | Returns path to system temp directory. | — |
-| **Uid** | `Uid() - int` | Returns the real user ID of the process. | — |
-| **Wait** | `Wait(pid:int) - int` | Wait (blocking) for child process to exit. Returns its exit code, the negative signal number if killed by a signal, or `nil` on `waitpid` error. | — |
-| **WaitTimeout** | `WaitTimeout(pid:int, timeoutMs:int) - object` | Wait up to `timeoutMs` milliseconds for a child process to exit. Returns `{Alive:bool, Exit:int, TimedOut:bool}`; when the deadline expires first, `Alive` stays `true` and `TimedOut` is `true`. | — |
-| **Spawn** | `Spawn(cmd:string, args?:array) - object` | Fork and exec `cmd` with separate stdin/stdout/stderr pipes. Returns `{Pid:int, Stdin:int, Stdout:int, Stderr:int}` where the int values are raw file descriptors for use with `ReadPipe`/`WritePipe`/`ClosePipe`. Returns `nil` on error. Stdout and stderr fds are non-blocking. | — |
-| **ReadPipe** | `ReadPipe(fd:int) - string` | Non-blocking read from a pipe fd returned by `Spawn`. Returns `nil` when no data is available or the pipe is closed. | — |
-| **WritePipe** | `WritePipe(fd:int, data:string) - int` | Write `data` to a pipe fd (stdin of a spawned process). Returns bytes written, or `-1` on error. | — |
-| **ClosePipe** | `ClosePipe(fd:int) - bool` | Close a pipe fd. Call on stdin to signal EOF to the child process. | — |
-| **IsAlive** | `IsAlive(pid:int) - bool` | Returns `true` if the process with `pid` is still running. Non-blocking. Does not reap the child - safe to call before `TryWait`/`Wait`. | — |
-| **TryWait** | `TryWait(pid:int) - object` | Non-blocking wait. Returns `{Alive:bool, Exit:int}`. When `Alive` is `false` the child has been reaped and `Exit` holds the exit code. Prefer over polling `IsAlive`+`Wait` to avoid double-reap. | — |
-| **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance. For sending signals to arbitrary PIDs use `Os.Kill` (requires `--unsafe`). | — |
-| **RunEx** | `RunEx(cmd:string, args?:array) - object` | Run `cmd` and wait for it to finish. Returns `{Exit:int, Stdout:string, Stderr:string}` with stdout and stderr captured separately. Returns `nil` on fork/spawn failure. | — |
-| **RunExTimeout** | `RunExTimeout(cmd:string, timeoutMs:int, args?:array) - object` | Run `cmd` with separate stdout/stderr capture and wait up to `timeoutMs` milliseconds. Returns `{Exit:int, Stdout:string, Stderr:string, TimedOut:bool}`. If the timeout expires first, the child is terminated and `TimedOut` is `true` with `Exit` set to `124`. | — |
-| **GetEnvAll** | `GetEnvAll() - object` | Returns all environment variables as an object `{NAME: "value", ...}`. | — |
+| **Uid** | `Uid() - int` | Returns the real user ID of the process; `0` on Windows. | — |
+| **Wait** | `Wait(pid:int) - int` | Wait (blocking) for child process to exit. Returns its exit code, the negative signal number if killed by a signal, or `nil` when `pid` is not an unreaped child of this process (`0` and negative values included - they never select a process group). | — |
+| **WaitTimeout** | `WaitTimeout(pid:int, timeoutMs:int) - object` | Wait (blocking) up to `timeoutMs` milliseconds for a child process to exit. Returns `{Alive:bool, Exit:int, TimedOut:bool}`; when the deadline expires first, `Alive` stays `true` and `TimedOut` is `true`. `timeoutMs <= 0` checks once. `Exit` is `nil` when `pid` is not an unreaped child of this process. | — |
+| **WaitAsync** | `WaitAsync(pid:int, timeoutMs?:int) - fiber` | Wait for a child to exit without blocking other fibers: `await` resolves to `{Alive:bool, Exit:int, TimedOut:bool}`, as `WaitTimeout` returns, and reaps the child once it has exited. Without `timeoutMs` it waits for the exit; `timeoutMs <= 0` checks once. On Linux and macOS the wait costs no thread and `Fiber.CancelIo` abandons it (`nil`, `Stream.LastError()` 7); on Windows it runs on the I/O pool in short slices, where `Fiber.CancelIo` cannot interrupt it - pass a timeout there. | — |
+| **Spawn** | `Spawn(cmd:string, args?:array, options?:object) - object` | Start `cmd` (searched on `PATH`, no shell) with separate stdin/stdout/stderr pipes. Returns `{Pid:int, Stdin:int, Stdout:int, Stderr:int}`; the three descriptors are the only ones `ReadPipe`/`WritePipe`/`ClosePipe` accept. Accepts `Cwd`, `Env`, `MergeStderr` (then `Stderr` is `nil`) and `Streams`: with `Streams: true` the three pipes are `Stream` objects instead - use `Stream.ReadLine`, `Stream.ReadLineAsync`, `Stream.WriteString` and friends, and `Stream.Close` them yourself. Stdout and stderr are non-blocking. Returns `nil` when the program cannot be started, or while 256 spawned children are still unreaped. The child is never reaped for you - `TryWait`/`Wait` it, or it stays a zombie. | — |
+| **ReadPipe** | `ReadPipe(fd:int) - string` | Non-blocking read of up to 4 KB from a pipe returned by `Spawn`. Binary-safe. Returns `nil` when no data is available, the pipe is at end of file, or `fd` did not come from `Spawn` - use `TryWait` to tell "not yet" from "finished". | — |
+| **WritePipe** | `WritePipe(fd:int, data:string) - int` | Write `data` to the `Stdin` pipe of a spawned process. Returns bytes written (possibly fewer than `len(data)`), or `-1` on error or when `fd` did not come from `Spawn`. Blocks every fiber while the pipe is full. | — |
+| **ClosePipe** | `ClosePipe(fd:int) - bool` | Close a pipe returned by `Spawn`. Call on `Stdin` to signal EOF to the child process. `false` for a descriptor that did not come from `Spawn` or is already closed. | — |
+| **IsAlive** | `IsAlive(pid:int) - bool` | Returns `true` if the process with `pid` is still running. Non-blocking. Does not reap the child: a child that has exited reports `false` while its exit code stays available to `TryWait`/`Wait`. | — |
+| **TryWait** | `TryWait(pid:int) - object` | Non-blocking wait. Returns `{Alive:bool, Exit:int}`. When `Alive` is `false` the child has been reaped and `Exit` holds the exit code - or `nil` when `pid` is not an unreaped child of this process (never spawned, or already reaped). | — |
+| **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance or has already been reaped. For sending signals to arbitrary PIDs use `Os.Kill` (requires `--unsafe`). | — |
+| **RunEx** | `RunEx(cmd:string, args?:array, options?:object) - object` | Run `cmd` (searched on `PATH`, no shell) and wait for it to finish. Returns `{Exit:int, Stdout:string, Stderr:string}` with stdout and stderr captured separately; stdin is inherited unless `Stdin` is given. Accepts `Cwd`, `Env`, `Stdin`, `MergeStderr` and `Timeout` (see [Launch options](#launch-options)); with `Timeout` the result also carries `TimedOut`. Returns `nil` when the program cannot be started (not found, not executable). Each stream keeps its first 16 MB; after that the pipe is closed, so a child that keeps writing receives `SIGPIPE`. | — |
+| **RunExTimeout** | `RunExTimeout(cmd:string, timeoutMs:int, args?:array, options?:object) - object` | Takes the same options as `RunEx` except `Timeout`. Run `cmd` with separate stdout/stderr capture and wait up to `timeoutMs` milliseconds. Returns `{Exit:int, Stdout:string, Stderr:string, TimedOut:bool}`. If the timeout expires first, the child is terminated and `TimedOut` is `true` with `Exit` set to `124`. The child runs in its own process group (a Job Object on Windows) and the whole group is killed, so a grandchild cannot outlive the deadline or stretch the call past it. `timeoutMs <= 0` means no limit. | — |
+| **GetEnvAll** | `GetEnvAll() - object` | Returns all environment variables as an object `{NAME: "value", ...}`; `Object.Keys` lists the names. | — |
+
+#### Launch options
+
+`RunEx`, `RunExTimeout` and `Spawn` take an optional options object as their last
+argument. An unknown option, or one of the wrong type, raises rather than being
+ignored.
+
+| Option | Type | Effect | Accepted by |
+|--------|------|--------|-------------|
+| `Cwd` | string | Working directory of the child. | all three |
+| `Env` | object | Variables to set in the child, merged over this process's environment; a `nil` value removes the variable. The program itself is still looked up with this process's `PATH`. | all three |
+| `Stdin` | string | Text written to the child's stdin, which is then closed. `""` gives the child an empty stdin instead of this process's. Written while the output is read, so a child that writes before it reads cannot deadlock. | `RunEx`, `RunExTimeout` |
+| `MergeStderr` | bool | Send stderr to the same pipe as stdout, interleaved as written. | all three |
+| `Timeout` | int | Milliseconds before the child and its process group are killed; `Exit` is then `124` and `TimedOut` is `true`. | `RunEx` |
+| `Streams` | bool | Return the pipes as `Stream` objects. | `Spawn` |
+
+```flaris
+let r = Os.RunEx("git", ["log", "--oneline", "-5"], {
+    Cwd: "/src/project",
+    Env: {GIT_PAGER: "cat", LANG: nil},
+    Timeout: 5000
+});
+
+let p = Os.Spawn("sort", [], {Streams: true});
+Stream.WriteString(p.Stdin, "b\na\n");
+Stream.Close(p.Stdin);
+var line = Stream.ReadLine(p.Stdout);
+while (line != nil) {
+    Console.WriteLine(line);
+    line = Stream.ReadLine(p.Stdout);
+}
+Stream.Close(p.Stdout);
+Stream.Close(p.Stderr);
+Os.Wait(p.Pid);
+```
+
+A child process inherits only its standard streams - none of the VM's open files or sockets. On Linux and macOS it also starts with `SIGPIPE` at its default action (the VM itself ignores it) and an empty signal mask. `GetEnv`, `SetEnv`, `UnsetEnv`, `GetEnvAll` and every process launch are serialised against each other, so setting a variable while an `ExecuteAsync` command starts on a background thread is safe.
 
 #### Verifying the binary before it runs
 
@@ -3407,15 +3464,18 @@ if (out == nil) {
 Get the expected digest with `File.Sha256(path)`. The comparison is case-insensitive,
 and the digest must be exactly 64 hex characters.
 
-**The command must start with an explicit path.** A bare name like `"mytool"` is
-rejected, because the shell would resolve it through `PATH` while the check can only
-hash the literal text - the two would not necessarily be the same file. Write
-`/usr/local/bin/mytool` or `./mytool` instead. A path containing spaces cannot be
-verified either, since the first space ends the binary name.
+**A bare name is resolved first.** `"mytool --version"` is looked up the way
+`Os.Which("mytool")` does it, that file is hashed, and the command that runs starts
+with the resolved path instead of the name - so the shell executes exactly the file
+that was checked rather than searching `PATH` a second time. An explicit path
+(`/usr/local/bin/mytool`, `./mytool`) is hashed as written. The digest identifies a
+file, not a command name: on a busybox system `ls` and `echo` resolve to the same
+binary and share one digest. A path containing spaces
+cannot be verified, since the first space ends the binary name.
 
 The check fails closed: a missing file, an unreadable file (including an
-execute-only one), a malformed digest, or a bare name all return `nil` without
-running anything.
+execute-only one), a malformed digest, or a name `Which` cannot resolve all return
+`nil` without running anything.
 
 Two things it deliberately does **not** do:
 
@@ -3442,19 +3502,19 @@ Cross-platform path string manipulation.
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **ChangeExtension** | `ChangeExtension(path:string, ext:string) - string` | Replace file extension. | — |
-| **Combine** | `Combine(part1:string, part2:string, ...more) - string` | Join path segments with separator. Up to 15 arguments. | — |
-| **GetCurrentDir** | `GetCurrentDir() - string` | Returns current working directory. | — |
+| **Combine** | `Combine(part1:string, part2:string, ...more) - string` | Join the parts with exactly one `/` between neighbours (none added where either side already has one); `\` becomes `/`. A plain string join: a later rooted part does not discard earlier ones and `..` is kept - use `Resolve` on the result before trusting it to stay inside a directory. Up to 16 parts. | — |
+| **GetCurrentDir** | `GetCurrentDir() - string` | Current working directory (any length), or `nil` if it can't be read. | — |
 | **GetDirectoryName** | `GetDirectoryName(path:string) - string` | Returns directory portion of path. | — |
 | **GetExtension** | `GetExtension(path:string) - string` | Returns extension including dot (e.g. `".txt"`). | — |
 | **GetFileName** | `GetFileName(path:string) - string` | Returns filename with extension. | — |
 | **GetFileNameWithoutExtension** | `GetFileNameWithoutExtension(path:string) - string` | Returns filename without extension. | — |
-| **GetFullPath** | `GetFullPath(path:string) - string` | Resolve to absolute path (lexical `.`/`//` tidy; does **not** resolve `..` - use `Resolve`). | — |
-| **GetRelativePath** | `GetRelativePath(from:string, to:string) - string` | Relative path that reaches `to` when walked from directory `from` (using `../` to climb). Both are resolved to absolute canonical form first. `"."` when equal. Pure lexical; `nil` if `getcwd` fails. | — |
-| **GetRoot** | `GetRoot(path:string) - string` | Returns `"/"` for a POSIX-absolute path, `""` otherwise (Windows drive roots are not recognized). | — |
+| **GetFullPath** | `GetFullPath(path:string) - string` | Same as `Resolve`: the absolute path with `.` and `..` resolved. | — |
+| **GetRelativePath** | `GetRelativePath(from:string, to:string) - string` | Relative path that reaches `to` when walked from directory `from` (using `../` to climb). Both are resolved to absolute canonical form first. `"."` when equal; `to` itself (resolved) when the two have different roots, such as two drives. Pure lexical; `nil` if the working directory can't be read. | — |
+| **GetRoot** | `GetRoot(path:string) - string` | The root `IsAbsolute` recognizes, with `/` separators: `"/"`, `"C:/"` or `"//server/share/"`; `""` for a relative path. | — |
 | **HasExtension** | `HasExtension(path:string) - bool` | `true` if path has an extension. | — |
-| **IsAbsolute** | `IsAbsolute(path:string) - bool` | `true` for a POSIX root (`/`), a Windows drive root (`C:\` / `C:/`), a leading backslash, or a UNC path (`\\server`). Pure lexical test - no filesystem access. | — |
-| **Normalize** | `Normalize(path:string) - string` | Convert `\` to `/`, collapse `//` runs and drop `./` segments. Does **not** resolve `..` or touch the filesystem. | — |
-| **Resolve** | `Resolve(path:string) - string` | Absolute path with `.` and `..` resolved (relative inputs anchored to the current directory). Unlike `Normalize`/`GetFullPath` this collapses `..`, giving a canonical form for containment checks. Purely lexical - does not resolve symlinks or require the path to exist. `nil` if `getcwd` fails. | — |
+| **IsAbsolute** | `IsAbsolute(path:string) - bool` | `true` for a POSIX root (`/`), a leading backslash, a Windows drive root (`C:\` / `C:/`) or a UNC path (`\\server\share`) - on every host. `C:x` (drive-relative) is not absolute. Pure lexical test - no filesystem access. | — |
+| **Normalize** | `Normalize(path:string) - string` | Convert `\` to `/`, collapse `//` runs, drop `.` segments and any trailing `/`; `"."` when nothing is left. Keeps `..` (use `Resolve`) and never touches the filesystem. | — |
+| **Resolve** | `Resolve(path:string) - string` | Absolute path with `.` and `..` resolved (relative inputs anchored to the current directory); `..` never climbs above the root (`/`, `C:/` or a UNC share). The canonical form for containment checks. Purely lexical - does not resolve symlinks or require the path to exist. `nil` if the working directory can't be read. | — |
 | **TempFile** | `TempFile(prefix?:string) - string` | Create a unique empty file in the system temp dir (`mkstemp`) and return its path. Optional name prefix (default `"flaris"`) must not contain path separators. The file is not auto-deleted. `nil` on failure. | — |
 
 ---
@@ -3471,11 +3531,14 @@ Regular expression matching, search, replace, and split. The engine is a lightwe
 | -------- | --------- | ----------- | --- |
 | **IsMatch** | `IsMatch(input:string, pattern:string) - bool` | `true` if pattern matches anywhere in input. | ✓ |
 | **Match** | `Match(input:string, pattern:string) - string` | Returns first match substring, or `nil`. | ✓ owned¹ |
-| **Matches** | `Matches(input:string, pattern:string) - array` | Returns all non-overlapping match substrings. | — |
+| **Matches** | `Matches(input:string, pattern:string) - array` | Returns all non-overlapping match substrings, empty matches included (see [Matching semantics](#matching-semantics)). | — |
+| **Count** | `Count(input:string, pattern:string) - int` | The number of matches `Matches` would return, without building the array. | — |
+| **MatchAll** | `MatchAll(input:string, pattern:string) - array` | Every match as `{Index:int, Text:string, Groups:array}`: the byte offset where it starts, the matched text, and the capture groups from group 1 on (`nil` for a group that did not participate). | — |
 | **Capture** | `Capture(input:string, pattern:string) - array` | Returns `[fullMatch, group1, group2, ...]` for the first match, or `nil` if no match. Element 0 is the whole match; subsequent elements are the capture groups in order of their opening `(`. A group that did not participate in the match (e.g. an unmatched optional group) is `nil`. | — |
-| **Replace** | `Replace(input:string, pattern:string, replacement:string) - string` | Replace all matches with replacement string. | ✓ owned¹ |
+| **Replace** | `Replace(input:string, pattern:string, replacement:string) - string` | Replace all matches. In `replacement`, `$0`-`$31` or `${n}` insert a capture group (empty if it did not participate), `$&` the whole match and `$$` a literal `$`; a `$` that forms none of these - including a group the pattern does not have - stays literal, so `"costs $5"` needs no escaping. | ✓ owned¹ |
 | **ReplaceFn** | `ReplaceFn(input:string, pattern:string, fn:fn) - string` | Replace each match with the result of `fn(match)`. The callback receives the matched substring and must return a string (`nil` deletes the match). If the callback raises, or returns a value that is neither a string nor `nil`, the exception propagates to the caller (wrap the call in `try`/`catch` to handle it). | — |
-| **Split** | `Split(input:string, pattern:string) - array` | Split input at pattern boundaries. Always includes remainder as last element. | — |
+| **Split** | `Split(input:string, pattern:string) - array` | Split input at the matches. The text after the last match is kept (`Split("a,b,", ",")` is `["a", "b", ""]`); an empty match at the very start or end adds no empty element, so `Split("a1b2c", "[0-9]*")` is `["a", "b", "c"]`. An empty input gives `[""]`. | — |
+| **Escape** | `Escape(s:string) - string` | `s` with every metacharacter backslash-escaped, so the result used as a pattern matches `s` literally: `Regex.Split(line, Regex.Escape(sep))`. | — |
 
 #### Supported syntax
 
@@ -3669,6 +3732,15 @@ greedy. For multi-alternative patterns, the match starting at the earliest
 position in the input wins regardless of branch order - e.g.
 `Regex.Match("dog cat", "cat|dog")` returns `"dog"`. Matching is linear in the
 length of the input (no catastrophic backtracking).
+
+`Matches`, `Count`, `MatchAll`, `Split`, `Replace` and `ReplaceFn` scan for
+successive non-overlapping matches under the rules Go, JavaScript and Python share.
+An **empty match counts**, and the scan then moves on by one character (a whole
+UTF-8 sequence). An empty match that begins exactly where the previous match ended
+is skipped. So `Regex.Replace("abc", "x*", "-")` is `"-a-b-c-"`,
+`Regex.Replace("baaac", "a*", "-")` is `"-b-c-"`, and
+`Regex.Matches("a1b22", "[0-9]*")` is `["", "1", "22"]`. An empty match at the end
+of the input counts too, so `Regex.Match("", "a*")` is `""`, not `nil`.
 
 ---
 
@@ -3888,6 +3960,10 @@ s += " world";  // s becomes a new string; t is still "hello"
 
 `String.Join(parts, sep)` is still the better choice when the pieces are already in an array, since it sizes the result once.
 
+Every function that returns a string returns a **new** one, even when nothing changed (`Trim` of an already-trimmed string, `Replace` with no match, `PadLeft` to a smaller width), so an in-place `r[i] = ch` on a result never reaches the argument.
+
+Searches and predicates are byte-exact over the whole string: text read from a file or buffer may contain NUL bytes, and `Contains`, `IndexOf`, `Split`, `Count`, `Trim`, the `Is*` classifiers and the rest see past them exactly as `Length` does.
+
 A `nil` argument in a string position never crashes and follows one policy: transforms and formatters return `nil`, predicates return `false`, index searches return `-1`, `Count` returns `0`; `Length` and `CharAt` treat `nil` as the empty string.
 
 | Function | Signature | Description | JIT |
@@ -3899,11 +3975,11 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **Empty** | `Empty - string` | Property: the empty string constant `""`. Not a function. | — |
 | **EndsWith** | `EndsWith(s:string, suffix:string) - bool` | `true` if `s` ends with `suffix`. | ✓ |
 | **EqualsIgnoreCase** | `EqualsIgnoreCase(a:string, b:string) - bool` | Case-insensitive equality. ASCII only (`A-Z` folds to `a-z`) and locale-independent, matching `ToLower`/`ToUpper`; non-ASCII bytes compare exactly, so `"Å"` and `"å"` are **not** equal. | ✓ |
-| **Format** | `Format(fmt:string, ...args) - string` | C#-style positional formatting: `{0}`, `{1,width}` (negative width = left-align), `{0:X4}`/`{0:x}` hex, `{0:D3}` zero-padded decimal, `{0:F2}` or `{0:.2f}` fixed-point (ints included: `{0:F2}` of `5` is `"5.00"`). `{{` and `}}` emit literal braces. The template is used **literally** - a source literal's escapes are already expanded by the compiler, so `fmt` is never unescaped again and a `\t` in e.g. a Windows path survives. `:X`/`:x`/`:D` require an int and yield `nil` otherwise; other specs fall back to the value's default rendering. Returns `nil` on a malformed template. At least 1 arg required. Interpolated `$"...{x:X4}..."` literals compile to this call. | — |
+| **Format** | `Format(fmt:string, ...args) - string` | C#-style positional formatting: `{0}`, `{1,width}` (negative width = left-align), `{0:X4}`/`{0:x}` hex, `{0:D3}` zero-padded decimal, `{0:F2}` or `{0:.2f}` fixed-point (ints included: `{0:F2}` of `5` is `"5.00"`). `{{` and `}}` emit literal braces. The template is used **literally** - a source literal's escapes are already expanded by the compiler, so `fmt` is never unescaped again and a `\t` in e.g. a Windows path survives. `:X`/`:x`/`:D`/`:d` require an int and yield `nil` otherwise; `:F` on a non-number falls back to the value's default rendering. A plain `{0}` renders every value exactly as `str()` does. Returns `nil` on a malformed template, including an unknown spec letter such as `{0:N}`. At least 1 arg required. Interpolated `$"...{x:X4}..."` literals compile to this call. | — |
 | **FormatArray** | `FormatArray(fmt:string, values:array) - string` | Like `Format`, but placeholder indices `{0}`, `{1}`, … refer to elements of `values`. Identical grammar and rendering - both share one engine. Returns `nil` on a malformed template or out-of-range index. | ✓ owned¹ |
 | **IndexOf** | `IndexOf(s:string, sub:string) - int` | Byte index of first occurrence of `sub`, or `-1`. | ✓ |
-| **IndexOfAnyFrom** | `IndexOfAnyFrom(s:string, charset:string, start:int) - int` | Byte index of the first character in `s` (starting from `start`) that appears anywhere in `charset`, or `-1`. Uses a single `strcspn` scan - efficient for finding the first of several possible delimiter characters. | ✓ |
-| **IndexOfFrom** | `IndexOfFrom(s:string, sub:string, start:int) - int` | Byte index of first occurrence of `sub` at or after byte offset `start`, or `-1`. Avoids allocating a substring; use instead of `IndexOf(Substr(s, start))` in parsing loops. | ✓ |
+| **IndexOfAnyFrom** | `IndexOfAnyFrom(s:string, charset:string, start:int) - int` | Byte index of the first byte of `s` (starting from `start`) that appears anywhere in `charset`, or `-1`. One linear scan with a constant-time membership test - efficient for finding the first of several possible delimiter characters. | ✓ |
+| **IndexOfFrom** | `IndexOfFrom(s:string, sub:string, start:int) - int` | Byte index of first occurrence of `sub` at or after byte offset `start`, or `-1`. An empty `sub` returns `start` (up to `Length(s)`). Avoids allocating a substring; use instead of `IndexOf(Substr(s, start))` in parsing loops. | ✓ |
 | **LastIndexOf** | `LastIndexOf(s:string, sub:string) - int` | Byte index of the **last** occurrence of `sub`, or `-1`. An empty `sub` returns `Length(s)` (as `IndexOf` returns `0`). | ✓ |
 | **LastIndexOfAny** | `LastIndexOfAny(s:string, charset:string) - int` | Byte index of the last character of `s` that appears anywhere in `charset`, or `-1`. Use to split on the last of several delimiters, e.g. `LastIndexOfAny(path, "/\\")`. | ✓ |
 | **Insert** | `Insert(s:string, pos:int, sub:string) - string` | Insert `sub` at byte position `pos`. | ✓ owned¹ |
@@ -3914,15 +3990,15 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **IsNumeric** | `IsNumeric(s:string) - bool` | `true` if all characters are numeric digits. `false` for `""`. | ✓ |
 | **IsWhitespace** | `IsWhitespace(s:string) - bool` | `true` if all characters are whitespace. `false` for `""`. | ✓ |
 | **Join** | `Join(arr:array, sep:str\|char) - string` | Concatenate array elements with separator. | ✓ owned¹ |
-| **JsonPretty** | `JsonPretty(json:string) - string` | Pretty-print a JSON string. | ✓ owned¹ |
+| **JsonPretty** | `JsonPretty(json:string) - string` | Pretty-print JSON with 2-space indent (same as `Json.Format(json)`); input that is not valid JSON is returned unchanged. | ✓ owned¹ |
 | **Left** | `Left(s:string, n:int) - string` | Return first `n` bytes. | ✓ owned¹ |
 | **Length** | `Length(s:string) - int` | Byte length of string. | ✓ |
 | **Levenshtein** | `Levenshtein(a:string, b:string) - int` | Edit distance (insert/delete/substitute) between the strings. Byte-based (equals character distance for ASCII). O(n·m) in C - use for "did you mean", fuzzy matching, dedup. Raises if `n*m` exceeds 100M rather than stalling the VM on huge inputs. | ✓ |
 | **NaturalCompare** | `NaturalCompare(a:string, b:string) - int` | Three-way compare with digit runs compared numerically, so `"file2" < "file10"`. ASCII case-insensitive with a byte-wise tiebreak (total, deterministic order). Sort naturally: `Array.Sort(arr, fn(x,y) { return String.NaturalCompare(x,y) < 0; })`. | ✓ |
 | **ProcessCallback** | `ProcessCallback(fn:function, s:string, len:int, cb:function) - nil` | Processes a string with your worker function `fn(s, len)`, then calls `cb(s, result)` when finished. A **read-only** kernel (reads `s[i]`, returns an `int`/`float` — a hash, checksum, count, or scan) runs on another CPU core when simple enough; a kernel that **writes** to the string runs normally (inline) so the string stays correct. Returns immediately. See `Buffer.ProcessCallback`. | ✓ |
 | **ProcessEvent** | `ProcessEvent(fn:function, s:string, len:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ |
-| **PadLeft** | `PadLeft(s:string, width:int, fill?:str\|char) - string` | Left-pad to `width` with `fill` (default space). | ✓ owned¹ |
-| **PadRight** | `PadRight(s:string, width:int, fill?:str\|char) - string` | Right-pad to `width` with `fill` (default space). | ✓ owned¹ |
+| **PadLeft** | `PadLeft(s:string, width:int, fill?:str\|char) - string` | Left-pad to `width` bytes with `fill` (default space; a string fill uses its first byte). `fill` must be ASCII - a NUL or non-ASCII fill returns `nil`. | ✓ owned¹ |
+| **PadRight** | `PadRight(s:string, width:int, fill?:str\|char) - string` | Right-pad to `width` bytes with `fill`; same `fill` rules as `PadLeft`. | ✓ owned¹ |
 | **Repeat** | `Repeat(s:string, n:int) - string` | Concatenate `s` with itself `n` times. Returns `""` for `n ≤ 0` and `nil` if the result would exceed the string size limit. | ✓ owned¹ |
 | **Replace** | `Replace(s:string, old:string, new:string, count?:int) - string` | Replace occurrences of `old` with `new`, left to right. Without `count` (or with a negative one) every occurrence is replaced; `0` replaces none. Matching is non-overlapping, so `Replace("aaa", "aa", "b")` is `"ba"`. | ✓ owned¹ |
 | **Reverse** | `Reverse(s:string) - string` | Reverse bytes of string. | ✓ owned¹ |
@@ -3933,25 +4009,25 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **SplitLines** | `SplitLines(s:string) - array` | Split by newlines; returns array of strings. | — |
 | **StartsWith** | `StartsWith(s:string, prefix:string) - bool` | `true` if `s` starts with `prefix`. | ✓ |
 | **Substr** | `Substr(s:string, start:int, len?:int) - string` | Byte substring starting at `start`, optional `len`. | ✓ owned¹ |
-| **ToAscii** | `ToAscii(s:string, replacement?:str\|char\|int) - string` | Strip/replace non-ASCII characters. | ✓ owned¹ |
+| **ToAscii** | `ToAscii(s:string, replacement?:str\|char\|int) - string` | Replace every non-ASCII codepoint with `replacement` (default `'?'`). The replacement must be ASCII 1-127, else `nil`; `nil` on invalid UTF-8. | ✓ owned¹ |
 | **ToLower** | `ToLower(s:string) - string` | Lowercase ASCII characters. Non-ASCII is left untouched - use `Utf8ToLower` for Unicode. | ✓ owned¹ |
 | **ToUpper** | `ToUpper(s:string) - string` | Uppercase ASCII characters. Non-ASCII is left untouched - use `Utf8ToUpper` for Unicode. | ✓ owned¹ |
 | **Trim** | `Trim(s:string, cutset?:str\|char) - string` | Remove leading and trailing whitespace, or every leading/trailing character present in `cutset` when given. An empty `cutset` trims nothing. | ✓ owned¹ |
 | **TrimLeft** | `TrimLeft(s:string, cutset?:str\|char) - string` | Remove leading whitespace, or leading `cutset` characters. | ✓ owned¹ |
 | **TrimRight** | `TrimRight(s:string, cutset?:str\|char) - string` | Remove trailing whitespace, or trailing `cutset` characters. | ✓ owned¹ |
-| **Truncate** | `Truncate(s:string, maxLen:int) - string` | Truncate to `maxLen` bytes. | ✓ owned¹ |
+| **Truncate** | `Truncate(s:string, maxLen:int) - string` | Shorten to at most `maxLen` bytes, ending in `"..."` when cut (`Truncate("hello world", 5)` is `"he..."`). A `maxLen` of 3 or less cuts without the ellipsis; a string that fits comes back as an unchanged copy. | ✓ owned¹ |
 
 **UTF-8 helpers:**
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Utf8ByteIndexOf** | `Utf8ByteIndexOf(s:string, cpIndex:int) - int` | Byte offset of codepoint at index `cpIndex`. | ✓ |
-| **Utf8Concat** | `Utf8Concat(...parts:str\|char\|int) - string` | Concatenate strings, chars, or codepoints. 1–5 args. | ✓ owned¹ |
+| **Utf8Concat** | `Utf8Concat(...parts:str\|char\|int) - string` | Concatenate strings, chars, or codepoints. 1–5 args; `nil` parts are skipped. A codepoint of 0, a surrogate or one above U+10FFFF returns `nil`. | ✓ owned¹ |
 | **Utf8CpAt** | `Utf8CpAt(s:string, bytePos:int) - char` | Codepoint at byte position `bytePos`. | ✓ |
 | **Utf8CpNext** | `Utf8CpNext(s:string, bytePos:int) - int` | Byte offset of next codepoint after `bytePos`. | ✓ |
 | **Utf8GetCharAt** | `Utf8GetCharAt(s:string, cpIndex:int) - char` | Character at codepoint index `cpIndex`. | ✓ |
 | **Utf8Length** | `Utf8Length(s:string) - int` | Number of Unicode codepoints. | ✓ |
-| **Utf8Substr** | `Utf8Substr(s:string, cpStart:int, cpLen:int) - string` | Substring by codepoint indices. | ✓ owned¹ |
+| **Utf8Substr** | `Utf8Substr(s:string, cpStart:int, cpLen:int) - string` | Substring by codepoint indices. `nil` when the range falls outside the string (unlike the clamping `Substr`) or on invalid UTF-8. | ✓ owned¹ |
 | **Utf8ToLower** | `Utf8ToLower(s:string) - string` | Unicode-aware lowercase: `Utf8ToLower("ÅÄÖ")` is `"åäö"`, where the ASCII-only `ToLower` leaves it unchanged. Uses the same tables as `Char.ToLower`; uncased codepoints pass through. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
 | **Utf8ToUpper** | `Utf8ToUpper(s:string) - string` | Unicode-aware uppercase: `Utf8ToUpper("åäö")` is `"ÅÄÖ"`. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
 

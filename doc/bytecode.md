@@ -289,7 +289,7 @@ annotations) may union several bits.
 | 1 | `VAL_CHAR` | `0x00000002` | Unicode scalar, 32-bit |
 | 2 | `VAL_FLOAT` | `0x00000004` | IEEE 754 binary64 |
 | 3 | `VAL_INT` | `0x00000008` | signed 64-bit two's-complement |
-| 4 | `VAL_STRING` | `0x00000010` | mutable byte string (UTF-8 by convention, no embedded NUL) |
+| 4 | `VAL_STRING` | `0x00000010` | mutable byte string (UTF-8 by convention; `length` is authoritative) |
 | 5 | `VAL_OBJECT` | `0x00000020` | hash-keyed map (string keys) |
 | 6 | `VAL_ARRAY` | `0x00000040` | dynamic array |
 | 7 | `VAL_BOOL` | `0x00000080` | `true` / `false` |
@@ -354,8 +354,11 @@ table). `OP_CMP_IS` compares identity (same object), not structural equality.
 
 ### 4.4 Strings
 
-Strings are **mutable in place**, length-tracked byte sequences with no embedded
-NUL bytes (`length` is always `strlen`-derived). Implementation notes: strings
+Strings are **mutable in place**, length-tracked byte sequences, stored with a
+trailing NUL. `length` is authoritative: a constant never contains a NUL byte,
+but a string built at runtime from binary input (a buffer, a file, a host's
+explicit-length string) may, and every string operation is bounded by
+`length`, not by the first NUL. Implementation notes: strings
 of ≤ 7 bytes use small-string optimization; a string caches its 64-bit hash and
 must rehash after in-place writes.
 
