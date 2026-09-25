@@ -2,7 +2,7 @@
 # Integer-kernel benchmarks: recursive fib, sieve of Eratosthenes, Collatz.
 # These are tight arithmetic and call-heavy loops with no library work, so they
 # measure the VM dispatch loop itself rather than Flaris's C builtins - see
-# run_bench_realworld.sh for the other half of the picture.
+# run_bench_realworld.sh and run_bench_io.sh for the other halves of the picture.
 #
 # Writes a dated snapshot to results/ and then hands off to the real-world
 # runner, which appends its sections to the same file.
@@ -319,11 +319,16 @@ for l in "${TAILCALL_LANGS[@]}"; do
 done | sort -n | cut -f2-
 echo "═══════════════════════════════════════════════════════════"
 
-# ── hand off to the real-world half, appending to the same snapshot ──────────
+# ── hand off to the other halves, appending to the same snapshot ─────────────
 if [[ -x "$BENCH_ROOT/run_bench_realworld.sh" ]]; then
     echo ""
     BENCH_REPORT="$REPORT" BENCH_APPEND=1 "$BENCH_ROOT/run_bench_realworld.sh" \
         || warn "real-world benchmarks failed"
+fi
+if [[ -x "$BENCH_ROOT/run_bench_io.sh" ]]; then
+    echo ""
+    BENCH_REPORT="$REPORT" BENCH_APPEND=1 "$BENCH_ROOT/run_bench_io.sh" \
+        || warn "I/O benchmarks failed"
 fi
 
 cat >> "$REPORT" <<'METHOD'

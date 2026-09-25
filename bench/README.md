@@ -1,6 +1,6 @@
 # Flaris benchmarks
 
-Reproducible cross-language benchmarks for the Flaris VM, in two halves that
+Reproducible cross-language benchmarks for the Flaris VM, in three halves that
 answer different questions.
 
 **Integer kernels** (`kernels/`) are tight arithmetic and call-heavy loops with
@@ -12,7 +12,14 @@ actually reach for - `Json.Parse`, string concatenation, `Regex.Matches`. Most
 of that work happens inside Flaris's C builtins, so the results look quite
 different from the kernels.
 
-Both halves matter. A language that only publishes the flattering half is not
+**File I/O** (`io/`) moves bytes between the program and the filesystem:
+reading a file line by line, reading one whole, writing one. This is where a
+log processor, a build tool or a web server spends its life, and it is the half
+most language comparisons leave out entirely. It is also where the differences
+between runtimes are least about clever compilation and most about whether the
+basics - buffering, allocation, system-call count - were got right.
+
+All three matter. A language that only publishes the flattering half is not
 telling you much.
 
 ## Running them
@@ -25,8 +32,9 @@ curl -fsSL https://www.flaris-lang.org/install.sh | sh
 ```
 
 `run_bench.sh` runs the kernels and then hands off to
-`run_bench_realworld.sh`, writing both halves into one dated snapshot under
-`results/`. Either script can also be run on its own.
+`run_bench_realworld.sh` and `run_bench_io.sh`, writing all three halves into
+one dated snapshot under `results/`. Any of the three can also be run on its
+own.
 
 Every other language is optional. Anything that is not installed is reported
 once and left out of the tables - it is never reported as a zero or a failure.
