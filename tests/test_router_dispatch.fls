@@ -89,7 +89,7 @@ fn test_matching() {
     checkEq(bodyOf(app._dispatch(mkReq("GET", "/files/"))),        "f:",        "catch-all with nothing left");
     checkEq(bodyOf(app._dispatch(mkReq("GET", "/files"))),         "f:",        "catch-all without the slash");
 
-    // Leniency the old matcher had, which the map lookup must preserve.
+    // Fixed routes are matched leniently: extra and empty slashes are ignored.
     checkEq(bodyOf(app._dispatch(mkReq("GET", "/health/"))),  "ok", "trailing slash still matches");
     checkEq(bodyOf(app._dispatch(mkReq("GET", "//health"))),  "ok", "empty segments ignored");
     checkEq(bodyOf(app._dispatch(mkReq("GET", "/a//b/c"))),   "abc", "internal empty segment ignored");
@@ -104,6 +104,22 @@ fn test_matching() {
     checkEq(rShort.status, 404, "param route needs its segment");
     let rLong = app._dispatch(mkReq("GET", "/a/b/c/d"));
     checkEq(rLong.status, 404, "extra segment does not match a fixed route");
+
+    // Among dynamic routes the first registered match wins, a literal has to
+    // match byte for byte, and "*" in the middle still captures the tail.
+    let dyn = new Router();
+    dyn.Get("/p/:a/x",  fn(r) { return Response.Text("px:" + r.params.a, nil); });
+    dyn.Get("/p/:b/:c", fn(r) { return Response.Text("pbc:" + r.params.b + r.params.c, nil); });
+    dyn.Get("/p/é/:d",  fn(r) { return Response.Text("pe:" + r.params.d, nil); });
+    dyn.Put("/p/:a/x",  fn(r) { return Response.Text("put:" + r.params.a, nil); });
+    dyn.Get("/m/*/end", fn(r) { return Response.Text("m:" + r.params["*"], nil); });
+    checkEq(bodyOf(dyn._dispatch(mkReq("GET", "/p/1/x"))),     "px:1",  "first dynamic match wins");
+    checkEq(bodyOf(dyn._dispatch(mkReq("GET", "/p/1/xx"))),    "pbc:1xx", "literal needs the whole segment");
+    checkEq(bodyOf(dyn._dispatch(mkReq("GET", "/p/é/9"))),     "pbc:é9", "earlier route matches before the literal one");
+    checkEq(bodyOf(dyn._dispatch(mkReq("PUT", "//p//2/x/"))),  "put:2", "method and normalised path select the route");
+    checkEq(bodyOf(dyn._dispatch(mkReq("GET", "/m/end/a/b"))), "m:a/b", "mid-pattern * captures the tail");
+    checkEq(dyn._dispatch(mkReq("GET", "/m/x/end")).status,   404,     "mid-pattern * keeps the literal after it");
+    checkEq(dyn._dispatch(mkReq("PATCH", "/p/1/x")).status,   404,     "unregistered method");
     return 0;
 }
 

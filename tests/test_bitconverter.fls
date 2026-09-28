@@ -74,7 +74,11 @@ fn checkBytes(blk, expected, msg) {
 // ---------------------------------------------------------------------------
 fn test_endianness() {
     Console.WriteLine("== IsLittleEndian ==");
-    check(BitConverter.IsLittleEndian() == true, "IsLittleEndian returns true");
+    checkEq(BitConverter.IsLittleEndian(), Memory.IsLittleEndian(), "IsLittleEndian matches the host");
+    let native: block = Buffer.Create(1, 2);
+    native[0] = 0x0102;
+    let hostOrder = BitConverter.GetBytesUInt16(0x0102, !BitConverter.IsLittleEndian());
+    check(Buffer.Equals(native, hostOrder), "host-order encoding matches the memory layout");
     return 0;
 }
 
@@ -426,18 +430,45 @@ fn test_hex() {
 
     // FromHex on empty string
     let emptyBlk = BitConverter.FromHex("");
-    let emptyArr = Buffer.ToArray(emptyBlk);
-    checkEq(len(emptyArr), 0, "FromHex empty string returns empty block");
+    check(Type.IsBlock(emptyBlk), "FromHex empty string returns a block");
+    checkEq(len(emptyBlk), 0, "FromHex empty string returns empty block");
 
     // FromHex on invalid hex (odd length)
     let oddBlk = BitConverter.FromHex("ABC");
-    let oddArr = Buffer.ToArray(oddBlk);
-    checkEq(len(oddArr), 0, "FromHex odd-length returns empty block");
+    check(Type.IsBlock(oddBlk), "FromHex odd-length returns a block");
+    checkEq(len(oddBlk), 0, "FromHex odd-length returns empty block");
 
     // FromHex on invalid characters
     let badBlk = BitConverter.FromHex("GG");
-    let badArr = Buffer.ToArray(badBlk);
-    checkEq(len(badArr), 0, "FromHex invalid chars returns empty block");
+    check(Type.IsBlock(badBlk), "FromHex invalid chars returns a block");
+    checkEq(len(badBlk), 0, "FromHex invalid chars returns empty block");
+    checkEq(len(BitConverter.FromHex("12-3G")), 0, "FromHex invalid char after a dash");
+
+    // Mixed case, and every byte value
+    checkEq(BitConverter.ToHex(BitConverter.FromHex("aBcD eF-01")), "ABCDEF01", "FromHex mixed case and separators");
+    let all = Buffer.Create(256, 1);
+    iter (i from 0 to 256) { Buffer.WriteU8At(all, i, i); }
+    let allHex = BitConverter.ToHex(all);
+    checkEq(len(allHex), 512, "ToHex 256 bytes length");
+    checkEq(String.Substr(allHex, 0, 8), "00010203", "ToHex 256 bytes start");
+    checkEq(String.Substr(allHex, 504, 8), "FCFDFEFF", "ToHex 256 bytes end");
+    check(Buffer.Equals(BitConverter.FromHex(allHex), all), "FromHex(ToHex) every byte value");
+    let allDash = BitConverter.ToString(all);
+    checkEq(len(allDash), 767, "ToString 256 bytes length");
+    checkEq(String.Substr(allDash, 759, 8), "FD-FE-FF", "ToString 256 bytes end");
+    check(Buffer.Equals(BitConverter.FromHex(allDash), all), "FromHex(ToString) every byte value");
+    checkEq(BitConverter.ToString(Buffer.FromString("")), "", "ToString empty block");
+    checkEq(BitConverter.ToHex(Buffer.FromString("")), "", "ToHex empty block");
+
+    // Large blocks convert in linear time
+    let big = Crypto.RandomBytes(1048576);
+    let t0 = Time.Ticks();
+    let bigHex = BitConverter.ToHex(big);
+    let bigBack = BitConverter.FromHex(bigHex);
+    let ms = Time.TicksToMs(Time.Ticks() - t0);
+    checkEq(len(bigHex), 2097152, "ToHex 1 MB length");
+    check(Buffer.Equals(bigBack, big), "FromHex(ToHex) 1 MB round-trip");
+    check(ms < 5000.0, "ToHex + FromHex of 1 MB is linear");
 
     return 0;
 }
@@ -594,6 +625,23 @@ fn async Main() {
     bench("ToFloat32        block - float", fn() {
         let v = BitConverter.ToFloat32(bufF32, 0, nil); _sink = _sink + 1;
     }, 20000);
+
+    Console.WriteLine("\n[ Hex, 64 KB block ]");
+    let blk64k  = Crypto.RandomBytes(65536);
+    let hex64k  = BitConverter.ToHex(blk64k);
+    let dash64k = BitConverter.ToString(blk64k);
+    bench("ToHex          64 KB - string", fn() {
+        _sink = _sink + len(BitConverter.ToHex(blk64k));
+    }, 20);
+    bench("FromHex        128 KB hex - block", fn() {
+        _sink = _sink + len(BitConverter.FromHex(hex64k));
+    }, 20);
+    bench("ToString       64 KB - dashed string", fn() {
+        _sink = _sink + len(BitConverter.ToString(blk64k));
+    }, 20);
+    bench("FromHex        dashed - block", fn() {
+        _sink = _sink + len(BitConverter.FromHex(dash64k));
+    }, 20);
 
     benchSep();
     Console.WriteLine("_sink=" + str(_sink));

@@ -304,6 +304,31 @@ fn _poly_fill(c: [float], nc: int, out: [float], cnt: int, a: float, h: float): 
     return 0;
 }
 
+// Roots of the polynomial c in [a, a + samples*h]: a sign change between two
+// neighbouring samples is refined by bisection, and a sample within tol of
+// zero counts as a root itself (the last sample only as a bracket end).
+fn _poly_roots(c: [float], nc: int, a: float, h: float, samples: int, tol: float): [float] {
+    let roots = Array.Create(0, Type.Float);
+    let cnt: int = samples + 1;
+    let vals = Array.Create(cnt, Type.Float);
+    _poly_fill(c, nc, vals, cnt, a, h);
+    if (Math.AbsF(vals[0]) < tol) { Array.Append(roots, a); }
+    let i: int = 1;
+    while (i < cnt) {
+        let f0: float = vals[i - 1];
+        let f1: float = vals[i];
+        if (f0 * f1 < 0.0) {
+            let x0: float = a + h * ((i - 1) + 0.0);
+            let x1: float = a + h * (i + 0.0);
+            Array.Append(roots, _bisect(c, nc, x0, x1, tol, 100));
+        } else if (i < samples && Math.AbsF(f1) < tol) {
+            Array.Append(roots, a + h * (i + 0.0));
+        }
+        i = i + 1;
+    }
+    return roots;
+}
+
 fn _arr_min(a: [float], n: int): float {
     let m: float = a[0];
     let i: int = 1;
@@ -367,31 +392,15 @@ class Numerics {
         return _secant(coeffs, nc, x0, x1, tol, maxIter);
     }
 
-    // Find all roots of a polynomial (coeffs ascending) in [a, b]. Both the
-    // scan (_poly_fill) and the per-bracket refinement (_bisect) run as JIT
-    // kernels, so this stays fast for high-degree polynomials.
+    // Find all roots of a polynomial (coeffs ascending) in [a, b]. The scan and
+    // the per-bracket refinement both run in the _poly_roots kernel, so this
+    // stays fast for high-degree polynomials.
     fn FindRootsPoly(coeffs: array, a: float, b: float, samples: int, tol: float): array {
         let roots = [];
         let nc: int = len(coeffs);
         if (nc == 0 || samples < 1 || b <= a) return roots;
-        let cnt: int = samples + 1;
-        let vals: [float] = Array.Create(cnt, Type.Float);
         let h: float = (b - a) / samples;
-        _poly_fill(coeffs, nc, vals, cnt, a, h);      // JIT
-        if (Math.AbsF(vals[0]) < tol) { Array.Append(roots, a); }
-        let i: int = 1;
-        while (i < cnt) {
-            let f0: float = vals[i - 1];
-            let f1: float = vals[i];
-            if (f0 * f1 < 0.0) {
-                let x0: float = a + h * ((i - 1) + 0.0);
-                let x1: float = a + h * (i + 0.0);
-                Array.Append(roots, _bisect(coeffs, nc, x0, x1, tol, 100));   // JIT
-            } else if (i < samples && Math.AbsF(f1) < tol) {
-                Array.Append(roots, a + h * (i + 0.0));
-            }
-            i = i + 1;
-        }
+        foreach (r in _poly_roots(_to_float(coeffs), nc, a, h, samples, tol)) { Array.Append(roots, r); }
         return roots;
     }
 

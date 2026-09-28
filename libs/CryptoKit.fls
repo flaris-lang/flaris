@@ -1057,26 +1057,27 @@ fn _sha512Blocks(h: [int], data: block, off: int, count: int, W: [int], K: [int]
 }
 
 // Keccak-f[1600]: 24 rounds over a 25-lane (5x5x64-bit) state, index x + 5*y.
-// C/D are 5-lane scratch, B is 25-lane scratch. RC/ROT are the fixed tables
-// above. This is the permutation shared by SHA3-224/256/384/512, Keccak-256
+// W is 35 lanes of scratch - C in 0-4, D in 5-9, B in 10-34 - one array so
+// _keccakAbsorb stays within the JIT's 8 integer/pointer arguments. RC/ROT are
+// the fixed tables above. This is the permutation shared by SHA3-224/256/384/512, Keccak-256
 // (the pre-standardization, Ethereum-style hash - same permutation, different
 // padding byte) and SHAKE128/256. Needs `>>>` and flat [int] arrays (1.0.3.0+).
-fn _keccakF(state: [int], C: [int], D: [int], B: [int], RC: [int], ROT: [int]) {
+fn _keccakF(state: [int], W: [int], RC: [int], ROT: [int]) {
     let rnd: int = 0;
     while (rnd < 24) {
         // theta: column parity, then mix each column into its two neighbours
         let x: int = 0;
-        while (x < 5) { C[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20]; x = x + 1; }
+        while (x < 5) { W[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20]; x = x + 1; }
         x = 0;
         while (x < 5) {
-            let cxp1: int = C[(x + 1) % 5];
-            D[x] = C[(x + 4) % 5] ^ ((cxp1 << 1) | (cxp1 >>> 63));
+            let cxp1: int = W[(x + 1) % 5];
+            W[5 + x] = W[(x + 4) % 5] ^ ((cxp1 << 1) | (cxp1 >>> 63));
             x = x + 1;
         }
         x = 0;
         while (x < 5) {
             let y: int = 0;
-            while (y < 5) { let i: int = x + 5 * y; state[i] = state[i] ^ D[x]; y = y + 1; }
+            while (y < 5) { let i: int = x + 5 * y; state[i] = state[i] ^ W[5 + x]; y = y + 1; }
             x = x + 1;
         }
         // rho (per-lane rotate) + pi (lane permutation), fused into one pass
@@ -1088,7 +1089,7 @@ fn _keccakF(state: [int], C: [int], D: [int], B: [int], RC: [int], ROT: [int]) {
                 let r: int = ROT[i];
                 let v: int = state[i];
                 let rotated: int = (r == 0) ? v : ((v << r) | (v >>> (64 - r)));
-                B[y + 5 * ((2 * x + 3 * y) % 5)] = rotated;
+                W[10 + y + 5 * ((2 * x + 3 * y) % 5)] = rotated;
                 y = y + 1;
             }
             x = x + 1;
@@ -1099,9 +1100,9 @@ fn _keccakF(state: [int], C: [int], D: [int], B: [int], RC: [int], ROT: [int]) {
             let y: int = 0;
             while (y < 5) {
                 let i: int = x + 5 * y;
-                let b1: int = B[((x + 1) % 5) + 5 * y];
-                let b2: int = B[((x + 2) % 5) + 5 * y];
-                state[i] = B[i] ^ ((~b1) & b2);
+                let b1: int = W[10 + ((x + 1) % 5) + 5 * y];
+                let b2: int = W[10 + ((x + 2) % 5) + 5 * y];
+                state[i] = W[10 + i] ^ ((~b1) & b2);
                 y = y + 1;
             }
             x = x + 1;
@@ -1115,13 +1116,13 @@ fn _keccakF(state: [int], C: [int], D: [int], B: [int], RC: [int], ROT: [int]) {
 // Sponge absorb: XOR `count` `laneCount*8`-byte blocks of `data` (starting at
 // `off`) into the rate portion of `state`, permuting after each. laneCount is
 // rate/8 (9/13/17/18/21 for the five rates this library uses).
-fn _keccakAbsorb(state: [int], data: block, off: int, count: int, laneCount: int, C: [int], D: [int], B: [int], RC: [int], ROT: [int]) {
+fn _keccakAbsorb(state: [int], data: block, off: int, count: int, laneCount: int, W: [int], RC: [int], ROT: [int]) {
     let n: int = 0;
     while (n < count) {
         let p: int = off + n * (laneCount * 8);
         let i: int = 0;
         while (i < laneCount) { state[i] = state[i] ^ Buffer.ReadU64At(data, p + i * 8, false); i = i + 1; }
-        _keccakF(state, C, D, B, RC, ROT);
+        _keccakF(state, W, RC, ROT);
         n = n + 1;
     }
 }
@@ -1137,9 +1138,7 @@ class Digest {
     let _algo = 0;          // DIGEST_*
     let _h = nil;           // [int] state words (4/5/8 for MD5/SHA-1/SHA-2, 25 lanes for Keccak)
     let _w = nil;           // [int] message schedule scratch (Keccak: unused)
-    let _c = nil;           // [int](5) Keccak theta scratch; nil for non-Keccak
-    let _d = nil;           // [int](5) Keccak theta scratch; nil for non-Keccak
-    let _b = nil;           // [int](25) Keccak rho/pi scratch; nil for non-Keccak
+    let _w35 = nil;         // [int](35) Keccak scratch (see _keccakF); nil for non-Keccak
     let _buf = nil;         // block(_blockSize): bytes not yet compressed
     let _bufLen = 0;
     let _total = 0;         // bytes hashed so far (a 64-bit byte count; see Final)
@@ -1188,9 +1187,7 @@ class Digest {
         } else { this._algo = 0; }
         if (this._sponge) {
             this._h = Array.Create(25, Type.Int);
-            this._c = Array.Create(5, Type.Int);
-            this._d = Array.Create(5, Type.Int);
-            this._b = Array.Create(25, Type.Int);
+            this._w35 = Array.Create(35, Type.Int);
         }
         this._buf = Buffer.Create(this._blockSize < 1 ? 1 : this._blockSize, 1);
         this.Reset();
@@ -1272,7 +1269,7 @@ class Digest {
         else if (this._algo == DIGEST_SHA1)   { _sha1Blocks(this._h, data, off, count, this._w); }
         else if (this._algo == DIGEST_SHA256) { _sha256Blocks(this._h, data, off, count, this._w, SHA256_K); }
         else if (this._algo == DIGEST_SHA384 || this._algo == DIGEST_SHA512) { _sha512Blocks(this._h, data, off, count, this._w, SHA512_K); }
-        else if (this._sponge) { _keccakAbsorb(this._h, data, off, count, this._blockSize / 8, this._c, this._d, this._b, KECCAK_RC, KECCAK_ROT); }
+        else if (this._sponge) { _keccakAbsorb(this._h, data, off, count, this._blockSize / 8, this._w35, KECCAK_RC, KECCAK_ROT); }
     }
 
     // Feed more bytes (string or block). Returns this, or nil after Final,
@@ -1414,7 +1411,7 @@ class Digest {
                 got = got + take;
                 i = i + 1;
             }
-            if (got < outLen) { _keccakF(this._h, this._c, this._d, this._b, KECCAK_RC, KECCAK_ROT); }
+            if (got < outLen) { _keccakF(this._h, this._w35, KECCAK_RC, KECCAK_ROT); }
         }
         if (raw == true) { return out; }
         return Util.BinToHex(out);

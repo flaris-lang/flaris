@@ -93,6 +93,12 @@
 //   .OnTlsError(handler)       - fn(peer, message); default drops silently
 //   .OnAccess(handler)         - fn(entry) once per completed request; pair
 //                                with HttpStatus.CombinedLogLine(entry)
+//                                OnError, OnTlsError and OnAccess may be
+//                                `fn async` (they are awaited). One that throws
+//                                is contained: the exception is dropped and
+//                                counted, the server keeps serving, and a failed
+//                                OnError still gets the default 500.
+//   .HookErrors()              - exceptions dropped from those three hooks so far
 //   .InFlight()  .ActiveConnections()
 //   .IsSecure()                - true when this server terminates TLS
 //   .Static(urlPrefix, rootDir, opts?)
@@ -241,8 +247,9 @@
 //   The upgraded socket no longer counts against maxConnections, and closing it
 //   is the caller's job.
 //
-// Not implemented: HTTP/2, and request pipelining (a second request is read
-// only after the first replies).
+// Pipelining: requests a client sends back to back on one connection are
+// answered one at a time, in order - the next is read only after the previous
+// reply is written. Not implemented: HTTP/2.
 // =============================================================================
 
 // A method named Json or File shadows the namespace of the same name for the
@@ -1778,8 +1785,8 @@ class HttpServer
     let _maxHeaders:int        = 100;
     let _maxHeaderBytes:int    = 65536;
     let _maxBodyBytes:int      = 8388608;
-    // Raised from 64 now that a stalled client can no longer hold a slot: the
-    // cap bounds memory and file descriptors, not slow-client exposure. Keep it
+    // A stalled client cannot hold a slot (reads time out), so this cap bounds
+    // memory and file descriptors, not slow-client exposure. Keep it
     // below the process descriptor limit (`ulimit -n`), which is 1024 on many
     // Linux systems.
     let _maxConnections:int    = 512;
@@ -1799,6 +1806,7 @@ class HttpServer
     let _onError                = nil;
     let _onTlsError             = nil;
     let _onAccess               = nil;
+    let _hookErrors:int        = 0;    // exceptions dropped from OnAccess/OnError/OnTlsError
     let _inFlight:int          = 0;    // requests being handled right now
     let _statics:array         = [];   // { prefix, root, index, cacheControl }
 
@@ -1856,6 +1864,8 @@ class HttpServer
     // Format it yourself, or pass it to HttpStatus.CombinedLogLine():
     //   srv.OnAccess(fn(e) { Console.WriteLine(HttpStatus.CombinedLogLine(e)); });
     fn OnAccess(handler) { _onAccess = handler; return this; }
+
+    fn HookErrors(): int { return _hookErrors; }
 
     // Requests being handled right now - what Stop() waits for.
     fn InFlight(): int { return _inFlight; }
@@ -2028,7 +2038,13 @@ class HttpServer
             c = Stream.AcceptTls(c, _tls);
             if (c == nil) {
                 if (_onTlsError != nil) {
-                    _onTlsError(peer, Stream.TlsLastError() ?? "handshake failed");
+                    // A hook runs on this connection fiber, so an exception
+                    // escaping it would end the whole process.
+                    try {
+                        _settled(_onTlsError(peer, Stream.TlsLastError() ?? "handshake failed"));
+                    } catch (_e) {
+                        _hookErrors = _hookErrors + 1;
+                    }
                 }
                 _activeConns = _activeConns - 1;
                 return nil;
@@ -2093,17 +2109,23 @@ class HttpServer
         _inFlight = _inFlight - 1;
 
         if (_onAccess != nil) {
-            _onAccess({
-                peer:       peer,
-                method:     req.method,
-                path:       req.rawPath,
-                version:    req.version,
-                status:     res.StatusCode(),
-                bytes:      res.BodyBytes(),
-                durationMs: Time.Millis() - t0,
-                referer:    req.Header("Referer",    "") ?? "",
-                userAgent:  req.Header("User-Agent", "") ?? ""
-            });
+            // A logging bug must not take the connection fiber - and with it
+            // the process - down.
+            try {
+                _settled(_onAccess({
+                    peer:       peer,
+                    method:     req.method,
+                    path:       req.rawPath,
+                    version:    req.version,
+                    status:     res.StatusCode(),
+                    bytes:      res.BodyBytes(),
+                    durationMs: Time.Millis() - t0,
+                    referer:    req.Header("Referer",    "") ?? "",
+                    userAgent:  req.Header("User-Agent", "") ?? ""
+                }));
+            } catch (_e) {
+                _hookErrors = _hookErrors + 1;
+            }
         }
 
         // The handler took the socket over - it is no longer an HTTP connection.
@@ -2166,7 +2188,14 @@ class HttpServer
             }
         } catch (e) {
             if (_onError != nil) {
-                _onError(req, res, e);
+                // Awaited so an async hook finishes its reply before the 500
+                // check. If the hook itself throws, that is not fed back into
+                // it: it is dropped and the default 500 goes out.
+                try {
+                    _settled(_onError(req, res, e));
+                } catch (_e2) {
+                    _hookErrors = _hookErrors + 1;
+                }
             }
             if (!res.Sent()) { res.Error(500, "internal server error"); }
         }
@@ -2209,8 +2238,7 @@ class HttpServer
                     return true;
                 }
 
-                // One stat answers exists / is-a-directory / size / mtime / is-a-symlink;
-                // the old path called Exists, then Directory.Exists, then read.
+                // One stat answers exists / is-a-directory / size / mtime / is-a-symlink.
                 let st = _fileStat(fileFull);
                 if (st == nil || st.IsDir) { return false; }
 

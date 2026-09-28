@@ -326,11 +326,28 @@ class Router
     let _onAccess          = nil;
     let _hasHosts:bool     = false;  // any host-scoped routes at all?
 
+    // _routes again, flattened for the _findRoute kernel (same order):
+    let _rtFirst           = nil;  // [int] first segment of each route in _sgAt/_sgLen
+    let _rtCount           = nil;  // [int] its segment count
+    let _rtFlags           = nil;  // [int] 1 = has a "*" (catch-all), 2 = host-scoped
+    let _rtMethod          = nil;  // [int] method id, see _methodIds
+    let _sgAt              = nil;  // [int] literal segment start in _sgText; -1 = ":param"
+    let _sgLen             = nil;  // [int] literal segment length
+    let _sgText:string     = "";
+    let _methodIds         = nil;  // method name -> id
+
     fn Constructor() {
         _routes     = [];
         _exact      = {};
         _middleware = [];
         _gen        = 0;
+        _rtFirst    = Array.Create(0, Type.Int);
+        _rtCount    = Array.Create(0, Type.Int);
+        _rtFlags    = Array.Create(0, Type.Int);
+        _rtMethod   = Array.Create(0, Type.Int);
+        _sgAt       = Array.Create(0, Type.Int);
+        _sgLen      = Array.Create(0, Type.Int);
+        _methodIds  = {};
     }
 
     // ---- route registration ----
@@ -359,8 +376,8 @@ class Router
         _addRoute("HEAD", pattern, handler, []);
     }
 
-    // Patterns are split once, at registration. The old matcher re-split both
-    // the pattern *and* the request path for every route on every request.
+    // Patterns are split once, at registration, so matching a request never
+    // re-splits a route's pattern.
     fn _addRoute(method:string, pattern:string, handler:fn, routeMiddleware:array, host?) {
         let raw = String.Split(pattern, "/");
         let segs:array    = [];
@@ -398,6 +415,25 @@ class Router
         let wildHost = (h != nil) && String.StartsWith(h, "*");
         if (dynamic || wildHost) {
             Array.Append(_routes, route);
+            var mid = _methodIds[method];
+            if (mid == nil) {
+                mid = len(Object.Keys(_methodIds)) + 1;
+                _methodIds[method] = mid;
+            }
+            Array.Append(_rtFirst, len(_sgAt));
+            Array.Append(_rtCount, len(segs));
+            Array.Append(_rtFlags, (catchAll ? 1 : 0) | ((h != nil) ? 2 : 0));
+            Array.Append(_rtMethod, mid);
+            foreach (sg in segs) {
+                if (String.CharAt(sg, 0) == ':') {
+                    Array.Append(_sgAt, -1);
+                    Array.Append(_sgLen, 0);
+                } else {
+                    Array.Append(_sgAt, String.Length(_sgText));
+                    Array.Append(_sgLen, String.Length(sg));
+                    _sgText = _sgText + sg;
+                }
+            }
         } else {
             _exact[(h ?? "") + "\n" + method + " /" + String.Join(segs, "/")] = route;
         }
@@ -531,6 +567,85 @@ class Router
         return out;
     }
 
+    // "/" plus the non-empty segments of path joined by "/" - the path
+    // _pathSegs and String.Join give back - or "" when path holds a NUL byte.
+    fn static _normPath(path:string): string {
+        let n   = len(path);
+        let out = String.Create(n + 1);
+        var k   = 0;
+        var p   = 0;
+        while (p < n) {
+            while (p < n && path[p] == '/') { p += 1; }
+            if (p >= n) { break; }
+            out[k] = '/';
+            k += 1;
+            while (p < n && path[p] != '/') {
+                if (Char.Code(path[p]) == 0) { return ""; }
+                out[k] = path[p];
+                k += 1;
+                p += 1;
+            }
+        }
+        if (k == 0) {
+            out[0] = '/';
+            k = 1;
+        }
+        return String.Substr(out, 0, k);
+    }
+
+    // Index of the first route that is not host-scoped, has method id `mid`
+    // and matches the segments of `norm` (a _normPath result), or -1. The
+    // same test as _matchRoute, without the captures.
+    fn static _findRoute(norm:string, mid:int, rtFirst:[int], rtCount:[int], rtFlags:[int], rtMethod:[int], sgAt:[int], sgLen:[int], sgText:string): int {
+        let n     = len(norm);
+        let segAt = Array.Create(0, Type.Int);
+        let segTo = Array.Create(0, Type.Int);
+        if (n > 1) {
+            var start = 1;
+            iter (p from 1 to n) {
+                if (norm[p] == '/') {
+                    Array.Append(segAt, start);
+                    Array.Append(segTo, p);
+                    start = p + 1;
+                }
+            }
+            Array.Append(segAt, start);
+            Array.Append(segTo, n);
+        }
+        let ns = len(segAt);
+        iter (r from 0 to len(rtFirst)) {
+            if (rtMethod[r] != mid || (rtFlags[r] & 2) != 0) { continue; }
+            let cnt = rtCount[r];
+            if ((rtFlags[r] & 1) != 0) {
+                if (ns < cnt) { continue; }
+            } else if (ns != cnt) {
+                continue;
+            }
+            let f  = rtFirst[r];
+            var ok = true;
+            iter (i from 0 to cnt) {
+                let a = sgAt[f + i];
+                if (a >= 0) {
+                    let l = sgLen[f + i];
+                    let s = segAt[i];
+                    if (segTo[i] - s != l) {
+                        ok = false;
+                        break;
+                    }
+                    iter (k from 0 to l) {
+                        if (norm[s + k] != sgText[a + k]) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!ok) { break; }
+                }
+            }
+            if (ok) { return r; }
+        }
+        return -1;
+    }
+
     // Match pre-split request segments against a pre-split route, filling
     // req.params on success. The params object is allocated only once a capture
     // actually happens, so a route that fails on its first literal costs nothing.
@@ -574,8 +689,7 @@ class Router
     }
 
     // The combined global + route-scoped chain, built once per route and reused
-    // until Use() adds another middleware. The old code rebuilt and re-copied
-    // this array on every single request.
+    // until Use() adds another middleware.
     fn _chainFor(route) {
         if (route.chainGen != _gen) {
             route.chain    = this._buildChain(route.middleware);
@@ -589,13 +703,25 @@ class Router
             return Response.Error(400, "Bad Request");
         }
 
-        let segs = this._pathSegs(req.path);
-        let tail = req.method + " /" + String.Join(segs, "/");
+        // A string method and path take the native route: the path is
+        // normalised and the dynamic routes are scanned by kernels, and the
+        // segments are split only when a route needs its captures.
+        var norm = "";
+        if (type(req.path) == Type.String && type(req.method) == Type.String) {
+            norm = Router._normPath(req.path);
+        }
+        var segs = nil;
+        var tail = "";
+        if (norm != "") {
+            tail = req.method + " " + norm;
+        } else {
+            segs = this._pathSegs(req.path);
+            tail = req.method + " /" + String.Join(segs, "/");
+        }
         let host = _hasHosts ? _reqHostOf(req) : "";
 
         // Fixed patterns resolve in a single map lookup. Keying on the rejoined
-        // segments keeps the old lenient behaviour, where "/a/b/" and "//a//b"
-        // both match "/a/b". A route bound to this host is preferred over one
+        // segments makes matching lenient: "/a/b/" and "//a//b" both match "/a/b". A route bound to this host is preferred over one
         // that serves every host.
         let hit = nil;
         if (_hasHosts) { hit = Object.TryGet(_exact, host + "\n" + tail, nil); }
@@ -609,6 +735,7 @@ class Router
         // Two passes for the same reason: host-scoped routes first, then the
         // ones that serve any host. Skipped entirely when no host is in play.
         if (_hasHosts) {
+            if (segs == nil) { segs = this._pathSegs(req.path); }
             let hi:int = 0;
             while (hi < len(_routes)) {
                 let hr = _routes[hi];
@@ -621,15 +748,28 @@ class Router
             }
         }
 
-        let i:int = 0;
-        while (i < len(_routes)) {
-            let route = _routes[i];
-            if (route.host == nil && route.method == req.method
-                && this._matchRoute(route, segs, req)) {
-                let pipeline = new _Pipeline(this._chainFor(route), route.handler);
-                return pipeline.Run(req);
+        if (norm != "") {
+            let mid = _methodIds[req.method];
+            if (mid != nil) {
+                let ri = Router._findRoute(norm, mid, _rtFirst, _rtCount, _rtFlags, _rtMethod, _sgAt, _sgLen, _sgText);
+                if (ri >= 0) {
+                    let route = _routes[ri];
+                    this._matchRoute(route, this._pathSegs(req.path), req);
+                    let pipeline = new _Pipeline(this._chainFor(route), route.handler);
+                    return pipeline.Run(req);
+                }
             }
-            i += 1;
+        } else {
+            let i:int = 0;
+            while (i < len(_routes)) {
+                let route = _routes[i];
+                if (route.host == nil && route.method == req.method
+                    && this._matchRoute(route, segs, req)) {
+                    let pipeline = new _Pipeline(this._chainFor(route), route.handler);
+                    return pipeline.Run(req);
+                }
+                i += 1;
+            }
         }
 
         // No route matched. Still run the global middleware chain so that

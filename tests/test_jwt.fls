@@ -317,6 +317,78 @@ fn Main() {
     assert("EdDSA WithClaims expired fails", !jwt.VerifyEdDSAWithClaims(tedExp, kp.PublicKey, { now: now }));
 
     // ============================================================
+    //  Every documented method is callable on the class
+    // ============================================================
+
+    assert("static Base64UrlEncodeString",   Jwt.Base64UrlEncodeString("hello") == "aGVsbG8");
+    assert("static Base64UrlDecodeToString", Jwt.Base64UrlDecodeToString("aGVsbG8") == "hello");
+    let s256 = Jwt.EncodeHS256({ sub: "s" }, secret, { exp: now + 60 });
+    let s512 = Jwt.EncodeHS512({ sub: "s" }, secret, { exp: now + 60 });
+    let sEd  = Jwt.EncodeEdDSA({ sub: "s" }, kp.SecretKey, { exp: now + 60 });
+    assert("static EncodeHS256/VerifyHS256",           Jwt.VerifyHS256(s256, secret));
+    assert("static VerifyHS256WithClaims",             Jwt.VerifyHS256WithClaims(s256, secret, { now: now }));
+    assert("static VerifyDecodedHS256",                Jwt.VerifyDecodedHS256(Jwt.Decode(s256), secret, { now: now }));
+    assert("static EncodeHS512/VerifyHS512",           Jwt.VerifyHS512(s512, secret));
+    assert("static VerifyHS512WithClaims",             Jwt.VerifyHS512WithClaims(s512, secret, { now: now }));
+    assert("static EncodeEdDSA/VerifyEdDSA",           Jwt.VerifyEdDSA(sEd, kp.PublicKey));
+    assert("static VerifyEdDSAWithClaims",             Jwt.VerifyEdDSAWithClaims(sEd, kp.PublicKey, { now: now }));
+    assert("static ValidateClaims",                    Jwt.ValidateClaims({ exp: now + 60 }, { now: now }));
+    assert("static IsExpired",                         !Jwt.IsExpired(s256));
+    assert("static ExpiresAt",                         Jwt.ExpiresAt(s256) == now + 60);
+    assert("static GetClaim",                          Jwt.GetClaim(s512, "sub") == "s");
+    assert("static GetClaimFromDecoded",               Jwt.GetClaimFromDecoded(Jwt.Decode(sEd), "sub") == "s");
+    assert("static Refresh",                           Jwt.VerifyHS256(Jwt.Refresh(s256, secret, 120), secret));
+
+    // ============================================================
+    //  Encode never writes the caller's payload
+    // ============================================================
+
+    let mine = { sub: "keep" };
+    let tm1 = Jwt.EncodeHS256(mine, secret, { iat: now, exp: now + 60, nbf: now });
+    let tm2 = Jwt.EncodeHS512(mine, secret, { iat: now, exp: now + 60 });
+    let tm3 = Jwt.EncodeEdDSA(mine, kp.SecretKey, { exp: now + 60 });
+    assert("Encode leaves payload keys unchanged", len(Object.Keys(mine)) == 1 && mine.sub == "keep");
+    assert("Encode leaves no exp/iat/nbf on payload", mine.exp == nil && mine.iat == nil && mine.nbf == nil);
+    assert("Encode copy still carries the claims",
+        Jwt.GetClaim(tm1, "nbf") == now && Jwt.GetClaim(tm2, "iat") == now && Jwt.GetClaim(tm3, "exp") == now + 60);
+    assert("Encode copy keeps the payload's own claims", Jwt.GetClaim(tm1, "sub") == "keep");
+    let preset = { sub: "p", exp: 5 };
+    let tm4 = Jwt.EncodeHS256(preset, secret, { exp: 9 });
+    assert("Option exp overrides payload exp in the token only", Jwt.GetClaim(tm4, "exp") == 9 && preset.exp == 5);
+
+    // ============================================================
+    //  aud / iss (checked only when the options ask)
+    // ============================================================
+
+    let tAud  = Jwt.EncodeHS256({ sub: "a", aud: "api", iss: "auth.example" }, secret, { exp: now + 60 });
+    let tAuds = Jwt.EncodeHS256({ sub: "a", aud: ["web", "api"] }, secret, { exp: now + 60 });
+    let tNone = Jwt.EncodeHS256({ sub: "a" }, secret, { exp: now + 60 });
+    assert("aud string matches string",        Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, aud: "api" }));
+    assert("aud string mismatch fails",        !Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, aud: "other" }));
+    assert("aud string in accepted array",     Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, aud: ["x", "api"] }));
+    assert("aud string not in accepted array", !Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, aud: ["x", "y"] }));
+    assert("aud array contains expected",      Jwt.VerifyHS256WithClaims(tAuds, secret, { now: now, aud: "api" }));
+    assert("aud array lacks expected",         !Jwt.VerifyHS256WithClaims(tAuds, secret, { now: now, aud: "admin" }));
+    assert("aud array overlaps accepted array", Jwt.VerifyHS256WithClaims(tAuds, secret, { now: now, aud: ["admin", "web"] }));
+    assert("aud arrays disjoint fails",        !Jwt.VerifyHS256WithClaims(tAuds, secret, { now: now, aud: ["admin", "cli"] }));
+    assert("aud required but token has none",  !Jwt.VerifyHS256WithClaims(tNone, secret, { now: now, aud: "api" }));
+    assert("iss matches",                      Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, iss: "auth.example" }));
+    assert("iss mismatch fails",               !Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, iss: "evil.example" }));
+    assert("iss required but token has none",  !Jwt.VerifyHS256WithClaims(tNone, secret, { now: now, iss: "auth.example" }));
+    assert("aud + iss both match",             Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, aud: "api", iss: "auth.example" }));
+    assert("aud ok but iss wrong fails",       !Jwt.VerifyHS256WithClaims(tAud, secret, { now: now, aud: "api", iss: "x" }));
+    assert("token aud ignored without option", Jwt.VerifyHS256WithClaims(tAud, secret, { now: now }));
+    assert("token aud ignored, no options",    Jwt.VerifyHS256WithClaims(tAud, secret));
+    assert("VerifyDecodedHS256 checks aud",    !Jwt.VerifyDecodedHS256(Jwt.Decode(tAud), secret, { aud: "other" }));
+    assert("ValidateClaims checks iss",        !Jwt.ValidateClaims({ iss: "a" }, { iss: "b" }));
+    let t512Aud = Jwt.EncodeHS512({ aud: "api", iss: "me" }, secret);
+    assert("HS512 WithClaims aud match",       Jwt.VerifyHS512WithClaims(t512Aud, secret, { aud: "api", iss: "me" }));
+    assert("HS512 WithClaims aud mismatch",    !Jwt.VerifyHS512WithClaims(t512Aud, secret, { aud: "web" }));
+    let tEdAud = Jwt.EncodeEdDSA({ aud: ["api"], iss: "me" }, kp.SecretKey);
+    assert("EdDSA WithClaims aud match",       Jwt.VerifyEdDSAWithClaims(tEdAud, kp.PublicKey, { aud: "api", iss: "me" }));
+    assert("EdDSA WithClaims iss mismatch",    !Jwt.VerifyEdDSAWithClaims(tEdAud, kp.PublicKey, { iss: "you" }));
+
+    // ============================================================
     //  Summary
     // ============================================================
 

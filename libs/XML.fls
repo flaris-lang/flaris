@@ -57,35 +57,297 @@
 
 class XML {
 
-    // ── Mutable cursor state (set by Parse, used by all _* helpers) ───────────
-    let _src:     string = "";
-    let _n:       int    = 0;
-    let _pos:     int    = 0;
-    let _results: array  = [];
+    let _results: array = [];
+    let _parts:   array = [];
 
-    // ── Low-level helpers ─────────────────────────────────────────────────────
+    // ── Scanner ───────────────────────────────────────────────────────────────
+    //
+    // _scan reads the whole document natively and records its structure as
+    // events of three ints, [kind | flags | length << 8, start, element],
+    // where start and length are a byte range of the source and element is the
+    // index of an element in document order (0 = the root). Parse turns the
+    // events into nodes.
+    //   1  element opens (range = tag name; element = its parent, -1 for none)
+    //   2  attribute name of the element opened last; flag 16 = no "=value",
+    //      the attribute is true
+    //   3  attribute value, right after its name; flag 16 = holds "&"
+    //   5  one of several text runs of the element; flag 16 = holds "&"
+    //   6  CDATA section (element = its parent, -1 for none)
+    //   7  closing tag whose name differs from the element's tag
+    //   8  the element's only text run, already trimmed; flag 16 = holds "&",
+    //      flag 32 = decoding it can expose whitespace at an end
+    //   9  the element's text runs are complete and want trimming
+    // Text runs are the stretches between markup that hold a character
+    // String.Trim keeps; whitespace-only runs are dropped.
 
-    fn _peek() : string {
-        if (this._pos >= this._n) return "";
-        return String.Substr(this._src, this._pos, 1);
-    }
-
-    fn _peekAt(offset: int) : string {
-        let p = this._pos + offset;
-        if (p >= this._n) return "";
-        return String.Substr(this._src, p, 1);
-    }
-
-    fn _find(sub: string) : int {
-        return String.IndexOfFrom(this._src, sub, this._pos);
-    }
-
-    fn _skipSpace() {
-        while (this._pos < this._n) {
-            let c = String.Substr(this._src, this._pos, 1);
-            if (c != " " && c != "\t" && c != "\n" && c != "\r") break;
-            this._pos += 1;
+    fn static _ws(s: string, pos: int, n: int) : int {
+        var p = pos;
+        while (p < n) {
+            let c = s[p];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') { return p; }
+            p += 1;
         }
+        return p;
+    }
+
+    fn static _nameEnd(s: string, pos: int, n: int) : int {
+        let e = String.IndexOfAnyFrom(s, " \t\n\r>/=\"'<", pos);
+        if (e < 0) { return n; }
+        return e;
+    }
+
+    // First index in [a, b) holding a character String.Trim keeps, or b.
+    fn static _ink(s: string, a: int, b: int) : int {
+        var p = a;
+        while (p < b) {
+            let c = s[p];
+            if (c != ' ' && (c < '\t' || c > '\r')) { return p; }
+            p += 1;
+        }
+        return b;
+    }
+
+    // One past the last index in [a, b) holding a character String.Trim keeps.
+    fn static _inkEnd(s: string, a: int, b: int) : int {
+        var p = b;
+        while (p > a) {
+            let c = s[p - 1];
+            if (c != ' ' && (c < '\t' || c > '\r')) { return p; }
+            p -= 1;
+        }
+        return a;
+    }
+
+    fn static _same(s: string, a: int, alen: int, b: int, blen: int) : bool {
+        if (alen != blen) { return false; }
+        iter (i from 0 to alen) {
+            if (s[a + i] != s[b + i]) { return false; }
+        }
+        return true;
+    }
+
+    fn static _ev(ev: [int], w: int, start: int, elem: int) : int {
+        Array.Append(ev, w);
+        Array.Append(ev, start);
+        Array.Append(ev, elem);
+        return 0;
+    }
+
+    // Emits the text of an element that had `count` text runs; a single run is
+    // [at, end) with its "&" flag.
+    fn static _textDone(s: string, ev: [int], elem: int, count: int, at: int, end: int, amp: int) : int {
+        if (count == 1) {
+            let a = XML._ink(s, at, end);
+            let b = XML._inkEnd(s, a, end);
+            var fl = amp;
+            if (amp != 0 && (s[a] == '&' || s[b - 1] == ';')) { fl = fl | 32; }
+            XML._ev(ev, 8 | fl | ((b - a) << 8), a, elem);
+        } else if (count > 1) {
+            XML._ev(ev, 9, 0, elem);
+        }
+        return 0;
+    }
+
+    fn static _scan(s: string) : [int] {
+        let ev = Array.Create(0, Type.Int);
+        let n  = len(s);
+
+        // Per open element, indexed by depth - 1.
+        let dElem   = Array.Create(0, Type.Int);
+        let dTagAt  = Array.Create(0, Type.Int);
+        let dTagLen = Array.Create(0, Type.Int);
+        let dRuns   = Array.Create(0, Type.Int);
+        let dRunAt  = Array.Create(0, Type.Int);
+        let dRunEnd = Array.Create(0, Type.Int);
+        let dRunAmp = Array.Create(0, Type.Int);
+
+        var depth  = 0;
+        var elems  = 0;
+        var amp    = -1;     // first "&" at or after the last range tested; n = none left
+        var pos    = XML._ws(s, 0, n);
+        if (pos >= n || s[pos] != '<') { return ev; }
+        var markup = true;   // pos is on a "<" that starts markup
+
+        while (true) {
+            if (!markup) {
+                if (pos >= n) { break; }
+                if (s[pos] == '<') {
+                    if (pos + 1 < n && s[pos + 1] == '/') {
+                        let ns = pos + 2;
+                        let ne = XML._nameEnd(s, ns, n);
+                        depth -= 1;
+                        if (!XML._same(s, ns, ne - ns, dTagAt[depth], dTagLen[depth])) {
+                            XML._ev(ev, 7 | ((ne - ns) << 8), ns, dElem[depth]);
+                        }
+                        XML._textDone(s, ev, dElem[depth], dRuns[depth], dRunAt[depth], dRunEnd[depth], dRunAmp[depth]);
+                        pos = XML._ws(s, ne, n);
+                        if (pos < n && s[pos] == '>') { pos += 1; }
+                        if (depth == 0) { break; }
+                        continue;
+                    }
+                    markup = true;
+                    continue;
+                }
+                var te = String.IndexOfFrom(s, "<", pos);
+                if (te < 0) { te = n; }
+                if (XML._ink(s, pos, te) < te) {
+                    if (amp < pos) {
+                        amp = String.IndexOfFrom(s, "&", pos);
+                        if (amp < 0) { amp = n; }
+                    }
+                    var fl = 0;
+                    if (amp < te) { fl = 16; }
+                    let d = depth - 1;
+                    let runs = dRuns[d];
+                    if (runs == 0) {
+                        dRunAt[d]  = pos;
+                        dRunEnd[d] = te;
+                        dRunAmp[d] = fl;
+                    } else {
+                        if (runs == 1) {
+                            XML._ev(ev, 5 | dRunAmp[d] | ((dRunEnd[d] - dRunAt[d]) << 8), dRunAt[d], dElem[d]);
+                        }
+                        XML._ev(ev, 5 | fl | ((te - pos) << 8), pos, dElem[d]);
+                    }
+                    dRuns[d] = runs + 1;
+                }
+                pos = te;
+                continue;
+            }
+
+            markup = false;
+            pos += 1;
+
+            // <?...?>, <!-- ... --> and <!...> are skipped together with the
+            // whitespace after them.
+            var skipped = false;
+            if (pos < n && s[pos] == '?') {
+                let e = String.IndexOfFrom(s, "?>", pos);
+                if (e >= 0) { pos = e + 2; }
+                skipped = true;
+            } else if (pos < n && s[pos] == '!') {
+                if (pos + 1 < n && s[pos + 1] == '[') {
+                    let cs     = pos + 8;     // past "![CDATA["
+                    let e      = String.IndexOfFrom(s, "]]>", cs);
+                    let parent = (depth > 0) ? dElem[depth - 1] : -1;
+                    if (e >= 0) {
+                        XML._ev(ev, 6 | ((e - cs) << 8), cs, parent);
+                        pos = e + 3;
+                    } else {
+                        if (cs < n) {
+                            XML._ev(ev, 6 | ((n - cs) << 8), cs, parent);
+                        } else {
+                            XML._ev(ev, 6, n, parent);
+                        }
+                        pos = n;
+                    }
+                    if (depth == 0) { break; }
+                    continue;
+                }
+                if (pos + 1 < n && s[pos + 1] == '-') {
+                    let e = String.IndexOfFrom(s, "-->", pos);
+                    if (e >= 0) { pos = e + 3; }
+                } else {
+                    let e = String.IndexOfFrom(s, ">", pos);
+                    if (e >= 0) { pos = e + 1; }
+                }
+                skipped = true;
+            }
+            if (skipped) {
+                pos = XML._ws(s, pos, n);
+                if (depth == 0) {
+                    if (pos < n && s[pos] == '<') {
+                        markup = true;
+                        continue;
+                    }
+                    break;
+                }
+                continue;
+            }
+
+            let ne = XML._nameEnd(s, pos, n);
+            if (ne == pos) {
+                if (depth == 0) { break; }
+                continue;
+            }
+            let parent = (depth > 0) ? dElem[depth - 1] : -1;
+            XML._ev(ev, 1 | ((ne - pos) << 8), pos, parent);
+            if (depth < len(dElem)) {
+                dElem[depth]   = elems;
+                dTagAt[depth]  = pos;
+                dTagLen[depth] = ne - pos;
+                dRuns[depth]   = 0;
+            } else {
+                Array.Append(dElem, elems);
+                Array.Append(dTagAt, pos);
+                Array.Append(dTagLen, ne - pos);
+                Array.Append(dRuns, 0);
+                Array.Append(dRunAt, 0);
+                Array.Append(dRunEnd, 0);
+                Array.Append(dRunAmp, 0);
+            }
+            elems += 1;
+            depth += 1;
+            pos = ne;
+
+            while (true) {
+                pos = XML._ws(s, pos, n);
+                if (pos >= n) { break; }
+                let c = s[pos];
+                if (c == '>' || c == '/' || c == '<') { break; }
+                let ks = pos;
+                let ke = XML._nameEnd(s, ks, n);
+                if (ke == ks) { break; }
+                pos = XML._ws(s, ke, n);
+                if (pos >= n || s[pos] != '=') {
+                    XML._ev(ev, 2 | 16 | ((ke - ks) << 8), ks, 0);
+                    continue;
+                }
+                XML._ev(ev, 2 | ((ke - ks) << 8), ks, 0);
+                pos = XML._ws(s, pos + 1, n);
+                var vs = pos;
+                var ve = pos;
+                if (pos < n && (s[pos] == '"' || s[pos] == '\'')) {
+                    vs = pos + 1;
+                    if (s[pos] == '"') {
+                        ve = String.IndexOfFrom(s, "\"", vs);
+                    } else {
+                        ve = String.IndexOfFrom(s, "'", vs);
+                    }
+                    if (ve < 0) {
+                        ve  = n;
+                        pos = n;
+                    } else {
+                        pos = ve + 1;
+                    }
+                }
+                var fl = 0;
+                if (ve > vs) {
+                    if (amp < vs) {
+                        amp = String.IndexOfFrom(s, "&", vs);
+                        if (amp < 0) { amp = n; }
+                    }
+                    if (amp < ve) { fl = 16; }
+                }
+                XML._ev(ev, 3 | fl | ((ve - vs) << 8), vs, 0);
+            }
+
+            pos = XML._ws(s, pos, n);
+            if (pos < n && s[pos] == '/') {
+                pos += 2;
+                depth -= 1;
+                if (depth == 0) { break; }
+                continue;
+            }
+            if (pos < n && s[pos] == '>') { pos += 1; }
+        }
+
+        // Elements still open at the end of the input end there.
+        while (depth > 0) {
+            depth -= 1;
+            XML._textDone(s, ev, dElem[depth], dRuns[depth], dRunAt[depth], dRunEnd[depth], dRunAmp[depth]);
+        }
+        return ev;
     }
 
     // ── Entity codec ──────────────────────────────────────────────────────────
@@ -101,255 +363,254 @@ class XML {
     // An unrecognised "&..." is passed through verbatim rather than dropped.
     // XML calls it a well-formedness error, but a parser that silently deletes
     // text is worse than one that hands it back unchanged.
-    fn _decode(s: string) : string {
-        let amp = String.IndexOf(s, "&");
-        if (amp < 0) return s;
-
-        let n = len(s);
-        let parts = [];
+    //
+    // Every reference is at least as long as the UTF-8 it stands for, so the
+    // result never outgrows the input.
+    fn static _decode(s: string) : string {
+        var at  = String.IndexOf(s, "&");
+        let n   = len(s);
+        let out = String.Create(n);
+        var k   = 0;
         var pos = 0;
-        var at  = amp;
-
         while (at >= 0) {
-            if (at > pos) { Array.Append(parts, String.Substr(s, pos, at - pos)); }
-
-            // The longest reference this parser knows is "&#x10FFFF;" - an
-            // eight-character body - so a ";" further off than that cannot be
-            // closing an entity, and the "&" is just an ampersand. Bounding it
-            // also keeps a document full of stray "&" from scanning to the end
-            // of the text on every one.
-            let semi = String.IndexOfFrom(s, ";", at + 1);
-            var lit = nil;
-            if (semi > at && semi - at <= 9) {
-                lit = XML._entity(String.Substr(s, at + 1, semi - at - 1));
+            while (pos < at) {
+                out[k] = s[pos];
+                k   += 1;
+                pos += 1;
             }
-
-            if (lit == nil) {
-                Array.Append(parts, String.Substr(s, at, 1));   // a bare "&"
+            let semi = XML._semi(s, at, n);
+            var cp   = -1;
+            if (semi > 0) { cp = XML._entity(s, at + 1, semi); }
+            if (cp < 0) {
+                out[k] = '&';
+                k  += 1;
                 pos = at + 1;
             } else {
-                Array.Append(parts, lit);
+                k   = XML._putUtf8(out, k, cp);
                 pos = semi + 1;
             }
-            at = (pos < n) ? String.IndexOfFrom(s, "&", pos) : -1;
+            at = -1;
+            if (pos < n) { at = String.IndexOfFrom(s, "&", pos); }
         }
-
-        if (pos < n) { Array.Append(parts, String.Substr(s, pos, n - pos)); }
-        return String.Join(parts, "");
+        while (pos < n) {
+            out[k] = s[pos];
+            k   += 1;
+            pos += 1;
+        }
+        return String.Substr(out, 0, k);
     }
 
-    // The body of one entity reference - what sits between "&" and ";" - as the
-    // text it stands for, or nil when it is not a reference this parser knows.
-    fn static _entity(body: string) : string {
-        if (body == "amp")  return "&";
-        if (body == "lt")   return "<";
-        if (body == "gt")   return ">";
-        if (body == "quot") return "\"";
-        if (body == "apos") return "'";
+    // The ";" closing a reference that starts at the "&" at `at`, or -1. The
+    // longest reference this parser knows is "&#x10FFFF;" - an eight-character
+    // body - so a ";" further off than that cannot be closing one.
+    fn static _semi(s: string, at: int, n: int) : int {
+        var p = at + 1;
+        while (p < n && p <= at + 9) {
+            if (s[p] == ';') { return p; }
+            p += 1;
+        }
+        return -1;
+    }
+
+    // The codepoint named by the reference body s[a, b) - what sits between
+    // "&" and ";" - or -1 when it is not a reference this parser knows.
+    fn static _entity(s: string, a: int, b: int) : int {
+        let m = b - a;
+        if (m == 2 && s[a + 1] == 't') {
+            if (s[a] == 'l') { return 60; }
+            if (s[a] == 'g') { return 62; }
+            return -1;
+        }
+        if (m == 3 && s[a] == 'a' && s[a + 1] == 'm' && s[a + 2] == 'p') { return 38; }
+        if (m == 4 && s[a] == 'q' && s[a + 1] == 'u' && s[a + 2] == 'o' && s[a + 3] == 't') { return 34; }
+        if (m == 4 && s[a] == 'a' && s[a + 1] == 'p' && s[a + 2] == 'o' && s[a + 3] == 's') { return 39; }
 
         // Numeric character references. Real documents are full of them -
         // "&#8217;" for a right single quote is what most editors emit - and
         // without this they survive the parse as literal text and then get
         // re-encoded to "&amp;#8217;" on the way out, mangling the document.
-        if (len(body) < 2 || String.Substr(body, 0, 1) != "#") return nil;
-
-        var digits = "";
-        var radix  = 10;
-        let second = String.Substr(body, 1, 1);
-        if (second == "x" || second == "X") {
-            if (len(body) < 3) return nil;
-            digits = String.Substr(body, 2, len(body) - 2);
-            radix  = 16;
-        } else {
-            digits = String.Substr(body, 1, len(body) - 1);
+        if (m < 2 || s[a] != '#') { return -1; }
+        var p     = a + 1;
+        var radix = 10;
+        if (s[p] == 'x' || s[p] == 'X') {
+            if (m < 3) { return -1; }
+            radix = 16;
+            p += 1;
         }
 
-        // Every character has to be a digit of the right base. Without this a
-        // parser that stops at the first bad character would read "&#5abc;" as
-        // codepoint 5 and silently drop the rest.
-        let allowed = (radix == 16) ? "0123456789abcdefABCDEF" : "0123456789";
-        iter (i from 0 to len(digits)) {
-            if (String.IndexOf(allowed, String.Substr(digits, i, 1)) < 0) return nil;
+        // Every character has to be a digit of the right base. Stopping at the
+        // first bad one would read "&#5abc;" as codepoint 5 and drop the rest.
+        var cp = 0;
+        while (p < b) {
+            let c = s[p];
+            var d = -1;
+            if (c >= '0' && c <= '9') {
+                d = Char.Code(c) - 48;
+            } else if (radix == 16 && c >= 'a' && c <= 'f') {
+                d = Char.Code(c) - 87;
+            } else if (radix == 16 && c >= 'A' && c <= 'F') {
+                d = Char.Code(c) - 55;
+            }
+            if (d < 0) { return -1; }
+            cp = cp * radix + d;
+            p += 1;
         }
-
-        let cp = Convert.ParseRadix(digits, radix);
 
         // U+0000 cannot be represented in a Flaris string, and anything past
         // U+10FFFF or inside the surrogate range is not a codepoint at all.
-        if (cp == nil || cp <= 0 || cp > 1114111) return nil;
-        if (cp >= 55296 && cp <= 57343) return nil;
-        return "" + Char.FromInt(cp);
+        if (cp <= 0 || cp > 1114111) { return -1; }
+        if (cp >= 55296 && cp <= 57343) { return -1; }
+        return cp;
     }
 
-    fn _encode(s: string) : string {
-        var r = String.Replace(s,    "&",   "&amp;");
-        r      = String.Replace(r,   "<",   "&lt;");
-        r      = String.Replace(r,   ">",   "&gt;");
-        r      = String.Replace(r,   "\"",  "&quot;");
-        r      = String.Replace(r,   "'",   "&apos;");
-        return r;
-    }
-
-    // ── Name parser ───────────────────────────────────────────────────────────
-
-    fn _parseName() : string {
-        let end = String.IndexOfAnyFrom(this._src, " \t\n\r>/=\"'<", this._pos);
-        if (end < 0) end = this._n;
-        let name = String.Substr(this._src, this._pos, end - this._pos);
-        this._pos = end;
-        return name;
-    }
-
-    // ── Attribute value ───────────────────────────────────────────────────────
-
-    fn _parseAttrVal() : string {
-        let quote = this._peek();
-        if (quote != "\"" && quote != "'") return "";
-        this._pos += 1;
-        let close = String.IndexOfFrom(this._src, quote, this._pos);
-        if (close < 0) {
-            let val = String.Substr(this._src, this._pos, this._n - this._pos);
-            this._pos = this._n;
-            return this._decode(val);
+    // Writes cp as UTF-8 at out[k]; returns the index after it.
+    fn static _putUtf8(out: string, k: int, cp: int) : int {
+        if (cp < 128) {
+            out[k] = Char.FromInt(cp);
+            return k + 1;
         }
-        let val = String.Substr(this._src, this._pos, close - this._pos);
-        this._pos = close + 1;
-        return this._decode(val);
+        if (cp < 2048) {
+            out[k]     = Char.FromInt(192 | (cp >> 6));
+            out[k + 1] = Char.FromInt(128 | (cp & 63));
+            return k + 2;
+        }
+        if (cp < 65536) {
+            out[k]     = Char.FromInt(224 | (cp >> 12));
+            out[k + 1] = Char.FromInt(128 | ((cp >> 6) & 63));
+            out[k + 2] = Char.FromInt(128 | (cp & 63));
+            return k + 3;
+        }
+        out[k]     = Char.FromInt(240 | (cp >> 18));
+        out[k + 1] = Char.FromInt(128 | ((cp >> 12) & 63));
+        out[k + 2] = Char.FromInt(128 | ((cp >> 6) & 63));
+        out[k + 3] = Char.FromInt(128 | (cp & 63));
+        return k + 4;
     }
 
-    // ── Attribute list ────────────────────────────────────────────────────────
-
-    fn _parseAttrs() : object {
-        let attrs = {};
-        while (true) {
-            this._skipSpace();
-            let c = this._peek();
-            if (c == ">" || c == "/" || c == "" || c == "<") break;
-
-            let key = this._parseName();
-            if (String.Length(key) == 0) break;
-
-            this._skipSpace();
-            if (this._peek() != "=") {
-                attrs[key] = true;
-                continue;
+    fn static _encode(s: string) : string {
+        let n     = len(s);
+        let first = String.IndexOfAnyFrom(s, "&<>\"'", 0);
+        if (first < 0) { return String.Substr(s, 0, n); }
+        var grow = 0;
+        iter (i from first to n) {
+            let c = s[i];
+            if (c == '&') {
+                grow += 4;
+            } else if (c == '<' || c == '>') {
+                grow += 3;
+            } else if (c == '"' || c == '\'') {
+                grow += 5;
             }
-            this._pos += 1;
-            this._skipSpace();
-            attrs[key] = this._parseAttrVal();
         }
-        return attrs;
-    }
-
-    // ── Element parser ────────────────────────────────────────────────────────
-
-    fn _parseElem() : object {
-        this._skipSpace();
-        if (this._pos >= this._n) return nil;
-        if (this._peek() != "<") return nil;
-        this._pos += 1;
-
-        let c1 = this._peek();
-
-        // PI  <?...?>
-        if (c1 == "?") {
-            let end = this._find("?>");
-            if (end >= 0) this._pos = end + 2;
-            return this._parseElem();
-        }
-
-        // DOCTYPE / Comment / CDATA
-        if (c1 == "!") {
-            let c2 = this._peekAt(1);
-
-            if (c2 == "-") {
-                let end = this._find("-->");
-                if (end >= 0) this._pos = end + 3;
-                return this._parseElem();
-            }
-
-            if (c2 == "[") {
-                this._pos += 8; // skip "![CDATA["
-                let end = this._find("]]>");
-                var text = "";
-                if (end >= 0) {
-                    text = String.Substr(this._src, this._pos, end - this._pos);
-                    this._pos = end + 3;
-                } else {
-                    text = String.Substr(this._src, this._pos, this._n - this._pos);
-                    this._pos = this._n;
-                }
-                return { tag: "", text: text, attrs: {}, children: [] };
-            }
-
-            let end = this._find(">");
-            if (end >= 0) this._pos = end + 1;
-            return this._parseElem();
-        }
-
-        // Regular open tag
-        let tag = this._parseName();
-        if (String.Length(tag) == 0) return nil;
-
-        let attrs = this._parseAttrs();
-        this._skipSpace();
-
-        // Self-closing />
-        if (this._peek() == "/") {
-            this._pos += 2;
-            return { tag: tag, text: "", attrs: attrs, children: [] };
-        }
-
-        if (this._peek() == ">") this._pos += 1;
-
-        // Collect children / text
-        var children = [];
-        var text     = "";
-
-        while (this._pos < this._n) {
-            let c = this._peek();
-
-            if (c == "<") {
-                if (this._peekAt(1) == "/") {
-                    this._pos += 2;
-                    let closeTag = this._parseName();
-                    if (closeTag != tag) {
-                        Console.WriteLine("[XML] Warning: mismatched tag </" + closeTag + "> inside <" + tag + ">");
-                    }
-                    this._skipSpace();
-                    if (this._peek() == ">") this._pos += 1;
-                    break;
-                }
-
-                let child = this._parseElem();
-                if (child != nil) {
-                    children = Array.Append(children, child);
-                }
-
+        let out = String.Create(n + grow);
+        var k   = 0;
+        iter (i from 0 to n) {
+            let c = s[i];
+            if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') {
+                k = XML._putRef(out, k, c);
             } else {
-                let tEnd = String.IndexOfFrom(this._src, "<", this._pos);
-                if (tEnd < 0) tEnd = this._n;
-                let chunk   = String.Substr(this._src, this._pos, tEnd - this._pos);
-                let trimmed = String.Trim(chunk);
-                if (String.Length(trimmed) > 0) {
-                    text = text + this._decode(chunk);
-                }
-                this._pos = tEnd;
+                out[k] = c;
+                k += 1;
             }
         }
+        return out;
+    }
 
-        return { tag: tag, text: String.Trim(text), attrs: attrs, children: children };
+    // Writes the entity reference for c at out[k]; returns the index after it.
+    fn static _putRef(out: string, k: int, c: char) : int {
+        out[k] = '&';
+        if (c == '<' || c == '>') {
+            out[k + 1] = (c == '<') ? 'l' : 'g';
+            out[k + 2] = 't';
+            out[k + 3] = ';';
+            return k + 4;
+        }
+        if (c == '&') {
+            out[k + 1] = 'a';
+            out[k + 2] = 'm';
+            out[k + 3] = 'p';
+            out[k + 4] = ';';
+            return k + 5;
+        }
+        if (c == '"') {
+            out[k + 1] = 'q';
+            out[k + 2] = 'u';
+            out[k + 3] = 'o';
+            out[k + 4] = 't';
+        } else {
+            out[k + 1] = 'a';
+            out[k + 2] = 'p';
+            out[k + 3] = 'o';
+            out[k + 4] = 's';
+        }
+        out[k + 5] = ';';
+        return k + 6;
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     fn static Parse(source: string) {
         if (source == nil) return nil;
-        let p   = new XML();
-        p._src  = str(source);
-        p._n    = String.Length(p._src);
-        p._pos  = 0;
-        return p._parseElem();
+        let src   = str(source);
+        let ev    = XML._scan(src);
+        let m     = len(ev);
+        var elems = [];     // element nodes in document order
+        var root  = nil;
+        var attrs = nil;    // attribute map of the element opened last
+        var i     = 0;
+        while (i < m) {
+            let w    = ev[i];
+            let kind = w & 15;
+            if (kind == 1) {
+                let node   = { tag: String.Substr(src, ev[i + 1], w >> 8), text: "", attrs: {}, children: [] };
+                let parent = ev[i + 2];
+                if (parent < 0) {
+                    root = node;
+                } else {
+                    Array.Append(elems[parent].children, node);
+                }
+                Array.Append(elems, node);
+                attrs = node.attrs;
+            } else if (kind == 8) {
+                var t = String.Substr(src, ev[i + 1], w >> 8);
+                if ((w & 16) != 0) {
+                    t = XML._decode(t);
+                    if ((w & 32) != 0) { t = String.Trim(t); }
+                }
+                elems[ev[i + 2]].text = t;
+            } else if (kind == 2) {
+                let key = String.Substr(src, ev[i + 1], w >> 8);
+                if ((w & 16) != 0) {
+                    attrs[key] = true;
+                } else {
+                    i += 3;
+                    let vw  = ev[i];
+                    var val = String.Substr(src, ev[i + 1], vw >> 8);
+                    if ((vw & 16) != 0) { val = XML._decode(val); }
+                    attrs[key] = val;
+                }
+            } else if (kind == 5) {
+                var run = String.Substr(src, ev[i + 1], w >> 8);
+                if ((w & 16) != 0) { run = XML._decode(run); }
+                let node = elems[ev[i + 2]];
+                node.text = node.text + run;
+            } else if (kind == 9) {
+                let node = elems[ev[i + 2]];
+                node.text = String.Trim(node.text);
+            } else if (kind == 6) {
+                let cdata  = { tag: "", text: String.Substr(src, ev[i + 1], w >> 8), attrs: {}, children: [] };
+                let parent = ev[i + 2];
+                if (parent < 0) {
+                    root = cdata;
+                } else {
+                    Array.Append(elems[parent].children, cdata);
+                }
+            } else if (kind == 7) {
+                Console.WriteLine("[XML] Warning: mismatched tag </" + String.Substr(src, ev[i + 1], w >> 8) + "> inside <" + elems[ev[i + 2]].tag + ">");
+            }
+            i += 3;
+        }
+        return root;
     }
 
     // Parse XML from a file. Returns nil if the file cannot be read.
@@ -361,47 +622,43 @@ class XML {
 
     fn static Build(node) : string {
         if (node == nil) return "";
+        if (node.tag == "") return XML._encode(node.text);
         let b = new XML();
-        return b._buildNode(node);
+        b._buildInto(node);
+        return String.Join(b._parts, "");
     }
 
-    fn _buildNode(node) : string {
-        if (node == nil) return "";
-
-        if (node.tag == "") return this._encode(node.text);
+    // Appends the markup of node to _parts; Build joins the pieces once.
+    fn _buildInto(node) {
+        if (node == nil) return;
+        let parts = this._parts;
+        if (node.tag == "") {
+            Array.Append(parts, XML._encode(node.text));
+            return;
+        }
 
         var open = "<" + node.tag;
         foreach (attrVal, attrKey in node.attrs) {
-            open = open + " " + attrKey + "=\"" + this._encode(str(attrVal)) + "\"";
+            open = open + " " + attrKey + "=\"" + XML._encode(str(attrVal)) + "\"";
         }
 
-        let nc      = len(node.children);
+        let kids    = node.children;
+        let nc      = len(kids);
         let hasText = node.text != nil && String.Length(str(node.text)) > 0;
 
         if (nc == 0 && !hasText) {
-            return open + "/>";
+            Array.Append(parts, open + "/>");
+            return;
         }
 
-        let nParts = 1 + (hasText ? 1 : 0) + nc + 1;
-        let parts  = Array.Create(nParts);
-        var idx    = 0;
-
-        parts[idx] = open + ">";
-        idx += 1;
-
+        Array.Append(parts, open + ">");
         if (hasText) {
-            parts[idx] = this._encode(str(node.text));
-            idx += 1;
+            Array.Append(parts, XML._encode(str(node.text)));
         }
-
         iter (i from 0 to nc) {
-            parts[idx] = this._buildNode(node.children[i]);
-            idx += 1;
+            this._buildInto(kids[i]);
         }
-
-        parts[idx] = "</" + node.tag + ">";
-
-        return String.Join(parts, "");
+        Array.Append(parts, "</" + node.tag + ">");
     }
 
     // Pretty-print with indentation. indent defaults to two spaces.
@@ -417,7 +674,7 @@ class XML {
 
         // Text/CDATA node
         if (node.tag == "") {
-            let t = String.Trim(this._encode(node.text));
+            let t = String.Trim(XML._encode(node.text));
             if (String.Length(t) == 0) return "";
             return String.Repeat(indent, depth) + t + "\n";
         }
@@ -425,7 +682,7 @@ class XML {
         let pad  = String.Repeat(indent, depth);
         var open = pad + "<" + node.tag;
         foreach (attrVal, attrKey in node.attrs) {
-            open = open + " " + attrKey + "=\"" + this._encode(str(attrVal)) + "\"";
+            open = open + " " + attrKey + "=\"" + XML._encode(str(attrVal)) + "\"";
         }
 
         let nc      = len(node.children);
@@ -437,13 +694,13 @@ class XML {
 
         // Inline: single text child, no element children
         if (hasText && nc == 0) {
-            return open + ">" + this._encode(str(node.text)) + "</" + node.tag + ">\n";
+            return open + ">" + XML._encode(str(node.text)) + "</" + node.tag + ">\n";
         }
 
         var parts = [open + "\n"];
 
         if (hasText) {
-            parts = Array.Append(parts, String.Repeat(indent, depth + 1) + this._encode(str(node.text)) + "\n");
+            parts = Array.Append(parts, String.Repeat(indent, depth + 1) + XML._encode(str(node.text)) + "\n");
         }
 
         iter (i from 0 to nc) {

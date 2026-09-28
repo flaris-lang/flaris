@@ -307,7 +307,55 @@ fn test_waiters() {
     checkEq(r2.value, "stop", "AwaitResult canceled value");
 }
 
-// 10. Delay / RejectAfter / CancelAfterNew
+// 10. Parked waiters: woken by settlement, not by polling
+global parkedDone = 0;
+fn parkedWaiter(p) { p.Await(); parkedDone = parkedDone + 1; return 0; }
+
+fn test_parked_waiters() {
+    Console.WriteLine("== Parked waiters ==");
+
+    // A manually settled promise wakes every fiber waiting on it.
+    let gate = new Promise();
+    let ws = [];
+    iter (i from 0 to 5) {
+        Array.Append(ws, Fiber.New(fn() { return parkedWaiter(gate); }));
+    }
+    foreach (w in ws) { Fiber.Resume(w, true); }
+    Fiber.Sleep(10);
+    checkEq(parkedDone, 0, "waiters stay parked while pending");
+    checkEq(len(gate._waiters), 5, "each waiter is registered once");
+    gate.Resolve("go");
+    Fiber.AwaitAll(ws);
+    checkEq(parkedDone, 5, "Resolve wakes every waiter");
+    checkEq(len(gate._waiters), 0, "settling clears the registrations");
+
+    // The waiter resumes when the promise settles, not on a later poll.
+    let t0 = Time.Millis();
+    let v = Promise.Delay(30, "late").Await();
+    let took = Time.Millis() - t0;
+    checkEq(v, "late", "Await returns the delayed value");
+    check(took >= 25 && took < 250, "Await wakes when the promise settles");
+
+    // Race leaves no registration behind on the losers.
+    let slow = Promise.Delay(40, "slow");
+    let winner = Promise.Race([Promise.Delay(5, "fast"), slow]);
+    checkEq(winner, "fast", "Race returns the first settled value");
+    checkEq(len(slow._waiters), 0, "Race forgets the promises that lost");
+    checkEq(slow.Await(), "slow", "a promise that lost a Race can still be awaited");
+
+    // A cancelled waiter does not disturb the promise it waited on.
+    let held = new Promise();
+    let victim = Fiber.New(fn() { return parkedWaiter(held); });
+    Fiber.Resume(victim, true);
+    Fiber.Sleep(5);
+    Fiber.Cancel(victim);
+    Fiber.Sleep(5);
+    check(Fiber.IsDone(victim), "a parked waiter can be cancelled");
+    held.Resolve(1);
+    checkEq(held.Await(), 1, "the promise still settles after its waiter was cancelled");
+}
+
+// 11. Delay / RejectAfter / CancelAfterNew
 fn test_delayed_factories() {
     Console.WriteLine("== Delayed factories ==");
 
@@ -325,7 +373,7 @@ fn test_delayed_factories() {
     check(caught3, "CancelAfterNew cancels");
 }
 
-// 11. All
+// 12. All
 fn test_all() {
     Console.WriteLine("== Promise.All ==");
 
@@ -351,7 +399,7 @@ fn test_all() {
     check(canceled, "All throws on cancellation");
 }
 
-// 12. Race / FirstSettled
+// 13. Race / FirstSettled
 fn test_race_first_settled() {
     Console.WriteLine("== Race / FirstSettled ==");
 
@@ -367,7 +415,7 @@ fn test_race_first_settled() {
     checkEq(fs.value, "x", "FirstSettled value");
 }
 
-// 13. AllSettled
+// 14. AllSettled
 fn test_all_settled() {
     Console.WriteLine("== AllSettled ==");
 
@@ -387,7 +435,7 @@ fn test_all_settled() {
     checkEq(results[2].value, "stop", "AllSettled canceled value");
 }
 
-// 14. Retry
+// 15. Retry
 fn test_retry() {
     Console.WriteLine("== Retry ==");
 
@@ -413,7 +461,7 @@ fn test_retry() {
     checkEq(_retryAttempts, 3, "Retry: fn was called exactly 3 times");
 }
 
-// 15. Any
+// 16. Any
 fn test_any() {
     Console.WriteLine("== Promise.Any ==");
 
@@ -517,6 +565,7 @@ fn async Main() {
     test_finally();
     test_timeout_cancel();
     test_waiters();
+    test_parked_waiters();
     test_delayed_factories();
     test_all();
     test_race_first_settled();

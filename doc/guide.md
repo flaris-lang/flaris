@@ -37,7 +37,7 @@ Flaris is:
 - **Deterministic** - execution order is always clear and reproducible.
 - **Fast** - written in C with a compact bytecode interpreter.
 - **Embeddable** - ideal for applications, tools, servers, and games.
-- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`). Optional static analysis helps catch mistakes early. Runtime-version only without compiler and eval/compile functionality provided (flarisrt)
+- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`). Static analysis runs on every compile and catches mistakes before the program starts. A runtime-only binary (`flaris`) ships without the compiler, `VM.Eval` or `VM.Compile`.
 - **Concurrent** - fibers and async functions allow concurrency without threads.
 
 **Three core principles:**
@@ -250,7 +250,8 @@ flarisvm --require-signed --exec app.flx
 | `--stats` | Statistics (allocations, counters) |
 | `--unsafe` | Enable FFI / unsafe code |
 | `--small` | Enable strip of symbols |
-| `--strip` | Strip debug symbols (production) |
+| `-g` / `--no-strip` | Keep debug info - line numbers in stack traces (off by default) |
+| `--strip` | No debug info - the default; overrides the `-g` that `--debug` implies |
 | `--no-opt` | Disable optimizations |
 | `--no-verify` | Disable FFI library SHA-256 checks (not `library()` pins) |
 | `--require-signed` | Refuse to load any `.flx` that is unsigned, tampered, or signed by an untrusted key |
@@ -444,13 +445,16 @@ const PI = 3.1415926535;
 const MAX = 128;
 ```
 
-`const` prevents rebinding, but not mutation of the object itself:
+`const` is deep: neither the binding nor the object it holds can change:
 
 ```js
 const cfg = { port: 8080 };
-cfg.port = 9090;   // ✅ allowed (mutating the object)
-cfg = {};          // ❌ illegal (reassigning the binding)
+cfg.port = 9090;   // ❌ compile error 1005 (a const's properties)
+cfg = {};          // ❌ compile error 1005 (reassigning the binding)
 ```
+
+A change that reaches a const object some other way, through a function
+parameter for example, raises at run time. Use `let` for an object you mutate.
 
 **Globals**
 
@@ -482,7 +486,7 @@ Flaris is dynamically typed. Every value has a type at runtime.
 
 **Binary:** `block`, `pointer`
 
-Type annotations on function signatures are **optional** and produce warnings, not errors. They don't change runtime behavior. See **Reference R3** for the full type annotation specification.
+Type annotations are **optional**. A value the compiler can see is of the wrong type is a compile error; a value whose type is only known when the program runs is checked as it enters an annotated variable, parameter, field or return value. See **Reference R3** for the full type annotation specification.
 
 Quick example:
 
@@ -627,6 +631,22 @@ Integers, booleans, strings, and other scalar values are snapshotted when the in
 function is created. Mutating the outer variable after the inner function is created
 does not affect the captured copy.
 
+Assigning to a captured variable inside the closure changes only the closure's own
+copy. The new value persists across later calls of that closure, but the enclosing
+function never sees it:
+
+```js
+fn makeCounter() {
+    let n = 0;
+    let f = fn() { n += 1; return n; };
+    n = 100;          // f captured n = 0 above; this does not reach it
+    return f;
+}
+let c = makeCounter();
+Console.WriteLine(c());  // 1
+Console.WriteLine(c());  // 2
+```
+
 Reference types (arrays, objects) share the same heap object - mutations are visible
 through the closure:
 
@@ -701,10 +721,10 @@ fn worker(id) {
 
 - `let x;` is illegal - always provide an initializer - forces developers to set a reasonable initial value
 - `let` and `var` at the top level are illegal - use `global name = value;` at module scope
-- `const` prevents rebinding the name, not mutating the value
+- `const` prevents rebinding the name and mutating the value it holds
 - Declaring `let x` inside a function does not modify a global `x` - use `global x = value;` to declare a new global from within a function
 - Reusing the same name in nested scopes shadows the outer variable
-- `global x = value;` on an already-declared global produces a warning and redefines it - not a silent no-op
+- `global x = value;` executed again for an existing global (a function that declares it, called twice) warns and redefines it - not a silent no-op; a `VM.Eval` unit may not redefine one at all (1004)
 
 ---
 
@@ -788,25 +808,21 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 - `x && y` yields the value of `y` when `x` is truthy, otherwise `false`; `x || y` yields `true` when `x` is truthy, otherwise the value of `y`
 - `and` / `or` are exact tokenizer aliases - identical precedence and behaviour to `&&` / `||`
 
-**Increment / Decrement:** `++` `--` (postfix)
+**Increment / Decrement:** `++` `--` (prefix or postfix)
 
-`++` and `--` only work on plain variables (locals and globals). They mutate in place and **produce no value** - they cannot be used inside expressions.
+`++` and `--` work on variables (locals and globals), fields and array elements, in
+either position. They mutate in place and **produce no value** - they are statements
+and cannot be used inside expressions. The target must be numeric.
 
 ```js
 let i = 0;
 let s = "";
 i++;          // ok - i is now 1
+++i;          // ok - same thing, i is now 2
+obj.count++;  // ok
+--arr[0];     // ok
 let x = i++;  // ❌ compile error - ++ produces no value
-obj.count++;  // ❌ compile error - use obj.count += 1 instead
-arr[0]++;     // ❌ compile error - use arr[0] += 1 instead
-s++;          // ❌ compile error          
-```
-
-For member properties and array elements, use compound assignment instead:
-
-```js
-obj.count += 1;
-arr[i] -= 1;
+s++;          // ❌ compile error - '++' requires a numeric type
 ```
 
 **Null coalescing:** `x ?? y` - returns `y` only if `x` is `nil`
@@ -851,9 +867,25 @@ conn?.Close();                        // no call when conn is nil
 array[i]       // 0-based integer index
 object["key"]  // string key (equivalent to object.key)
 string[i]      // byte at index i
+block[i]       // element i of a block, as an int
 ```
 
 Null-safe: `nil[x]` returns `nil`.
+
+A block element reads back **unsigned** when the block's elements are 1, 2 or
+4 bytes wide, and as the plain 64-bit value when they are 8 bytes wide. A write
+keeps only the element's low bytes, so a byte written as `-1` reads as `255`:
+
+```js
+let b = Buffer.Create(2, 1);
+b[0] = 200;
+b[1] = -1;
+Console.WriteLine(b[0], " ", b[1]);         // 200 255
+Console.WriteLine(Buffer.ReadI8At(b, 1));   // -1: the signed view
+```
+
+For signed data - PCM samples, signed fields in a binary format - read with
+`Buffer.ReadI8At`, `Buffer.ReadI16At` or `Buffer.ReadI32At` (byte offsets).
 
 ### `guard`
 
@@ -973,7 +1005,7 @@ for (let i = 0; ; i += 1) {   // no condition - step and break inside the body
 
 ## Foreach
 
-Iterates arrays, objects, and strings. Null-safe - iterating `nil` runs zero times.
+Iterates arrays, objects, strings, and collections. Any other value, `nil` included, raises `Exception.InvalidArguments`.
 
 ```js
 foreach (item in [1, 2, 3]) {
@@ -995,8 +1027,13 @@ foreach (ch in "hello") {
 | ---------- | ----- | ------- |
 | Array | integer index | element value |
 | Object | property name (string) | property value |
-| String | character index | UTF-8 character |
-| nil | - | no iterations |
+| String | byte index | byte, as a `char` |
+| Stack, Queue, Deque, Set | index | element (a snapshot taken when the loop starts) |
+| HashMap, OrderedMap | key | value (OrderedMap: insertion order) |
+
+The loop variables need no annotation: over an `[int]`, `[float]`, `[char]` or
+`[bool]` array the value has the element type, over a string it is a `char`,
+and the index is an `int`. They cannot be assigned inside the body.
 
 ## Iter
 
@@ -1155,9 +1192,17 @@ is fine (it does not leave the `finally`).
 If no handler exists, the exception propagates up through fibers. An uncaught
 exception terminates the VM.
 
-> Note: `case <ImportedClass>:` across module boundaries is matched by value,
-> not type, for now (cross-module type resolution is a later addition); the
-> compiler warns when a switch label's type is unknown.
+`case <ImportedClass>:` is an `instanceof` test exactly like a local class.
+Labels are tried top to bottom and the first match wins, so a base class listed
+before its subclass swallows it - here the `NetworkError` arm is unreachable, and
+the compiler warns that it can never match:
+
+```js
+switch (e) {
+    case Exception:    log(e);        break;   // matches every exception
+    case NetworkError: reconnect();   break;   // never reached
+}
+```
 
 ## Import
 
@@ -1395,15 +1440,21 @@ apply(greet, "Carol");  // pass as argument
 
 ### Type Annotations (optional)
 
-Type annotations on parameters and return values produce compile-time warnings, not errors:
+Type annotations on parameters and return values are checked at compile time
+where the types are known, and at run time where they are not:
 
 ```js
 fn add(a: int, b: int): int {
     return a + b;
 }
 
-add(5, 10);       // ✓ OK
-add("x", "y");    // ⚠ Warning at compile time, still runs
+add(5, 10);         // ✓ OK
+add("x", "y");      // ❌ compile error 1000 - expected int, got string
+add(Json.Parse(s), 1); // checked when called: raises InvalidArgs unless it is an int
+
+fn count(o): int {
+    return o.n;     // o is untyped: the returned value is checked, and a
+}                   // non-int raises TypeMismatch (22)
 ```
 
 Use `any` to explicitly accept all types for a parameter - this disables type checking for that parameter while still annotating the others:
@@ -1567,9 +1618,12 @@ static async fn fetch(url) { ... }  // combine modifiers
 ```
 
 `inline` is a hint: the compiler expands the body at each call site when it can
-do so without changing behavior, and otherwise emits a normal call (e.g. when a
-name in the body would collide with a caller local, on deep inline recursion,
-or on arity mismatch). Restrictions: the body may contain at most one `return`,
+do so without changing behavior - with or without `--no-opt` - and otherwise
+emits a normal call: when a name in the body would collide with a caller local,
+on deep inline recursion, when the call passes more arguments than there are
+parameters (too few is fine - the missing ones are `nil`), or when an argument
+is not provably of its parameter's declared type (the normal call is what checks
+it). Restrictions: the body may contain at most one `return`,
 and only as its last statement - a `return` inside a nested block (`if`, loop,
 `try`) is a compile error. Arguments are always evaluated exactly once, left to
 right. Note that `VM.PatchFunction` does not affect call sites that were
@@ -2078,6 +2132,28 @@ let f = load();   // creates a fiber, does not run yet
 
 A newly created fiber does not run until resumed.
 
+### Waiting for several fibers
+
+Because a fiber starts only when it is first resumed or awaited, awaiting
+fibers one by one runs them one after another:
+
+```js
+fn async fetch(url) { /* ... */ }
+
+let a = await fetch(urlA);   // fetch(urlB) has not started yet
+let b = await fetch(urlB);
+```
+
+`Fiber.AwaitAll` starts them all first, so their waits overlap, and returns
+every result in the order given:
+
+```js
+let results = Fiber.AwaitAll([fetch(urlA), fetch(urlB)]);
+```
+
+If any of them fails, `AwaitAll` raises the first failure in array order once
+all of them have finished.
+
 ### Resuming
 
 `Fiber.Resume(f)` - runs the fiber until it yields or returns, then resumes the caller:
@@ -2486,12 +2562,13 @@ by source position.
 
 **Symptom**
 
-- `Cannot assign to const 'X'.`
+- `Cannot modify const 'X' or its properties.`
 
 **Fix**
 
-- Use `let` if rebinding is intended.
-- Keep `const` if you only mutate object contents (e.g., `cfg.port = 1;` is OK) but do not rebind `cfg`.
+- `const` is deep: neither the binding nor its properties or elements can be
+  changed, so `cfg.port = 1;` on a `const cfg` is this error too.
+- Use `let` for a value you rebind or mutate.
 
 ### Missing return on some paths
 
@@ -2537,19 +2614,19 @@ to `a.b` or `a[i]`. If none of these fit, cast: `let ok: int = (int)a;`.
 
 **Symptom**
 
-- `Invalid assignment (produces no output) in if-statement` (also `in while-statement`, `in for condition-statement`)
+- `Assignment used as the 'if' condition; use '==' to compare.` (also `'while'` and `'for'`)
 
 **Fix**
-Assignments do not produce values in compiled bytecode. Rewrite:
+
+An assignment that is the whole condition is almost always a typo for `==`.
+To assign and test in one step, make the assignment an operand of the test:
 
 ```js
 // bad
 if (x = get()) { ... }
 
 // good
-let tmp = get();
-x = tmp;
-if (tmp) { ... }
+while ((line = Next()) != nil) { ... }
 ```
 
 ### Common Warnings and Fixes
@@ -2670,17 +2747,20 @@ or in a container.
 
 ### Debug Symbols
 
-Debug symbols map VM instructions back to source code (file, line, function). Enabled by default.
+Debug info maps VM instructions back to source lines. It is **off** by default;
+`-g` (alias `--no-strip`) turns it on, and `--debug` / `--dap` turn it on for you.
 
 ```bash
-flarisvm script.fls            # symbols enabled (default)
-flarisvm script.fls --strip         # strip symbols for production
+flarisvm script.fls            # no debug info (default)
+flarisvm -g script.fls         # line numbers in stack traces
 ```
 
-With symbols: error messages show file, line, and function name.  
-Without symbols: errors show only memory addresses.
+Function and file names are always recorded, so a stack trace names every frame
+either way. Without `-g` every frame reports line 0; with it, the real line
+(lines past 65,535 all report 65,535).
 
-Overhead is minimal (~5-10% bytecode size, ~2-3% runtime).
+Overhead: a compiled `.flx` grows by typically 7-17%, and each source line in a
+hot loop costs one extra dispatch per iteration when the code is interpreted.
 
 ### Breakpoints
 
@@ -2869,13 +2949,13 @@ flarisvm script.fls --verbose --time
 # Development - all debug features
 flarisvm script.fls --verbose --time
 
-# Production - stripped, fast (compiled with --small and --strip )
+# Production - no debug info (the default), compiled with --small
 flarisvm --exec app.flx 
 ```
 
 ## Best Practices
 
-- Always keep debug symbols during development (default, don't use `--strip`)
+- Run with `-g` during development so stack traces carry line numbers
 - Use meaningful breakpoint codes - treat them as documentation
 - Combine `--verbose` + `breakpoint` for step-through investigation
 - Use `Debug.Assert` liberally in test code
@@ -3068,7 +3148,7 @@ x++;
 
 // Flaris
 let x = 10;
-x += 1;     // or: x++ (postfix only, no prefix ++)
+x += 1;     // or: x++ / ++x (a statement, not an expression)
 ```
 
 **Arrays:**
@@ -3170,7 +3250,7 @@ const MAX: i32 = 100;
 
 ```js
 let x = 10;
-x += 1;     // or: x++ (postfix only, no prefix ++)
+x += 1;     // or: x++ / ++x (a statement, not an expression)
 const MAX = 100;
 // All variables are mutable unless const. No type annotations required.
 ```

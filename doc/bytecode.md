@@ -22,7 +22,7 @@ The specification covers:
 
 - the `.flx` binary container: header, signature, string pool, chunks, bundles
 - the serialization of constants, functions and classes
-- the instruction encoding and the semantics of all 198 opcodes
+- the instruction encoding and the semantics of all 199 opcodes
 - the abstract machine: value system, operand stack, call frames, fibers,
   exception handling
 - the validation rules a conforming loader must apply before execution
@@ -109,7 +109,7 @@ after `FIBER_QUANTUM` = 10000 checkpoints, or immediately at explicit
 involved; bytecode never observes preemption in the middle of an instruction.
 
 Implementation note (dispatch): the reference VM uses computed-goto dispatch
-over an `OP_LAST`-sized table (198 entries), caches
+over an `OP_LAST`-sized table (199 entries), caches
 `frame`/`constants`/`locals`/`code`/`ip` in locals, and re-derives them after
 any operation that can change the frame. The
 frame's stored `ip` is only guaranteed current at frame switches, raises and
@@ -255,9 +255,11 @@ Patching is valid because class member layouts are base-first (§4.5): a
 resolved index is correct for the defining class and every subclass. Patched
 operands are resolved indices, **not** constant-pool indices. Patches apply
 only for non-native classes and happen in the shared in-memory chunk. A
-static compiler SHOULD emit only the hash-keyed forms; the slot forms are
-legal in a `.flx` but their indices are validated only at run time (guarded
-per access). An independent VM MAY treat self-patching as an optional
+static compiler MUST emit only the hash-keyed forms. The loader rejects a
+`.flx` containing `OP_GET_THIS_SLOT`, `OP_SET_THIS_SLOT`, `OP_GET_THIS_CONST`,
+`OP_THIS_ARITH_SLOT_L` / `_C`, `OP_THIS_INVOKE_SLOT`, `OP_SUPER_INVOKE_SLOT`
+or `OP_TAIL_THIS_INVOKE_SLOT`; the three `*_ARR_SLOT_*` forms load, and their
+field slot is checked on every access. An independent VM MAY treat self-patching as an optional
 optimization — executing the hash-keyed forms every time is observably
 equivalent.
 
@@ -322,8 +324,7 @@ its own type word alongside `VAL_ARRAY`, unshifted:
 `type = VAL_ARRAY | elementBits`. Example: `[int]` has type
 `0x00000048` (`VAL_ARRAY | VAL_INT`). Arrays typed `[float]` and `[int]` are stored
 *flat* (`double[]` / `int64_t[]` backing, no per-element boxes); `[float]` writes
-coerce to float, `[int]` writes accept only ints (implementation note: flags
-`OBJECT_FLAG_FLAT_FLOAT` / `OBJECT_FLAG_FLAT_INT`).
+coerce to float, `[int]` writes accept only ints.
 
 ### 4.2 Numeric model
 
@@ -540,9 +541,11 @@ A *chunk* is one function body (the top level is a chunk too). On the wire:
    below 512 / 64 / 80 respectively. Only a top-level chunk carries the
    section; it is what a bundler resolves dependencies from.
 
-`--strip` removes the debug section (clears `CHUNK_FLAG_DBG`) and suppresses
-the `OP_DBG_*` opcodes in code. There is no separate line table: source lines
-are the inline `OP_DBG_LINE` instructions.
+Debug info is off by default. Compiling with `-g` (alias `--no-strip`) sets
+`CHUNK_FLAG_DBG`, writes the debug section and emits `OP_DBG_LINE`; `--strip`
+restates the default (it also overrides the `-g` that `--debug` implies).
+`OP_DBG_FILE_NAME` and `OP_DBG_BREAK` are emitted either way. There is no
+separate line table: source lines are the inline `OP_DBG_LINE` instructions.
 
 ### 5.6 Constant value serialization
 
@@ -564,7 +567,7 @@ the value's `ObjectType` bit (§4.1). Exception: a pool reference (§5.4) is
 | `VAL_BLOCK` `0x100` | none — blocks do not serialize; reads back as `nil` |
 | `VAL_FUNCTION` `0x10000` | `u8 arity` + `u8 localCount` + `u32 flags` + `u32 returnType` + `16 × u32 argsTypes` + name (value-key, may be the nil sentinel) + **nested chunk** (§5.5, recursive). Reader MUST clamp `localCount ≤ 128`, `arity ≤ 16`, clear flags `FUNC_FLAG_IS_CLONE` + `FUNC_FLAG_ENV_OWNED`, and re-derive `FUNC_FLAG_TYPED_PARAMS` itself |
 | `VAL_BUILTIN_FUNCTION` / `VAL_MODULE` / `VAL_EXCEPTION` / `VAL_BOUND_METHOD` / `VAL_POINTER` | none — read back as `nil` |
-| `VAL_CLASS` `0x1000000` | `u32 ownCount` (≤ 65535) + `u64 protoHash` (base-class name hash, 0 = none) + name (must be string) + `ownCount ×` { `u8 kind` (0 field / 1 method / 2 const; > 2 MUST be rejected), member name (must decode to string), member value }. Function members are back-linked to the class as owner |
+| `VAL_CLASS` `0x1000000` | `u32 ownCount` (≤ 65535) + `u64 protoHash` (base-class name hash, 0 = none) + name (must be string) + `ownCount ×` { `u8 kind` (0 field / 1 method / 2 const, in the low 7 bits; any other value MUST be rejected), member name (must decode to string), member value, and when bit 7 (`0x80`) of the kind is set: `u32 fieldType` }. Bit 7 is valid on a field only; `fieldType` is the `VAL_*` mask every store into the field must fit (§4.5), and a field without it is untyped. Function members are back-linked to the class as owner |
 | any other tag | MUST be rejected |
 
 **Value-keys** (object keys, class member names, function names) are ordinary
@@ -701,17 +704,21 @@ Total length in bytes, opcode included. This table is normative for stepping
 over code; a decoder MUST treat a truncated instruction (operands running past
 `codelen`) as malformed.
 
+Every opcode appears in exactly one row, in opcode-number order within the row.
+
 | Len | Instructions |
 | --- | --- |
-| 1 | all operand-less opcodes: `NOP`, `NIL`, `TRUE`, `FALSE`, `ONE`, `NEG_ONE`, `POP`, `DUP`, unary/binary arithmetic and comparisons (`NEGATE` … `CMP_IS`), `NULL_COALESCING`, `GET_LOCAL0-3`, `SET_LOCAL0-3`, `GET_INDEX`, `SET_INDEX`, `MAKE_CONST`, `RETURN`, `RETURN_NONE`, `RETURN_NIL`, `YIELD`, `AWAIT`, `BIND_THIS`, `TRY_END`, `CATCH_BEGIN`, `CATCH_END`, `FINALLY_BEGIN`, `FINALLY_END`, `THROW`, `LEN`, `TYPE`, `IS_ARRAY`, `IS_OBJECT`, `HAS_KEY`, `TO_*` (all ten), `SUPER`, `GUARD`, `CONCAT` |
-| 2 | `IMM8`, `GET_LOCAL`, `SET_LOCAL`, `INC_LOCAL`, `DEC_LOCAL`, `NIL_LOCAL`, `GET_ARR_LI`, `GET_INDEX_LOCAL`, `SET_INDEX_LOCAL`, `RETURN_L`, `CALL`, `CALL_TYPED`, `CALL_SELF`, `TAIL_SELF`, `TAIL_CALL`, `NEW`, `CONCAT_N`, `CALL_WITH_THIS` |
-| 3 | `IMM16`, `CONSTANT`, `DEFINE_GLOBAL`, `GET_GLOBAL`, `SET_GLOBAL`, `FN`, `GET_PROPERTY`, `SET_PROPERTY`, `GET_THIS_PROP`, `SET_THIS_PROP`, `GET_THIS_SLOT`, `SET_THIS_SLOT`, `GET_THIS_CONST`, `JUMP`, `JUMP_IF_FALSE`, `JUMP_IF_TRUE`, `LOOP`, `ARITH_IMM8`, `ARITH_L`, `GET_ARR_LC`, `GET_ARR_LL`, `SET_ARR_LC`, `SET_ARR_LL`, `GET_BLK_LC`, `GET_BLK_LL`, `SET_BLK_LC`, `SET_BLK_LL`, `BUILD_OBJECT`, `PUSH_BUILTIN`, `CALL0_BUILTIN` … `CALL5_BUILTIN`, `DBG_LINE`, `DBG_FUNC_NAME`, `DBG_FILE_NAME`, `DBG_BREAK` |
-| 4 | `INVOKE`, `THIS_INVOKE`, `THIS_INVOKE_SLOT`, `SUPER_INVOKE`, `CALL_GLOBAL`, `GET_THIS_ARR_L`, `GET_THIS_ARR_SLOT_L`, `SET_THIS_ARR_L`, `SET_THIS_ARR_SLOT_L`, `GET_LOCAL_PROP`, `ARITH_LC`, `ARITH_LL`, `ARITH_L_IMM8`, `ARITH_LL_PUSH`, `SET_ARR_LLC`, `SET_ARR_LLL`, `LOCAL_ARR_LC`, `LOCAL_ARR_LL`, `SET_OBJ_L`, `SET_BLK_LLC`, `SET_BLK_LLL`, `LOCAL_BLK_LC`, `LOCAL_BLK_LL` |
-| 5 | `IMM32`, `IMM_CHAR` (u32 codepoint), `ARITH_ELC`, `ARITH_ELL`, `SET_OBJ_LL`, `THIS_ARITH_L`, `THIS_ARITH_C`, `THIS_ARITH_SLOT_L`, `THIS_ARITH_SLOT_C`, `SET_THIS_ARR_LL`, `SET_THIS_ARR_SLOT_LL`, `BUILD_ARRAY` (count:u16 + elemType:u16), `ITER_BEGIN`, `ITER_NEXT`, `TRY_LEAVE`, `ARITH_FMA_LLL` |
-| 6 | `INVOKE_INSTANCE` (key:u16 argc:u8 slotCache:u16 — the cache field is runtime-managed scratch), `INVOKE_GLOBAL`, `CMP_JUMP_LL`, `CMP_JUMP_LC`, `TRY_BEGIN` |
-| 7 | `FOREACH` (slot1:u8 slot2:u8 iterable:u8 index:u8 endAddr:u16; slot operands may be the sentinel `0xFF` = unused) |
-| 9 | `CMP_JUMP_LC32`, `EXPORT` (aliasIdx:u16 nameIdx:u16 type:u32), `PUSH_HOST`, `CALL0_HOST` … `CALL5_HOST` (modHash:u32 fnHash:u32, rewritten in place to one member pointer at load) |
-| var | `FN_CAPTURE` = 4 + 3·count: `fnIdx:u16 count:u8`, then count × (`nameConstIdx:u16 parentSlot:u8`). `JUMP_TABLE` = 12 + 2·size: `min:i32 max:i32 size:u8`, then size × `caseAddr:u16`, then `defaultAddr:u16` (all addresses absolute) |
+| 1 | `NOP`, `NIL`, `TRUE`, `FALSE`, `ONE`, `NEG_ONE`, `POP`, `DUP`, `NEGATE`, `NOT`, `BITWISE_NOT`, `ADD`, `SUBTRACT`, `MULTIPLY`, `DIVIDE`, `MODULO`, `POWER`, `BITWISE_AND`, `BITWISE_OR`, `XOR`, `SHL`, `SHR`, `USHR`, `IS_NIL`, `IS_NOT_NIL`, `EQUAL`, `NOT_EQUAL`, `LESS`, `LESS_EQUAL`, `GREATER`, `GREATER_EQUAL`, `APPROX_EQ`, `CMP_IS`, `GET_LOCAL0`, `GET_LOCAL1`, `GET_LOCAL2`, `GET_LOCAL3`, `SET_LOCAL0`, `SET_LOCAL1`, `SET_LOCAL2`, `SET_LOCAL3`, `GET_INDEX`, `SET_INDEX`, `MAKE_CONST`, `RETURN`, `RETURN_NONE`, `RETURN_NIL`, `YIELD`, `AWAIT`, `BIND_THIS`, `TRY_END`, `CATCH_BEGIN`, `CATCH_END`, `FINALLY_BEGIN`, `FINALLY_END`, `THROW`, `LEN`, `TYPE`, `IS_ARRAY`, `IS_OBJECT`, `HAS_KEY`, `TO_STRING`, `TO_INT`, `TO_FLOAT`, `TO_CHAR`, `TO_I8`, `TO_U8`, `TO_I16`, `TO_U16`, `TO_I32`, `TO_U32`, `SUPER`, `GUARD`, `CONCAT` |
+| 2 | `IMM8`, `GET_LOCAL`, `SET_LOCAL`, `INC_LOCAL`, `DEC_LOCAL`, `GET_ARR_LI`, `GET_INDEX_LOCAL`, `SET_INDEX_LOCAL`, `CALL`, `CALL_TYPED`, `CALL_SELF`, `TAIL_SELF`, `TAIL_CALL`, `RETURN_L`, `NEW`, `GET_BLK_LI`, `CONCAT_N`, `NIL_LOCAL`, `CALL_WITH_THIS` |
+| 3 | `CONSTANT`, `IMM16`, `JUMP_IF_FALSE`, `JUMP_IF_TRUE`, `JUMP`, `LOOP`, `DEFINE_GLOBAL`, `GET_GLOBAL`, `SET_GLOBAL`, `ARITH_L`, `ARITH_IMM8`, `GET_PROPERTY`, `SET_PROPERTY`, `GET_ARR_LC`, `GET_ARR_LL`, `SET_ARR_LC`, `SET_ARR_LL`, `GET_THIS_PROP`, `SET_THIS_PROP`, `BUILD_OBJECT`, `FN`, `PUSH_BUILTIN`, `CALL0_BUILTIN`, `CALL1_BUILTIN`, `CALL2_BUILTIN`, `CALL3_BUILTIN`, `CALL4_BUILTIN`, `CALL5_BUILTIN`, `DBG_LINE`, `DBG_FILE_NAME`, `DBG_BREAK`, `GET_BLK_LC`, `GET_BLK_LL`, `SET_BLK_LC`, `SET_BLK_LL`, `GET_THIS_SLOT`, `SET_THIS_SLOT`, `GET_THIS_CONST` |
+| 4 | `ARITH_LC`, `ARITH_LL`, `ARITH_L_IMM8`, `ARITH_LL_PUSH`, `SET_ARR_LLC`, `SET_ARR_LLL`, `SET_OBJ_L`, `LOCAL_ARR_LC`, `LOCAL_ARR_LL`, `THIS_INVOKE`, `SET_BLK_LLC`, `SET_BLK_LLL`, `LOCAL_BLK_LC`, `LOCAL_BLK_LL`, `GET_LOCAL_PROP`, `THIS_INVOKE_SLOT`, `GET_THIS_ARR_L`, `GET_THIS_ARR_SLOT_L`, `SUPER_INVOKE`, `CALL_GLOBAL`, `TAIL_THIS_INVOKE`, `TAIL_THIS_INVOKE_SLOT`, `SUPER_INVOKE_SLOT`, `SET_THIS_ARR_L`, `SET_THIS_ARR_SLOT_L`, `ARITH_IMM16` (aop:u8 imm:i16) |
+| 5 | `IMM32`, `IMM_CHAR` (u32 codepoint), `ARITH_ELC`, `ARITH_ELL`, `ARITH_EIC`, `ARITH_EIL`, `SET_OBJ_LL`, `THIS_ARITH_L`, `THIS_ARITH_C`, `BUILD_ARRAY` (count:u16 + elemType:u16), `TRY_LEAVE`, `ITER_BEGIN`, `ITER_NEXT`, `ARITH_BLK_LC`, `ARITH_BLK_LL`, `ARITH_BLK_IC`, `ARITH_BLK_IL`, `ARITH_FMA_LLL`, `THIS_ARITH_SLOT_L`, `THIS_ARITH_SLOT_C`, `SET_THIS_ARR_LL`, `SET_THIS_ARR_SLOT_LL` |
+| 6 | `CMP_JUMP_LL`, `CMP_JUMP_LC`, `TRY_BEGIN`, `INVOKE_INSTANCE` (key:u16 argc:u8 slotCache:u16 — the cache field is runtime-managed scratch), `OBJ_ARITH_L` (obj:u8 key:u16 aop:u8 src:u8) |
+| 7 | `FOREACH` (slot1:u8 slot2:u8 iterable:u8 index:u8 endAddr:u16; slot operands may be the sentinel `0xFF` = unused), `CHECK_TYPE` (mask:u32 label:u16) |
+| 9 | `EXPORT` (aliasIdx:u16 nameIdx:u16 type:u32), `CMP_JUMP_LC32`, `PUSH_HOST`, `CALL0_HOST`, `CALL1_HOST`, `CALL2_HOST`, `CALL3_HOST`, `CALL4_HOST`, `CALL5_HOST` (host forms: modHash:u32 fnHash:u32, rewritten in place to one member pointer at load) |
+| 11 | `INVOKE_MEMBER` (key:u16 argc:u8 mode:u8 classIdGuard:u32 idx:u16 — the last three fields are runtime-managed cache, emitted as zero) |
+| 13 | `INVOKE_GLOBAL_CACHED` (globalKey:u16 methodKey:u16 argc:u8 mode:u8 classIdGuard:u32 idx:u16 — cache fields as in INVOKE_MEMBER) |
+| var | `JUMP_TABLE` = 12 + 2·size: `min:i32 max:i32 size:u8`, then size × `caseAddr:u16`, then `defaultAddr:u16` (all addresses absolute). `FN_CAPTURE` = 4 + 3·count: `fnIdx:u16 count:u8`, then count × (`nameConstIdx:u16 parentSlot:u8`) |
 
 ### 6.6 Branch-target computation
 
@@ -792,9 +799,10 @@ non-numeric operands.
 
 **`OP_DIVIDE`** — 1 byte. Stack `a, b → r`. int/int: truncating division,
 result int; `INT64_MIN / −1 = INT64_MIN`. Float lane if either is float.
-Zero divisor raises `DivisionByZero`. Note: on the generic path the zero
-check is `AsFloat(b) == 0.0`, and non-numeric values coerce to 0.0 — so
-dividing by a non-numeric value raises `DivisionByZero`, not a type error.
+Zero divisor raises `DivisionByZero`. Note: unless both operands are small
+ints, the zero check reads the divisor as a number first, and a non-numeric
+value reads as 0.0 — so dividing by a non-numeric value raises
+`DivisionByZero`, not a type error.
 
 **`OP_MODULO`** — 1 byte. Stack `a, b → r`. int lane: C remainder (sign of
 the dividend: `−7 % 3 = −1`); `INT64_MIN % −1 = 0`. Float lane: `fmod`.
@@ -840,9 +848,10 @@ case-insensitive equality. Numeric: NaN never equal, infinities equal only
 same-signed, else `|a−b| ≤ 1e-9 + 1e-2·max(|a|,|b|)`. Other operands →
 false. Traps: —
 
-**`OP_CMP_IS`** — 1 byte. Stack `a, b → r:bool`. If either operand is a
-class: instance-of / subclass-of test on the other (proto chain, ≤ 8 deep),
-order-independent. Otherwise plain identity `a == b`. Traps: —
+**`OP_CMP_IS`** — 1 byte. Stack `v, t → r:bool`. If `t` is a class:
+instance-of / subclass-of test of `v` (proto chain, ≤ 8 deep), so a class
+`v` tests as a subclass and `Base is Derived` is false. Otherwise plain
+identity `v == t`. Traps: —
 
 ### 7.4 Control flow
 
@@ -871,10 +880,11 @@ Equivalent to `GET_LOCAL a; GET_LOCAL b; CMP; JUMP_IF_FALSE`. Traps:
 `NestingError` (deep structural compare).
 
 **`OP_CMP_JUMP_LC`** `<slot:u8> <cop:u8> <imm:i8> <off:u16>` — 6 bytes.
-As `OP_CMP_JUMP_LL` with an i8 immediate right operand. If the local is not
-a small int, the comparison is performed as `AsFloat(local)` vs
-`(double)imm` — non-numeric locals coerce to 0.0 rather than raising.
-Traps: —
+As `OP_CMP_JUMP_LL` with an i8 immediate right operand. A small-int local
+compares as int64, a float local as a double against `(double)imm`; any other
+value (nil, bool, char, string, container, …) compares exactly as the unfused
+`GET_LOCAL; IMM8; CMP` sequence would, so `nil == 0` and `"abc" < 5` are
+false. Traps: —
 
 **`OP_CMP_JUMP_LC32`** `<slot:u8> <cop:u8> <imm:i32> <off:u16>` — 9 bytes.
 `OP_CMP_JUMP_LC` with an i32 immediate. Traps: —
@@ -962,12 +972,17 @@ generic path it replaces, including int overflow to float. Both operands are
 read from their slots, never consumed.
 
 **`OP_ARITH_FMA_LLL`** `<dst:u8> <a:u8> <b:u8> <c:u8>` — 5 bytes. Stack `→`.
-`local[dst] = local[a]·local[b] + local[c]`. All-int lane wraps in int64;
-otherwise all three operands must be numeric and the result is the double
-`a·b + c` (computed as separate multiply and add, not a fused C `fma`).
-Traps: `TypeMismatch` if any operand is non-numeric (note: the old `dst`
-value is released before the check — after this trap the slot must be
-treated as dead until reassigned).
+`local[dst] = local[a]·local[b] + local[c]`. The compiler emits it only when
+`a`, `b`, `c` and the result are all proven ints (`dst = a*b + c`,
+`dst = c + a*b`, and the accumulate form `dst += a*b`, where `c` is `dst`); a
+float multiply-add is compiled as a separate multiply and add, so it rounds
+twice.
+All-int lane (boxed ints included) wraps in int64 exactly like the separate
+operators. A float operand from another producer yields the double
+`a·b + c`; whether that rounds once or twice is unspecified, so a producer
+SHOULD NOT emit this opcode for non-int operands. All operands are read
+before `dst` is written, so `c` (or `a`, `b`) may be `dst`. Traps:
+`TypeMismatch` if any operand is non-numeric; `dst` is left unchanged.
 
 ### 7.7 Property and index access (generic)
 
@@ -997,8 +1012,9 @@ copied on store; the replaced value is released.
 
 - array + int: negative index counts from the end; out-of-bounds raises
   `IndexOutOfBounds`;
-- block + int: bounds-checked, sign-extended read of one element (element
-  size 1/2/4/8 bytes) → int;
+- block + int: bounds-checked read of one element (element size 1/2/4/8
+  bytes) → int, zero-extended for 1/2/4-byte elements, the raw int64 for
+  8-byte ones;
 - object + string: property value or `nil`;
 - string + int: one **byte** as a char (negative index from end; OOB
   raises);
@@ -1197,11 +1213,11 @@ key) and builds a fresh object. Scalar values copied. Traps: `StackError`
 (underflow), `NestingError` (result nesting ≥ 64 deep).
 
 **`OP_BUILD_ARRAY`** `<count:u16> <elemType:type:u16>` — 5 bytes. Stack
-`v_n, …, v₁ → arr`. Pops `count` values, TOS-first, into elements
-`0, 1, …, count−1` — the compiler pushes elements in **reverse source
-order**, so `[a, b, c]` ends up in source order. `elemType` = 0 → untyped
-array; `elemType = VAL_FLOAT` → flat float storage (each element coerced
-with `AsFloat`); `elemType = VAL_INT` → flat int storage (a non-int element
+`v₁, …, v_n → arr`. Consumes `count` values; the deepest is element 0 and
+TOS is element `count−1`, so the compiler pushes `[a, b, c]` in source
+order. `elemType` = 0 → untyped
+array; `elemType = VAL_FLOAT` → flat float storage (each element converted
+to a double; a non-numeric element becomes 0.0, `true` 1.0); `elemType = VAL_INT` → flat int storage (a non-int element
 raises `TypeMismatch`); any other non-zero `elemType` → typed array — a value
 whose type doesn't intersect the mask raises `TypeMismatch`. Traps:
 `StackError`, `TypeMismatch`, `NestingError`.
@@ -1361,7 +1377,7 @@ cache misses and the name isn't a class method.
 
 **`OP_INVOKE_GLOBAL_CACHED`** `<globalKey:u16> <methodKey:u16> <argc:u8>
 <mode:u8> <classIdGuard:u32> <idx:u16>` — 13 bytes. Stack `arg₁ … arg_n → r`.
-Fused `GET_GLOBAL + INVOKE` for `Identifier.method(args)` on a global
+Fused `GET_GLOBAL` + `INVOKE_MEMBER` for `Identifier.method(args)` on a global
 receiver (imported module, class statics); the receiver never touches the
 operand stack. `globalKey` resolves through a plain hashmap lookup every
 call (already O(1), not cached here). The method resolution self-classifies
@@ -1508,8 +1524,8 @@ Per container in `local[iterSlot]`:
   key = index;
 - string: as array over **bytes**; value = char;
 - object / instance / exception / class: advance an opaque map cursor
-  (iteration order is the hash map's internal order — NOT insertion order;
-  structural mutation during iteration is undefined); value = entry value,
+  (iteration order is insertion order — a key deleted and added again moves
+  to the end; structural mutation during iteration is undefined); value = entry value,
   key = entry key; a slot-backed instance with no dynamic map is
   immediately exhausted;
 - other: raise `InvalidArgs`.
@@ -1552,7 +1568,7 @@ method+const count; every other type → 0. Traps: —
 instance is **not** `VAL_OBJECT`; a typed array is still `VAL_ARRAY`).
 Traps: —
 
-**`OP_HAS_KEY`** — Stack `c, k → r:bool`. object: property presence.
+**`OP_HAS_KEY`** — Stack `k, c → r:bool` (key below, container on top). object: property presence.
 array: deep-equality membership test. string container: containment - a
 **string** key is a byte-substring test (the empty string is contained in
 every string), a **char** key is encoded to UTF-8 and searched the same way.
@@ -1579,6 +1595,17 @@ sign-extend the low 8/16/32 bits. **`OP_TO_U8` / `OP_TO_U16` /
 `OP_TO_U32`** — coerce to int, then zero-extend the low bits. Traps: as
 `OP_TO_INT`.
 
+**`OP_CHECK_TYPE`** `<mask:u32> <label:u16>` — 7 bytes, stack `v → v'`. The
+value on top is about to be stored in a variable, or returned from a
+function, whose declared type is `mask` (§4.1 bits; a typed array keeps its
+element bits). The compiler emits it only where the value's type is not known
+statically. `v` fits when it shares a type bit with `mask`, with these rules:
+nil fits a mask holding `VAL_NIL` or any reference type; any array fits an
+array mask, and nothing else does; an int is converted to float when the mask
+admits float but not int, and a char to int when it admits int but not char
+(`v'` is the converted value). `label` indexes a string constant naming the
+slot for the error message. Traps: `TypeMismatch` (22), `v` released.
+
 ### 7.18 Modules
 
 **`OP_EXPORT`** `<aliasIdx:u16> <nameIdx:u16> <type:u32>` — 9 bytes. Stack
@@ -1591,10 +1618,14 @@ from the `.flx`; the VM ignores it at run time. Traps: `RuntimeError`
 
 ### 7.19 Debug
 
-Present only in non-stripped chunks; all are semantically transparent.
+All are semantically transparent. Only `OP_DBG_LINE` depends on debug info
+(§5.5); the other two are emitted in every chunk.
 
 **`OP_DBG_LINE`** `<line:u16>` — 3 bytes. Sets the frame's current source
-line (stack traces, debugger line stepping). Traps: —
+line (stack traces, debugger line stepping). Emitted where the source line
+changes, not per statement: two statements on one line share one marker.
+Lines above 65,535 saturate to 65,535 (the compiler warns once). A frame that
+has executed no `OP_DBG_LINE` reports line 0. Traps: —
 
 **`OP_DBG_FILE_NAME`** `<idx:const:u16>` — 3 bytes. Sets the chunk's
 source-file name. Traps: —
@@ -1606,9 +1637,9 @@ Traps: —
 ### 7.20 Block (raw memory) fast paths
 
 All ten require `local[blk]` to be a block, else `TypeMismatch`. Reads
-sign-extend the block's element (element size 1/2/4/8 bytes; other sizes →
-`RuntimeError`) and push an int; writes truncate an int to the element
-size. Negative indices count from the end. Out-of-bounds raises
+zero-extend the block's element (element size 1/2/4 bytes; an 8-byte element
+is the raw int64; other sizes → `RuntimeError`) and push an int; writes
+truncate an int to the element size. Negative indices count from the end. Out-of-bounds raises
 `IndexOutOfBounds`. The payload is VM-owned memory bounded by the block's
 own length, so no further address check is made.
 
@@ -1706,10 +1737,10 @@ function runs interpreted).
 - Every declared length or count must also fit in the bytes that remain in
   the buffer, checked before any allocation is sized from it.
 
-### 8.3 `ValidateChunk`
+### 8.3 Chunk validation
 
-Every chunk — freshly compiled or deserialized — MUST pass `ValidateChunk`
-before execution; it recurses into every function constant's sub-chunk
+Every chunk — freshly compiled or deserialized — MUST pass the loader's
+validator before execution; it recurses into every function constant's sub-chunk
 (recursion cap 256). It rejects on: NULL/empty code, a constant table
 announced but absent, and **string-constant hash collisions** — two string
 constants whose 64-bit hashes are equal but whose bytes differ (the hash is
@@ -1728,7 +1759,7 @@ unconditionally and must be real); argc >
 outside `[0, codelen]`; absolute target ≥ `codelen`; `OP_TRY_BEGIN` catchSlot
 ≥ 128; `OP_JUMP_TABLE` with `max < min`; builtin references out of the builtin
 registry's range, and `OP_CALL0..5_BUILTIN` targets that are not builtin
-functions; `OP_EXPORT` indices out of range. A host-call opcode
+functions; `OP_EXPORT` indices out of range; an `OP_CHECK_TYPE` label index ≥ `constCount`. A host-call opcode
 (`OP_PUSH_HOST`, `OP_CALL0..5_HOST`) present in the code makes the chunk
 require host linking, so a crafted chunk cannot leave one unlinked for the
 interpreter to dereference: linking either binds every host call to a
@@ -1760,14 +1791,14 @@ Per-instruction depth deltas (net effect; branch seeds in parentheses):
 
 | Delta | Instructions |
 | --- | --- |
-| +1 | `NIL` `TRUE` `FALSE` `ONE` `NEG_ONE` `DUP` `SUPER` `CONSTANT` `IMM8/16/32` `IMM_CHAR` `GET_LOCAL` `GET_LOCAL0-3` `GET_GLOBAL` `GET_THIS_PROP` `GET_THIS_SLOT` `GET_THIS_CONST` `GET_THIS_ARR_L` `GET_THIS_ARR_SLOT_L` `FN` `FN_CAPTURE` `GET_ARR_LC/LL` `GET_LOCAL_PROP` `GET_BLK_LC/LL` `PUSH_BUILTIN` `CALL0_BUILTIN` `PUSH_HOST` `CALL0_HOST` |
-| 0 | unary ops, `TO_*` converters, `GET_PROPERTY` `GET_ARR_LI` `GET_INDEX_LOCAL` `ARITH_IMM8/LC/LL/ELC/ELL` `INC/DEC_LOCAL` `NIL_LOCAL` `SET_ARR_LLC/LLL` `SET_OBJ_LL` `THIS_ARITH_*` `SET_THIS_ARR_LL` `SET_THIS_ARR_SLOT_LL` `LOCAL_ARR_*` `SET_BLK_LLC/LLL` `LOCAL_BLK_*` `DBG_*` `EXPORT` `CALL1_BUILTIN` `CALL1_HOST` `ARITH_FMA_LLL` `CATCH_END` `FINALLY_BEGIN/END` `TRY_END` `MAKE_CONST` `GUARD` `BIND_THIS` `YIELD` `AWAIT` `NOP` |
-| −1 | `POP`, binary arithmetic and comparisons, `NULL_COALESCING` `HAS_KEY` `GET_INDEX` `CONCAT` `SET_LOCAL` `SET_LOCAL0-3` `SET_GLOBAL` `DEFINE_GLOBAL` `SET_ARR_LC/LL` `SET_OBJ_L` `SET_THIS_PROP` `SET_THIS_SLOT` `SET_THIS_ARR_L` `SET_THIS_ARR_SLOT_L` `SET_BLK_LC/LL` `CALL2_BUILTIN` `CALL2_HOST` `ARITH_L` `CATCH_BEGIN` |
+| +1 | `NIL` `TRUE` `FALSE` `ONE` `NEG_ONE` `DUP` `SUPER` `CONSTANT` `IMM8/16/32` `IMM_CHAR` `GET_LOCAL` `GET_LOCAL0-3` `GET_GLOBAL` `GET_THIS_PROP` `GET_THIS_SLOT` `GET_THIS_CONST` `GET_THIS_ARR_L` `GET_THIS_ARR_SLOT_L` `FN` `FN_CAPTURE` `GET_ARR_LC/LL` `GET_LOCAL_PROP` `GET_BLK_LC/LL` `PUSH_BUILTIN` `CALL0_BUILTIN` `PUSH_HOST` `CALL0_HOST` `ARITH_L_IMM8` `ARITH_LL_PUSH` |
+| 0 | unary ops, `TO_*` converters, `GET_PROPERTY` `GET_ARR_LI` `GET_BLK_LI` `GET_INDEX_LOCAL` `ARITH_IMM8/IMM16/LC/LL/ELC/ELL/EIC/EIL` `ARITH_BLK_*` `OBJ_ARITH_L` `INC/DEC_LOCAL` `NIL_LOCAL` `SET_ARR_LLC/LLL` `SET_OBJ_LL` `THIS_ARITH_*` `SET_THIS_ARR_LL` `SET_THIS_ARR_SLOT_LL` `LOCAL_ARR_*` `SET_BLK_LLC/LLL` `LOCAL_BLK_*` `DBG_*` `EXPORT` `CHECK_TYPE` `CALL1_BUILTIN` `CALL1_HOST` `ARITH_FMA_LLL` `CATCH_END` `FINALLY_BEGIN/END` `TRY_END` `MAKE_CONST` `GUARD` `BIND_THIS` `YIELD` `AWAIT` `NOP` |
+| −1 | `POP`, binary arithmetic and comparisons, `HAS_KEY` `GET_INDEX` `CONCAT` `SET_LOCAL` `SET_LOCAL0-3` `SET_GLOBAL` `DEFINE_GLOBAL` `SET_ARR_LC/LL` `SET_OBJ_L` `SET_THIS_PROP` `SET_THIS_SLOT` `SET_THIS_ARR_L` `SET_THIS_ARR_SLOT_L` `SET_BLK_LC/LL` `CALL2_BUILTIN` `CALL2_HOST` `ARITH_L` `CATCH_BEGIN` |
 | −2 | `SET_PROPERTY` `SET_INDEX_LOCAL` `CALL3_BUILTIN` `CALL3_HOST` |
 | −3 | `SET_INDEX` `CALL4_BUILTIN` `CALL4_HOST` |
 | −4 | `CALL5_BUILTIN` `CALL5_HOST` |
-| −argc | `CALL` `CALL_TYPED` `NEW` `INVOKE` `INVOKE_INSTANCE` (callee/receiver replaced by result) |
-| 1−argc | `INVOKE_GLOBAL` `THIS_INVOKE` `THIS_INVOKE_SLOT` `SUPER_INVOKE` `CALL_GLOBAL` `CALL_SELF` (receiver resolved internally, result pushed) |
+| −argc | `CALL` `CALL_TYPED` `NEW` `INVOKE_INSTANCE` `INVOKE_MEMBER` (callee/receiver replaced by result) |
+| 1−argc | `INVOKE_GLOBAL_CACHED` `THIS_INVOKE` `THIS_INVOKE_SLOT` `SUPER_INVOKE` `SUPER_INVOKE_SLOT` `CALL_GLOBAL` `CALL_SELF` (receiver resolved internally, result pushed) |
 | −1−argc | `CALL_WITH_THIS` (receiver, args and callee all popped, result pushed) |
 | 1−2·count | `BUILD_OBJECT` |
 | 1−count | `BUILD_ARRAY` |
@@ -1778,126 +1809,118 @@ at `d−1`; `CMP_JUMP_*` continue and seed at `d`; `TRY_BEGIN` seeds its catch
 target at `d+1` (the caught exception); `JUMP_TABLE` seeds all targets at
 `d−1` and terminates the fall-through path; `JUMP` seeds its target at `d` and
 terminates; `TRY_LEAVE` seeds its target at `d` and terminates;
-`LOOP`, `TAIL_CALL`, `TAIL_SELF`, `RETURN*`, `THROW` terminate.
+`LOOP`, `TAIL_CALL`, `TAIL_SELF`, `TAIL_THIS_INVOKE`, `TAIL_THIS_INVOKE_SLOT`,
+`RETURN*`, `THROW` terminate.
 
 ---
 
 ## Appendix A. Opcode map
 
-Dense numbering for the current opcode set. `OP_LAST` = 198
-(not a real instruction). Any opcode ≥ 198 MUST be rejected.
+Dense numbering for the current opcode set. `OP_LAST` = 199
+(not a real instruction). Any opcode ≥ 199 MUST be rejected.
 
 | # | Hex | Mnemonic | # | Hex | Mnemonic |
 | --- | --- | --- | --- | --- | --- |
-| 0 | 0x00 | `OP_NOP` | 99 | 0x63 | `OP_RETURN` |
-| 1 | 0x01 | `OP_CONSTANT` | 100 | 0x64 | `OP_RETURN_NONE` |
-| 2 | 0x02 | `OP_NIL` | 101 | 0x65 | `OP_RETURN_NIL` |
-| 3 | 0x03 | `OP_TRUE` | 102 | 0x66 | `OP_RETURN_L` |
-| 4 | 0x04 | `OP_FALSE` | 103 | 0x67 | `OP_FN` |
-| 5 | 0x05 | `OP_ONE` | 104 | 0x68 | `OP_FN_CAPTURE` |
-| 6 | 0x06 | `OP_NEG_ONE` | 105 | 0x69 | `OP_YIELD` |
-| 7 | 0x07 | `OP_IMM8` | 106 | 0x6A | `OP_AWAIT` |
-| 8 | 0x08 | `OP_IMM16` | 107 | 0x6B | `OP_THIS_INVOKE` |
-| 9 | 0x09 | `OP_IMM32` | 108 | 0x6C | `OP_BIND_THIS` |
-| 10 | 0x0A | `OP_IMM_CHAR` | 109 | 0x6D | `OP_PUSH_BUILTIN` |
-| 11 | 0x0B | `OP_POP` | 110 | 0x6E | `OP_CALL0_BUILTIN` |
-| 12 | 0x0C | `OP_DUP` | 111 | 0x6F | `OP_CALL1_BUILTIN` |
-| 13 | 0x0D | `OP_NEGATE` | 112 | 0x70 | `OP_CALL2_BUILTIN` |
-| 14 | 0x0E | `OP_NOT` | 113 | 0x71 | `OP_CALL3_BUILTIN` |
-| 15 | 0x0F | `OP_BITWISE_NOT` | 114 | 0x72 | `OP_CALL4_BUILTIN` |
-| 16 | 0x10 | `OP_ADD` | 115 | 0x73 | `OP_CALL5_BUILTIN` |
-| 17 | 0x11 | `OP_SUBTRACT` | 116 | 0x74 | `OP_TRY_BEGIN` |
-| 18 | 0x12 | `OP_MULTIPLY` | 117 | 0x75 | `OP_TRY_END` |
-| 19 | 0x13 | `OP_DIVIDE` | 118 | 0x76 | `OP_CATCH_BEGIN` |
-| 20 | 0x14 | `OP_MODULO` | 119 | 0x77 | `OP_CATCH_END` |
-| 21 | 0x15 | `OP_POWER` | 120 | 0x78 | `OP_FINALLY_BEGIN` |
-| 22 | 0x16 | `OP_BITWISE_AND` | 121 | 0x79 | `OP_FINALLY_END` |
-| 23 | 0x17 | `OP_BITWISE_OR` | 122 | 0x7A | `OP_TRY_LEAVE` |
-| 24 | 0x18 | `OP_XOR` | 123 | 0x7B | `OP_THROW` |
-| 25 | 0x19 | `OP_SHL` | 124 | 0x7C | `OP_FOREACH` |
-| 26 | 0x1A | `OP_SHR` | 125 | 0x7D | `OP_ITER_BEGIN` |
-| 27 | 0x1B | `OP_USHR` | 126 | 0x7E | `OP_ITER_NEXT` |
-| 28 | 0x1C | `OP_IS_NIL` | 127 | 0x7F | `OP_LEN` |
-| 29 | 0x1D | `OP_IS_NOT_NIL` | 128 | 0x80 | `OP_TYPE` |
-| 30 | 0x1E | `OP_EQUAL` | 129 | 0x81 | `OP_IS_ARRAY` |
-| 31 | 0x1F | `OP_NOT_EQUAL` | 130 | 0x82 | `OP_IS_OBJECT` |
-| 32 | 0x20 | `OP_LESS` | 131 | 0x83 | `OP_HAS_KEY` |
-| 33 | 0x21 | `OP_LESS_EQUAL` | 132 | 0x84 | `OP_TO_STRING` |
-| 34 | 0x22 | `OP_GREATER` | 133 | 0x85 | `OP_TO_INT` |
-| 35 | 0x23 | `OP_GREATER_EQUAL` | 134 | 0x86 | `OP_TO_FLOAT` |
-| 36 | 0x24 | `OP_APPROX_EQ` | 135 | 0x87 | `OP_TO_CHAR` |
-| 37 | 0x25 | `OP_CMP_IS` | 136 | 0x88 | `OP_TO_I8` |
-| 38 | 0x26 | `OP_JUMP_IF_FALSE` | 137 | 0x89 | `OP_TO_U8` |
-| 39 | 0x27 | `OP_JUMP_IF_TRUE` | 138 | 0x8A | `OP_TO_I16` |
-| 40 | 0x28 | `OP_JUMP` | 139 | 0x8B | `OP_TO_U16` |
-| 41 | 0x29 | `OP_LOOP` | 140 | 0x8C | `OP_TO_I32` |
-| 42 | 0x2A | `OP_JUMP_TABLE` | 141 | 0x8D | `OP_TO_U32` |
-| 43 | 0x2B | `OP_CMP_JUMP_LL` | 142 | 0x8E | `OP_EXPORT` |
-| 44 | 0x2C | `OP_CMP_JUMP_LC` | 143 | 0x8F | `OP_NEW` |
-| 45 | 0x2D | `OP_DEFINE_GLOBAL` | 144 | 0x90 | `OP_SUPER` |
-| 46 | 0x2E | `OP_GET_GLOBAL` | 145 | 0x91 | `OP_GUARD` |
-| 47 | 0x2F | `OP_SET_GLOBAL` | 146 | 0x92 | `OP_DBG_LINE` |
-| 48 | 0x30 | `OP_GET_LOCAL` | 147 | 0x93 | `OP_DBG_FILE_NAME` |
-| 49 | 0x31 | `OP_SET_LOCAL` | 148 | 0x94 | `OP_DBG_BREAK` |
-| 50 | 0x32 | `OP_GET_LOCAL0` | 149 | 0x95 | `OP_GET_BLK_LC` |
-| 51 | 0x33 | `OP_GET_LOCAL1` | 150 | 0x96 | `OP_GET_BLK_LL` |
-| 52 | 0x34 | `OP_GET_LOCAL2` | 151 | 0x97 | `OP_GET_BLK_LI` |
-| 53 | 0x35 | `OP_GET_LOCAL3` | 152 | 0x98 | `OP_SET_BLK_LC` |
-| 54 | 0x36 | `OP_SET_LOCAL0` | 153 | 0x99 | `OP_SET_BLK_LL` |
-| 55 | 0x37 | `OP_SET_LOCAL1` | 154 | 0x9A | `OP_SET_BLK_LLC` |
-| 56 | 0x38 | `OP_SET_LOCAL2` | 155 | 0x9B | `OP_SET_BLK_LLL` |
-| 57 | 0x39 | `OP_SET_LOCAL3` | 156 | 0x9C | `OP_LOCAL_BLK_LC` |
-| 58 | 0x3A | `OP_INC_LOCAL` | 157 | 0x9D | `OP_LOCAL_BLK_LL` |
-| 59 | 0x3B | `OP_DEC_LOCAL` | 158 | 0x9E | `OP_ARITH_BLK_LC` |
-| 60 | 0x3C | `OP_ARITH_LC` | 159 | 0x9F | `OP_ARITH_BLK_LL` |
-| 61 | 0x3D | `OP_ARITH_LL` | 160 | 0xA0 | `OP_ARITH_BLK_IC` |
-| 62 | 0x3E | `OP_ARITH_L` | 161 | 0xA1 | `OP_ARITH_BLK_IL` |
-| 63 | 0x3F | `OP_ARITH_IMM8` | 162 | 0xA2 | `OP_CONCAT` |
-| 64 | 0x40 | `OP_ARITH_L_IMM8` | 163 | 0xA3 | `OP_ARITH_FMA_LLL` |
-| 65 | 0x41 | `OP_ARITH_LL_PUSH` | 164 | 0xA4 | `OP_INVOKE_INSTANCE` |
-| 66 | 0x42 | `OP_GET_PROPERTY` | 165 | 0xA5 | `OP_CMP_JUMP_LC32` |
-| 67 | 0x43 | `OP_SET_PROPERTY` | 166 | 0xA6 | `OP_GET_LOCAL_PROP` |
-| 68 | 0x44 | `OP_GET_INDEX` | 167 | 0xA7 | `OP_GET_THIS_SLOT` |
-| 69 | 0x45 | `OP_SET_INDEX` | 168 | 0xA8 | `OP_SET_THIS_SLOT` |
-| 70 | 0x46 | `OP_GET_ARR_LC` | 169 | 0xA9 | `OP_GET_THIS_CONST` |
-| 71 | 0x47 | `OP_GET_ARR_LL` | 170 | 0xAA | `OP_THIS_ARITH_SLOT_L` |
-| 72 | 0x48 | `OP_GET_ARR_LI` | 171 | 0xAB | `OP_THIS_ARITH_SLOT_C` |
-| 73 | 0x49 | `OP_GET_INDEX_LOCAL` | 172 | 0xAC | `OP_THIS_INVOKE_SLOT` |
-| 74 | 0x4A | `OP_SET_ARR_LC` | 173 | 0xAD | `OP_GET_THIS_ARR_L` |
-| 75 | 0x4B | `OP_SET_ARR_LL` | 174 | 0xAE | `OP_GET_THIS_ARR_SLOT_L` |
-| 76 | 0x4C | `OP_SET_ARR_LLC` | 175 | 0xAF | `OP_SUPER_INVOKE` |
-| 77 | 0x4D | `OP_SET_ARR_LLL` | 176 | 0xB0 | `OP_CALL_GLOBAL` |
-| 78 | 0x4E | `OP_SET_INDEX_LOCAL` | 177 | 0xB1 | `OP_CONCAT_N` |
-| 79 | 0x4F | `OP_ARITH_ELC` | 178 | 0xB2 | `OP_NIL_LOCAL` |
-| 80 | 0x50 | `OP_ARITH_ELL` | 179 | 0xB3 | `OP_CALL_WITH_THIS` |
-| 81 | 0x51 | `OP_ARITH_EIC` | 180 | 0xB4 | `OP_OBJ_ARITH_L` |
-| 82 | 0x52 | `OP_ARITH_EIL` | 181 | 0xB5 | `OP_PUSH_HOST` |
-| 83 | 0x53 | `OP_SET_OBJ_L` | 182 | 0xB6 | `OP_CALL0_HOST` |
-| 84 | 0x54 | `OP_SET_OBJ_LL` | 183 | 0xB7 | `OP_CALL1_HOST` |
-| 85 | 0x55 | `OP_GET_THIS_PROP` | 184 | 0xB8 | `OP_CALL2_HOST` |
-| 86 | 0x56 | `OP_SET_THIS_PROP` | 185 | 0xB9 | `OP_CALL3_HOST` |
-| 87 | 0x57 | `OP_THIS_ARITH_L` | 186 | 0xBA | `OP_CALL4_HOST` |
-| 88 | 0x58 | `OP_THIS_ARITH_C` | 187 | 0xBB | `OP_CALL5_HOST` |
-| 89 | 0x59 | `OP_LOCAL_ARR_LC` | 188 | 0xBC | `OP_INVOKE_MEMBER` |
-| 90 | 0x5A | `OP_LOCAL_ARR_LL` | 189 | 0xBD | `OP_INVOKE_GLOBAL_CACHED` |
-| 91 | 0x5B | `OP_BUILD_OBJECT` | 190 | 0xBE | `OP_TAIL_THIS_INVOKE` |
-| 92 | 0x5C | `OP_BUILD_ARRAY` | 191 | 0xBF | `OP_TAIL_THIS_INVOKE_SLOT` |
-| 93 | 0x5D | `OP_MAKE_CONST` | 192 | 0xC0 | `OP_SUPER_INVOKE_SLOT` |
-| 94 | 0x5E | `OP_CALL` | 193 | 0xC1 | `OP_SET_THIS_ARR_L` |
-| 95 | 0x5F | `OP_CALL_TYPED` | 194 | 0xC2 | `OP_SET_THIS_ARR_SLOT_L` |
-| 96 | 0x60 | `OP_CALL_SELF` | 195 | 0xC3 | `OP_SET_THIS_ARR_LL` |
-| 97 | 0x61 | `OP_TAIL_SELF` | 196 | 0xC4 | `OP_SET_THIS_ARR_SLOT_LL` |
-| 98 | 0x62 | `OP_TAIL_CALL` | 197 | 0xC5 | `OP_ARITH_IMM16` |
-
-Opcodes added after the original 194-entry table (single-column continuation,
-rather than re-pairing the two-column layout above on every addition):
-
-| # | Hex | Mnemonic |
-| --- | --- | --- |
-| 194 | 0xC2 | `OP_SET_THIS_ARR_L` |
-| 195 | 0xC3 | `OP_SET_THIS_ARR_SLOT_L` |
-| 196 | 0xC4 | `OP_SET_THIS_ARR_LL` |
-| 197 | 0xC5 | `OP_SET_THIS_ARR_SLOT_LL` |
+| 0 | 0x00 | `OP_NOP` | 100 | 0x64 | `OP_RETURN_NONE` |
+| 1 | 0x01 | `OP_CONSTANT` | 101 | 0x65 | `OP_RETURN_NIL` |
+| 2 | 0x02 | `OP_NIL` | 102 | 0x66 | `OP_RETURN_L` |
+| 3 | 0x03 | `OP_TRUE` | 103 | 0x67 | `OP_FN` |
+| 4 | 0x04 | `OP_FALSE` | 104 | 0x68 | `OP_FN_CAPTURE` |
+| 5 | 0x05 | `OP_ONE` | 105 | 0x69 | `OP_YIELD` |
+| 6 | 0x06 | `OP_NEG_ONE` | 106 | 0x6A | `OP_AWAIT` |
+| 7 | 0x07 | `OP_IMM8` | 107 | 0x6B | `OP_THIS_INVOKE` |
+| 8 | 0x08 | `OP_IMM16` | 108 | 0x6C | `OP_BIND_THIS` |
+| 9 | 0x09 | `OP_IMM32` | 109 | 0x6D | `OP_PUSH_BUILTIN` |
+| 10 | 0x0A | `OP_IMM_CHAR` | 110 | 0x6E | `OP_CALL0_BUILTIN` |
+| 11 | 0x0B | `OP_POP` | 111 | 0x6F | `OP_CALL1_BUILTIN` |
+| 12 | 0x0C | `OP_DUP` | 112 | 0x70 | `OP_CALL2_BUILTIN` |
+| 13 | 0x0D | `OP_NEGATE` | 113 | 0x71 | `OP_CALL3_BUILTIN` |
+| 14 | 0x0E | `OP_NOT` | 114 | 0x72 | `OP_CALL4_BUILTIN` |
+| 15 | 0x0F | `OP_BITWISE_NOT` | 115 | 0x73 | `OP_CALL5_BUILTIN` |
+| 16 | 0x10 | `OP_ADD` | 116 | 0x74 | `OP_TRY_BEGIN` |
+| 17 | 0x11 | `OP_SUBTRACT` | 117 | 0x75 | `OP_TRY_END` |
+| 18 | 0x12 | `OP_MULTIPLY` | 118 | 0x76 | `OP_CATCH_BEGIN` |
+| 19 | 0x13 | `OP_DIVIDE` | 119 | 0x77 | `OP_CATCH_END` |
+| 20 | 0x14 | `OP_MODULO` | 120 | 0x78 | `OP_FINALLY_BEGIN` |
+| 21 | 0x15 | `OP_POWER` | 121 | 0x79 | `OP_FINALLY_END` |
+| 22 | 0x16 | `OP_BITWISE_AND` | 122 | 0x7A | `OP_TRY_LEAVE` |
+| 23 | 0x17 | `OP_BITWISE_OR` | 123 | 0x7B | `OP_THROW` |
+| 24 | 0x18 | `OP_XOR` | 124 | 0x7C | `OP_FOREACH` |
+| 25 | 0x19 | `OP_SHL` | 125 | 0x7D | `OP_ITER_BEGIN` |
+| 26 | 0x1A | `OP_SHR` | 126 | 0x7E | `OP_ITER_NEXT` |
+| 27 | 0x1B | `OP_USHR` | 127 | 0x7F | `OP_LEN` |
+| 28 | 0x1C | `OP_IS_NIL` | 128 | 0x80 | `OP_TYPE` |
+| 29 | 0x1D | `OP_IS_NOT_NIL` | 129 | 0x81 | `OP_IS_ARRAY` |
+| 30 | 0x1E | `OP_EQUAL` | 130 | 0x82 | `OP_IS_OBJECT` |
+| 31 | 0x1F | `OP_NOT_EQUAL` | 131 | 0x83 | `OP_HAS_KEY` |
+| 32 | 0x20 | `OP_LESS` | 132 | 0x84 | `OP_TO_STRING` |
+| 33 | 0x21 | `OP_LESS_EQUAL` | 133 | 0x85 | `OP_TO_INT` |
+| 34 | 0x22 | `OP_GREATER` | 134 | 0x86 | `OP_TO_FLOAT` |
+| 35 | 0x23 | `OP_GREATER_EQUAL` | 135 | 0x87 | `OP_TO_CHAR` |
+| 36 | 0x24 | `OP_APPROX_EQ` | 136 | 0x88 | `OP_TO_I8` |
+| 37 | 0x25 | `OP_CMP_IS` | 137 | 0x89 | `OP_TO_U8` |
+| 38 | 0x26 | `OP_JUMP_IF_FALSE` | 138 | 0x8A | `OP_TO_I16` |
+| 39 | 0x27 | `OP_JUMP_IF_TRUE` | 139 | 0x8B | `OP_TO_U16` |
+| 40 | 0x28 | `OP_JUMP` | 140 | 0x8C | `OP_TO_I32` |
+| 41 | 0x29 | `OP_LOOP` | 141 | 0x8D | `OP_TO_U32` |
+| 42 | 0x2A | `OP_JUMP_TABLE` | 142 | 0x8E | `OP_EXPORT` |
+| 43 | 0x2B | `OP_CMP_JUMP_LL` | 143 | 0x8F | `OP_NEW` |
+| 44 | 0x2C | `OP_CMP_JUMP_LC` | 144 | 0x90 | `OP_SUPER` |
+| 45 | 0x2D | `OP_DEFINE_GLOBAL` | 145 | 0x91 | `OP_GUARD` |
+| 46 | 0x2E | `OP_GET_GLOBAL` | 146 | 0x92 | `OP_DBG_LINE` |
+| 47 | 0x2F | `OP_SET_GLOBAL` | 147 | 0x93 | `OP_DBG_FILE_NAME` |
+| 48 | 0x30 | `OP_GET_LOCAL` | 148 | 0x94 | `OP_DBG_BREAK` |
+| 49 | 0x31 | `OP_SET_LOCAL` | 149 | 0x95 | `OP_GET_BLK_LC` |
+| 50 | 0x32 | `OP_GET_LOCAL0` | 150 | 0x96 | `OP_GET_BLK_LL` |
+| 51 | 0x33 | `OP_GET_LOCAL1` | 151 | 0x97 | `OP_GET_BLK_LI` |
+| 52 | 0x34 | `OP_GET_LOCAL2` | 152 | 0x98 | `OP_SET_BLK_LC` |
+| 53 | 0x35 | `OP_GET_LOCAL3` | 153 | 0x99 | `OP_SET_BLK_LL` |
+| 54 | 0x36 | `OP_SET_LOCAL0` | 154 | 0x9A | `OP_SET_BLK_LLC` |
+| 55 | 0x37 | `OP_SET_LOCAL1` | 155 | 0x9B | `OP_SET_BLK_LLL` |
+| 56 | 0x38 | `OP_SET_LOCAL2` | 156 | 0x9C | `OP_LOCAL_BLK_LC` |
+| 57 | 0x39 | `OP_SET_LOCAL3` | 157 | 0x9D | `OP_LOCAL_BLK_LL` |
+| 58 | 0x3A | `OP_INC_LOCAL` | 158 | 0x9E | `OP_ARITH_BLK_LC` |
+| 59 | 0x3B | `OP_DEC_LOCAL` | 159 | 0x9F | `OP_ARITH_BLK_LL` |
+| 60 | 0x3C | `OP_ARITH_LC` | 160 | 0xA0 | `OP_ARITH_BLK_IC` |
+| 61 | 0x3D | `OP_ARITH_LL` | 161 | 0xA1 | `OP_ARITH_BLK_IL` |
+| 62 | 0x3E | `OP_ARITH_L` | 162 | 0xA2 | `OP_CONCAT` |
+| 63 | 0x3F | `OP_ARITH_IMM8` | 163 | 0xA3 | `OP_ARITH_FMA_LLL` |
+| 64 | 0x40 | `OP_ARITH_L_IMM8` | 164 | 0xA4 | `OP_INVOKE_INSTANCE` |
+| 65 | 0x41 | `OP_ARITH_LL_PUSH` | 165 | 0xA5 | `OP_CMP_JUMP_LC32` |
+| 66 | 0x42 | `OP_GET_PROPERTY` | 166 | 0xA6 | `OP_GET_LOCAL_PROP` |
+| 67 | 0x43 | `OP_SET_PROPERTY` | 167 | 0xA7 | `OP_GET_THIS_SLOT` |
+| 68 | 0x44 | `OP_GET_INDEX` | 168 | 0xA8 | `OP_SET_THIS_SLOT` |
+| 69 | 0x45 | `OP_SET_INDEX` | 169 | 0xA9 | `OP_GET_THIS_CONST` |
+| 70 | 0x46 | `OP_GET_ARR_LC` | 170 | 0xAA | `OP_THIS_ARITH_SLOT_L` |
+| 71 | 0x47 | `OP_GET_ARR_LL` | 171 | 0xAB | `OP_THIS_ARITH_SLOT_C` |
+| 72 | 0x48 | `OP_GET_ARR_LI` | 172 | 0xAC | `OP_THIS_INVOKE_SLOT` |
+| 73 | 0x49 | `OP_GET_INDEX_LOCAL` | 173 | 0xAD | `OP_GET_THIS_ARR_L` |
+| 74 | 0x4A | `OP_SET_ARR_LC` | 174 | 0xAE | `OP_GET_THIS_ARR_SLOT_L` |
+| 75 | 0x4B | `OP_SET_ARR_LL` | 175 | 0xAF | `OP_SUPER_INVOKE` |
+| 76 | 0x4C | `OP_SET_ARR_LLC` | 176 | 0xB0 | `OP_CALL_GLOBAL` |
+| 77 | 0x4D | `OP_SET_ARR_LLL` | 177 | 0xB1 | `OP_CONCAT_N` |
+| 78 | 0x4E | `OP_SET_INDEX_LOCAL` | 178 | 0xB2 | `OP_NIL_LOCAL` |
+| 79 | 0x4F | `OP_ARITH_ELC` | 179 | 0xB3 | `OP_CALL_WITH_THIS` |
+| 80 | 0x50 | `OP_ARITH_ELL` | 180 | 0xB4 | `OP_OBJ_ARITH_L` |
+| 81 | 0x51 | `OP_ARITH_EIC` | 181 | 0xB5 | `OP_PUSH_HOST` |
+| 82 | 0x52 | `OP_ARITH_EIL` | 182 | 0xB6 | `OP_CALL0_HOST` |
+| 83 | 0x53 | `OP_SET_OBJ_L` | 183 | 0xB7 | `OP_CALL1_HOST` |
+| 84 | 0x54 | `OP_SET_OBJ_LL` | 184 | 0xB8 | `OP_CALL2_HOST` |
+| 85 | 0x55 | `OP_GET_THIS_PROP` | 185 | 0xB9 | `OP_CALL3_HOST` |
+| 86 | 0x56 | `OP_SET_THIS_PROP` | 186 | 0xBA | `OP_CALL4_HOST` |
+| 87 | 0x57 | `OP_THIS_ARITH_L` | 187 | 0xBB | `OP_CALL5_HOST` |
+| 88 | 0x58 | `OP_THIS_ARITH_C` | 188 | 0xBC | `OP_INVOKE_MEMBER` |
+| 89 | 0x59 | `OP_LOCAL_ARR_LC` | 189 | 0xBD | `OP_INVOKE_GLOBAL_CACHED` |
+| 90 | 0x5A | `OP_LOCAL_ARR_LL` | 190 | 0xBE | `OP_TAIL_THIS_INVOKE` |
+| 91 | 0x5B | `OP_BUILD_OBJECT` | 191 | 0xBF | `OP_TAIL_THIS_INVOKE_SLOT` |
+| 92 | 0x5C | `OP_BUILD_ARRAY` | 192 | 0xC0 | `OP_SUPER_INVOKE_SLOT` |
+| 93 | 0x5D | `OP_MAKE_CONST` | 193 | 0xC1 | `OP_SET_THIS_ARR_L` |
+| 94 | 0x5E | `OP_CALL` | 194 | 0xC2 | `OP_SET_THIS_ARR_SLOT_L` |
+| 95 | 0x5F | `OP_CALL_TYPED` | 195 | 0xC3 | `OP_SET_THIS_ARR_LL` |
+| 96 | 0x60 | `OP_CALL_SELF` | 196 | 0xC4 | `OP_SET_THIS_ARR_SLOT_LL` |
+| 97 | 0x61 | `OP_TAIL_SELF` | 197 | 0xC5 | `OP_ARITH_IMM16` |
+| 98 | 0x62 | `OP_TAIL_CALL` | 198 | 0xC6 | `OP_CHECK_TYPE` |
+| 99 | 0x63 | `OP_RETURN` | | | |
 
 ## Appendix B. Machine limits and named constants
 
@@ -1921,7 +1944,7 @@ time for portability of programs near the limits.
 | `XXHASH64_SEED` | 0 | seed for all identifier hashing (§4.6) |
 | `XXHASH64_EMPTY` | `0xEF46DB3751D8E999` | xxHash64 of the empty string (§4.6) |
 | `EXIT_CODE_ERR_FILE` | 4 | process exit code for every load-time rejection (§8) |
-| `MAX_VALIDATE_NESTING` | 256 | `ValidateChunk` recursion cap over nested function chunks (§8.3) |
+| `MAX_VALIDATE_NESTING` | 256 | validator recursion cap over nested function chunks (§8.3) |
 
 ### B.2 Machine limits
 
@@ -2109,7 +2132,7 @@ chunk, not inferred from the prose alone.
 | `let r = foo() + 5;` | `OP_ARITH_IMM8` | `foo()` isn't a bare local, so the `L_IMM8` fusion below doesn't apply. |
 | `let r = x + 5;` (`x` local) | `OP_ARITH_L_IMM8` | Fresh push, not a compound-assign — the `GET_LOCAL`-free form of `ARITH_IMM8`. |
 | `let r = x + y;` (`x`, `y` both local) | `OP_ARITH_LL_PUSH` | Closes the gap `ARITH_L_IMM8` leaves for two-local operands; ~15-20% faster than the `push+push+ADD` it replaces on a tight loop. |
-| `let r = a*b+c;` / `return a*b+c;` / `f(a*b+c)` (`a`,`b`,`c` all local) | `OP_ARITH_FMA_LLL` | Also reached from `arr[a*b+c]`/`buf[a*b+c]` (§D.8/§D.20) via a compiler-allocated temp holding the FMA result, and from any plain pushed-value position — a return expression, a call argument, a nested sub-expression — not just an assignment target or an index. Measured ~9% faster than the unfused sequence in the pure-interpreter case (JIT disabled), rising to ~14% once the temp is correctly recognized as never needing a per-iteration clear inside a loop body (the same recognition also improved the array/block indexed-access temps in §D.8/§D.20 by a further ~2-9% on top of their own already-measured wins). A JIT-compiled, fully-typed hot function bypasses this fusion entirely, since the JIT compiles from source through its own independent code path rather than executing this bytecode. |
+| `let r = a*b+c;` / `return a*b+c;` / `f(a*b+c)` (`a`,`b`,`c` all local, all proven int) | `OP_ARITH_FMA_LLL` | Never emitted when any operand may be a float: `a*b+c` on floats stays a separate multiply and add. Also reached from `arr[a*b+c]`/`buf[a*b+c]` (§D.8/§D.20) via a compiler-allocated temp holding the FMA result, and from any plain pushed-value position — a return expression, a call argument, a nested sub-expression — not just an assignment target or an index. Measured ~9% faster than the unfused sequence in the pure-interpreter case (JIT disabled), rising to ~14% once the temp is correctly recognized as never needing a per-iteration clear inside a loop body (the same recognition also improved the array/block indexed-access temps in §D.8/§D.20 by a further ~2-9% on top of their own already-measured wins). A JIT-compiled, fully-typed hot function bypasses this fusion entirely, since the JIT compiles from source through its own independent code path rather than executing this bytecode. |
 
 ### D.7 Property and index access, generic (§7.7)
 
@@ -2178,7 +2201,7 @@ chunk, not inferred from the prose alone.
 | Code | Opcode(s) | Comment |
 | --- | --- | --- |
 | `{a: 1, b: 2}` | `OP_BUILD_OBJECT` | |
-| `[1, 2, 3]` | `OP_BUILD_ARRAY` | Elements pushed in reverse source order so they land in forward order; also the flat-int/flat-float path when the element type is provably `int`/`float` throughout. |
+| `[1, 2, 3]` | `OP_BUILD_ARRAY` | Elements pushed in source order; also the flat-int/flat-float path when the element type is provably `int`/`float` throughout. |
 | `const arr = [1, 2, 3];` | `OP_MAKE_CONST` | Reference-type `const` only — a scalar `const` needs no runtime marker. |
 | `new MyClass(args)` | `OP_NEW` | |
 | `super(args);` | `OP_SUPER` | Pushes the base-class constructor bound to `this`; the actual call is a following `OP_CALL`. |
@@ -2281,6 +2304,7 @@ Only reachable in an embedding that registers its own native modules
 | `u16(x)` | `OP_TO_U16` | |
 | `i32(x)` | `OP_TO_I32` | |
 | `u32(x)` | `OP_TO_U32` | |
+| `let n: int = f(x)` / `n = o.k` / `return f(x)` in `fn g(): int` | … `OP_CHECK_TYPE` | Only when the stored value's type is not known at compile time; a statically known misfit is a compile error instead. |
 
 ### D.18 Modules (§7.18)
 
@@ -2290,13 +2314,11 @@ Only reachable in an embedding that registers its own native modules
 
 ### D.19 Debug (§7.19)
 
-Present only in non-stripped chunks; every row below is emitted automatically, never by a dedicated construct.
-
 | Code | Opcode(s) | Comment |
 | --- | --- | --- |
-| *(every source line)* | `OP_DBG_LINE` | |
-| *(the top-level chunk, once)* | `OP_DBG_FILE_NAME` | Names the whole unit; nested chunks inherit it |
-| *(a line with a debugger breakpoint set)* | `OP_DBG_BREAK` | |
+| *(each change of source line, with `-g` only)* | `OP_DBG_LINE` | Two statements on one line share one marker. |
+| *(the top-level chunk, once)* | `OP_DBG_FILE_NAME` | Names the whole unit; nested chunks inherit it. Emitted with or without `-g`. |
+| `breakpoint(7);` | `OP_DBG_BREAK` | Emitted with or without `-g`. |
 
 ### D.20 Block (raw memory) fast paths (§7.20)
 

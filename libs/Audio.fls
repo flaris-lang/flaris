@@ -18,26 +18,29 @@
 //   ReadWav(path)                             →  { signal, sampleRate } or nil
 //   WriteWav(path, signal, sampleRate)        →  bool
 //
+// A `[float]` result is a flat float array: storing an int into it stores a float,
+// storing a non-number raises. ApplyEnvelope/FadeIn/FadeOut keep the layout of `signal`.
+//
 // Envelope:
-//   ADSR(n, sampleRate, attack, decay, sustain, release)  →  array
+//   ADSR(n, sampleRate, attack, decay, sustain, release)  →  [float]
 //   ApplyEnvelope(signal, envelope)           →  array
 //   FadeIn(signal, samples)                   →  array
 //   FadeOut(signal, samples)                  →  array
 //
 // Gain & dynamics:
-//   Gain(signal, db)                          →  array  - amplify/attenuate by dB
-//   Clip(signal, threshold)                   →  array  - hard clip to ±threshold
-//   Compress(signal, sampleRate, threshold, ratio, attack, release)  →  array
+//   Gain(signal, db)                          →  [float]  - amplify/attenuate by dB
+//   Clip(signal, threshold)                   →  [float]  - hard clip to ±threshold
+//   Compress(signal, sampleRate, threshold, ratio, attack, release)  →  [float]
 //
 // Stereo:
-//   Interleave(left, right)                   →  array  - interleaved L,R,L,R,...
-//   Deinterleave(stereo)                      →  { left, right }
-//   Pan(signal, pan)                          →  { left, right }  - pan in [-1, 1]
-//   StereoToMono(left, right)                 →  array
-//   Mix(a, b, weight)                         →  array  - blend two signals
+//   Interleave(left, right)                   →  [float]  - interleaved L,R,L,R,...
+//   Deinterleave(stereo)                      →  { left: [float], right: [float] }
+//   Pan(signal, pan)                          →  { left: [float], right: [float] }  - pan in [-1, 1]
+//   StereoToMono(left, right)                 →  [float]
+//   Mix(a, b, weight)                         →  [float]  - blend two signals
 //
 // Pitch & frequency:
-//   PitchDetect(signal, sampleRate, minFreq?, maxFreq?)  →  float (Hz)
+//   PitchDetect(signal, sampleRate, minFreq?, maxFreq?)  →  float (Hz); range default 80..1200 Hz
 //   MidiToHz(midi)                            →  float
 //   HzToMidi(hz)                              →  int
 //   NoteToHz(note)                            →  float  - "A4", "C#3", "Bb2", etc.
@@ -124,6 +127,65 @@ class Audio : Signals {
         return 0;
     }
 
+    // 16-bit PCM little-endian samples into buf from byte 44, clipped to [-1, 1].
+    fn _aud_pcm16_kernel(sig: [float], buf: block, n: int): int {
+        iter(i from 0 to n) {
+            let s: float = sig[i];
+            if (s >  1.0) s =  1.0;
+            if (s < -1.0) s = -1.0;
+            Buffer.WriteU16At(buf, 44 + i * 2, int(s * 32767.0));
+        }
+        return 0;
+    }
+
+    fn _aud_adsr_kernel(env: [float], n: int, attackSmp: int, decaySmp: int, sustainSmp: int, releaseSmp: int,
+                        sustainLevel: float): int {
+        var pos: int   = 0;
+        let attackF: float    = float(attackSmp);
+        let decayF: float     = float(decaySmp);
+        let releaseF: float   = float(releaseSmp);
+        let decayRange: float = 1.0 - sustainLevel;
+        iter(i from 0 to attackSmp) {
+            if (pos < n) { env[pos] = i / attackF; pos += 1; }
+        }
+        iter(i from 0 to decaySmp) {
+            if (pos < n) { env[pos] = 1.0 - decayRange * i / decayF; pos += 1; }
+        }
+        iter(i from 0 to sustainSmp) {
+            if (pos < n) { env[pos] = sustainLevel; pos += 1; }
+        }
+        iter(i from 0 to releaseSmp) {
+            if (pos < n) { env[pos] = sustainLevel * (1.0 - i / releaseF); pos += 1; }
+        }
+        return 0;
+    }
+
+    fn _aud_stereo_kernel(sig: [float], left: [float], right: [float], n: int, gainL: float, gainR: float): int {
+        iter(i from 0 to n) {
+            left[i]  = sig[i] * gainL;
+            right[i] = sig[i] * gainR;
+        }
+        return 0;
+    }
+
+    fn _aud_deinterleave_kernel(stereo: [float], left: [float], right: [float], n: int): int {
+        iter(i from 0 to n) {
+            left[i]  = stereo[i * 2];
+            right[i] = stereo[i * 2 + 1];
+        }
+        return 0;
+    }
+
+    fn _aud_fadein_kernel(out: [float], n: int): int {
+        iter(i from 0 to n) { out[i] = out[i] * (i / float(n)); }
+        return 0;
+    }
+
+    fn _aud_fadeout_kernel(out: [float], start: int, n: int): int {
+        iter(i from 0 to n) { out[start + i] = out[start + i] * (1.0 - (i + 1) / float(n)); }
+        return 0;
+    }
+
     // ============================================================
     //  WAV I/O  (16-bit PCM mono)
     // ============================================================
@@ -134,7 +196,7 @@ class Audio : Signals {
         let fileSize  = 36 + dataBytes;
         let byteRate  = sampleRate * 2;
         let total     = 44 + dataBytes;
-        let bytes     = Array.Create(total);
+        let bytes     = Array.Create(44);
 
         _setFourCC(bytes, 0,  82, 73, 70, 70);      // "RIFF"
         _setI32   (bytes, 4,  fileSize);
@@ -150,15 +212,9 @@ class Audio : Signals {
         _setFourCC(bytes, 36, 100, 97, 116, 97);    // "data"
         _setI32   (bytes, 40, dataBytes);
 
-        iter(i from 0 to n) {
-            let s = signal[i];
-            if (s >  1.0) s =  1.0;
-            if (s < -1.0) s = -1.0;
-            _setI16(bytes, 44 + i * 2, int(s * 32767.0));
-        }
-
         let buf = Buffer.Create(total, 1);
         Buffer.FromArray(buf, bytes);
+        _aud_pcm16_kernel(signal, buf, n);
         return File.WriteAllBytes(path, buf);
     }
 
@@ -166,15 +222,13 @@ class Audio : Signals {
         let buf = File.ReadAllBytes(path);
         if (buf == nil) return nil;
 
-        let raw    = Buffer.ToArray(buf);
-        let sr     = _getI32(raw, 24);
-        let nBytes = _getI32(raw, 40);
+        let sr     = Buffer.ReadU32At(buf, 24);
+        let nBytes = Buffer.ReadU32At(buf, 40);
         let n      = nBytes / 2;
         let out    = Array.Create(n);
 
         iter(i from 0 to n) {
-            let v = _getI16Signed(raw, 44 + i * 2);
-            out[i] = v / 32768.0;
+            out[i] = Buffer.ReadI16At(buf, 44 + i * 2) / 32768.0;
         }
 
         return { signal: out, sampleRate: sr };
@@ -188,37 +242,13 @@ class Audio : Signals {
             attack:float, decay:float,
             sustainLevel:float, release:float) : array {
 
-        let env        = Array.Create(n);
+        let env: [float] = Array.Create(n, Type.Float);
         let attackSmp  = int(attack  * sampleRate);
         let decaySmp   = int(decay   * sampleRate);
         let releaseSmp = int(release * sampleRate);
         let sustainSmp = n - attackSmp - decaySmp - releaseSmp;
         if (sustainSmp < 0) sustainSmp = 0;
-
-        var pos        = 0;
-        let attackF    = float(attackSmp);
-        let decayF     = float(decaySmp);
-        let releaseF   = float(releaseSmp);
-        let decayRange = 1.0 - sustainLevel;
-
-        iter(i from 0 to attackSmp) {
-            if (pos < n) { env[pos] = i / attackF; pos += 1; }
-        }
-        iter(i from 0 to decaySmp) {
-            if (pos < n) {
-                env[pos] = 1.0 - decayRange * i / decayF;
-                pos += 1;
-            }
-        }
-        iter(i from 0 to sustainSmp) {
-            if (pos < n) { env[pos] = sustainLevel; pos += 1; }
-        }
-        iter(i from 0 to releaseSmp) {
-            if (pos < n) {
-                env[pos] = sustainLevel * (1.0 - i / releaseF);
-                pos += 1;
-            }
-        }
+        _aud_adsr_kernel(env, n, attackSmp, decaySmp, sustainSmp, releaseSmp, sustainLevel);
         return env;
     }
 
@@ -230,9 +260,7 @@ class Audio : Signals {
         let out = Array.Subset(signal, 0, len(signal));
         let n   = int(Math.Min(samples, len(out)));
         if (n == 0) return out;
-        iter(i from 0 to n) {
-            out[i] = out[i] * (i / float(n));
-        }
+        _aud_fadein_kernel(out, n);
         return out;
     }
 
@@ -242,9 +270,7 @@ class Audio : Signals {
         let total = len(out);
         let n     = int(Math.Min(samples, total));
         let start = total - n;
-        iter(i from 0 to n) {
-            out[start + i] = out[start + i] * (1.0 - (i + 1) / float(n));
-        }
+        _aud_fadeout_kernel(out, start, n);
         return out;
     }
 
@@ -291,12 +317,9 @@ class Audio : Signals {
 
     fn Deinterleave(stereo:array) : object {
         let n     = len(stereo) / 2;
-        let left  = Array.Create(n);
-        let right = Array.Create(n);
-        iter(i from 0 to n) {
-            left[i]  = stereo[i * 2];
-            right[i] = stereo[i * 2 + 1];
-        }
+        let left: [float]  = Array.Create(n, Type.Float);
+        let right: [float] = Array.Create(n, Type.Float);
+        _aud_deinterleave_kernel(stereo, left, right, n);
         return { left: left, right: right };
     }
 
@@ -305,12 +328,9 @@ class Audio : Signals {
         let gainL = Math.Cos(angle);
         let gainR = Math.Sin(angle);
         let n     = len(signal);
-        let left  = Array.Create(n);
-        let right = Array.Create(n);
-        iter(i from 0 to n) {
-            left[i]  = signal[i] * gainL;
-            right[i] = signal[i] * gainR;
-        }
+        let left: [float]  = Array.Create(n, Type.Float);
+        let right: [float] = Array.Create(n, Type.Float);
+        _aud_stereo_kernel(signal, left, right, n, gainL, gainR);
         return { left: left, right: right };
     }
 
@@ -318,8 +338,12 @@ class Audio : Signals {
     //  Pitch
     // ============================================================
 
+    // Omitted bounds default to 80..1200 Hz. Autocorrelation rises toward lag 0,
+    // so a maxHz far above the true pitch can win at the edge of the range.
     fn PitchDetect(signal:array, sampleRate:float,
-                   minHz:float, maxHz:float) : float {
+                   minHz?:float, maxHz?:float) : float {
+        if (minHz == nil) { minHz = 80.0; }
+        if (maxHz == nil) { maxHz = 1200.0; }
 
         let n      = len(signal);
         let minLag = int(sampleRate / maxHz);
@@ -328,14 +352,7 @@ class Audio : Signals {
 
         let ac = this.Autocorrelate(signal, maxLag);
 
-        let bestLag = minLag;
-        let bestVal = ac[minLag];
-        iter(lag from minLag+1 to maxLag + 1) {
-            if (ac[lag] > bestVal) {
-                bestVal = ac[lag];
-                bestLag = lag;
-            }
-        }
+        let bestLag = this._sig_argmax_range(ac, minLag, minLag + 1, maxLag + 1);
 
         if (bestLag == 0) return 0.0;
         return sampleRate / float(bestLag);
@@ -389,14 +406,7 @@ class Audio : Signals {
         let spec = this.FFT(this.ApplyWindow(signal, win));
         let mag  = this.Magnitude(spec);
 
-        let best  = 1;
-        let bestV = mag[1];
-        iter(i from 2 to int(n/2)) {
-            if (mag[i] > bestV) {
-                bestV = mag[i];
-                best  = i;
-            }
-        }
+        let best = this._sig_argmax_range(mag, 1, 2, int(n/2));
         return this.BinToHz(best, n, sampleRate);
     }
 
@@ -500,10 +510,8 @@ class Audio : Signals {
     // Length of the result = min(len(left), len(right)).
     fn StereoToMono(left:array, right:array) : array {
         let n   = int(Math.Min(len(left), len(right)));
-        let out = Array.Create(n);
-        iter(i from 0 to n) {
-            out[i] = (left[i] + right[i]) * 0.5;
-        }
+        let out: [float] = Array.Create(n, Type.Float);
+        this._sig_mix_kernel(left, right, out, n, 0.5, 0.5);
         return out;
     }
 

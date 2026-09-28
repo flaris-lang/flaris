@@ -2,8 +2,9 @@
 // Version: 1.0
 //
 // A Promise represents a value that will be available in the future.
-// Promises are fiber-based: Await() yields the current fiber until the
-// promise is settled, so the scheduler can continue running other fibers.
+// Promises are fiber-based: Await() parks the current fiber (Fiber.Park)
+// until the promise settles and wakes it, so the scheduler runs other fibers
+// meanwhile and a waiting fiber uses no CPU.
 //
 // Usage:
 //   import { Promise } from library("Promise", "1.0");
@@ -71,7 +72,7 @@ global _pr_next  = 0;    // monotonic id counter
 
 fn _PromiseRetryWorker() {
     let self = Fiber.FromId(Fiber.Id());
-    while (!Fiber.HasMessage(self)) { Fiber.Sleep(0); }
+    while (!Fiber.HasMessage(self)) { Fiber.Park(); }
 
     let msg        = Fiber.GetMessage(self);
     let pid        = msg.id;
@@ -99,7 +100,7 @@ fn _PromiseRetryWorker() {
 
 fn _PromiseDelayedWorker() {
     let self = Fiber.FromId(Fiber.Id());
-    while (!Fiber.HasMessage(self)) { Fiber.Sleep(0); }
+    while (!Fiber.HasMessage(self)) { Fiber.Park(); }
 
     let msg = Fiber.GetMessage(self);
     let pid = msg.id;
@@ -122,6 +123,7 @@ class Promise {
     let _handlers = nil; 
     let _state: string = "pending"; 
     let _value = nil; 
+    let _waiters = nil;
     let id = 0;
 
     fn Constructor() {
@@ -130,6 +132,7 @@ class Promise {
         this._state     = "pending";   // "pending" | "resolved" | "rejected" | "canceled"
         this._value     = nil;
         this._handlers  = [];          // [{onFulfilled, onRejected, onFinally, next}]
+        this._waiters   = [];          // ids of fibers parked until this settles
         _pr_store[str(this.id)] = this;
     }
 
@@ -251,6 +254,10 @@ class Promise {
 
         this._handlers = [];
         Object.Delete(_pr_store, str(this.id));
+
+        let waiters = this._waiters;
+        this._waiters = [];
+        foreach (w in waiters) { Fiber.Unpark(Fiber.FromId(w)); }
     }
 
     // ── Chaining ──────────────────────────────────────────────────────────────
@@ -308,13 +315,40 @@ class Promise {
     }
 
     // ── Waiting ───────────────────────────────────────────────────────────────
+    // A waiter adds its fiber id to _waiters and parks; _Dispatch unparks every
+    // one. Ids, not fibers: holding the fiber here would make a reference cycle
+    // through the waiter's own locals.
+
+    fn _Wait() {
+        let me = Fiber.Id();
+        while (this._state == "pending") {
+            Array.Append(this._waiters, me);
+            Fiber.Park();
+            this._Forget(me);
+        }
+    }
+
+    fn _Forget(id:int) {
+        if (len(this._waiters) == 0) { return; }
+        let kept = [];
+        foreach (w in this._waiters) {
+            if (w != id) { Array.Append(kept, w); }
+        }
+        this._waiters = kept;
+    }
+
+    // Park until one of `promises` that is still pending settles.
+    fn static _WaitAny(promises:array) {
+        let me = Fiber.Id();
+        foreach (p in promises) {
+            if (p._state == "pending") { Array.Append(p._waiters, me); }
+        }
+        Fiber.Park();
+        foreach (p in promises) { p._Forget(me); }
+    }
 
     fn Await() {
-        let spins = 0;
-        while (this._state == "pending") {
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
-        }
+        this._Wait();
 
         if (this._state == "rejected") {
             throw(1, str(this._value));
@@ -328,11 +362,7 @@ class Promise {
     }
 
     fn AwaitResult(): object {
-        let spins = 0;
-        while (this._state == "pending") {
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
-        }
+        this._Wait();
         return {
             ok: this._state == "resolved",
             state: this._state,
@@ -341,11 +371,7 @@ class Promise {
     }
 
     fn TryAwait(defaultValue) {
-        let spins = 0;
-        while (this._state == "pending") {
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
-        }
+        this._Wait();
         if (this._state == "resolved") { return this._value; }
         return defaultValue;
     }
@@ -446,16 +472,7 @@ class Promise {
     // ── Static: combinators (blocking helpers) ───────────────────────────────
 
     fn static All(promises:array): array {
-        let spins = 0;
-        while (true) {
-            let pending = 0;
-            foreach (p in promises) {
-                if (p._state == "pending") { pending = pending + 1; }
-            }
-            if (pending == 0) { break; }
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
-        }
+        foreach (p in promises) { p._Wait(); }
 
         let results = [];
         foreach (p in promises) {
@@ -468,7 +485,6 @@ class Promise {
     }
 
     fn static Race(promises:array) {
-        let spins = 0;
         while (true) {
             foreach (p in promises) {
                 if (p._state != "pending") {
@@ -478,35 +494,23 @@ class Promise {
                     return p._value;
                 }
             }
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+            Promise._WaitAny(promises);
         }
     }
 
     fn static FirstSettled(promises:array): object {
-        let spins = 0;
         while (true) {
             foreach (p in promises) {
                 if (p._state != "pending") {
                     return { state: p._state, value: p._value };
                 }
             }
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+            Promise._WaitAny(promises);
         }
     }
 
     fn static AllSettled(promises:array): array {
-        let spins = 0;
-        while (true) {
-            let pending = 0;
-            foreach (p in promises) {
-                if (p._state == "pending") { pending = pending + 1; }
-            }
-            if (pending == 0) { break; }
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
-        }
+        foreach (p in promises) { p._Wait(); }
 
         let results = [];
         foreach (p in promises) {
@@ -520,7 +524,6 @@ class Promise {
             throw(1, "Promise.Any: empty array");
         }
 
-        let spins = 0;
         while (true) {
             let allSettled = true;
             foreach (p in promises) {
@@ -530,8 +533,7 @@ class Promise {
             if (allSettled) {
                 throw(1, "Promise.Any: all promises rejected or canceled");
             }
-            spins += 1;
-            if (spins > 3) { Fiber.Sleep(1); } else { Fiber.Sleep(0); }
+            Promise._WaitAny(promises);
         }
     }
 
@@ -546,7 +548,7 @@ class Promise {
 
     fn static ReceiveId() {
         let self = Fiber.FromId(Fiber.Id());
-        while (!Fiber.HasMessage(self)) { Fiber.Sleep(0); }
+        while (!Fiber.HasMessage(self)) { Fiber.Park(); }
         return Fiber.GetMessage(self);
     }
 

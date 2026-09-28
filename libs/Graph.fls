@@ -14,7 +14,7 @@
 //   g.AddEdge("B", "C", 1);
 //
 //   Console.WriteLine(g.BFS("A"));          // ["A", "B", "C"]
-//   let path = g.ShortestPath("A", "C");    // { path: ["A","C"], distance: 2 }
+//   let path = g.ShortestPath("A", "C");    // ["A", "C"]
 //   Console.WriteLine(g.IsConnected());     // true
 //
 //   // Directed graph with BigInt weights
@@ -54,8 +54,9 @@
 //
 // Shortest paths:
 //   BFSPath(start, end)   →  array of node IDs (unweighted, BFS)
-//   Dijkstra(start)       →  object mapping node → { dist, prev }  (no negative weights)
-//   ShortestPath(start, end)  →  { path:array, distance } or nil if unreachable
+//   Dijkstra(start)       →  { Distances, Prev }: HashMaps node → distance and
+//                            node → predecessor (no negative weights)
+//   ShortestPath(start, end)  →  array of node IDs, or nil if unreachable
 //   AStar(start, end, heuristic)  →  path array or nil; heuristic(node) estimates
 //                                    remaining cost (admissible; no negative weights)
 //   BellmanFord(start)    →  { Distances, Prev, HasNegativeCycle }  (negative weights ok)
@@ -194,11 +195,19 @@ class Graph {
         if (src == dst) return this;  // self-loops not supported
         if (weight == nil) weight = this._wOne();
 
-        this.AddNode(src);
-        this.AddNode(dst);
+        // AddNode(src) and AddNode(dst), in that order.
+        let adj = this._adj;
+        var srcEdges = adj.Get(src);
+        if (srcEdges == nil) {
+            srcEdges = [];
+            adj.Set(src, srcEdges);
+        }
+        var dstEdges = adj.Get(dst);
+        if (dstEdges == nil) {
+            dstEdges = [];
+            adj.Set(dst, dstEdges);
+        }
 
-        // Inline duplicate check (AddNode guarantees both keys exist)
-        let srcEdges = this._adj.Get(src);
         foreach (e in srcEdges) {
             if (e.To == dst) return this;
         }
@@ -207,7 +216,7 @@ class Graph {
         this._edgeCount = this._edgeCount + 1;
 
         if (!this._directed) {
-            Array.Append(this._adj.Get(dst), { To: src, Weight: weight });
+            Array.Append(dstEdges, { To: src, Weight: weight });
         }
 
         return this;
@@ -372,6 +381,10 @@ class Graph {
     // raise an exception. For negative weights, use Bellman-Ford instead.
     fn Dijkstra(start) {
         if (!this._adj.Has(start)) return nil;
+        if (this._wNative) {
+            let fast = this._dijkstraDense(start);
+            if (fast != nil) return fast;
+        }
 
         let dist = Collections.HashMap();
         let prev = Collections.HashMap();
@@ -454,6 +467,138 @@ class Graph {
         }
 
         return { Distances: dist, Prev: prev };
+    }
+
+    // Dense copy of the adjacency for the typed kernels: node i is Ids[i], and
+    // its edges, in adjacency order, are To[Off[i] .. Off[i + 1]) with weights
+    // W[...]. nil unless every weight is an int in 0 .. maxW and every edge
+    // leads to a node of the graph.
+    fn _dense(maxW: int) {
+        let adj   = this._adj;
+        let ids   = adj.Keys();
+        let n     = len(ids);
+        let index = Collections.HashMap();
+        iter (i from 0 to n) { index.Set(ids[i], i); }
+        let off = Array.Create(n + 1, Type.Int);
+        let to  = Array.Create(0, Type.Int);
+        let w   = Array.Create(0, Type.Int);
+        iter (i from 0 to n) {
+            off[i] = len(to);
+            foreach (e in adj.Get(ids[i])) {
+                let j  = index.Get(e.To);
+                let wt = e.Weight;
+                if (j == nil || type(wt) != Type.Int) return nil;
+                Array.Append(to, j);
+                Array.Append(w, wt);
+            }
+        }
+        off[n] = len(to);
+        if (!Graph._inRange(w, 0, maxW)) return nil;
+        return { Ids: ids, Index: index, Off: off, To: to, W: w };
+    }
+
+    fn static _inRange(a: [int], lo: int, hi: int): bool {
+        foreach (v in a) {
+            if (v < lo || v > hi) return false;
+        }
+        return true;
+    }
+
+    // Dijkstra over int weights on the dense copy. The heap reproduces the
+    // Collections.PriorityQueue order entry for entry, so ties resolve, and the
+    // result maps fill, exactly as in the general loop. nil when the graph
+    // does not qualify (see _dense).
+    fn _dijkstraDense(start) {
+        // A path has fewer than n edges, so n * maxW bounds every distance;
+        // keeping that under 2^53 keeps the float heap priorities exact.
+        let n = this._adj.Size();
+        let d = this._dense(9007199254740991 / (n + 1));
+        if (d == nil) return nil;
+
+        let s     = d.Index.Get(start);
+        let dist  = Array.Create(n, Type.Int);
+        let prev  = Array.Create(n, Type.Int);
+        let order = Array.Create(0, Type.Int);
+        Graph._dijkstraK(d.Off, d.To, d.W, s, dist, prev, order);
+
+        let ids      = d.Ids;
+        let distMap  = Collections.HashMap();
+        let prevMap  = Collections.HashMap();
+        distMap.Set(start, 0);
+        foreach (v in order) {
+            distMap.Set(ids[v], dist[v]);
+            prevMap.Set(ids[v], ids[prev[v]]);
+        }
+        return { Distances: distMap, Prev: prevMap };
+    }
+
+    // Fills dist/prev for every node reached from s and lists those nodes in
+    // order of their first relaxation (s excluded).
+    fn static _dijkstraK(off: [int], to: [int], w: [int], s: int, dist: [int], prev: [int], order: [int]): int {
+        let n       = len(off) - 1;
+        let visited = Array.Create(n, Type.Bool);
+        let known   = Array.Create(n, Type.Bool);
+
+        // Binary min-heap of node ids (hv) by priority (hp), with the sift
+        // rules of Collections.PriorityQueue: an entry only moves past a
+        // strictly smaller or larger priority. Every relaxation pushes once, so
+        // it never holds more than the edge count plus the start.
+        let hv   = Array.Create(len(to) + 1, Type.Int);
+        let hp   = Array.Create(len(to) + 1, Type.Float);
+        var size = 1;
+        hv[0]    = s;
+        known[s] = true;
+        dist[s]  = 0;
+
+        while (size > 0) {
+            let u = hv[0];
+            size -= 1;
+            if (size > 0) {
+                let lv = hv[size];
+                let lp = hp[size];
+                var i  = 0;
+                while (2 * i + 1 < size) {
+                    var c = 2 * i + 1;
+                    if (c + 1 < size && hp[c + 1] < hp[c]) c += 1;
+                    if (!(hp[c] < lp)) break;
+                    hv[i] = hv[c];
+                    hp[i] = hp[c];
+                    i = c;
+                }
+                hv[i] = lv;
+                hp[i] = lp;
+            }
+            if (visited[u]) continue;
+            visited[u] = true;
+            let du = dist[u];
+            iter (k from off[u] to off[u + 1]) {
+                let v = to[k];
+                if (!visited[v]) {
+                    let nd = du + w[k];
+                    if (!known[v] || nd < dist[v]) {
+                        if (!known[v]) {
+                            known[v] = true;
+                            Array.Append(order, v);
+                        }
+                        dist[v] = nd;
+                        prev[v] = u;
+                        let pf = float(nd);
+                        var i  = size;
+                        size += 1;
+                        while (i > 0) {
+                            let parent = (i - 1) / 2;
+                            if (!(pf < hp[parent])) break;
+                            hv[i] = hv[parent];
+                            hp[i] = hp[parent];
+                            i = parent;
+                        }
+                        hv[i] = v;
+                        hp[i] = pf;
+                    }
+                }
+            }
+        }
+        return len(order);
     }
 
     fn ShortestPath(start, end) {

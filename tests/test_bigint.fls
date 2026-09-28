@@ -648,21 +648,23 @@ fn test_bytes() {
 // ToHex/ToBytes/FromHex/FromBytes are built on limb-level short division and
 // short multiplication rather than the general DivMod/Mul. That is far faster
 // but it is also where an off-by-one in the carry would hide, so these walk
-// the powers of the 10^6 limb base and round-trip a long run of widths.
+// the powers of the 10^8 limb base and round-trip a long run of widths.
 // ---------------------------------------------------------------
 
 fn test_base_conversion() {
     Console.WriteLine("-- base conversion across limb boundaries");
 
     // Exactly at, either side of, and two limbs past the base.
+    eq("ToHex(99999999)",         BigInt.ToHex(BigInt.From("99999999")),         "5f5e0ff");
+    eq("ToHex(100000000)",        BigInt.ToHex(BigInt.From("100000000")),        "5f5e100");
+    eq("ToHex(100000001)",        BigInt.ToHex(BigInt.From("100000001")),        "5f5e101");
+    eq("ToHex(9999999999999999)", BigInt.ToHex(BigInt.From("9999999999999999")), "2386f26fc0ffff");
+    eq("ToHex(10^16)",            BigInt.ToHex(BigInt.From("10000000000000000")), "2386f26fc10000");
     eq("ToHex(999999)",           BigInt.ToHex(BigInt.From("999999")),           "f423f");
-    eq("ToHex(1000000)",          BigInt.ToHex(BigInt.From("1000000")),          "f4240");
-    eq("ToHex(1000001)",          BigInt.ToHex(BigInt.From("1000001")),          "f4241");
-    eq("ToHex(999999999999)",     BigInt.ToHex(BigInt.From("999999999999")),     "e8d4a50fff");
     eq("ToHex(1000000000000)",    BigInt.ToHex(BigInt.From("1000000000000")),    "e8d4a51000");
 
-    bstr("FromHex round-trips the base",  BigInt.FromHex("f4240"),      "1000000");
-    bstr("FromHex round-trips two limbs", BigInt.FromHex("e8d4a51000"), "1000000000000");
+    bstr("FromHex round-trips the base",  BigInt.FromHex("5f5e100"),        "100000000");
+    bstr("FromHex round-trips two limbs", BigInt.FromHex("2386f26fc10000"), "10000000000000000");
 
     // Big-endian byte layout, checked against a value whose bytes are 1,2,3,4.
     let b = BigInt.ToBytes(BigInt.From(16909060));
@@ -688,8 +690,7 @@ fn test_base_conversion() {
     eq("big-endian round-trip, widths 1-200",    beBad,  0);
     eq("little-endian round-trip, widths 1-200", leBad,  0);
 
-    // A 2048-bit-scale value: the size these are actually reached for, and the
-    // size at which the old DivMod-per-digit loop took several seconds.
+    // A 2048-bit-scale value: the size these conversions are used for in practice.
     var big = "";
     iter (i from 0 to 617) { big = big + str((i * 3 + 1) % 10); }
     while (len(big) > 1 && String.StartsWith(big, "0")) { big = String.Substr(big, 1); }
@@ -698,7 +699,245 @@ fn test_base_conversion() {
     let h = BigInt.ToHex(n);
     let dt = Time.TicksToMs(Time.Ticks() - t0);
     eq("617-digit hex round-trips", BigInt.ToString(BigInt.FromHex(h)), big);
-    ok("617-digit ToHex under 500 ms (was ~5 s)", dt < 500.0);
+    ok("617-digit ToHex under 500 ms", dt < 500.0);
+}
+
+// ================================================================
+// Reference-value helpers
+//
+// Large operands come from a small linear congruential generator, so the
+// tests need no long literals. The expected values were computed with
+// Python's int and are compared through the first 16 hex digits of the
+// SHA-256 of the decimal string.
+// ================================================================
+
+fn genDigits(seed: int, n: int, lead: int): string {
+    let parts = Array.Create(n);
+    var x = seed;
+    iter (i from 0 to n) {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        var d = (x >> 16) % 10;
+        if (i == 0) {
+            if (lead > 0) { d = lead; } else if (d == 0) { d = 7; }
+        }
+        parts[i] = str(d);
+    }
+    return String.Join(parts, "");
+}
+
+fn gen(seed: int, n: int, neg: bool, lead: int) {
+    let v = BigInt.From(genDigits(seed, n, lead));
+    return neg ? BigInt.Neg(v) : v;
+}
+
+fn h(x): string {
+    if (x == nil) { return "nil"; }
+    return String.Left(Hash.Sha256(BigInt.ToString(x)), 16);
+}
+
+fn big(name, x, want) { eq(name, h(x), want); }
+
+fn checkPair(label: string, a, b, want) {
+    let dm = BigInt.DivMod(a, b);
+    eq(label + " Mul",      h(BigInt.Mul(a, b)),      want[0]);
+    eq(label + " Add",      h(BigInt.Add(a, b)),      want[1]);
+    eq(label + " Sub",      h(BigInt.Sub(a, b)),      want[2]);
+    eq(label + " Div",      h(BigInt.Div(a, b)),      want[3]);
+    eq(label + " Mod",      h(BigInt.Mod(a, b)),      want[4]);
+    eq(label + " FloorDiv", h(BigInt.FloorDiv(a, b)), want[5]);
+    eq(label + " FloorMod", h(BigInt.FloorMod(a, b)), want[6]);
+    eq(label + " DivMod",   h(dm.q) + h(dm.r),        want[3] + want[4]);
+}
+
+fn divCase(u: string, v: string, q: string, r: string) {
+    let a = BigInt.From(u); let b = BigInt.From(v);
+    bstr("Div " + u + " / " + v, BigInt.Div(a, b), q);
+    bstr("Mod " + u + " % " + v, BigInt.Mod(a, b), r);
+}
+
+fn mpCase(label: string, b, e, m, want: string) {
+    eq("ModPow " + label, h(BigInt.ModPow(b, e, m)), want);
+}
+
+// ================================================================
+// Parsing, radix conversion and int range
+// ================================================================
+
+fn test_parse_radix() {
+    Console.WriteLine("-- Parse / radix / ToInt range");
+
+    bstr("From('0x1F')",          BigInt.From("0x1F"),      "31");
+    bstr("From('-0x1f')",         BigInt.From("-0x1f"),     "-31");
+    bstr("From('0b101')",         BigInt.From("0b101"),     "5");
+    bstr("From('0o17')",          BigInt.From("0o17"),      "15");
+    bstr("From('+42')",           BigInt.From("+42"),       "42");
+    bstr("From malformed '1-12345' is 0", BigInt.From("1-12345"), "0");
+    bstr("From malformed '12 345' is 0",  BigInt.From("12 345"),  "0");
+    bstr("From('-') is 0",        BigInt.From("-"),         "0");
+    bstr("From(Int64Min)",        BigInt.From(-9223372036854775807 - 1), "-9223372036854775808");
+
+    bstr("Parse decimal",         BigInt.Parse("-123456789012345678901234567890"), "-123456789012345678901234567890");
+    bstr("Parse('ff', 16)",       BigInt.Parse("ff", 16),   "255");
+    bstr("Parse('FF', 16)",       BigInt.Parse("FF", 16),   "255");
+    bstr("Parse('zz', 36)",       BigInt.Parse("zz", 36),   "1295");
+    bstr("Parse('-7fffffffffffffff', 16)", BigInt.Parse("-7fffffffffffffff", 16), "-9223372036854775807");
+    ok("Parse('1-12345') nil",    BigInt.Parse("1-12345") == nil);
+    ok("Parse('12a') nil",        BigInt.Parse("12a") == nil);
+    ok("Parse('') nil",           BigInt.Parse("") == nil);
+    ok("Parse('0x1f') nil (no prefix)", BigInt.Parse("0x1f", 16) == nil);
+    ok("Parse('19', 8) nil",      BigInt.Parse("19", 8) == nil);
+    ok("Parse base 1 nil",        BigInt.Parse("1", 1) == nil);
+    ok("Parse base 37 nil",       BigInt.Parse("1", 37) == nil);
+
+    eq("ToString(255, 2)",        BigInt.ToString(BigInt.From(255), 2),   "11111111");
+    eq("ToString(-255, 16)",      BigInt.ToString(BigInt.From(-255), 16), "-ff");
+    eq("ToString(0, 7)",          BigInt.ToString(BigInt.Zero(), 7),      "0");
+    eq("ToString(1295, 36)",      BigInt.ToString(BigInt.From(1295), 36), "zz");
+    eq("ToString(n, 10)",         BigInt.ToString(BigInt.From(-1234), 10), "-1234");
+    ok("ToString base 1 nil",     BigInt.ToString(BigInt.From(5), 1) == nil);
+
+    eq("ToInt(10^18)",            BigInt.ToInt(BigInt.From("1000000000000000000")), 1000000000000000000);
+    eq("ToInt(2^63-1)",           BigInt.ToInt(BigInt.From("9223372036854775807")), 9223372036854775807);
+    eq("ToInt(-2^63)",            BigInt.ToInt(BigInt.From("-9223372036854775808")), -9223372036854775807 - 1);
+    eq("ToInt(-10^17-3)",         BigInt.ToInt(BigInt.From("-100000000000000003")), -100000000000000003);
+    ok("ToInt(2^63) nil",         BigInt.ToInt(BigInt.From("9223372036854775808")) == nil);
+    ok("ToInt(-2^63-1) nil",      BigInt.ToInt(BigInt.From("-9223372036854775809")) == nil);
+
+    // Every base, round trip through a 300-digit value.
+    let n = gen(89, 300, true, 0);
+    var bad = 0;
+    iter (b from 2 to 37) {
+        if (!BigInt.Eq(BigInt.Parse(BigInt.ToString(n, b), b), n)) { bad += 1; }
+    }
+    eq("radix round trip, bases 2-36", bad, 0);
+    eq("ToString(n, 2)",  String.Left(Hash.Sha256(BigInt.ToString(n, 2)), 16),  "b947be98a0dfdc31");
+    eq("ToString(n, 3)",  String.Left(Hash.Sha256(BigInt.ToString(n, 3)), 16),  "38292d8ddfd93da4");
+    eq("ToString(n, 7)",  String.Left(Hash.Sha256(BigInt.ToString(n, 7)), 16),  "07d5aeec0dfdd1d3");
+    eq("ToString(n, 16)", String.Left(Hash.Sha256(BigInt.ToString(n, 16)), 16), "b65a37a0d11e83f5");
+    eq("ToString(n, 36)", String.Left(Hash.Sha256(BigInt.ToString(n, 36)), 16), "4e9d6fa4bf9c2a03");
+
+    var hex = "";
+    let hd = "0123456789abcdefABCDEF";
+    iter (i from 0 to 500) { hex = hex + String.Substr(hd, (i * 7 + 3) % 22, 1); }
+    big("Parse 500 hex digits", BigInt.Parse(hex, 16), "12922c5f8a1f719f");
+    big("FromHex 500 hex digits", BigInt.FromHex("0x" + hex), "12922c5f8a1f719f");
+}
+
+// ================================================================
+// Division signs: Div/Mod truncate, FloorDiv/FloorMod round down
+// ================================================================
+
+fn test_division_signs() {
+    Console.WriteLine("-- division signs");
+
+    let cases = [[7, 3, 2, 1, 2, 1], [7, -3, -2, 1, -3, -2], [-7, 3, -2, -1, -3, 2],
+                 [-7, -3, 2, -1, 2, -1], [-6, 3, -2, 0, -2, 0], [-6, -3, 2, 0, 2, 0]];
+    foreach (c in cases) {
+        let a = BigInt.From(c[0]); let b = BigInt.From(c[1]);
+        let tag = str(c[0]) + "," + str(c[1]);
+        bstr("Div(" + tag + ")",      BigInt.Div(a, b),      str(c[2]));
+        bstr("Mod(" + tag + ")",      BigInt.Mod(a, b),      str(c[3]));
+        bstr("FloorDiv(" + tag + ")", BigInt.FloorDiv(a, b), str(c[4]));
+        bstr("FloorMod(" + tag + ")", BigInt.FloorMod(a, b), str(c[5]));
+    }
+    ok("FloorDiv by zero nil", BigInt.FloorDiv(BigInt.One(), BigInt.Zero()) == nil);
+    ok("FloorMod by zero nil", BigInt.FloorMod(BigInt.One(), BigInt.Zero()) == nil);
+    let dm = BigInt.DivMod(BigInt.From(-7), BigInt.From(3));
+    bstr("DivMod(-7,3).q", dm.q, "-2");
+    bstr("DivMod(-7,3).r", dm.r, "-1");
+    bstr("Shr(-5, 1) truncates", BigInt.Shr(BigInt.From(-5), 1), "-2");
+}
+
+// ================================================================
+// Large operands against reference values
+// ================================================================
+
+fn test_large_reference() {
+    Console.WriteLine("-- large operands against reference values");
+
+    // Schoolbook, Karatsuba on equal and uneven lengths, one-limb and
+    // multi-limb divisors (a small top limb needs the largest scaling in
+    // Algorithm D, a large one none), and a divisor longer than the dividend.
+    // Expected: Mul, Add, Sub, Div, Mod, FloorDiv, FloorMod.
+    checkPair("30 by 20 digits", gen(11, 30, false, 0), gen(12, 20, false, 0), ["3d501f88eeb59ebc", "af6cbf9071aa1455", "0931164105e8f5f8", "e759ab8d6d396693", "850515fc5befe307", "e759ab8d6d396693", "850515fc5befe307"]);
+    checkPair("200 by 7 (one-limb divisor)", gen(13, 200, true, 0), gen(14, 7, false, 0), ["2686e0b4504260d4", "abec169126fb7553", "f8cec2d39eeb5825", "3f65c2b312084701", "c8f20373e5e27360", "523872700f4fa1eb", "ed57335219935676"]);
+    checkPair("1100 by 1100 (Karatsuba)", gen(15, 1100, true, 0), gen(16, 1100, false, 0), ["7ede850ea1bd3568", "90c2dd81a6351301", "0f940d26fc4986d7", "5feceb66ffc86f38", "134b1a373996a60e", "1bad6b8cf97131fc", "90c2dd81a6351301"]);
+    checkPair("2600 by 1030 (uneven)", gen(17, 2600, false, 0), gen(18, 1030, true, 0), ["60199eb852e084c3", "7e9d95f745a20fd5", "f7e188df4a781567", "0988e159a54300ac", "de2aa92d0a938090", "8876e05a6052baf2", "ab86c2fa52c2d79d"]);
+    checkPair("6500 by 1700 (uneven, long tail)", gen(19, 6500, true, 0), gen(20, 1700, true, 0), ["22c5a64fc63264f1", "3020cc86781df5d6", "6824407b34a99608", "9f5a408f2513da21", "ebd1ae0c6343c528", "9f5a408f2513da21", "ebd1ae0c6343c528"]);
+    checkPair("2001 by 993 (small top limb)", gen(21, 2001, false, 0), gen(22, 993, false, 1), ["f4266a5fff6dffaf", "1d1d8f1f2c5e76cc", "76e617047500b9a4", "f71b627aa52ea67d", "da2347a80333109e", "f71b627aa52ea67d", "da2347a80333109e"]);
+    checkPair("2001 by 992 (large top limb)", gen(23, 2001, true, 0), gen(24, 992, false, 9), ["194c74b46bb8e1a1", "5b6fd8eee56b8c84", "3766927717d5542d", "c92d23b0bfb6ab0a", "437f68c93a710bd2", "347ff2285c9344f7", "d6d84596a553bb4a"]);
+    checkPair("500 by 800 (divisor longer)", gen(25, 500, false, 0), gen(26, 800, true, 0), ["7a710058adfe454e", "c203eaa411b947f0", "699c44f75c43d537", "5feceb66ffc86f38", "f1ae0e3747f3c2d0", "1bad6b8cf97131fc", "c203eaa411b947f0"]);
+
+    let x = gen(31, 1500, false, 0);
+    let y = gen(32, 1400, true, 0);
+    big("exact division (x*y)/y", BigInt.Div(BigInt.Mul(x, y), y), "f6205538a18c80aa");
+    bstr("exact division remainder", BigInt.Mod(BigInt.Mul(x, y), y), "0");
+
+    // Quotient limbs whose first estimate passes the two-limb test yet is one
+    // too large, so Algorithm D has to add the divisor back (step D6). Found
+    // by searching with a Python model of the same algorithm; the last case
+    // puts that step at the top of a longer division.
+    divCase("35970477155873724408237282140057", "991696769999999899999999", "36271648", "991696768035402118411705");
+    divCase("8599552898213275394607578837278933957506", "87126038999999989907261912253286", "98702442", "87126038390785474564289883233094");
+    divCase("156483503567365449203372451", "5709999999903866755", "27405166", "5709999996740716121");
+    divCase("53911147805122423004671821", "5156857810552730829", "10454262", "5156857810102828623");
+    divCase("359704771558737244082372821400582345678901234567", "991696769999999899999999", "362716489999999980189531", "303602200364631981424098");
+
+    // Both ModPow paths (Montgomery for moduli coprime to 10 up to 512 limbs,
+    // square-and-multiply otherwise), moduli of 4 to 7 limbs, a one-limb
+    // modulus and a negative base.
+    mpCase("even modulus", gen(70, 400, true, 0), gen(71, 60, false, 0), gen(42, 150, false, 0), "1aacb9154afdd76c");
+    mpCase("modulus ending in 5", gen(70, 400, true, 0), gen(71, 60, false, 0), gen(55, 150, false, 0), "e57970fdaca5a8e7");
+    mpCase("32-digit odd modulus", gen(70, 400, true, 0), gen(71, 60, false, 0), gen(95, 32, false, 0), "1f7d5ab68bc1f542");
+    mpCase("40-digit odd modulus", gen(70, 400, true, 0), gen(71, 60, false, 0), gen(161, 40, false, 0), "d74cc679c0099f2c");
+    mpCase("48-digit odd modulus", gen(70, 400, true, 0), gen(71, 60, false, 0), gen(109, 48, false, 0), "890478deff32c1c8");
+    mpCase("56-digit odd modulus", gen(70, 400, true, 0), gen(71, 60, false, 0), gen(118, 56, false, 0), "f35928746fd0fd64");
+    mpCase("one-limb modulus", gen(70, 400, true, 0), gen(71, 60, false, 0), gen(90, 7, false, 0), "26727c7a639d3938");
+    mpCase("4200-digit odd modulus", gen(70, 400, true, 0), gen(72, 15, false, 0), gen(95, 4200, false, 0), "8f9d3c09fa4af63a");
+    let m521 = BigInt.Sub(BigInt.Pow(BigInt.From(2), 521), BigInt.One());
+    mpCase("2^521-1, 300-digit exponent", gen(74, 100, false, 0), gen(73, 300, false, 0), m521, "fbdb1a869934bdd0");
+    let m1024 = BigInt.Sub(BigInt.Pow(BigInt.From(2), 1024), BigInt.From(105));
+    mpCase("2^1024-105, exponent 2^1023-1", BigInt.From(65537), BigInt.Sub(BigInt.Pow(BigInt.From(2), 1023), BigInt.One()), m1024, "f4f6891f21afeb94");
+    mpCase("negative modulus", gen(75, 50, true, 0), gen(76, 40, false, 0), gen(77, 45, true, 0), "fae8a20e173f44bf");
+    bstr("ModPow exp 0", BigInt.ModPow(gen(75, 50, false, 0), BigInt.Zero(), m521), "1");
+    bstr("ModPow mod 1", BigInt.ModPow(gen(75, 50, false, 0), BigInt.From(5), BigInt.One()), "0");
+
+    big("Sqrt of a 3001-digit value", BigInt.Sqrt(gen(80, 3001, false, 0)), "a908959f63d98230");
+    let r = gen(81, 900, false, 0);
+    big("Sqrt of a perfect square", BigInt.Sqrt(BigInt.Mul(r, r)), "3e15237784cff5aa");
+    let g = gen(82, 300, false, 0);
+    big("Gcd of 1000-digit values", BigInt.Gcd(BigInt.Mul(gen(83, 700, false, 0), g), BigInt.Mul(gen(84, 650, false, 0), g)), "d02dcacc13677d86");
+    big("ModInverse mod 2^521-1", BigInt.ModInverse(gen(85, 150, false, 0), m521), "7241eb3aaced813f");
+    eq("BitLength of a 1000-digit value", BigInt.BitLength(gen(86, 1000, false, 0)), 3321);
+    let p = gen(87, 700, false, 0); let q = gen(88, 500, false, 0);
+    big("And of large values", BigInt.And(p, q), "ed5df195f1f10c4f");
+    big("Or of large values",  BigInt.Or(p, q),  "40a0dc06551e8f81");
+    big("Xor of large values", BigInt.Xor(p, q), "f45a56e69ee943f8");
+    big("Shl by 333",          BigInt.Shl(gen(92, 100, false, 0), 333), "8bf194de6d0f941d");
+    big("Shr of a negative by 777", BigInt.Shr(gen(93, 300, true, 0), 777), "240c3807c5f56f7f");
+    let tb = gen(94, 200, false, 0);
+    let bits = [0, 1, 31, 32, 33, 500, 663, 664, 700];
+    let want = [0, 0, 1, 1, 1, 1, 1, 0, 0];
+    var tbBad = 0;
+    iter (i from 0 to len(bits)) { if (BigInt.TestBit(tb, bits[i]) != (want[i] == 1)) { tbBad += 1; } }
+    eq("TestBit across word boundaries", tbBad, 0);
+    let bb = gen(91, 400, false, 0);
+    let bytes = BigInt.ToBytes(bb);
+    eq("ToBytes length of a 400-digit value", len(bytes), 167);
+    eq("ToBytes first byte", bytes[0], 1);
+    eq("ToBytes last byte", bytes[166], 162);
+    ok("FromBytes round trip", BigInt.Eq(BigInt.FromBytes(bytes), bb));
+    ok("FromBytes little-endian round trip", BigInt.Eq(BigInt.FromBytes(BigInt.ToBytes(bb, true), true), bb));
+
+    big("Factorial(1000)", BigInt.Factorial(1000), "cc336cf135d690c1");
+    big("Fibonacci(10000)", BigInt.Fibonacci(10000), "e9c83559a05641cf");
+    big("Pow(120-digit, 37)", BigInt.Pow(gen(90, 120, false, 0), 37), "e7741d62c226a7ed");
+
+    ok("2^127-1 prime", BigInt.IsPrime(BigInt.Sub(BigInt.Pow(BigInt.From(2), 127), BigInt.One())));
+    ok("2^521-1 prime", BigInt.IsPrime(m521));
+    ok("strong pseudoprime to bases 2-23 is composite", !BigInt.IsPrime(BigInt.From("3825123056546413051")));
+    ok("strong pseudoprime to bases 2-37 is composite", !BigInt.IsPrime(BigInt.From("318665857834031151167461")));
+    ok("negative not prime", !BigInt.IsPrime(BigInt.From(-7)));
 }
 
 // ================================================================
@@ -731,6 +970,9 @@ fn Main() {
     test_base_conversion();
     test_bitwise();
     test_bytes();
+    test_parse_radix();
+    test_division_signs();
+    test_large_reference();
 
     Console.WriteLine("");
     Console.WriteLine("Results: " + Convert.ToString(passed) + " passed, " + Convert.ToString(failed) + " failed.");
@@ -768,8 +1010,8 @@ fn Main() {
     bench("Mul   small × small", fn() {
         let r = BigInt.Mul(bi_a, bi_b); _sink = _sink + 1;
     }, 1000);
-    bench("GCD   small, small", fn() {
-        let r = BigInt.GCD(bi_a, bi_b); _sink = _sink + 1;
+    bench("Gcd   small, small", fn() {
+        let r = BigInt.Gcd(bi_a, bi_b); _sink = _sink + 1;
     }, 1000);
 
     Console.WriteLine("\n[ Arithmetic - 20-digit numbers ]");
@@ -802,6 +1044,31 @@ fn Main() {
     bench("ToHex  50-digit", fn() {
         let s = BigInt.ToHex(bi_big); _sink = _sink + 1;
     }, 200);
+
+    let bl_a   = gen(15, 1100, false, 0);
+    let bl_b   = gen(16, 1100, false, 0);
+    let bl_n   = gen(21, 2001, false, 0);
+    let bl_d   = gen(22, 1000, false, 0);
+    let bl_m   = BigInt.Sub(BigInt.Pow(BigInt.From(2), 1024), BigInt.From(105));
+    let bl_e   = BigInt.Sub(BigInt.Pow(BigInt.From(2), 1023), BigInt.One());
+    let bl_g   = BigInt.From(65537);
+
+    Console.WriteLine("\n[ Large numbers ]");
+    bench("Mul   1100 × 1100 digits (Karatsuba)", fn() {
+        let r = BigInt.Mul(bl_a, bl_b); _sink = _sink + 1;
+    }, 50);
+    bench("Div   2001 / 1000 digits", fn() {
+        let r = BigInt.Div(bl_n, bl_d); _sink = _sink + 1;
+    }, 50);
+    bench("ModPow 1024-bit modulus, 1023-bit exponent", fn() {
+        let r = BigInt.ModPow(bl_g, bl_e, bl_m); _sink = _sink + 1;
+    }, 5);
+    bench("Factorial(1000)", fn() {
+        let r = BigInt.Factorial(1000); _sink = _sink + 1;
+    }, 20);
+    bench("ToString 2001 digits, base 16", fn() {
+        let s = BigInt.ToString(bl_n, 16); _sink = _sink + 1;
+    }, 20);
 
     benchSep();
     Console.WriteLine("_sink=" + str(_sink));

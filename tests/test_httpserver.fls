@@ -63,6 +63,8 @@ fn async asyncSlow(ms: int)  { Fiber.Sleep(ms); return ms; }
 fn async asyncEcho(_req, res)  { let v = await asyncValue("async-ok"); res.Text(v); }
 fn async asyncSlowH(_req, res) { let v = await asyncSlow(250); res.Text("slow-" + str(v)); }
 fn async asyncThrow(_req, _res) { await asyncValue("x"); throw(1, "async failure"); }
+fn async asyncOnError(_req, res, _err) { let v = await asyncValue("handled"); res.Text(v, 503); }
+fn async asyncAccessThrow(_e) { await asyncValue(1); throw(2, "async logger failed"); }
 
 // ---------------------------------------------------------------------------
 // Raw HTTP client
@@ -459,6 +461,55 @@ fn test_keep_alive() {
     return 0;
 }
 
+// Several requests in one write: each is answered, in order. Responses are
+// framed by Content-Length here - a body carries no newline, so reading them
+// line by line would glue a body to the next status line.
+fn test_pipelining() {
+    Console.WriteLine("== pipelining ==");
+
+    let c = openConn(gPort);
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\n\r\nGET /users/7 HTTP/1.1\r\nHost: t\r\n\r\n");
+    let a = readResponse(c, false);
+    let b = readResponse(c, false);
+    checkEq((a == nil) ? "" : a.body, "Hello", "first of two pipelined GETs answered first");
+    check(b != nil && b.code == 200 && Json.Parse(b.body).id == "7", "second pipelined GET answered second");
+
+    // A Content-Length body, then a GET, then a chunked body, then a HEAD.
+    Stream.WriteString(c,
+        "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello"
+        + "GET /users/8 HTTP/1.1\r\nHost: t\r\n\r\n"
+        + "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+        + "HEAD / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let p1 = readResponse(c, false);
+    let p2 = readResponse(c, false);
+    let p3 = readResponse(c, false);
+    let p4 = readResponse(c, true);
+    checkEq((p1 == nil) ? "" : p1.body, "hello", "a POST body does not swallow the GET after it");
+    check(p2 != nil && Json.Parse(p2.body).id == "8", "the GET after a POST body is answered");
+    checkEq((p3 == nil) ? "" : p3.body, "abcde", "a chunked body pipelined after a GET");
+    checkEq((p4 == nil) ? 0 : p4.code, 200, "a HEAD pipelined after a chunked body");
+
+    // More than the 4 KB read-ahead in one write, then a closing request.
+    let batch = "";
+    iter (i from 0 to 40) {
+        batch = batch + "GET /users/" + str(i) + " HTTP/1.1\r\nHost: t\r\nX-Pad: "
+              + String.Repeat("p", 100) + "\r\n\r\n";
+    }
+    batch = batch + "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    Stream.WriteString(c, batch);
+    let inOrder = 0;
+    iter (i from 0 to 40) {
+        let x = readResponse(c, false);
+        if (x != nil && x.code == 200 && Json.Parse(x.body).id == str(i)) { inOrder += 1; }
+    }
+    checkEq(inOrder, 40, "40 pipelined requests past the read-ahead all answered in order");
+    let last = readResponse(c, false);
+    check(last != nil && Object.TryGet(last.headers, "connection", "") == "close",
+          "a pipelined Connection: close ends the batch");
+    Stream.Close(c);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Limits and malformed input
 // ---------------------------------------------------------------------------
@@ -800,6 +851,76 @@ fn test_access_log() {
     let fl = HttpStatus.CombinedLogLine(forged);
     check(!String.Contains(fl, "\n"), "a newline in a field cannot split the log line");
     check(!String.Contains(fl, "\r"), "nor a carriage return");
+    return 0;
+}
+
+// Hooks run on the connection fiber; one that throws must cost neither the
+// connection nor the process.
+fn waitHookErrors(srv, n: int) {
+    let spins = 0;
+    while (srv.HookErrors() < n && spins < 200) { Fiber.Sleep(5); spins += 1; }
+    return srv.HookErrors();
+}
+
+fn test_hook_failures() {
+    Console.WriteLine("== throwing hooks ==");
+
+    let srv = new HttpServer({ port: 0, idleTimeoutMs: 400 });
+    srv.Get("/",     fn(_req, res) { res.Text("ok"); });
+    srv.Get("/boom", fn(_req, _res) { throw(7, "handler bug"); });
+    srv.OnAccess(fn(_e) { throw(1, "logger failed"); });
+    srv.OnError(fn(_req, _res, _err) { throw(8, "error hook failed"); });
+    let port = srv.ListenAsync();
+
+    checkEq(req1(port, "GET", "/").code, 200, "a throwing OnAccess does not cost the reply");
+    checkEq(req1(port, "GET", "/").code, 200, "still serving after OnAccess threw");
+    let c = openConn(port);
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let k1 = readResponse(c, false);
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let k2 = readResponse(c, false);
+    Stream.Close(c);
+    check(k1 != nil && k2 != nil && k2.code == 200, "the keep-alive connection survives a throwing OnAccess");
+
+    checkEq(req1(port, "GET", "/boom").code, 500, "a throwing OnError still sends the default 500");
+    checkEq(req1(port, "GET", "/").code, 200, "still serving after OnError threw");
+    checkEq(waitHookErrors(srv, 7), 7, "6 OnAccess + 1 OnError exceptions dropped and counted");
+    checkEq(srv.ActiveConnections(), 0, "no connection leaked by a throwing hook");
+    checkEq(srv.InFlight(), 0, "nothing left in flight after throwing hooks");
+    srv.Stop(500);
+
+    // Async hooks are awaited: OnError's reply is the one sent, and an async
+    // OnAccess that throws is contained and counted like a plain one.
+    let srv2 = new HttpServer({ port: 0, idleTimeoutMs: 400 });
+    srv2.Get("/boom", fn(_req, _res) { throw(7, "handler bug"); });
+    srv2.OnError(asyncOnError);
+    srv2.OnAccess(asyncAccessThrow);
+    let port2 = srv2.ListenAsync();
+    let r = req1(port2, "GET", "/boom");
+    check(r != nil && r.code == 503 && r.body == "handled", "an async OnError's own reply is sent");
+    checkEq(req1(port2, "GET", "/boom").code, 503, "still serving after an async OnAccess threw");
+    checkEq(waitHookErrors(srv2, 2), 2, "async OnAccess exceptions are counted");
+    srv2.Stop(500);
+
+    // A failed handshake runs OnTlsError; a pkcs12 file that does not exist
+    // makes every handshake fail without needing a certificate.
+    if (Stream.TlsServerAvailable()) {
+        let srv3 = new HttpServer({ port: 0, idleTimeoutMs: 400, readTimeoutMs: 1000,
+                                    tls: { pkcs12File: "/nonexistent/flaris-test.p12", password: "x" } });
+        srv3.OnTlsError(fn(_peer, _msg) { throw(9, "tls hook failed"); });
+        let port3 = srv3.ListenAsync();
+        iter (i from 0 to 2) {
+            let t = openConn(port3);
+            if (t != nil) {
+                Stream.WriteString(t, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+                Stream.WaitReadable(t, 1500);
+                Stream.Close(t);
+            }
+        }
+        checkEq(waitHookErrors(srv3, 2), 2, "a throwing OnTlsError is contained, once per handshake");
+        check(srv3.IsRunning(), "the TLS server is still running after OnTlsError threw");
+        srv3.Stop(500);
+    }
     return 0;
 }
 
@@ -1145,7 +1266,7 @@ fn test_static_exposure() {
         check(!String.Contains(escd.body, "OUTSIDE_THE_ROOT"), "symlinked directory target not disclosed");
     }
 
-    // The guards are opt-out, and opting out restores the old behaviour.
+    // The guards are opt-out: with them off, dotfiles and symlinks are served.
     checkEq(req1(gPort, "GET", "/loose/.env").code, 200, "dotfiles:true serves .env");
     if (File.Exists(Path.Combine(gStaticDir, "escape.txt"))) {
         checkEq(req1(gPort, "GET", "/loose/escape.txt").code, 200, "followSymlinks:true follows the link");
@@ -1516,6 +1637,7 @@ fn async Main() {
     test_async_handlers();
     test_split_requests();
     test_keep_alive();
+    test_pipelining();
     test_limits();
     test_static();
     test_header_safety();
@@ -1525,6 +1647,7 @@ fn async Main() {
     test_streaming_bodies();
     test_multipart();
     test_access_log();
+    test_hook_failures();
     test_graceful_shutdown();
     test_file_semantics();
     test_gzip_sidecar();

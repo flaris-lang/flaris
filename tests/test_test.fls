@@ -3,6 +3,16 @@
 
 import { Test } from library("Test", "1.0");
 
+class DeepPoint { let x = 1; let y = 2; }
+class DeepOther { let x = 1; let y = 2; }
+
+// The message deepEq fails with, or "" when it passes.
+fn deepEqMessage(t, actual, expected): string {
+    var msg = "";
+    try { t.deepEq(actual, expected); } catch (e) { msg = str(e.Error); }
+    return msg;
+}
+
 fn Main() {
 
     // ── Suite 1: all assertions that should pass ───────────────────────────
@@ -171,9 +181,9 @@ fn Main() {
 
     let f2 = t2.run();
 
-    // ── Suite 3: new features ─────────────────────────────────────────────
+    // ── Suite 3: approxEq, deepEq, throwsCode, matches and hooks ─────────
 
-    let t3 = Test.Suite("New features");
+    let t3 = Test.Suite("approxEq, deepEq, throwsCode, matches, hooks");
 
     // approxEq with default epsilon
     t3.it("approxEq default eps", fn() {
@@ -273,6 +283,107 @@ fn Main() {
 
     let f3 = t3.run();
 
+    // ── deepEq on objects, arrays and instances ───────────────────────────
+
+    let td = Test.Suite("deepEq structure");
+
+    td.it("deepEq equal objects, any key order", fn() {
+        td.deepEq({ a: 1, b: [1, { c: nil }], s: "x" }, { s: "x", b: [1, { c: nil }], a: 1 });
+    });
+
+    td.it("deepEq equal instances", fn() {
+        td.deepEq(new DeepPoint(), new DeepPoint());
+    });
+
+    td.it("deepEq typed array equals plain array", fn() {
+        let ia:[int] = [1, 2, 3];
+        td.deepEq(ia, [1, 2, 3]);
+    });
+
+    td.it("deepEq names an unexpected key", fn() {
+        td.eq(deepEqMessage(td, { a: 1 }, { b: 2 }), "deepEq: a: unexpected key (value 1)");
+    });
+
+    td.it("deepEq names a missing key", fn() {
+        td.eq(deepEqMessage(td, { a: 1 }, { a: 1, z: 2 }), "deepEq: z: missing (expected 2)");
+    });
+
+    td.it("deepEq names the nested path of a differing value", fn() {
+        td.eq(deepEqMessage(td, { a: { x: 1 } }, { a: { x: 2 } }), "deepEq: a.x: 1 != 2");
+        td.eq(deepEqMessage(td, { user: { tags: ["a", "a"] } }, { user: { tags: ["a", "b"] } }),
+              "deepEq: user.tags[1]: \"a\" != \"b\"");
+    });
+
+    td.it("deepEq reports an array length difference", fn() {
+        td.eq(deepEqMessage(td, { list: [1, 2] }, { list: [1, 2, 3] }), "deepEq: list: length 2 != 3");
+    });
+
+    td.it("deepEq compares instances by class and fields", fn() {
+        td.eq(deepEqMessage(td, new DeepPoint(), new DeepOther()), "deepEq: DeepPoint instance != DeepOther instance");
+        let moved = new DeepPoint();
+        moved.y = 5;
+        td.eq(deepEqMessage(td, new DeepPoint(), moved), "deepEq: y: 2 != 5");
+    });
+
+    td.it("deepEq label prefixes the message", fn() {
+        var msg = "";
+        try { td.deepEq({ a: 1 }, { a: 2 }, "config"); } catch (e) { msg = str(e.Error); }
+        td.eq(msg, "config: deepEq: a: 1 != 2");
+    });
+
+    let fd = td.run();
+
+    // ── Async bodies, failing hooks and run()'s result ────────────────────
+
+    let seen = { asyncDone: false, bodyRan: false, afterRan: 0 };
+
+    let ta = Test.Suite("async bodies (2 of 3 must fail)");
+    ta.it("async body that finishes", fn async () { Fiber.Sleep(2); seen.asyncDone = true; });
+    ta.it("async body that throws", fn async () { Fiber.Sleep(1); throw(9, "async failure"); });
+    ta.it("async body whose assertion fails", fn async () { Fiber.Sleep(1); ta.eq(1, 2); });
+    let asyncResult = ta.run();
+
+    let tbe = Test.Suite("throwing beforeEach (its test must fail)");
+    tbe.beforeEach(fn() { throw(3, "fixture could not open db"); });
+    tbe.afterEach(fn() { seen.afterRan += 1; });
+    tbe.it("body behind a failing beforeEach", fn() { seen.bodyRan = true; });
+    let beforeResult = tbe.run();
+
+    let tf = Test.Suite("throwing afterEach (its test must fail)");
+    tf.afterEach(fn() { throw(4, "teardown failed"); });
+    tf.it("passing body, failing afterEach", fn() { tf.ok(true); });
+    let afterResult = tf.run();
+
+    let tm = Test.Suite("three failures (run() must return 1)");
+    tm.it("fail 1", fn() { tm.ok(false); });
+    tm.it("fail 2", fn() { tm.ok(false); });
+    tm.it("fail 3", fn() { tm.ok(false); });
+    let manyResult = tm.run();
+
+    let tr = Test.Suite("Async, hooks and results");
+    tr.it("an async body runs to completion", fn() { tr.ok(seen.asyncDone); });
+    tr.it("async failures are counted", fn() {
+        tr.eq(ta._passed, 1);
+        tr.eq(ta._failed, 2);
+        tr.eq(asyncResult, 1);
+    });
+    tr.it("a throwing beforeEach fails the test and skips its body", fn() {
+        tr.eq(tbe._failed, 1);
+        tr.eq(beforeResult, 1);
+        tr.notOk(seen.bodyRan);
+    });
+    tr.it("afterEach still runs after a failing beforeEach", fn() { tr.eq(seen.afterRan, 1); });
+    tr.it("a throwing afterEach fails the test", fn() {
+        tr.eq(tf._failed, 1);
+        tr.eq(afterResult, 1);
+    });
+    tr.it("run() returns 1 for any number of failures", fn() {
+        tr.eq(tm._failed, 3);
+        tr.eq(manyResult, 1);
+    });
+    tr.it("run() returns 0 when everything passed", fn() { tr.eq(f1, 0); tr.eq(fd, 0); });
+    let f5 = tr.run();
+
     // ── RunAll aggregator ─────────────────────────────────────────────────
 
     let ra1 = Test.Suite("RunAll A");
@@ -282,8 +393,16 @@ fn Main() {
 
     let aggFailed = Test.RunAll([ra1, ra2]);
 
+    let rb1 = Test.Suite("RunAll C");
+    rb1.it("pass", fn() { rb1.ok(true); });
+    let rb2 = Test.Suite("RunAll D (2 must fail)");
+    rb2.it("fail 1", fn() { rb2.ok(false); });
+    rb2.it("fail 2", fn() { rb2.ok(false); });
+    let aggMixed = Test.RunAll([rb1, rb2]);
+
     let tAgg = Test.Suite("RunAll");
     tAgg.it("RunAll returns 0 when all pass", fn() { tAgg.eq(aggFailed, 0); });
+    tAgg.it("RunAll returns 1 when any test fails", fn() { tAgg.eq(aggMixed, 1); });
     let f4 = tAgg.run();
 
     // ── Benchmarks: assertion throughput ──────────────────────────────────
@@ -314,5 +433,5 @@ fn Main() {
 
     Console.WriteLine("=== benchmarks done ===");
 
-    return (f1 + f2 + f3 + f4) > 0 ? 1 : 0;
+    return (f1 + f2 + f3 + f4 + f5) > 0 ? 1 : 0;
 }

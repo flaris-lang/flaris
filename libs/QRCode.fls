@@ -165,16 +165,16 @@ class QRCode {
         return ec;
     }
 
-    fn _set(m: array, sz: int, r: int, c: int, v: int) {
+    fn _set(m: [int], sz: int, r: int, c: int, v: int) {
         if (r >= 0 && r < sz && c >= 0 && c < sz) m[r*sz+c] = v;
     }
 
-    fn _get(m: array, sz: int, r: int, c: int) : int {
+    fn _get(m: [int], sz: int, r: int, c: int) : int {
         if (r < 0 || r >= sz || c < 0 || c >= sz) return -2;
         return m[r*sz+c];
     }
 
-    fn _finder(m: array, sz: int, tr: int, tc: int) {
+    fn _finder(m: [int], sz: int, tr: int, tc: int) {
         iter (dr from -1 to 8) {
             iter (dc from -1 to 8) {
                 let dark = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6 &&
@@ -185,7 +185,7 @@ class QRCode {
         }
     }
 
-    fn _timing(m: array, sz: int) {
+    fn _timing(m: [int], sz: int) {
         iter (i from 8 to (sz - 9) + 1) {
             let d = (i % 2 == 0) ? 1 : 0;
             if (m[6*sz+i] == -1) m[6*sz+i] = d;
@@ -212,7 +212,7 @@ class QRCode {
         }
     }
 
-    fn _reserveFmt(m: array, sz: int) {
+    fn _reserveFmt(m: [int], sz: int) {
         iter (i from 0 to 6) { m[8*sz+i] = 2;  m[i*sz+8] = 2; }
         m[8*sz+7] = 2;  m[7*sz+8] = 2;  m[8*sz+8] = 2;
         m[(sz-8)*sz+8] = 1;
@@ -234,7 +234,7 @@ class QRCode {
         }
     }
 
-    fn _placeData(m: array, sz: int, bits: array) {
+    fn _placeData(m: [int], sz: int, bits: [int]) {
         var bi  = 0;
         var dir = -1;
         var r   = sz - 1;
@@ -283,7 +283,28 @@ class QRCode {
         return (((r+c)%2 + (r*c)%3) % 2 == 0) ? 1 : 0;
     }
 
-    fn _penalty(m: array, sz: int) : int {
+    // cand = fmat with `mask` applied to every non-function module.
+    fn _applyMask(cand: [int], fmat: [int], isFn: [int], sz: int, mask: int) : int {
+        iter (i from 0 to sz*sz) { cand[i] = fmat[i]; }
+        iter (r from 0 to sz) {
+            iter (c from 0 to sz) {
+                let i = r*sz+c;
+                if (isFn[i] == 0) {
+                    cand[i] = cand[i] ^ this._maskBit(mask, r, c);
+                }
+            }
+        }
+        return 0;
+    }
+
+    // Mask penalty (ISO 18004 8.8.2), in four parts to stay inside the JIT's
+    // register budget.
+    fn _penalty(m: [int], sz: int) : int {
+        return this._penaltyRuns(m, sz) + this._penaltyBlocks(m, sz) +
+               this._penaltyFinders(m, sz) + this._penaltyBalance(m, sz);
+    }
+
+    fn _penaltyRuns(m: [int], sz: int) : int {
         var p = 0;
         iter (row from 0 to sz) {
             var run = 1;
@@ -305,6 +326,11 @@ class QRCode {
                 } else { run = 1; }
             }
         }
+        return p;
+    }
+
+    fn _penaltyBlocks(m: [int], sz: int) : int {
+        var p = 0;
         iter (row from 0 to (sz-2) + 1) {
             iter (col from 0 to (sz-2) + 1) {
                 let v = m[row*sz+col];
@@ -312,8 +338,13 @@ class QRCode {
                     v == m[(row+1)*sz+col+1]) p = p + 3;
             }
         }
-        let f1 = [1,0,1,1,1,0,1,0,0,0,0];
-        let f2 = [0,0,0,0,1,0,1,1,1,0,1];
+        return p;
+    }
+
+    fn _penaltyFinders(m: [int], sz: int) : int {
+        var p = 0;
+        let f1: [int] = [1,0,1,1,1,0,1,0,0,0,0];
+        let f2: [int] = [0,0,0,0,1,0,1,1,1,0,1];
         iter (row from 0 to sz) {
             iter (col from 0 to (sz-12) + 1) {
                 var m1 = true;  var m2 = true;
@@ -334,13 +365,16 @@ class QRCode {
                 if (m1 || m2) p = p + 40;
             }
         }
+        return p;
+    }
+
+    fn _penaltyBalance(m: [int], sz: int) : int {
         var dark = 0;
         iter (i from 0 to sz*sz) { if (m[i] == 1) dark = dark + 1; }
         let pct = dark * 100 / (sz * sz);
         let d1  = (pct < 50) ? (50 - pct) / 5 : (pct - 50) / 5;
         let d2  = (pct < 49) ? (49 - pct) / 5 : (pct - 49) / 5;
-        p = p + ((d1 < d2) ? d1 : d2) * 10;
-        return p;
+        return ((d1 < d2) ? d1 : d2) * 10;
     }
 
     fn _encode(text: string, ecLevel: int, fast: bool) : object {
@@ -423,7 +457,7 @@ class QRCode {
             }
         }
 
-        let fmat = Array.Create(sz * sz);
+        let fmat = Array.Create(sz * sz, Type.Int);
         Array.Fill(fmat, -1);
         this._finder(fmat, sz, 0,    0);
         this._finder(fmat, sz, sz-7, 0);
@@ -433,7 +467,7 @@ class QRCode {
         this._alignPat(fmat, sz, ver);
         this._versionInfo(fmat, sz, ver);
 
-        let isFn = Array.Create(sz * sz);
+        let isFn = Array.Create(sz * sz, Type.Int);
         iter (i from 0 to sz*sz) { isFn[i] = (fmat[i] != -1) ? 1 : 0; }
 
         this._placeData(fmat, sz, dataBits);
@@ -446,16 +480,8 @@ class QRCode {
         let maskEnd   = fast ? 2 : 7;
 
         iter (mask from maskStart to maskEnd + 1) {
-            let cand = Array.Create(sz * sz);
-            iter (i from 0 to sz*sz) { cand[i] = fmat[i]; }
-            iter (r from 0 to sz) {
-                iter (c from 0 to sz) {
-                    let i = r*sz+c;
-                    if (!isFn[i]) {
-                        cand[i] = cand[i] ^ this._maskBit(mask, r, c);
-                    }
-                }
-            }
+            let cand = Array.Create(sz * sz, Type.Int);
+            this._applyMask(cand, fmat, isFn, sz, mask);
             this._writeFmt(cand, sz, _FI[ecLevel*8 + mask]);
             iter (i from 0 to sz*sz) { if (cand[i] == 2) cand[i] = 0; }
             let pen = fast ? 0 : this._penalty(cand, sz);

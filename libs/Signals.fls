@@ -66,7 +66,11 @@
 //   Threshold(signal, level)      - hard threshold
 //   MovingAverage(signal, w)
 //   MedianFilter(signal, w)
-//   LowPass(signal, cutoff, sampleRate, order?)   - IIR Butterworth
+//   LowPass(signal, cutoff, sampleRate, q?)       - 2nd-order IIR biquad
+//   HighPass(signal, cutoff, sampleRate, q?)
+//   BandPass(signal, centerFreq, sampleRate, q?)
+//   Notch(signal, centerFreq, sampleRate, q?)
+//                                 q defaults to 1/sqrt(2) (Butterworth response)
 //
 // Utilities:
 //   IsPowerOfTwo(n)  NextPowerOfTwo(n)
@@ -75,6 +79,7 @@
 class Signals {
 
     const TWO_PI = 6.28318531;
+    const Q_BUTTERWORTH = 0.7071067811865476;   // 1/sqrt(2): maximally flat biquad
 
     // ============================================================
     //  Internal helpers
@@ -260,6 +265,168 @@ class Signals {
         return 0;
     }
 
+    fn _sig_bitrev_kernel(inRe: [float], inIm: [float], re: [float], im: [float], n: int, bits: int): int {
+        iter(i from 0 to n) {
+            let j: int = _bitRev(i, bits);
+            re[j] = inRe[i];
+            im[j] = inIm[i];
+        }
+        return 0;
+    }
+
+    // In-place radix-2 butterflies over bit-reversed re/im.
+    fn _sig_fft_kernel(re: [float], im: [float], n: int, bits: int): int {
+        iter(s from 1 to bits + 1) {
+            let m: int = 1 << s;
+            let half: int = m >> 1;
+            let wRe: float = Math.Cos(-TWO_PI / m);
+            let wIm: float = Math.Sin(-TWO_PI / m);
+            let k: int = 0;
+            while (k < n) {
+                let curRe: float = 1.0;
+                let curIm: float = 0.0;
+                iter(j from 0 to half) {
+                    let u: int = k + j;
+                    let v: int = k + j + half;
+                    let tRe: float = curRe * re[v] - curIm * im[v];
+                    let tIm: float = curRe * im[v] + curIm * re[v];
+                    re[v] = re[u] - tRe;
+                    im[v] = im[u] - tIm;
+                    re[u] = re[u] + tRe;
+                    im[u] = im[u] + tIm;
+                    let nextRe: float = curRe * wRe - curIm * wIm;
+                    let nextIm: float = curRe * wIm + curIm * wRe;
+                    curRe = nextRe;
+                    curIm = nextIm;
+                }
+                k += m;
+            }
+        }
+        return 0;
+    }
+
+    fn _sig_mag_kernel(re: [float], im: [float], out: [float], n: int): int {
+        iter(i from 0 to n) { out[i] = Math.Sqrt(re[i]*re[i] + im[i]*im[i]); }
+        return 0;
+    }
+
+    fn _sig_phase_kernel(re: [float], im: [float], out: [float], n: int): int {
+        iter(i from 0 to n) { out[i] = Math.Atan2(im[i], re[i]); }
+        return 0;
+    }
+
+    fn _sig_sq_kernel(sig: [float], out: [float], n: int): int {
+        iter(i from 0 to n) { let m: float = sig[i]; out[i] = m * m; }
+        return 0;
+    }
+
+    fn _sig_db_kernel(sig: [float], out: [float], n: int): int {
+        iter(i from 0 to n) {
+            let m: float = sig[i];
+            if (m <= 0.0) {
+                out[i] = -120.0;
+            } else {
+                out[i] = 20.0 * Math.Log10(m);
+            }
+        }
+        return 0;
+    }
+
+    // Windows. kind: 0 Hann, 1 Hamming, 2 Blackman.
+    fn _sig_cos_window_kernel(w: [float], n: int, kind: int): int {
+        let step: float = TWO_PI / (n - 1);
+        iter(i from 0 to n) {
+            if (kind == 0) {
+                w[i] = 0.5 * (1.0 - Math.Cos(step * i));
+            } else if (kind == 1) {
+                w[i] = 0.54 - 0.46 * Math.Cos(step * i);
+            } else {
+                let a: float = step * i;
+                w[i] = 0.42 - 0.5 * Math.Cos(a) + 0.08 * Math.Cos(2.0 * a);
+            }
+        }
+        return 0;
+    }
+
+    fn _sig_bartlett_kernel(w: [float], n: int): int {
+        let half: float = (n - 1) / 2.0;
+        iter(i from 0 to n) { w[i] = 1.0 - Math.AbsF(i - half) / half; }
+        return 0;
+    }
+
+    fn _sig_xcorr_kernel(a: [float], b: [float], out: [float], n: int, maxlag: int): int {
+        iter(lag from 0 to maxlag + 1) {
+            let sum: float = 0.0;
+            iter(i from 0 to (n - lag)) { sum += a[i] * b[i + lag]; }
+            out[lag] = sum / n;
+        }
+        return 0;
+    }
+
+    fn _sig_copy_kernel(src: [float], dst: [float], n: int): int {
+        iter(i from 0 to n) { dst[i] = src[i]; }
+        return 0;
+    }
+
+    // Index of the largest element in [lo, hi), starting from `best`; ties keep the earlier index.
+    fn _sig_argmax_range(sig: [float], best: int, lo: int, hi: int): int {
+        let b: int = best;
+        let bestVal: float = sig[best];
+        iter(i from lo to hi) {
+            if (sig[i] > bestVal) { bestVal = sig[i]; b = i; }
+        }
+        return b;
+    }
+
+    // Largest |x|, from 0.0 (NaN samples never win); 0.0 for an empty signal.
+    fn _sig_abspeak_kernel(sig: [float], n: int): float {
+        let peak: float = 0.0;
+        iter(i from 0 to n) {
+            let a: float = Math.AbsF(sig[i]);
+            if (a > peak) peak = a;
+        }
+        return peak;
+    }
+
+    fn _sig_min_kernel(sig: [float], n: int): float {
+        let m: float = sig[0];
+        iter(i from 1 to n) { if (sig[i] < m) m = sig[i]; }
+        return m;
+    }
+
+    fn _sig_max_kernel(sig: [float], n: int): float {
+        let m: float = sig[0];
+        iter(i from 1 to n) { if (sig[i] > m) m = sig[i]; }
+        return m;
+    }
+
+    // Running median over the last w samples (zero-padded before the start);
+    // win is w floats of scratch.
+    fn _sig_median_kernel(sig: [float], out: [float], win: [float], n: int, w: int): int {
+        let half: int = w / 2;
+        iter(i from 0 to n) {
+            iter(j from 0 to w) {
+                let idx: int = i - j;
+                if (idx >= 0) {
+                    win[j] = sig[idx];
+                } else {
+                    win[j] = 0.0;
+                }
+            }
+            iter(k from 1 to w) {
+                let key: float = win[k];
+                let m: int = k - 1;
+                while (m >= 0 && win[m] > key) {
+                    win[m + 1] = win[m];
+                    m -= 1;
+                }
+                win[m + 1] = key;
+            }
+            out[i] = win[half];
+        }
+        return 0;
+    }
+
     fn IsPowerOfTwo(n:int): bool {
         return n > 0 && ((n & (n - 1)) == 0);
     }
@@ -282,46 +449,8 @@ class Signals {
         let re:array = Array.Create(n, Type.Float);
         let im:array = Array.Create(n, Type.Float);
         let bits:int = _log2n(n);
-
-        iter(i from 0 to n) {
-            let j:int = _bitRev(i, bits);
-            re[j] = inRe[i];
-            im[j] = inIm[i];
-        }
-
-        iter(s from 1 to bits + 1) {
-            let m:int = 1 << s;
-            let half:int = m >> 1;
-
-            let wRe:float = Math.Cos(-TWO_PI / m);
-            let wIm:float = Math.Sin(-TWO_PI / m);
-
-            let k:int = 0;
-            while (k < n) {
-                let curRe:float = 1.0;
-                let curIm:float = 0.0;
-
-                iter(j from 0 to half) {
-                    let u:int = k + j;
-                    let v:int = k + j + half;
-
-                    let tRe:float = curRe * re[v] - curIm * im[v];
-                    let tIm:float = curRe * im[v] + curIm * re[v];
-
-                    re[v] = re[u] - tRe;
-                    im[v] = im[u] - tIm;
-                    re[u] = re[u] + tRe;
-                    im[u] = im[u] + tIm;
-
-                    let nextRe:float = curRe * wRe - curIm * wIm;
-                    let nextIm:float = curRe * wIm + curIm * wRe;
-                    curRe = nextRe;
-                    curIm = nextIm;
-                }
-
-                k += m;
-            }
-        }
+        _sig_bitrev_kernel(inRe, inIm, re, im, n, bits);
+        _sig_fft_kernel(re, im, n, bits);
 
         return { real: re, imag: im };
     }
@@ -338,10 +467,7 @@ class Signals {
         if (n <= 0) return [];
         if (n == 1) return [1.0];
         let w:array = Array.Create(n, Type.Float);
-        let step:float = TWO_PI / (n - 1);
-        iter(i from 0 to n) {
-            w[i] = 0.5 * (1.0 - Math.Cos(step * i));
-        }
+        _sig_cos_window_kernel(w, n, 0);
         return w;
     }
 
@@ -349,10 +475,7 @@ class Signals {
         if (n <= 0) return [];
         if (n == 1) return [1.0];
         let w:array = Array.Create(n, Type.Float);
-        let step:float = TWO_PI / (n - 1);
-        iter(i from 0 to n) {
-            w[i] = 0.54 - 0.46 * Math.Cos(step * i);
-        }
+        _sig_cos_window_kernel(w, n, 1);
         return w;
     }
 
@@ -360,11 +483,7 @@ class Signals {
         if (n <= 0) return [];
         if (n == 1) return [1.0];
         let w:array = Array.Create(n, Type.Float);
-        let step:float = TWO_PI / (n - 1);
-        iter(i from 0 to n) {
-            let a:float = step * i;
-            w[i] = 0.42 - 0.5 * Math.Cos(a) + 0.08 * Math.Cos(2.0 * a);
-        }
+        _sig_cos_window_kernel(w, n, 2);
         return w;
     }
 
@@ -372,10 +491,7 @@ class Signals {
         if (n <= 0) return [];
         if (n == 1) return [1.0];
         let w:array = Array.Create(n, Type.Float);
-        let half:float = (n - 1) / 2.0;
-        iter(i from 0 to n) {
-            w[i] = 1.0 - Math.AbsF(i - half) / half;
-        }
+        _sig_bartlett_kernel(w, n);
         return w;
     }
 
@@ -409,12 +525,8 @@ class Signals {
     fn PeakToPeak(signal:array): float {
         let n:int = len(signal);
         if (n == 0) return 0.0;
-        let mn:float = signal[0];
-        let mx:float = signal[0];
-        iter(i from 1 to n) {
-            if (signal[i] < mn) mn = signal[i];
-            if (signal[i] > mx) mx = signal[i];
-        }
+        let mn:float = _sig_min_kernel(signal, n);
+        let mx:float = _sig_max_kernel(signal, n);
         return mx - mn;
     }
 
@@ -485,12 +597,8 @@ class Signals {
     fn Rescale(signal:array, newMin:float, newMax:float): array {
         let n:int = len(signal);
         if (n == 0) return [];
-        let oldMin:float = signal[0];
-        let oldMax:float = signal[0];
-        iter(i from 1 to n) {
-            if (signal[i] < oldMin) oldMin = signal[i];
-            if (signal[i] > oldMax) oldMax = signal[i];
-        }
+        let oldMin:float = _sig_min_kernel(signal, n);
+        let oldMax:float = _sig_max_kernel(signal, n);
         if (oldMax <= oldMin) return _filled(n, newMin);
         let scale:float = (newMax - newMin) / (oldMax - oldMin);
         let out: [float] = Array.Create(n, Type.Float);
@@ -551,9 +659,7 @@ class Signals {
 
         let size:int = IsPowerOfTwo(n) ? n : NextPowerOfTwo(n);
         let padded:array = _zeros(size);
-        iter(i from 0 to n) {
-            padded[i] = signal[i];
-        }
+        _sig_copy_kernel(signal, padded, n);
 
         let spec:object = FFT(padded);
         let mag:array = Magnitude(spec);
@@ -561,16 +667,7 @@ class Signals {
         if (count < 2) return 0.0;
 
         let half:int = int(count / 2);
-        let best:int = 1;
-        let bestVal:float = mag[1];
-
-        iter(i from 2 to half) {
-            if (mag[i] > bestVal) {
-                bestVal = mag[i];
-                best = i;
-            }
-        }
-
+        let best:int = _sig_argmax_range(mag, 1, 2, half);
         return BinToHz(best, count, sampleRate);
     }
 
@@ -691,28 +788,32 @@ class Signals {
     }
 
     // ============================================================
-    //  Convenience filters
+    //  Convenience filters (q omitted -> Q_BUTTERWORTH)
     // ============================================================
 
-    fn LowPass(signal:array, cutoff:float, sampleRate:float, q:float): array {
+    fn LowPass(signal:array, cutoff:float, sampleRate:float, q?:float): array {
+        if (q == nil) { q = Q_BUTTERWORTH; }
         let coeffs:array = LowPassCoeffs(cutoff, sampleRate, q);
         if (len(coeffs) < 5) return [];
         return IIR(signal, coeffs);
     }
 
-    fn HighPass(signal:array, cutoff:float, sampleRate:float, q:float): array {
+    fn HighPass(signal:array, cutoff:float, sampleRate:float, q?:float): array {
+        if (q == nil) { q = Q_BUTTERWORTH; }
         let coeffs:array = HighPassCoeffs(cutoff, sampleRate, q);
         if (len(coeffs) < 5) return [];
         return IIR(signal, coeffs);
     }
 
-    fn BandPass(signal:array, centerFreq:float, sampleRate:float, q:float): array {
+    fn BandPass(signal:array, centerFreq:float, sampleRate:float, q?:float): array {
+        if (q == nil) { q = Q_BUTTERWORTH; }
         let coeffs:array = BandPassCoeffs(centerFreq, sampleRate, q);
         if (len(coeffs) < 5) return [];
         return IIR(signal, coeffs);
     }
 
-    fn Notch(signal:array, centerFreq:float, sampleRate:float, q:float): array {
+    fn Notch(signal:array, centerFreq:float, sampleRate:float, q?:float): array {
+        if (q == nil) { q = Q_BUTTERWORTH; }
         let coeffs:array = NotchCoeffs(centerFreq, sampleRate, q);
         if (len(coeffs) < 5) return [];
         return IIR(signal, coeffs);
@@ -723,32 +824,8 @@ class Signals {
         if (n == 0) return [];
         if (w <= 0) return [];
         let out:array = Array.Create(n, Type.Float);
-        let half:int = w / 2;
-
-        iter(i from 0 to n) {
-            let win:array = Array.Create(w, Type.Float);
-            iter(j from 0 to w) {
-                let idx:int = i - j;
-                if (idx >= 0) {
-                    win[j] = signal[idx];
-                } else {
-                    win[j] = 0.0;
-                }
-            }
-
-            iter(k from 1 to len(win)) {
-                let key:float = win[k];
-                let m:int = k - 1;
-                while (m >= 0 && win[m] > key) {
-                    win[m + 1] = win[m];
-                    m -= 1;
-                }
-                win[m + 1] = key;
-            }
-
-            out[i] = win[half];
-        }
-
+        let win:array = Array.Create(w, Type.Float);
+        _sig_median_kernel(signal, out, win, n, w);
         return out;
     }
 
@@ -824,9 +901,7 @@ class Signals {
         let im:array = spectrum.imag;
         let n:int = len(re);
         let mag:array = Array.Create(n, Type.Float);
-        iter(i from 0 to n) {
-            mag[i] = Math.Sqrt(re[i]*re[i] + im[i]*im[i]);
-        }
+        _sig_mag_kernel(re, im, mag, n);
         return mag;
     }
 
@@ -835,9 +910,7 @@ class Signals {
         let im:array = spectrum.imag;
         let n:int = len(re);
         let ph:array = Array.Create(n, Type.Float);
-        iter(i from 0 to n) {
-            ph[i] = Math.Atan2(im[i], re[i]);
-        }
+        _sig_phase_kernel(re, im, ph, n);
         return ph;
     }
 
@@ -845,24 +918,14 @@ class Signals {
         let mag:array = Magnitude(spectrum);
         let n:int = len(mag);
         let out:array = Array.Create(n, Type.Float);
-        iter(i from 0 to n) {
-            let m:float = mag[i];
-            out[i] = m * m;
-        }
+        _sig_sq_kernel(mag, out, n);
         return out;
     }
 
     fn ToDb(magnitude:array): array {
         let n:int = len(magnitude);
         let out:array = Array.Create(n, Type.Float);
-        iter(i from 0 to n) {
-            let m:float = magnitude[i];
-            if (m <= 0.0) {
-                out[i] = -120.0;
-            } else {
-                out[i] = 20.0 * Math.Log10(m);
-            }
-        }
+        _sig_db_kernel(magnitude, out, n);
         return out;
     }
 
@@ -891,13 +954,7 @@ class Signals {
         let lagMax:int = maxLag;
         if (lagMax >= n) lagMax = n - 1;
         let out:array = Array.Create(lagMax + 1, Type.Float);
-        iter(lag from 0 to lagMax + 1) {
-            let sum:float = 0.0;
-            iter(i from 0 to (n - lag)) {
-                sum += a[i] * b[i + lag];
-            }
-            out[lag] = sum / n;
-        }
+        _sig_xcorr_kernel(a, b, out, n, lagMax);
         return out;
     }
 
@@ -1061,14 +1118,10 @@ class Signals {
 
     fn PeakNormalize(signal:array): array {
         let n = len(signal);
-        var peak: float = 0.0;
-        iter(i from 0 to n) {
-            let a: float = Math.AbsF(signal[i]);
-            if (a > peak) peak = a;
-        }
+        let peak: float = _sig_abspeak_kernel(signal, n);
         if (peak == 0) return signal;
         let out: [float] = Array.Create(n, Type.Float);
-        iter(i from 0 to n) { out[i] = signal[i] / peak; }
+        _sig_normalize_kernel(signal, out, n, peak);
         return out;
     }
 
@@ -1078,7 +1131,7 @@ class Signals {
         while (p < n) p = p * 2;
         if (p == n) return signal;
         let out: [float] = Array.Create(p, Type.Float);
-        iter(i from 0 to n) { out[i] = signal[i]; }
+        _sig_copy_kernel(signal, out, n);
         return out;
     }
 

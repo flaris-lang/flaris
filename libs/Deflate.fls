@@ -99,7 +99,11 @@ const S_OUT = 3;         // next byte offset in dst
 const S_ERR = 4;         // 0 = ok, negative = error code
 const S_SIZE = 5;
 
+// Built on first use and shared by every call in this VM: no kernel writes into C.
+global _deflateConsts = nil;
+
 fn _inflateConsts(): array {
+    if (_deflateConsts != nil) { return _deflateConsts; }
     let c: [int] = Array.Create(C_SIZE, Type.Int);
     let lb = [3,4,5,6,7,8,9,10, 11,13,15,17, 19,23,27,31, 35,43,51,59, 67,83,99,115, 131,163,195,227, 258];
     let le = [0,0,0,0,0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3, 4,4,4,4, 5,5,5,5, 0];
@@ -128,6 +132,7 @@ fn _inflateConsts(): array {
         while (j < 29 && c[C_DBASE + j + 1] <= d) { j = j + 1; }
         c[C_DLARGE + k] = j;
     }
+    _deflateConsts = c;
     return c;
 }
 
@@ -874,7 +879,8 @@ fn _huffLengths(E: [int], fOff: int, n: int, lOff: int, maxBits: int): int {
     }
 }
 
-// Canonical codes for lengths at E[lOff] -> E[cOff]. Codes are MSB-first.
+// Canonical codes for lengths at E[lOff] -> E[cOff], stored bit-reversed: the
+// emitter fills its bit buffer LSB-first, so it ORs a code in as it is.
 fn _huffCodes(E: [int], lOff: int, cOff: int, n: int): int {
     let cnt: [int] = Array.Create(16, Type.Int);
     iter (i from 0 to n) { cnt[E[lOff + i]] = cnt[E[lOff + i]] + 1; }
@@ -884,7 +890,13 @@ fn _huffCodes(E: [int], lOff: int, cOff: int, n: int): int {
     iter (b from 1 to 16) { code = (code + cnt[b - 1]) << 1; next[b] = code; }
     iter (i from 0 to n) {
         let l = E[lOff + i];
-        if (l > 0) { E[cOff + i] = next[l]; next[l] = next[l] + 1; }
+        if (l > 0) {
+            let c = next[l];
+            let r = 0;
+            iter (b from 0 to l) { r = (r << 1) | ((c >> b) & 1); }
+            E[cOff + i] = r;
+            next[l] = next[l] + 1;
+        }
         else { E[cOff + i] = 0; }
     }
     return 0;
@@ -993,9 +1005,7 @@ fn _emitDynamic(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]):
         let v: int = j < hlit ? E[E_LENL + j] : E[E_LEND + (j - hlit)];
         let cl: int = E[E_CLLEN + v];
         let cc: int = E[E_CLCODE + v];
-        let r: int = 0; let b: int = 0;
-        while (b < cl) { r = (r << 1) | ((cc >> b) & 1); b = b + 1; }
-        bitbuf = bitbuf | (r << bitcnt); bitcnt = bitcnt + cl;
+        bitbuf = bitbuf | (cc << bitcnt); bitcnt = bitcnt + cl;
         while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
         j = j + 1;
     }
@@ -1005,18 +1015,14 @@ fn _emitDynamic(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]):
         if (tl[t] == 0) {
             let lit: int = tv[t];
             let l1: int = E[E_LENL + lit]; let c1: int = E[E_CODEL + lit];
-            let r1: int = 0; let b1: int = 0;
-            while (b1 < l1) { r1 = (r1 << 1) | ((c1 >> b1) & 1); b1 = b1 + 1; }
-            bitbuf = bitbuf | (r1 << bitcnt); bitcnt = bitcnt + l1;
+            bitbuf = bitbuf | (c1 << bitcnt); bitcnt = bitcnt + l1;
             while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
         } else {
             let mlen: int = tl[t]; let mdist: int = tv[t];
             let ls: int = C[C_LSYMOF + mlen];
             let sym: int = 257 + ls;
             let l2: int = E[E_LENL + sym]; let c2: int = E[E_CODEL + sym];
-            let r2: int = 0; let b2: int = 0;
-            while (b2 < l2) { r2 = (r2 << 1) | ((c2 >> b2) & 1); b2 = b2 + 1; }
-            bitbuf = bitbuf | (r2 << bitcnt); bitcnt = bitcnt + l2;
+            bitbuf = bitbuf | (c2 << bitcnt); bitcnt = bitcnt + l2;
             while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
             let lex: int = C[C_LEXTRA + ls];
             if (lex > 0) {
@@ -1025,9 +1031,7 @@ fn _emitDynamic(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]):
             }
             let ds: int = mdist <= 256 ? C[C_DSMALL + mdist] : C[C_DLARGE + ((mdist - 1) >> 7)];
             let l3: int = E[E_LEND + ds]; let c3: int = E[E_CODED + ds];
-            let r3: int = 0; let b3: int = 0;
-            while (b3 < l3) { r3 = (r3 << 1) | ((c3 >> b3) & 1); b3 = b3 + 1; }
-            bitbuf = bitbuf | (r3 << bitcnt); bitcnt = bitcnt + l3;
+            bitbuf = bitbuf | (c3 << bitcnt); bitcnt = bitcnt + l3;
             while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
             let dex: int = C[C_DEXTRA + ds];
             if (dex > 0) {
@@ -1040,9 +1044,7 @@ fn _emitDynamic(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]):
 
     // end-of-block symbol 256
     let le: int = E[E_LENL + 256]; let ce: int = E[E_CODEL + 256];
-    let re: int = 0; let be: int = 0;
-    while (be < le) { re = (re << 1) | ((ce >> be) & 1); be = be + 1; }
-    bitbuf = bitbuf | (re << bitcnt); bitcnt = bitcnt + le;
+    bitbuf = bitbuf | (ce << bitcnt); bitcnt = bitcnt + le;
     while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
 
     P[P_BUF] = bitbuf; P[P_CNT] = bitcnt; P[P_OUT] = outp;

@@ -276,7 +276,7 @@ rejected rather than read as a default.
 | `startIoPool` | on | Starts the I/O worker threads. Off keeps your process single-threaded; I/O still completes, inline on the VM thread. |
 | `jit` | on | Native code generation. |
 | `optimizations` | on | Constant folding and peephole passes. |
-| `debugInfo` | on | Keeps line numbers and names, so stack traces are useful. |
+| `debugInfo` | off | Keeps source line numbers, so stack traces report real lines instead of line 0. Function and file names are kept either way. |
 | `signatureChecks` | on | Verifies a `.flx` fingerprint when one is pinned. |
 | `requireSigned` | off | Refuses `.flx` not signed by a trusted key. |
 | `verbose` | off | Emits the VM's own progress chatter at `FLARIS_LOG_INFO`. |
@@ -845,10 +845,18 @@ FlarisInitVM(&cfg);
 The same mask on `FlarisOptions.deniedModules` denies modules for one context
 only, on top of whatever the VM already withholds — see section 6a.
 
-A call into a denied module raises `Exception.UnsafeOperation`, which the script
-can catch and your `FlarisCall` sees as `FLARIS_ERR_RAISED`. Nothing else about
-the script changes, and an allowed module costs nothing — the check is a bit
-test on an operand the call already carries.
+A call into a denied module raises `Exception.ModuleDenied` (code 25), which the
+script can catch and your `FlarisCall` sees as `FLARIS_ERR_RAISED`. Nothing else
+about the script changes, and an allowed module costs nothing — the check is a
+bit test on an operand the call already carries.
+
+JIT-compiled code is held to the same mask. A compiled function knows which
+built-in modules its native code can reach, counting every compiled function it
+calls; in a context that denies one of them it runs interpreted, so the call
+raises exactly where it would with the JIT off. That covers fibers the context
+spawns and callbacks a built-in runs for it (`Array.Map`, `Memory.Process`,
+...). A library imported by both a trusted and a sandboxed context shares one
+compiled copy, used natively by the first and interpreted by the second.
 
 The constants are `FLARIS_MOD_` plus the module name in upper case:
 `FLARIS_MOD_FILE`, `FLARIS_MOD_NET`, `FLARIS_MOD_OS`, `FLARIS_MOD_JSON` and so

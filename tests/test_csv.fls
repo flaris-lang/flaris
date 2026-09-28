@@ -345,25 +345,38 @@ fn testForEach() {
 fn testHead() {
     Console.WriteLine("--- Head ---");
 
-    let src = "a,b\n1,2\n3,4\n5,6\n7,8\n";
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_head_test.csv");
+    File.WriteText(path, "a,b\n1,2\n3,4\n5,6\n7,8\n");
 
-    let h2 = CSV.Head(src, 2);
+    let h2 = CSV.Head(path, 2);
     chkEq("Head(2) len",     len(h2), 2);
     chkEq("Head(2) [0][0]",  h2[0][0], "a");
     chkEq("Head(2) [1][0]",  h2[1][0], "1");
 
     // Head with headers option - header row doesn't count against limit
-    let h1 = CSV.Head(src, 1, { headers: true });
+    let h1 = CSV.Head(path, 1, { headers: true });
     chkEq("Head(1,headers) len",       len(h1), 1);
     chkEq("Head(1,headers) [0].a",     h1[0].a, "1");
 
-    // Head larger than file returns everything (src has 5 rows: a,b / 1,2 / 3,4 / 5,6 / 7,8)
-    let hAll = CSV.Head(src, 100);
+    // Head larger than file returns everything (5 rows: a,b / 1,2 / 3,4 / 5,6 / 7,8)
+    let hAll = CSV.Head(path, 100);
     chkEq("Head(100) capped at file",  len(hAll), 5);
 
     // Head(0) returns nothing
-    let h0 = CSV.Head(src, 0);
+    let h0 = CSV.Head(path, 0);
     chkEq("Head(0) empty",   len(h0), 0);
+
+    chkEq("Head missing file", len(CSV.Head(path + ".missing", 3)), 0);
+
+    // Head of a large file: the first rows, with types
+    let big = [["id", "v"]];
+    iter (i from 0 to 20000) { Array.Append(big, [i, i * 0.5]); }
+    CSV.WriteFile(path, big);
+    let hb = CSV.Head(path, 3, { headers: true, types: true });
+    chkEq("Head large len",     len(hb), 3);
+    chkEq("Head large [2].id",  hb[2].id, 2);
+    chkEq("Head large [2].v",   hb[2].v, 1.0);
+    File.Delete(path);
 }
 
 // ============================================================
@@ -531,6 +544,159 @@ fn testFormulaInjection() {
     chk("sanitize no quote on numbers", !String.Contains(ns, "'-5"));
 }
 
+fn testWriterValues() {
+    Console.WriteLine("--- Writer value forms ---");
+
+    let floats = [3.14159265358979, 0.1, 1e-7, 123456789.123, 2.0, -0.5, 0.1 + 0.2];
+    let text = CSV.Stringify([floats]);
+    chkEq("floats shortest round-trip form", text,
+          "3.14159265358979,0.1,1e-7,123456789.123,2.0,-0.5,0.30000000000000004\n");
+    let back = CSV.Parse(text, { types: true })[0];
+    iter (i from 0 to len(floats)) {
+        chkEq("float round-trips " + str(i), back[i], floats[i]);
+    }
+    chkEq("nan / inf", CSV.Stringify([[Math.NaN, Math.Infinity, 0.0 - Math.Infinity]]), "nan,inf,-inf\n");
+
+    chkEq("nil in array row is empty", CSV.Stringify([["a", nil, "b"]]), "a,,b\n");
+    chkEq("nil in object row is empty", CSV.Stringify([{ a: 1, b: nil }], { headers: ["a", "b"] }), "a,b\n1,\n");
+    chkEq("char written as itself", CSV.Stringify([['x', true, 7]]), "x,true,7\n");
+    chkEq("mixed row quoting", CSV.Stringify([[1, "a,b", 2.5, "q\"t"]]), "1,\"a,b\",2.5,\"q\"\"t\"\n");
+}
+
+fn testQuotingModes() {
+    Console.WriteLine("--- Quoting modes ---");
+
+    let rows = [["name", "n", "f", "note"], ["Ada", 3, 1.5, "x,y"], ["B", -2, nil, ""]];
+    chkEq("quoting minimal (default)", CSV.Stringify(rows),
+          "name,n,f,note\nAda,3,1.5,\"x,y\"\nB,-2,,\n");
+    chkEq("quoting minimal explicit", CSV.Stringify(rows, { quoting: "minimal" }), CSV.Stringify(rows));
+    chkEq("quoting all", CSV.Stringify(rows, { quoting: "all" }),
+          "\"name\",\"n\",\"f\",\"note\"\n\"Ada\",\"3\",\"1.5\",\"x,y\"\n\"B\",\"-2\",\"\",\"\"\n");
+    chkEq("quoting nonnumeric", CSV.Stringify(rows, { quoting: "nonnumeric" }),
+          "\"name\",\"n\",\"f\",\"note\"\n\"Ada\",3,1.5,\"x,y\"\n\"B\",-2,\"\",\"\"\n");
+    chkEq("quoting all + objects", CSV.Stringify([{ a: "1" }], { quoting: "all" }), "\"a\"\n\"1\"\n");
+    chkEq("quoting all round-trips", len(CSV.Parse(CSV.Stringify(rows, { quoting: "all" }))), 3);
+
+    var msg = "";
+    try { CSV.Stringify(rows, { quoting: "some" }); } catch (e) { msg = e.Error; }
+    chk("unknown quoting mode raises", String.Contains(msg, "quoting"));
+}
+
+fn testInferenceRule() {
+    Console.WriteLine("--- Inference rule ---");
+
+    chkEq("Infer 0",       CSV.Infer("0"),      0);
+    chkEq("Infer -12",     CSV.Infer("-12"),    -12);
+    chkEq("Infer 0.5",     CSV.Infer("0.5"),    0.5);
+    chkEq("Infer -0.5",    CSV.Infer("-0.5"),   -0.5);
+    chkEq("Infer 1e3",     CSV.Infer("1e3"),    1000.0);
+    chkEq("Infer 2.5E-2",  CSV.Infer("2.5E-2"), 0.025);
+    chkEq("Infer 2.50 type", type(CSV.Infer("2.50")), Type.Float);
+    foreach (s in ["nan", "NaN", "Inf", "-inf", "0x1F", "007", "-01", "00.5", "+5", " 12", "12 ",
+                   "1.", ".5", "1e", "0b11", "1.2.3", "12abc", "-", "1_000"]) {
+        chkEq("Infer keeps string '" + s + "'", CSV.Infer(s), s);
+    }
+    chkEq("Infer tRuE",   CSV.Infer("tRuE"), true);
+    chkEq("Infer yes",    CSV.Infer("yes"),  "yes");
+
+    let r = CSV.Parse("zip,code\n00501,0x10\n", { headers: true, types: true });
+    chkEq("types keeps zip code", r[0].zip,  "00501");
+    chkEq("types keeps hex",      r[0].code, "0x10");
+}
+
+fn testBom() {
+    Console.WriteLine("--- Byte-order mark ---");
+
+    let src = "\u{FEFF}name,age\nAda,36\n";
+    let rows = CSV.Parse(src, { headers: true });
+    chkEq("BOM dropped from first key", rows[0].name, "Ada");
+    chkEq("BOM keys", Object.HasKey(rows[0], "\u{FEFF}name"), false);
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_bom.csv");
+    File.WriteText(path, src);
+    chkEq("BOM ParseFile", CSV.ParseFile(path, { headers: true })[0].name, "Ada");
+    let names = [];
+    CSV.ForEachFile(path, fn(row) { Array.Append(names, row.name); }, { headers: true });
+    chkEq("BOM ForEachFile", names[0], "Ada");
+    chkEq("BOM Head", CSV.Head(path, 1, { headers: true })[0].name, "Ada");
+    File.Delete(path);
+}
+
+fn testRowIndex() {
+    Console.WriteLine("--- Row index ---");
+
+    let idx = [];
+    CSV.ForEach("h\na\nb\nc\n", fn(_row, i) { Array.Append(idx, i); }, { headers: true });
+    chkEq("ForEach index count", len(idx), 3);
+    chkEq("ForEach index first", idx[0], 0);
+    chkEq("ForEach index last",  idx[2], 2);
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_index.csv");
+    File.WriteText(path, "h\na\nb\nc\n");
+    let fidx = [];
+    let fval = [];
+    CSV.ForEachFile(path, fn(row, i) { Array.Append(fidx, i); Array.Append(fval, row.h); }, { headers: true });
+    chkEq("ForEachFile index count", len(fidx), 3);
+    chkEq("ForEachFile index 0", fidx[0], 0);
+    chkEq("ForEachFile index 2", fidx[2], 2);
+    chkEq("ForEachFile value 2", fval[2], "c");
+    File.Delete(path);
+}
+
+// Records that contain quotes, CRLF endings and embedded line breaks placed
+// so they straddle the 64 KB scan and read chunks.
+fn testChunkBoundaries() {
+    Console.WriteLine("--- Chunk boundaries ---");
+
+    let rows = [["id", "text", "n"]];
+    iter (i from 0 to 12000) {
+        var t = "plain " + str(i);
+        if (i % 7 == 0) { t = "say \"hi\", " + str(i); }
+        if (i % 11 == 0) { t = "two\r\nlines " + str(i); }
+        Array.Append(rows, [str(i), t, str(i * 3)]);
+    }
+    let text = CSV.Stringify(rows, { crlf: true });
+    chk("chunk test input spans chunks", len(text) > 3 * 65536);
+
+    let parsed = CSV.Parse(text);
+    chkEq("chunks: Parse row count", len(parsed), len(rows));
+    var same = true;
+    iter (i from 0 to len(rows)) {
+        if (!Array.SequenceEqual(parsed[i], rows[i])) { same = false; }
+    }
+    chk("chunks: Parse matches every field", same);
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_chunks.csv");
+    File.WriteText(path, text);
+    let streamed = [];
+    CSV.ForEachFile(path, fn(row) { Array.Append(streamed, row); });
+    chkEq("chunks: ForEachFile row count", len(streamed), len(rows));
+    var same2 = true;
+    iter (i from 0 to len(rows)) {
+        if (!Array.SequenceEqual(streamed[i], rows[i])) { same2 = false; }
+    }
+    chk("chunks: ForEachFile matches every field", same2);
+
+    let objs = CSV.ParseFile(path, { headers: true, types: true });
+    chkEq("chunks: typed objects count", len(objs), 12000);
+    chkEq("chunks: typed last n", objs[11999].n, 11999 * 3);
+    chkEq("chunks: embedded CRLF kept", objs[11].text, "two\r\nlines 11");
+    File.Delete(path);
+
+    let unterminated = CSV.Parse("a,\"open\nb,c\n");
+    chkEq("unterminated quote takes the rest", unterminated[0][1], "open\nb,c\n");
+}
+
+fn testAppendNoTrailingNewline() {
+    Console.WriteLine("--- AppendFile without trailing newline ---");
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_csv_append_nonl.csv");
+    File.WriteText(path, "a;b\n1;2");
+    CSV.AppendFile(path, [{ b: "4", a: "3" }], { delimiter: ";" });
+    chkEq("append adds line break first", File.ReadText(path), "a;b\n1;2\n3;4\n");
+    File.Delete(path);
+}
+
 // ============================================================
 // Benchmarks
 // ============================================================
@@ -565,6 +731,28 @@ fn testBenchmarks() {
     chkEq("bench round-trip rows", len(parsed), 1000);
     chkEq("bench round-trip [0][0]", parsed[0][0], "row1");
 
+    // 20k rows, one in ten holding a quoted field.
+    let mixed = [["id", "name", "amount", "note"]];
+    iter (i from 0 to 20000) {
+        let note = (i % 10 == 0) ? "said \"hi\", then left" : "plain note " + str(i);
+        Array.Append(mixed, [str(i), "user" + str(i), str(i) + ".25", note]);
+    }
+    let t2 = Time.Ticks();
+    let mtext = CSV.Stringify(mixed);
+    Console.WriteLine("Stringify 20k mixed rows: ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t2)]), " ms");
+    let t3 = Time.Ticks();
+    let mrows = CSV.Parse(mtext);
+    Console.WriteLine("Parse 20k mixed rows: ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t3)]), " ms");
+    let t4 = Time.Ticks();
+    let mobjs = CSV.Parse(mtext, { headers: true, types: true });
+    Console.WriteLine("Parse 20k mixed rows, headers+types: ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t4)]), " ms");
+    chkEq("bench mixed rows", len(mrows), 20001);
+    chkEq("bench mixed quoted note", mrows[1][3], "said \"hi\", then left");
+    chkEq("bench mixed typed amount", mobjs[19999].amount, 19999.25);
+
     Console.WriteLine("=== benchmarks done ===");
 }
 
@@ -589,6 +777,13 @@ fn Main() {
     testColumnIndex();
     testInference();
     testFormulaInjection();
+    testWriterValues();
+    testQuotingModes();
+    testInferenceRule();
+    testBom();
+    testRowIndex();
+    testChunkBoundaries();
+    testAppendNoTrailingNewline();
     testBenchmarks();
 
     Console.WriteLine("");
