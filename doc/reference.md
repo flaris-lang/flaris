@@ -1409,8 +1409,6 @@ These functions are VM instructions - available everywhere, no namespace require
 | ---------- |------------- |
 | `type(x)` | Returns the runtime type as an `int` bitmask. Compare with `Type` module constants: `type(x) == Type.Int`. |
 | `is_nil(x)` | Returns `true` if `x` is `nil`. |
-| `is_array(x)` | Returns `true` if `x` is an array. |
-| `is_object(x)` | Returns `true` if `x` is an object. |
 
 ### Type Conversion
 
@@ -2105,10 +2103,10 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **Average** | `Average(arr:array) - float` | Returns the arithmetic mean of all elements as `float`. Returns `nil` if empty. | ✓ |
 | **BinarySearch** | `BinarySearch(arr:array, value:any, less?:fn) - int` | Binary search over a SORTED array. Returns the index of a match, or `-(insertionPoint) - 1` when absent (so `-(result) - 1` is where it would go). Optional `less(a,b)-bool` must be the same predicate the array was sorted with. O(log n). | — |
 | **Capacity** | `Capacity(arr:array) - int` | Returns current internal capacity (may exceed length). | ✓ |
-| **Clear** | `Clear(arr:array) - bool` | Removes all elements; capacity kept. Mutates. | ✓ statement² |
+| **Clear** | `Clear(arr:array) - bool` | Removes all elements; capacity kept. Mutates. | ✓² |
 | **Concat** | `Concat(a:array, b:array) - array` | Returns new array: all of `a` followed by all of `b`. When both have the same element type (`[int]`, `[string]`, ...) the result keeps it; otherwise it is untyped. `nil` past 10,000,000 elements. | — |
 | **Contains** | `Contains(arr:array, value:any) - bool` | `true` if any element equals `value` (deep equality). | ✓ |
-| **Create** | `Create(size:int, type?:int) - array` | Creates new array with `size` pre-allocated slots (`nil` if `size` is negative or above 10,000,000). Optional `type` (a `Type.*` constant) pre-fills all slots with the zero value for that type - `Type.Float` gives a `[float]` array of 0.0 values; `Type.Int` gives a `[int]` array of 0 values; `Type.String` gives a `[string]` array of "" values. Without a type argument all slots are `nil`. | — |
+| **Create** | `Create(size:int, type?:int) - array` | Creates new array with `size` pre-allocated slots (`nil` if `size` is negative or above 10,000,000). Optional `type` (a `Type.*` constant) pre-fills all slots with the zero value for that type - `Type.Float` gives a `[float]` array of 0.0 values; `Type.Int` gives a `[int]` array of 0 values; `Type.String` gives a `[string]` array of "" values. Without a type argument all slots are `nil`. | ✓ owned¹ |
 | **Distinct** | `Distinct(arr:array) - array` | Returns new array with only the first occurrence of each value, in order, by strict equality (`1`, `1.0` and `"1"` are all kept; `0.0` and `-0.0` are equal; deep-equal arrays and objects are duplicates). O(n) for every element type. Keeps the element type. | — |
 | **Clone** | `Clone(arr:array) - array` | Returns a shallow copy: a new array with the same elements (element refs shared). Preserves a typed array's element type. | — |
 | **Count** | `Count(arr:array, pred:fn) - int` | Number of elements for which `pred(x)` is truthy. | — |
@@ -2138,8 +2136,8 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **ProcessEvent** | `ProcessEvent(fn:function, arr:array, len:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | — |
 | **Reduce** | `Reduce(arr:array, func:fn, initial?:any) - any` | Aggregates left-to-right: `acc = fn(acc, x)` starting from `initial`. Without `initial`, seeds with the first element (empty array → `nil`). `acc`/result may be any type the callback returns. | — |
 | **RemoveAll** | `RemoveAll(arr:array, pred:fn) - int` | Removes every element for which `pred(x)` is truthy and returns how many; the rest keep their order. `nil` if `pred` raises (nothing is removed). Mutates. | — |
-| **RemoveAt** | `RemoveAt(arr:array, index:int) - bool` | Removes element at `index`, shifts remaining left. Mutates. | ✓ statement² |
-| **Reserve** | `Reserve(arr:array, capacity:int) - bool` | Ensures capacity ≥ `capacity`. Does not affect length. Mutates capacity. | ✓ statement² |
+| **RemoveAt** | `RemoveAt(arr:array, index:int) - bool` | Removes element at `index`, shifts remaining left. Mutates. `false` when `index` is out of range. | ✓² |
+| **Reserve** | `Reserve(arr:array, capacity:int) - bool` | Ensures capacity ≥ `capacity`. Does not affect length. Mutates capacity. `false` on a negative `capacity` or a failed allocation. | ✓² |
 | **Reverse** | `Reverse(arr:array) - array` | Reverses elements in-place. Returns same array. Mutates. | — |
 | **Select** | `Select(arr:array, func:fn ) - array` | Returns new array by applying `fn(x)` to every element (map). | — |
 | **Shuffle** | `Shuffle(arr:array) - array` | Randomly shuffles elements in-place (Fisher-Yates, CSPRNG). Returns same array. Mutates. | — |
@@ -2223,7 +2221,7 @@ out-of-range subscript raises `Exception.OutOfBounds` instead of returning `0`.
 | **ReadU16At** | `ReadU16At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 2-byte unsigned integer at `offset`. Optional `bigEndian` defaults to `false` (little-endian). Returns 0 if out of bounds. | ✓ |
 | **ReadU32At** | `ReadU32At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 4-byte unsigned integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
 | **ReadU64At** | `ReadU64At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 8-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
-| **Reserve** | `Reserve(buf:block, capacity:int) - bool` | Ensures `buf` holds at least `capacity` **elements** (`capacity × size` bytes). Grows the buffer in-place via `realloc` if needed; the block object is mutated and `len(buf)` reflects the new element count. No-op if already large enough; `false` on a non-block, a capacity outside 1..2^32-1, or a failed grow (the block is left untouched). | — |
+| **Reserve** | `Reserve(buf:block, capacity:int) - bool` | Ensures `buf` holds at least `capacity` **elements** (`capacity × size` bytes). Grows the buffer in-place via `realloc` if needed; the block object is mutated, `len(buf)` reflects the new element count and the new elements are zero. No-op if already large enough; `false` on a non-block, a capacity outside 1..2^32-1, or a failed grow (the block is left untouched). | ✓ |
 | **Slice** | `Slice(buf:block, offset:int, count:int) - block` | Returns new buffer: `count` elements starting at element index `offset`. | ✓ owned¹ |
 | **StringToArray** | `StringToArray(s:string, arr:array, offset?:int) - int` | Writes the raw UTF-8 bytes of `s` directly into `arr` at `offset` without allocating an intermediate block. Returns the number of bytes written (`len(s)`), or 0 when nothing could be written (not an array, a negative `offset`, or an `offset` past the end). Optional `offset` defaults to 0. | — |
 | **ToArray** | `ToArray(buf:block, offset?:int, count?:int) - [int]` | A flat `[int]` array of the unsigned element values, `count` elements from element `offset` (`offset` defaults to 0, `count` to the rest). Element size must be 1, 2, 4, or 8; `nil` on a bad range. | ✓ owned¹ |
@@ -2242,7 +2240,7 @@ out-of-range subscript raises `Exception.OutOfBounds` instead of returning `0`.
 | **Reverse** | `Reverse(buf:block) - bool` | Reverses the buffer's elements in place (each element is `size` bytes; a byte buffer is reversed byte-for-byte). `false` on a non-block. | ✓ |
 | **CopyWithin** | `CopyWithin(buf:block, destOff:int, srcOff:int, length:int) - bool` | Moves `length` bytes within the same buffer from byte `srcOff` to byte `destOff` (memmove; the spans may overlap). Bounds-checked against the byte extent; `false` if out of range. | ✓ |
 | **Concat** | `Concat(a:block, b:block) - block` | Returns a new byte block (element size 1) holding `a`'s bytes followed by `b`'s bytes (each buffer's full extent). `nil` on a non-block. | ✓ owned¹ |
-| **Append** | `Append(buf:block, src:block\|string) - int` | Grows `buf` in place and appends `src`'s bytes. Returns the new element count, or `0` on failure (non-block/-src, a byte count that is not a multiple of the element size, or a failed grow — on failure `buf` is left unchanged). | — |
+| **Append** | `Append(buf:block, src:block\|string) - int` | Grows `buf` in place and appends `src`'s bytes. Returns the new element count, or `0` on failure (non-block/-src, a byte count that is not a multiple of the element size, or a failed grow — on failure `buf` is left unchanged). | ✓ |
 
 - **ProcessCallback / ProcessEvent** — process a buffer, optionally on another CPU core
   - You give it a **worker function** `fn(buf, len, blocksize)` that reads and writes the buffer, plus a **`cb(buf, result)`** that runs when the work is finished. `ProcessCallback` returns right away; `cb` is called later. (`ProcessEvent` is the same but signals an event instead of calling `cb` — see below.)
@@ -2787,12 +2785,12 @@ Signals fibers can wait on. Max 64 events (a shared, fixed pool).
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **Create** | `Create() - int` | Claims a new event id (`0..63`), or **`-1`** if the 64-id pool is exhausted. Always check for `-1`. | — |
-| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..63`, or `InvalidArgs` for an id that was never created. | — |
+| **Create** | `Create() - int` | Claims a new event id (`0..63`), or **`-1`** if the 64-id pool is exhausted. Always check for `-1`. | ✓ |
+| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..63`, or `InvalidArgs` for an id that was never created. | ✓ |
 | **WaitOne** | `WaitOne(id:int, timeoutMs?:int) - any` | Parks the caller until `Set` is called on this event, then returns the value it was set with. With a positive `timeoutMs` it resumes with **`nil`** once the deadline passes; `0`/omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id. | — |
 | **WaitFor** | `WaitFor(ids:array, timeoutMs?:int) - array` | Waits until **all** of the events in `ids` have been set, then returns their values as an array. Use it to start several `ProcessEvent`/`Set` jobs and continue once they've all finished. (An empty list returns `[]` right away.) With a positive `timeoutMs`, if the deadline passes before every event fires it returns **`nil`** and stops waiting; `0` or omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id or `InvalidArgs` for a non-int element. | — |
-| **Free** | `Free(id:int)` | Releases an id back to the pool. Use to reclaim an event you created but never delivered (a dropped job) so the fixed pool is not exhausted. Raises `IndexOutOfBounds` for an out-of-range id. | — |
-| **Reset** | `Reset(id:int)` | Clears a claimed event's signalled state and value so it can be `Set` and waited on again, without returning the id to the pool. Raises `IndexOutOfBounds` for an out-of-range id. | — |
+| **Free** | `Free(id:int)` | Releases an id back to the pool. Use to reclaim an event you created but never delivered (a dropped job) so the fixed pool is not exhausted. Raises `IndexOutOfBounds` for an out-of-range id. | ✓ |
+| **Reset** | `Reset(id:int)` | Clears a claimed event's signalled state and value so it can be `Set` and waited on again, without returning the id to the pool. Raises `IndexOutOfBounds` for an out-of-range id. | ✓ |
 
 Lifecycle: an event is reclaimed automatically once the last fiber waiting on it has been served, so a fan-out `WaitFor` join does not leak ids. An event you `Create` but never deliver stays claimed until you `Free` it. A `Set` is broadcast to every fiber already parked on the event; a fiber that starts waiting **after** the last waiter was served and the id reclaimed will block (one-shot events are not retained) — subscribe your waiters before signalling.
 
@@ -2975,8 +2973,8 @@ File read, write, and metadata operations.
 | **Stat** | `Stat(path:string) - object` | One-syscall metadata: `{Size, Modified, Accessed, Created, IsDir, IsFile, IsSymlink, Mode}`. Times are Unix timestamps; `Mode` is the permission bits (octal 7777 mask); `Created` uses birth time on macOS/BSD, else ctime. Returns `nil` if the path does not exist. A dangling symlink stats as the link itself. | — |
 | **Touch** | `Touch(path:string) - bool` | Create file if missing; set access + modification time to now (like POSIX `touch`). `false` on failure. | — |
 | **Truncate** | `Truncate(path:string, size:int) - bool` | Resize the file to exactly `size` bytes (extension zero-fills). `false` if `size` is negative or the file can't be resized. | — |
-| **WriteAllBytes** | `WriteAllBytes(path:string, data:string\|block) - bool` | Write binary data to file (overwrite). `false` on open/write failure. | — |
-| **WriteAtomic** | `WriteAtomic(path:string, data:string\|block) - bool` | Durable write: stream into a temp file in the same directory, `fsync`, then `rename()` over the target - a reader never sees a half-written file, and a crash leaves either the old or new content, never a truncated mix. An existing file keeps its permission bits; a new one gets the same mode `WriteText` would give it. `false` on any failure (temp file removed). Atomic only within one filesystem. | — |
+| **WriteAllBytes** | `WriteAllBytes(path:string, data:string\|block) - bool` | Write binary data to file (overwrite). `false` on open/write failure. | ✓ |
+| **WriteAtomic** | `WriteAtomic(path:string, data:string\|block) - bool` | Durable write: stream into a temp file in the same directory, `fsync`, then `rename()` over the target - a reader never sees a half-written file, and a crash leaves either the old or new content, never a truncated mix. An existing file keeps its permission bits; a new one gets the same mode `WriteText` would give it. `false` on any failure (temp file removed). Atomic only within one filesystem. | ✓ |
 | **WriteLines** | `WriteLines(path:string, lines:array) - bool` | Write each string element followed by `\n` (overwrite); other elements are skipped. Written verbatim, so `\n` stays `\n` on Windows too. `false` on open/write failure, or for a typed `[int]`/`[float]` array. | — |
 | **WriteText** | `WriteText(path:string, text:string) - bool` | Write text to the file (overwrite), bytes written verbatim. `false` on open/write failure. | — |
 | **WriteTextAsync** | `WriteTextAsync(path:string, text:string) - fiber` | Non-blocking `WriteText`. Use with `await`; resolves to `true`, or `false` on failure. Other fibers run while the file is written. | — |
@@ -3120,7 +3118,7 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
-| **Abs** | `Abs(x:int\|float) - int` | Absolute value as integer. | ✓ |
+| **Abs** | `Abs(x:int) - int` | Absolute value. The smallest int has no positive counterpart and is returned unchanged. For a float use `AbsF`. | ✓ |
 | **AbsF** | `AbsF(x:int\|float) - float` | Absolute value as float. | ✓ |
 | **Acos** | `Acos(x:int\|float) - float` | Arc cosine (radians). | ✓ |
 | **Acosh** | `Acosh(x:int\|float) - float` | Inverse hyperbolic cosine. | ✓ |
@@ -3133,7 +3131,7 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | **Atanh** | `Atanh(x:int\|float) - float` | Inverse hyperbolic tangent. | ✓ |
 | **Cbrt** | `Cbrt(x:int\|float) - float` | Cube root. | ✓ |
 | **Ceil** | `Ceil(x:int\|float) - int` | Ceiling (round up). | ✓ |
-| **Clamp** | `Clamp(x:int\|float, min:int\|float, max:int\|float) - float` | Clamp x to [min, max]. | ✓ |
+| **Clamp** | `Clamp(x:int\|float, min:int\|float, max:int\|float) - float` | Clamp x to [min, max]. Raises `InvalidArguments` when min > max. | ✓ |
 | **CopySign** | `CopySign(x:int\|float, y:int\|float) - float` | Returns magnitude of x with sign of y. | ✓ |
 | **Cos** | `Cos(x:int\|float) - float` | Cosine. | ✓ |
 | **Cosh** | `Cosh(x:int\|float) - float` | Hyperbolic cosine. | ✓ |
@@ -3156,22 +3154,22 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | **Log** | `Log(x:int\|float) - float` | Natural logarithm. | ✓ |
 | **Log10** | `Log10(x:int\|float) - float` | Base-10 logarithm. | ✓ |
 | **LogBase** | `LogBase(x:int\|float, base:int\|float) - float` | Logarithm with arbitrary base. | ✓ |
-| **Max** | `Max(a:int\|float, b:int\|float) - int` | Larger of a, b as integer. | ✓ |
+| **Max** | `Max(a:int, b:int) - int` | Larger of a, b. For floats use `MaxF`. | ✓ |
 | **MaxF** | `MaxF(a:int\|float, b:int\|float) - float` | Larger of a, b as float. | ✓ |
 | **MaxOf** | `MaxOf(arr:array) - int\|float` | Largest element of a numeric array (type preserved). `nil` if empty or non-numeric. | — |
-| **Min** | `Min(a:int\|float, b:int\|float) - int` | Smaller of a, b as integer. | ✓ |
+| **Min** | `Min(a:int, b:int) - int` | Smaller of a, b. For floats use `MinF`. | ✓ |
 | **MinF** | `MinF(a:int\|float, b:int\|float) - float` | Smaller of a, b as float. | ✓ |
 | **MinOf** | `MinOf(arr:array) - int\|float` | Smallest element of a numeric array (type preserved). `nil` if empty or non-numeric. | — |
-| **Mod** | `Mod(a:int\|float, b:int\|float) - int\|float` | Euclidean/floored modulo: result takes sign of b, so Mod(-1,5)=4. `nil` if b=0. | — |
+| **Mod** | `Mod(a:int\|float, b:int\|float) - int\|float` | Floored modulo: the result takes the sign of b, so Mod(-1,5)=4. Two ints give an exact int, and b=0 raises `ModByZero` as `%` does; otherwise a float, `NaN` when b=0. | — |
 | **Pow** | `Pow(base:int\|float, exp:int\|float) - float` | base^exp. | ✓ |
 | **Product** | `Product(arr:array) - int\|float` | Product of array elements (int if all-int, else float). `1` if empty; `nil` if non-numeric. | — |
 | **Rad** | `Rad(x:int\|float) - float` | Convert degrees to radians. | ✓ |
 | **RandBool** | `RandBool() - bool` | Random boolean. | ✓ |
 | **RandChoice** | `RandChoice(arr:array) - any` | Random element from array. | — |
-| **RandFloat** | `RandFloat(min:int\|float, max:int\|float) - float` | Random float in [min, max]. | ✓ |
+| **RandFloat** | `RandFloat(min:int\|float, max:int\|float) - float` | Random float in [min, max]; min itself when they are equal. Raises `InvalidArguments` when min > max. | ✓ |
 | **Random** | `Random() - float` | Random float in [0.0, 1.0). | ✓ |
-| **RandomInt** | `RandomInt(min:int\|float, max:int\|float) - int` | Random integer in [min, max]. | ✓ |
-| **Round** | `Round(x:int\|float) - int` | Round to nearest integer (half-up). | ✓ |
+| **RandomInt** | `RandomInt(min:int, max:int) - int` | Random integer in [min, max], both included. Raises `InvalidArguments` when min > max. | ✓ |
+| **Round** | `Round(x:int\|float) - int` | Round to nearest integer, halves away from zero: `Round(2.5)` is 3, `Round(-2.5)` is -3. | ✓ |
 | **RoundTo** | `RoundTo(x:int\|float, decimals:int) - float` | Round to `decimals` fractional digits (clamped 0..15). | ✓ |
 | **Sec** | `Sec(x:int\|float) - float` | Secant. | ✓ |
 | **Sech** | `Sech(x:int\|float) - float` | Hyperbolic secant. | ✓ |
@@ -3190,18 +3188,18 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
 | **Clamp01** | `Clamp01(x:int\|float) - float` | Clamp to [0.0, 1.0]. | ✓ |
-| **Combination** | `Combination(n:int\|float, r:int\|float) - int` | Binomial coefficient C(n,r). | ✓ |
+| **Combination** | `Combination(n:int, r:int) - int` | Binomial coefficient C(n,r); 0 when n or r is negative or r > n. Raises `InvalidArguments` when the result does not fit in an int. | ✓ |
 | **Distance** | `Distance(x1:int\|float, y1:int\|float, x2:int\|float, y2:int\|float) - float` | 2D Euclidean distance. | ✓ |
 | **Expm1** | `Expm1(x:int\|float) - float` | e^x − 1 (accurate near zero). | ✓ |
-| **Factorial** | `Factorial(n:int\|float) - int` | n! | ✓ |
-| **Fma** | `Fma(a:int\|float, b:int\|float, c:int\|float) - float` | a × b + c rounded once (fused multiply-add, like C `fma`). `a * b + c` rounds the product first, so the two can differ in the last bit: `Fma(0.1, 10.0, -1.0)` is `5.551115123125783e-17`, `0.1 * 10.0 - 1.0` is `0.0`. | ✓ on arm64; x86-64 runs the calling function interpreted |
+| **Factorial** | `Factorial(n:int) - int` | n!; 0 for a negative n. Raises `InvalidArguments` past 20!, the largest that fits in an int. | ✓ |
+| **Fma** | `Fma(a:int\|float, b:int\|float, c:int\|float) - float` | a × b + c rounded once (fused multiply-add, like C `fma`). `a * b + c` rounds the product first, so the two can differ in the last bit: `Fma(0.1, 10.0, -1.0)` is `5.551115123125783e-17`, `0.1 * 10.0 - 1.0` is `0.0`. | ✓ |
 | **Fract** | `Fract(x:int\|float) - float` | Fractional part of x. | ✓ |
 | **IEEERemainder** | `IEEERemainder(x:int\|float, y:int\|float) - float` | IEEE 754 remainder. | ✓ |
 | **IsClose** | `IsClose(a:int\|float, b:int\|float) - bool` | Approximate equality check. | ✓ |
 | **Lerp** | `Lerp(a:int\|float, b:int\|float, t:int\|float) - float` | Linear interpolation. | ✓ |
 | **Log1p** | `Log1p(x:int\|float) - float` | ln(1 + x) (accurate near zero). | ✓ |
 | **Log2** | `Log2(x:int\|float) - float` | Base-2 logarithm. | ✓ |
-| **Permutation** | `Permutation(n:int\|float, r:int\|float) - int` | P(n,r) ordered permutations. | ✓ |
+| **Permutation** | `Permutation(n:int, r:int) - int` | P(n,r) ordered permutations; 0 when n or r is negative or r > n. Raises `InvalidArguments` when the result does not fit in an int. | ✓ |
 
 **Special functions** (`Gamma`, `LnGamma`, `Erf`, `Erfc` run at native speed inside JIT functions):
 
@@ -3285,7 +3283,7 @@ Unsafe raw memory access. Requires `--unsafe` flag. `ptr` = `int\|string\|block\
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
-| **Alloc** | `Alloc(size:int) - int` | Allocate `size` bytes; returns the raw address. `nil` if `size <= 0` or exceeds the 2 GiB per-allocation cap. Caller must `Free`. | — |
+| **Alloc** | `Alloc(size:int) - int` | Allocate `size` bytes; returns the raw address. `0` if `size <= 0` or exceeds the 2 GiB per-allocation cap. Caller must `Free`. | ✓ `--unsafe` |
 | **BitClear** | `BitClear(ptr:int\|string\|block\|pointer, bit:int, offset?:int) - nil` | Clear bit `bit & 7` of the byte at `ptr`(+`offset`). | ✓ `--unsafe` |
 | **BitSet** | `BitSet(ptr:int\|string\|block\|pointer, bit:int, offset?:int) - nil` | Set bit `bit & 7` of the byte at `ptr`(+`offset`). | ✓ `--unsafe` |
 | **BitTest** | `BitTest(ptr:int\|string\|block\|pointer, bit:int, offset?:int) - bool` | `true` if bit `bit & 7` of the byte at `ptr`(+`offset`) is set. | ✓ `--unsafe` |
@@ -3294,9 +3292,9 @@ Unsafe raw memory access. Requires `--unsafe` flag. `ptr` = `int\|string\|block\
 | **Copy** | `Copy(dst:int\|string\|block\|pointer, src:int\|string\|block\|pointer, len:int) - nil` | `memcpy` `len` bytes — the spans must **not** overlap (use `Move` if they might). Region-guarded. | ✓ `--unsafe` |
 | **Move** | `Move(dst:int\|string\|block\|pointer, src:int\|string\|block\|pointer, len:int) - nil` | `memmove` `len` bytes; the `dst` and `src` spans **may** overlap. Region-guarded. | ✓ `--unsafe` |
 | **Fill** | `Fill(addr:int\|string\|block\|pointer, value:int, len:int) - nil` | Set `len` bytes at `addr` to byte `value` (0–255). Region-guarded; `nil`/no-op out of region or on a bad value. | ✓ `--unsafe` |
-| **Free** | `Free(addr:int) - nil` | Release a region returned by `Alloc`. Any other address - a block's backing store, a `Pin`ned region, an interior pointer - raises `Forbidden/Invalid memory-access` and is left untouched. | — |
+| **Free** | `Free(addr:int) - nil` | Release a region returned by `Alloc`; `Free(0)` does nothing. Any other address - a block's backing store, a `Pin`ned region, an interior pointer - raises `Forbidden/Invalid memory-access` and is left untouched. | ✓ `--unsafe` |
 | **IsLittleEndian** | `IsLittleEndian() - bool` | `true` if host is little-endian. | — |
-| **Pin** | `Pin(addr:int, size:int) - int` | Register an externally-owned region (e.g. an FFI buffer) so the peek/poke guards accept it; returns `addr`. `nil` for `addr <= 0`, a `size` that is not below the 2 GiB per-allocation cap, or a span that wraps around. Does not allocate or take ownership; the caller vouches for the memory (a pinned span nothing backs is a wild read). **Must be paired with `Unpin`** — a region left pinned at exit is reported as a leaked block region (and fails under `--mem`). | — |
+| **Pin** | `Pin(addr:int, size:int) - int` | Register an externally-owned region (e.g. an FFI buffer) so the peek/poke guards accept it; returns `addr`. `0` for `addr <= 0`, a `size` that is not below the 2 GiB per-allocation cap, or a span that wraps around. Does not allocate or take ownership; the caller vouches for the memory (a pinned span nothing backs is a wild read). **Must be paired with `Unpin`** — a region left pinned at exit is reported as a leaked block region (and fails under `--mem`). | ✓ `--unsafe` |
 | **Process** | `Process(addr:int, len:int, elemSize:int, fn:function) - bool` | In-place map: for each of `len` elements of `elemSize` (1/2/4/8) bytes at `addr`, calls `fn(value:int, index:int)` and stores the integer it returns back, truncated to the element width. `false` on a bad size or length, an unregistered span, or a builtin `fn` that cannot take two arguments; `nil` if `fn` raised. At most 16 MB per call. | — |
 | **ProcessCallback** | `ProcessCallback(fn, address:int, start:int, len:int, cb)` | Processes a raw memory range with your worker function `fn(address, start, len)` (which reads/writes it via `Memory.Read*`/`Write*`), then calls `cb(address, result)` when finished. Runs on another CPU core when `fn` is simple enough (only `Memory.Read*`/`Write*` on that address, plain number math, no calls or allocations) — otherwise runs normally, same result. **Don't allocate or free memory while the job is running.** | ✓ `--unsafe` |
 | **ProcessEvent** | `ProcessEvent(fn, address:int, start:int, len:int, eventId:int)` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ `--unsafe` |
@@ -3311,7 +3309,7 @@ Unsafe raw memory access. Requires `--unsafe` flag. `ptr` = `int\|string\|block\
 | **Swap16** | `Swap16(v:int) - int` | Byte-swap 16-bit value. No `--unsafe` needed. | ✓ |
 | **Swap32** | `Swap32(v:int) - int` | Byte-swap 32-bit value. No `--unsafe` needed. | ✓ |
 | **Swap64** | `Swap64(v:int) - int` | Byte-swap 64-bit value. No `--unsafe` needed. | ✓ |
-| **Unpin** | `Unpin(addr:int) - bool` | Remove a region previously registered with `Pin`; returns `true` if it was tracked. A block's backing store or an `Alloc` region is left alone (`false`). Does not free the underlying memory. | — |
+| **Unpin** | `Unpin(addr:int) - bool` | Remove a region previously registered with `Pin`; returns `true` if it was tracked. A block's backing store or an `Alloc` region is left alone (`false`). Does not free the underlying memory. | ✓ `--unsafe` |
 | **Write8** | `Write8(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 1 byte. | ✓ `--unsafe` |
 | **Write16** | `Write16(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 2 bytes, host byte order. | ✓ `--unsafe` |
 | **Write32** | `Write32(ptr:int\|string\|block\|pointer, value:int, offset?:int) - nil` | Write 4 bytes, host byte order. | ✓ `--unsafe` |
@@ -3381,7 +3379,7 @@ the class's declaration order.
 | ---------- | ----------- | ------------- | --- |
 | **Clear** | `Clear(obj:object) - bool` | Remove all properties from `obj`. Mutates. Raises if `obj` is frozen. | — |
 | **Clone** | `Clone(value:any) - any` | Deep clone: scalars, strings, arrays (including flat `[int]`/`[float]`), objects, classes and instances are copied recursively; functions, builtins, modules and exceptions are shared (ref-counted, not copied). A **cyclic** value (or nesting past the clone-depth limit) raises `Exception.NestingError` rather than looping forever. | — |
-| **Count** | `Count(obj:object\|instance\|class) - int` | Number of properties (object) or declared fields (instance/class). | ✓ |
+| **Count** | `Count(obj:object\|instance\|class) - int` | Number of properties (object) or declared fields (instance/class); `0` for anything else. | ✓ |
 | **Delete** | `Delete(obj:object, key:string) - bool` | Delete property `key`. Returns `true` if existed. Raises if `obj` is frozen. | — |
 | **Entries** | `Entries(obj:object\|instance\|class) - array` | Array of `[key, value]` pairs (object properties, or field name → value). | — |
 | **Freeze** | `Freeze(obj:object) - bool` | Makes `obj` read-only. Any subsequent write throws — including via `Merge`/`Delete`/`Clear`. Shallow only. Returns `false` for a non-object. Query with `IsFrozen`. | — |
@@ -3389,7 +3387,7 @@ the class's declaration order.
 | **FromKeys** | `FromKeys(arr:array, value:any) - object` | Creates new object from string key array, all set to `value`. `nil` if `arr` is nil or holds a key that is not a string. | — |
 | **All** | `All(obj:object, func:fn) - bool` | Returns `true` if `fn(key, value)` is truthy for every entry. Returns `true` for an empty object. | — |
 | **Any** | `Any(obj:object, func:fn) - bool` | Returns `true` if `fn(key, value)` is truthy for at least one entry. Returns `false` for an empty object. | — |
-| **HasKey** | `HasKey(obj:object, key:string) - bool` | `true` if property `key` exists. | ✓ |
+| **HasKey** | `HasKey(obj:object, key:string) - bool` | `true` if property `key` exists; `false` for anything that is not an object. | ✓ |
 | **Invert** | `Invert(obj:object) - object` | Returns a new object with keys and values swapped. Values are coerced to string to become keys. | — |
 | **IsFrozen** | `IsFrozen(obj:object) - bool` | `true` if `obj` was frozen by `Freeze`. `false` for an unfrozen object or a non-object. | ✓ |
 | **IsNil** | `IsNil(val:any) - bool` | `true` if `val` is `nil`. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Find`, `Array.Count`, etc. | ✓ |
@@ -4053,13 +4051,13 @@ ones already running. Sockets never pay this on any platform.
 | **Stderr** | `Stderr() - stream` | A `dup()` of the process stderr as a writable stream. Closing it (or its GC) leaves the real stderr open. | — |
 | **Stdin** | `Stdin() - stream` | A `dup()` of the process stdin as a readable stream. Closing it leaves the real stdin open. | — |
 | **Stdout** | `Stdout() - stream` | A `dup()` of the process stdout as a writable stream. Closing it leaves the real stdout open. | — |
-| **Tell** | `Tell(s:stream) - int` | Return current byte offset. | — |
+| **Tell** | `Tell(s:stream) - int` | Current byte offset, or `-1` when the stream cannot seek (pipe, socket, TLS). | — |
 | **Truncate** | `Truncate(s:stream, size:int) - bool` | Grow or shrink the file to exactly `size` bytes (`ftruncate`). Returns `true` on success. | — |
 | **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. | — | **On a socket this leaves the descriptor non-blocking for good** (deliberately — async slots re-arm it, and a socket may have read and write armed at once). A later *synchronous* `ReadBytes`/`ReadString` on that socket therefore ignores `SetTimeout` and comes up short the moment the next byte is still in flight, so loop until you have what you need rather than treating one short read as a dead peer. `ReadLine` is the exception: it parks until the rest of the line arrives.
-| **WriteAll** | `WriteAll(s:stream, data:string\|block) - bool` | Write all bytes, retrying on partial writes. | — |
-| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int). **A deadline that fires part-way still resolves to a count** - the bytes already delivered - so compare it with `len(data)` rather than treating any int as success, and resume from that offset if you need the rest; `Stream.LastError()` reports `1` for the short case and `0` for a complete one. `nil` means nothing was delivered at all, or a hard I/O error, where no resume is possible. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. | — |
+| **WriteAll** | `WriteAll(s:stream, data:string\|block) - bool` | Write all bytes, retrying on partial writes. A block writes all of its bytes: element count × element size. | ✓ |
+| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int). **A deadline that fires part-way still resolves to a count** - the bytes already delivered - so compare it with the size of `data` in bytes (`len(data)` for a string or a buffer of 1-byte elements) rather than treating any int as success, and resume from that offset if you need the rest; `Stream.LastError()` reports `1` for the short case and `0` for a complete one. `nil` means nothing was delivered at all, or a hard I/O error, where no resume is possible. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. | — |
 | **WriteByte** | `WriteByte(s:stream, value:int) - bool` | Write single byte. Returns `true` on success, `false` on a write error. | — |
-| **WriteBytes** | `WriteBytes(s:stream, buf:block, count:int) - int` | Write `count` bytes from block; returns bytes written. | — |
+| **WriteBytes** | `WriteBytes(s:stream, buf:block, count:int) - int` | Write `count` bytes from block, at most its size in bytes (element count × element size); returns bytes written, or `-1` on failure. | ✓ |
 | **WriteString** | `WriteString(s:stream, s:string) - bool` | Write the string's bytes — all of them, including any embedded NUL. | — |
 | **ReadU8** | `ReadU8(s:stream) - int` | Read one unsigned byte (0–255). Returns `nil` on EOF. | — |
 | **ReadU16** | `ReadU16(s:stream, bigEndian?:bool) - int` | Read 2 bytes as unsigned 16-bit integer. Default little-endian. | — |
@@ -4169,8 +4167,8 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **JsonPretty** | `JsonPretty(json:string) - string` | Pretty-print JSON with 2-space indent (same as `Json.Format(json)`); input that is not valid JSON is returned unchanged. | ✓ owned¹ |
 | **Left** | `Left(s:string, n:int) - string` | Return first `n` bytes. | ✓ owned¹ |
 | **Length** | `Length(s:string) - int` | Byte length of string. | ✓ |
-| **Levenshtein** | `Levenshtein(a:string, b:string) - int` | Edit distance (insert/delete/substitute) between the strings. Byte-based (equals character distance for ASCII). O(n·m) in C - use for "did you mean", fuzzy matching, dedup. Raises if `n*m` exceeds 100M rather than stalling the VM on huge inputs. | ✓ |
-| **NaturalCompare** | `NaturalCompare(a:string, b:string) - int` | Three-way compare with digit runs compared numerically, so `"file2" < "file10"`. ASCII case-insensitive with a byte-wise tiebreak (total, deterministic order). Sort naturally: `Array.Sort(arr, fn(x,y) { return String.NaturalCompare(x,y) < 0; })`. | ✓ |
+| **Levenshtein** | `Levenshtein(a:string, b:string) - int` | Edit distance (insert/delete/substitute) between the strings. Byte-based (equals character distance for ASCII). O(n·m) in C - use for "did you mean", fuzzy matching, dedup. Raises if `n*m` exceeds 100M rather than stalling the VM on huge inputs. `nil` counts as `""`. | ✓ |
+| **NaturalCompare** | `NaturalCompare(a:string, b:string) - int` | Three-way compare with digit runs compared numerically, so `"file2" < "file10"`. ASCII case-insensitive with a byte-wise tiebreak (total, deterministic order). Sort naturally: `Array.Sort(arr, fn(x,y) { return String.NaturalCompare(x,y) < 0; })`. `nil` counts as `""`. | ✓ |
 | **ProcessCallback** | `ProcessCallback(fn:function, s:string, len:int, cb:function) - nil` | Processes a string with your worker function `fn(s, len)`, then calls `cb(s, result)` when finished. A **read-only** kernel (reads `s[i]`, returns an `int`/`float` — a hash, checksum, count, or scan) runs on another CPU core when simple enough; a kernel that **writes** to the string runs normally (inline) so the string stays correct. Returns immediately. See `Buffer.ProcessCallback`. | ✓ |
 | **ProcessEvent** | `ProcessEvent(fn:function, s:string, len:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ |
 | **PadLeft** | `PadLeft(s:string, width:int, fill?:str\|char) - string` | Left-pad to `width` bytes with `fill` (default space; a string fill uses its first byte). `fill` must be ASCII - a NUL or non-ASCII fill returns `nil`. | ✓ owned¹ |
@@ -4199,10 +4197,10 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | -------- | --------- | ----------- | --- |
 | **Utf8ByteIndexOf** | `Utf8ByteIndexOf(s:string, cpIndex:int) - int` | Byte offset of codepoint at index `cpIndex`. | ✓ |
 | **Utf8Concat** | `Utf8Concat(...parts:str\|char\|int) - string` | Concatenate strings, chars, or codepoints. 1–5 args; `nil` parts are skipped. A codepoint of 0, a surrogate or one above U+10FFFF returns `nil`. | ✓ owned¹ |
-| **Utf8CpAt** | `Utf8CpAt(s:string, bytePos:int) - char` | Codepoint at byte position `bytePos`. | ✓ |
-| **Utf8CpNext** | `Utf8CpNext(s:string, bytePos:int) - int` | Byte offset of next codepoint after `bytePos`. | ✓ |
-| **Utf8GetCharAt** | `Utf8GetCharAt(s:string, cpIndex:int) - char` | Character at codepoint index `cpIndex`. | ✓ |
-| **Utf8Length** | `Utf8Length(s:string) - int` | Number of Unicode codepoints. | ✓ |
+| **Utf8CpAt** | `Utf8CpAt(s:string, bytePos:int) - char` | Codepoint at byte position `bytePos`: `'\0'` outside the string, U+FFFD for an invalid byte. | ✓ |
+| **Utf8CpNext** | `Utf8CpNext(s:string, bytePos:int) - int` | Byte offset of the codepoint after the one at `bytePos`: the length at the end, `0` for a negative `bytePos`. An invalid byte is one codepoint wide, so a walk from `0` takes exactly `Utf8Length` steps. | ✓ |
+| **Utf8GetCharAt** | `Utf8GetCharAt(s:string, cpIndex:int) - char` | Character at codepoint index `cpIndex`: `'\0'` outside the string, U+FFFD for an invalid byte. | ✓ |
+| **Utf8Length** | `Utf8Length(s:string) - int` | Number of Unicode codepoints; an invalid byte counts as one (U+FFFD). | ✓ |
 | **Utf8Substr** | `Utf8Substr(s:string, cpStart:int, cpLen:int) - string` | Substring by codepoint indices. `nil` when the range falls outside the string (unlike the clamping `Substr`) or on invalid UTF-8. | ✓ owned¹ |
 | **Utf8ToLower** | `Utf8ToLower(s:string) - string` | Unicode-aware lowercase: `Utf8ToLower("ÅÄÖ")` is `"åäö"`, where the ASCII-only `ToLower` leaves it unchanged. Uses the same tables as `Char.ToLower`; uncased codepoints pass through. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
 | **Utf8ToUpper** | `Utf8ToUpper(s:string) - string` | Unicode-aware uppercase: `Utf8ToUpper("åäö")` is `"ÅÄÖ"`. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
@@ -4245,7 +4243,7 @@ library.
 | **TimeZoneOffsetMins** | `TimeZoneOffsetMins(t?:int) - int` | Local timezone offset in minutes from UTC, DST-aware. Uses the current time, or the given timestamp. | ✓ |
 | **ToMillis** | `ToMillis(seconds:int) - int` | Convert whole seconds to milliseconds. Inverse of `FromMillis`. | ✓ |
 | **Weekday** | `Weekday(t:int) - int` | Day of week: 0=Sunday … 6=Saturday. | ✓ |
-| **Year** | `Year(t:int) - int` | Four-digit year. | ✓ |
+| **Year** | `Year(t:int) - int` | The year, e.g. 2026. Every timestamp has one: far past and future years are returned in full. | ✓ |
 
 ---
 
@@ -5037,7 +5035,7 @@ What runs natively inside a JIT function:
 | String comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`) | Both operands strings (variables, literals, or string fields of `this`) |
 | String concatenation `s + t` | Only as a local initializer, a return value, or a builtin-call argument |
 | `Buffer.Create` / `Array.Create` and other allocating builtins | Only as a local initializer or a return value (the frame owns and releases the result) |
-| `Array.Append` / `InsertAt` / `RemoveAt` / `Clear` / `Reserve` on a typed array | As a statement, on an `[int]`/`[float]`/`[char]`/`[bool]` array with a value of its element type; also `a = Array.Append(a, v)` and the method form `a.Append(v)` |
+| `Array.Append` / `InsertAt` / `RemoveAt` / `Clear` / `Reserve` on a typed array | On an `[int]`/`[float]`/`[char]`/`[bool]` array. `Append` and `InsertAt` as a statement, also `a = Array.Append(a, v)`; `RemoveAt`, `Clear` and `Reserve` anywhere. Each has the method form `a.Append(v)` |
 | Homogeneous `[int]` / `[float]` array literals with computed elements (`[x, y, x*2]`) | Only as a local initializer (allocated + filled as an owned typed array). Fully-constant literals are already const-folded |
 | `this.<field>` reads (scalar unboxed; string/array/block/object/float borrowed) and stores (int/bool/char inline, `float` copy-on-write, object fields borrowed) | Declared fields of the method's own class |
 | `<recv>.<field>` reads and stores, where `recv` is a **class-typed parameter** (`a: Vec2`) or a **`new`-pinned local** | The receiver's class is known at compile time; int/bool/char store inline, `float` fields store copy-on-write (no per-store allocation), object fields take a borrowed value |
@@ -5071,14 +5069,14 @@ A function that uses an unsupported construct is simply not JIT-compiled - it ru
 | --- | --- |
 | ✓ | Callable directly from JIT-compiled code (scalar result, arguments passed borrowed) |
 | ✓ owned¹ | Callable; the fresh object result must be consumed where the frame can track it: a local declaration's initializer, a return value, or a string-concatenation operand |
-| ✓ statement² | Callable as a statement (its result discarded) on an `[int]`/`[float]`/`[char]`/`[bool]` array with a value of the array's element type - a `[float]` array also takes an `int`. `a = Array.Append(a, v)` and the method form `a.Append(v)` count as statements |
+| ✓ statement² / ✓² | Callable on an `[int]`/`[float]`/`[char]`/`[bool]` array; on an array of any other element type the surrounding function falls back to the interpreter. `✓ statement²` only as a statement (its result discarded) - `a = Array.Append(a, v)` and the method form `a.Append(v)` count as statements. A value of another element type raises `Exception.TypeMismatch`, as in the interpreter; a `[float]` array also takes an `int` |
 | ✓ `--unsafe` | Callable, but the builtin itself requires unsafe mode (`--unsafe`) at runtime |
 | ✓ checked | Callable when its result initializes an annotated local, is assigned to one, or is returned from a typed function: the value is checked against the declared type exactly as in interpreted code |
 | — | Not callable natively - a call makes the surrounding function fall back to the interpreter |
 
 Callable builtins require every argument to be a JIT value (typed scalar, string, block, typed array, or `nil`); optional trailing arguments may be omitted exactly as in interpreted code. The core builtins `len(x)`, `int(x)`, and `float(x)` are also JIT-lowered.
 
-The array mutators behave exactly as in the interpreter, including growth past the capacity, an out-of-range `InsertAt`/`RemoveAt` index that changes nothing, and values across the full 64-bit `int` range. A value of another element type (a `float` for an `[int]` array) keeps the function interpreted, where the call raises `Exception.TypeMismatch`. A `foreach` variable over a typed array has the element type, so it can be passed to a mutator directly. A `foreach` over an array reads the array's length again before every step whenever its body calls something that can resize it, so elements appended or removed during the loop are seen exactly as the interpreter sees them.
+The array mutators behave exactly as in the interpreter, including growth past the capacity, an out-of-range `InsertAt`/`RemoveAt` index that changes nothing, and values across the full 64-bit `int` range. A value of another element type (a `float` for an `[int]` array) raises `Exception.TypeMismatch` in compiled code, as in the interpreter. A `foreach` variable over a typed array has the element type, so it can be passed to a mutator directly. A `foreach` over an array reads the array's length again before every step whenever its body calls something that can resize it, so elements appended or removed during the loop are seen exactly as the interpreter sees them.
 
 The practical rule remains: **assemble complex data structures in normal interpreter code; pass typed arrays, blocks, and scalars into JIT functions that do the heavy computation**.
 
@@ -5408,7 +5406,7 @@ JIT functions may call the following `Math.*` functions directly, at native spee
 | `Math.Gamma(x)` `Math.LnGamma(x)` | Gamma Γ(x) / log-gamma |
 | `Math.Erf(x)` `Math.Erfc(x)` | Error function / complementary error function |
 
-These always return a `float` and follow IEEE semantics (see the *Math* module below): domain errors return `NaN`, poles return `±Inf`. The fused form `a * b + c` is also recognised and optimised.
+These always return a `float` and follow IEEE semantics (see the *Math* module below): domain errors return `NaN`, poles return `±Inf`. `a * b + c` keeps both of its roundings in native code too; `Math.Fma(a, b, c)` is the single-rounding form.
 
 ```js
 fn gaussian(x: float, mu: float, sigma: float): float {
@@ -5427,15 +5425,13 @@ The following `Math.*` functions take and return `int` and run at native speed:
 | `Math.LeadingZeros(n)` | Count of leading zero bits (64-bit) |
 | `Math.TrailingZeros(n)` | Count of trailing zero bits (64-bit) |
 | `Math.BitLength(n)` | Bit length: floor(log2(abs(n))) + 1, or 0 for 0 |
-| `Math.Abs(n)` | Integer absolute value (int arg only) |
-| `Math.Sign(n)` | -1 / 0 / 1 (int arg only) |
+| `Math.Abs(n)` | Integer absolute value |
+| `Math.Sign(x)` | -1 / 0 / 1; `x` may also be a float |
 | `Math.Min(a, b)` | Integer minimum |
 | `Math.Max(a, b)` | Integer maximum |
 
-`Math.Abs`/`Sign`/`Min`/`Max` are `int|float -> int` in general; the native path
-applies only when **all** arguments are `int`. A call with a float argument runs
-on the interpreter. `Math.Lerp(a, b, t)` (float) also runs natively, computed as
-`a + (b - a) * t` with the same rounding as the interpreter.
+`Math.Lerp(a, b, t)` and `Math.Fma(a, b, c)` (float) also run natively, with the
+same rounding as the interpreter.
 
 ### Char builtins in JIT functions
 
