@@ -1,0 +1,2789 @@
+// =============================================================================
+// OpenApi.fls - OpenAPI 3 document builder and interactive API docs for Router.
+// Version: 1.0
+//
+// Describe your Router routes once and get a standards-conformant OpenAPI 3
+// document (JSON) plus a self-contained "Try it out" documentation page, with
+// no build step and no external dependency.
+//
+// Exports:
+//   OpenApi        - the document builder; also a documenting facade over Router
+//   OpenApiGroup   - prefix-scoped facade returned by OpenApi.Group()
+//
+// Usage:
+//   import { Router, Response } from library("Router", "1.0");
+//   import { OpenApi }          from library("OpenApi", "1.0");
+//
+//   let app = new Router();
+//   let api = OpenApi.For(app, { title: "Pet Store", version: "1.0.0" });
+//
+//   api.Schema("Pet", { id: "int", name: "string", "tag?": "string" });
+//
+//   api.Get("/pets", {
+//       summary:   "List pets",
+//       tags:      ["pets"],
+//       query:     { limit: { type: "int", description: "Page size" } },
+//       responses: { "200": "[Pet]" }
+//   }, fn(req) { return Response.Json(store.All()); });
+//
+//   api.Post("/pets", { summary: "Create a pet", body: "Pet", responses: { "201": "Pet" } },
+//            fn(req) { return Response.Json(store.Add(Json.Parse(req.body)), 201); });
+//
+//   api.Get("/pets/:id", { summary: "Fetch one pet", responses: { "200": "Pet", "404": "Not found" } },
+//           fn(req) { return Response.Json(store.Get(req.params.id)); });
+//
+//   Console.WriteLine(api.ToJson(true)); // the OpenAPI document, pretty-printed
+//   app.Listen(8080);
+//
+// Registering through the facade both documents the operation and registers
+// the handler on the Router, so the document and the routes cannot drift apart.
+// Pass no handler to document an operation registered elsewhere, or call
+// Discover() to pick up every Router route that has no documentation yet.
+//
+// OpenApi:
+//   new OpenApi(info?)            - info: object or a title string (see Info)
+//   OpenApi.For(router, info?)    - same, attached to a Router
+//   .Info(info)                   - merge into info: { title, version, description,
+//                                   termsOfService, contact, license }
+//   .Server(url, description?)    - add a servers[] entry
+//   .Tag(name, description?)      - declare a tag (order = order in the docs page)
+//   .ExternalDocs(url, description?)
+//   .Version(v)                   - "3.0.3" (default) or "3.1.0"
+//   .Extension(key, value)        - root-level "x-..." field
+//
+//   .Get / .Post / .Put / .Patch / .Delete / .Head(pattern, doc?, handler?)
+//       pattern: Router syntax - ":id" and "*" become "{id}" and "{path}"
+//       doc:     operation description (below); may be omitted
+//       handler: fn(req) -> response; registered on the attached Router
+//       Returns this, so calls chain.
+//   .Operation(method, pattern, doc?) - document without registering
+//   .Group(prefix, opts?)         - OpenApiGroup; opts: a tag name, or
+//                                   { tag, tags, description }
+//   .Discover(router?)            - document every route on the Router that is
+//                                   not documented yet (path, method, path params)
+//
+//   .Schema(name, schema)         - register components.schemas[name]; returns
+//                                   the $ref object for it
+//   .SchemaOf(name, instance, opts?) - infer a schema from a class instance's
+//                                   field values: int -> integer, float -> number,
+//                                   string, bool, array (items from the first
+//                                   element), object (recursive), nil -> nullable
+//                                   untyped. opts: { required: [names],
+//                                   descriptions: { field: text }, example: bool,
+//                                   description }
+//   OpenApi.Ref(name)             - { "$ref": "#/components/schemas/<name>" }
+//   .SecurityScheme(name, scheme) - register components.securitySchemes[name]
+//   OpenApi.Bearer(format?)       - { type: "http", scheme: "bearer", bearerFormat }
+//   OpenApi.Basic()               - { type: "http", scheme: "basic" }
+//   OpenApi.ApiKey(name, in?)     - { type: "apiKey", name, in: "header" }
+//   .Security(requirements)       - document-wide requirement: ["bearerAuth"] or
+//                                   [{ oauth: ["read"] }]; [] makes everything public
+//
+//   .Spec()                       - the document as a plain object
+//   .ToJson(pretty?)              - the document as JSON text. Keys come out in
+//                                   the conventional order (openapi, info, servers,
+//                                   tags, paths, components, ...), paths and
+//                                   schemas in registration order, so the output
+//                                   is stable and diff-friendly.
+//
+//   .Serve(opts?)                 - register GET <specPath> (the document, with
+//                                   ETag / 304 and CORS "*") and GET <docsPath>
+//                                   (the docs page) on the attached Router
+//       opts: { specPath: "/openapi.json", docsPath: "/docs",
+//               ui: "builtin" | "swagger" | "redoc" | false,
+//               title, cdn, pretty: true, cors: true }
+//       "builtin" is the self-contained explorer described below; "swagger" and
+//       "redoc" serve a small page that loads Swagger UI / ReDoc from a CDN (set
+//       cdn to point elsewhere). Anything registered or changed after Serve()
+//       is picked up by the next request.
+//   .Unserve()                    - stop answering; both routes then return 410
+//   OpenApi.DocsHtml(specUrl, opts?)    - the explorer page for any spec URL;
+//                                         opts: { title }
+//   OpenApi.SwaggerHtml(specUrl, opts?) - Swagger UI shell; opts: { title, cdn }
+//   OpenApi.RedocHtml(specUrl, opts?)   - ReDoc shell;      opts: { title, cdn }
+//   OpenApi.Load(json, router?)   - an OpenApi from an existing document (JSON
+//                                   text or parsed object): extend it, Serve()
+//                                   docs for it, or just reformat it
+//   OpenApi.LoadFile(path, router?)
+//
+// The explorer page: operations grouped by tag with a filter box, parameter
+// tables with inputs, a request-body editor prefilled from the schema,
+// response schemas with generated examples, a schema browser, an Authorize
+// panel for every security scheme (values stay in the browser's localStorage)
+// and "Send request", which calls the API from the browser and shows status,
+// headers, body, timing and the equivalent curl command. Requests go to the
+// page's own origin unless a server from servers[] is picked, so no CORS setup
+// is needed for the common case. Everything is inlined: no CDN, no build step.
+//
+//   .Validate(opts?)              - Router middleware: app.Use(api.Validate()).
+//                                   Checks every documented request before its
+//                                   handler runs - path, query, header and
+//                                   cookie parameters (coerced to the declared
+//                                   type: "42" becomes 42) and the JSON or form
+//                                   body against its schema. A violation answers
+//                                   400 with { error, details: [{ path, message }] }
+//                                   and the handler never runs. The handler gets
+//                                   req.validated = { params, query, headers,
+//                                   cookies, body } with typed values.
+//       opts: { status: 400, coerce: true (write typed values back to
+//               req.params / req.query), responses: false (also check the
+//               handler's answer: an undeclared status or a body that does not
+//               match its schema becomes a 500 naming the mismatch) }
+//       Undocumented routes pass through untouched.
+//   .Learn(opts?)                 - Router middleware that fills the document
+//                                   in from live traffic: query parameters,
+//                                   request-body and response schemas per
+//                                   status code, all marked "x-learned": true
+//                                   and widened as more samples arrive.
+//                                   Declared schemas are never changed. Call
+//                                   Discover() first so every route has an
+//                                   operation; open the docs page while using
+//                                   the API and watch it fill in.
+//       opts: { maxSamples: 50, examples: false, query: true, bodies: true,
+//               responses: true }
+//   .Contract(opts?)              - calls every documented operation on the
+//                                   attached Router (no sockets) with values
+//                                   derived from the document - path and
+//                                   required query parameters from examples or
+//                                   schemas, a body generated from the request
+//                                   schema - and checks that each answer is a
+//                                   declared status whose JSON body matches the
+//                                   declared schema.
+//       returns { ok, passed, failed, results: [{ method, path, request,
+//                 operationId, status, ok, errors: [{ path, message }] }] }
+//       opts: { values: { paramName: value }, headers: { "X-Api-Key": "..." },
+//               bodies: { operationId: body }, only: [operationId], skip: [...] }
+//   OpenApi.ValidateValue(value, schema, schemas?) - the validator on its own:
+//       [{ path, message }], empty when valid. Supports type (incl. 3.1 arrays
+//       and "null"), nullable, enum, const, required, properties,
+//       additionalProperties, items, min/max for length, items, properties and
+//       numbers (3.0 boolean and 3.1 numeric exclusive bounds), multipleOf,
+//       pattern, uniqueItems, allOf / anyOf / oneOf / not, $ref into
+//       components.schemas, and the formats date, date-time, uuid, email, uri,
+//       ipv4. Class instances validate by their fields.
+//
+// Operation doc object - every key is optional:
+//   summary, description, operationId, deprecated, tags ("pets" or ["pets"])
+//   params:     { id: "int", ... }          path parameters (name -> type/schema)
+//   query:      { limit: "int?", q: {...} } query parameters
+//   headers:    { "X-Trace": "string" }     header parameters
+//   cookies:    { session: "string" }       cookie parameters
+//   parameters: [ ...full OpenAPI parameter objects... ]  appended as-is
+//       A parameter value is a type shorthand (below) or an object:
+//       { type, schema, description, required, deprecated, example, enum, ... }
+//       Path parameters are always required; other "?" types are optional.
+//   body:       "Pet" | { schema, description, required, contentType, example }
+//       requestBody; contentType defaults to application/json
+//   responses:  { "200": "Pet", "201": { schema: "Pet", description: "Created" },
+//                 404: "Not found", "204": nil }
+//       A string that names a type or schema is the response schema; any other
+//       string is the description. The description defaults to the standard
+//       reason phrase. Long form: { description, schema, contentType, headers,
+//       example }. Without responses the operation gets 200 "OK".
+//   security:   false (public) | ["bearerAuth"] | [{ oauth: ["scope"] }]
+//   Any "x-..." key, plus externalDocs, servers and callbacks pass through.
+//
+// Type shorthand (accepted wherever a schema is expected):
+//   "int" "integer" "int32" "int64" "float" "double" "number" "string" "bool"
+//   "boolean" "any" "object" "date" "datetime" "uuid" "email" "uri" "binary"
+//   "Pet"        - $ref to components.schemas.Pet (any other capitalised name)
+//   "[Pet]"      - array of Pet;  "[int]" - array of integers
+//   "string?"    - optional and nullable
+//   { id: "int", "tag?": "string" } - inline object; keys are required unless
+//                the key or its type ends in "?"
+//   { type: "string", enum: ["a", "b"] } - a schema object is used as-is, with
+//                shorthand expanded inside items / properties / oneOf / ...
+//
+// OpenApiGroup (from Group):
+//   .Get / .Post / .Put / .Patch / .Delete(pattern, doc?, handler?)
+//   .Use(middleware)  - group-scoped Router middleware
+//   .Group(prefix, opts?)
+//   Operations inherit the group's tags when the doc names none.
+// =============================================================================
+
+// Preferred key order for JSON output. Anything not listed sorts after these,
+// alphabetically, so two builds of the same document are byte-identical.
+global _KEY_ORDER = [
+    "openapi", "name", "url", "in", "title", "version", "info", "servers", "tags",
+    "summary", "description", "termsOfService", "contact", "license", "email",
+    "operationId", "deprecated", "required", "schema", "externalDocs", "paths",
+    "webhooks", "components", "schemas", "parameters", "requestBody", "requestBodies",
+    "responses", "headers", "content", "examples", "securitySchemes", "security",
+    "links", "callbacks", "$ref", "type", "format", "nullable", "enum", "const",
+    "default", "example", "properties", "additionalProperties", "items", "allOf",
+    "oneOf", "anyOf", "not", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "pattern",
+    "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties",
+    "readOnly", "writeOnly", "scheme", "bearerFormat", "flows", "openIdConnectUrl",
+    "style", "explode", "allowEmptyValue", "allowReserved"
+];
+global _RANK = nil;
+
+// Inside a schema (or security scheme) object the natural reading order
+// differs: type first, then shape, then constraints, examples last.
+global _KEY_ORDER_SCHEMA = [
+    "$ref", "title", "type", "name", "in", "scheme", "bearerFormat", "format", "nullable",
+    "description", "deprecated", "readOnly", "writeOnly", "properties", "required",
+    "additionalProperties", "items", "allOf", "oneOf", "anyOf", "not", "discriminator",
+    "enum", "const", "default", "minimum", "maximum", "exclusiveMinimum",
+    "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "pattern", "minItems",
+    "maxItems", "uniqueItems", "minProperties", "maxProperties", "example", "examples",
+    "xml", "externalDocs"
+];
+global _RANK_SCHEMA = nil;
+
+// Methods in the order a path item conventionally lists them.
+global _METHOD_ORDER = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
+
+// Documents currently served through Serve(), by key. The route handlers hold
+// only the key, so a Router never references the OpenApi that references it.
+global _servedRegistry = {};
+global _servedNext:int = 1;
+
+global _STATUS_TEXT = {
+    "100": "Continue", "101": "Switching Protocols",
+    "200": "OK", "201": "Created", "202": "Accepted", "204": "No Content",
+    "206": "Partial Content", "301": "Moved Permanently", "302": "Found",
+    "303": "See Other", "304": "Not Modified", "307": "Temporary Redirect",
+    "308": "Permanent Redirect", "400": "Bad Request", "401": "Unauthorized",
+    "402": "Payment Required", "403": "Forbidden", "404": "Not Found",
+    "405": "Method Not Allowed", "406": "Not Acceptable", "408": "Request Timeout",
+    "409": "Conflict", "410": "Gone", "412": "Precondition Failed",
+    "413": "Payload Too Large", "415": "Unsupported Media Type",
+    "422": "Unprocessable Entity", "429": "Too Many Requests",
+    "500": "Internal Server Error", "501": "Not Implemented",
+    "502": "Bad Gateway", "503": "Service Unavailable", "504": "Gateway Timeout",
+    "default": "Unexpected error"
+};
+
+// Shorthand type names and the schema each expands to.
+global _TYPE_MAP = {
+    "int":      { type: "integer" },
+    "integer":  { type: "integer" },
+    "int32":    { type: "integer", format: "int32" },
+    "int64":    { type: "integer", format: "int64" },
+    "float":    { type: "number" },
+    "double":   { type: "number", format: "double" },
+    "number":   { type: "number" },
+    "string":   { type: "string" },
+    "str":      { type: "string" },
+    "bool":     { type: "boolean" },
+    "boolean":  { type: "boolean" },
+    "any":      {},
+    "object":   { type: "object" },
+    "array":    { type: "array", items: {} },
+    "date":     { type: "string", format: "date" },
+    "datetime": { type: "string", format: "date-time" },
+    "date-time": { type: "string", format: "date-time" },
+    "uuid":     { type: "string", format: "uuid" },
+    "email":    { type: "string", format: "email" },
+    "uri":      { type: "string", format: "uri" },
+    "url":      { type: "string", format: "uri" },
+    "binary":   { type: "string", format: "binary" },
+    "byte":     { type: "string", format: "byte" },
+    "password": { type: "string", format: "password" }
+};
+
+// Formats the validator checks; anything else passes.
+global _FORMAT_RE = {
+    "date":      """^[0-9]{4}-[0-9]{2}-[0-9]{2}$""",
+    "date-time": """^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?([Zz]|[+-][0-9]{2}:?[0-9]{2})?$""",
+    "uuid":      """^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$""",
+    "email":     """^[^@\s]+@[^@\s]+\.[^@\s]+$""",
+    "uri":       """^[A-Za-z][A-Za-z0-9+.-]*:[^\s]*$""",
+    "ipv4":      """^([0-9]{1,3}\.){3}[0-9]{1,3}$"""
+};
+
+fn _fail(errors:array, path:string, message:string) {
+    Array.Append(errors, { path: path, message: message });
+}
+
+// Keys whose presence marks an object as a schema rather than a property map.
+global _SCHEMA_MARKERS = ["$ref", "type", "enum", "oneOf", "anyOf", "allOf", "not",
+                          "properties", "items", "additionalProperties", "const"];
+
+fn _rankOf(k:string): int {
+    if (_RANK == nil) {
+        _RANK = {};
+        foreach (key, i in _KEY_ORDER) {
+            if (!Object.HasKey(_RANK, key)) { _RANK[key] = i; }
+        }
+    }
+    return Object.TryGet(_RANK, k, 100000);
+}
+
+fn _rankSchemaOf(k:string): int {
+    if (_RANK_SCHEMA == nil) {
+        _RANK_SCHEMA = {};
+        foreach (key, i in _KEY_ORDER_SCHEMA) {
+            if (!Object.HasKey(_RANK_SCHEMA, key)) { _RANK_SCHEMA[key] = i; }
+        }
+    }
+    return Object.TryGet(_RANK_SCHEMA, k, 100000);
+}
+
+fn _keyBefore(a, b): bool {
+    let ra:int = _rankOf(a);
+    let rb:int = _rankOf(b);
+    if (ra != rb) { return ra < rb; }
+    return a < b;
+}
+
+fn _schemaKeyBefore(a, b): bool {
+    let ra:int = _rankSchemaOf(a);
+    let rb:int = _rankSchemaOf(b);
+    if (ra != rb) { return ra < rb; }
+    return a < b;
+}
+
+fn _sortedKeys(o): array { return Array.Sort(Object.Keys(o), fn(a, b) => a < b); }
+
+fn _htmlEscape(s:string): string {
+    var t = String.Replace(s, "&", "&amp;");
+    t = String.Replace(t, "<", "&lt;");
+    t = String.Replace(t, ">", "&gt;");
+    t = String.Replace(t, "\"", "&quot;");
+    return String.Replace(t, "'", "&#39;");
+}
+
+// A JSON string literal that cannot close a surrounding <script> block.
+fn _jsString(s:string): string {
+    return String.Replace(Json.Stringify(s), "<", "\\u003c");
+}
+
+// Route handlers registered by Serve() land here with the registry key.
+fn _serveFromRegistry(key:string, what:string, req) {
+    let api = Object.TryGet(_servedRegistry, key, nil);
+    if (api == nil) {
+        return { status: 410, headers: { "Content-Type": "application/json" },
+                 body: Json.Stringify({ error: "This API documentation is no longer served" }) };
+    }
+    return (what == "spec") ? api._serveSpec(req) : api._serveDocs(req);
+}
+
+fn _pascal(s:string): string {
+    if (String.Length(s) == 0) { return s; }
+    return String.ToUpper(String.Substr(s, 0, 1)) + String.Substr(s, 1);
+}
+
+// "Pet?" -> "Pet"; anything else unchanged.
+fn _baseWord(t:string): string {
+    if (String.EndsWith(t, "?")) { return String.Substr(t, 0, String.Length(t) - 1); }
+    return t;
+}
+
+fn _isSchemaObject(o): bool {
+    foreach (k in _SCHEMA_MARKERS) {
+        if (Object.HasKey(o, k)) { return true; }
+    }
+    return false;
+}
+
+// True for a string that the shorthand grammar can turn into a schema: a known
+// type name, "[T]", or a capitalised schema name - each optionally ending in "?".
+fn _isTypeWord(s:string): bool {
+    var t = s;
+    if (String.EndsWith(t, "?")) { t = String.Substr(t, 0, String.Length(t) - 1); }
+    if (String.StartsWith(t, "[") && String.EndsWith(t, "]")) {
+        return _isTypeWord(String.Substr(t, 1, String.Length(t) - 2));
+    }
+    if (Object.HasKey(_TYPE_MAP, t)) { return true; }
+    return Regex.IsMatch(t, """^[A-Z][A-Za-z0-9_.]*$""");
+}
+
+// =============================================================================
+// _Ordered - an object that remembers insertion order, for paths and components
+// =============================================================================
+
+class _Ordered
+{
+    let keys:array = [];
+    let map        = nil;
+
+    fn Constructor() {
+        keys = [];
+        map  = {};
+    }
+
+    fn Set(k:string, v) {
+        if (!Object.HasKey(map, k)) { Array.Append(keys, k); }
+        map[k] = v;
+    }
+
+    fn Get(k:string) { return Object.TryGet(map, k, nil); }
+    fn Has(k:string): bool { return Object.HasKey(map, k); }
+    fn Count(): int { return len(keys); }
+}
+
+// Deep-copies a document tree, turning every _Ordered into a plain object.
+fn _plain(v) {
+    if (v == nil) { return nil; }
+    if (Type.IsArray(v)) {
+        let out = [];
+        foreach (e in v) { Array.Append(out, _plain(e)); }
+        return out;
+    }
+    if (Class.IsInstance(v) && v is _Ordered) {
+        let o = {};
+        foreach (k in v.keys) { o[k] = _plain(v.map[k]); }
+        return o;
+    }
+    if (Type.IsObject(v)) {
+        let o = {};
+        foreach (val, k in v) { o[k] = _plain(val); }
+        return o;
+    }
+    return v;
+}
+
+// =============================================================================
+// JSON writer - conventional key order, insertion order for _Ordered, optional
+// two-space pretty printing. Scalars are escaped by Json.Stringify.
+// =============================================================================
+
+fn _writeObj(keys:array, src, pretty:bool, depth:int, out:array) {
+    if (len(keys) == 0) { Array.Append(out, "{}"); return; }
+    let pad     = pretty ? String.Repeat("  ", depth + 1) : "";
+    let padEnd  = pretty ? String.Repeat("  ", depth) : "";
+    let nl      = pretty ? "\n" : "";
+    let colon   = pretty ? ": " : ":";
+    Array.Append(out, "{" + nl);
+    foreach (k, i in keys) {
+        Array.Append(out, pad + Json.Stringify(k) + colon);
+        _writeVal(src[k], pretty, depth + 1, out);
+        Array.Append(out, (i < len(keys) - 1 ? "," : "") + nl);
+    }
+    Array.Append(out, padEnd + "}");
+}
+
+fn _writeVal(v, pretty:bool, depth:int, out:array) {
+    if (v == nil) { Array.Append(out, "null"); return; }
+    if (Type.IsString(v) || Type.IsBool(v) || Type.IsInt(v) || Type.IsFloat(v)) {
+        Array.Append(out, Json.Stringify(v));
+        return;
+    }
+    if (Type.IsArray(v)) {
+        if (len(v) == 0) { Array.Append(out, "[]"); return; }
+        let pad    = pretty ? String.Repeat("  ", depth + 1) : "";
+        let padEnd = pretty ? String.Repeat("  ", depth) : "";
+        let nl     = pretty ? "\n" : "";
+        Array.Append(out, "[" + nl);
+        foreach (e, i in v) {
+            Array.Append(out, pad);
+            _writeVal(e, pretty, depth + 1, out);
+            Array.Append(out, (i < len(v) - 1 ? "," : "") + nl);
+        }
+        Array.Append(out, padEnd + "]");
+        return;
+    }
+    if (Class.IsInstance(v) && v is _Ordered) {
+        _writeObj(v.keys, v.map, pretty, depth, out);
+        return;
+    }
+    if (Type.IsObject(v)) {
+        let keys = Array.Sort(Object.Keys(v), _isSchemaObject(v) ? _schemaKeyBefore : _keyBefore);
+        _writeObj(keys, v, pretty, depth, out);
+        return;
+    }
+    if (Class.IsInstance(v)) {
+        _writeVal(Json.Parse(Json.Stringify(v)), pretty, depth, out);
+        return;
+    }
+    Array.Append(out, "null");
+}
+
+fn _writeJson(v, pretty:bool): string {
+    let out = [];
+    _writeVal(v, pretty, 0, out);
+    return String.Join(out, "");
+}
+
+// =============================================================================
+// Explorer page assets. Each literal stays under the 64 KB string cap; the
+// page is assembled by OpenApi.DocsHtml.
+// =============================================================================
+
+global _DOCS_CSS = """
+:root {
+  --bg: #f6f7f9; --fg: #1f2430; --muted: #6b7280; --line: #dfe3ea; --card: #ffffff;
+  --accent: #2f6fed; --accent-fg: #ffffff; --code-bg: #eef1f6; --side-bg: #ffffff;
+  --get: #2f80ed; --post: #27ae60; --put: #f2994a; --patch: #16a5a5; --delete: #eb5757;
+  --head: #7b8794; --options: #7b8794; --trace: #7b8794;
+  --ok: #1f9d55; --warn: #c27c0e; --err: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151c; --fg: #e6e9ef; --muted: #98a2b3; --line: #2a3140; --card: #1a1f2a;
+    --accent: #6ea0ff; --accent-fg: #0b1020; --code-bg: #232a38; --side-bg: #161b25;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .path, .method, .nav-path, .sch-type, .sch-name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
+pre { background: var(--code-bg); padding: 10px 12px; border-radius: 6px; overflow: auto; font-size: 13px; line-height: 1.45; margin: 8px 0; white-space: pre-wrap; word-break: break-word; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 18px; margin: 28px 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+h4 { margin: 18px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.muted { color: var(--muted); font-size: 13px; }
+.badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px; background: var(--code-bg); color: var(--muted); margin-left: 6px; vertical-align: middle; }
+.badge.warn { background: #fdf1d6; color: #8a5a00; }
+.badge.ver { background: var(--accent); color: var(--accent-fg); }
+.loading, .error { padding: 60px 20px; text-align: center; color: var(--muted); }
+.error h1 { color: var(--err); }
+
+.top { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; justify-content: space-between; padding: 10px 20px; background: var(--card); border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.spec-link { font-size: 13px; margin-left: 8px; }
+.tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.tools select, .tools input, .try input, .try select, .try textarea, .auth input {
+  font: inherit; font-size: 13px; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+}
+.try textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; resize: vertical; }
+.tools .filter { min-width: 220px; }
+button { font: inherit; font-size: 13px; cursor: pointer; border-radius: 6px; padding: 6px 12px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+button.send { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+button:hover { filter: brightness(0.96); }
+
+.layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 0; }
+.side { position: sticky; top: 57px; height: calc(100vh - 57px); overflow: auto; padding: 14px 10px 30px; background: var(--side-bg); border-right: 1px solid var(--line); }
+.nav-group { margin-bottom: 14px; }
+.nav-tag { display: block; font-weight: 600; font-size: 13px; padding: 4px 8px; color: var(--fg); }
+.nav-op { display: flex; gap: 8px; align-items: center; padding: 4px 8px; border-radius: 6px; color: var(--fg); font-size: 12.5px; }
+.nav-op:hover { background: var(--code-bg); text-decoration: none; }
+.nav-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.main { padding: 10px 28px 60px; min-width: 0; }
+.intro { margin-top: 14px; }
+.md p { margin: 6px 0; }
+.foot { padding: 20px; text-align: center; color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); }
+
+.method { display: inline-block; min-width: 62px; text-align: center; font-weight: 700; font-size: 12px; padding: 5px 8px; border-radius: 5px; color: #fff; }
+.method.mini { min-width: 46px; font-size: 10px; padding: 2px 4px; }
+.method.get { background: var(--get); } .method.post { background: var(--post); } .method.put { background: var(--put); }
+.method.patch { background: var(--patch); } .method.delete { background: var(--delete); } .method.head { background: var(--head); }
+.method.options { background: var(--options); } .method.trace { background: var(--trace); }
+
+.op { background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--head); border-radius: 8px; margin: 10px 0; }
+.op-get { border-left-color: var(--get); } .op-post { border-left-color: var(--post); } .op-put { border-left-color: var(--put); }
+.op-patch { border-left-color: var(--patch); } .op-delete { border-left-color: var(--delete); }
+.op-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 10px 14px; cursor: pointer; user-select: none; }
+.op-head .path { font-weight: 600; font-size: 14px; word-break: break-all; }
+.op-head .summary { color: var(--muted); font-size: 14px; flex: 1 1 200px; }
+.op-head .lock { font-size: 13px; }
+.op-body { display: none; padding: 4px 16px 18px; border-top: 1px solid var(--line); }
+.op.open .op-body { display: block; }
+
+table.params { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.params th, table.params td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.params th { font-size: 12px; color: var(--muted); font-weight: 600; }
+table.params input, table.params select { width: 100%; min-width: 120px; }
+.sch-req { color: var(--err); font-weight: 700; margin-left: 2px; }
+.sch { margin: 2px 0; }
+.sch-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; font-size: 13.5px; padding: 2px 0; }
+.sch-name { font-weight: 600; }
+.sch-type { color: var(--accent); font-size: 12.5px; }
+.sch-enum { color: var(--muted); font-size: 12px; }
+.sch-desc { color: var(--muted); font-size: 13px; flex-basis: 100%; }
+.sch-children, .sch details { margin-left: 18px; padding-left: 10px; border-left: 1px dashed var(--line); }
+.sch summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+details.schema-box { margin: 6px 0; }
+details.schema-box > summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.schema-card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; margin: 8px 0; }
+.schema-card > summary { cursor: pointer; display: flex; gap: 10px; align-items: center; }
+
+.responses .resp { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.resp-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.ctype-label { font-size: 12px; }
+.resp-headers { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.status { font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.status.s1, .status.s3 { color: var(--muted); } .status.s2 { color: var(--ok); } .status.s4 { color: var(--warn); } .status.s5 { color: var(--err); }
+
+.actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+.actions .target { color: var(--muted); font-size: 12px; margin-left: auto; }
+.curl { display: none; }
+.result-head { display: flex; gap: 12px; align-items: baseline; margin-top: 12px; }
+.resp-hdrs summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.resp-body { max-height: 480px; }
+
+.auth { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; margin: 14px 0; }
+.auth summary { cursor: pointer; font-weight: 600; }
+.auth-row { display: grid; grid-template-columns: 220px 1fr; gap: 6px 14px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13.5px; }
+.auth-row .muted { grid-column: 2; }
+.meta { margin: 4px 0 0; }
+
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  .side { display: none; }
+  .main { padding: 10px 14px 40px; }
+  .auth-row { grid-template-columns: 1fr; }
+}
+""";
+
+global _DOCS_JS = """
+(function () {
+  "use strict";
+  var CFG = window.__OPENAPI__ || {};
+  var SPEC_URL = CFG.specUrl || "/openapi.json";
+  var STORE_KEY = "openapi-docs:" + SPEC_URL;
+  var METHODS = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
+  var spec = null;
+  var state = { server: "", auth: {}, filter: "" };
+
+  function loadState() {
+    try {
+      var s = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
+      if (s && typeof s === "object") { state.server = s.server || ""; state.auth = s.auth || {}; }
+    } catch (e) { /* storage unavailable */ }
+  }
+  function saveState() {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify({ server: state.server, auth: state.auth })); } catch (e) { /* ignore */ }
+  }
+
+  // h(tag, attrs, ...children): attrs may hold class, text, html, dataset, on<event> handlers.
+  function h(tag, attrs) {
+    var e = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        var v = attrs[k];
+        if (v === null || v === undefined || v === false) return;
+        if (k === "class") e.className = v;
+        else if (k === "text") e.textContent = v;
+        else if (k === "html") e.innerHTML = v;
+        else if (k === "dataset") Object.keys(v).forEach(function (d) { e.dataset[d] = v[d]; });
+        else if (k.slice(0, 2) === "on") e.addEventListener(k.slice(2), v);
+        else e.setAttribute(k, v === true ? "" : v);
+      });
+    }
+    for (var i = 2; i < arguments.length; i++) append(e, arguments[i]);
+    return e;
+  }
+  function append(e, c) {
+    if (c === null || c === undefined || c === false) return;
+    if (Array.isArray(c)) { c.forEach(function (x) { append(e, x); }); return; }
+    if (typeof c === "string" || typeof c === "number") { e.appendChild(document.createTextNode(String(c))); return; }
+    e.appendChild(c);
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  // Minimal markdown: paragraphs, line breaks, `code`, **bold**, [text](http-link).
+  function md(text) {
+    if (!text) return null;
+    var html = esc(text)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+      .replace(/\n\n+/g, "</p><p>")
+      .replace(/\n/g, "<br>");
+    return h("div", { class: "md", html: "<p>" + html + "</p>" });
+  }
+
+  function components(kind) { return (spec.components && spec.components[kind]) || {}; }
+  function refName(ref) { return decodeURIComponent(String(ref).split("/").pop()); }
+  function resolve(schema) {
+    var guard = 0;
+    while (schema && schema.$ref && guard++ < 32) schema = components("schemas")[refName(schema.$ref)];
+    return schema || {};
+  }
+  function resolveIn(kind, obj) { return obj && obj.$ref ? (components(kind)[refName(obj.$ref)] || obj) : obj; }
+
+  function typeLabel(schema) {
+    if (!schema) return "any";
+    if (schema.$ref) return refName(schema.$ref);
+    var s = schema;
+    if (s.allOf && s.allOf.length === 1 && s.allOf[0].$ref) return refName(s.allOf[0].$ref) + (s.nullable ? " | null" : "");
+    if (s.oneOf) return s.oneOf.map(typeLabel).join(" | ");
+    if (s.anyOf) return s.anyOf.map(typeLabel).join(" | ");
+    if (s.allOf) return s.allOf.map(typeLabel).join(" & ");
+    var t = Array.isArray(s.type) ? s.type.join(" | ") : s.type;
+    if (t === "array") return typeLabel(s.items) + "[]";
+    if (!t) return s.properties ? "object" : (s.enum ? "enum" : "any");
+    var out = t;
+    if (s.format) out += "(" + s.format + ")";
+    if (s.nullable) out += " | null";
+    return out;
+  }
+
+  function exampleOf(schema, depth) {
+    depth = depth || 0;
+    if (!schema || depth > 12) return null;
+    if (schema.$ref) return exampleOf(resolve(schema), depth + 1);
+    if (schema.example !== undefined) return schema.example;
+    if (schema.default !== undefined) return schema.default;
+    if (schema.enum && schema.enum.length) return schema.enum[0];
+    if (schema.allOf) {
+      var merged = {};
+      schema.allOf.forEach(function (a) {
+        var v = exampleOf(a, depth + 1);
+        if (v && typeof v === "object" && !Array.isArray(v)) Object.assign(merged, v);
+      });
+      return merged;
+    }
+    if (schema.oneOf) return exampleOf(schema.oneOf[0], depth + 1);
+    if (schema.anyOf) return exampleOf(schema.anyOf[0], depth + 1);
+    var t = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+    if (t === "array") { var item = exampleOf(schema.items, depth + 1); return item === null ? [] : [item]; }
+    if (t === "object" || schema.properties) {
+      var o = {}; var props = schema.properties || {};
+      Object.keys(props).forEach(function (k) { o[k] = exampleOf(props[k], depth + 1); });
+      return o;
+    }
+    if (t === "integer") return 0;
+    if (t === "number") return 0;
+    if (t === "boolean") return true;
+    if (t === "string") {
+      var f = schema.format;
+      if (f === "date") return "2024-01-01";
+      if (f === "date-time") return "2024-01-01T12:00:00Z";
+      if (f === "uuid") return "00000000-0000-0000-0000-000000000000";
+      if (f === "email") return "user@example.com";
+      if (f === "uri") return "https://example.com";
+      if (f === "binary") return "(binary)";
+      return "string";
+    }
+    return null;
+  }
+
+  function constraints(s) {
+    var parts = [];
+    ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "minLength", "maxLength", "pattern",
+     "minItems", "maxItems", "uniqueItems", "multipleOf"].forEach(function (k) {
+      if (s[k] !== undefined) parts.push(k + ": " + JSON.stringify(s[k]));
+    });
+    return parts.length ? h("span", { class: "sch-enum", text: parts.join(", ") }) : null;
+  }
+
+  // Recursive schema view. opts: { name, required, depth, seen }
+  function schemaTree(schema, opts) {
+    opts = opts || {};
+    var depth = opts.depth || 0, seen = opts.seen || [];
+    var refN = schema && schema.$ref ? refName(schema.$ref) : null;
+    var s = resolve(schema);
+    var row = h("div", { class: "sch-row" },
+      opts.name !== undefined ? h("span", { class: "sch-name", text: opts.name }) : null,
+      opts.required ? h("span", { class: "sch-req", title: "required", text: "*" }) : null,
+      refN ? h("a", { class: "sch-type sch-ref", href: "#schema/" + encodeURIComponent(refN), text: refN })
+           : h("span", { class: "sch-type", text: typeLabel(s) }),
+      s.deprecated ? h("span", { class: "badge warn", text: "deprecated" }) : null,
+      s.readOnly ? h("span", { class: "badge", text: "read-only" }) : null,
+      s.writeOnly ? h("span", { class: "badge", text: "write-only" }) : null,
+      s.enum ? h("span", { class: "sch-enum", text: "enum: " + s.enum.map(function (v) { return JSON.stringify(v); }).join(", ") }) : null,
+      s.default !== undefined ? h("span", { class: "sch-enum", text: "default: " + JSON.stringify(s.default) }) : null,
+      constraints(s),
+      s.description ? h("span", { class: "sch-desc", text: s.description }) : null);
+    var node = h("div", { class: "sch" + (depth ? " sch-nested" : "") }, row);
+    if (refN && seen.indexOf(refN) >= 0) { row.appendChild(h("span", { class: "badge", text: "recursive" })); return node; }
+    var seen2 = refN ? seen.concat([refN]) : seen;
+    var children = [];
+    var props = s.properties, req = s.required || [];
+    if (props) Object.keys(props).forEach(function (k) {
+      children.push(schemaTree(props[k], { name: k, required: req.indexOf(k) >= 0, depth: depth + 1, seen: seen2 }));
+    });
+    if (s.additionalProperties && typeof s.additionalProperties === "object")
+      children.push(schemaTree(s.additionalProperties, { name: "{key}", depth: depth + 1, seen: seen2 }));
+    if (s.items) children.push(schemaTree(s.items, { name: "[items]", depth: depth + 1, seen: seen2 }));
+    ["allOf", "oneOf", "anyOf"].forEach(function (comb) {
+      if (s[comb]) s[comb].forEach(function (alt, i) {
+        children.push(schemaTree(alt, { name: comb + "[" + i + "]", depth: depth + 1, seen: seen2 }));
+      });
+    });
+    if (children.length) {
+      if (depth >= 1 && props) {
+        node.appendChild(h("details", { open: depth < 2 }, h("summary", { text: Object.keys(props).length + " properties" }), children));
+      } else {
+        node.appendChild(h("div", { class: "sch-children" }, children));
+      }
+    }
+    return node;
+  }
+
+  function allOps() {
+    var ops = [], paths = spec.paths || {};
+    Object.keys(paths).forEach(function (path) {
+      var item = paths[path] || {};
+      METHODS.forEach(function (m) {
+        if (item[m]) ops.push({ path: path, method: m, op: item[m], pathItem: item });
+      });
+    });
+    return ops;
+  }
+  // Groups by first tag; declared tag order first, then first-seen order.
+  function groupOps(ops) {
+    var declared = (spec.tags || []).map(function (t) { return t.name; });
+    var groups = {}, names = [];
+    ops.forEach(function (o) {
+      var t = (o.op.tags && o.op.tags.length) ? o.op.tags[0] : "default";
+      if (!groups[t]) { groups[t] = []; names.push(t); }
+      groups[t].push(o);
+    });
+    names.sort(function (a, b) {
+      var ia = declared.indexOf(a), ib = declared.indexOf(b);
+      if (ia < 0 && ib < 0) return names.indexOf(a) - names.indexOf(b);
+      if (ia < 0) return 1;
+      if (ib < 0) return -1;
+      return ia - ib;
+    });
+    return names.map(function (n) {
+      var tag = (spec.tags || []).filter(function (t) { return t.name === n; })[0] || { name: n };
+      return { tag: tag, ops: groups[n] };
+    });
+  }
+  function anchorOf(o) { return "op/" + encodeURIComponent(o.op.operationId || (o.method + o.path)); }
+  function opParams(o) {
+    var index = {}, list = [];
+    (o.pathItem.parameters || []).concat(o.op.parameters || []).forEach(function (raw) {
+      var p = resolveIn("parameters", raw);
+      if (!p || !p.name) return;
+      var k = p["in"] + ":" + p.name;
+      if (index[k] !== undefined) list[index[k]] = p; else { index[k] = list.length; list.push(p); }
+    });
+    return list;
+  }
+  function securityFor(o) { return o.op.security !== undefined ? o.op.security : (spec.security || []); }
+  function isSecured(o) {
+    var s = securityFor(o);
+    return Array.isArray(s) && s.some(function (req) { return Object.keys(req).length > 0; });
+  }
+
+  function opCard(o) {
+    var anchor = anchorOf(o);
+    var card = h("section", { class: "op op-" + o.method, id: anchor });
+    var body = null;
+    card.ensureBody = function () { if (!body) { body = opBody(o); card.appendChild(body); } };
+    card.appendChild(h("header", { class: "op-head", onclick: function () {
+        card.classList.toggle("open");
+        if (card.classList.contains("open")) { card.ensureBody(); history.replaceState(null, "", "#" + anchor); }
+      } },
+      h("span", { class: "method " + o.method, text: o.method.toUpperCase() }),
+      h("span", { class: "path", text: o.path }),
+      h("span", { class: "summary", text: o.op.summary || "" }),
+      o.op.deprecated ? h("span", { class: "badge warn", text: "deprecated" }) : null,
+      isSecured(o) ? h("span", { class: "lock", title: "requires authentication", text: "🔒" }) : null));
+    return card;
+  }
+
+  function paramInput(p) {
+    var s = resolve(p.schema || {});
+    var ex = p.example !== undefined ? p.example : exampleOf(p.schema);
+    var ds = { pin: p["in"], pname: p.name };
+    if (s.enum) {
+      var opts = p.required ? [] : [h("option", { value: "", text: "" })];
+      return h("select", { dataset: ds, name: p.name, required: !!p.required },
+        opts.concat(s.enum.map(function (v) { return h("option", { value: String(v), text: String(v) }); })));
+    }
+    if (s.type === "boolean") {
+      return h("select", { dataset: ds, name: p.name },
+        [h("option", { value: "", text: "" }), h("option", { value: "true", text: "true" }), h("option", { value: "false", text: "false" })]);
+    }
+    return h("input", { type: "text", dataset: ds, name: p.name, required: !!p.required,
+      placeholder: ex === null || ex === undefined ? "" : (typeof ex === "object" ? JSON.stringify(ex) : String(ex)) });
+  }
+
+  function opBody(o) {
+    var params = opParams(o);
+    var body = h("div", { class: "op-body" });
+    if (o.op.description) body.appendChild(md(o.op.description));
+    if (o.op.externalDocs) body.appendChild(h("p", null,
+      h("a", { href: o.op.externalDocs.url, target: "_blank", rel: "noopener", text: o.op.externalDocs.description || o.op.externalDocs.url })));
+    var result = h("div", { class: "result" });
+    var curl = h("pre", { class: "curl" });
+    var form = h("form", { class: "try", onsubmit: function (ev) { ev.preventDefault(); send(o, form, result); } });
+
+    if (params.length) {
+      var tb = h("tbody");
+      params.forEach(function (p) {
+        tb.appendChild(h("tr", null,
+          h("td", null, h("code", { text: p.name }), p.required ? h("span", { class: "sch-req", text: "*" }) : null),
+          h("td", { text: p["in"] }),
+          h("td", null, h("span", { class: "sch-type", text: typeLabel(p.schema) })),
+          h("td", null, p.description ? md(p.description) : null, p.deprecated ? h("span", { class: "badge warn", text: "deprecated" }) : null),
+          h("td", null, paramInput(p))));
+      });
+      form.appendChild(h("h4", { text: "Parameters" }));
+      form.appendChild(h("table", { class: "params" },
+        h("thead", null, h("tr", null, h("th", { text: "Name" }), h("th", { text: "In" }), h("th", { text: "Type" }), h("th", { text: "Description" }), h("th", { text: "Value" }))),
+        tb));
+    }
+
+    var rb = resolveIn("requestBodies", o.op.requestBody);
+    if (rb && rb.content) {
+      var types = Object.keys(rb.content);
+      var sel = h("select", { class: "ctype", name: "__ctype" }, types.map(function (t) { return h("option", { value: t, text: t }); }));
+      var ta = h("textarea", { class: "body", name: "__body", rows: 8, spellcheck: "false" });
+      var fillBody = function () {
+        var mt = rb.content[sel.value] || {};
+        var ex = mt.example !== undefined ? mt.example : (mt.examples ? firstExample(mt.examples) : exampleOf(mt.schema));
+        ta.value = ex === null || ex === undefined ? "" : (typeof ex === "string" ? ex : JSON.stringify(ex, null, 2));
+      };
+      sel.addEventListener("change", fillBody);
+      fillBody();
+      form.appendChild(h("h4", null, "Request body", rb.required ? h("span", { class: "sch-req", text: "*" }) : null, " ", sel));
+      if (rb.description) form.appendChild(md(rb.description));
+      var mt0 = rb.content[types[0]] || {};
+      if (mt0.schema) form.appendChild(h("details", { class: "schema-box" }, h("summary", { text: "Schema: " + typeLabel(mt0.schema) }), schemaTree(mt0.schema, {})));
+      form.appendChild(ta);
+    }
+
+    var responses = o.op.responses || {};
+    var codes = Object.keys(responses);
+    if (codes.length) {
+      var rlist = h("div", { class: "responses" });
+      codes.forEach(function (code) {
+        var r = resolveIn("responses", responses[code]) || {};
+        var content = r.content || {}, ct = Object.keys(content)[0];
+        var block = h("div", { class: "resp" },
+          h("div", { class: "resp-head" },
+            h("span", { class: "status s" + code.charAt(0), text: code }),
+            h("span", { text: r.description || "" }),
+            ct ? h("code", { class: "ctype-label", text: ct }) : null));
+        if (ct && content[ct].schema) {
+          block.appendChild(h("details", { class: "schema-box" },
+            h("summary", { text: "Schema: " + typeLabel(content[ct].schema) }),
+            schemaTree(content[ct].schema, {}),
+            h("details", null, h("summary", { text: "Example" }), h("pre", { text: JSON.stringify(exampleOf(content[ct].schema), null, 2) }))));
+        }
+        if (r.headers) {
+          block.appendChild(h("div", { class: "resp-headers" }, "Headers: ",
+            Object.keys(r.headers).map(function (n) { return [h("code", { text: n + ": " + typeLabel((r.headers[n] || {}).schema) }), " "]; })));
+        }
+        rlist.appendChild(block);
+      });
+      form.appendChild(h("h4", { text: "Responses" }));
+      form.appendChild(rlist);
+    }
+
+    form.appendChild(h("div", { class: "actions" },
+      h("button", { type: "submit", class: "send", text: "Send request" }),
+      h("button", { type: "button", class: "ghost", text: "Copy as curl", onclick: function () {
+        var r = buildRequest(o, form);
+        if (!r) return;
+        curl.textContent = toCurl(r);
+        curl.style.display = "block";
+        if (navigator.clipboard) navigator.clipboard.writeText(curl.textContent).catch(function () { /* clipboard blocked */ });
+      } }),
+      h("span", { class: "target", text: state.server || location.origin })));
+    form.appendChild(curl);
+    form.appendChild(result);
+    body.appendChild(form);
+    return body;
+  }
+  function firstExample(examples) { var k = Object.keys(examples)[0]; return k ? examples[k].value : null; }
+
+  function buildRequest(o, form) {
+    var path = o.path, query = [], headers = {}, cookies = [], missing = [];
+    Array.prototype.forEach.call(form.querySelectorAll("[data-pin]"), function (inp) {
+      var where = inp.dataset.pin, name = inp.dataset.pname, val = inp.value;
+      if (val === "") { if (inp.required) missing.push(name); return; }
+      if (where === "path") path = path.split("{" + name + "}").join(val.split("/").map(encodeURIComponent).join("/"));
+      else if (where === "query") query.push(encodeURIComponent(name) + "=" + encodeURIComponent(val));
+      else if (where === "header") headers[name] = val;
+      else if (where === "cookie") cookies.push(name + "=" + val);
+    });
+    if (missing.length) { alert("Missing required parameter(s): " + missing.join(", ")); return null; }
+    var bodyEl = form.querySelector("[name=__body]"), ctEl = form.querySelector("[name=__ctype]");
+    var body = null;
+    if (bodyEl && bodyEl.value !== "") {
+      var ct = ctEl ? ctEl.value : "application/json";
+      headers["Content-Type"] = ct;
+      body = bodyEl.value;
+      if (ct.indexOf("x-www-form-urlencoded") >= 0) {
+        try {
+          var obj = JSON.parse(body);
+          body = Object.keys(obj).map(function (k) { return encodeURIComponent(k) + "=" + encodeURIComponent(obj[k]); }).join("&");
+        } catch (e) { /* send as typed */ }
+      }
+    }
+    applyAuth(o, headers, query, cookies);
+    if (cookies.length) headers["Cookie"] = cookies.join("; ");
+    var url = (state.server || "") + path + (query.length ? "?" + query.join("&") : "");
+    return { method: o.method.toUpperCase(), url: url, headers: headers, body: body };
+  }
+  function applyAuth(o, headers, query, cookies) {
+    var schemes = components("securitySchemes"), reqs = securityFor(o);
+    if (!Array.isArray(reqs)) return;
+    var used = {};
+    reqs.forEach(function (req) {
+      Object.keys(req).forEach(function (name) {
+        if (used[name]) return;
+        var sc = schemes[name], v = state.auth[name];
+        if (!sc || !v) return;
+        used[name] = true;
+        var scheme = (sc.scheme || "").toLowerCase();
+        if (sc.type === "http" && scheme === "basic") headers["Authorization"] = "Basic " + btoa(v);
+        else if (sc.type === "http") headers["Authorization"] = (scheme && scheme !== "bearer" ? sc.scheme + " " : "Bearer ") + v;
+        else if (sc.type === "apiKey") {
+          if (sc["in"] === "query") query.push(encodeURIComponent(sc.name) + "=" + encodeURIComponent(v));
+          else if (sc["in"] === "cookie") cookies.push(sc.name + "=" + v);
+          else headers[sc.name] = v;
+        }
+        else headers["Authorization"] = "Bearer " + v;
+      });
+    });
+  }
+  function toCurl(r) {
+    var parts = ["curl -X " + r.method, sq(absolute(r.url))];
+    Object.keys(r.headers).forEach(function (k) { parts.push("-H " + sq(k + ": " + r.headers[k])); });
+    if (r.body !== null && r.body !== undefined) parts.push("--data " + sq(r.body));
+    return parts.join(" \\\n  ");
+  }
+  function sq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+  function absolute(url) { try { return new URL(url, location.href).href; } catch (e) { return url; } }
+
+  function send(o, form, result) {
+    var r = buildRequest(o, form);
+    if (!r) return;
+    result.innerHTML = "";
+    result.appendChild(h("div", { class: "muted", text: "Sending " + r.method + " " + r.url + " ..." }));
+    var t0 = performance.now();
+    var init = { method: r.method, headers: r.headers, credentials: "same-origin" };
+    if (r.body !== null && r.method !== "GET" && r.method !== "HEAD") init.body = r.body;
+    fetch(r.url, init).then(function (res) {
+      return res.text().then(function (text) {
+        var ms = Math.round(performance.now() - t0);
+        var pretty = text;
+        if ((res.headers.get("content-type") || "").indexOf("json") >= 0) {
+          try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* not JSON after all */ }
+        }
+        var hdrs = [];
+        res.headers.forEach(function (v, k) { hdrs.push(k + ": " + v); });
+        result.innerHTML = "";
+        result.appendChild(h("div", { class: "result-head" },
+          h("span", { class: "status s" + String(res.status).charAt(0), text: res.status + " " + res.statusText }),
+          h("span", { class: "muted", text: ms + " ms, " + text.length + " bytes" })));
+        result.appendChild(h("details", { class: "resp-hdrs" },
+          h("summary", { text: "Response headers (" + hdrs.length + ")" }), h("pre", { text: hdrs.join("\n") })));
+        result.appendChild(h("pre", { class: "resp-body", text: pretty || "(empty body)" }));
+      });
+    }).catch(function (err) {
+      result.innerHTML = "";
+      result.appendChild(h("div", { class: "result-head" },
+        h("span", { class: "status s5", text: "Network error" }),
+        h("span", { class: "muted", text: String((err && err.message) || err) })));
+      result.appendChild(h("p", { class: "muted", text: "An API on another origin must allow CORS; otherwise pick this server in the server list." }));
+    });
+  }
+
+  function serverPicker() {
+    var servers = (spec.servers || []).map(function (s) { return s.url; });
+    if (servers.indexOf(state.server) < 0) state.server = "";
+    var sel = h("select", { class: "server", title: "Server that receives the requests", onchange: function (ev) {
+        state.server = ev.target.value;
+        saveState();
+        Array.prototype.forEach.call(document.querySelectorAll(".target"), function (t) { t.textContent = state.server || location.origin; });
+      } },
+      h("option", { value: "", text: "This server (" + location.origin + ")" }),
+      servers.map(function (u) { return h("option", { value: u, text: u }); }));
+    sel.value = state.server;
+    return sel;
+  }
+  function describeScheme(sc) {
+    if (sc.type === "http") return "HTTP " + (sc.scheme || "") + (sc.bearerFormat ? " " + sc.bearerFormat : "");
+    if (sc.type === "apiKey") return "API key in " + sc["in"] + " " + sc.name;
+    return sc.type || "?";
+  }
+  function placeholderFor(sc) {
+    if (sc.type === "http" && (sc.scheme || "").toLowerCase() === "basic") return "user:password";
+    if (sc.type === "apiKey") return "key value";
+    return "token";
+  }
+  function authButton() {
+    if (!Object.keys(components("securitySchemes")).length) return null;
+    return h("button", { type: "button", class: "ghost", text: "Authorize", onclick: function () {
+      var p = document.getElementById("auth");
+      if (p) { p.open = !p.open; if (p.open) p.scrollIntoView({ block: "start" }); }
+    } });
+  }
+  function authPanel() {
+    var schemes = components("securitySchemes"), names = Object.keys(schemes);
+    if (!names.length) return null;
+    var panel = h("details", { class: "auth", id: "auth" }, h("summary", { text: "Authorization" }));
+    names.forEach(function (n) {
+      var sc = schemes[n];
+      panel.appendChild(h("div", { class: "auth-row" },
+        h("label", { text: n + " (" + describeScheme(sc) + ")" }),
+        h("input", { type: "password", placeholder: placeholderFor(sc), value: state.auth[n] || "", autocomplete: "off",
+          oninput: function (ev) { state.auth[n] = ev.target.value; saveState(); } }),
+        sc.description ? h("span", { class: "muted", text: sc.description }) : null));
+    });
+    panel.appendChild(h("p", { class: "muted", text: "Values stay in this browser's local storage and are sent only with requests you trigger here." }));
+    return panel;
+  }
+  function metaLine(info) {
+    var parts = [];
+    if (info.contact) {
+      var c = info.contact;
+      parts.push(h("span", null, "Contact: ",
+        c.email ? h("a", { href: "mailto:" + c.email, text: c.name || c.email })
+                : (c.url ? h("a", { href: c.url, target: "_blank", rel: "noopener", text: c.name || c.url }) : (c.name || ""))));
+    }
+    if (info.license) parts.push(h("span", null, "License: ",
+      info.license.url ? h("a", { href: info.license.url, target: "_blank", rel: "noopener", text: info.license.name }) : info.license.name));
+    if (info.termsOfService) parts.push(h("a", { href: info.termsOfService, target: "_blank", rel: "noopener", text: "Terms of service" }));
+    if (spec.externalDocs) parts.push(h("a", { href: spec.externalDocs.url, target: "_blank", rel: "noopener", text: spec.externalDocs.description || "External docs" }));
+    if (!parts.length) return null;
+    return h("p", { class: "meta muted" }, parts.map(function (p, i) { return i ? [" | ", p] : p; }));
+  }
+
+  function applyFilter() {
+    var q = state.filter;
+    Array.prototype.forEach.call(document.querySelectorAll("[data-search]"), function (e) {
+      e.style.display = (!q || e.dataset.search.indexOf(q) >= 0) ? "" : "none";
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".tag-group, .nav-group"), function (g) {
+      var visible = Array.prototype.some.call(g.querySelectorAll("[data-search]"), function (e) { return e.style.display !== "none"; });
+      g.style.display = visible ? "" : "none";
+    });
+  }
+  function openFromHash() {
+    var raw = location.hash.slice(1);
+    if (!raw) return;
+    var target = document.getElementById(raw) || document.getElementById(decodeURIComponent(raw));
+    if (!target) return;
+    if (target.classList.contains("op")) { target.classList.add("open"); if (target.ensureBody) target.ensureBody(); }
+    if (target.tagName === "DETAILS") target.open = true;
+    target.scrollIntoView({ block: "start" });
+  }
+
+  function render() {
+    var app = document.getElementById("app");
+    app.innerHTML = "";
+    var info = spec.info || {};
+    document.title = (info.title || CFG.title || "API") + (info.version ? " " + info.version : "");
+    var ops = allOps(), groups = groupOps(ops);
+
+    app.appendChild(h("header", { class: "top" },
+      h("div", { class: "brand" },
+        h("h1", { text: info.title || CFG.title || "API" }),
+        info.version ? h("span", { class: "badge ver", text: "v" + info.version }) : null,
+        h("span", { class: "badge", text: "OpenAPI " + (spec.openapi || "3") }),
+        h("a", { class: "spec-link", href: SPEC_URL, target: "_blank", rel: "noopener", text: SPEC_URL.split("/").pop() || SPEC_URL })),
+      h("div", { class: "tools" },
+        serverPicker(),
+        h("input", { class: "filter", type: "search", placeholder: "Filter operations...",
+          oninput: function (ev) { state.filter = ev.target.value.toLowerCase(); applyFilter(); } }),
+        authButton())));
+
+    var side = h("nav", { class: "side" });
+    var main = h("main", { class: "main" });
+    if (info.description) main.appendChild(h("section", { class: "intro" }, md(info.description)));
+    append(main, metaLine(info));
+    append(main, authPanel());
+
+    groups.forEach(function (g) {
+      var gid = "tag/" + encodeURIComponent(g.tag.name);
+      var navGroup = h("div", { class: "nav-group" }, h("a", { class: "nav-tag", href: "#" + gid, text: g.tag.name }));
+      var sect = h("section", { class: "tag-group", id: gid }, h("h2", { text: g.tag.name }), g.tag.description ? md(g.tag.description) : null);
+      g.ops.forEach(function (o) {
+        var search = (o.method + " " + o.path + " " + (o.op.summary || "") + " " + (o.op.operationId || "") + " " + g.tag.name).toLowerCase();
+        var card = opCard(o);
+        card.dataset.search = search;
+        sect.appendChild(card);
+        navGroup.appendChild(h("a", { class: "nav-op", href: "#" + anchorOf(o), dataset: { search: search } },
+          h("span", { class: "method mini " + o.method, text: o.method.toUpperCase() }),
+          h("span", { class: "nav-path", text: o.path })));
+      });
+      side.appendChild(navGroup);
+      main.appendChild(sect);
+    });
+
+    var schemas = components("schemas"), names = Object.keys(schemas);
+    if (names.length) {
+      var comp = h("section", { class: "tag-group", id: "schemas" }, h("h2", { text: "Schemas" }));
+      var navS = h("div", { class: "nav-group" }, h("a", { class: "nav-tag", href: "#schemas", text: "Schemas" }));
+      names.forEach(function (n) {
+        var sid = "schema/" + encodeURIComponent(n);
+        comp.appendChild(h("details", { class: "schema-card", id: sid, dataset: { search: n.toLowerCase() } },
+          h("summary", null, h("code", { text: n }), h("span", { class: "sch-type", text: typeLabel(schemas[n]) })),
+          schemaTree(schemas[n], {}),
+          h("details", null, h("summary", { text: "Example" }), h("pre", { text: JSON.stringify(exampleOf(schemas[n]), null, 2) }))));
+        navS.appendChild(h("a", { class: "nav-op", href: "#" + sid, dataset: { search: n.toLowerCase() } }, h("span", { class: "nav-path", text: n })));
+      });
+      side.appendChild(navS);
+      main.appendChild(comp);
+    }
+
+    app.appendChild(h("div", { class: "layout" }, side, main));
+    app.appendChild(h("footer", { class: "foot", text: ops.length + " operations, " + names.length + " schemas" }));
+    openFromHash();
+    window.addEventListener("hashchange", openFromHash);
+  }
+
+  function fail(msg) {
+    var app = document.getElementById("app");
+    app.innerHTML = "";
+    app.appendChild(h("div", { class: "error" },
+      h("h1", { text: "Could not load the API description" }),
+      h("p", { text: msg }),
+      h("p", null, "Tried ", h("a", { href: SPEC_URL, text: SPEC_URL }))));
+  }
+
+  loadState();
+  fetch(SPEC_URL, { credentials: "same-origin" })
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (s) { spec = s; render(); })
+    .catch(function (e) { fail(String((e && e.message) || e)); });
+})();
+""";
+
+// =============================================================================
+// OpenApiGroup - prefix-scoped facade, mirrors Router's RouteGroup
+// =============================================================================
+
+class OpenApiGroup
+{
+    let _api           = nil;
+    let _prefix:string = "";
+    let _tags          = nil;   // default tags for operations in this group
+    let _rg            = nil;   // the Router RouteGroup, nil when unattached
+
+    fn Constructor(api, prefix:string, tags, rg) {
+        _api    = api;
+        _prefix = prefix;
+        _tags   = tags;
+        _rg     = rg;
+    }
+
+    fn Get(pattern:string, doc?, handler?)    { return _api._op("get",    pattern, doc, handler, this); }
+    fn Post(pattern:string, doc?, handler?)   { return _api._op("post",   pattern, doc, handler, this); }
+    fn Put(pattern:string, doc?, handler?)    { return _api._op("put",    pattern, doc, handler, this); }
+    fn Patch(pattern:string, doc?, handler?)  { return _api._op("patch",  pattern, doc, handler, this); }
+    fn Delete(pattern:string, doc?, handler?) { return _api._op("delete", pattern, doc, handler, this); }
+
+    fn Use(middleware:fn) {
+        if (_rg != nil) { _rg.Use(middleware); }
+        return this;
+    }
+
+    fn Group(prefix:string, opts?) {
+        let tags = _api._groupTags(opts) ?? _tags;
+        let rg   = (_rg != nil) ? _rg.Group(prefix) : nil;
+        return new OpenApiGroup(_api, _prefix + prefix, tags, rg);
+    }
+
+    // Registers on the Router through the RouteGroup so group middleware applies.
+    fn _register(method:string, pattern:string, handler:fn) {
+        if (_rg == nil) { return; }
+        if (method == "get")         { _rg.Get(pattern, handler); }
+        else if (method == "post")   { _rg.Post(pattern, handler); }
+        else if (method == "put")    { _rg.Put(pattern, handler); }
+        else if (method == "patch")  { _rg.Patch(pattern, handler); }
+        else if (method == "delete") { _rg.Delete(pattern, handler); }
+    }
+}
+
+// =============================================================================
+// OpenApi
+// =============================================================================
+
+class OpenApi
+{
+    let _openapi:string  = "3.0.3";
+    let _info            = nil;
+    let _servers:array   = [];
+    let _tags:array      = [];
+    let _tagSeen         = nil;
+    let _paths           = nil;   // _Ordered: "/pets/{id}" -> _Ordered: "get" -> operation
+    let _schemas         = nil;   // _Ordered: name -> schema
+    let _securitySchemes = nil;   // _Ordered: name -> scheme
+    let _security        = nil;   // array or nil
+    let _externalDocs    = nil;
+    let _extensions      = nil;   // _Ordered: "x-..." -> value
+    let _componentsExtra = nil;   // other components.* sections, kept verbatim
+    let _rootExtra       = nil;   // other root keys (webhooks, jsonSchemaDialect)
+    let _router          = nil;
+    let _serveOpts       = nil;   // Serve() options while served, else nil
+    let _serveKey        = "";
+    let _cacheJson       = nil;   // rendered document, its ETag and the docs page
+    let _cacheEtag       = nil;
+    let _cacheHtml       = nil;
+    let _cacheSchemas    = nil;   // components.schemas as plain objects
+
+    fn Constructor(info?) {
+        _info            = { title: "API", version: "1.0.0" };
+        _servers         = [];
+        _tags            = [];
+        _tagSeen         = {};
+        _paths           = new _Ordered();
+        _schemas         = new _Ordered();
+        _securitySchemes = new _Ordered();
+        _extensions      = new _Ordered();
+        _componentsExtra = {};
+        _rootExtra       = {};
+        if (info != nil) { this.Info(info); }
+    }
+
+    fn static For(router, info?) {
+        let api = new OpenApi(info);
+        api._router = router;
+        return api;
+    }
+
+    // ---- document metadata ----
+
+    fn Info(info) {
+        this._touch();
+        if (Type.IsString(info)) { _info.title = info; return this; }
+        if (Type.IsObject(info)) { Object.Merge(_info, info); }
+        return this;
+    }
+
+    fn Server(url:string, description?) {
+        this._touch();
+        let s = { url: url };
+        if (description != nil) { s.description = description; }
+        Array.Append(_servers, s);
+        return this;
+    }
+
+    fn Tag(name:string, description?) {
+        this._touch();
+        if (Object.HasKey(_tagSeen, name)) {
+            if (description != nil) {
+                foreach (t, i in _tags) { if (t.name == name) { _tags[i].description = description; } }
+            }
+            return this;
+        }
+        _tagSeen[name] = true;
+        let t = { name: name };
+        if (description != nil) { t.description = description; }
+        Array.Append(_tags, t);
+        return this;
+    }
+
+    fn ExternalDocs(url:string, description?) {
+        this._touch();
+        _externalDocs = { url: url };
+        if (description != nil) { _externalDocs.description = description; }
+        return this;
+    }
+
+    fn Version(v:string) {
+        this._touch();
+        _openapi = v;
+        return this;
+    }
+
+    fn Extension(key:string, value) {
+        this._touch();
+        _extensions.Set(String.StartsWith(key, "x-") ? key : "x-" + key, value);
+        return this;
+    }
+
+    // ---- components ----
+
+    fn static Ref(name:string) { return { "$ref": "#/components/schemas/" + name }; }
+
+    fn Schema(name:string, schema) {
+        this._touch();
+        _schemas.Set(name, OpenApi._expand(schema));
+        return OpenApi.Ref(name);
+    }
+
+    fn SchemaOf(name:string, instance, opts?) {
+        this._touch();
+        let o      = opts ?? {};
+        let schema = OpenApi._infer(instance);
+        if (Type.IsArray(o.required)) { schema.required = o.required; }
+        if (Type.IsObject(o.descriptions) && schema.properties != nil) {
+            foreach (text, field in o.descriptions) {
+                let p = (schema.properties is _Ordered)
+                    ? schema.properties.Get(field)
+                    : Object.TryGet(schema.properties, field, nil);
+                if (p != nil) { p.description = text; }
+            }
+        }
+        if (o.description != nil) { schema.description = o.description; }
+        if (o.example == true) { schema.example = Json.Parse(Json.Stringify(instance)); }
+        _schemas.Set(name, schema);
+        return OpenApi.Ref(name);
+    }
+
+    fn SecurityScheme(name:string, scheme) {
+        this._touch();
+        _securitySchemes.Set(name, scheme);
+        return this;
+    }
+
+    fn static Bearer(format?) {
+        let s = { type: "http", scheme: "bearer" };
+        if (format != nil) { s.bearerFormat = format; }
+        return s;
+    }
+
+    fn static Basic() { return { type: "http", scheme: "basic" }; }
+
+    fn static ApiKey(name:string, location?) {
+        return { type: "apiKey", name: name, "in": location ?? "header" };
+    }
+
+    fn Security(requirements) {
+        this._touch();
+        _security = OpenApi._securityList(requirements);
+        return this;
+    }
+
+    // ---- operations ----
+
+    fn Get(pattern:string, doc?, handler?)    { return this._op("get",    pattern, doc, handler, nil); }
+    fn Post(pattern:string, doc?, handler?)   { return this._op("post",   pattern, doc, handler, nil); }
+    fn Put(pattern:string, doc?, handler?)    { return this._op("put",    pattern, doc, handler, nil); }
+    fn Patch(pattern:string, doc?, handler?)  { return this._op("patch",  pattern, doc, handler, nil); }
+    fn Delete(pattern:string, doc?, handler?) { return this._op("delete", pattern, doc, handler, nil); }
+    fn Head(pattern:string, doc?, handler?)   { return this._op("head",   pattern, doc, handler, nil); }
+
+    fn Operation(method:string, pattern:string, doc?) {
+        return this._op(String.ToLower(method), pattern, doc, nil, nil);
+    }
+
+    fn Group(prefix:string, opts?) {
+        let tags = this._groupTags(opts);
+        let rg   = (_router != nil) ? _router.Group(prefix) : nil;
+        return new OpenApiGroup(this, prefix, tags, rg);
+    }
+
+    // Tags for a group: opts is a tag name or { tag, tags, description }.
+    fn _groupTags(opts) {
+        if (opts == nil) { return nil; }
+        if (Type.IsString(opts)) { this.Tag(opts, nil); return [opts]; }
+        if (!Type.IsObject(opts)) { return nil; }
+        if (opts.tag != nil) {
+            this.Tag(opts.tag, opts.description);
+            return [opts.tag];
+        }
+        if (Type.IsArray(opts.tags)) {
+            foreach (t in opts.tags) { this.Tag(t, nil); }
+            return opts.tags;
+        }
+        return nil;
+    }
+
+    // Records the operation and registers the handler. `group` is the
+    // OpenApiGroup the call came through, or nil for the root facade.
+    fn _op(method:string, pattern:string, doc, handler, group) {
+        this._touch();
+        var d = doc;
+        var h = handler;
+        if (Type.IsFunction(d) && h == nil) { h = d; d = nil; }
+        if (d == nil) { d = {}; }
+
+        let prefix:string = (group != nil) ? group._prefix : "";
+        if (h != nil) {
+            if (group != nil) { group._register(method, pattern, h); }
+            else { this._register(method, prefix + pattern, h); }
+        }
+
+        let conv   = OpenApi._convertPath(prefix + pattern);
+        let op     = this._buildOperation(method, conv.path, d, conv.params,
+                                          (group != nil) ? group._tags : nil);
+        var ops = _paths.Get(conv.path);
+        if (ops == nil) { ops = new _Ordered(); _paths.Set(conv.path, ops); }
+        ops.Set(method, op);
+        return this;
+    }
+
+    fn _register(method:string, pattern:string, handler:fn) {
+        if (_router == nil) { return; }
+        if (method == "get")         { _router.Get(pattern, handler); }
+        else if (method == "post")   { _router.Post(pattern, handler); }
+        else if (method == "put")    { _router.Put(pattern, handler); }
+        else if (method == "patch")  { _router.Patch(pattern, handler); }
+        else if (method == "delete") { _router.Delete(pattern, handler); }
+        else if (method == "head")   { _router.Head(pattern, handler); }
+    }
+
+    // Router pattern -> OpenAPI path template plus the path parameter names.
+    fn static _convertPath(pattern:string) {
+        let raw    = String.Split(pattern, "/");
+        let segs   = [];
+        let params = [];
+        foreach (sg in raw) {
+            if (String.Length(sg) == 0) { continue; }
+            if (sg == "*") {
+                Array.Append(segs, "{path}");
+                Array.Append(params, "path");
+            } else if (String.CharAt(sg, 0) == ':') {
+                let name = String.Substr(sg, 1);
+                Array.Append(segs, "{" + name + "}");
+                Array.Append(params, name);
+            } else if (String.StartsWith(sg, "{") && String.EndsWith(sg, "}")) {
+                Array.Append(segs, sg);
+                Array.Append(params, String.Substr(sg, 1, String.Length(sg) - 2));
+            } else {
+                Array.Append(segs, sg);
+            }
+        }
+        return { path: "/" + String.Join(segs, "/"), params: params };
+    }
+
+    // "get" + "/pets/{id}" -> "getPetsById"
+    fn static _autoOperationId(method:string, path:string): string {
+        var id = method;
+        foreach (sg in String.Split(path, "/")) {
+            if (String.Length(sg) == 0) { continue; }
+            if (String.StartsWith(sg, "{")) {
+                id += "By" + _pascal(String.Substr(sg, 1, String.Length(sg) - 2));
+            } else {
+                id += _pascal(Regex.Replace(sg, """[^A-Za-z0-9]""", ""));
+            }
+        }
+        return id;
+    }
+
+    fn _buildOperation(method:string, path:string, d, pathParams:array, groupTags) {
+        let op = {};
+
+        var tags = d.tags;
+        if (Type.IsString(tags)) { tags = [tags]; }
+        if (tags == nil) { tags = groupTags; }
+        if (Type.IsArray(tags) && len(tags) > 0) {
+            op.tags = tags;
+            foreach (t in tags) { this.Tag(t, nil); }
+        }
+
+        if (d.summary != nil)     { op.summary = d.summary; }
+        if (d.description != nil) { op.description = d.description; }
+        op.operationId = d.operationId ?? OpenApi._autoOperationId(method, path);
+        if (d.deprecated == true) { op.deprecated = true; }
+        if (d.externalDocs != nil) { op.externalDocs = d.externalDocs; }
+        if (d.servers != nil)     { op.servers = d.servers; }
+        if (d.callbacks != nil)   { op.callbacks = d.callbacks; }
+
+        let params = OpenApi._parameters(d, pathParams);
+        if (len(params) > 0) { op.parameters = params; }
+
+        if (Object.HasKey(d, "body") && d.body != nil) { op.requestBody = OpenApi._requestBody(d.body); }
+
+        op.responses = OpenApi._responses(d.responses);
+
+        if (Object.HasKey(d, "security")) {
+            op.security = (d.security == false) ? [] : OpenApi._securityList(d.security);
+        }
+
+        foreach (v, k in d) {
+            if (String.StartsWith(k, "x-")) { op[k] = v; }
+        }
+        return op;
+    }
+
+    // ---- parameters ----
+
+    fn static _parameters(d, pathParams:array): array {
+        let out  = [];
+        let seen = {};
+        let declared = Type.IsObject(d.params) ? d.params : {};
+
+        // Path parameters first, in path order; a declaration refines the default.
+        foreach (name in pathParams) {
+            let spec = Object.TryGet(declared, name, "string");
+            let p = OpenApi._parameter(name, "path", spec);
+            p.required = true;
+            Array.Append(out, p);
+            seen[name] = true;
+        }
+        foreach (spec, name in declared) {
+            if (Object.HasKey(seen, name)) { continue; }
+            let where = (Type.IsObject(spec) && spec["in"] != nil) ? spec["in"] : "query";
+            Array.Append(out, OpenApi._parameter(name, where, spec));
+        }
+        if (Type.IsObject(d.query)) {
+            foreach (spec, name in d.query)   { Array.Append(out, OpenApi._parameter(name, "query", spec)); }
+        }
+        if (Type.IsObject(d.headers)) {
+            foreach (spec, name in d.headers) { Array.Append(out, OpenApi._parameter(name, "header", spec)); }
+        }
+        if (Type.IsObject(d.cookies)) {
+            foreach (spec, name in d.cookies) { Array.Append(out, OpenApi._parameter(name, "cookie", spec)); }
+        }
+        if (Type.IsArray(d.parameters)) {
+            foreach (p in d.parameters) { Array.Append(out, p); }
+        }
+        return out;
+    }
+
+    // One parameter object from a shorthand type or an option object.
+    fn static _parameter(name:string, where:string, spec) {
+        let p = { name: name, "in": where };
+        if (Type.IsString(spec) || spec == nil) {
+            let t = spec ?? "string";
+            p.schema = OpenApi._expand(_baseWord(t));
+            if (!String.EndsWith(t, "?") || where == "path") { p.required = true; }
+            return p;
+        }
+        if (Type.IsObject(spec)) {
+            if (spec.description != nil) { p.description = spec.description; }
+            if (spec.deprecated == true) { p.deprecated = true; }
+            if (spec.example != nil)     { p.example = spec.example; }
+            if (spec.examples != nil)    { p.examples = spec.examples; }
+            if (spec.style != nil)       { p.style = spec.style; }
+            if (spec.explode != nil)     { p.explode = spec.explode; }
+            if (spec.allowEmptyValue != nil) { p.allowEmptyValue = spec.allowEmptyValue; }
+            var schema = nil;
+            if (spec.schema != nil) {
+                schema = OpenApi._expand(spec.schema);
+            } else if (Type.IsString(spec.type) && !Object.HasKey(_TYPE_MAP, spec.type) && _isTypeWord(spec.type)) {
+                schema = OpenApi._expand(_baseWord(spec.type));
+            } else {
+                schema = {};
+                foreach (v, k in spec) {
+                    if (k == "in" || k == "description" || k == "required" || k == "deprecated"
+                        || k == "example" || k == "examples" || k == "style" || k == "explode"
+                        || k == "allowEmptyValue" || k == "name") { continue; }
+                    schema[k] = v;
+                }
+                schema = OpenApi._expand(Object.Count(schema) > 0 ? schema : "string");
+            }
+            p.schema = schema;
+            var required = (spec.required == true) || where == "path";
+            if (Type.IsString(spec.type) && !String.EndsWith(spec.type, "?") && spec.required == nil && where != "path") {
+                required = true;
+            }
+            if (spec.required == false && where != "path") { required = false; }
+            if (required) { p.required = true; }
+            return p;
+        }
+        p.schema = OpenApi._expand(spec);
+        if (where == "path") { p.required = true; }
+        return p;
+    }
+
+    // ---- request body and responses ----
+
+    fn static _requestBody(body) {
+        let rb = {};
+        var schema = nil;
+        var ct = "application/json";
+        var required = true;
+        var example = nil;
+        if (Type.IsObject(body) && !_isSchemaObject(body)
+            && (body.schema != nil || body.description != nil || body.contentType != nil
+                || Object.HasKey(body, "required") || body.example != nil)) {
+            if (body.description != nil) { rb.description = body.description; }
+            if (body.required == false)  { required = false; }
+            if (body.contentType != nil) { ct = body.contentType; }
+            example = body.example;
+            schema  = OpenApi._expand(body.schema ?? {});
+        } else if (Type.IsString(body)) {
+            required = !String.EndsWith(body, "?");
+            schema   = OpenApi._expand(_baseWord(body));
+        } else {
+            schema = OpenApi._expand(body);
+        }
+        let media = { schema: schema };
+        if (example != nil) { media.example = example; }
+        rb.required = required;
+        rb.content  = {};
+        rb.content[ct] = media;
+        return rb;
+    }
+
+    fn static _responses(spec) {
+        let out = {};
+        if (!Type.IsObject(spec) || Object.Count(spec) == 0) {
+            out["200"] = { description: "OK" };
+            return out;
+        }
+        let codes = Array.Sort(Object.Keys(spec), fn(a, b) => a < b);
+        foreach (code in codes) {
+            out[code] = OpenApi._response(code, spec[code]);
+        }
+        return out;
+    }
+
+    fn static _response(code:string, v) {
+        let r = {};
+        let fallback = Object.TryGet(_STATUS_TEXT, code, "Response " + code);
+        if (v == nil) {
+            r.description = fallback;
+            return r;
+        }
+        if (Type.IsString(v)) {
+            if (_isTypeWord(v)) {
+                r.description = fallback;
+                r.content = { "application/json": { schema: OpenApi._expand(v) } };
+            } else {
+                r.description = v;
+            }
+            return r;
+        }
+        if (Type.IsObject(v) && !_isSchemaObject(v)
+            && (v.description != nil || v.schema != nil || v.contentType != nil
+                || v.headers != nil || v.example != nil || v.content != nil)) {
+            r.description = v.description ?? fallback;
+            if (v.headers != nil) {
+                r.headers = {};
+                foreach (h, name in v.headers) {
+                    r.headers[name] = Type.IsObject(h) && (h.schema != nil || h.description != nil)
+                        ? h : { schema: OpenApi._expand(h) };
+                }
+            }
+            if (v.content != nil) {
+                r.content = v.content;
+            } else if (v.schema != nil) {
+                let media = { schema: OpenApi._expand(v.schema) };
+                if (v.example != nil) { media.example = v.example; }
+                r.content = {};
+                r.content[v.contentType ?? "application/json"] = media;
+            }
+            foreach (x, k in v) { if (String.StartsWith(k, "x-")) { r[k] = x; } }
+            return r;
+        }
+        r.description = fallback;
+        r.content = { "application/json": { schema: OpenApi._expand(v) } };
+        return r;
+    }
+
+    fn static _securityList(reqs) {
+        if (reqs == nil) { return nil; }
+        if (Type.IsString(reqs)) { let one = {}; one[reqs] = []; return [one]; }
+        if (!Type.IsArray(reqs)) { return Type.IsObject(reqs) ? [reqs] : nil; }
+        let out = [];
+        foreach (r in reqs) {
+            if (Type.IsString(r)) { let one = {}; one[r] = []; Array.Append(out, one); }
+            else if (Type.IsObject(r)) { Array.Append(out, r); }
+        }
+        return out;
+    }
+
+    // ---- schema shorthand ----
+
+    // Expands the shorthand grammar into an OpenAPI schema object. Anything that
+    // already is a schema is copied with its nested shorthand expanded.
+    fn static _expand(x) {
+        if (x == nil) { return {}; }
+        if (Type.IsString(x)) { return OpenApi._expandWord(x); }
+        if (Type.IsArray(x)) {
+            return { type: "array", items: (len(x) > 0) ? OpenApi._expand(x[0]) : {} };
+        }
+        if (!Type.IsObject(x)) { return {}; }
+        if (_isSchemaObject(x)) { return OpenApi._expandSchema(x); }
+        // A property map: { id: "int", "tag?": "string" }
+        let props    = {};
+        let required = [];
+        foreach (v, k in x) {
+            var name = k;
+            var optional = String.EndsWith(k, "?");
+            if (optional) { name = String.Substr(k, 0, String.Length(k) - 1); }
+            if (Type.IsString(v) && String.EndsWith(v, "?")) { optional = true; }
+            props[name] = OpenApi._expand(v);
+            if (!optional) { Array.Append(required, name); }
+        }
+        let schema = { type: "object", properties: props };
+        if (len(required) > 0) { schema.required = Array.Sort(required, fn(a, b) => a < b); }
+        return schema;
+    }
+
+    fn static _expandWord(word:string) {
+        var t = word;
+        var nullable = false;
+        if (String.EndsWith(t, "?")) {
+            nullable = true;
+            t = String.Substr(t, 0, String.Length(t) - 1);
+        }
+        var schema = nil;
+        if (String.StartsWith(t, "[") && String.EndsWith(t, "]")) {
+            schema = { type: "array", items: OpenApi._expandWord(String.Substr(t, 1, String.Length(t) - 2)) };
+        } else if (Object.HasKey(_TYPE_MAP, t)) {
+            schema = Object.Clone(_TYPE_MAP[t]);
+        } else if (_isTypeWord(t)) {
+            schema = OpenApi.Ref(t);
+        } else {
+            schema = { type: "string" };
+        }
+        if (nullable) {
+            if (Object.HasKey(schema, "$ref")) { schema = { allOf: [schema], nullable: true }; }
+            else { schema.nullable = true; }
+        }
+        return schema;
+    }
+
+    fn static _expandSchema(s) {
+        let out = {};
+        foreach (v, k in s) {
+            if (k == "items" || k == "not") {
+                out[k] = OpenApi._expand(v);
+            } else if (k == "properties" && Type.IsObject(v)) {
+                let props = {};
+                foreach (pv, pk in v) { props[pk] = OpenApi._expand(pv); }
+                out[k] = props;
+            } else if (k == "additionalProperties" && !Type.IsBool(v)) {
+                out[k] = OpenApi._expand(v);
+            } else if ((k == "oneOf" || k == "anyOf" || k == "allOf") && Type.IsArray(v)) {
+                let alts = [];
+                foreach (a in v) { Array.Append(alts, OpenApi._expand(a)); }
+                out[k] = alts;
+            } else {
+                out[k] = v;
+            }
+        }
+        if (Object.HasKey(out, "properties") && !Object.HasKey(out, "type")) { out.type = "object"; }
+        return out;
+    }
+
+    // Schema inferred from a live value: a class instance (by declared field),
+    // a plain object, an array or a scalar. Types are read from the values
+    // themselves, so a float default of 0.0 stays a number.
+    fn static _infer(v) {
+        if (v == nil)          { return { nullable: true }; }
+        if (Type.IsBool(v))    { return { type: "boolean" }; }
+        if (Type.IsInt(v))     { return { type: "integer" }; }
+        if (Type.IsFloat(v))   { return { type: "number" }; }
+        if (Type.IsString(v))  { return { type: "string" }; }
+        if (Type.IsChar(v))    { return { type: "string", maxLength: 1 }; }
+        if (Type.IsArray(v)) {
+            return { type: "array", items: (len(v) > 0) ? OpenApi._infer(v[0]) : {} };
+        }
+        if (Class.IsInstance(v)) {
+            let props    = new _Ordered();
+            let required = [];
+            foreach (name in Class.Fields(v)) {
+                let val = Class.GetField(v, name);
+                props.Set(name, OpenApi._infer(val));
+                if (val != nil) { Array.Append(required, name); }
+            }
+            let schema = { type: "object", properties: props };
+            if (len(required) > 0) { schema.required = Array.Sort(required, fn(a, b) => a < b); }
+            return schema;
+        }
+        if (Type.IsObject(v)) {
+            let props    = {};
+            let required = [];
+            foreach (val, k in v) {
+                props[k] = OpenApi._infer(val);
+                if (val != nil) { Array.Append(required, k); }
+            }
+            let schema = { type: "object", properties: props };
+            if (len(required) > 0) { schema.required = Array.Sort(required, fn(a, b) => a < b); }
+            return schema;
+        }
+        return {};
+    }
+
+    // ---- discovery ----
+
+    // Documents every Router route that has no operation yet. Routes are added
+    // sorted by path and method, so the result does not depend on hash order.
+    fn Discover(router?) {
+        this._touch();
+        let target = router ?? _router;
+        if (target == nil) { return this; }
+        let found = [];
+        foreach (route in Object.Values(target._exact)) { Array.Append(found, route); }
+        foreach (route in target._routes) { Array.Append(found, route); }
+        let entries = [];
+        foreach (route in found) {
+            let conv = OpenApi._convertPath(route.pattern);
+            Array.Append(entries, { method: String.ToLower(route.method), path: conv.path,
+                                    params: conv.params, host: route.host });
+        }
+        Array.Sort(entries, fn(a, b) {
+            if (a.path != b.path) { return a.path < b.path; }
+            return a.method < b.method;
+        });
+        foreach (e in entries) {
+            let ops = _paths.Get(e.path);
+            if (ops != nil && ops.Has(e.method)) { continue; }
+            let doc = {};
+            if (e.host != nil) { doc["x-host"] = e.host; }
+            let op = this._buildOperation(e.method, e.path, doc, e.params, nil);
+            var slot = ops;
+            if (slot == nil) { slot = new _Ordered(); _paths.Set(e.path, slot); }
+            slot.Set(e.method, op);
+        }
+        return this;
+    }
+
+    // ---- serving ----
+
+    fn Serve(opts?) {
+        if (_router == nil) {
+            throw(Exception.InvalidArguments,
+                  "OpenApi.Serve needs a Router - create the document with OpenApi.For(router, info)");
+        }
+        let o = opts ?? {};
+        _serveOpts = {
+            specPath: o.specPath ?? "/openapi.json",
+            docsPath: o.docsPath ?? "/docs",
+            ui:       Object.HasKey(o, "ui") ? o.ui : "builtin",
+            title:    o.title,
+            cdn:      o.cdn,
+            pretty:   o.pretty != false,
+            cors:     o.cors != false
+        };
+        this._touch();
+        let key = this._ensureKey();
+        _router.Get(_serveOpts.specPath, fn(req) { return _serveFromRegistry(key, "spec", req); });
+        if (_serveOpts.ui != false && _serveOpts.ui != nil) {
+            _router.Get(_serveOpts.docsPath, fn(req) { return _serveFromRegistry(key, "docs", req); });
+        }
+        return this;
+    }
+
+    fn Unserve() {
+        if (_serveKey != "" && Object.HasKey(_servedRegistry, _serveKey)) {
+            Object.Delete(_servedRegistry, _serveKey);
+        }
+        return this;
+    }
+
+    fn _touch() {
+        _cacheJson    = nil;
+        _cacheEtag    = nil;
+        _cacheHtml    = nil;
+        _cacheSchemas = nil;
+    }
+
+    fn _serveSpec(req) {
+        if (_cacheJson == nil) {
+            _cacheJson = this.ToJson(_serveOpts.pretty);
+            _cacheEtag = "\"" + String.Substr(Hash.Sha256(_cacheJson), 0, 32) + "\"";
+        }
+        let headers = { "Content-Type": "application/json; charset=utf-8",
+                        "ETag": _cacheEtag, "Cache-Control": "no-cache" };
+        if (_serveOpts.cors) { headers["Access-Control-Allow-Origin"] = "*"; }
+        let inm = Object.TryGet(req.headers ?? {}, "If-None-Match", nil);
+        if (inm != nil && inm == _cacheEtag) { return { status: 304, body: "", headers: headers }; }
+        return { status: 200, body: _cacheJson, headers: headers };
+    }
+
+    fn _serveDocs(_req) {
+        if (_cacheHtml == nil) {
+            let o = { title: _serveOpts.title ?? _info.title ?? "API", cdn: _serveOpts.cdn };
+            if (_serveOpts.ui == "swagger")    { _cacheHtml = OpenApi.SwaggerHtml(_serveOpts.specPath, o); }
+            else if (_serveOpts.ui == "redoc") { _cacheHtml = OpenApi.RedocHtml(_serveOpts.specPath, o); }
+            else                               { _cacheHtml = OpenApi.DocsHtml(_serveOpts.specPath, o); }
+        }
+        return { status: 200, body: _cacheHtml,
+                 headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" } };
+    }
+
+    fn static DocsHtml(specUrl:string, opts?) {
+        let o = opts ?? {};
+        let title = o.title ?? "API documentation";
+        return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            + "<title>" + _htmlEscape(title) + "</title>\n<style>\n" + _DOCS_CSS + "\n</style>\n</head>\n<body>\n"
+            + "<div id=\"app\"><div class=\"loading\">Loading " + _htmlEscape(specUrl) + " ...</div></div>\n"
+            + "<script>window.__OPENAPI__ = { specUrl: " + _jsString(specUrl) + ", title: " + _jsString(title) + " };</script>\n"
+            + "<script>\n" + _DOCS_JS + "\n</script>\n</body>\n</html>\n";
+    }
+
+    fn static SwaggerHtml(specUrl:string, opts?) {
+        let o = opts ?? {};
+        let title = o.title ?? "API documentation";
+        let cdn = o.cdn ?? "https://unpkg.com/swagger-ui-dist@5";
+        return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            + "<title>" + _htmlEscape(title) + "</title>\n"
+            + "<link rel=\"stylesheet\" href=\"" + _htmlEscape(cdn) + "/swagger-ui.css\">\n</head>\n<body>\n"
+            + "<div id=\"swagger-ui\"></div>\n"
+            + "<script src=\"" + _htmlEscape(cdn) + "/swagger-ui-bundle.js\" crossorigin></script>\n"
+            + "<script>window.onload = function () { window.ui = SwaggerUIBundle({ url: " + _jsString(specUrl)
+            + ", dom_id: \"#swagger-ui\", deepLinking: true, tryItOutEnabled: true }); };</script>\n</body>\n</html>\n";
+    }
+
+    fn static RedocHtml(specUrl:string, opts?) {
+        let o = opts ?? {};
+        let title = o.title ?? "API documentation";
+        let cdn = o.cdn ?? "https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js";
+        return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            + "<title>" + _htmlEscape(title) + "</title>\n<style>body { margin: 0; }</style>\n</head>\n<body>\n"
+            + "<redoc spec-url=\"" + _htmlEscape(specUrl) + "\"></redoc>\n"
+            + "<script src=\"" + _htmlEscape(cdn) + "\"></script>\n</body>\n</html>\n";
+    }
+
+    // ---- loading an existing document ----
+
+    fn static Load(json, router?) {
+        let doc = Type.IsString(json) ? Json.Parse(json) : json;
+        if (!Type.IsObject(doc)) { throw(Exception.InvalidArguments, "OpenApi.Load: expected a JSON object"); }
+        let api = new OpenApi(nil);
+        api._router = router ?? nil;
+        if (Type.IsString(doc.openapi)) { api._openapi = doc.openapi; }
+        if (Type.IsObject(doc.info))    { api._info = doc.info; }
+        if (Type.IsArray(doc.servers))  { api._servers = doc.servers; }
+        if (Type.IsArray(doc.tags)) {
+            api._tags = doc.tags;
+            foreach (t in doc.tags) { if (Type.IsObject(t) && Type.IsString(t.name)) { api._tagSeen[t.name] = true; } }
+        }
+        if (Type.IsObject(doc.paths)) {
+            foreach (path in _sortedKeys(doc.paths)) {
+                let item = doc.paths[path];
+                if (!Type.IsObject(item)) { continue; }
+                let ops = new _Ordered();
+                foreach (m in _METHOD_ORDER) { if (Object.HasKey(item, m)) { ops.Set(m, item[m]); } }
+                foreach (k in _sortedKeys(item)) { if (!ops.Has(k)) { ops.Set(k, item[k]); } }
+                api._paths.Set(path, ops);
+            }
+        }
+        if (Type.IsObject(doc.components)) {
+            let c = doc.components;
+            if (Type.IsObject(c.schemas)) {
+                foreach (n in _sortedKeys(c.schemas)) { api._schemas.Set(n, c.schemas[n]); }
+            }
+            if (Type.IsObject(c.securitySchemes)) {
+                foreach (n in _sortedKeys(c.securitySchemes)) { api._securitySchemes.Set(n, c.securitySchemes[n]); }
+            }
+            foreach (v, k in c) {
+                if (k != "schemas" && k != "securitySchemes") { api._componentsExtra[k] = v; }
+            }
+        }
+        if (Object.HasKey(doc, "security"))     { api._security = doc.security; }
+        if (Object.HasKey(doc, "externalDocs")) { api._externalDocs = doc.externalDocs; }
+        foreach (v, k in doc) {
+            if (k == "openapi" || k == "info" || k == "servers" || k == "tags" || k == "paths"
+                || k == "components" || k == "security" || k == "externalDocs") { continue; }
+            if (String.StartsWith(k, "x-")) { api._extensions.Set(k, v); } else { api._rootExtra[k] = v; }
+        }
+        return api;
+    }
+
+    fn static LoadFile(path:string, router?) {
+        let text = File.ReadText(path);
+        if (text == nil) { throw(Exception.InvalidArguments, "OpenApi.LoadFile: cannot read " + path); }
+        return OpenApi.Load(text, router);
+    }
+
+    // ---- validation ----
+
+    // Errors as [{ path, message }]; empty means valid. `schemas` resolves
+    // $ref (components.schemas); pass Spec().components.schemas or nothing.
+    fn static ValidateValue(value, schema, schemas?) {
+        let errors = [];
+        OpenApi._validate(value, schema, schemas ?? {}, "value", errors, 0);
+        return errors;
+    }
+
+    fn static _resolveRef(schema, schemas) {
+        var s = schema;
+        var hops:int = 0;
+        while (Type.IsObject(s) && s["$ref"] != nil && hops < 32) {
+            let ref:string = s["$ref"];
+            let name = String.Substr(ref, String.LastIndexOf(ref, "/") + 1);
+            s = Object.TryGet(schemas, name, nil);
+            hops += 1;
+        }
+        return s;
+    }
+
+    fn static _typeName(v): string {
+        if (v == nil)          { return "null"; }
+        if (Type.IsBool(v))    { return "boolean"; }
+        if (Type.IsInt(v))     { return "integer"; }
+        if (Type.IsFloat(v))   { return "number"; }
+        if (Type.IsString(v))  { return "string"; }
+        if (Type.IsArray(v))   { return "array"; }
+        if (Type.IsObject(v))  { return "object"; }
+        if (Class.IsInstance(v)) { return "object"; }
+        return "unknown";
+    }
+
+    fn static _check(value, schema, schemas, path:string, depth:int): array {
+        let e = [];
+        OpenApi._validate(value, schema, schemas, path, e, depth);
+        return e;
+    }
+
+    fn static _validate(valueIn, schemaIn, schemas, path:string, errors:array, depth:int) {
+        if (depth > 64) { return; }
+        var value = valueIn;
+        if (Class.IsInstance(value)) { value = Json.Parse(Json.Stringify(value)); }
+        let schema = OpenApi._resolveRef(schemaIn, schemas);
+        if (!Type.IsObject(schema)) {
+            if (Type.IsObject(schemaIn) && schemaIn["$ref"] != nil) {
+                _fail(errors, path, "unresolved $ref " + schemaIn["$ref"]);
+            }
+            return;
+        }
+        if (Object.Count(schema) == 0) { return; }
+
+        if (value == nil) {
+            if (schema.nullable == true) { return; }
+            if (schema.type == "null") { return; }
+            if (Type.IsArray(schema.type) && Array.Contains(schema.type, "null")) { return; }
+            if (schema.type != nil || schema.properties != nil || schema.items != nil || schema.enum != nil) {
+                _fail(errors, path, "must not be null");
+            }
+            return;
+        }
+
+        if (Type.IsArray(schema.allOf)) {
+            foreach (s in schema.allOf) { OpenApi._validate(value, s, schemas, path, errors, depth + 1); }
+        }
+        if (Type.IsArray(schema.anyOf)) {
+            var any = false;
+            foreach (s in schema.anyOf) {
+                if (len(OpenApi._check(value, s, schemas, path, depth + 1)) == 0) { any = true; break; }
+            }
+            if (!any) { _fail(errors, path, "matches none of anyOf"); }
+        }
+        if (Type.IsArray(schema.oneOf)) {
+            var n:int = 0;
+            foreach (s in schema.oneOf) {
+                if (len(OpenApi._check(value, s, schemas, path, depth + 1)) == 0) { n += 1; }
+            }
+            if (n != 1) { _fail(errors, path, "matches " + str(n) + " of oneOf, expected exactly 1"); }
+        }
+        if (schema["not"] != nil && len(OpenApi._check(value, schema["not"], schemas, path, depth + 1)) == 0) {
+            _fail(errors, path, "matches the excluded schema");
+        }
+
+        let actual = OpenApi._typeName(value);
+        if (schema.type != nil) {
+            let types = Type.IsArray(schema.type) ? schema.type : [schema.type];
+            var okType = false;
+            foreach (t in types) {
+                if (t == actual || (t == "number" && actual == "integer")) { okType = true; }
+            }
+            if (!okType) {
+                _fail(errors, path, "expected " + String.Join(types, " or ") + ", got " + actual);
+                return;
+            }
+        }
+        if (Type.IsArray(schema.enum) && !Array.Contains(schema.enum, value)) {
+            _fail(errors, path, "must be one of " + Json.Stringify(schema.enum));
+        }
+        if (Object.HasKey(schema, "const") && Json.Canonicalize(value) != Json.Canonicalize(schema["const"])) {
+            _fail(errors, path, "must equal " + Json.Stringify(schema["const"]));
+        }
+
+        if (actual == "string")                             { OpenApi._validateString(value, schema, path, errors); }
+        else if (actual == "integer" || actual == "number") { OpenApi._validateNumber(value, schema, path, errors); }
+        else if (actual == "array")                         { OpenApi._validateArray(value, schema, schemas, path, errors, depth); }
+        else if (actual == "object")                        { OpenApi._validateObject(value, schema, schemas, path, errors, depth); }
+    }
+
+    fn static _validateString(v:string, schema, path:string, errors:array) {
+        let n:int = String.Utf8Length(v);
+        if (Type.IsInt(schema.minLength) && n < schema.minLength) { _fail(errors, path, "shorter than " + str(schema.minLength) + " characters"); }
+        if (Type.IsInt(schema.maxLength) && n > schema.maxLength) { _fail(errors, path, "longer than " + str(schema.maxLength) + " characters"); }
+        if (Type.IsString(schema.pattern)) {
+            var matched = true;
+            try { matched = Regex.IsMatch(v, schema.pattern); } catch (_e) { matched = true; }
+            if (!matched) { _fail(errors, path, "does not match pattern " + schema.pattern); }
+        }
+        if (Type.IsString(schema.format)) {
+            let re = Object.TryGet(_FORMAT_RE, schema.format, nil);
+            if (re != nil && !Regex.IsMatch(v, re)) { _fail(errors, path, "is not a valid " + schema.format); }
+        }
+    }
+
+    fn static _validateNumber(v, schema, path:string, errors:array) {
+        let x:float = float(v);
+        if (Type.IsNumber(schema.minimum)) {
+            let excl = schema.exclusiveMinimum == true;
+            if (excl ? x <= float(schema.minimum) : x < float(schema.minimum)) {
+                _fail(errors, path, (excl ? "must be greater than " : "must be at least ") + str(schema.minimum));
+            }
+        }
+        if (Type.IsNumber(schema.maximum)) {
+            let excl = schema.exclusiveMaximum == true;
+            if (excl ? x >= float(schema.maximum) : x > float(schema.maximum)) {
+                _fail(errors, path, (excl ? "must be less than " : "must be at most ") + str(schema.maximum));
+            }
+        }
+        if (Type.IsNumber(schema.exclusiveMinimum) && x <= float(schema.exclusiveMinimum)) {
+            _fail(errors, path, "must be greater than " + str(schema.exclusiveMinimum));
+        }
+        if (Type.IsNumber(schema.exclusiveMaximum) && x >= float(schema.exclusiveMaximum)) {
+            _fail(errors, path, "must be less than " + str(schema.exclusiveMaximum));
+        }
+        if (Type.IsNumber(schema.multipleOf) && Math.AbsF(float(schema.multipleOf)) > 0.0) {
+            let q = x / float(schema.multipleOf);
+            if (Math.AbsF(q - float(Math.Round(q))) > 0.000000001) { _fail(errors, path, "must be a multiple of " + str(schema.multipleOf)); }
+        }
+        if (Type.IsInt(v) && schema.format == "int32" && (v > 2147483647 || v < -2147483648)) {
+            _fail(errors, path, "does not fit int32");
+        }
+    }
+
+    fn static _validateArray(v:array, schema, schemas, path:string, errors:array, depth:int) {
+        let n:int = len(v);
+        if (Type.IsInt(schema.minItems) && n < schema.minItems) { _fail(errors, path, "fewer than " + str(schema.minItems) + " items"); }
+        if (Type.IsInt(schema.maxItems) && n > schema.maxItems) { _fail(errors, path, "more than " + str(schema.maxItems) + " items"); }
+        if (schema.uniqueItems == true) {
+            let seen = {};
+            foreach (e in v) {
+                let k = Json.Canonicalize(e);
+                if (Object.HasKey(seen, k)) { _fail(errors, path, "items are not unique"); break; }
+                seen[k] = true;
+            }
+        }
+        if (schema.items != nil) {
+            foreach (e, i in v) { OpenApi._validate(e, schema.items, schemas, path + "[" + str(i) + "]", errors, depth + 1); }
+        }
+    }
+
+    fn static _validateObject(v, schema, schemas, path:string, errors:array, depth:int) {
+        let n:int = Object.Count(v);
+        if (Type.IsInt(schema.minProperties) && n < schema.minProperties) { _fail(errors, path, "fewer than " + str(schema.minProperties) + " properties"); }
+        if (Type.IsInt(schema.maxProperties) && n > schema.maxProperties) { _fail(errors, path, "more than " + str(schema.maxProperties) + " properties"); }
+        if (Type.IsArray(schema.required)) {
+            foreach (k in schema.required) {
+                if (!Object.HasKey(v, k)) { _fail(errors, path + "." + k, "is required"); }
+            }
+        }
+        let props = (schema.properties is _Ordered) ? _plain(schema.properties) : schema.properties;
+        foreach (val, k in v) {
+            let ps = Type.IsObject(props) ? Object.TryGet(props, k, nil) : nil;
+            if (ps != nil) {
+                OpenApi._validate(val, ps, schemas, path + "." + k, errors, depth + 1);
+            } else if (schema.additionalProperties == false) {
+                _fail(errors, path + "." + k, "is not allowed");
+            } else if (Type.IsObject(schema.additionalProperties)) {
+                OpenApi._validate(val, schema.additionalProperties, schemas, path + "." + k, errors, depth + 1);
+            }
+        }
+    }
+
+    // Turns a raw parameter string into the value its schema describes.
+    // Returns { ok, value, message }.
+    fn static _coerce(raw, schemaIn, schemas) {
+        if (!Type.IsString(raw)) { return { ok: true, value: raw }; }
+        let schema = OpenApi._resolveRef(schemaIn, schemas);
+        if (!Type.IsObject(schema)) { return { ok: true, value: raw }; }
+        var t = schema.type;
+        if (Type.IsArray(t)) { t = (len(t) > 0) ? t[0] : nil; }
+        if (t == "integer") {
+            if (!Regex.IsMatch(raw, """^[-+]?[0-9]+$""")) { return { ok: false, value: raw, message: "expected integer, got \"" + raw + "\"" }; }
+            return { ok: true, value: int(raw) };
+        }
+        if (t == "number") {
+            if (!Regex.IsMatch(raw, """^[-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$""")) {
+                return { ok: false, value: raw, message: "expected number, got \"" + raw + "\"" };
+            }
+            return { ok: true, value: float(raw) };
+        }
+        if (t == "boolean") {
+            if (raw == "true" || raw == "1")  { return { ok: true, value: true }; }
+            if (raw == "false" || raw == "0") { return { ok: true, value: false }; }
+            return { ok: false, value: raw, message: "expected boolean, got \"" + raw + "\"" };
+        }
+        if (t == "array") {
+            let out = [];
+            foreach (part in String.Split(raw, ",")) {
+                let c = OpenApi._coerce(part, schema.items ?? {}, schemas);
+                if (!c.ok) { return c; }
+                Array.Append(out, c.value);
+            }
+            return { ok: true, value: out };
+        }
+        return { ok: true, value: raw };
+    }
+
+    // Header lookup tolerant of the spellings Router leaves in req.headers.
+    fn static _headerValue(headers, name:string) {
+        if (!Type.IsObject(headers)) { return nil; }
+        var v = Object.TryGet(headers, name, nil);
+        if (v == nil) { v = Object.TryGet(headers, String.ToLower(name), nil); }
+        if (v == nil) {
+            let parts = String.Split(String.ToLower(name), "-");
+            foreach (p, i in parts) { parts[i] = _pascal(p); }
+            v = Object.TryGet(headers, String.Join(parts, "-"), nil);
+        }
+        return v;
+    }
+
+    fn static _mediaType(contentType): string {
+        if (!Type.IsString(contentType)) { return ""; }
+        let semi = String.IndexOf(contentType, ";");
+        let ct = (semi >= 0) ? String.Substr(contentType, 0, semi) : contentType;
+        return String.ToLower(String.Trim(ct));
+    }
+
+    // The content entry that fits a request or response media type.
+    fn static _pickMedia(content, mediaType:string) {
+        if (!Type.IsObject(content)) { return nil; }
+        if (Object.HasKey(content, mediaType)) { return { type: mediaType, media: content[mediaType] }; }
+        foreach (m, k in content) {
+            if (String.Contains(mediaType, "json") && String.Contains(k, "json")) { return { type: k, media: m }; }
+            if (k == "*/*") { return { type: k, media: m }; }
+        }
+        return nil;
+    }
+
+    fn _ensureKey(): string {
+        if (_serveKey == "") {
+            _serveKey = str(_servedNext);
+            _servedNext += 1;
+        }
+        _servedRegistry[_serveKey] = this;
+        return _serveKey;
+    }
+
+    // components.schemas as plain objects, for $ref resolution.
+    fn _plainSchemas() {
+        if (_cacheSchemas == nil) { _cacheSchemas = _plain(_schemas); }
+        return _cacheSchemas;
+    }
+
+    // The operation that answers `method` + `path`, with the path parameters
+    // the template captured, or nil.
+    fn _matchOperation(method:string, path:string) {
+        let m = String.ToLower(method);
+        let segs = [];
+        foreach (sg in String.Split(path, "/")) { if (String.Length(sg) > 0) { Array.Append(segs, sg); } }
+        let direct = _paths.Get("/" + String.Join(segs, "/"));
+        if (direct != nil && direct.Has(m)) { return { op: direct.Get(m), params: {} }; }
+        foreach (tpl in _paths.keys) {
+            if (!String.Contains(tpl, "{")) { continue; }
+            let ops = _paths.map[tpl];
+            if (!ops.Has(m)) { continue; }
+            let params = OpenApi._matchTemplate(tpl, segs);
+            if (params != nil) { return { op: ops.Get(m), params: params }; }
+        }
+        return nil;
+    }
+
+    fn static _matchTemplate(tpl:string, segs:array) {
+        let tsegs = [];
+        foreach (sg in String.Split(tpl, "/")) { if (String.Length(sg) > 0) { Array.Append(tsegs, sg); } }
+        let nt:int = len(tsegs);
+        let catchAll = nt > 0 && tsegs[nt - 1] == "{path}";
+        if (catchAll ? len(segs) < nt - 1 : len(segs) != nt) { return nil; }
+        let params = {};
+        var i:int = 0;
+        while (i < nt) {
+            let t:string = tsegs[i];
+            if (catchAll && i == nt - 1) {
+                params["path"] = String.Join(Array.Slice(segs, i), "/");
+                break;
+            }
+            if (String.StartsWith(t, "{") && String.EndsWith(t, "}")) {
+                params[String.Substr(t, 1, String.Length(t) - 2)] = segs[i];
+            } else if (t != segs[i]) {
+                return nil;
+            }
+            i += 1;
+        }
+        return params;
+    }
+
+    // Router middleware that checks every documented request against its
+    // operation before the handler runs. opts: { status: 400, coerce: true,
+    // responses: false }. Undocumented routes pass through untouched.
+    fn Validate(opts?) {
+        let key = this._ensureKey();
+        let o = opts ?? {};
+        let cfg = { status: o.status ?? 400, coerce: o.coerce != false, responses: o.responses == true };
+        return fn(req, next) {
+            let api = Object.TryGet(_servedRegistry, key, nil);
+            if (api == nil) { return next(req); }
+            return api._validateRequest(req, next, cfg);
+        };
+    }
+
+    fn _validateRequest(req, next, cfg) {
+        let match = this._matchOperation(req.method ?? "", req.path ?? "");
+        if (match == nil) { return next(req); }
+        let op      = match.op;
+        let schemas = this._plainSchemas();
+        let errors  = [];
+        let validated = { params: {}, query: {}, headers: {}, cookies: {}, body: nil };
+
+        foreach (pIn in op.parameters ?? []) {
+            let p = OpenApi._resolveRef(pIn, Object.TryGet(_componentsExtra, "parameters", {}));
+            if (!Type.IsObject(p) || p.name == nil) { continue; }
+            let where:string = p["in"] ?? "query";
+            let name:string  = p.name;
+            var raw = nil;
+            if (where == "path") {
+                raw = Object.TryGet(req.params ?? {}, name, nil) ?? Object.TryGet(match.params, name, nil);
+                if (raw == nil && name == "path") { raw = Object.TryGet(req.params ?? {}, "*", nil); }
+            } else if (where == "query")  { raw = Object.TryGet(req.query ?? {}, name, nil); }
+            else if (where == "header")   { raw = OpenApi._headerValue(req.headers, name); }
+            else if (where == "cookie")   { raw = Object.TryGet(req.cookies ?? {}, name, nil); }
+            let label = where + "." + name;
+            if (raw == nil) {
+                if (p.required == true) { _fail(errors, label, "is required"); }
+                continue;
+            }
+            let c = OpenApi._coerce(raw, p.schema ?? {}, schemas);
+            if (!c.ok) { _fail(errors, label, c.message); continue; }
+            OpenApi._validate(c.value, p.schema ?? {}, schemas, label, errors, 0);
+            if (where == "path")        { validated.params[name] = c.value;  if (cfg.coerce && Type.IsObject(req.params)) { req.params[name] = c.value; } }
+            else if (where == "query")  { validated.query[name] = c.value;   if (cfg.coerce && Type.IsObject(req.query))  { req.query[name] = c.value; } }
+            else if (where == "header") { validated.headers[name] = c.value; }
+            else                        { validated.cookies[name] = c.value; }
+        }
+
+        let rb = OpenApi._resolveRef(op.requestBody, Object.TryGet(_componentsExtra, "requestBodies", {}));
+        if (Type.IsObject(rb)) {
+            let body = Type.IsString(req.body) ? req.body : "";
+            if (String.Length(body) == 0) {
+                if (rb.required == true) { _fail(errors, "body", "is required"); }
+            } else {
+                let ct   = OpenApi._mediaType(OpenApi._headerValue(req.headers, "Content-Type") ?? "application/json");
+                let pick = OpenApi._pickMedia(rb.content, ct);
+                if (pick == nil) {
+                    _fail(errors, "body", "unsupported content type " + ct);
+                } else if (String.Contains(pick.type, "json")) {
+                    let parsed = Json.Parse(body);
+                    if (parsed == nil && String.Trim(body) != "null") {
+                        _fail(errors, "body", "is not valid JSON");
+                    } else {
+                        validated.body = parsed;
+                        if (pick.media.schema != nil) { OpenApi._validate(parsed, pick.media.schema, schemas, "body", errors, 0); }
+                    }
+                } else if (String.Contains(pick.type, "x-www-form-urlencoded")) {
+                    validated.body = OpenApi._coerceForm(req.form ?? {}, pick.media.schema, schemas);
+                    if (pick.media.schema != nil) { OpenApi._validate(validated.body, pick.media.schema, schemas, "body", errors, 0); }
+                } else {
+                    validated.body = body;
+                }
+            }
+        }
+
+        if (len(errors) > 0) {
+            return { status: cfg.status, headers: { "Content-Type": "application/json" },
+                     body: Json.Stringify({ error: "Validation failed", details: errors }) };
+        }
+        req.validated = validated;
+        let resp = next(req);
+        if (!cfg.responses || resp == nil) { return resp; }
+
+        let rerrors = [];
+        OpenApi._checkResponse(resp, op, schemas, rerrors);
+        if (len(rerrors) == 0) { return resp; }
+        return { status: 500, headers: { "Content-Type": "application/json" },
+                 body: Json.Stringify({ error: "Response does not match the API description", details: rerrors }) };
+    }
+
+    // Form fields arrive as strings; coerce each against its property schema.
+    fn static _coerceForm(form, schemaIn, schemas) {
+        let out = {};
+        let schema = OpenApi._resolveRef(schemaIn, schemas);
+        let props = Type.IsObject(schema) ? _plain(schema.properties) : nil;
+        foreach (v, k in form) {
+            let ps = Type.IsObject(props) ? Object.TryGet(props, k, nil) : nil;
+            let c = (ps != nil) ? OpenApi._coerce(v, ps, schemas) : { ok: true, value: v };
+            out[k] = c.ok ? c.value : v;
+        }
+        return out;
+    }
+
+    // Validates a handler response against the operation's declared responses.
+    fn static _checkResponse(resp, op, schemas, errors:array) {
+        let code = str(resp.status ?? 200);
+        let responses = op.responses ?? {};
+        let declared = Object.TryGet(responses, code, nil) ?? Object.TryGet(responses, String.Substr(code, 0, 1) + "XX", nil)
+                       ?? Object.TryGet(responses, "default", nil);
+        if (declared == nil) { _fail(errors, "status", "undocumented status " + code); return; }
+        if (!Type.IsObject(declared.content)) { return; }
+        let ct   = OpenApi._mediaType(OpenApi._headerValue(resp.headers, "Content-Type") ?? "application/json");
+        let pick = OpenApi._pickMedia(declared.content, ct);
+        if (pick == nil) { _fail(errors, "content-type", "undocumented content type " + ct + " for status " + code); return; }
+        if (pick.media.schema == nil || !String.Contains(pick.type, "json")) { return; }
+        let body = Type.IsString(resp.body) ? resp.body : "";
+        let parsed = Json.Parse(body);
+        if (parsed == nil && String.Trim(body) != "null") { _fail(errors, "body", "is not valid JSON"); return; }
+        OpenApi._validate(parsed, pick.media.schema, schemas, "body", errors, 0);
+    }
+
+    // ---- learning from traffic ----
+
+    // Router middleware that fills in what the documentation lacks from the
+    // requests and responses it sees: query parameters, request-body schemas
+    // and response schemas per status code. Declared schemas are never
+    // touched; learned ones carry "x-learned": true and keep widening as more
+    // samples arrive. Run Discover() first so every route has an operation.
+    // opts: { maxSamples: 50, examples: false, query: true, bodies: true,
+    //         responses: true }
+    fn Learn(opts?) {
+        let key = this._ensureKey();
+        let o = opts ?? {};
+        let cfg = { maxSamples: o.maxSamples ?? 50, examples: o.examples == true,
+                    query: o.query != false, bodies: o.bodies != false, responses: o.responses != false };
+        return fn(req, next) {
+            let resp = next(req);
+            let api = Object.TryGet(_servedRegistry, key, nil);
+            if (api != nil) { api._learn(req, resp, cfg); }
+            return resp;
+        };
+    }
+
+    fn _learn(req, resp, cfg) {
+        let match = this._matchOperation(req.method ?? "", req.path ?? "");
+        if (match == nil) { return; }
+        let op = match.op;
+        var meta = Object.TryGet(op, "x-learned", nil);
+        if (meta == nil) { meta = { samples: 0 }; op["x-learned"] = meta; }
+        if (meta.samples >= cfg.maxSamples) { return; }
+        meta.samples += 1;
+
+        if (cfg.query && Type.IsObject(req.query)) { OpenApi._learnQuery(op, req.query, meta.samples == 1); }
+
+        if (cfg.bodies && Type.IsString(req.body) && String.Length(req.body) > 0) {
+            let ct = OpenApi._mediaType(OpenApi._headerValue(req.headers, "Content-Type") ?? "application/json");
+            if (String.Contains(ct, "json")) {
+                let parsed = Json.Parse(req.body);
+                if (parsed != nil) {
+                    var rb = op.requestBody;
+                    if (rb == nil) { rb = { required: true, content: {}, "x-learned": true }; op.requestBody = rb; }
+                    if (rb["x-learned"] == true || rb.content == nil) {
+                        if (rb.content == nil) { rb.content = {}; }
+                        OpenApi._learnMedia(rb.content, ct, parsed, cfg.examples);
+                    }
+                }
+            }
+        }
+
+        if (cfg.responses && Type.IsObject(resp)) {
+            let code = str(resp.status ?? 200);
+            if (op.responses == nil) { op.responses = {}; }
+            var r = Object.TryGet(op.responses, code, nil);
+            if (r == nil) {
+                r = { description: Object.TryGet(_STATUS_TEXT, code, "Response " + code), "x-learned": true };
+                op.responses[code] = r;
+            }
+            let ct = OpenApi._mediaType(OpenApi._headerValue(resp.headers, "Content-Type") ?? "");
+            if (String.Contains(ct, "json") && Type.IsString(resp.body) && String.Length(resp.body) > 0) {
+                let parsed = Json.Parse(resp.body);
+                if (parsed != nil && (r["x-learned"] == true || r.content == nil)) {
+                    if (r.content == nil) { r.content = {}; }
+                    OpenApi._learnMedia(r.content, ct, parsed, cfg.examples);
+                }
+            }
+        }
+        this._touch();
+    }
+
+    fn static _learnQuery(op, query, firstSample:bool) {
+        if (op.parameters == nil) { op.parameters = []; }
+        let seen = {};
+        foreach (v, name in query) {
+            seen[name] = true;
+            var p = nil;
+            foreach (cand in op.parameters) {
+                if (Type.IsObject(cand) && cand["in"] == "query" && cand.name == name) { p = cand; break; }
+            }
+            if (p == nil) {
+                p = { name: name, "in": "query", schema: OpenApi._mergeSchema(nil, OpenApi._inferText(v)), "x-learned": true };
+                if (firstSample) { p.required = true; }
+                Array.Append(op.parameters, p);
+            } else if (p["x-learned"] == true) {
+                p.schema = OpenApi._mergeSchema(p.schema, OpenApi._inferText(v));
+            }
+        }
+        foreach (p in op.parameters) {
+            if (Type.IsObject(p) && p["x-learned"] == true && p["in"] == "query"
+                && !Object.HasKey(seen, p.name) && Object.HasKey(p, "required")) {
+                Object.Delete(p, "required");
+            }
+        }
+    }
+
+    fn static _learnMedia(content, ct:string, parsed, keepExample:bool) {
+        var media = Object.TryGet(content, ct, nil);
+        if (media == nil) { media = {}; content[ct] = media; }
+        if (media.schema != nil && media.schema["x-learned"] != true) { return; }
+        media.schema = OpenApi._mergeSchema(media.schema, OpenApi._infer(parsed));
+        if (keepExample && media.example == nil) { media.example = parsed; }
+    }
+
+    // Schema for a raw query-string value.
+    fn static _inferText(v) {
+        if (!Type.IsString(v)) { return OpenApi._infer(v); }
+        if (Regex.IsMatch(v, """^[-+]?[0-9]+$"""))                  { return { type: "integer" }; }
+        if (Regex.IsMatch(v, """^[-+]?[0-9]*\.[0-9]+([eE][-+]?[0-9]+)?$""")) { return { type: "number" }; }
+        if (v == "true" || v == "false")                          { return { type: "boolean" }; }
+        return { type: "string" };
+    }
+
+    // Widens learned schema `a` with sample schema `b`; the result is marked
+    // learned. Declared schemas (no x-learned) are returned unchanged.
+    fn static _markLearned(schema) {
+        if (!Type.IsObject(schema)) { return schema; }
+        schema["x-learned"] = true;
+        if (Type.IsObject(schema.properties)) {
+            foreach (ps, k in schema.properties) { OpenApi._markLearned(ps); }
+        }
+        if (Type.IsObject(schema.items)) { OpenApi._markLearned(schema.items); }
+        return schema;
+    }
+
+    fn static _mergeSchema(a, b) {
+        if (a == nil) { return OpenApi._markLearned(_plain(b)); }
+        if (a["x-learned"] != true) { return a; }
+        let bb = _plain(b);
+        if (a.nullable == true && a.type == nil) {
+            let widened = bb; widened.nullable = true; widened["x-learned"] = true; return widened;
+        }
+        if (bb.nullable == true && bb.type == nil) { a.nullable = true; return a; }
+        if (a.type != bb.type) {
+            if ((a.type == "integer" && bb.type == "number") || (a.type == "number" && bb.type == "integer")) {
+                a.type = "number";
+            } else {
+                Object.Delete(a, "type"); Object.Delete(a, "properties"); Object.Delete(a, "required"); Object.Delete(a, "items");
+            }
+            return a;
+        }
+        if (a.type == "object") {
+            if (a.properties == nil) { a.properties = {}; }
+            let bprops = bb.properties ?? {};
+            foreach (ps, k in bprops) {
+                a.properties[k] = Object.HasKey(a.properties, k) ? OpenApi._mergeSchema(a.properties[k], ps) : OpenApi._mergeSchema(nil, ps);
+            }
+            let kept = [];
+            foreach (k in a.required ?? []) { if (Array.Contains(bb.required ?? [], k)) { Array.Append(kept, k); } }
+            if (len(kept) > 0) { a.required = kept; } else { Object.Delete(a, "required"); }
+        } else if (a.type == "array") {
+            let bi = bb.items ?? {};
+            if (Object.Count(bi) > 0) {
+                a.items = (a.items == nil || Object.Count(a.items) == 0) ? OpenApi._mergeSchema(nil, bi) : OpenApi._mergeSchema(a.items, bi);
+            }
+        }
+        return a;
+    }
+
+    // ---- contract check ----
+
+    // Calls every documented operation on the attached Router with values
+    // derived from the document and checks that each answer is a declared
+    // status whose JSON body matches the declared schema. Returns
+    // { ok, passed, failed, results: [{ method, path, request, status, ok, errors, operationId }] }.
+    // opts: { values: { paramName: value }, headers: {}, bodies: { operationId: body },
+    //         only: [operationId], skip: [operationId] }
+    fn Contract(opts?) {
+        if (_router == nil) {
+            throw(Exception.InvalidArguments, "OpenApi.Contract needs a Router - create the document with OpenApi.For(router, info)");
+        }
+        let o = opts ?? {};
+        let schemas = this._plainSchemas();
+        let results = [];
+        var passed:int = 0;
+        var failed:int = 0;
+        foreach (path in _paths.keys) {
+            let ops = _paths.map[path];
+            foreach (m in ops.keys) {
+                if (!Array.Contains(_METHOD_ORDER, m)) { continue; }
+                let op = ops.map[m];
+                if (Type.IsArray(o.only) && !Array.Contains(o.only, op.operationId)) { continue; }
+                if (Type.IsArray(o.skip) && Array.Contains(o.skip, op.operationId)) { continue; }
+                let r = this._contractOne(m, path, op, schemas, o);
+                Array.Append(results, r);
+                if (r.ok) { passed += 1; } else { failed += 1; }
+            }
+        }
+        return { ok: failed == 0, passed: passed, failed: failed, results: results };
+    }
+
+    fn _contractOne(method:string, path:string, op, schemas, o) {
+        let values  = o.values ?? {};
+        let headers = Object.Clone(o.headers ?? {});
+        let query   = {};
+        var concrete = path;
+        foreach (pIn in op.parameters ?? []) {
+            let p = OpenApi._resolveRef(pIn, Object.TryGet(_componentsExtra, "parameters", {}));
+            if (!Type.IsObject(p) || p.name == nil) { continue; }
+            let given = Object.HasKey(values, p.name);
+            let v = given ? values[p.name] : (p.example ?? OpenApi._exampleOf(p.schema, schemas, 0));
+            let text = Type.IsString(v) ? v : Json.Stringify(v);
+            if (p["in"] == "path")                                   { concrete = String.Replace(concrete, "{" + p.name + "}", text); }
+            else if (p["in"] == "query" && (p.required == true || given))  { query[p.name] = text; }
+            else if (p["in"] == "header" && (p.required == true || given)) { headers[p.name] = text; }
+        }
+        var body = "";
+        let rb = OpenApi._resolveRef(op.requestBody, Object.TryGet(_componentsExtra, "requestBodies", {}));
+        if (Type.IsObject(rb) && Type.IsObject(rb.content)) {
+            let pick = OpenApi._pickMedia(rb.content, "application/json") ?? { type: Object.Keys(rb.content)[0], media: Object.Values(rb.content)[0] };
+            let given = Type.IsObject(o.bodies) && Object.HasKey(o.bodies, op.operationId);
+            let ex = given ? o.bodies[op.operationId] : (pick.media.example ?? OpenApi._exampleOf(pick.media.schema, schemas, 0));
+            body = Type.IsString(ex) ? ex : Json.Stringify(ex);
+            headers["Content-Type"] = pick.type;
+        }
+        let req = { method: String.ToUpper(method), path: concrete, rawPath: concrete, params: {}, query: query,
+                    headers: headers, cookies: {}, form: {}, peer: "127.0.0.1:0", secure: false, body: body };
+        let errors = [];
+        var resp = nil;
+        try { resp = _router._dispatch(req); }
+        catch (e) { _fail(errors, "handler", "raised: " + e.Error); }
+        if (resp == nil) {
+            if (len(errors) == 0) { _fail(errors, "handler", "returned nil"); }
+        } else {
+            OpenApi._checkResponse(resp, op, schemas, errors);
+        }
+        return { method: String.ToUpper(method), path: path, request: concrete, operationId: op.operationId,
+                 status: (resp != nil) ? resp.status : nil, ok: len(errors) == 0, errors: errors };
+    }
+
+    // A value that satisfies `schema`, used for contract requests.
+    fn static _exampleOf(schemaIn, schemas, depth:int) {
+        if (depth > 12) { return nil; }
+        let s = OpenApi._resolveRef(schemaIn, schemas);
+        if (!Type.IsObject(s)) { return nil; }
+        if (Object.HasKey(s, "example")) { return s.example; }
+        if (Object.HasKey(s, "default")) { return s.default; }
+        if (Type.IsArray(s.enum) && len(s.enum) > 0) { return s.enum[0]; }
+        if (Type.IsArray(s.allOf)) {
+            let merged = {};
+            foreach (a in s.allOf) {
+                let v = OpenApi._exampleOf(a, schemas, depth + 1);
+                if (Type.IsObject(v)) { Object.Merge(merged, v); }
+            }
+            return merged;
+        }
+        if (Type.IsArray(s.oneOf) && len(s.oneOf) > 0) { return OpenApi._exampleOf(s.oneOf[0], schemas, depth + 1); }
+        if (Type.IsArray(s.anyOf) && len(s.anyOf) > 0) { return OpenApi._exampleOf(s.anyOf[0], schemas, depth + 1); }
+        var t = s.type;
+        if (Type.IsArray(t)) { t = (len(t) > 0) ? t[0] : nil; }
+        if (t == "array") {
+            let item = OpenApi._exampleOf(s.items, schemas, depth + 1);
+            return (item == nil) ? [] : [item];
+        }
+        if (t == "object" || s.properties != nil) {
+            let out = {};
+            let props = _plain(s.properties) ?? {};
+            foreach (ps, k in props) { out[k] = OpenApi._exampleOf(ps, schemas, depth + 1); }
+            return out;
+        }
+        if (t == "integer") { return (Type.IsNumber(s.minimum)) ? int(s.minimum) : 1; }
+        if (t == "number")  { return (Type.IsNumber(s.minimum)) ? float(s.minimum) : 1.0; }
+        if (t == "boolean") { return true; }
+        if (t == "string") {
+            let f = s.format;
+            if (f == "date")      { return "2024-01-01"; }
+            if (f == "date-time") { return "2024-01-01T12:00:00Z"; }
+            if (f == "uuid")      { return "00000000-0000-0000-0000-000000000000"; }
+            if (f == "email")     { return "user@example.com"; }
+            if (f == "uri")       { return "https://example.com"; }
+            return "string";
+        }
+        return nil;
+    }
+
+    // ---- output ----
+
+    // The document tree with _Ordered containers still in place.
+    fn _document() {
+        let doc = new _Ordered();
+        doc.Set("openapi", _openapi);
+        doc.Set("info", _info);
+        if (len(_servers) > 0) { doc.Set("servers", _servers); }
+        if (len(_tags) > 0)    { doc.Set("tags", _tags); }
+        doc.Set("paths", _paths);
+        if (_schemas.Count() > 0 || _securitySchemes.Count() > 0 || Object.Count(_componentsExtra) > 0) {
+            let comps = new _Ordered();
+            if (_schemas.Count() > 0)         { comps.Set("schemas", _schemas); }
+            if (_securitySchemes.Count() > 0) { comps.Set("securitySchemes", _securitySchemes); }
+            foreach (k in _sortedKeys(_componentsExtra)) { comps.Set(k, _componentsExtra[k]); }
+            doc.Set("components", comps);
+        }
+        if (_security != nil)     { doc.Set("security", _security); }
+        if (_externalDocs != nil) { doc.Set("externalDocs", _externalDocs); }
+        foreach (k in _sortedKeys(_rootExtra)) { doc.Set(k, _rootExtra[k]); }
+        foreach (k in _extensions.keys) { doc.Set(k, _extensions.map[k]); }
+        return doc;
+    }
+
+    fn Spec() { return _plain(this._document()); }
+
+    fn ToJson(pretty?): string { return _writeJson(this._document(), pretty == true); }
+}
+
+export { OpenApi, OpenApiGroup };

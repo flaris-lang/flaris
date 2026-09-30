@@ -557,6 +557,68 @@ fn test_delimited() {
     check("delimited: first",  Pb.DecodeDelimited(r, Spec1).a, 150);
     check("delimited: second", Pb.DecodeDelimited(r, Spec1).a, 7);
     check("delimited: drained", r.AtEnd(), true);
+
+    // A message in the middle of a reader's window, then a raw varint after it.
+    let w2 = new PbWriter();
+    w2.VarInt(99);
+    w2.Raw(Pb.EncodeDelimited(a));
+    w2.VarInt(5);
+    let r2 = new PbReader(w2.ToBuffer());
+    check("delimited: prefix varint", r2.VarInt(), 99);
+    check("delimited: middle message", Pb.DecodeDelimited(r2, Spec1).a, 150);
+    check("delimited: reader continues after it", r2.VarInt(), 5);
+    var caught = "";
+    try { Pb.DecodeDelimited(new PbReader(BitConverter.FromHex("05089601")), Spec1); }
+    catch (e) { caught = e.Error; }
+    check("delimited: length past the reader raises", String.Contains(caught, "runs past"), true);
+}
+
+// Lengths of 128 bytes and more take a two-byte varint, at every nesting level.
+fn test_long_lengths() {
+    let inner = new Inner();
+    inner.note = String.Repeat("x", 200);
+    let t = new Tree();
+    t.label = String.Repeat("L", 130);
+    t.left = new Tree();
+    t.left.label = String.Repeat("l", 140);
+    let bytes = Pb.Encode(t);
+    let hex = String.ToLower(BitConverter.ToHex(bytes));
+    check("long: outer label length prefix", String.Substr(hex, 0, 6), "0a8201");
+    check("long: nested message length prefix", String.Substr(hex, 266, 6), "128f01");
+    check("long: nested label length prefix", String.Substr(hex, 272, 6), "0a8c01");
+    check("long: total size", len(bytes), 1 + 2 + 130 + 1 + 2 + 1 + 2 + 140);
+    let back = Pb.Decode(bytes, Tree);
+    check("long: round-trip label", back.left.label, t.left.label);
+
+    let all = new AllTypes();
+    all.inners = [inner, inner];
+    all.m_sm = { big: inner };
+    all.nums = [];
+    iter (i from 0 to 100) { Array.Append(all.nums, 1000 + i); }
+    let ab = Pb.Encode(all);
+    check("long: EncodedSize", Pb.EncodedSize(all), len(ab));
+    let again = Pb.Decode(ab, AllTypes);
+    check("long: packed run of 200 bytes", len(again.nums), 100);
+    check("long: packed last", again.nums[99], 1099);
+    check("long: map message value", len(again.m_sm.big.note), 200);
+    check("long: repeated message", again.inners[1].note, inner.note);
+    check("long: re-encode identical", String.ToLower(BitConverter.ToHex(Pb.Encode(again))),
+          String.ToLower(BitConverter.ToHex(ab)));
+}
+
+fn test_reader_after_error() {
+    let r = new PbReader(BitConverter.FromHex("0196"));
+    check("reader: first varint", r.VarInt(), 1);
+    var caught = "";
+    try { r.VarInt(); } catch (e) { caught = e.Error; }
+    check("reader: truncated varint raises", String.Contains(caught, "truncated varint"), true);
+    check("reader: position unchanged by the failed read", r.Position(), 1);
+    caught = "";
+    try { r.Fixed32(); } catch (e) { caught = e.Error; }
+    check("reader: truncated fixed32 raises", String.Contains(caught, "truncated fixed32"), true);
+    let ok = new PbReader(BitConverter.FromHex("2a000000000000f03f"));
+    check("reader: usable after errors elsewhere", ok.VarInt(), 42);
+    check("reader: fixed64", ok.Fixed64(), 0x3FF0000000000000);
 }
 
 fn test_encoded_size() {
@@ -598,7 +660,7 @@ fn test_errors() {
     try {
         let deep = new Tree();
         let cur = deep;
-        iter (i from 0 to 120) { cur.left = new Tree(); cur = cur.left; }
+        iter (i from 0 to 121) { cur.left = new Tree(); cur = cur.left; }
         Pb.Encode(deep);
     } catch (e) { caught = true; }
     check("error: depth cap enforced", caught, true);
@@ -946,6 +1008,31 @@ fn test_proto_imports() {
           String.Contains(caught, "cannot find imported file"), true);
 }
 
+// The documented call forms, optional arguments left out.
+fn test_optional_args() {
+    let w = new PbWriter();
+    w.VarInt(300);
+    w.VarInt(7);
+    let blk:block = w.ToBuffer();
+    check("optional: PbReader(buf)",         new PbReader(blk).VarInt(), 300);
+    let r = new PbReader(blk, 2);
+    check("optional: PbReader(buf, offset)", r.VarInt(), 7);
+    check("optional: offset reader drained", r.AtEnd(), true);
+    check("optional: PbReader length",       new PbReader(blk, 0, 2).Limit(), 2);
+
+    let src:string = "syntax = \"proto3\";\nmessage P { int32 v = 1; }\n";
+    check("optional: ParseProto(src)", Pb.ParseProto(src).messages[0].fqName, "P");
+    let t = Pb.LoadProto(src);
+    check("optional: LoadProto(src)",  Class.IsClass(t["P"]), true);
+    let msg:string = "";
+    try { Pb.ParseProto("syntax = \"proto3\";\nmessage {"); } catch (e) { msg = e.Error; }
+    check("optional: unnamed source reported as <input>", String.Contains(msg, "<input>"), true);
+
+    let main:string = Path.Combine(TMPDIR, "main.proto");
+    check("optional: ParseProtoFile(path)", len(Pb.ParseProtoFile(main).deps), 1);
+    check("optional: LoadProtoFile(path)",  Class.IsClass(Pb.LoadProtoFile(main)["Bill"]), true);
+}
+
 fn test_proto_services() {
     let t = Pb.LoadProto(
         "syntax = \"proto3\";\n"
@@ -1266,7 +1353,7 @@ fn bench(name:string, f:fn, n:int, batch:int) {
     f(); f(); f();
 
     let t0:int = Time.Ticks();
-    iter (i from 0 to n - 1) { f(); }
+    iter (i from 0 to n) { f(); }
     let dt:int = Time.Ticks() - t0;
 
     let ms:float = Time.TicksToMs(dt);
@@ -1292,27 +1379,27 @@ fn test_benchmark() {
     Console.WriteLine("== Benchmark == (AllTypes is ", len(_benchBytes), " bytes, 24 fields)");
 
     bench("baseline (empty loop)", fn() {
-        iter (i from 0 to BATCH - 1) { _sink = 0; }
+        iter (i from 0 to BATCH) { _sink = 0; }
     }, N, BATCH);
 
     bench("Encode  AllTypes", fn() {
-        iter (i from 0 to BATCH - 1) { _sink = len(Pb.Encode(_benchMsg)); }
+        iter (i from 0 to BATCH) { _sink = len(Pb.Encode(_benchMsg)); }
     }, N, BATCH);
 
     bench("Decode  AllTypes", fn() {
-        iter (i from 0 to BATCH - 1) { _sink = Pb.Decode(_benchBytes, AllTypes).f_int32; }
+        iter (i from 0 to BATCH) { _sink = Pb.Decode(_benchBytes, AllTypes).f_int32; }
     }, N, BATCH);
 
     bench("EncodedSize AllTypes", fn() {
-        iter (i from 0 to BATCH - 1) { _sink = Pb.EncodedSize(_benchMsg); }
+        iter (i from 0 to BATCH) { _sink = Pb.EncodedSize(_benchMsg); }
     }, N, BATCH);
 
     bench("Encode  3-byte message", fn() {
-        iter (i from 0 to BATCH - 1) { _sink = len(Pb.Encode(small)); }
+        iter (i from 0 to BATCH) { _sink = len(Pb.Encode(small)); }
     }, N, BATCH);
 
     bench("Decode  3-byte message", fn() {
-        iter (i from 0 to BATCH - 1) { _sink = Pb.Decode(smallBytes, Spec1).a; }
+        iter (i from 0 to BATCH) { _sink = Pb.Decode(smallBytes, Spec1).a; }
     }, N, BATCH);
 }
 
@@ -1341,6 +1428,8 @@ fn Main() {
     test_merge();
     test_equals_clone();
     test_delimited();
+    test_long_lengths();
+    test_reader_after_error();
 
     Console.WriteLine("--- runtime-defined messages ---");
     test_dynamic_messages();
@@ -1351,6 +1440,7 @@ fn Main() {
     test_proto_define();
     test_proto_matches_static();
     test_proto_imports();
+    test_optional_args();
     test_proto_services();
     test_well_known();
     test_json();

@@ -55,6 +55,7 @@
 // ── DateTime ─────────────────────────────────────────────────────────────────
 //
 // Constructors (static):
+//   new DateTime(ts, tz?)          - from Unix seconds (int or float; tz default UTC)
 //   DateTime.Now()                 - current UTC time
 //   DateTime.NowIn(tz)             - current time in named timezone
 //   DateTime.NowLocal()            - current local time
@@ -63,7 +64,7 @@
 //   DateTime.FromUnix(ts)          - from Unix timestamp (seconds, UTC)
 //   DateTime.FromUnixIn(ts, tz)    - from Unix timestamp with timezone
 //   DateTime.FromMillis(ms)        - from millisecond timestamp
-//   DateTime.Parse(s, tz?)         - ISO 8601 string
+//   DateTime.Parse(s, tz?)         - ISO 8601 string; a trailing "Z" or "+hh:mm" offset is applied
 //   DateTime.ParseFmt(s, fmt, tz?) - custom format string
 //   DateTime.Min(a, b)  DateTime.Max(a, b)
 //
@@ -199,7 +200,7 @@ class Duration {
     fn TotalWeeks(): float      { return this._secs / 604800.0; }
 
     // Integer component parts (always non-negative).
-    fn Days(): int    { return int(Math.Abs(float(this._secs)) / 86400); }
+    fn Days(): int    { return int(Math.Abs(this._secs) / 86400); }
     fn Hours(): int   { return int(Math.Abs(this._secs) / 3600); }
     fn Minutes(): int { return int((Math.Abs(this._secs) % 3600) / 60); }
     fn Seconds(): int { return Math.Abs(this._secs) % 60; }
@@ -283,7 +284,7 @@ class TimeSpan {
     fn Sub(other:instance): instance { return new TimeSpan(this._ms - other._ms); }
     fn Scale(factor:number): instance { return new TimeSpan(this._ms * factor); }
     fn Negate(): instance { return new TimeSpan(-this._ms); }
-    fn Abs(): instance { return new TimeSpan(Math.Abs(this._ms)); }
+    fn Abs(): instance { return new TimeSpan(Math.AbsF(this._ms)); }
 
     fn TotalMilliseconds(): float { return this._ms; }
     fn TotalSeconds(): float { return this._ms / 1000.0; }
@@ -299,7 +300,7 @@ class TimeSpan {
 
     fn ToString(): string {
         let sign = (this._ms < 0.0 ? "-" : "");
-        let total = Math.Abs(this._ms);
+        let total = Math.AbsF(this._ms);
         let ms = int(total) % 1000;
         let sec = int(total / 1000.0) % 60;
         let min = int(total / 60000.0) % 60;
@@ -353,13 +354,14 @@ class DateTime {
     let _ms = 0;
     let _tz: string = nil; 
 
-    fn Constructor(timestamp:number, tz:string|nil) {
+    fn Constructor(timestamp:number, tz?:string) {
         let secs = int(timestamp);
-        let fraction = timestamp - float(secs);
         this._ts = secs;
-        this._ms = int(fraction * 1000.0);
-        if (this._ms < 0) {
-            this._ms = 0;
+        if (timestamp != secs) {
+            this._ms = int((timestamp - float(secs)) * 1000.0);
+            if (this._ms < 0) {
+                this._ms = 0;
+            }
         }
         this._tz = (tz == nil ? "UTC" : tz);
     }
@@ -395,10 +397,103 @@ class DateTime {
     fn static _FormatOffset(offsetMins:int): string {
         if (offsetMins == 0) { return "+00:00"; }
         let sign = (offsetMins < 0 ? "-" : "+");
-        let abs  = Math.Abs(offsetMins);
-        let h    = int(abs / 60);
-        let m    = abs % 60;
-        return sign + String.PadLeft(str(h), 2, "0") + ":" + String.PadLeft(str(m), 2, "0");
+        let abs  = (offsetMins < 0 ? -offsetMins : offsetMins);
+        let h    = str(abs / 60);
+        let m    = str(abs % 60);
+        return sign + String.PadLeft(h, 2, "0") + ":" + String.PadLeft(m, 2, "0");
+    }
+
+    // "YYYY-MM-DD" sep "HH:MM:SS", followed by "+HH:MM" for offsetMins when
+    // withOffset is set, for a local timestamp in the years 0-9999 and an
+    // offset of less than 100 hours - the text Time.Format and _FormatOffset
+    // produce for it.
+    fn static _StampText(local:int, sep:char, offsetMins:int, withOffset:bool): string {
+        var days = local / 86400;
+        var secs = local % 86400;
+        if (secs < 0) {
+            secs = secs + 86400;
+            days = days - 1;
+        }
+
+        // Proleptic Gregorian date from days since 1970-01-01, counted in
+        // 400-year eras of 146097 days with years starting on 1 March.
+        let z     = days + 719468;
+        let era   = (z >= 0 ? z : z - 146096) / 146097;
+        let doe   = z - era * 146097;
+        let yoe   = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy   = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp    = (5 * doy + 2) / 153;
+        let day   = doy - (153 * mp + 2) / 5 + 1;
+        let month = (mp < 10 ? mp + 3 : mp - 9);
+        var year  = yoe + era * 400;
+        if (month <= 2) { year = year + 1; }
+
+        let hh  = secs / 3600;
+        let mi  = (secs / 60) % 60;
+        let ss  = secs % 60;
+        let out = String.Create(withOffset ? 25 : 19, '0');
+        out[0]  = Char.FromInt(48 + year / 1000);
+        out[1]  = Char.FromInt(48 + (year / 100) % 10);
+        out[2]  = Char.FromInt(48 + (year / 10) % 10);
+        out[3]  = Char.FromInt(48 + year % 10);
+        out[4]  = '-';
+        out[5]  = Char.FromInt(48 + month / 10);
+        out[6]  = Char.FromInt(48 + month % 10);
+        out[7]  = '-';
+        out[8]  = Char.FromInt(48 + day / 10);
+        out[9]  = Char.FromInt(48 + day % 10);
+        out[10] = sep;
+        out[11] = Char.FromInt(48 + hh / 10);
+        out[12] = Char.FromInt(48 + hh % 10);
+        out[13] = ':';
+        out[14] = Char.FromInt(48 + mi / 10);
+        out[15] = Char.FromInt(48 + mi % 10);
+        out[16] = ':';
+        out[17] = Char.FromInt(48 + ss / 10);
+        out[18] = Char.FromInt(48 + ss % 10);
+        if (withOffset) {
+            let oh = (offsetMins < 0 ? -offsetMins : offsetMins) / 60;
+            let om = (offsetMins < 0 ? -offsetMins : offsetMins) % 60;
+            out[19] = (offsetMins < 0 ? '-' : '+');
+            out[20] = Char.FromInt(48 + oh / 10);
+            out[21] = Char.FromInt(48 + oh % 10);
+            out[22] = ':';
+            out[23] = Char.FromInt(48 + om / 10);
+            out[24] = Char.FromInt(48 + om % 10);
+        }
+        return out;
+    }
+
+    // Seconds east of UTC named by the zone designator of an ISO 8601
+    // date-time - the first "Z", "+" or "-" after the "T" - when it runs to the
+    // end of the string as "Z", "+hh:mm", "+hhmm" or "+hh" (or "-"); else 0.
+    fn static _IsoOffsetSecs(s:string): int {
+        let n = len(s);
+        let t = String.IndexOf(s, "T");
+        if (t < 0) { return 0; }
+        let p = String.IndexOfAnyFrom(s, "Zz+-", t + 1);
+        if (p < 0) { return 0; }
+        let sign = s[p];
+        if (sign != '+' && sign != '-') { return 0; }
+        let rest = n - p - 1;
+        if (rest != 2 && rest != 4 && rest != 5) { return 0; }
+        var mAt = p + 3;
+        if (rest == 5) {
+            if (s[p + 3] != ':') { return 0; }
+            mAt = p + 4;
+        }
+        let h1 = Char.Code(s[p + 1]) - 48;
+        let h2 = Char.Code(s[p + 2]) - 48;
+        var m1 = 0;
+        var m2 = 0;
+        if (rest > 2) {
+            m1 = Char.Code(s[mAt]) - 48;
+            m2 = Char.Code(s[mAt + 1]) - 48;
+        }
+        if (h1 < 0 || h1 > 2 || h2 < 0 || h2 > 9 || h1 * 10 + h2 > 23) { return 0; }
+        if (m1 < 0 || m1 > 5 || m2 < 0 || m2 > 9) { return 0; }
+        let secs = (h1 * 10 + h2) * 3600 + (m1 * 10 + m2) * 60;
+        return (sign == '-' ? -secs : secs);
     }
 
     // Day of year (1–366) from a raw UTC timestamp.
@@ -407,7 +502,7 @@ class DateTime {
         let m   = Time.Month(ts);
         let d   = Time.Day(ts);
         let doy = 0;
-        iter (i from 1 to m - 1) {
+        iter (i from 1 to m) {
             doy = doy + DateTime._DaysInMonth(y, i);
         }
         return doy + d;
@@ -523,7 +618,7 @@ class DateTime {
 
     fn Ago(): string {
         let nowTs = DateTime.Now().Unix();
-        let diffSecs = int(Math.Abs(float(nowTs - this.Unix())));
+        let diffSecs = Math.Abs(nowTs - this.Unix());
         let future = this.Unix() > nowTs;
         let suffix = future ? " from now" : " ago";
         if (diffSecs < 60)   return str(diffSecs) + " second" + (diffSecs == 1 ? "" : "s") + suffix;
@@ -610,7 +705,7 @@ class DateTime {
 
     fn _isHolidayDate(holidays): bool {
         if (holidays == nil) { return false; }
-        iter (i from 0 to len(holidays) - 1) {
+        iter (i from 0 to len(holidays)) {
             if (this.IsSameDay(holidays[i])) { return true; }
         }
         return false;
@@ -718,12 +813,21 @@ class DateTime {
 
     // ISO 8601 with timezone offset: "2025-06-15T09:30:00+02:00"
     fn ToISO(): string {
-        return Time.Format(this._LocalTs(), "%Y-%m-%dT%H:%M:%S") + this.FormatOffset();
+        let off   = DateTime._TzOffset(this._tz);
+        let local = this._ts + off * 60;
+        if (local >= -62167219200 && local < 253402300800 && off > -6000 && off < 6000) {
+            return DateTime._StampText(local, 'T', off, true);
+        }
+        return Time.Format(local, "%Y-%m-%dT%H:%M:%S") + DateTime._FormatOffset(off);
     }
 
     // "YYYY-MM-DD HH:MM:SS TZ"
     fn ToString(): string {
-        return Time.Format(this._LocalTs(), "long") + " " + this._tz;
+        let local = this._LocalTs();
+        if (local >= -62167219200 && local < 253402300800) {
+            return DateTime._StampText(local, ' ', 0, false) + " " + this._tz;
+        }
+        return Time.Format(local, "long") + " " + this._tz;
     }
 
     // ── Static constructors ───────────────────────────────────────────────────
@@ -732,7 +836,7 @@ class DateTime {
     fn static NowIn(tz:string): instance  { return new DateTime(Time.Now(), tz); }
     fn static NowLocal(): instance { return new DateTime(Time.Now(), "local"); }
 
-    fn static Today(tz:string|nil): instance {
+    fn static Today(tz?:string): instance {
         let tzStr = (tz == nil ? "UTC" : tz);
         return DateTime.NowIn(tzStr).StartOfDay();
     }
@@ -750,20 +854,22 @@ class DateTime {
         return dt;
     }
 
-    // Parse ISO 8601 string treated as UTC.
-    fn static Parse(s:string, tz:string|nil): instance {
-        let ts = Time.Parse(s, "ISO");
+    // Parse an ISO 8601 date-time. A trailing "Z" or "+hh:mm" / "+hhmm" / "+hh"
+    // offset is applied; a string without one is read as UTC.
+    fn static Parse(s:string, tz?:string): instance {
+        var ts = Time.Parse(s, "ISO");
+        if (ts != nil) { ts = ts - DateTime._IsoOffsetSecs(s); }
         return new DateTime(ts, (tz == nil ? "UTC" : tz));
     }
 
     // Parse with explicit strftime/named format.
-    fn static ParseFmt(s:string, fmt:string, tz:string|nil): instance {
+    fn static ParseFmt(s:string, fmt:string, tz?:string): instance {
         let ts = Time.Parse(s, fmt);
         return new DateTime(ts, (tz == nil ? "UTC" : tz));
     }
 
     // Construct from calendar components interpreted in the given timezone.
-    fn static Of(year:int, month:int, day:int, hour:int, minute:int, second:int, tz:string|nil): instance {
+    fn static Of(year:int, month:int, day:int, hour:int, minute:int, second:int, tz?:string): instance {
         let tzStr = (tz == nil ? "UTC" : tz);
         let iso = String.PadLeft(str(year),   4, "0") + "-" +
                   String.PadLeft(str(month),  2, "0") + "-" +

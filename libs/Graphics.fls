@@ -1163,7 +1163,9 @@ class Raster {
 
     // ----------------------------------------------------------------
     // The kernel. Straight-line integer work over one block: no calls, no
-    // allocation, so it compiles to native code.
+    // allocation, so it compiles to native code. Arena words read back as
+    // unsigned 32-bit values; a coordinate that can be negative is restored
+    // with (w ^ 0x80000000) - 0x80000000.
     // ----------------------------------------------------------------
     // Composite kernel: source-over of one arena region onto another, with an
     // optional global alpha scaling the source alpha first.
@@ -1257,7 +1259,8 @@ class Raster {
             let sz = b[p + 1];
             let dOff = b[p + 2]; let dStr = b[p + 3];
             let cw = b[p + 4];   let ch = b[p + 5];
-            let gx = b[p + 6];   let gy = b[p + 7];
+            let gx = (b[p + 6] ^ 0x80000000) - 0x80000000;
+            let gy = (b[p + 7] ^ 0x80000000) - 0x80000000;
             let code = b[p + 8]; let sc = b[p + 9];
             let fb = b[p + 10];  let col = b[p + 11];
             var ry = 0;
@@ -1354,7 +1357,8 @@ class Raster {
             let dst    = b[p + 2];
             let stride = b[p + 3];
             let cw = b[p + 4]; let ch = b[p + 5];
-            let cx = b[p + 6]; let cy = b[p + 7];
+            let cx = (b[p + 6] ^ 0x80000000) - 0x80000000;
+            let cy = (b[p + 7] ^ 0x80000000) - 0x80000000;
             let ro = b[p + 8]; let ri = b[p + 9];
             let col = b[p + 10];
             let sa  = (col >> 24) & 0xFF;
@@ -1456,8 +1460,8 @@ class Raster {
                 // at 255*255+127 = 65152, so neither carries into the other),
                 // and the divide uses the identity y/255 == (y+1+(y>>8))>>8,
                 // exact over that range - three integer divisions per pixel
-                // would otherwise dominate. Block elements read back
-                // sign-extended; every use masks after shifting.
+                // would otherwise dominate. Every use of a pixel masks after
+                // shifting.
                 let x = b[p + 4]; let y = b[p + 5];
                 let w = b[p + 6]; let h = b[p + 7];
                 let sa  = (col >> 24) & 0xFF;
@@ -1503,8 +1507,10 @@ class Raster {
                 // blend. Clipping is per pixel rather than up front, because
                 // clipping the endpoints would change the error term.
                 let cw = b[p + 4]; let ch = b[p + 5];
-                var lx = b[p + 6]; var ly = b[p + 7];
-                let ex = b[p + 8]; let ey = b[p + 9];
+                var lx = (b[p + 6] ^ 0x80000000) - 0x80000000;
+                var ly = (b[p + 7] ^ 0x80000000) - 0x80000000;
+                let ex = (b[p + 8] ^ 0x80000000) - 0x80000000;
+                let ey = (b[p + 9] ^ 0x80000000) - 0x80000000;
                 let sa  = (col >> 24) & 0xFF;
                 let ia  = 255 - sa;
                 let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
@@ -1570,8 +1576,10 @@ class Raster {
             let stride = b[p + 3];
             let col    = b[p + sz - 1];
             let cw = b[p + 4]; let ch = b[p + 5];
-            let x0 = b[p + 6]; let y0 = b[p + 7];
-            let x1 = b[p + 8]; let y1 = b[p + 9];
+            let x0 = (b[p + 6] ^ 0x80000000) - 0x80000000;
+            let y0 = (b[p + 7] ^ 0x80000000) - 0x80000000;
+            let x1 = (b[p + 8] ^ 0x80000000) - 0x80000000;
+            let y1 = (b[p + 9] ^ 0x80000000) - 0x80000000;
             let rr = b[p + 10];
             let sa  = (col >> 24) & 0xFF;
             let ia  = 255 - sa;
@@ -1651,8 +1659,10 @@ class Raster {
             let stride = b[p + 3];
             let col    = b[p + sz - 1];
             let cw = b[p + 4]; let ch = b[p + 5];
-            let x0 = b[p + 6]; let y0 = b[p + 7];
-            let x1 = b[p + 8]; let y1 = b[p + 9];
+            let x0 = (b[p + 6] ^ 0x80000000) - 0x80000000;
+            let y0 = (b[p + 7] ^ 0x80000000) - 0x80000000;
+            let x1 = (b[p + 8] ^ 0x80000000) - 0x80000000;
+            let y1 = (b[p + 9] ^ 0x80000000) - 0x80000000;
             let sa  = (col >> 24) & 0xFF;
             let ia  = 255 - sa;
             let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
@@ -2162,7 +2172,7 @@ class Graphics {
     }
 
     // Offload a region kernel fn(pixels, x, y, w, h, stride) -> scalar to a
-    // worker thread (threadsafe JIT kernel + --jit) or run it inline, then fire
+    // worker thread when it is simple enough, or run it inline, then fire
     // cb(surface, result). `pixels` is the 32-bit ARGB block; index a region
     // pixel as pixels[(y+dy)*stride + (x+dx)]. `surface` handed to cb is the
     // underlying Gfx image. See Buffer.ProcessCallback for the kernel rules.

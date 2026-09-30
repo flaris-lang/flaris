@@ -89,7 +89,7 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 `StringBuilder`
 
 **Web & network** — `Http`, `Https`, `HttpServer`, `HttpUtil`, `Router`,
-`WebSocket`, `Jwt`
+`OpenApi`, `WebSocket`, `Jwt`
 
 **Security** — `CryptoKit` (HKDF, PBKDF2, TOTP/HOTP, Argon2id password hashing,
 sealed blobs, streaming MD5/SHA-1/SHA-256/SHA-384/SHA-512/SHA-3/Keccak-256/SHAKE)

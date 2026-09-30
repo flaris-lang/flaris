@@ -38,9 +38,26 @@
 //   rather than quietly serving in the clear.
 //
 // Concurrency:
-//   Each accepted connection is served on its own fiber, so a slow client does
-//   not stall the others. Fibers are cooperative, so a handler that never yields
-//   holds the VM - keep handlers short, or yield inside long loops.
+//   Each accepted connection is served on its own fiber, and every socket wait
+//   - the idle keep-alive gap, a header or body still in flight - parks that
+//   fiber, never the VM, so a slow or stalled client delays only itself.
+//
+//   A handler may be `fn async`. Its fiber is awaited before the response is
+//   finalised, so `await` inside it lets other requests run meanwhile:
+//
+//   fn async upstream(req, res) {
+//       let r = await Https.GetAsync("https://api.example.com/x");
+//       res.Json(r.body);
+//   }
+//   srv.Get("/upstream", upstream);
+//
+//   What still holds the VM is a call that blocks the thread: a synchronous
+//   client call (Https.Get), an FFI call (Postgres, SQLite, Redis), or a long
+//   computation - CPU work is time-sliced with the other fibers but still costs
+//   its full time on the one thread. In a handler prefer the *Async client
+//   calls. An async handler occupies a second fiber while it runs, so with
+//   every route async keep maxConnections below half the VM's fiber limit
+//   (1024).
 //
 // HttpServer:
 //   new HttpServer(opts?)
@@ -76,6 +93,12 @@
 //   .OnTlsError(handler)       - fn(peer, message); default drops silently
 //   .OnAccess(handler)         - fn(entry) once per completed request; pair
 //                                with HttpStatus.CombinedLogLine(entry)
+//                                OnError, OnTlsError and OnAccess may be
+//                                `fn async` (they are awaited). One that throws
+//                                is contained: the exception is dropped and
+//                                counted, the server keeps serving, and a failed
+//                                OnError still gets the default 500.
+//   .HookErrors()              - exceptions dropped from those three hooks so far
 //   .InFlight()  .ActiveConnections()
 //   .IsSecure()                - true when this server terminates TLS
 //   .Static(urlPrefix, rootDir, opts?)
@@ -100,7 +123,7 @@
 //   Patterns: "/users/:id" captures a segment into req.Param("id");
 //             a trailing "*" matches the rest into req.Param("*").
 //
-// Handler signature: fn(req, res)
+// Handler signature: fn(req, res), plain or `fn async`
 //
 // HttpRequest:
 //   .method .path .rawPath .version .headers .body .peer .secure
@@ -200,9 +223,10 @@
 //   Request line, header count/size and body size are all capped; a request
 //   that exceeds them gets 431 or 413 instead of allocating. Header names and
 //   values are validated so a handler cannot inject CRLF into the response.
-//   Sockets carry an OS-level read timeout, so one stalled client cannot hold
-//   the VM: the accept loop and the keep-alive idle wait park the fiber via
-//   Stream.WaitReadable, and every blocking read is bounded by readTimeoutMs.
+//   Sockets carry a read timeout (readTimeoutMs): the accept loop, the
+//   keep-alive idle wait and a request whose bytes are still in flight all
+//   park their own fiber, never the VM, and a peer that stays silent for
+//   readTimeoutMs gets a 400 and a closed connection.
 //
 // WebSockets:
 //   res.Hijack() hands the socket over, and the WebSocket library does the
@@ -223,8 +247,9 @@
 //   The upgraded socket no longer counts against maxConnections, and closing it
 //   is the caller's job.
 //
-// Not implemented: HTTP/2, and request pipelining (a second request is read
-// only after the first replies).
+// Pipelining: requests a client sends back to back on one connection are
+// answered one at a time, in order - the next is read only after the previous
+// reply is written. Not implemented: HTTP/2.
 // =============================================================================
 
 // A method named Json or File shadows the namespace of the same name for the
@@ -233,6 +258,11 @@
 import { HttpUtil } from library("HttpUtil", "1.0");
 
 fn _jsonEncode(value): string { return Json.Stringify(value); }
+
+// A handler declared `fn async` returns its fiber; wait for it here so the
+// response is complete - and an exception it raised surfaces - before the
+// server finalises the reply.
+fn _settled(v) { return Type.IsFiber(v) ? Fiber.Await(v) : v; }
 fn _jsonDecode(text:string)   { return Json.Parse(text); }
 fn _fileExists(path:string): bool { return File.Exists(path); }
 fn _fileBytes(path:string)        { return File.ReadAllBytes(path); }
@@ -1714,7 +1744,7 @@ class _Route
             return false;
         }
 
-        iter (i from 0 to len(segs) - 1) {
+        iter (i from 0 to len(segs)) {
             let s = segs[i];
             if (String.StartsWith(s, ":")) {
                 params[String.Substr(s, 1)] = parts[i];
@@ -1724,7 +1754,7 @@ class _Route
         }
         if (catchAll) {
             let tail = [];
-            iter (i from len(segs) to len(parts) - 1) { Array.Append(tail, parts[i]); }
+            iter (i from len(segs) to len(parts)) { Array.Append(tail, parts[i]); }
             params["*"] = String.Join(tail, "/");
         }
         return true;
@@ -1755,8 +1785,8 @@ class HttpServer
     let _maxHeaders:int        = 100;
     let _maxHeaderBytes:int    = 65536;
     let _maxBodyBytes:int      = 8388608;
-    // Raised from 64 now that a stalled client can no longer hold a slot: the
-    // cap bounds memory and file descriptors, not slow-client exposure. Keep it
+    // A stalled client cannot hold a slot (reads time out), so this cap bounds
+    // memory and file descriptors, not slow-client exposure. Keep it
     // below the process descriptor limit (`ulimit -n`), which is 1024 on many
     // Linux systems.
     let _maxConnections:int    = 512;
@@ -1776,6 +1806,7 @@ class HttpServer
     let _onError                = nil;
     let _onTlsError             = nil;
     let _onAccess               = nil;
+    let _hookErrors:int        = 0;    // exceptions dropped from OnAccess/OnError/OnTlsError
     let _inFlight:int          = 0;    // requests being handled right now
     let _statics:array         = [];   // { prefix, root, index, cacheControl }
 
@@ -1833,6 +1864,8 @@ class HttpServer
     // Format it yourself, or pass it to HttpStatus.CombinedLogLine():
     //   srv.OnAccess(fn(e) { Console.WriteLine(HttpStatus.CombinedLogLine(e)); });
     fn OnAccess(handler) { _onAccess = handler; return this; }
+
+    fn HookErrors(): int { return _hookErrors; }
 
     // Requests being handled right now - what Stop() waits for.
     fn InFlight(): int { return _inFlight; }
@@ -1993,8 +2026,8 @@ class HttpServer
         let c    = conn;
 
         Stream.SetNoDelay(c, true);
-        // An OS-level read timeout bounds every blocking read below, so a client
-        // that stops mid-request cannot hold the single-threaded VM.
+        // A read that runs ahead of the peer parks this fiber; the socket
+        // timeout bounds how long it waits before giving the request up.
         Stream.SetTimeout(c, _readTimeoutMs);
 
         // TLS terminates here, inside the connection fiber - never in the accept
@@ -2005,7 +2038,13 @@ class HttpServer
             c = Stream.AcceptTls(c, _tls);
             if (c == nil) {
                 if (_onTlsError != nil) {
-                    _onTlsError(peer, Stream.TlsLastError() ?? "handshake failed");
+                    // A hook runs on this connection fiber, so an exception
+                    // escaping it would end the whole process.
+                    try {
+                        _settled(_onTlsError(peer, Stream.TlsLastError() ?? "handshake failed"));
+                    } catch (_e) {
+                        _hookErrors = _hookErrors + 1;
+                    }
                 }
                 _activeConns = _activeConns - 1;
                 return nil;
@@ -2070,17 +2109,23 @@ class HttpServer
         _inFlight = _inFlight - 1;
 
         if (_onAccess != nil) {
-            _onAccess({
-                peer:       peer,
-                method:     req.method,
-                path:       req.rawPath,
-                version:    req.version,
-                status:     res.StatusCode(),
-                bytes:      res.BodyBytes(),
-                durationMs: Time.Millis() - t0,
-                referer:    req.Header("Referer",    "") ?? "",
-                userAgent:  req.Header("User-Agent", "") ?? ""
-            });
+            // A logging bug must not take the connection fiber - and with it
+            // the process - down.
+            try {
+                _settled(_onAccess({
+                    peer:       peer,
+                    method:     req.method,
+                    path:       req.rawPath,
+                    version:    req.version,
+                    status:     res.StatusCode(),
+                    bytes:      res.BodyBytes(),
+                    durationMs: Time.Millis() - t0,
+                    referer:    req.Header("Referer",    "") ?? "",
+                    userAgent:  req.Header("User-Agent", "") ?? ""
+                }));
+            } catch (_e) {
+                _hookErrors = _hookErrors + 1;
+            }
         }
 
         // The handler took the socket over - it is no longer an HTTP connection.
@@ -2112,7 +2157,7 @@ class HttpServer
                         if (m == req.method || (req.method == "HEAD" && m == "GET")) {
                             req.params = p;
                             matched = true;
-                            r.handler(req, res);
+                            _settled(r.handler(req, res));
                         } else {
                             methodMismatch = true;
                         }
@@ -2128,7 +2173,7 @@ class HttpServer
             // 3. Catch-all handler.
             if (!matched && _onRequest != nil) {
                 matched = true;
-                _onRequest(req, res);
+                _settled(_onRequest(req, res));
             }
 
             // 4. Nothing claimed it.
@@ -2136,14 +2181,21 @@ class HttpServer
                 if (methodMismatch) {
                     res.Error(405, "method not allowed");
                 } else if (_notFound != nil) {
-                    _notFound(req, res);
+                    _settled(_notFound(req, res));
                 } else {
                     res.Error(404, "not found");
                 }
             }
         } catch (e) {
             if (_onError != nil) {
-                _onError(req, res, e);
+                // Awaited so an async hook finishes its reply before the 500
+                // check. If the hook itself throws, that is not fed back into
+                // it: it is dropped and the default 500 goes out.
+                try {
+                    _settled(_onError(req, res, e));
+                } catch (_e2) {
+                    _hookErrors = _hookErrors + 1;
+                }
             }
             if (!res.Sent()) { res.Error(500, "internal server error"); }
         }
@@ -2186,8 +2238,7 @@ class HttpServer
                     return true;
                 }
 
-                // One stat answers exists / is-a-directory / size / mtime / is-a-symlink;
-                // the old path called Exists, then Directory.Exists, then read.
+                // One stat answers exists / is-a-directory / size / mtime / is-a-symlink.
                 let st = _fileStat(fileFull);
                 if (st == nil || st.IsDir) { return false; }
 
@@ -2305,7 +2356,8 @@ class HttpServer
             h = Stream.ReadLine(conn);
         }
         // ReadLine returns "" for a genuine blank line (and at EOF) but nil
-        // when the peer stalled mid-line. Treating the two alike answers a
+        // when the peer went silent for readTimeoutMs or closed mid-line.
+        // Treating the two alike answers a
         // request the client never finished sending - and leaves whatever it
         // sends next to be read as a second request.
         if (h == nil) {

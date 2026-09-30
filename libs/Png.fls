@@ -2,10 +2,11 @@
 // Png.fls - PNG encoder / decoder for Flaris.
 // Version: 1.0
 //
-// A complete PNG codec written in Flaris. Decoding leans on the native
-// `Compress.Unzip` builtin for the zlib stream and `Hash.Crc32` for chunk
-// integrity, so the expensive half of the format runs at C speed; everything
-// else - chunk parsing, filter reconstruction, sample expansion - is Flaris.
+// A complete PNG codec written in Flaris, zlib stream included: IDAT data is
+// inflated and deflated by Inflate.Zlib / Deflate.Zlib from Deflate.fls. The
+// native `Hash.Crc32` computes the chunk CRCs the encoder writes; the decoder
+// does not verify chunk CRCs - it skips them, so damage is caught only where it
+// breaks the chunk structure or the zlib stream (whose Adler-32 is checked).
 //
 // Pixels are exchanged as a `block` of 32-bit `0xAARRGGBB` words, one word per
 // pixel, row-major, stride == width. That is the same layout `Gfx` uses for its
@@ -377,13 +378,25 @@ class Png {
         return 0;
     }
 
-    // Expand reconstructed scanlines to 32-bit ARGB words.
+    // Expand reconstructed scanlines to 32-bit ARGB words. Split per colour
+    // type: the JIT takes at most 8 integer/pointer arguments per function.
     fn static _expand(raw:block, out:block, w:int, h:int, rowBytes:int,
                       ct:int, bd:int, plte:block, plteN:int,
                       trns:block, trnsN:int) {
         var step = 1;
         if (bd == 16) { step = 2; }
+        if (ct == 0) {
+            Png._expandGray(raw, out, w, h, rowBytes, bd);
+        } else if (ct == 3) {
+            Png._expandPal(raw, out, w, h, rowBytes, bd, Png._palette(plte, plteN, trns ?? plte, trnsN));
+        } else {
+            Png._expandRgb(raw, out, w, h, rowBytes, ct, step);
+        }
+        return;
+    }
 
+    // RGBA (6), RGB (2) and grayscale + alpha (4).
+    fn static _expandRgb(raw:block, out:block, w:int, h:int, rowBytes:int, ct:int, step:int) {
         var y = 0;
         while (y < h) {
             let cur = y * (1 + rowBytes) + 1;
@@ -408,12 +421,6 @@ class Png {
                                     (raw[s + 2 * step] & 0xFF));
                     x = x + 1;
                 }
-            } else if (ct == 0) {                            // grayscale
-                while (x < w) {
-                    let g = Png._gray8(Png._samp(raw, cur, x, bd), bd);
-                    out[dst + x] = (0xFF000000 | (g << 16) | (g << 8) | g);
-                    x = x + 1;
-                }
             } else if (ct == 4) {                            // grayscale + alpha
                 while (x < w) {
                     let s = cur + x * 2 * step;
@@ -422,18 +429,56 @@ class Png {
                     out[dst + x] = ((a << 24) | (g << 16) | (g << 8) | g);
                     x = x + 1;
                 }
-            } else if (ct == 3) {                            // palette (+tRNS)
-                while (x < w) {
-                    var idx = Png._samp(raw, cur, x, bd);
-                    if (idx >= plteN) { idx = 0; }
-                    var a = 255;
-                    if (idx < trnsN) { a = trns[idx] & 0xFF; }
-                    out[dst + x] = ((a << 24) |
-                                    ((plte[idx * 3] & 0xFF) << 16) |
-                                    ((plte[idx * 3 + 1] & 0xFF) << 8) |
-                                    (plte[idx * 3 + 2] & 0xFF));
-                    x = x + 1;
-                }
+            }
+            y = y + 1;
+        }
+        return;
+    }
+
+    fn static _expandGray(raw:block, out:block, w:int, h:int, rowBytes:int, bd:int) {
+        var y = 0;
+        while (y < h) {
+            let cur = y * (1 + rowBytes) + 1;
+            let dst = y * w;
+            var x = 0;
+            while (x < w) {
+                let g = Png._gray8(Png._samp(raw, cur, x, bd), bd);
+                out[dst + x] = (0xFF000000 | (g << 16) | (g << 8) | g);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        return;
+    }
+
+    // 256-entry ARGB lookup: an index past the palette maps to entry 0, alpha
+    // comes from tRNS where it has an entry.
+    fn static _palette(plte:block, plteN:int, trns:block, trnsN:int) : block {
+        let lut:block = Buffer.Create(256, 4);
+        var i = 0;
+        while (i < 256) {
+            var idx = i;
+            if (idx >= plteN) { idx = 0; }
+            var a = 255;
+            if (idx < trnsN) { a = trns[idx] & 0xFF; }
+            lut[i] = ((a << 24) |
+                      ((plte[idx * 3] & 0xFF) << 16) |
+                      ((plte[idx * 3 + 1] & 0xFF) << 8) |
+                      (plte[idx * 3 + 2] & 0xFF));
+            i = i + 1;
+        }
+        return lut;
+    }
+
+    fn static _expandPal(raw:block, out:block, w:int, h:int, rowBytes:int, bd:int, lut:block) {
+        var y = 0;
+        while (y < h) {
+            let cur = y * (1 + rowBytes) + 1;
+            let dst = y * w;
+            var x = 0;
+            while (x < w) {
+                out[dst + x] = lut[Png._samp(raw, cur, x, bd)];
+                x = x + 1;
             }
             y = y + 1;
         }
@@ -447,7 +492,7 @@ class Png {
     // Encode(pixels:block, w:int, h:int, opts?:object) -> block of PNG bytes,
     // or nil. `pixels` holds w*h 32-bit 0xAARRGGBB words. `opts.filter` selects
     // Png.FILTER_ADAPTIVE (default) or Png.FILTER_NONE.
-    fn static Encode(pixels:block, w:int, h:int, opts:object|nil) : block|nil {
+    fn static Encode(pixels:block, w:int, h:int, opts?:object) : block|nil {
         if (pixels == nil) { return nil; }
         if (w <= 0 || h <= 0) { return nil; }
         if (w > MAX_DIM || h > MAX_DIM) { return nil; }
@@ -495,7 +540,7 @@ class Png {
     }
 
     // Save(path, pixels, w, h, opts?) -> bool
-    fn static Save(path:string, pixels:block, w:int, h:int, opts:object|nil) : bool {
+    fn static Save(path:string, pixels:block, w:int, h:int, opts?:object) : bool {
         let bytes = Png.Encode(pixels, w, h, opts);
         if (bytes == nil) { return false; }
         return File.WriteAllBytes(path, bytes);

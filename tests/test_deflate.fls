@@ -1,9 +1,8 @@
 // Test suite for Deflate.fls
 //
-// Every case is differential: the built-in Compress module produces the
-// stream, this library decodes it, and the result must equal the original
-// byte for byte. Payloads are generated in-process so the suite can run from
-// either repo root.
+// Streams from this library's encoder, plus frozen reference streams from an
+// independent encoder, must decode to the original byte for byte. Payloads are
+// generated in-process so the suite can run from either repo root.
 //
 // Run: ./flarisvm ./tests/test_deflate.fls
 
@@ -67,7 +66,7 @@ fn test_block_types() {
     roundtrip("stored ", mk(200000, 2));
     roundtrip("longmatch", mk(200000, 0));
     let t = "";
-    iter (i from 0 to 3999) { t = t + "the quick brown fox " + str(i) + " jumps over the lazy dog\n"; }
+    iter (i from 0 to 4000) { t = t + "the quick brown fox " + str(i) + " jumps over the lazy dog\n"; }
     roundtrip("dynamic", Buffer.FromString(t));
 }
 
@@ -81,7 +80,7 @@ fn test_reference_vectors() {
                "789c8dca5711c0201405512b57413ca59084fae84d3d0c0af8dcd9137f0697f82d71792a062f5588a46d0065e611e756676f78e83b56ede201bf71206f"];
     let want = ["", "a", "hello world", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "the quick brown fox jumps over the lazy dog. the quick brown fox jumps over the lazy dog."];
-    iter (i from 0 to len(hex) - 1) {
+    iter (i from 0 to len(hex)) {
         let z = Util.HexToBin(hex[i]);
         let got = Inflate.Zlib(z, 0);
         check(got != nil && str(got) == want[i], "reference vector " + str(i) + " decodes");
@@ -93,7 +92,7 @@ fn test_reference_vectors() {
 // must not be pathologically worse than a general-purpose one.
 fn test_compression_quality() {
     let t = "";
-    iter (i from 0 to 999) { t = t + "line " + str(i) + " of sample text with some repetition\n"; }
+    iter (i from 0 to 1000) { t = t + "line " + str(i) + " of sample text with some repetition\n"; }
     let src = Buffer.FromString(t);
     let z = Deflate.Raw(src, 32);
     check(len(z) < len(src) / 3, "structured text compresses at least 3x");
@@ -132,13 +131,75 @@ fn test_malformed() {
     check(Inflate.Zlib(bad, len(src)) == nil, "bad Adler-32 -> nil");
 }
 
+global SMALL_WORDS = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+                      "and", "runs", "far", "away", "from", "home", "again"];
+
+// Word salad from an LCG: short matches of many lengths at many distances,
+// the table entries small HTTP bodies and zip entries actually hit.
+fn wordsText(n: int, seed: int): block {
+    var x = seed;
+    var s = "";
+    while (len(s) < n) {
+        x = (x * 1103515245 + 12345) & 0x7fffffff;
+        s = s + SMALL_WORDS[(x >> 16) % 15];
+        let k = (x >> 8) % 8;
+        if (k == 0) { s = s + " " + str(x % 1000) + ". "; }
+        else if (k == 1) { s = s + ", "; }
+        else { s = s + " "; }
+    }
+    return Buffer.Slice(Buffer.FromString(s), 0, n);
+}
+
+// wordsText(700, 7) compressed by zlib (dynamic, then fixed Huffman). Our own
+// encoder and decoder read the same constant table, so damage to it can cancel
+// out in a round trip; these streams catch it on the decode side.
+global SMALL_REF_DYN = "78da65525976c22014dd0a0be07094108ccba19a38d484366db476f5e5def7346a3fcc61b823cfe3d47f7c997449579386ad59578d33e334e8510c0b67f2b91de5cc47afdb66a50b90f00b7541ee73dfeaf12e1d06fd6ef3ce54be10baa417964b02bb31f7d6bc8df9328847977fcce774d8bc2bfbc8803895fddd1512b36153578ea81a0d8aa578405e2588fddeb7205b420110ab53fabd1a1fd64e6a33c8dd8862d4105af0c1dd0a966b80ad2890020b7ad19b52b8540925b2b0b2b46d91224d607834ca61f1d01c999bc799c8d3cd0fc1b4acc99992c924dc438db479c69ce033d6bef4e6bd1513468eab4ac61997e52d04f36feeb7bf0670da97638497a466aee58252f6490018de82117d81a09264630ce0fe006deced59";
+global SMALL_REF_FIXED = "7801cb2acd2d2856482c4fac5448cc4b51b034b6d053282acd830a999918e829e497a51641c48ccc8ca05c0b732803a409844d4c812a33f27353a1c2e98999795032253f5dc1d808a8212d112aa103668215a615e5e7ea282415e597e741ec48cbaf50282ccd4cce86eace023b10240ae1c36d051981b0d0c2d4580facca14e403a095103b40c6438d00ab2dc9480569d6012b0529805895935855a9606462a907f136d821708bc08681cd8068333132d1837910280d52ac033101ac056405d82eb0dd60a340925023a01ac11e86ea82fa166814581b441928d0c0c68118483e07b9d902394e2041870808b06bc1de04c7295827d825603ec834b036441c83631055ad0e9abfc1f23a104bc04e3633378644a79921302c206a30e21d963440eaa0fe054723c82e88abc1ee3234001ba5836200480d5816a4c3cc08a804e42588dbc0ce00a903006deced59";
+
+// Many small streams in mixed order and framing: all but the first call share
+// one constant table, so a table damaged by any call shows up in a later one.
+fn smallMixed(rounds: int): int {
+    var bad = 0;
+    let ref = wordsText(700, 7);
+    let refDyn = Util.HexToBin(SMALL_REF_DYN);
+    let refFixed = Util.HexToBin(SMALL_REF_FIXED);
+    iter (r from 0 to rounds) {
+        if (!same(Inflate.Zlib(refDyn), ref))   { bad += 1; }
+        if (!same(Inflate.Zlib(refFixed), ref)) { bad += 1; }
+        let src = (r % 2 == 0) ? wordsText(1 + (r * 53) % 700, r + 1) : mk(1 + (r * 53) % 700, r % 4);
+        let kind = r % 3;
+        if (kind == 0) {
+            if (!same(Inflate.Zlib(Deflate.Zlib(src)), src)) { bad += 1; }
+            if (!same(Inflate.Raw(Deflate.Raw(src)), src))   { bad += 1; }
+        } else if (kind == 1) {
+            let g = Deflate.Gzip(src);
+            if (!same(Inflate.Gzip(g), src))                 { bad += 1; }
+            if (!same(Inflate.Auto(g), src))                 { bad += 1; }
+        } else {
+            let raw = Deflate.Raw(src, 8);
+            let z = Deflate.Zlib(src);
+            if (!same(Inflate.Raw(raw, len(src)), src))      { bad += 1; }
+            if (!same(Inflate.Zlib(z), src))                 { bad += 1; }
+        }
+    }
+    return bad;
+}
+
+fn test_small_repeated() {
+    check(smallMixed(60) == 0, "small streams, mixed order: every round-trip exact");
+    let hello = Util.HexToBin("789c010b00f4ff68656c6c6f20776f726c641a0b045d");
+    iter (i from 0 to 5) { check(str(Inflate.Zlib(hello)) == "hello world", "reference stream after reuse " + str(i)); }
+    let f = Fiber.New(fn() { return smallMixed(12); });
+    check(Fiber.Await(f) == 0, "small streams in a fresh fiber");
+}
+
 fn test_benchmarks() {
     Console.WriteLine("=== Deflate benchmarks ===");
     // Realistic English-ish text is the interesting case: it is the one that
     // actually exercises Huffman decoding rather than long matches or stored
     // blocks, and it is where the pure-Flaris decoder is furthest from C.
     let words = "";
-    iter (i from 0 to 19999) { words = words + "the quick brown fox " + str(i * 7919 % 100000) + " jumps over lazy dogs near riverbanks\n"; }
+    iter (i from 0 to 20000) { words = words + "the quick brown fox " + str(i * 7919 % 100000) + " jumps over lazy dogs near riverbanks\n"; }
     let textSrc = Buffer.FromString(words);
     foreach (m in [1, 2, 3, 4]) {
         let src = m == 4 ? textSrc : mk(1048576, m);
@@ -146,11 +207,11 @@ fn test_benchmarks() {
         let label = m == 1 ? "repetitive" : (m == 2 ? "random    " : (m == 3 ? "periodic  " : "real text "));
 
         let t = Time.Millis();
-        iter (i from 0 to 4) { Deflate.Raw(src, 32); }
+        iter (i from 0 to 5) { Deflate.Raw(src, 32); }
         let d = (Time.Millis() - t) / 5;
 
         t = Time.Millis();
-        iter (i from 0 to 4) { Inflate.Raw(raw, len(src)); }
+        iter (i from 0 to 5) { Inflate.Raw(raw, len(src)); }
         let f = (Time.Millis() - t) / 5;
 
         Console.WriteLine("  " + label + " " + str(len(src)) + " B -> " + str(len(raw))
@@ -165,6 +226,7 @@ fn Main() {
     test_compression_quality();
     test_block_types();
     test_malformed();
+    test_small_repeated();
     test_benchmarks();
     Console.WriteLine("");
     Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));

@@ -145,7 +145,7 @@ class Template {
     // Advances c.p past the closing "}}".
     fn static _readTag(c) {
         c.p += 2;
-        let raw = c.p < c.n and String.Substr(c.s, c.p, 1) == "{";
+        let raw = c.p < c.n and String.CharAt(c.s, c.p) == '{';
         if (raw) c.p += 1;
 
         let closeStr = raw ? "}}}" : "}}";
@@ -179,12 +179,10 @@ class Template {
         return [key];
     }
 
-    // String.IndexOf with a start offset (the builtin takes only 2 args).
-    fn static _find(src:string, needle:string, pos:int) {
+    // Index of needle at or after pos, or -1 (also for pos past the end).
+    fn static _find(src:string, needle:string, pos:int): int {
         if (pos >= String.Length(src)) return -1;
-        let idx = String.IndexOf(String.Substr(src, pos), needle);
-        if (idx < 0) return -1;
-        return idx + pos;
+        return String.IndexOfFrom(src, needle, pos);
     }
 
     // =========================================================================
@@ -192,7 +190,7 @@ class Template {
     // =========================================================================
 
     fn static _render(nodes, ctx, parts) {
-        iter (i from 0 to len(nodes) - 1) {
+        iter (i from 0 to len(nodes)) {
             let node = nodes[i];
 
             let k = node.k;
@@ -201,7 +199,12 @@ class Template {
 
             } else if (k == 1) {
                 let val = Template._resolve(node.path, ctx);
-                if (val != nil) Array.Append(parts, Template._escape(str(val)));
+                if (val != nil) {
+                    // Most values hold none of the five escaped characters and
+                    // go out as they are.
+                    let sv = str(val);
+                    Array.Append(parts, (String.IndexOfAnyFrom(sv, "&<>\"'", 0) < 0) ? sv : Template._escape(sv));
+                }
 
             } else if (k == 2) {
                 let val = Template._resolve(node.path, ctx);
@@ -229,7 +232,7 @@ class Template {
                 let items = Template._resolve(node.path, ctx);
                 if (items != nil and type(items) == Type.Array) {
                     let count = len(items);
-                    iter (j from 0 to count - 1) {
+                    iter (j from 0 to count) {
                         let frame = {
                             _value:  items[j],
                             _index:  j,
@@ -255,20 +258,25 @@ class Template {
     //   _index/_first/…  - loop meta-vars from the each-frame
     //   key              - property on _value (if object), then ctx, then _parent
     fn static _resolve(path, ctx) {
-        if (ctx == nil or path == nil or len(path) == 0) return nil;
+        return Template._resolveAt(path, 0, ctx);
+    }
+
+    // _resolve for the path segments from index `at` on.
+    fn static _resolveAt(path, at:int, ctx) {
+        if (ctx == nil or path == nil or len(path) <= at) return nil;
         if (type(ctx) != Type.Object) return nil;
 
-        let key  = path[0];
-        let rest = len(path) > 1 ? Array.Subset(path, 1, len(path) - 1) : nil;
+        let key  = path[at];
+        let more = len(path) - at > 1;
 
         // "." = the current iteration item
         if (key == ".") {
             let dotVal = Object.TryGet(ctx, "_value", nil);
             if (dotVal != nil) {
-                if (rest != nil) return Template._resolve(rest, dotVal);
+                if (more) return Template._resolveAt(path, at + 1, dotVal);
                 return dotVal;
             }
-            if (rest != nil) return Template._resolve(rest, ctx);
+            if (more) return Template._resolveAt(path, at + 1, ctx);
             return ctx;
         }
 
@@ -277,7 +285,7 @@ class Template {
             let mv = Object.TryGet(ctx, key, nil);
             if (mv != nil) return mv;
             let par0 = Object.TryGet(ctx, "_parent", nil);
-            if (par0 != nil) return Template._resolve(path, par0);
+            if (par0 != nil) return Template._resolveAt(path, at, par0);
             return nil;
         }
 
@@ -296,12 +304,12 @@ class Template {
         // Still nothing - walk up the parent chain
         let par = Object.TryGet(ctx, "_parent", nil);
         if (val == nil and par != nil) {
-            return Template._resolve(path, par);
+            return Template._resolveAt(path, at, par);
         }
 
         // Traverse remaining path segments into the resolved value
-        if (val != nil and rest != nil) {
-            return Template._resolve(rest, val);
+        if (val != nil and more) {
+            return Template._resolveAt(path, at + 1, val);
         }
 
         return val;
@@ -318,17 +326,56 @@ class Template {
         return true;
     }
 
-    // HTML-escape: & < > " '
-    fn static _escape(s:string) {
-        // Most values contain none of the five, so a single scan for any of
-        // them hands the string back untouched without running one Replace.
-        if (String.IndexOfAnyFrom(s, "&<>\"'", 0) < 0) return s;
-        s = String.Replace(s, "&",  "&amp;");
-        s = String.Replace(s, "<",  "&lt;");
-        s = String.Replace(s, ">",  "&gt;");
-        s = String.Replace(s, "\"", "&quot;");
-        s = String.Replace(s, "'",  "&#39;");
-        return s;
+    // HTML-escape: s with & < > " ' replaced by &amp; &lt; &gt; &quot; &#39;,
+    // in one pass.
+    fn static _escape(s:string): string {
+        let n  = len(s);
+        var sz = n;
+        iter (i from 0 to n) {
+            let c = s[i];
+            if (c == '&' || c == '\'') {
+                sz += 4;
+            } else if (c == '<' || c == '>') {
+                sz += 3;
+            } else if (c == '"') {
+                sz += 5;
+            }
+        }
+        let out = String.Create(sz);
+        var k   = 0;
+        iter (i from 0 to n) {
+            let c = s[i];
+            if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') {
+                out[k] = '&';
+                if (c == '&') {
+                    out[k + 1] = 'a';
+                    out[k + 2] = 'm';
+                    out[k + 3] = 'p';
+                    k += 4;
+                } else if (c == '<' || c == '>') {
+                    out[k + 1] = (c == '<') ? 'l' : 'g';
+                    out[k + 2] = 't';
+                    k += 3;
+                } else if (c == '"') {
+                    out[k + 1] = 'q';
+                    out[k + 2] = 'u';
+                    out[k + 3] = 'o';
+                    out[k + 4] = 't';
+                    k += 5;
+                } else {
+                    out[k + 1] = '#';
+                    out[k + 2] = '3';
+                    out[k + 3] = '9';
+                    k += 4;
+                }
+                out[k] = ';';
+                k += 1;
+            } else {
+                out[k] = c;
+                k += 1;
+            }
+        }
+        return out;
     }
 }
 export { Template };

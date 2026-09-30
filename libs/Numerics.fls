@@ -304,6 +304,31 @@ fn _poly_fill(c: [float], nc: int, out: [float], cnt: int, a: float, h: float): 
     return 0;
 }
 
+// Roots of the polynomial c in [a, a + samples*h]: a sign change between two
+// neighbouring samples is refined by bisection, and a sample within tol of
+// zero counts as a root itself (the last sample only as a bracket end).
+fn _poly_roots(c: [float], nc: int, a: float, h: float, samples: int, tol: float): [float] {
+    let roots = Array.Create(0, Type.Float);
+    let cnt: int = samples + 1;
+    let vals = Array.Create(cnt, Type.Float);
+    _poly_fill(c, nc, vals, cnt, a, h);
+    if (Math.AbsF(vals[0]) < tol) { Array.Append(roots, a); }
+    let i: int = 1;
+    while (i < cnt) {
+        let f0: float = vals[i - 1];
+        let f1: float = vals[i];
+        if (f0 * f1 < 0.0) {
+            let x0: float = a + h * ((i - 1) + 0.0);
+            let x1: float = a + h * (i + 0.0);
+            Array.Append(roots, _bisect(c, nc, x0, x1, tol, 100));
+        } else if (i < samples && Math.AbsF(f1) < tol) {
+            Array.Append(roots, a + h * (i + 0.0));
+        }
+        i = i + 1;
+    }
+    return roots;
+}
+
 fn _arr_min(a: [float], n: int): float {
     let m: float = a[0];
     let i: int = 1;
@@ -367,31 +392,15 @@ class Numerics {
         return _secant(coeffs, nc, x0, x1, tol, maxIter);
     }
 
-    // Find all roots of a polynomial (coeffs ascending) in [a, b]. Both the
-    // scan (_poly_fill) and the per-bracket refinement (_bisect) run as JIT
-    // kernels, so this stays fast for high-degree polynomials.
+    // Find all roots of a polynomial (coeffs ascending) in [a, b]. The scan and
+    // the per-bracket refinement both run in the _poly_roots kernel, so this
+    // stays fast for high-degree polynomials.
     fn FindRootsPoly(coeffs: array, a: float, b: float, samples: int, tol: float): array {
         let roots = [];
         let nc: int = len(coeffs);
         if (nc == 0 || samples < 1 || b <= a) return roots;
-        let cnt: int = samples + 1;
-        let vals: [float] = Array.Create(cnt, Type.Float);
         let h: float = (b - a) / samples;
-        _poly_fill(coeffs, nc, vals, cnt, a, h);      // JIT
-        if (Math.AbsF(vals[0]) < tol) { Array.Append(roots, a); }
-        let i: int = 1;
-        while (i < cnt) {
-            let f0: float = vals[i - 1];
-            let f1: float = vals[i];
-            if (f0 * f1 < 0.0) {
-                let x0: float = a + h * ((i - 1) + 0.0);
-                let x1: float = a + h * (i + 0.0);
-                Array.Append(roots, _bisect(coeffs, nc, x0, x1, tol, 100));   // JIT
-            } else if (i < samples && Math.AbsF(f1) < tol) {
-                Array.Append(roots, a + h * (i + 0.0));
-            }
-            i = i + 1;
-        }
+        foreach (r in _poly_roots(_to_float(coeffs), nc, a, h, samples, tol)) { Array.Append(roots, r); }
         return roots;
     }
 
@@ -500,7 +509,7 @@ class Numerics {
         let cnt: int = n + 1;
         let ys: [float] = Array.Create(cnt, Type.Float);
         let h: float = (b - a) / n;
-        iter(i from 0 to n) {
+        iter(i from 0 to n + 1) {
             let x: float = a + h * (i + 0.0);
             ys[i] = f(x) + 0.0;
         }
@@ -532,7 +541,7 @@ class Numerics {
         let xprev: float = a;
         let fprev: float = f(a);
         if (Math.AbsF(fprev) < tol) { Array.Append(roots, a); }
-        iter(i from 1 to samples) {
+        iter(i from 1 to samples + 1) {
             let xcur: float = a + h * (i + 0.0);
             let fcur: float = f(xcur);
             if (fprev * fcur < 0.0) {
@@ -718,7 +727,7 @@ class Stats {
     // Flat float copy, ascending-sorted (leaves the caller's array untouched).
     fn _sortedCopy(xs: array, n: int): array {
         let c: [float] = Array.Create(n, Type.Float);
-        iter(i from 0 to n - 1) { c[i] = xs[i] + 0.0; }
+        iter(i from 0 to n) { c[i] = xs[i] + 0.0; }
         Array.Sort(c);
         return c;
     }
@@ -1188,7 +1197,7 @@ fn _to_float(a: array): array {
     if (Array.IsAllFloat(a)) return a;
     let n: int = len(a);
     let out: [float] = Array.Create(n, Type.Float);
-    iter(i from 0 to n - 1) { out[i] = a[i] + 0.0; }
+    iter(i from 0 to n) { out[i] = a[i] + 0.0; }
     return out;
 }
 
@@ -1205,7 +1214,7 @@ class LinAlg {
     // Flat row-major copy of a matrix/vector (never mutate the caller's data).
     fn static _copy(a: array, count: int): array {
         let c: [float] = Array.Create(count, Type.Float);
-        iter(i from 0 to count - 1) { c[i] = a[i] + 0.0; }
+        iter(i from 0 to count) { c[i] = a[i] + 0.0; }
         return c;
     }
 
@@ -1243,8 +1252,8 @@ class LinAlg {
         if (_la_lu(lu, n, piv) == 0) return [];
         // Row-permute b into y per the pivot record.
         let y: [float] = Array.Create(n, Type.Float);
-        iter(i from 0 to n - 1) { y[i] = b[i] + 0.0; }
-        iter(k from 0 to n - 1) {
+        iter(i from 0 to n) { y[i] = b[i] + 0.0; }
+        iter(k from 0 to n) {
             let pr: int = int(piv[k]);
             if (pr != k) { let t: float = y[k]; y[k] = y[pr]; y[pr] = t; }
         }
@@ -1258,7 +1267,7 @@ class LinAlg {
         let piv: [float] = Array.Create(n, Type.Float);
         if (_la_lu(lu, n, piv) == 0) return 0.0;
         let det: float = 1.0;
-        iter(k from 0 to n - 1) {
+        iter(k from 0 to n) {
             det = det * lu[k * n + k];
             if (int(piv[k]) != k) { det = -det; }   // each swap flips the sign
         }
@@ -1272,15 +1281,15 @@ class LinAlg {
         if (_la_lu(lu, n, piv) == 0) return [];
         let inv: [float] = Array.Create(n * n, Type.Float);
         let y: [float] = Array.Create(n, Type.Float);
-        iter(c from 0 to n - 1) {
-            iter(r from 0 to n - 1) { y[r] = 0.0; }
+        iter(c from 0 to n) {
+            iter(r from 0 to n) { y[r] = 0.0; }
             y[c] = 1.0;
-            iter(k from 0 to n - 1) {
+            iter(k from 0 to n) {
                 let pr: int = int(piv[k]);
                 if (pr != k) { let t: float = y[k]; y[k] = y[pr]; y[pr] = t; }
             }
             _la_fbsolve(lu, y, n);
-            iter(r from 0 to n - 1) { inv[r * n + c] = y[r]; }
+            iter(r from 0 to n) { inv[r * n + c] = y[r]; }
         }
         return inv;
     }
@@ -1290,8 +1299,8 @@ class LinAlg {
         let l = _copy(a, n * n);
         if (_la_chol(l, n) == 0) return [];
         // Zero the strict upper triangle (kernel only wrote the lower part).
-        iter(i from 0 to n - 1) {
-            iter(j from i + 1 to n - 1) { l[i * n + j] = 0.0; }
+        iter(i from 0 to n) {
+            iter(j from i + 1 to n) { l[i * n + j] = 0.0; }
         }
         return l;
     }
@@ -1342,11 +1351,11 @@ class Matrix {
         if (r == 0) return nil;
         let c: int = len(rows[0]);
         if (c == 0) return nil;
-        iter(i from 1 to r - 1) {
+        iter(i from 1 to r) {
             if (len(rows[i]) != c) return nil;
         }
         let d: [float] = Array.Create(r * c, Type.Float);
-        iter(i from 0 to r - 1) {
+        iter(i from 0 to r) {
             let row = _to_float(rows[i]);
             _mx_copy_at(row, d, i * c, c);
         }
@@ -1423,9 +1432,9 @@ class Matrix {
     // Back to an array-of-rows, each row its own [float].
     fn ToRows(): array {
         let outer = [];
-        iter(i from 0 to this._r - 1) {
+        iter(i from 0 to this._r) {
             let row: [float] = Array.Create(this._c, Type.Float);
-            iter(j from 0 to this._c - 1) { row[j] = this._d[i * this._c + j]; }
+            iter(j from 0 to this._c) { row[j] = this._d[i * this._c + j]; }
             Array.Append(outer, row);
         }
         return outer;
@@ -1434,7 +1443,7 @@ class Matrix {
     fn Copy(): Matrix {
         let n: int = this._r * this._c;
         let d: [float] = Array.Create(n, Type.Float);
-        iter(i from 0 to n - 1) { d[i] = this._d[i]; }
+        iter(i from 0 to n) { d[i] = this._d[i]; }
         return new Matrix(d, this._r, this._c);
     }
 
@@ -1498,7 +1507,7 @@ class Matrix {
         let piv: [float] = Array.Create(n, Type.Float);
         if (_la_lu(lu, n, piv) == 0) return 0.0;
         let det: float = 1.0;
-        iter(k from 0 to n - 1) {
+        iter(k from 0 to n) {
             det = det * lu[k * n + k];
             if (int(piv[k]) != k) { det = 0.0 - det; }   // each swap flips the sign
         }
@@ -1515,15 +1524,15 @@ class Matrix {
         if (_la_lu(lu, n, piv) == 0) return nil;
         let inv: [float] = Array.Create(n * n, Type.Float);
         let y: [float] = Array.Create(n, Type.Float);
-        iter(c from 0 to n - 1) {
-            iter(r from 0 to n - 1) { y[r] = 0.0; }
+        iter(c from 0 to n) {
+            iter(r from 0 to n) { y[r] = 0.0; }
             y[c] = 1.0;
-            iter(k from 0 to n - 1) {
+            iter(k from 0 to n) {
                 let pr: int = int(piv[k]);
                 if (pr != k) { let t: float = y[k]; y[k] = y[pr]; y[pr] = t; }
             }
             _la_fbsolve(lu, y, n);
-            iter(r from 0 to n - 1) { inv[r * n + c] = y[r]; }
+            iter(r from 0 to n) { inv[r * n + c] = y[r]; }
         }
         return new Matrix(inv, n, n);
     }
@@ -1532,7 +1541,7 @@ class Matrix {
     fn Equals(o: Matrix, tol: float): bool {
         if (o == nil || o._r != this._r || o._c != this._c) return false;
         let n: int = this._r * this._c;
-        iter(i from 0 to n - 1) {
+        iter(i from 0 to n) {
             if (Math.AbsF(this._d[i] - o._d[i]) > tol) return false;
         }
         return true;

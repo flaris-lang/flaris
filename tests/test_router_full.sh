@@ -74,6 +74,12 @@ BODY=$(echo "$RESP" | head -1)
 check "GET /health" "200" "$STATUS" "$BODY"
 check_body "GET /health body" "ok" "$BODY"
 
+RESP=$(curl -s -w "\n%{http_code}" "$BASE/async")
+STATUS=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | head -1)
+check "GET /async (async handler)" "200" "$STATUS" "$BODY"
+check_body "GET /async body" "async-hello" "$BODY"
+
 # --- CORS preflight ---
 echo ""
 echo "--- CORS ---"

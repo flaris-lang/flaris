@@ -1,0 +1,937 @@
+// test_openapi.fls - OpenApi.fls: document building, shorthand expansion,
+// Router facade, discovery and the JSON writer. No sockets: routes are driven
+// through the Router's dispatch entry, so the test is deterministic and fast.
+//
+// Run: flarisvm ./tests/test_openapi.fls --libs='./libs'
+
+import { Router, Response } from library("Router", "1.0");
+import { OpenApi }          from library("OpenApi", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.Error("  FAIL: ", msg); }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.Error("  FAIL: ", msg, " - expected [", expected, "] got [", actual, "]");
+    }
+}
+
+// Deep equality through canonical JSON, so key order never matters.
+fn checkJson(actual, expected, msg) {
+    checkEq(Json.Canonicalize(actual), Json.Canonicalize(expected), msg);
+}
+
+fn mkReq(method:string, path:string, body?) {
+    return { method: method, path: path, rawPath: path, params: {}, query: {},
+             headers: {}, peer: "127.0.0.1:1234", secure: false, body: body ?? "" };
+}
+
+class Inst { let id:int = 1; let name = "n"; }
+
+class Pet {
+    let id:int       = 0;
+    let name:string  = "";
+    let price:float  = 0.0;
+    let tags:array   = [];
+    let owner        = nil;
+    let sold:bool    = false;
+}
+
+// ---------------------------------------------------------------------------
+fn test_facade_registers_routes() {
+    Console.WriteLine("== facade registers on the Router ==");
+    let app = new Router();
+    let api = OpenApi.For(app, { title: "Pets", version: "2.0.0" });
+
+    api.Get("/pets", { summary: "List" }, fn(_r) { return Response.Text("list", nil); });
+    api.Post("/pets", fn(r) { return Response.Text("posted:" + r.body, nil); });   // doc omitted
+    api.Get("/pets/:id", { summary: "One" }, fn(r) { return Response.Text("pet:" + r.params.id, nil); });
+    api.Delete("/pets/:id", nil, fn(r) { return Response.Text("gone:" + r.params.id, nil); });
+    api.Get("/files/*", fn(r) { return Response.Text("file:" + r.params["*"], nil); });
+
+    checkEq(app._dispatch(mkReq("GET", "/pets")).body,        "list",       "GET registered");
+    checkEq(app._dispatch(mkReq("POST", "/pets", "x")).body,  "posted:x",   "POST with doc omitted");
+    checkEq(app._dispatch(mkReq("GET", "/pets/7")).body,      "pet:7",      "param route");
+    checkEq(app._dispatch(mkReq("DELETE", "/pets/7")).body,   "gone:7",     "DELETE with nil doc");
+    checkEq(app._dispatch(mkReq("GET", "/files/a/b.txt")).body, "file:a/b.txt", "catch-all route");
+
+    let spec = api.Spec();
+    checkEq(spec.openapi, "3.0.3", "default OpenAPI version");
+    checkEq(spec.info.title, "Pets", "title");
+    checkEq(spec.info.version, "2.0.0", "version");
+    check(Object.HasKey(spec.paths, "/pets"), "path /pets");
+    check(Object.HasKey(spec.paths, "/pets/{id}"), ":id converted to {id}");
+    check(Object.HasKey(spec.paths, "/files/{path}"), "* converted to {path}");
+    check(Object.HasKey(spec.paths["/pets"], "get") && Object.HasKey(spec.paths["/pets"], "post"), "both methods on /pets");
+    checkEq(spec.paths["/pets/{id}"].get.operationId, "getPetsById", "auto operationId with param");
+    checkEq(spec.paths["/pets"].post.operationId, "postPets", "auto operationId");
+    checkEq(spec.paths["/files/{path}"].get.parameters[0].name, "path", "catch-all path parameter");
+
+    let p = spec.paths["/pets/{id}"].get.parameters[0];
+    checkEq(p.name, "id", "path param name");
+    checkEq(p["in"], "path", "path param location");
+    checkEq(p.required, true, "path param required");
+    checkEq(p.schema.type, "string", "path param default type");
+    checkJson(spec.paths["/pets"].get.responses, { "200": { description: "OK" } }, "default response");
+}
+
+// ---------------------------------------------------------------------------
+fn test_shorthand() {
+    Console.WriteLine("== schema shorthand ==");
+    let api = new OpenApi("T");
+
+    checkJson(OpenApi._expand("int"),      { type: "integer" },  "int");
+    checkJson(OpenApi._expand("int64"),    { type: "integer", format: "int64" }, "int64");
+    checkJson(OpenApi._expand("float"),    { type: "number" },   "float");
+    checkJson(OpenApi._expand("bool"),     { type: "boolean" },  "bool");
+    checkJson(OpenApi._expand("datetime"), { type: "string", format: "date-time" }, "datetime");
+    checkJson(OpenApi._expand("any"),      {},                    "any");
+    checkJson(OpenApi._expand("string?"),  { type: "string", nullable: true }, "nullable string");
+    checkJson(OpenApi._expand("Pet"),      { "$ref": "#/components/schemas/Pet" }, "ref by name");
+    checkJson(OpenApi._expand("[Pet]"),    { type: "array", items: { "$ref": "#/components/schemas/Pet" } }, "array of ref");
+    checkJson(OpenApi._expand("[int]"),    { type: "array", items: { type: "integer" } }, "array of int");
+    checkJson(OpenApi._expand("Pet?"),     { allOf: [{ "$ref": "#/components/schemas/Pet" }], nullable: true }, "nullable ref");
+    checkJson(OpenApi._expand(["string"]), { type: "array", items: { type: "string" } }, "array literal");
+
+    checkJson(OpenApi._expand({ id: "int", "tag?": "string", note: "string?" }),
+        { type: "object",
+          properties: { id: { type: "integer" }, tag: { type: "string" }, note: { type: "string", nullable: true } },
+          required: ["id"] },
+        "property map with optional key and optional type");
+
+    checkJson(OpenApi._expand({ type: "string", enum: ["a", "b"] }),
+        { type: "string", enum: ["a", "b"] }, "schema object passes through");
+    checkJson(OpenApi._expand({ type: "array", items: "Pet" }),
+        { type: "array", items: { "$ref": "#/components/schemas/Pet" } }, "items shorthand inside schema");
+    checkJson(OpenApi._expand({ properties: { a: "int" } }),
+        { type: "object", properties: { a: { type: "integer" } } }, "properties implies object");
+    checkJson(OpenApi._expand({ oneOf: ["Cat", "Dog"] }),
+        { oneOf: [{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }] }, "oneOf shorthand");
+    checkJson(OpenApi._expand({ type: "object", additionalProperties: "int" }),
+        { type: "object", additionalProperties: { type: "integer" } }, "additionalProperties shorthand");
+
+    let ref = api.Schema("Pet", { id: "int", name: "string" });
+    checkJson(ref, { "$ref": "#/components/schemas/Pet" }, "Schema returns ref");
+    let spec = api.Spec();
+    checkJson(spec.components.schemas.Pet,
+        { type: "object", properties: { id: { type: "integer" }, name: { type: "string" } }, required: ["id", "name"] },
+        "registered schema");
+}
+
+// ---------------------------------------------------------------------------
+fn test_schema_of() {
+    Console.WriteLine("== SchemaOf ==");
+    let api = new OpenApi("T");
+    api.SchemaOf("Pet", new Pet(), { descriptions: { name: "Display name" }, example: true });
+    let s = api.Spec().components.schemas.Pet;
+    checkEq(s.type, "object", "inferred object");
+    checkEq(s.properties.id.type, "integer", "int field");
+    checkEq(s.properties.name.type, "string", "string field");
+    checkEq(s.properties.price.type, "number", "float field");
+    checkEq(s.properties.tags.type, "array", "array field");
+    checkEq(s.properties.sold.type, "boolean", "bool field");
+    checkEq(s.properties.owner.nullable, true, "nil default is nullable");
+    check(!Object.HasKey(s.properties.owner, "type"), "nil default has no type");
+    checkEq(s.properties.name.description, "Display name", "description applied");
+    checkJson(s.required, ["id", "name", "price", "sold", "tags"], "non-nil defaults are required");
+    checkEq(s.example.id, 0, "example carries the sample");
+
+    api.SchemaOf("Slim", new Pet(), { required: ["id"] });
+    checkJson(api.Spec().components.schemas.Slim.required, ["id"], "required override");
+}
+
+// ---------------------------------------------------------------------------
+fn test_parameters_body_responses() {
+    Console.WriteLine("== parameters, body, responses ==");
+    let api = new OpenApi("T");
+    api.Get("/search/:kind", {
+        params:  { kind: { type: "string", enum: ["pet", "owner"], description: "What to search" } },
+        query:   { q: "string", limit: "int?", sort: { type: "string", description: "Sort key", required: false } },
+        headers: { "X-Trace": "string?" },
+        cookies: { session: "string" },
+        parameters: [{ name: "raw", "in": "query", schema: { type: "integer" } }],
+        responses: { "200": "[Pet]", "404": "Nothing matched", "500": nil,
+                     "201": { schema: "Pet", description: "Made", headers: { Location: "string" } },
+                     "204": { description: "Emptied" } }
+    });
+    let op = api.Spec().paths["/search/{kind}"].get;
+
+    let byName = {};
+    foreach (p in op.parameters) { byName[p["in"] + ":" + p.name] = p; }
+    checkEq(len(op.parameters), 7, "parameter count");
+    checkEq(op.parameters[0].name, "kind", "path param first");
+    checkJson(byName["path:kind"].schema, { type: "string", enum: ["pet", "owner"] }, "path param refined by params");
+    checkEq(byName["path:kind"].description, "What to search", "path param description");
+    checkEq(byName["path:kind"].required, true, "path param stays required");
+    checkEq(byName["query:q"].required, true, "plain type is required");
+    check(!Object.HasKey(byName["query:limit"], "required"), "int? is optional");
+    checkJson(byName["query:limit"].schema, { type: "integer" }, "optional query param is not nullable");
+    check(!Object.HasKey(byName["query:sort"], "required"), "required:false honoured");
+    checkEq(byName["query:sort"].description, "Sort key", "object form description");
+    checkEq(byName["header:X-Trace"]["in"], "header", "header param");
+    checkEq(byName["cookie:session"]["in"], "cookie", "cookie param");
+    checkJson(byName["query:raw"], { name: "raw", "in": "query", schema: { type: "integer" } }, "raw parameter passthrough");
+
+    let r = op.responses;
+    checkJson(Array.Sort(Object.Keys(r), fn(a, b) => a < b), ["200", "201", "204", "404", "500"], "all responses present");
+    checkEq(r["200"].description, "OK", "type string gets reason phrase");
+    checkJson(r["200"].content["application/json"].schema,
+        { type: "array", items: { "$ref": "#/components/schemas/Pet" } }, "type string becomes schema");
+    checkEq(r["404"].description, "Nothing matched", "plain string is description");
+    check(!Object.HasKey(r["404"], "content"), "description-only response has no content");
+    checkEq(r["500"].description, "Internal Server Error", "nil gets reason phrase");
+    checkEq(r["201"].description, "Made", "long form description");
+    checkJson(r["201"].content["application/json"].schema, { "$ref": "#/components/schemas/Pet" }, "long form schema");
+    checkJson(r["201"].headers.Location, { schema: { type: "string" } }, "response header shorthand");
+    checkEq(r["204"].description, "Emptied", "description-only long form");
+
+    api.Post("/pets", { body: "Pet" });
+    api.Put("/pets/:id", { body: { schema: { name: "string" }, contentType: "application/x-www-form-urlencoded",
+                                   required: false, description: "Fields to change" } });
+    api.Patch("/pets/:id", { body: "Pet?" });
+    let spec = api.Spec();
+    checkJson(spec.paths["/pets"].post.requestBody,
+        { required: true, content: { "application/json": { schema: { "$ref": "#/components/schemas/Pet" } } } },
+        "body shorthand");
+    let put = spec.paths["/pets/{id}"].put.requestBody;
+    checkEq(put.required, false, "long form required:false");
+    checkEq(put.description, "Fields to change", "long form description");
+    check(Object.HasKey(put.content, "application/x-www-form-urlencoded"), "custom content type");
+    checkEq(spec.paths["/pets/{id}"].patch.requestBody.required, false, "Pet? body is optional");
+    checkJson(spec.paths["/pets/{id}"].patch.requestBody.content["application/json"].schema,
+        { "$ref": "#/components/schemas/Pet" }, "optional body keeps plain ref");
+}
+
+// ---------------------------------------------------------------------------
+fn test_metadata_and_security() {
+    Console.WriteLine("== metadata, tags, security ==");
+    let api = new OpenApi({ title: "Shop", version: "1.2.3", description: "Buy things" });
+    api.Info({ termsOfService: "https://shop/tos", contact: { email: "dev@shop" } })
+       .Server("https://api.shop", "Production")
+       .Server("http://localhost:8080")
+       .Tag("orders", "Order handling")
+       .ExternalDocs("https://docs.shop", "More")
+       .Version("3.1.0")
+       .Extension("audience", "internal")
+       .Extension("x-owner", "team-a");
+    api.SecurityScheme("bearerAuth", OpenApi.Bearer("JWT"));
+    api.SecurityScheme("apiKey", OpenApi.ApiKey("X-Api-Key"));
+    api.SecurityScheme("basic", OpenApi.Basic());
+    api.Security(["bearerAuth"]);
+
+    api.Get("/orders", { tags: "orders" });
+    api.Get("/health", { tags: ["ops"], security: false });
+    api.Get("/admin",  { security: [{ apiKey: [] }, "basic"] });
+    api.Tag("orders", "Orders, updated");
+
+    let spec = api.Spec();
+    checkEq(spec.openapi, "3.1.0", "version override");
+    checkEq(spec.info.description, "Buy things", "info description");
+    checkEq(spec.info.termsOfService, "https://shop/tos", "info merged");
+    checkEq(spec.info.contact.email, "dev@shop", "nested info merged");
+    checkEq(len(spec.servers), 2, "two servers");
+    checkEq(spec.servers[0].description, "Production", "server description");
+    check(!Object.HasKey(spec.servers[1], "description"), "server without description");
+    checkJson(spec.tags, [{ name: "orders", description: "Orders, updated" }, { name: "ops" }],
+        "declared tag updated, used tag auto-added");
+    checkJson(spec.externalDocs, { url: "https://docs.shop", description: "More" }, "externalDocs");
+    checkEq(spec["x-audience"], "internal", "extension gets x- prefix");
+    checkEq(spec["x-owner"], "team-a", "extension keeps x- prefix");
+    checkJson(spec.components.securitySchemes.bearerAuth, { type: "http", scheme: "bearer", bearerFormat: "JWT" }, "bearer scheme");
+    checkJson(spec.components.securitySchemes.apiKey, { type: "apiKey", name: "X-Api-Key", "in": "header" }, "api key scheme");
+    checkJson(spec.components.securitySchemes.basic, { type: "http", scheme: "basic" }, "basic scheme");
+    checkJson(spec.security, [{ bearerAuth: [] }], "global security");
+    checkJson(spec.paths["/health"].get.security, [], "security:false is public");
+    checkJson(spec.paths["/admin"].get.security, [{ apiKey: [] }, { basic: [] }], "mixed security list");
+    check(!Object.HasKey(spec.paths["/orders"].get, "security"), "no per-op security when not given");
+}
+
+// ---------------------------------------------------------------------------
+fn test_groups() {
+    Console.WriteLine("== groups ==");
+    let app = new Router();
+    let api = OpenApi.For(app, "T");
+    let seen = [];
+    let v1 = api.Group("/api/v1", { tag: "v1", description: "Version one" });
+    v1.Use(fn(req, next) { Array.Append(seen, req.path); return next(req); });
+    v1.Get("/pets", { summary: "List" }, fn(_r) { return Response.Text("v1 pets", nil); });
+    let admin = v1.Group("/admin", "admin");
+    admin.Post("/reset", fn(_r) { return Response.Text("reset", nil); });
+    let plain = api.Group("/misc");
+    plain.Get("/ping", { tags: ["ops"] }, fn(_r) { return Response.Text("pong", nil); });
+    plain.Get("/untagged", fn(_r) { return Response.Text("u", nil); });
+
+    checkEq(app._dispatch(mkReq("GET", "/api/v1/pets")).body, "v1 pets", "group route dispatches");
+    checkEq(app._dispatch(mkReq("POST", "/api/v1/admin/reset")).body, "reset", "nested group dispatches");
+    checkEq(app._dispatch(mkReq("GET", "/misc/ping")).body, "pong", "plain group dispatches");
+    checkEq(len(seen), 2, "group middleware ran for the group and its child");
+
+    let spec = api.Spec();
+    check(Object.HasKey(spec.paths, "/api/v1/pets"), "group prefix in path");
+    check(Object.HasKey(spec.paths, "/api/v1/admin/reset"), "nested prefix in path");
+    checkJson(spec.paths["/api/v1/pets"].get.tags, ["v1"], "group tag inherited");
+    checkJson(spec.paths["/api/v1/admin/reset"].post.tags, ["admin"], "nested group tag overrides");
+    checkJson(spec.paths["/misc/ping"].get.tags, ["ops"], "doc tags win over group");
+    check(!Object.HasKey(spec.paths["/misc/untagged"].get, "tags"), "no tags without group tag");
+    checkJson(spec.tags, [{ name: "v1", description: "Version one" }, { name: "admin" }, { name: "ops" }], "tag order");
+    checkEq(spec.paths["/api/v1/admin/reset"].post.operationId, "postApiV1AdminReset", "operationId from full path");
+}
+
+// ---------------------------------------------------------------------------
+fn test_discover() {
+    Console.WriteLine("== discover ==");
+    let app = new Router();
+    app.Get("/zeta", fn(_r) { return Response.Text("z", nil); });
+    app.Get("/alpha/:id", fn(_r) { return Response.Text("a", nil); });
+    app.Post("/alpha/:id", fn(_r) { return Response.Text("a", nil); });
+    app.Get("/static/*", fn(_r) { return Response.Text("s", nil); });
+    app.Host("shop.example").Get("/shop", fn(_r) { return Response.Text("h", nil); });
+
+    let api = OpenApi.For(app, "T");
+    api.Get("/zeta", { summary: "Documented already" });
+    api.Discover();
+
+    let spec = api.Spec();
+    checkEq(spec.paths["/zeta"].get.summary, "Documented already", "documented route not overwritten");
+    check(Object.HasKey(spec.paths, "/alpha/{id}"), "dynamic route discovered");
+    check(Object.HasKey(spec.paths["/alpha/{id}"], "get") && Object.HasKey(spec.paths["/alpha/{id}"], "post"), "both methods discovered");
+    checkEq(spec.paths["/alpha/{id}"].get.parameters[0].name, "id", "discovered path param");
+    check(Object.HasKey(spec.paths, "/static/{path}"), "catch-all discovered");
+    checkEq(spec.paths["/shop"].get["x-host"], "shop.example", "host-scoped route carries x-host");
+
+    // Order: what was registered through the facade first, then discovered routes sorted.
+    let keys = Object.Keys(Json.Parse(api.ToJson(false)).paths);
+    let text = api.ToJson(false);
+    let iAlpha  = String.IndexOf(text, "\"/alpha/{id}\"");
+    let iShop   = String.IndexOf(text, "\"/shop\"");
+    let iStatic = String.IndexOf(text, "\"/static/{path}\"");
+    let iZeta   = String.IndexOf(text, "\"/zeta\"");
+    check(iZeta < iAlpha && iAlpha < iShop && iShop < iStatic, "discovered routes follow in sorted order");
+    checkEq(len(keys), 4, "four paths total");
+
+    let again = api.Discover();
+    checkEq(len(Object.Keys(again.Spec().paths["/alpha/{id}"])), 2, "second Discover adds nothing");
+}
+
+// ---------------------------------------------------------------------------
+fn test_json_writer() {
+    Console.WriteLine("== JSON writer ==");
+    let api = new OpenApi({ title: "W", version: "1" });
+    api.Schema("Zeta", { z: "int" });
+    api.Schema("Alpha", { a: "int" });
+    api.Get("/b", { summary: "B", responses: { "200": "Zeta", "404": "Missing" } });
+    api.Get("/a", { summary: "A" });
+    api.Post("/a", { body: "Alpha" });
+
+    let compact = api.ToJson(false);
+    let pretty  = api.ToJson(true);
+    check(Json.IsValid(compact), "compact output is valid JSON");
+    check(Json.IsValid(pretty),  "pretty output is valid JSON");
+    checkEq(Json.Canonicalize(Json.Parse(compact)), Json.Canonicalize(Json.Parse(pretty)), "pretty and compact agree");
+    checkEq(Json.Canonicalize(Json.Parse(compact)), Json.Canonicalize(api.Spec()), "Spec() matches ToJson()");
+    checkEq(api.ToJson(true), pretty, "output is stable across calls");
+    check(String.StartsWith(compact, "{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"W\",\"version\":\"1\"},\"paths\":{"),
+          "conventional key order at the root");
+    check(String.StartsWith(pretty, "{\n  \"openapi\": \"3.0.3\",\n  \"info\": {\n    \"title\": \"W\","), "two-space pretty print");
+    check(!String.Contains(pretty, "\n\n"), "no blank lines");
+    check(String.IndexOf(compact, "\"/b\"") < String.IndexOf(compact, "\"/a\""), "paths in registration order");
+    check(String.IndexOf(compact, "\"Zeta\"") < String.IndexOf(compact, "\"Alpha\""), "schemas in registration order");
+    let opText = "\"get\":{\"summary\":\"B\",\"operationId\":\"getB\",\"responses\":{\"200\":";
+    check(String.Contains(compact, opText), "operation keys in conventional order");
+    check(String.Contains(compact, "\"paths\":{\"/b\":{\"get\":"), "paths precede components");
+    check(String.IndexOf(compact, "\"paths\"") < String.IndexOf(compact, "\"components\""), "components after paths");
+    checkEq(String.Count(compact, "\"$ref\":\"#/components/schemas/Zeta\""), 1, "ref emitted once");
+
+    // Escaping and scalars go through the builtin serializer.
+    let esc = new OpenApi({ title: "Quote \" and \\ slash\nnewline", version: "1" });
+    esc.Extension("num", 3).Extension("flt", 2.5).Extension("flag", true).Extension("none", nil).Extension("list", [1, "a"]);
+    let e = Json.Parse(esc.ToJson(false));
+    checkEq(e.info.title, "Quote \" and \\ slash\nnewline", "string escaping");
+    checkEq(e["x-num"], 3, "int extension");
+    checkEq(e["x-flt"], 2.5, "float extension");
+    checkEq(e["x-flag"], true, "bool extension");
+    check(Object.HasKey(e, "x-none") && e["x-none"] == nil, "nil extension is null");
+    checkJson(e["x-list"], [1, "a"], "array extension");
+    check(String.Contains(esc.ToJson(false), "\"paths\":{}"), "empty paths object");
+}
+
+// ---------------------------------------------------------------------------
+fn test_serve() {
+    Console.WriteLine("== serve ==");
+    let app = new Router();
+    let api = OpenApi.For(app, { title: "Served", version: "1" });
+    api.Get("/a", { summary: "A" }, fn(_r) { return Response.Text("a", nil); });
+    api.Serve();
+
+    let r = app._dispatch(mkReq("GET", "/openapi.json"));
+    checkEq(r.status, 200, "spec route status");
+    check(String.StartsWith(r.headers["Content-Type"], "application/json"), "spec content type");
+    check(Json.IsValid(r.body), "spec body is JSON");
+    checkEq(Json.Parse(r.body).info.title, "Served", "spec body content");
+    checkEq(r.headers["Access-Control-Allow-Origin"], "*", "CORS header on the spec");
+    let etag = r.headers["ETag"];
+    check(Type.IsString(etag) && String.StartsWith(etag, "\""), "ETag present");
+    let conditional = mkReq("GET", "/openapi.json");
+    conditional.headers["If-None-Match"] = etag;
+    let r2 = app._dispatch(conditional);
+    checkEq(r2.status, 304, "matching If-None-Match gets 304");
+    checkEq(r2.body, "", "304 carries no body");
+
+    // Changes after Serve() show up on the next request, with a new ETag.
+    api.Get("/b", { summary: "B" }, fn(_r) { return Response.Text("b", nil); });
+    let r3 = app._dispatch(mkReq("GET", "/openapi.json"));
+    check(Object.HasKey(Json.Parse(r3.body).paths, "/b"), "a later route appears");
+    check(r3.headers["ETag"] != etag, "ETag changes with the document");
+    checkEq(app._dispatch(conditional).status, 200, "stale If-None-Match gets the full body");
+
+    let d = app._dispatch(mkReq("GET", "/docs"));
+    checkEq(d.status, 200, "docs route status");
+    check(String.StartsWith(d.headers["Content-Type"], "text/html"), "docs content type");
+    check(String.Contains(d.body, "<title>Served</title>"), "docs title from info");
+    check(String.Contains(d.body, "specUrl: \"/openapi.json\""), "docs page points at the spec route");
+    check(String.Contains(d.body, "<script>") && String.Contains(d.body, "<style>"), "docs page inlines its assets");
+    check(!String.Contains(d.body, "<script src="), "builtin page loads nothing external");
+    checkEq(app._dispatch(mkReq("GET", "/docs")).body, d.body, "docs page is cached");
+
+    api.Unserve();
+    checkEq(app._dispatch(mkReq("GET", "/openapi.json")).status, 410, "spec is gone after Unserve");
+    checkEq(app._dispatch(mkReq("GET", "/docs")).status, 410, "docs are gone after Unserve");
+
+    // Custom paths, the Swagger UI and ReDoc shells, and no docs at all.
+    let app2 = new Router();
+    let api2 = OpenApi.For(app2, "Two");
+    api2.Serve({ specPath: "/api/spec.json", docsPath: "/api/ui", ui: "swagger", title: "Custom", cors: false, pretty: false });
+    let s2 = app2._dispatch(mkReq("GET", "/api/spec.json"));
+    checkEq(s2.status, 200, "custom spec path");
+    check(!Object.HasKey(s2.headers, "Access-Control-Allow-Origin"), "cors:false drops the header");
+    check(!String.Contains(s2.body, "\n"), "pretty:false is compact");
+    let u2 = app2._dispatch(mkReq("GET", "/api/ui"));
+    check(String.Contains(u2.body, "swagger-ui-bundle.js") && String.Contains(u2.body, "url: \"/api/spec.json\""), "swagger shell");
+    check(String.Contains(u2.body, "<title>Custom</title>"), "custom title");
+    api2.Unserve();
+
+    let app3 = new Router();
+    let api3 = OpenApi.For(app3, "Three").Serve({ ui: "redoc", cdn: "https://cdn.example/redoc.js" });
+    let u3 = app3._dispatch(mkReq("GET", "/docs"));
+    check(String.Contains(u3.body, "<redoc spec-url=\"/openapi.json\">") && String.Contains(u3.body, "https://cdn.example/redoc.js"),
+          "redoc shell with a custom cdn");
+    api3.Unserve();
+
+    let app4 = new Router();
+    let api4 = OpenApi.For(app4, "Four").Serve({ ui: false });
+    checkEq(app4._dispatch(mkReq("GET", "/docs")).status, 404, "ui:false registers no docs route");
+    checkEq(app4._dispatch(mkReq("GET", "/openapi.json")).status, 200, "ui:false still serves the document");
+    api4.Unserve();
+
+    let unattached = new OpenApi("X");
+    var threw = false;
+    try { unattached.Serve(); } catch (e) { threw = true; }
+    check(threw, "Serve without a Router raises");
+}
+
+// ---------------------------------------------------------------------------
+fn test_load() {
+    Console.WriteLine("== load ==");
+    let src = new OpenApi({ title: "Src", version: "3" });
+    src.Server("https://s").Tag("t", "T").ExternalDocs("https://d", nil).Extension("k", 1);
+    src.Schema("Pet", { id: "int" });
+    src.SecurityScheme("b", OpenApi.Bearer(nil)).Security(["b"]);
+    src.Get("/p/:id", { tags: "t", responses: { "200": "Pet" } });
+    src.Post("/p", { body: "Pet" });
+    let text = src.ToJson(true);
+
+    let api = OpenApi.Load(text);
+    checkEq(Json.Canonicalize(api.Spec()), Json.Canonicalize(src.Spec()), "Load round-trips the document");
+    let loadedText = api.ToJson(true);
+    check(String.IndexOf(loadedText, "\"/p\"") < String.IndexOf(loadedText, "\"/p/{id}\""), "Load sorts paths");
+    checkEq(OpenApi.Load(loadedText).ToJson(true), loadedText, "Load of its own output is byte-identical");
+    let api2 = OpenApi.Load(Json.Parse(text));
+    checkEq(Json.Canonicalize(api2.Spec()), Json.Canonicalize(src.Spec()), "Load accepts a parsed object");
+
+    // Sections this library does not build itself survive verbatim.
+    let doc = Json.Parse(text);
+    doc.components.responses = { NotFound: { description: "nf" } };
+    doc.webhooks = { ping: { post: { responses: { "200": { description: "ok" } } } } };
+    doc.paths["/p"].parameters = [{ name: "v", "in": "query", schema: { type: "string" } }];
+    let api3 = OpenApi.Load(doc);
+    let out = api3.Spec();
+    checkEq(out.components.responses.NotFound.description, "nf", "components.responses kept");
+    checkEq(out.webhooks.ping.post.responses["200"].description, "ok", "webhooks kept");
+    checkEq(out.paths["/p"].parameters[0].name, "v", "path-level parameters kept");
+    let t3 = api3.ToJson(false);
+    check(String.IndexOf(t3, "\"schemas\"") < String.IndexOf(t3, "\"securitySchemes\"")
+          && String.IndexOf(t3, "\"securitySchemes\"") < String.IndexOf(t3, "\"responses\":{\"NotFound\""), "components order");
+    check(String.IndexOf(t3, "\"post\":") < String.IndexOf(t3, "\"parameters\":[{\"name\":\"v\""), "methods before path-level keys");
+
+    // A loaded document can be extended and served.
+    let app = new Router();
+    let api4 = OpenApi.Load(text, app);
+    api4.Get("/extra", { summary: "E" }, fn(_r) { return Response.Text("e", nil); });
+    api4.Serve();
+    checkEq(app._dispatch(mkReq("GET", "/extra")).body, "e", "route registered on a loaded document");
+    check(Object.HasKey(Json.Parse(app._dispatch(mkReq("GET", "/openapi.json")).body).paths, "/extra"), "served with the extra path");
+    api4.Unserve();
+
+    var threw = false;
+    try { OpenApi.Load("[1,2]"); } catch (e) { threw = true; }
+    check(threw, "Load rejects a non-object");
+    threw = false;
+    try { OpenApi.LoadFile("/nonexistent/dir/openapi.json"); } catch (e) { threw = true; }
+    check(threw, "LoadFile raises on a missing file");
+}
+
+// ---------------------------------------------------------------------------
+fn test_html() {
+    Console.WriteLine("== html ==");
+    let html = OpenApi.DocsHtml("/x/spec.json", { title: "A <b> & \"q\"" });
+    check(String.Contains(html, "<title>A &lt;b&gt; &amp; &quot;q&quot;</title>"), "title is HTML-escaped");
+    check(String.Contains(html, "specUrl: \"/x/spec.json\""), "spec url injected");
+    let evil = OpenApi.DocsHtml("</script><script>alert(1)</script>", nil);
+    check(!String.Contains(evil, "</script><script>alert"), "spec url cannot close the script block");
+    check(String.Contains(evil, "\\u003c/script"), "angle brackets escaped inside script");
+    check(String.Length(html) > 30000 && String.Length(html) < 65536, "page size in the expected range");
+    let sw = OpenApi.SwaggerHtml("/s.json", { cdn: "https://cdn.x/sw@5" });
+    check(String.Contains(sw, "https://cdn.x/sw@5/swagger-ui.css") && String.Contains(sw, "https://cdn.x/sw@5/swagger-ui-bundle.js"), "swagger cdn used");
+    let rd = OpenApi.RedocHtml("/s.json", nil);
+    check(String.Contains(rd, "redoc.standalone.js"), "redoc default cdn");
+}
+
+// ---------------------------------------------------------------------------
+fn errPaths(errors) {
+    let out = [];
+    foreach (e in errors) { Array.Append(out, e.path); }
+    return Array.Sort(out, fn(a, b) => a < b);
+}
+
+fn test_validator() {
+    Console.WriteLine("== validator ==");
+    let ok = fn(v, s) => len(OpenApi.ValidateValue(v, s, nil)) == 0;
+
+    check(ok(1, { type: "integer" }), "integer accepts int");
+    check(!ok(1.5, { type: "integer" }), "integer rejects float");
+    check(ok(1, { type: "number" }), "number accepts int");
+    check(ok(1.5, { type: "number" }), "number accepts float");
+    check(!ok("1", { type: "number" }), "number rejects string");
+    check(ok("x", { type: "string" }) && !ok(1, { type: "string" }), "string type");
+    check(ok(true, { type: "boolean" }) && !ok("true", { type: "boolean" }), "boolean type");
+    check(ok([1], { type: "array" }) && !ok({}, { type: "array" }), "array type");
+    check(ok({}, { type: "object" }) && !ok([], { type: "object" }), "object type");
+    check(ok(nil, { type: "string", nullable: true }), "nullable accepts nil");
+    check(!ok(nil, { type: "string" }), "non-nullable rejects nil");
+    check(ok(nil, {}), "empty schema accepts nil");
+    check(ok(nil, { type: ["string", "null"] }), "3.1 type array with null");
+    check(ok(1, { type: ["string", "integer"] }), "3.1 type array");
+    check(ok("a", { enum: ["a", "b"] }) && !ok("c", { enum: ["a", "b"] }), "enum");
+    check(ok(3, { "const": 3 }) && !ok(4, { "const": 3 }), "const");
+    checkEq(OpenApi.ValidateValue("x", { type: "integer" }, nil)[0].message, "expected integer, got string", "type message");
+
+    check(ok("abc", { type: "string", minLength: 3, maxLength: 3 }), "length bounds inclusive");
+    check(!ok("ab", { type: "string", minLength: 3 }) && !ok("abcd", { type: "string", maxLength: 3 }), "length bounds enforced");
+    check(ok("åäö", { type: "string", maxLength: 3 }), "length counts characters, not bytes");
+    check(ok("abc", { type: "string", pattern: "^[a-c]+$" }) && !ok("abd", { type: "string", pattern: "^[a-c]+$" }), "pattern");
+    check(ok("2024-02-29", { type: "string", format: "date" }) && !ok("2024-2-9", { type: "string", format: "date" }), "date format");
+    check(ok("2024-01-01T12:00:00Z", { type: "string", format: "date-time" }) && !ok("yesterday", { type: "string", format: "date-time" }), "date-time format");
+    check(ok("123e4567-e89b-12d3-a456-426614174000", { type: "string", format: "uuid" }) && !ok("nope", { type: "string", format: "uuid" }), "uuid format");
+    check(ok("a@b.co", { type: "string", format: "email" }) && !ok("a@b", { type: "string", format: "email" }), "email format");
+    check(ok("https://x.y/z", { type: "string", format: "uri" }) && !ok("x.y/z", { type: "string", format: "uri" }), "uri format");
+    check(ok("anything", { type: "string", format: "custom-unknown" }), "unknown format passes");
+
+    check(ok(5, { type: "integer", minimum: 5, maximum: 5 }), "numeric bounds inclusive");
+    check(!ok(5, { type: "integer", minimum: 5, exclusiveMinimum: true }), "3.0 exclusiveMinimum boolean");
+    check(!ok(5, { type: "integer", maximum: 5, exclusiveMaximum: true }), "3.0 exclusiveMaximum boolean");
+    check(!ok(5, { type: "integer", exclusiveMinimum: 5 }) && ok(6, { type: "integer", exclusiveMinimum: 5 }), "3.1 exclusiveMinimum number");
+    check(!ok(5, { type: "integer", exclusiveMaximum: 5 }) && ok(4, { type: "integer", exclusiveMaximum: 5 }), "3.1 exclusiveMaximum number");
+    check(ok(9, { type: "integer", multipleOf: 3 }) && !ok(10, { type: "integer", multipleOf: 3 }), "multipleOf int");
+    check(ok(0.75, { type: "number", multipleOf: 0.25 }) && !ok(0.8, { type: "number", multipleOf: 0.25 }), "multipleOf float");
+    check(!ok(3000000000, { type: "integer", format: "int32" }) && ok(3000000000, { type: "integer", format: "int64" }), "int32 range");
+
+    check(ok([1, 2], { type: "array", items: { type: "integer" }, minItems: 2, maxItems: 2 }), "array items and bounds");
+    check(!ok([1, "x"], { type: "array", items: { type: "integer" } }), "array item type");
+    checkEq(OpenApi.ValidateValue([1, "x"], { type: "array", items: { type: "integer" } }, nil)[0].path, "value[1]", "array error path");
+    check(!ok([1], { type: "array", minItems: 2 }) && !ok([1, 2, 3], { type: "array", maxItems: 2 }), "array bounds enforced");
+    check(!ok([1, 1], { type: "array", uniqueItems: true }) && ok([1, 2], { type: "array", uniqueItems: true }), "uniqueItems");
+    check(!ok([{ a: 1 }, { a: 1 }], { type: "array", uniqueItems: true }), "uniqueItems on objects");
+
+    let obj = { type: "object", properties: { id: { type: "integer" }, name: { type: "string" } }, required: ["id"] };
+    check(ok({ id: 1 }, obj), "object with required");
+    check(!ok({ name: "x" }, obj), "missing required");
+    checkJson(errPaths(OpenApi.ValidateValue({ name: 1 }, obj, nil)), ["value.id", "value.name"], "object error paths");
+    check(ok({ id: 1, extra: true }, obj), "additional properties allowed by default");
+    check(!ok({ id: 1, extra: true }, { type: "object", properties: { id: { type: "integer" } }, additionalProperties: false }), "additionalProperties false");
+    check(ok({ a: 1, b: 2 }, { type: "object", additionalProperties: { type: "integer" } })
+          && !ok({ a: "x" }, { type: "object", additionalProperties: { type: "integer" } }), "additionalProperties schema");
+    check(!ok({}, { type: "object", minProperties: 1 }) && !ok({ a: 1, b: 2 }, { type: "object", maxProperties: 1 }), "property count bounds");
+
+    let schemas = { Pet: { type: "object", properties: { id: { type: "integer" }, friend: { "$ref": "#/components/schemas/Pet" } }, required: ["id"] } };
+    check(len(OpenApi.ValidateValue({ id: 1, friend: { id: 2 } }, { "$ref": "#/components/schemas/Pet" }, schemas)) == 0, "$ref resolution, recursive");
+    checkEq(OpenApi.ValidateValue({ id: 1, friend: { id: "x" } }, { "$ref": "#/components/schemas/Pet" }, schemas)[0].path, "value.friend.id", "nested $ref error path");
+    checkEq(OpenApi.ValidateValue(1, { "$ref": "#/components/schemas/Nope" }, schemas)[0].message, "unresolved $ref #/components/schemas/Nope", "unresolved ref reported");
+    check(ok(nil, { allOf: [{ "$ref": "#/components/schemas/Pet" }], nullable: true }), "nullable ref wrapper accepts nil");
+
+    check(ok(5, { allOf: [{ type: "integer" }, { minimum: 3 }] }) && !ok(2, { allOf: [{ type: "integer" }, { minimum: 3 }] }), "allOf");
+    check(ok("x", { anyOf: [{ type: "integer" }, { type: "string" }] }) && !ok(true, { anyOf: [{ type: "integer" }, { type: "string" }] }), "anyOf");
+    check(ok(1, { oneOf: [{ type: "integer" }, { type: "string" }] }) && !ok(1, { oneOf: [{ type: "integer" }, { type: "number" }] }), "oneOf needs exactly one");
+    check(ok("x", { "not": { type: "integer" } }) && !ok(1, { "not": { type: "integer" } }), "not");
+
+    check(ok(new Inst(), obj), "class instances validate by field");
+
+    checkJson(OpenApi._coerce("42", { type: "integer" }, {}), { ok: true, value: 42 }, "coerce integer");
+    check(!OpenApi._coerce("4x", { type: "integer" }, {}).ok, "coerce rejects non-integer");
+    checkJson(OpenApi._coerce("2.5", { type: "number" }, {}), { ok: true, value: 2.5 }, "coerce number");
+    checkJson(OpenApi._coerce("true", { type: "boolean" }, {}), { ok: true, value: true }, "coerce boolean");
+    checkJson(OpenApi._coerce("1,2,3", { type: "array", items: { type: "integer" } }, {}), { ok: true, value: [1, 2, 3] }, "coerce array");
+    checkJson(OpenApi._coerce("abc", { type: "string" }, {}), { ok: true, value: "abc" }, "coerce string unchanged");
+    checkJson(OpenApi._coerce("7", {}, {}), { ok: true, value: "7" }, "coerce without type keeps string");
+}
+
+// ---------------------------------------------------------------------------
+fn test_validate_middleware() {
+    Console.WriteLine("== Validate middleware ==");
+    let app = new Router();
+    let api = OpenApi.For(app, "V");
+    api.Schema("NewPet", { name: "string", "tag?": "string", price: "float" });
+    api.Schema("Pet", { id: "int", name: "string" });
+    app.Use(api.Validate());
+    global gSeen = nil;
+    api.Get("/pets/:id", { params: { id: "int" }, query: { verbose: "bool?", tags: { type: "array", items: "string" } }, headers: { "X-Trace": "string?" },
+                           responses: { "200": "Pet" } },
+        fn(r) { gSeen = r; return Response.Json({ id: r.params.id, name: "x" }); });
+    api.Post("/pets", { body: "NewPet", responses: { "201": "Pet" } },
+        fn(r) { gSeen = r; return Response.Json({ id: 9, name: r.validated.body.name }, 201); });
+    api.Get("/echo", { query: { q: "string" } }, fn(r) { return Response.Text(r.query.q, nil); });
+    app.Get("/free/:x", fn(r) { return Response.Text("free:" + r.params.x, nil); });
+
+    let good = mkReq("GET", "/pets/42");
+    good.query = { verbose: "true", tags: "a,b" };
+    good.headers = { "X-Trace": "t1" };
+    let r = app._dispatch(good);
+    checkEq(r.status, 200, "valid request passes");
+    check(Type.IsInt(gSeen.params.id) && gSeen.params.id == 42, "path param coerced to int");
+    checkEq(gSeen.query.verbose, true, "query bool coerced");
+    checkJson(gSeen.query.tags, ["a", "b"], "query array coerced");
+    checkEq(gSeen.validated.headers["X-Trace"], "t1", "validated headers collected");
+    checkJson(gSeen.validated.params, { id: 42 }, "validated params collected");
+
+    let bad = app._dispatch(mkReq("GET", "/pets/abc"));
+    checkEq(bad.status, 400, "wrong path type rejected");
+    let details = Json.Parse(bad.body);
+    checkEq(details.error, "Validation failed", "error envelope");
+    checkEq(details.details[0].path, "path.id", "error names the parameter");
+    check(String.Contains(details.details[0].message, "expected integer"), "error explains the type");
+
+    let badq = mkReq("GET", "/pets/1"); badq.query = { verbose: "maybe" };
+    checkEq(Json.Parse(app._dispatch(badq).body).details[0].path, "query.verbose", "bad query value rejected");
+    checkEq(app._dispatch(mkReq("GET", "/echo")).status, 400, "missing required query rejected");
+    let okq = mkReq("GET", "/echo"); okq.query = { q: "hi" };
+    checkEq(app._dispatch(okq).body, "hi", "present required query passes");
+
+    checkEq(app._dispatch(mkReq("POST", "/pets")).status, 400, "missing required body rejected");
+    let nojson = mkReq("POST", "/pets", "{not json"); nojson.headers = { "Content-Type": "application/json" };
+    checkEq(Json.Parse(app._dispatch(nojson).body).details[0].message, "is not valid JSON", "malformed body rejected");
+    let wrong = mkReq("POST", "/pets", Json.Stringify({ name: 5 })); wrong.headers = { "Content-Type": "application/json; charset=utf-8" };
+    checkJson(errPaths(Json.Parse(app._dispatch(wrong).body).details), ["body.name", "body.price"], "body schema errors with paths");
+    let created = mkReq("POST", "/pets", Json.Stringify({ name: "Rex", price: 2.5 })); created.headers = { "content-type": "application/json" };
+    let cr = app._dispatch(created);
+    checkEq(cr.status, 201, "valid body passes");
+    checkEq(Json.Parse(cr.body).name, "Rex", "handler saw the parsed body");
+    let wrongCt = mkReq("POST", "/pets", "name=Rex"); wrongCt.headers = { "Content-Type": "text/plain" };
+    checkEq(Json.Parse(app._dispatch(wrongCt).body).details[0].message, "unsupported content type text/plain", "undeclared content type rejected");
+
+    checkEq(app._dispatch(mkReq("GET", "/free/7")).body, "free:7", "undocumented route passes through");
+    checkEq(app._dispatch(mkReq("GET", "/nothing")).status, 404, "unknown route still 404s");
+
+    // Without coercion the handler keeps the raw strings.
+    let app2 = new Router();
+    let api2 = OpenApi.For(app2, "V2");
+    app2.Use(api2.Validate({ coerce: false, status: 422 }));
+    api2.Get("/n/:id", { params: { id: "int" } }, fn(r) { gSeen = r; return Response.Text("ok", nil); });
+    app2._dispatch(mkReq("GET", "/n/5"));
+    check(Type.IsString(gSeen.params.id), "coerce:false keeps strings");
+    checkEq(gSeen.validated.params.id, 5, "validated still typed");
+    checkEq(app2._dispatch(mkReq("GET", "/n/x")).status, 422, "custom status");
+
+    // Response checking.
+    let app3 = new Router();
+    let api3 = OpenApi.For(app3, "V3");
+    app3.Use(api3.Validate({ responses: true }));
+    api3.Get("/good", { responses: { "200": { id: "int" } } }, fn(_r) { return Response.Json({ id: 1 }); });
+    api3.Get("/wrongbody", { responses: { "200": { id: "int" } } }, fn(_r) { return Response.Json({ id: "x" }); });
+    api3.Get("/undeclared", { responses: { "200": nil } }, fn(_r) { return Response.Text("teapot", 418); });
+    api3.Get("/range", { responses: { "2XX": nil } }, fn(_r) { return Response.Text("ok", 202); });
+    api3.Get("/default", { responses: { "default": "string" } }, fn(_r) { return Response.Json("s", 503); });
+    checkEq(app3._dispatch(mkReq("GET", "/good")).status, 200, "conforming response passes");
+    let wb = app3._dispatch(mkReq("GET", "/wrongbody"));
+    checkEq(wb.status, 500, "non-conforming body becomes 500");
+    checkEq(Json.Parse(wb.body).details[0].path, "body.id", "response error path");
+    checkEq(Json.Parse(app3._dispatch(mkReq("GET", "/undeclared")).body).details[0].message, "undocumented status 418", "undocumented status reported");
+    checkEq(app3._dispatch(mkReq("GET", "/range")).status, 202, "2XX range matches");
+    checkEq(app3._dispatch(mkReq("GET", "/default")).status, 503, "default response matches");
+
+    api3.Unserve();
+    checkEq(app3._dispatch(mkReq("GET", "/undeclared")).status, 418, "Unserve turns Validate into a pass-through");
+    api.Unserve();
+    api2.Unserve();
+}
+
+// ---------------------------------------------------------------------------
+fn test_learn() {
+    Console.WriteLine("== Learn ==");
+    let app = new Router();
+    app.Get("/items", fn(_r) { return Response.Json([{ id: 1, name: "a", price: 2.5 }]); });
+    app.Post("/items", fn(r) { return Response.Json(Json.Parse(r.body), 201); });
+    app.Get("/items/:id", fn(r) {
+        if (r.params.id == "404") { return Response.Json({ code: 404, message: "no" }, 404); }
+        return Response.Json({ id: int(r.params.id), name: "a", tags: ["x"], owner: nil });
+    });
+    app.Get("/plain", fn(_r) { return Response.Text("hi", nil); });
+
+    let api = OpenApi.For(app, "L");
+    api.Schema("Declared", { fixed: "string" });
+    api.Post("/declared", { body: "Declared", responses: { "200": "Declared" } }, fn(r) { return Response.Json(Json.Parse(r.body)); });
+    api.Discover();
+    app.Use(api.Learn({ examples: true }));
+
+    let q1 = mkReq("GET", "/items"); q1.query = { limit: "10", q: "abc" };
+    app._dispatch(q1);
+    let q2 = mkReq("GET", "/items"); q2.query = { limit: "2.5" };
+    app._dispatch(q2);
+    let post = mkReq("POST", "/items", Json.Stringify({ name: "n", price: 3 })); post.headers = { "Content-Type": "application/json" };
+    app._dispatch(post);
+    let post2 = mkReq("POST", "/items", Json.Stringify({ name: "m", price: 3.5, tag: "t" })); post2.headers = { "Content-Type": "application/json" };
+    app._dispatch(post2);
+    app._dispatch(mkReq("GET", "/items/1"));
+    app._dispatch(mkReq("GET", "/items/404"));
+    app._dispatch(mkReq("GET", "/plain"));
+    let decl = mkReq("POST", "/declared", Json.Stringify({ fixed: "v", extra: 1 })); decl.headers = { "Content-Type": "application/json" };
+    app._dispatch(decl);
+
+    let spec = api.Spec();
+    let list = spec.paths["/items"].get;
+    checkEq(list["x-learned"].samples, 2, "sample count");
+    let byName = {};
+    foreach (p in list.parameters) { byName[p.name] = p; }
+    checkEq(byName.limit.schema.type, "number", "int then float widens to number");
+    checkEq(byName.limit.required, true, "param seen in every sample is required");
+    checkEq(byName.q.schema.type, "string", "string query param learned");
+    check(!Object.HasKey(byName.q, "required"), "param missing from a later sample is optional");
+    checkEq(byName.limit["x-learned"], true, "learned parameters are marked");
+    let listSchema = list.responses["200"].content["application/json"].schema;
+    checkEq(listSchema.type, "array", "response array learned");
+    checkJson(Array.Sort(Object.Keys(listSchema.items.properties), fn(a, b) => a < b), ["id", "name", "price"], "item properties learned");
+    checkEq(listSchema.items.properties.price.type, "number", "float response field");
+    checkEq(listSchema["x-learned"], true, "learned response schema marked");
+    checkJson(list.responses["200"].content["application/json"].example, [{ id: 1, name: "a", price: 2.5 }], "example kept when asked");
+
+    let create = spec.paths["/items"].post;
+    let body = create.requestBody.content["application/json"].schema;
+    checkJson(Array.Sort(Object.Keys(body.properties), fn(a, b) => a < b), ["name", "price", "tag"], "body properties merged across samples");
+    checkJson(body.required, ["name", "price"], "required is the intersection");
+    checkEq(body.properties.price.type, "number", "int then float body field widens");
+    checkEq(create.requestBody["x-learned"], true, "learned body marked");
+    check(Object.HasKey(create.responses, "201"), "201 response learned");
+    checkEq(create.responses["201"].description, "Created", "reason phrase for learned status");
+
+    let one = spec.paths["/items/{id}"].get;
+    check(Object.HasKey(one.responses, "200") && Object.HasKey(one.responses, "404"), "both statuses learned");
+    checkEq(one.responses["404"].content["application/json"].schema.properties.code.type, "integer", "error body learned");
+    checkEq(one.responses["200"].content["application/json"].schema.properties.owner.nullable, true, "null field is nullable");
+    checkEq(one.responses["200"].content["application/json"].schema.properties.tags.items.type, "string", "array items learned");
+
+    check(!Object.HasKey(spec.paths["/plain"].get.responses["200"], "content"), "non-JSON response adds no content");
+
+    let declared = spec.paths["/declared"].post;
+    checkJson(declared.requestBody.content["application/json"].schema, { "$ref": "#/components/schemas/Declared" }, "declared body untouched");
+    checkJson(spec.components.schemas.Declared.properties, { fixed: { type: "string" } }, "declared schema untouched");
+    check(!Object.HasKey(declared.responses["200"], "x-learned"), "declared response untouched");
+
+    // maxSamples caps the work per operation.
+    let app2 = new Router();
+    app2.Get("/x", fn(_r) { return Response.Json({ n: 1 }); });
+    let api2 = OpenApi.For(app2, "L2").Discover();
+    app2.Use(api2.Learn({ maxSamples: 2 }));
+    iter (i from 1 to 6) { app2._dispatch(mkReq("GET", "/x")); }
+    checkEq(api2.Spec().paths["/x"].get["x-learned"].samples, 2, "maxSamples respected");
+
+    // The served document reflects learning immediately.
+    api2.Serve();
+    check(Object.HasKey(Json.Parse(app2._dispatch(mkReq("GET", "/openapi.json")).body).paths["/x"].get.responses["200"], "content"), "served document includes learned schema");
+    api2.Unserve();
+    api.Unserve();
+}
+
+// ---------------------------------------------------------------------------
+fn test_contract() {
+    Console.WriteLine("== Contract ==");
+    let app = new Router();
+    let api = OpenApi.For(app, "C");
+    api.Schema("Pet", { id: "int", name: "string" });
+    api.Schema("Error", { code: "int", message: "string" });
+    api.SecurityScheme("apiKey", OpenApi.ApiKey("X-Api-Key"));
+    api.Get("/pets", { query: { limit: "int" }, responses: { "200": "[Pet]" } }, fn(r) {
+        return Type.IsString(r.query.limit) ? Response.Json([{ id: 1, name: "a" }]) : Response.Json({ code: 400, message: "limit" }, 400);
+    });
+    api.Get("/pets/:id", { params: { id: { type: "int", example: 7 } }, responses: { "200": "Pet", "404": "Error" } }, fn(r) {
+        return (r.params.id == "7") ? Response.Json({ id: 7, name: "seven" }) : Response.Json({ code: 404, message: "no" }, 404);
+    });
+    api.Post("/pets", { body: "Pet", headers: { "X-Api-Key": "string?" }, responses: { "201": "Pet", "401": "Error" } }, fn(r) {
+        if (r.headers["X-Api-Key"] == nil) { return Response.Json({ code: 401, message: "key" }, 401); }
+        return Response.Json(Json.Parse(r.body), 201);
+    });
+    api.Delete("/pets/:id", { responses: { "204": nil } }, fn(_r) { return Response.NoContent(); });
+    api.Get("/broken", { responses: { "200": "Pet" } }, fn(_r) { return Response.Json({ id: "not-an-int", name: 1 }); });
+    api.Get("/teapot", { responses: { "200": nil } }, fn(_r) { return Response.Text("short and stout", 418); });
+    api.Get("/throws", { responses: { "200": nil } }, fn(_r) { throw(Exception.InvalidArguments, "boom"); });
+
+    let res = api.Contract({ headers: { "X-Api-Key": "k" } });
+    checkEq(res.passed + res.failed, 7, "every operation exercised");
+    check(!res.ok, "failures detected");
+    let byId = {};
+    foreach (r in res.results) { byId[r.operationId] = r; }
+    check(byId.getPets.ok, "list passes (required query filled from schema)");
+    checkEq(byId.getPets.request, "/pets", "request path for list");
+    check(byId.getPetsById.ok, "example path value used");
+    checkEq(byId.getPetsById.request, "/pets/7", "example substituted into the path");
+    check(byId.postPets.ok, "body generated from the schema, header from opts");
+    checkEq(byId.postPets.status, 201, "created status recorded");
+    check(byId.deletePetsById.ok, "204 without content passes");
+    check(!byId.getBroken.ok, "schema mismatch fails");
+    checkJson(errPaths(byId.getBroken.errors), ["body.id", "body.name"], "mismatch paths");
+    check(!byId.getTeapot.ok && byId.getTeapot.errors[0].message == "undocumented status 418", "undocumented status fails");
+    check(!byId.getThrows.ok && String.Contains(byId.getThrows.errors[0].message, "boom"), "raising handler fails with its message");
+
+    let noKey = api.Contract({ only: ["postPets"] });
+    checkEq(noKey.results[0].status, 401, "an optional header is not invented, so the handler refuses");
+    check(noKey.ok, "a declared 401 still passes the contract");
+    let subset = api.Contract({ skip: ["getBroken", "getTeapot", "getThrows"], headers: { "X-Api-Key": "k" }, values: { id: 5 } });
+    check(subset.ok, "skip list removes the failing operations");
+    checkEq(subset.passed, 4, "four remaining operations");
+    foreach (r in subset.results) { if (r.operationId == "getPetsById") { checkEq(r.status, 404, "values override the example"); } }
+
+    var threw = false;
+    try { (new OpenApi("X")).Contract(); } catch (e) { threw = true; }
+    check(threw, "Contract without a Router raises");
+}
+
+// ---------------------------------------------------------------------------
+fn Main() {
+    Console.WriteLine("=== OpenApi tests ===");
+    test_facade_registers_routes();
+    test_shorthand();
+    test_schema_of();
+    test_parameters_body_responses();
+    test_metadata_and_security();
+    test_groups();
+    test_discover();
+    test_json_writer();
+    test_serve();
+    test_load();
+    test_html();
+    test_validator();
+    test_validate_middleware();
+    test_learn();
+    test_contract();
+
+    Console.WriteLine("=============================");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    if (testsFailed > 0) {
+        Console.Error("Some OpenApi tests FAILED.");
+        return testsFailed;
+    }
+    Console.Ok("All OpenApi tests passed!");
+
+    // -----------------------------------------------------------------------
+    // Benchmarks
+    // -----------------------------------------------------------------------
+    Console.WriteLine("\n=== OpenApi benchmarks ===");
+    let N = 200;
+
+    // 1. Build a 60-operation document from scratch, N times.
+    let t0 = Time.Ticks();
+    iter (n from 1 to N + 1) {
+        let api = new OpenApi({ title: "Bench", version: "1" });
+        api.Schema("Pet", { id: "int", name: "string", "tag?": "string" });
+        iter (i from 0 to 20) {
+            let base = "/r" + str(i);
+            api.Get(base,          { summary: "List", query: { limit: "int?" }, responses: { "200": "[Pet]" } });
+            api.Post(base,         { body: "Pet", responses: { "201": "Pet", "400": "Bad input" } });
+            api.Get(base + "/:id", { responses: { "200": "Pet", "404": "Missing" } });
+        }
+        _sink += api._paths.Count();
+    }
+    let dt = Time.Ticks() - t0;
+    Console.WriteLine(String.PadRight("Build 60-op document x" + str(N), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(N)]), 8), " us/op");
+
+    // 2. Serialize that document, compact and pretty.
+    let api = new OpenApi({ title: "Bench", version: "1" });
+    api.Schema("Pet", { id: "int", name: "string", "tag?": "string" });
+    iter (i from 0 to 20) {
+        let base = "/r" + str(i);
+        api.Get(base,          { summary: "List", query: { limit: "int?" }, responses: { "200": "[Pet]" } });
+        api.Post(base,         { body: "Pet", responses: { "201": "Pet", "400": "Bad input" } });
+        api.Get(base + "/:id", { responses: { "200": "Pet", "404": "Missing" } });
+    }
+    let t1 = Time.Ticks();
+    iter (n from 1 to N + 1) { _sink += String.Length(api.ToJson(false)); }
+    dt = Time.Ticks() - t1;
+    Console.WriteLine(String.PadRight("ToJson compact (60 ops) x" + str(N), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(N)]), 8), " us/op");
+
+    let t2 = Time.Ticks();
+    iter (n from 1 to N + 1) { _sink += String.Length(api.ToJson(true)); }
+    dt = Time.Ticks() - t2;
+    Console.WriteLine(String.PadRight("ToJson pretty (60 ops) x" + str(N), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(N)]), 8), " us/op");
+
+    // 3. Shorthand expansion on its own.
+    let M = 20000;
+    let t3 = Time.Ticks();
+    iter (n from 1 to M + 1) {
+        _sink += Object.Count(OpenApi._expand({ id: "int", name: "string", "tags?": "[string]", owner: "Owner?" }));
+    }
+    dt = Time.Ticks() - t3;
+    Console.WriteLine(String.PadRight("Expand 4-field shorthand x" + str(M), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(M)]), 8), " us/op");
+
+    // 4. Validate a 6-field object against a schema with a $ref.
+    let vschemas = { Tag: { type: "string", minLength: 1, maxLength: 20 } };
+    let vschema  = { type: "object", required: ["id", "name", "price", "tags"],
+                     properties: { id: { type: "integer", minimum: 1 }, name: { type: "string", maxLength: 40 },
+                                   price: { type: "number", minimum: 0 }, active: { type: "boolean" },
+                                   tags: { type: "array", items: { "$ref": "#/components/schemas/Tag" }, maxItems: 10 },
+                                   note: { type: "string", nullable: true } } };
+    let vvalue = { id: 7, name: "Rex", price: 12.5, active: true, tags: ["a", "b", "c"], note: nil };
+    let t4 = Time.Ticks();
+    iter (n from 1 to M + 1) { _sink += len(OpenApi.ValidateValue(vvalue, vschema, vschemas)); }
+    dt = Time.Ticks() - t4;
+    Console.WriteLine(String.PadRight("Validate 6-field object x" + str(M), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(M)]), 8), " us/op");
+
+    // 5. Validate middleware overhead on a dispatched request with two params.
+    let vapp = new Router();
+    let vapi = OpenApi.For(vapp, "B");
+    vapp.Use(vapi.Validate());
+    vapi.Get("/b/:id", { params: { id: "int" }, query: { q: "string?" } }, fn(_r) { return Response.Text("b", nil); });
+    let vreq = mkReq("GET", "/b/12"); vreq.query = { q: "x" };
+    let t5 = Time.Ticks();
+    iter (n from 1 to M + 1) { _sink += vapp._dispatch(vreq).status; }
+    dt = Time.Ticks() - t5;
+    Console.WriteLine(String.PadRight("Validate middleware dispatch x" + str(M), 45),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 8), " ms",
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToUs(dt) / float(M)]), 8), " us/op");
+    vapi.Unserve();
+    return 0;
+}

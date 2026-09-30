@@ -2,11 +2,16 @@
 // Version: 1.0
 //
 // Keys are kept in ascending sorted order at all times.
-// Backed by a sorted array of keys + a HashMap for O(log n) lookup and
-// O(log n) insert/delete (binary search). Range queries are O(log n + k).
+// Backed by a sorted array of keys plus a HashMap of values. Get / Has are one
+// hash lookup; ordered queries (Rank, Floor, Range, ...) binary-search the key
+// array with Array.BinarySearch, so they are O(log n) (+ k for the entries a
+// range returns). Inserting or deleting a new key is a native O(log n) search
+// plus a memmove of the keys after it; updating an existing key is O(1).
 //
-// One key type per instance: int/bool/char, float, or string.
-// Keys of different types cannot be mixed in the same map.
+// One key type per instance: int/bool/char, float, or string. Keys of
+// different types cannot be mixed in the same map. Within the int/bool/char
+// group the order is the language's default order (bools, then ints, then
+// chars), so true, 1 and '1' are three distinct keys, as in a HashMap.
 //
 // Usage:
 //   import { TreeMap } from library("Treemap", "1.0");
@@ -17,7 +22,7 @@
 //   Console.WriteLine(m.MaxKey());      // "cherry"
 //
 //   foreach (e in m.Entries()) {        // sorted: apple, banana, cherry
-//       Console.WriteLine(e.key, e.value);
+//       Console.WriteLine(e.Key, e.Value);
 //   }
 //
 //   // Range: keys from "b" (inclusive) to "c" (exclusive)
@@ -36,19 +41,25 @@
 //
 // Min/max:
 //   MinKey()  MaxKey()   - also aliased as FirstKey() / LastKey()
-//   MinEntry()  MaxEntry()  - { key, value }
+//   MinEntry()  MaxEntry()  - { Key, Value }
 //   DeleteMin()  DeleteMax()  →  bool
+//   PopMin()  PopMax()   →  { Key, Value } removed, or nil when empty
 //
-// Ordered access:
-//   Keys()        →  array in ascending order
+// Ordered access (every entry is an object { Key, Value }):
+//   Keys()        →  array in ascending order (a copy)
 //   Values()      →  array in key order
-//   Entries()     →  array of { key, value } in key order
+//   Entries()     →  array of { Key, Value } in key order
 //   ReverseEntries()
-//   Range(minKey, maxKey, includeMin, includeMax)  →  array of { key, value }
-//   HeadEntries(toKey, inclusive)    - entries with key < (or <=) toKey
-//   TailEntries(fromKey, inclusive)  - entries with key >= (or >) fromKey
-//   Rank(key)     →  int  - number of keys strictly less than key
+//   Range(minKey, maxKey, includeMin?, includeMax?)  →  array of { Key, Value }
+//                 (includeMin default true, includeMax default false: [minKey, maxKey))
+//   HeadEntries(toKey, inclusive?)   - entries with key <= (or <) toKey; default inclusive
+//   TailEntries(fromKey, inclusive?) - entries with key >= (or >) fromKey; default inclusive
+//   CountRange(lo, hi)  →  int  - number of keys in [lo, hi]
+//   Rank(key)     →  int  - number of keys strictly less than key (present or not)
 //   Select(rank)  →  key at given rank
+//   FloorKey(k) CeilKey(k)   - greatest key <= k / least key >= k, or nil
+//   PrevKey(k)  NextKey(k)   - greatest key < k / least key > k, or nil
+//                              (aliases LowerKey / HigherKey)
 //
 // Iteration:
 //   ForEach(fn(key, value))          - ascending order; returns this
@@ -56,77 +67,54 @@
 //   EachValue(fn(value))             - returns this
 
 class TreeMap {
-    let _keyType = nil; 
-    let _keys: array = nil; 
-    let _map = nil; 
+    let _keyType: int = 0;      // key group of the keys held: 0 none yet, see _groupOf
+    let _keys: array = nil;     // ascending, in the default order Array.BinarySearch uses
+    let _map = nil;             // key -> value
     fn Constructor() {
         this._keys    = [];
         this._map     = Collections.HashMap();
-        this._keyType = nil;
+        this._keyType = 0;
     }
 
-    // ---------- Static helpers ----------
+    // ---------- Key groups ----------
 
-    fn static _cmp(a, b): int {
-        if (a < b) return -1;
-        if (a > b) return 1;
-        return 0;
-    }
-
-    fn static _keyTypeOf(key): string {
+    // 1 int/bool/char, 2 float, 3 string, -1 anything else.
+    fn static _groupOf(key): int {
         let t = type(key);
-        if (t == Type.Int || t == Type.Bool || t == Type.Char) return "int";
-        if (t == Type.Float) return "float";
-        if (t == Type.String) return "string";
-        return "invalid";
+        if (t == Type.Int || t == Type.Bool || t == Type.Char) return 1;
+        if (t == Type.Float) return 2;
+        if (t == Type.String) return 3;
+        return -1;
     }
 
-    // ---------- Internal helpers ----------
-
-    fn _checkKeyType(key) {
-        let kt = TreeMap._keyTypeOf(key);
-        if (kt == "invalid") {
+    // Raise unless `key` may live in this map. Only an insert passes `adopt`,
+    // so a query on an empty map never sets the key group.
+    fn _checkKeyType(key, adopt:bool) {
+        let g:int = TreeMap._groupOf(key);
+        if (g < 0) {
             throw(400, "TreeMap: invalid key type");
         }
-        if (this._keyType == nil) {
-            this._keyType = kt;
+        if (this._keyType == 0) {
+            if (adopt) { this._keyType = g; }
             return;
         }
-        if (this._keyType != kt) {
+        if (this._keyType != g) {
             throw(400, "TreeMap: mixed key types not allowed");
         }
     }
 
-    fn _binarySearchIndex(key): int {
-        let lo = 0;
-        let hi = len(this._keys) - 1;
-
-        while (lo <= hi) {
-            let mid = (lo + hi) / 2;
-            let c = TreeMap._cmp(key, this._keys[mid]);
-            if (c == 0) {
-                return mid;
-            } else if (c < 0) {
-                hi = mid - 1;
-            } else {
-                lo = mid + 1;
-            }
-        }
-
-        return 0 - lo - 1;   // insertion point encoding
+    // Index of the first key >= key (inclusive) or > key (exclusive).
+    fn _lowerIndex(key, inclusive:bool): int {
+        let idx:int = Array.BinarySearch(this._keys, key);
+        if (idx < 0) return 0 - idx - 1;
+        return inclusive ? idx : idx + 1;
     }
 
-    fn _insertKeyAt(index:int, key) {
-        let keys = this._keys;
-        let n = len(keys);
-        Array.Append(keys, key);
-
-        let i = n;
-        while (i > index) {
-            keys[i] = keys[i - 1];
-            i = i - 1;
-        }
-        keys[index] = key;
+    // Index just past the last key <= key (inclusive) or < key (exclusive).
+    fn _upperIndex(key, inclusive:bool): int {
+        let idx:int = Array.BinarySearch(this._keys, key);
+        if (idx < 0) return 0 - idx - 1;
+        return inclusive ? idx + 1 : idx;
     }
 
     fn _entryAt(index:int) {
@@ -135,111 +123,39 @@ class TreeMap {
         return { Key: k, Value: this._map.Get(k) };
     }
 
-    fn _firstIndexAtOrAfter(key): int {
-        let idx = this._binarySearchIndex(key);
-        if (idx >= 0) return idx;
-        return 0 - idx - 1;
+    // Entries for key indexes [from, to).
+    fn _entries(from:int, to:int): array {
+        let result = [];
+        let keys = this._keys;
+        let map  = this._map;
+        var i:int = from;
+        while (i < to) {
+            let k = keys[i];
+            Array.Append(result, { Key: k, Value: map.Get(k) });
+            i += 1;
+        }
+        return result;
     }
 
     // ---------- Core API ----------
 
     fn Set(key, value): instance {
-        this._checkKeyType(key);
-
-        let n = len(this._keys);
-
-        // Fast path: empty map
-        if (n == 0) {
-            Array.Append(this._keys, key);
-            this._map.Set(key, value);
-            return this;
-        }
-
-        // Fast path: append to end
-        let last = this._keys[n - 1];
-        let cmpLast = TreeMap._cmp(key, last);
-        if (cmpLast > 0) {
-            Array.Append(this._keys, key);
-            this._map.Set(key, value);
-            return this;
-        }
-        if (cmpLast == 0) {
-            this._map.Set(key, value);
-            return this;
-        }
-
-        // Fast path: insert at front
-        let first = this._keys[0];
-        let cmpFirst = TreeMap._cmp(key, first);
-        if (cmpFirst < 0) {
-            this._insertKeyAt(0, key);
-            this._map.Set(key, value);
-            return this;
-        }
-        if (cmpFirst == 0) {
-            this._map.Set(key, value);
-            return this;
-        }
-
-        // General path
-        let idx = this._binarySearchIndex(key);
-        if (idx >= 0) {
-            this._map.Set(key, value);
-        } else {
-            this._insertKeyAt(0 - idx - 1, key);
-            this._map.Set(key, value);
-        }
+        this._checkKeyType(key, true);
+        if (!this._map.Has(key)) { Array.SortedInsert(this._keys, key); }
+        this._map.Set(key, value);
         return this;
     }
 
     fn PutIfAbsent(key, value): bool {
-        this._checkKeyType(key);
-
-        let n = len(this._keys);
-
-        // Fast path: empty map
-        if (n == 0) {
-            Array.Append(this._keys, key);
-            this._map.Set(key, value);
-            return true;
-        }
-
-        // Fast path: append to end
-        let last = this._keys[n - 1];
-        let cmpLast = TreeMap._cmp(key, last);
-        if (cmpLast > 0) {
-            Array.Append(this._keys, key);
-            this._map.Set(key, value);
-            return true;
-        }
-        if (cmpLast == 0) {
-            return false;
-        }
-
-        // Fast path: insert at front
-        let first = this._keys[0];
-        let cmpFirst = TreeMap._cmp(key, first);
-        if (cmpFirst < 0) {
-            this._insertKeyAt(0, key);
-            this._map.Set(key, value);
-            return true;
-        }
-        if (cmpFirst == 0) {
-            return false;
-        }
-
-        // General path
-        let idx = this._binarySearchIndex(key);
-        if (idx >= 0) return false;
-
-        this._insertKeyAt(0 - idx - 1, key);
+        this._checkKeyType(key, true);
+        if (this._map.Has(key)) return false;
+        Array.SortedInsert(this._keys, key);
         this._map.Set(key, value);
         return true;
     }
 
     fn Replace(key, value): bool {
-        let idx = this._binarySearchIndex(key);
-        if (idx < 0) return false;
+        if (!this._map.Has(key)) return false;
         this._map.Set(key, value);
         return true;
     }
@@ -251,16 +167,15 @@ class TreeMap {
         return v;
     }
 
-    fn Has(key): bool { return this._binarySearchIndex(key) >= 0; }
+    fn Has(key): bool { return this._map.Has(key); }
 
     fn Delete(key): bool {
-        let idx = this._binarySearchIndex(key);
-        if (idx < 0) return false;
-        Array.RemoveAt(this._keys, idx);
+        if (!this._map.Has(key)) return false;
+        Array.RemoveAt(this._keys, Array.BinarySearch(this._keys, key));
         this._map.Delete(key);
 
         if (len(this._keys) == 0) {
-            this._keyType = nil;
+            this._keyType = 0;
         }
         return true;
     }
@@ -280,16 +195,18 @@ class TreeMap {
     fn Clear() {
         this._keys    = [];
         this._map     = Collections.HashMap();
-        this._keyType = nil;
+        this._keyType = 0;
     }
 
+    // Values are shared with the original, not copied.
     fn Clone(): instance {
         let m = new TreeMap();
         m._keyType = this._keyType;
-
+        m._keys    = Array.Clone(this._keys);
+        let src = this._map;
+        let dst = m._map;
         foreach (k in this._keys) {
-            m._keys = Array.Concat(m._keys, [k]);
-            m._map.Set(k, this._map.Get(k));
+            dst.Set(k, src.Get(k));
         }
         return m;
     }
@@ -324,111 +241,57 @@ class TreeMap {
     fn FirstEntry() { return this.MinEntry(); }
     fn LastEntry()  { return this.MaxEntry(); }
 
-    fn Keys(): array {
-        let out = [];
-        foreach (k in this._keys) {
-            Array.Append(out, k);
-        }
-        return out;
-    }
+    fn Keys(): array { return Array.Clone(this._keys); }
 
     fn KeySet(): array { return this.Keys(); }
 
     fn Values(): array {
         let result = [];
+        let map = this._map;
         foreach (k in this._keys) {
-            Array.Append(result, this._map.Get(k));
+            Array.Append(result, map.Get(k));
         }
         return result;
     }
 
-    fn Entries(): array {
-        let result = [];
-        foreach (k in this._keys) {
-            Array.Append(result, { Key: k, Value: this._map.Get(k) });
-        }
-        return result;
-    }
+    fn Entries(): array { return this._entries(0, len(this._keys)); }
 
     fn ReverseEntries(): array {
-        let result = [];
-        let i = len(this._keys) - 1;
-        while (i >= 0) {
-            let k = this._keys[i];
-            Array.Append(result, { Key: k, Value: this._map.Get(k) });
-            i = i - 1;
-        }
+        let result = this.Entries();
+        Array.Reverse(result);
         return result;
     }
 
-    fn Range(minKey, maxKey, includeMin:bool, includeMax:bool): array {
+    fn Range(minKey, maxKey, includeMin?:bool, includeMax?:bool): array {
         if (includeMin == nil) includeMin = true;
         if (includeMax == nil) includeMax = false;
 
-        this._checkKeyType(minKey);
-        this._checkKeyType(maxKey);
-
-        if (TreeMap._cmp(minKey, maxKey) > 0) return [];
-
-        let result = [];
-        let keys   = this._keys;
-        let n      = len(keys);
-
-        let idx = this._binarySearchIndex(minKey);
-        let i = 0;
-        if (idx >= 0) {
-            i = includeMin ? idx : idx + 1;
-        } else {
-            i = 0 - idx - 1;
+        this._checkKeyType(minKey, false);
+        this._checkKeyType(maxKey, false);
+        if (TreeMap._groupOf(minKey) != TreeMap._groupOf(maxKey)) {
+            throw(400, "TreeMap: mixed key types not allowed");
         }
 
-        while (i < n) {
-            let k = keys[i];
-            let cmpMax = TreeMap._cmp(k, maxKey);
-            if (cmpMax > 0 || (!includeMax && cmpMax == 0)) break;
-            Array.Append(result, { Key: k, Value: this._map.Get(k) });
-            i = i + 1;
-        }
-
-        return result;
+        let from:int = this._lowerIndex(minKey, includeMin);
+        let to:int   = this._upperIndex(maxKey, includeMax);
+        if (from >= to) return [];
+        return this._entries(from, to);
     }
 
-    fn HeadEntries(toKey, inclusive:bool): array {
+    fn HeadEntries(toKey, inclusive?:bool): array {
         if (inclusive == nil) inclusive = true;
         if (len(this._keys) == 0) return [];
 
-        this._checkKeyType(toKey);
-
-        let result = [];
-        foreach (k in this._keys) {
-            let c = TreeMap._cmp(k, toKey);
-            if (c > 0 || (!inclusive && c == 0)) break;
-            Array.Append(result, { Key: k, Value: this._map.Get(k) });
-        }
-        return result;
+        this._checkKeyType(toKey, false);
+        return this._entries(0, this._upperIndex(toKey, inclusive));
     }
 
-    fn TailEntries(fromKey, inclusive:bool): array {
+    fn TailEntries(fromKey, inclusive?:bool): array {
         if (inclusive == nil) inclusive = true;
         if (len(this._keys) == 0) return [];
 
-        this._checkKeyType(fromKey);
-
-        let result = [];
-        let i = this._firstIndexAtOrAfter(fromKey);
-        let n = len(this._keys);
-
-        if (!inclusive && i < n && TreeMap._cmp(this._keys[i], fromKey) == 0) {
-            i = i + 1;
-        }
-
-        while (i < n) {
-            let k = this._keys[i];
-            Array.Append(result, { Key: k, Value: this._map.Get(k) });
-            i = i + 1;
-        }
-
-        return result;
+        this._checkKeyType(fromKey, false);
+        return this._entries(this._lowerIndex(fromKey, inclusive), len(this._keys));
     }
 
     fn ForEach(fnIter:fn): instance {
@@ -454,11 +317,7 @@ class TreeMap {
 
     // ---------- Rank / select ----------
 
-    fn Rank(key): int {
-        let idx = this._binarySearchIndex(key);
-        if (idx < 0) return -1;
-        return idx;
-    }
+    fn Rank(key): int { return this._lowerIndex(key, true); }
 
     fn Select(rank:int) {
         if (rank < 0 || rank >= len(this._keys)) return nil;
@@ -473,71 +332,34 @@ class TreeMap {
 
     fn FloorKey(key) {
         if (len(this._keys) == 0) return nil;
-        this._checkKeyType(key);
-
-        let keys = this._keys;
-        let lo = 0;
-        let hi = len(keys) - 1;
-        let best = -1;
-
-        while (lo <= hi) {
-            let mid = (lo + hi) / 2;
-            let c = TreeMap._cmp(keys[mid], key);
-            if (c <= 0) {
-                best = mid;
-                lo = mid + 1;
-            } else {
-                hi = mid - 1;
-            }
-        }
-
-        if (best < 0) return nil;
-        return keys[best];
+        this._checkKeyType(key, false);
+        let i:int = this._upperIndex(key, true);
+        if (i == 0) return nil;
+        return this._keys[i - 1];
     }
 
     fn CeilKey(key) {
         if (len(this._keys) == 0) return nil;
-        this._checkKeyType(key);
-
-        let keys = this._keys;
-        let lo = 0;
-        let hi = len(keys) - 1;
-        let best = -1;
-
-        while (lo <= hi) {
-            let mid = (lo + hi) / 2;
-            let c = TreeMap._cmp(keys[mid], key);
-            if (c >= 0) {
-                best = mid;
-                hi = mid - 1;
-            } else {
-                lo = mid + 1;
-            }
-        }
-
-        if (best < 0) return nil;
-        return keys[best];
+        this._checkKeyType(key, false);
+        let i:int = this._lowerIndex(key, true);
+        if (i >= len(this._keys)) return nil;
+        return this._keys[i];
     }
 
     fn PrevKey(key) {
-        let floor = this.FloorKey(key);
-        if (floor == nil) return nil;
-        if (TreeMap._cmp(floor, key) < 0) return floor;
-
-        let idx = this._binarySearchIndex(key);
-        if (idx <= 0) return nil;
-        return this._keys[idx - 1];
+        if (len(this._keys) == 0) return nil;
+        this._checkKeyType(key, false);
+        let i:int = this._lowerIndex(key, true);
+        if (i == 0) return nil;
+        return this._keys[i - 1];
     }
 
     fn NextKey(key) {
-        let ceil = this.CeilKey(key);
-        if (ceil == nil) return nil;
-        if (TreeMap._cmp(ceil, key) > 0) return ceil;
-
-        let idx = this._binarySearchIndex(key);
-        let n = len(this._keys);
-        if (idx < 0 || idx + 1 >= n) return nil;
-        return this._keys[idx + 1];
+        if (len(this._keys) == 0) return nil;
+        this._checkKeyType(key, false);
+        let i:int = this._upperIndex(key, true);
+        if (i >= len(this._keys)) return nil;
+        return this._keys[i];
     }
 
     fn LowerKey(key)  { return this.PrevKey(key); }
@@ -586,7 +408,7 @@ class TreeMap {
         if (this.Size() != other.Size()) return false;
 
         let n = len(this._keys);
-        iter (i from 0 to n - 1) {
+        iter (i from 0 to n) {
             let k = this._keys[i];
             if (other.Has(k) == false) return false;
             if (other.Get(k) != this._map.Get(k)) return false;
@@ -597,7 +419,7 @@ class TreeMap {
     fn ToString(): string {
         let s = "{";
         let n = len(this._keys);
-        iter (i from 0 to n - 1) {
+        iter (i from 0 to n) {
             let k = this._keys[i];
             if (i > 0) s = s + ", ";
             s = s + str(k) + ": " + str(this._map.Get(k));
@@ -608,7 +430,7 @@ class TreeMap {
 
     fn Merge(other:instance): instance {
         let entries = other.Entries();
-        iter (i from 0 to len(entries) - 1) {
+        iter (i from 0 to len(entries)) {
             let e = entries[i];
             this.Set(e.Key, e.Value);
         }
@@ -616,17 +438,13 @@ class TreeMap {
     }
 
     fn CountRange(lo, hi): int {
-        var count = 0;
-        iter (i from 0 to len(this._keys) - 1) {
-            let k = this._keys[i];
-            if (TreeMap._cmp(k, lo) >= 0 && TreeMap._cmp(k, hi) <= 0) count += 1;
-        }
-        return count;
+        let n:int = this._upperIndex(hi, true) - this._lowerIndex(lo, true);
+        return (n > 0) ? n : 0;
     }
 
     fn static FromEntries(entries:array): instance {
         let tm = new TreeMap();
-        iter (i from 0 to len(entries) - 1) {
+        iter (i from 0 to len(entries)) {
             tm.Set(entries[i][0], entries[i][1]);
         }
         return tm;

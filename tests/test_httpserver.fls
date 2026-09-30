@@ -25,7 +25,7 @@ global gAccess     = [];   // entries captured by the access-log hook
 fn bench(name: string, f: fn, n: int) {
     f(); f(); f();
     let t0: int = Time.Ticks();
-    iter (i from 0 to n - 1) { f(); }
+    iter (i from 0 to n) { f(); }
     let dt: int = Time.Ticks() - t0;
     let ms: float = Time.TicksToMs(dt);
     let us: float = Time.TicksToUs(dt) / float(n);
@@ -55,6 +55,16 @@ fn checkEq(actual, expected, msg) {
     }
     return 0;
 }
+
+// Async handlers: the server awaits their fiber, so `await` inside one parks
+// only that request. The sleeps stand in for an upstream call.
+fn async asyncValue(v)       { Fiber.Sleep(1); return v; }
+fn async asyncSlow(ms: int)  { Fiber.Sleep(ms); return ms; }
+fn async asyncEcho(_req, res)  { let v = await asyncValue("async-ok"); res.Text(v); }
+fn async asyncSlowH(_req, res) { let v = await asyncSlow(250); res.Text("slow-" + str(v)); }
+fn async asyncThrow(_req, _res) { await asyncValue("x"); throw(1, "async failure"); }
+fn async asyncOnError(_req, res, _err) { let v = await asyncValue("handled"); res.Text(v, 503); }
+fn async asyncAccessThrow(_e) { await asyncValue(1); throw(2, "async logger failed"); }
 
 // ---------------------------------------------------------------------------
 // Raw HTTP client
@@ -344,6 +354,80 @@ fn test_chunked() {
 }
 
 // ---------------------------------------------------------------------------
+// Async handlers
+// ---------------------------------------------------------------------------
+fn test_async_handlers() {
+    Console.WriteLine("== async handlers ==");
+
+    let r = req1(gPort, "GET", "/async");
+    checkEq((r == nil) ? 0 : r.code, 200, "async handler answers");
+    checkEq((r == nil) ? "" : r.body, "async-ok", "async handler body is what it awaited");
+
+    // Slow async requests overlap instead of queueing behind each other.
+    global gAsyncBodies = [];
+    let n  = 8;
+    let t0 = Time.Millis();
+    iter (i from 0 to n) {
+        Fiber.Run(fn() {
+            let x = req1(gPort, "GET", "/async-slow");
+            Array.Append(gAsyncBodies, (x == nil) ? "" : x.body);
+            return 0;
+        });
+    }
+    let spins = 0;
+    while (len(gAsyncBodies) < n && spins < 1000) { Fiber.Sleep(5); spins += 1; }
+    let dt = Time.Millis() - t0;
+    checkEq(len(gAsyncBodies), n, "every concurrent async request completed");
+    checkEq(gAsyncBodies[0], "slow-250", "concurrent async request body");
+    check(dt < 1000, "async handlers overlapped: " + str(n) + " x 250 ms took " + str(dt) + " ms");
+
+    // An exception escaping an async handler is a 500, and the server carries on.
+    let e = req1(gPort, "GET", "/async-throw");
+    checkEq((e == nil) ? 0 : e.code, 500, "async handler exception becomes a 500");
+    checkEq(req1(gPort, "GET", "/").code, 200, "server still serving after an async failure");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Requests arriving in pieces
+// ---------------------------------------------------------------------------
+fn test_split_requests() {
+    Console.WriteLine("== split requests ==");
+
+    // Header block split mid-line across two segments with a pause between.
+    let c = openConn(gPort);
+    Stream.WriteString(c, "GET /users/5?x=1 HTTP/1.1\r\nHost: t\r\nX-Lo");
+    Fiber.Sleep(150);
+    Stream.WriteString(c, "ng: yes\r\nConnection: close\r\n\r\n");
+    let r = readResponse(c, false);
+    Stream.Close(c);
+    checkEq((r == nil) ? 0 : r.code, 200, "a header block split mid-line is reassembled");
+    check(r != nil && String.Contains(r.body, "\"id\":\"5\""), "split request routed with its parameters");
+
+    // Chunked upload whose chunks arrive one at a time.
+    let c2 = openConn(gPort);
+    Stream.WriteString(c2, "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n");
+    Fiber.Sleep(120);
+    Stream.WriteString(c2, "6\r\n world\r\n");
+    Fiber.Sleep(120);
+    Stream.WriteString(c2, "0\r\n\r\n");
+    let r2 = readResponse(c2, false);
+    Stream.Close(c2);
+    checkEq((r2 == nil) ? 0 : r2.code, 200, "chunks arriving separately are accepted");
+    checkEq((r2 == nil) ? "" : r2.body, "hello world", "chunked body assembled across pauses");
+
+    // Content-Length body arriving after the headers.
+    let c3 = openConn(gPort);
+    Stream.WriteString(c3, "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nConnection: close\r\n\r\n");
+    Fiber.Sleep(120);
+    Stream.WriteString(c3, "later");
+    let r3 = readResponse(c3, false);
+    Stream.Close(c3);
+    checkEq((r3 == nil) ? "" : r3.body, "later", "body arriving after the headers is read");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Keep-alive
 // ---------------------------------------------------------------------------
 fn test_keep_alive() {
@@ -377,6 +461,55 @@ fn test_keep_alive() {
     return 0;
 }
 
+// Several requests in one write: each is answered, in order. Responses are
+// framed by Content-Length here - a body carries no newline, so reading them
+// line by line would glue a body to the next status line.
+fn test_pipelining() {
+    Console.WriteLine("== pipelining ==");
+
+    let c = openConn(gPort);
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\n\r\nGET /users/7 HTTP/1.1\r\nHost: t\r\n\r\n");
+    let a = readResponse(c, false);
+    let b = readResponse(c, false);
+    checkEq((a == nil) ? "" : a.body, "Hello", "first of two pipelined GETs answered first");
+    check(b != nil && b.code == 200 && Json.Parse(b.body).id == "7", "second pipelined GET answered second");
+
+    // A Content-Length body, then a GET, then a chunked body, then a HEAD.
+    Stream.WriteString(c,
+        "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello"
+        + "GET /users/8 HTTP/1.1\r\nHost: t\r\n\r\n"
+        + "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+        + "HEAD / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let p1 = readResponse(c, false);
+    let p2 = readResponse(c, false);
+    let p3 = readResponse(c, false);
+    let p4 = readResponse(c, true);
+    checkEq((p1 == nil) ? "" : p1.body, "hello", "a POST body does not swallow the GET after it");
+    check(p2 != nil && Json.Parse(p2.body).id == "8", "the GET after a POST body is answered");
+    checkEq((p3 == nil) ? "" : p3.body, "abcde", "a chunked body pipelined after a GET");
+    checkEq((p4 == nil) ? 0 : p4.code, 200, "a HEAD pipelined after a chunked body");
+
+    // More than the 4 KB read-ahead in one write, then a closing request.
+    let batch = "";
+    iter (i from 0 to 40) {
+        batch = batch + "GET /users/" + str(i) + " HTTP/1.1\r\nHost: t\r\nX-Pad: "
+              + String.Repeat("p", 100) + "\r\n\r\n";
+    }
+    batch = batch + "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    Stream.WriteString(c, batch);
+    let inOrder = 0;
+    iter (i from 0 to 40) {
+        let x = readResponse(c, false);
+        if (x != nil && x.code == 200 && Json.Parse(x.body).id == str(i)) { inOrder += 1; }
+    }
+    checkEq(inOrder, 40, "40 pipelined requests past the read-ahead all answered in order");
+    let last = readResponse(c, false);
+    check(last != nil && Object.TryGet(last.headers, "connection", "") == "close",
+          "a pipelined Connection: close ends the batch");
+    Stream.Close(c);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Limits and malformed input
 // ---------------------------------------------------------------------------
@@ -392,7 +525,7 @@ fn test_limits() {
 
     // Too many headers.
     let hdrs = "";
-    iter (i from 0 to 40) { hdrs = hdrs + "X-H" + str(i) + ": v\r\n"; }
+    iter (i from 0 to 41) { hdrs = hdrs + "X-H" + str(i) + ": v\r\n"; }
     let r2 = request(gLimitPort, "GET / HTTP/1.1\r\nHost: t\r\n" + hdrs + "\r\n", false);
     checkEq(r2.code, 431, "too many headers rejected with 431");
 
@@ -721,6 +854,76 @@ fn test_access_log() {
     return 0;
 }
 
+// Hooks run on the connection fiber; one that throws must cost neither the
+// connection nor the process.
+fn waitHookErrors(srv, n: int) {
+    let spins = 0;
+    while (srv.HookErrors() < n && spins < 200) { Fiber.Sleep(5); spins += 1; }
+    return srv.HookErrors();
+}
+
+fn test_hook_failures() {
+    Console.WriteLine("== throwing hooks ==");
+
+    let srv = new HttpServer({ port: 0, idleTimeoutMs: 400 });
+    srv.Get("/",     fn(_req, res) { res.Text("ok"); });
+    srv.Get("/boom", fn(_req, _res) { throw(7, "handler bug"); });
+    srv.OnAccess(fn(_e) { throw(1, "logger failed"); });
+    srv.OnError(fn(_req, _res, _err) { throw(8, "error hook failed"); });
+    let port = srv.ListenAsync();
+
+    checkEq(req1(port, "GET", "/").code, 200, "a throwing OnAccess does not cost the reply");
+    checkEq(req1(port, "GET", "/").code, 200, "still serving after OnAccess threw");
+    let c = openConn(port);
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let k1 = readResponse(c, false);
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let k2 = readResponse(c, false);
+    Stream.Close(c);
+    check(k1 != nil && k2 != nil && k2.code == 200, "the keep-alive connection survives a throwing OnAccess");
+
+    checkEq(req1(port, "GET", "/boom").code, 500, "a throwing OnError still sends the default 500");
+    checkEq(req1(port, "GET", "/").code, 200, "still serving after OnError threw");
+    checkEq(waitHookErrors(srv, 7), 7, "6 OnAccess + 1 OnError exceptions dropped and counted");
+    checkEq(srv.ActiveConnections(), 0, "no connection leaked by a throwing hook");
+    checkEq(srv.InFlight(), 0, "nothing left in flight after throwing hooks");
+    srv.Stop(500);
+
+    // Async hooks are awaited: OnError's reply is the one sent, and an async
+    // OnAccess that throws is contained and counted like a plain one.
+    let srv2 = new HttpServer({ port: 0, idleTimeoutMs: 400 });
+    srv2.Get("/boom", fn(_req, _res) { throw(7, "handler bug"); });
+    srv2.OnError(asyncOnError);
+    srv2.OnAccess(asyncAccessThrow);
+    let port2 = srv2.ListenAsync();
+    let r = req1(port2, "GET", "/boom");
+    check(r != nil && r.code == 503 && r.body == "handled", "an async OnError's own reply is sent");
+    checkEq(req1(port2, "GET", "/boom").code, 503, "still serving after an async OnAccess threw");
+    checkEq(waitHookErrors(srv2, 2), 2, "async OnAccess exceptions are counted");
+    srv2.Stop(500);
+
+    // A failed handshake runs OnTlsError; a pkcs12 file that does not exist
+    // makes every handshake fail without needing a certificate.
+    if (Stream.TlsServerAvailable()) {
+        let srv3 = new HttpServer({ port: 0, idleTimeoutMs: 400, readTimeoutMs: 1000,
+                                    tls: { pkcs12File: "/nonexistent/flaris-test.p12", password: "x" } });
+        srv3.OnTlsError(fn(_peer, _msg) { throw(9, "tls hook failed"); });
+        let port3 = srv3.ListenAsync();
+        iter (i from 0 to 2) {
+            let t = openConn(port3);
+            if (t != nil) {
+                Stream.WriteString(t, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+                Stream.WaitReadable(t, 1500);
+                Stream.Close(t);
+            }
+        }
+        checkEq(waitHookErrors(srv3, 2), 2, "a throwing OnTlsError is contained, once per handshake");
+        check(srv3.IsRunning(), "the TLS server is still running after OnTlsError threw");
+        srv3.Stop(500);
+    }
+    return 0;
+}
+
 fn test_graceful_shutdown() {
     Console.WriteLine("== graceful shutdown ==");
 
@@ -1022,7 +1225,7 @@ fn test_response_framing() {
     checkEq(rby.code, 200, "large binary body status");
     checkEq(len(rby.body), 40000, "large binary body fully received");
     let ok = true;
-    iter (i from 0 to 39999) {
+    iter (i from 0 to 40000) {
         if (Buffer.ReadU8At(rby.body, i) != (i % 256)) { ok = false; }
     }
     check(ok, "large binary body byte-exact");
@@ -1063,7 +1266,7 @@ fn test_static_exposure() {
         check(!String.Contains(escd.body, "OUTSIDE_THE_ROOT"), "symlinked directory target not disclosed");
     }
 
-    // The guards are opt-out, and opting out restores the old behaviour.
+    // The guards are opt-out: with them off, dotfiles and symlinks are served.
     checkEq(req1(gPort, "GET", "/loose/.env").code, 200, "dotfiles:true serves .env");
     if (File.Exists(Path.Combine(gStaticDir, "escape.txt"))) {
         checkEq(req1(gPort, "GET", "/loose/escape.txt").code, 200, "followSymlinks:true follows the link");
@@ -1178,6 +1381,9 @@ fn buildServer() {
 
     srv.Post("/echo",   fn(req, res) { res.Json(req.Json()); });
     srv.Post("/raw",    fn(req, res) { res.Text(req.Text()); });
+    srv.Get("/async",       asyncEcho);
+    srv.Get("/async-slow",  asyncSlowH);
+    srv.Get("/async-throw", asyncThrow);
     srv.Post("/len",    fn(req, res) { res.Text(str(req.ContentLength())); });
     srv.Put("/verb",    fn(_req, res) { res.Text("PUT"); });
     srv.Patch("/verb",  fn(_req, res) { res.Text("PATCH"); });
@@ -1197,7 +1403,7 @@ fn buildServer() {
     });
     srv.Get("/bytes", fn(_req, res) {
         let b = Buffer.Create(256, 1);
-        iter (i from 0 to 255) { Buffer.WriteU8At(b, i, i); }
+        iter (i from 0 to 256) { Buffer.WriteU8At(b, i, i); }
         res.Bytes(b);
     });
     // Either side of the 16 KB write-coalescing threshold: the small body goes
@@ -1206,7 +1412,7 @@ fn buildServer() {
     srv.Get("/big", fn(_req, res) { res.Text(String.Repeat("Z", 40000)); });
     srv.Get("/bigbytes", fn(_req, res) {
         let b = Buffer.Create(40000, 1);
-        iter (i from 0 to 39999) { Buffer.WriteU8At(b, i, i % 256); }
+        iter (i from 0 to 40000) { Buffer.WriteU8At(b, i, i % 256); }
         res.Bytes(b);
     });
     srv.Get("/own-date", fn(_req, res) {
@@ -1319,7 +1525,7 @@ fn buildStreamServer() {
         let mp = req.Multipart({ dir: gUploadDir });
         if (!mp.ok) { res.Json({ ok: false, error: mp.error }, 400); return; }
         let out = [];
-        iter (i from 0 to len(mp.files) - 1) {
+        iter (i from 0 to len(mp.files)) {
             let f = mp.files[i];
             Array.Append(out, { name: f.name, filename: f.filename,
                                 contentType: f.contentType, size: f.size,
@@ -1332,7 +1538,7 @@ fn buildStreamServer() {
         let mp = req.Multipart(nil);
         if (!mp.ok) { res.Json({ ok: false, error: mp.error }, 400); return; }
         let out = [];
-        iter (i from 0 to len(mp.files) - 1) {
+        iter (i from 0 to len(mp.files)) {
             let f = mp.files[i];
             Array.Append(out, { filename: f.filename, size: f.size,
                                 body: (f.data == nil) ? "" : Buffer.ToString(f.data) });
@@ -1351,7 +1557,7 @@ fn buildStreamServer() {
 // entries; filename nil marks a plain field.
 fn mpBody(boundary: string, parts: array): string {
     let out = "";
-    iter (i from 0 to len(parts) - 1) {
+    iter (i from 0 to len(parts)) {
         let p = parts[i];
         out = out + "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + p[0] + "\"";
         if (p[1] != nil) { out = out + "; filename=\"" + p[1] + "\""; }
@@ -1428,7 +1634,10 @@ fn async Main() {
     test_methods_and_bodies();
     test_response_builders();
     test_chunked();
+    test_async_handlers();
+    test_split_requests();
     test_keep_alive();
+    test_pipelining();
     test_limits();
     test_static();
     test_header_safety();
@@ -1438,6 +1647,7 @@ fn async Main() {
     test_streaming_bodies();
     test_multipart();
     test_access_log();
+    test_hook_failures();
     test_graceful_shutdown();
     test_file_semantics();
     test_gzip_sidecar();

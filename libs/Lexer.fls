@@ -94,6 +94,14 @@ class Lexer {
 
     let _ready:      bool   = false;
 
+    // Scanner tables, rebuilt after any configuration change (see _tables).
+    let _tablesOk:   bool   = false;
+    let _cls                = nil;    // [int] per byte: 1 skip, 2 word start, 4 may open a comment,
+                                      //   8 may start an operator, (quote index + 1) << 4
+    let _lits:       string = "";     // comment delimiters and operators, back to back
+    let _litOff             = nil;    // [int] [start, end) of each literal in _lits; end < start never matches
+    let _cfg                = nil;    // [int] line comments, block comments, operators, number on, word on, emit ws
+
     // =========================================================================
     // Configuration API
     // =========================================================================
@@ -112,39 +120,45 @@ class Lexer {
         this._wordCont  = Lexer._expand(cont);
         this._wordOn    = true;
         this._ready     = false;
+        this._tablesOk  = false;
         return this;
     }
 
     // Integer and float literals.  val will be int or float.
     fn Number() : instance {
-        this._numOn = true;
-        this._ready = false;
+        this._numOn    = true;
+        this._ready    = false;
+        this._tablesOk = false;
         return this;
     }
 
     // Quoted string.  ch is the delimiter (e.g. "\"").  Backslash escapes
     // \n \t \r \\ and \" / \' are resolved.  val is the content without quotes.
     fn Quote(ch: string, type: string) : instance {
-        this._quotes = Array.Append(this._quotes, { ch: ch, type: type });
+        this._quotes   = Array.Append(this._quotes, { ch: ch, type: type });
+        this._tablesOk = false;
         return this;
     }
 
     // Skip from prefix to end of line (inclusive of the newline).
     fn LineComment(prefix: string) : instance {
-        this._lnCmts = Array.Append(this._lnCmts, prefix);
+        this._lnCmts   = Array.Append(this._lnCmts, prefix);
+        this._tablesOk = false;
         return this;
     }
 
     // Skip from open to close (both inclusive).
     fn BlockComment(open: string, close: string) : instance {
-        this._blkCmts = Array.Append(this._blkCmts, { open: open, close: close });
+        this._blkCmts  = Array.Append(this._blkCmts, { open: open, close: close });
+        this._tablesOk = false;
         return this;
     }
 
     // Add one operator string (may be multi-character, e.g. "==", "!=").
     fn Operator(op: string) : instance {
-        this._ops = Array.Append(this._ops, op);
-        this._ready = false;
+        this._ops      = Array.Append(this._ops, op);
+        this._ready    = false;
+        this._tablesOk = false;
         return this;
     }
 
@@ -156,7 +170,8 @@ class Lexer {
             this._ops = Array.Append(this._ops, String.Substr(chars, i, 1));
             i += 1;
         }
-        this._ready = false;
+        this._ready    = false;
+        this._tablesOk = false;
         return this;
     }
 
@@ -168,7 +183,7 @@ class Lexer {
 
     // Override the type for every word in the array.
     fn Keywords(words: array, type: string) : instance {
-        iter (i from 0 to len(words) - 1) {
+        iter (i from 0 to len(words)) {
             this._keywords[words[i]] = type;
         }
         return this;
@@ -178,6 +193,7 @@ class Lexer {
     fn Skip(chars: string) : instance {
         this._skipChars = chars;
         this._wsType    = "";
+        this._tablesOk  = false;
         return this;
     }
 
@@ -185,6 +201,7 @@ class Lexer {
     fn Whitespace(chars: string, type: string) : instance {
         this._skipChars = chars;
         this._wsType    = type;
+        this._tablesOk  = false;
         return this;
     }
 
@@ -237,7 +254,7 @@ class Lexer {
     // Sort operator array longest-first (insertion sort - list is usually tiny).
     fn static _sortOpsDesc(ops: array) : array {
         let n: int = len(ops);
-        iter (i from 1 to n - 1) {
+        iter (i from 1 to n) {
             let key: string = ops[i];
             var j: int = i - 1;
             while (j >= 0 and String.Length(ops[j]) < String.Length(key)) {
@@ -247,20 +264,6 @@ class Lexer {
             ops[j + 1] = key;
         }
         return ops;
-    }
-
-    // Resolve escape sequence after the backslash.
-    fn static _esc(ch: string) : string {
-        if (ch == "n")  return "\n";
-        if (ch == "t")  return "\t";
-        if (ch == "r")  return "\r";
-        if (ch == "\\") return "\\";
-        if (ch == "\"") return "\"";
-        if (ch == "'")  return "'";
-        // Flaris strings cannot hold an embedded NUL, so a "\0" escape maps to
-        // the empty string (a NUL would truncate the string at that byte).
-        if (ch == "0")  return "";
-        return ch;
     }
 
     // Prepare derived state; called once before first Tokenize.
@@ -278,7 +281,7 @@ class Lexer {
                 }
                 si += 1;
             }
-            iter (qi from 0 to len(this._quotes) - 1) {
+            iter (qi from 0 to len(this._quotes)) {
                 let qc: string = this._quotes[qi].ch;
                 if (!String.Contains(this._wordStop, qc)) {
                     this._wordStop = this._wordStop + qc;
@@ -288,15 +291,16 @@ class Lexer {
         if (this._numOn) {
             this._numStop = Lexer._buildStop("0123456789.");
             // Same: add skip chars so numbers stop at \n, \t, etc.
-            iter (si from 0 to String.Length(this._skipChars) - 1) {
+            iter (si from 0 to String.Length(this._skipChars)) {
                 let sc: string = String.Substr(this._skipChars, si, 1);
                 if (!String.Contains(this._numStop, sc)) {
                     this._numStop = this._numStop + sc;
                 }
             }
         }
-        this._ops   = Lexer._sortOpsDesc(this._ops);
-        this._ready = true;
+        this._ops      = Lexer._sortOpsDesc(this._ops);
+        this._ready    = true;
+        this._tablesOk = false;
     }
 
     // =========================================================================
@@ -306,154 +310,381 @@ class Lexer {
     // Tokenize src and return an array of token objects.
     fn Tokenize(src: string) : array {
         if (!this._ready) this._finalize();
+        if (!this._tablesOk) this._tables();
 
-        var tokens: array = [];
-        var pos:    int   = 0;
-        var line:   int   = 1;
-        var col:    int   = 1;
-        let n:      int   = String.Length(src);
+        let recs   = Lexer._scan(src, this._cls, this._lits, this._litOff, this._cfg, this._numStop, this._wordStop);
+        let m      = len(recs);
+        let tokens = Array.Create(m / 5);
+        var i      = 0;
+        var t      = 0;
+        while (i < m) {
+            let w    = recs[i];
+            let kind = w & 15;
+            let at   = recs[i + 1];
+            let n    = recs[i + 2];
+            let line = recs[i + 3];
+            let col  = recs[i + 4];
+            if (kind == 4) {
+                let word  = String.Substr(src, at, n);
+                let ktype = this._keywords[word];
+                let wtype: string = (ktype != nil) ? ktype : "word";
+                tokens[t] = { type: wtype, val: word, line: line, col: col };
+            } else if (kind == 5) {
+                tokens[t] = { type: "op", val: this._ops[w >> 8], line: line, col: col };
+            } else if (kind == 3) {
+                let raw = String.Substr(src, at, n);
+                var numval = nil;
+                if ((w & 16) != 0) {
+                    numval = Convert.ParseFloat(raw);
+                } else {
+                    numval = Convert.ParseInt(raw);
+                }
+                tokens[t] = { type: "number", val: numval, line: line, col: col };
+            } else if (kind == 2) {
+                var val: string = "";
+                if ((w & 16) != 0) {
+                    val = Lexer._unescape(src, at, at + n);
+                } else {
+                    val = String.Substr(src, at, n);
+                }
+                tokens[t] = { type: this._quotes[w >> 8].type, val: val, line: line, col: col };
+            } else if (kind == 1) {
+                tokens[t] = { type: this._wsType, val: String.Substr(src, at, n), line: line, col: col };
+            } else {
+                tokens[t] = { type: "unknown", val: String.Substr(src, at, 1), line: line, col: col };
+            }
+            i += 5;
+            t += 1;
+        }
+        return tokens;
+    }
+
+    // Rebuilds the scanner tables from the current configuration.
+    fn _tables() {
+        let nq = len(this._quotes);
+        let quoteBytes = Array.Create(nq, Type.Int);
+        iter (qi from 0 to nq) {
+            let qc = this._quotes[qi].ch;
+            if (type(qc) == Type.String && String.Length(qc) == 1) {
+                quoteBytes[qi] = Char.Code(String.CharAt(qc, 0));
+            } else {
+                quoteBytes[qi] = -1;
+            }
+        }
+        var parts = [];
+        let offs  = Array.Create(0, Type.Int);
+        var at    = 0;
+        foreach (pfx in this._lnCmts) { at = Lexer._addLit(parts, offs, at, pfx); }
+        foreach (bc in this._blkCmts) {
+            at = Lexer._addLit(parts, offs, at, bc.open);
+            at = Lexer._addLit(parts, offs, at, bc.close);
+        }
+        foreach (op in this._ops) { at = Lexer._addLit(parts, offs, at, op); }
+        this._lits   = String.Join(parts, "");
+        this._litOff = offs;
+
+        let cfg = Array.Create(6, Type.Int);
+        cfg[0] = len(this._lnCmts);
+        cfg[1] = len(this._blkCmts);
+        cfg[2] = len(this._ops);
+        cfg[3] = this._numOn ? 1 : 0;
+        cfg[4] = this._wordOn ? 1 : 0;
+        cfg[5] = (this._wsType != "") ? 1 : 0;
+        this._cfg      = cfg;
+        this._cls      = Lexer._classes(this._skipChars, this._wordStart, quoteBytes, this._lits, offs, cfg);
+        this._tablesOk = true;
+    }
+
+    // Records lit in parts/offs; a value that is not a string gets a range
+    // that never matches, as comparing a source slice with it never does.
+    fn static _addLit(parts: array, offs: [int], at: int, lit) : int {
+        if (type(lit) != Type.String) {
+            Array.Append(offs, at);
+            Array.Append(offs, at - 1);
+            return at;
+        }
+        let n = String.Length(lit);
+        Array.Append(parts, lit);
+        Array.Append(offs, at);
+        Array.Append(offs, at + n);
+        return at + n;
+    }
+
+    fn static _classes(skip: string, wordStart: string, quoteBytes: [int], lits: string, litOff: [int], cfg: [int]) : [int] {
+        let cls = Array.Create(256, Type.Int);
+        iter (i from 0 to len(skip)) {
+            let b = Char.Code(skip[i]);
+            cls[b] = cls[b] | 1;
+        }
+        iter (i from 0 to len(wordStart)) {
+            let b = Char.Code(wordStart[i]);
+            cls[b] = cls[b] | 2;
+        }
+        // Comment openers are the line comments and every other block-comment
+        // literal; the operators follow them.
+        let nLc   = cfg[0];
+        let opAt  = nLc + 2 * cfg[1];
+        let nLits = opAt + cfg[2];
+        iter (li from 0 to nLits) {
+            var bit = 8;
+            if (li < opAt) {
+                bit = 4;
+                if (li >= nLc && (li - nLc) % 2 == 1) continue;
+            }
+            let a = litOff[2 * li];
+            let b = litOff[2 * li + 1];
+            if (b > a) {
+                let first = Char.Code(lits[a]);
+                cls[first] = cls[first] | bit;
+            } else if (b == a) {
+                iter (x from 0 to 256) { cls[x] = cls[x] | bit; }
+            }
+        }
+        // Walk backwards so the quote registered first owns its byte.
+        var qi = len(quoteBytes) - 1;
+        while (qi >= 0) {
+            let b = quoteBytes[qi];
+            if (b >= 0) { cls[b] = (cls[b] & 15) | ((qi + 1) << 4); }
+            qi -= 1;
+        }
+        return cls;
+    }
+
+    // true when literal lits[a, b) occurs in s at pos.
+    fn static _at(s: string, pos: int, n: int, lits: string, a: int, b: int) : bool {
+        let m = b - a;
+        if (m < 0 || pos + m > n) return false;
+        if (m > 0 && s[pos] != lits[a]) return false;
+        iter (k from 1 to m) {
+            if (s[pos + k] != lits[a + k]) return false;
+        }
+        return true;
+    }
+
+    fn static _rec(out: [int], w: int, at: int, n: int, line: int, col: int) : int {
+        Array.Append(out, w);
+        Array.Append(out, at);
+        Array.Append(out, n);
+        Array.Append(out, line);
+        Array.Append(out, col);
+        return 0;
+    }
+
+    // Scans s into token records of five ints, [kind | flag | index << 8,
+    // start, length, line, col]:
+    //   1 whitespace run, when whitespace is emitted
+    //   2 quoted string: index = quote, range = content between the quotes;
+    //     flag 16 = holds a backslash escape
+    //   3 number; flag 16 = holds "."
+    //   4 word
+    //   5 operator: index = position in _ops
+    //   6 unrecognised byte
+    // Positions are bytes; col counts bytes from 1 and restarts after "\n".
+    fn static _scan(s: string, cls: [int], lits: string, litOff: [int], cfg: [int], numStop: string, wordStop: string) : [int] {
+        let out    = Array.Create(0, Type.Int);
+        let n      = len(s);
+        let nLc    = cfg[0];
+        let nBc    = cfg[1];
+        let opAt   = nLc + 2 * nBc;     // literal index of the first operator
+        var pos    = 0;
+        var line   = 1;
+        var col    = 1;
 
         while (pos < n) {
-            let ch: string = String.Substr(src, pos, 1);
+            let c = cls[Char.Code(s[pos])];
 
-            // ── Whitespace / skip ─────────────────────────────────────────────
-            if (String.Contains(this._skipChars, ch)) {
-                if (this._wsType != "") {
-                    // Emit whitespace token: accumulate the run
-                    let ws_line: int = line;
-                    let ws_col:  int = col;
-                    var wsval:   string = "";
-                    while (pos < n and String.Contains(this._skipChars, String.Substr(src, pos, 1))) {
-                        let wch = String.Substr(src, pos, 1);
-                        wsval = wsval + wch;
-                        if (wch == "\n") { line += 1; col = 1; } else { col += 1; }
+            if ((c & 1) != 0) {
+                if (cfg[5] != 0) {
+                    let wl = line;
+                    let wc = col;
+                    let ws = pos;
+                    while (pos < n && (cls[Char.Code(s[pos])] & 1) != 0) {
+                        if (s[pos] == '\n') {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
                         pos += 1;
                     }
-                    tokens = Array.Append(tokens, { type: this._wsType, val: wsval, line: ws_line, col: ws_col });
+                    Lexer._rec(out, 1, ws, pos - ws, wl, wc);
                 } else {
-                    if (ch == "\n") { line += 1; col = 1; } else { col += 1; }
+                    if (s[pos] == '\n') {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
                     pos += 1;
                 }
                 continue;
             }
 
-            // ── Line comments ─────────────────────────────────────────────────
-            var cmtDone: bool = false;
-            iter (ci from 0 to len(this._lnCmts) - 1) {
-                let pfx: string = this._lnCmts[ci];
-                let plen: int   = String.Length(pfx);
-                if (String.Substr(src, pos, plen) == pfx) {
-                    let end: int = String.IndexOfFrom(src, "\n", pos);
-                    if (end < 0) { pos = n; } else { pos = end; }
-                    cmtDone = true;
+            // Line comments run up to, not including, the newline; col is
+            // left where the comment started.
+            var skipped = false;
+            iter (ci from 0 to ((c & 4) != 0 ? nLc : 0)) {
+                if (Lexer._at(s, pos, n, lits, litOff[2 * ci], litOff[2 * ci + 1])) {
+                    let e = String.IndexOfFrom(s, "\n", pos);
+                    pos = (e < 0) ? n : e;
+                    skipped = true;
                     break;
                 }
             }
-            if (cmtDone) continue;
+            if (skipped) continue;
 
-            // ── Block comments ────────────────────────────────────────────────
-            var blkDone: bool = false;
-            iter (bi from 0 to len(this._blkCmts) - 1) {
-                let bc    = this._blkCmts[bi];
-                let olen: int = String.Length(bc.open);
-                if (String.Substr(src, pos, olen) == bc.open) {
-                    let clen: int = String.Length(bc.close);
-                    let end: int  = String.IndexOfFrom(src, bc.close, pos + olen);
-                    let stop: int = (end < 0) ? n : end + clen;
-                    // Count newlines inside the comment for line tracking
-                    iter (cp from pos to stop - 1) {
-                        if (String.Substr(src, cp, 1) == "\n") { line += 1; col = 1; } else { col += 1; }
+            iter (bi from 0 to ((c & 4) != 0 ? nBc : 0)) {
+                let li = nLc + 2 * bi;
+                let oa = litOff[2 * li];
+                let ob = litOff[2 * li + 1];
+                if (Lexer._at(s, pos, n, lits, oa, ob)) {
+                    let ca = litOff[2 * li + 2];
+                    let cb = litOff[2 * li + 3];
+                    var stop = n;
+                    if (cb >= ca) {
+                        let close = String.Substr(lits, ca, cb - ca);
+                        let e = String.IndexOfFrom(s, close, pos + ob - oa);
+                        if (e >= 0) { stop = e + cb - ca; }
                     }
-                    pos = stop;
-                    blkDone = true;
-                    break;
-                }
-            }
-            if (blkDone) continue;
-
-            // ── Capture token position ────────────────────────────────────────
-            let tok_line: int = line;
-            let tok_col:  int = col;
-
-            // ── Quoted strings ────────────────────────────────────────────────
-            var qDone: bool = false;
-            iter (qi from 0 to len(this._quotes) - 1) {
-                let q = this._quotes[qi];
-                if (ch == q.ch) {
-                    pos += 1; col += 1;   // consume opening quote
-                    var val: string = "";
-                    while (pos < n) {
-                        let qch = String.Substr(src, pos, 1);
-                        if (qch == "\\") {
-                            pos += 1; col += 1;
-                            if (pos < n) {
-                                val = val + Lexer._esc(String.Substr(src, pos, 1));
-                                pos += 1; col += 1;
-                            }
-                        } else if (qch == q.ch) {
-                            pos += 1; col += 1;   // consume closing quote
-                            break;
+                    iter (cp from pos to stop) {
+                        if (s[cp] == '\n') {
+                            line += 1;
+                            col = 1;
                         } else {
-                            val = val + qch;
-                            if (qch == "\n") { line += 1; col = 1; } else { col += 1; }
-                            pos += 1;
+                            col += 1;
                         }
                     }
-                    tokens = Array.Append(tokens, { type: q.type, val: val, line: tok_line, col: tok_col });
-                    qDone = true;
+                    pos = stop;
+                    skipped = true;
                     break;
                 }
             }
-            if (qDone) continue;
+            if (skipped) continue;
 
-            // ── Numbers ───────────────────────────────────────────────────────
-            if (this._numOn and String.Contains("0123456789", ch)) {
-                let end: int = String.IndexOfAnyFrom(src, this._numStop, pos);
-                let stop: int = (end < 0) ? n : end;
-                let raw: string = String.Substr(src, pos, stop - pos);
-                var numval = Convert.ParseInt(raw);
-                if (String.Contains(raw, ".")) { numval = Convert.ParseFloat(raw); }
-                col += stop - pos;
-                pos = stop;
-                tokens = Array.Append(tokens, { type: "number", val: numval, line: tok_line, col: tok_col });
+            let tl = line;
+            let tc = col;
+
+            let qi = (c >> 4) - 1;
+            if (qi >= 0) {
+                let q = s[pos];
+                pos += 1;
+                col += 1;
+                let qs = pos;
+                var fl = 0;
+                while (pos < n) {
+                    let x = s[pos];
+                    if (x == '\\') {
+                        fl = 16;
+                        pos += 1;
+                        col += 1;
+                        if (pos < n) {
+                            pos += 1;
+                            col += 1;
+                        }
+                    } else if (x == q) {
+                        break;
+                    } else {
+                        if (x == '\n') {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
+                        pos += 1;
+                    }
+                }
+                Lexer._rec(out, 2 | fl | (qi << 8), qs, pos - qs, tl, tc);
+                if (pos < n) {
+                    pos += 1;
+                    col += 1;
+                }
                 continue;
             }
 
-            // ── Words / identifiers ───────────────────────────────────────────
-            if (this._wordOn and String.Contains(this._wordStart, ch)) {
-                let end: int  = String.IndexOfAnyFrom(src, this._wordStop, pos);
-                let stop: int = (end < 0) ? n : end;
-                let word: string = String.Substr(src, pos, stop - pos);
+            let d = s[pos];
+            if (cfg[3] != 0 && d >= '0' && d <= '9') {
+                let e    = String.IndexOfAnyFrom(s, numStop, pos);
+                let stop = (e < 0) ? n : e;
+                var fl   = 0;
+                iter (k from pos to stop) {
+                    if (s[k] == '.') {
+                        fl = 16;
+                        break;
+                    }
+                }
+                Lexer._rec(out, 3 | fl, pos, stop - pos, tl, tc);
                 col += stop - pos;
                 pos = stop;
-                let ktype = this._keywords[word];
-                let wtype: string = (ktype != nil) ? ktype : "word";
-                tokens = Array.Append(tokens, { type: wtype, val: word, line: tok_line, col: tok_col });
                 continue;
             }
 
-            // ── Operators (longest match first) ───────────────────────────────
-            var opDone: bool = false;
-            iter (oi from 0 to len(this._ops) - 1) {
-                let op: string = this._ops[oi];
-                let olen: int  = String.Length(op);
-                if (String.Substr(src, pos, olen) == op) {
-                    col += olen;
-                    pos += olen;
-                    tokens = Array.Append(tokens, { type: "op", val: op, line: tok_line, col: tok_col });
-                    opDone = true;
+            if (cfg[4] != 0 && (c & 2) != 0) {
+                let e    = String.IndexOfAnyFrom(s, wordStop, pos);
+                let stop = (e < 0) ? n : e;
+                Lexer._rec(out, 4, pos, stop - pos, tl, tc);
+                col += stop - pos;
+                pos = stop;
+                continue;
+            }
+
+            // Operators are sorted longest first.
+            iter (oi from 0 to ((c & 8) != 0 ? cfg[2] : 0)) {
+                let li = opAt + oi;
+                let a  = litOff[2 * li];
+                let b  = litOff[2 * li + 1];
+                if (Lexer._at(s, pos, n, lits, a, b)) {
+                    Lexer._rec(out, 5 | (oi << 8), pos, b - a, tl, tc);
+                    col += b - a;
+                    pos += b - a;
+                    skipped = true;
                     break;
                 }
             }
-            if (opDone) continue;
+            if (skipped) continue;
 
-            // ── Unknown character ─────────────────────────────────────────────
-            tokens = Array.Append(tokens, { type: "unknown", val: ch, line: tok_line, col: tok_col });
+            Lexer._rec(out, 6, pos, 1, tl, tc);
             col += 1;
             pos += 1;
         }
+        return out;
+    }
 
-        return tokens;
+    // Content of a quoted string with its backslash escapes resolved: \n \t \r
+    // become the control characters, \0 is dropped (a Flaris string holds no
+    // NUL), and any other escaped byte stands for itself. A lone trailing
+    // backslash is dropped.
+    fn static _unescape(s: string, a: int, b: int) : string {
+        let out = String.Create(b - a);
+        var k   = 0;
+        var p   = a;
+        while (p < b) {
+            let c = s[p];
+            if (c == '\\') {
+                p += 1;
+                if (p < b) {
+                    let e = s[p];
+                    if (e == 'n') {
+                        out[k] = '\n';
+                        k += 1;
+                    } else if (e == 't') {
+                        out[k] = '\t';
+                        k += 1;
+                    } else if (e == 'r') {
+                        out[k] = '\r';
+                        k += 1;
+                    } else if (e != '0') {
+                        out[k] = e;
+                        k += 1;
+                    }
+                    p += 1;
+                }
+            } else {
+                out[k] = c;
+                k += 1;
+                p += 1;
+            }
+        }
+        return String.Substr(out, 0, k);
     }
 
     // =========================================================================
@@ -473,7 +704,7 @@ class Lexer {
         let lex = new Lexer();
 
         if (opts.word != nil) {
-            if (is_object(opts.word)) {
+            if (Type.Is(opts.word, Type.Object)) {
                 lex.Word(opts.word.start, opts.word.cont);
             } else {
                 lex.Word(opts.word, opts.word);
@@ -483,8 +714,8 @@ class Lexer {
         if (opts.number == true) { lex.Number(); }
 
         if (opts.string != nil) {
-            if (is_array(opts.string)) {
-                iter (i from 0 to len(opts.string) - 1) {
+            if (Type.Is(opts.string, Type.Array)) {
+                iter (i from 0 to len(opts.string)) {
                     lex.Quote(opts.string[i], "string");
                 }
             } else {
@@ -493,8 +724,8 @@ class Lexer {
         }
 
         if (opts.lineComment != nil) {
-            if (is_array(opts.lineComment)) {
-                iter (i from 0 to len(opts.lineComment) - 1) {
+            if (Type.Is(opts.lineComment, Type.Array)) {
+                iter (i from 0 to len(opts.lineComment)) {
                     lex.LineComment(opts.lineComment[i]);
                 }
             } else {
@@ -509,7 +740,7 @@ class Lexer {
         if (opts.ops != nil) { lex.Operators(opts.ops); }
 
         if (opts.keywords != nil) {
-            if (is_array(opts.keywords)) {
+            if (Type.Is(opts.keywords, Type.Array)) {
                 lex.Keywords(opts.keywords, "keyword");
             } else {
                 // object: {word: type}

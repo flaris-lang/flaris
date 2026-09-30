@@ -1,0 +1,217 @@
+// test_modem_hw.fls
+// Live tests for Modem.fls against a real modem. Read-only.
+//
+//   flarisvm tests/test_modem_hw.fls --libs=./libs /dev/ttyUSB2
+//
+// The device path is a required argument and is never discovered: writing to a
+// modem's NMEA interface to find out whether it speaks AT wedges the process
+// in the kernel, unkillably, because nothing drains that endpoint. Resolve the
+// port from the USB interface number instead - interface 2 is AT on Quectel
+// modules:
+//
+//   ls -l /sys/bus/usb-serial/devices/    # ...:1.<N>/ttyUSB<n>
+//
+// SAFETY - this runs against a modem carrying real traffic:
+//   Every command here reads. Nothing sends a message, enters a PIN, writes an
+//   APN, cycles +CFUN, or scans with AT+COPS=? (which drops the network for a
+//   minute). The only two commands that are not pure queries are +CEREG=2 and
+//   +COPS=3,0, issued by Registration() and Operator(): they set the reporting
+//   level and the operator-name format on this AT channel, and neither
+//   deregisters nor disturbs a data session.
+//
+// tests/test_modem.sh covers the same library against a fake modem on a pty.
+// This file exists for what a pty cannot show: real timing, a real UART, and a
+// real device's idea of when a reply is finished.
+
+import { AT, Modem } from library("Modem", "1.0");
+
+global passed = 0;
+global failed = 0;
+global skipped = 0;
+
+fn assert(name: string, cond: bool) {
+    if (cond) { Console.WriteLine("[PASS] " + name); passed += 1; }
+    else      { Console.WriteLine("[FAIL] " + name); failed += 1; }
+}
+
+fn skip(name: string, why: string) {
+    Console.WriteLine("[SKIP] " + name + " - " + why);
+    skipped += 1;
+}
+
+fn section(name: string) {
+    Console.WriteLine("");
+    Console.WriteLine("--- " + name + " ---");
+}
+
+fn Main() {
+    let argv = Os.Args();
+    if (len(argv) < 1) {
+        Console.WriteLine("usage: test_modem_hw.fls <tty>   e.g. /dev/ttyUSB2");
+        return 2;
+    }
+    let port = argv[0];
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Modem live test - " + port);
+    Console.WriteLine("================================================");
+
+    // ---- ownership -------------------------------------------------------
+    section("Port ownership");
+
+    let m = new Modem(port);
+    assert("new Modem(port) takes the port", m.IsOpen());
+    if (!m.IsOpen()) {
+        Console.WriteLine("cannot continue: " + m.Error());
+        return 1;
+    }
+    assert("Error() is nil while open", m.Error() == nil);
+    assert("Port() reports the path", m.Port() == port);
+    assert("the instance owns the port", m.At().OwnsPort());
+
+    let m2 = new Modem(port);
+    assert("a second instance is refused", !m2.IsOpen());
+    assert("  and says why", m2.Error() != nil && String.Contains(m2.Error(), "busy"));
+    let d = m2.SignalInfo();
+    assert("  and still answers a result object", !d["ok"] && d["errorKind"] == "port");
+    m2.Close();
+    assert("closing the refused instance leaves the holder alone", m.IsOpen());
+
+    // ---- what the device actually says ------------------------------------
+    section("Device");
+
+    let info = m.Info();
+    assert("Info() reads the device", info["ok"] && len(info["manufacturer"]) > 0);
+    Console.WriteLine("       " + info["manufacturer"] + " " + info["model"]
+                      + " fw " + info["revision"]);
+    assert("  IMEI is 15 digits", len(info["imei"]) == 15);
+    assert("  and passes the Luhn check", Modem.ValidateImei(info["imei"])["valid"]);
+
+    let sim = m.SimStatus();
+    Console.WriteLine("       SIM: " + sim["state"]);
+    assert("SimStatus() answers", sim["ok"]);
+
+    let sig = m.SignalInfo();
+    Console.WriteLine("       RSSI " + sig["rssi"] + " (" + sig["dbm"] + " dBm), "
+                      + sig["quality"]);
+    assert("SignalInfo() answers", sig["ok"]);
+    assert("  with a plausible RSSI", sig["rssi"] >= 0 && sig["rssi"] <= 31);
+
+    let reg = m.Registration();
+    Console.WriteLine("       registration: " + reg["status"] + " on " + reg["tech"]);
+    assert("Registration() answers", reg["ok"]);
+
+    let op = m.Operator();
+    Console.WriteLine("       operator: " + op["name"] + " (" + op["mcc"] + "/" + op["mnc"] + ")");
+    assert("Operator() answers", op["ok"]);
+
+    // ---- framing against a real UART ---------------------------------------
+    section("Framing");
+
+    let at = m.At();
+    // Repeated round trips: a reply split across reads is the normal case on a
+    // real port, not an edge case, so this fails loudly if _pump regressed.
+    var allOk = true;
+    var i = 0;
+    while (i < 20) {
+        let r = at.Send("AT+CSQ", 3000);
+        if (!r["ok"] || len(r["lines"]) == 0 || !String.StartsWith(r["lines"][0], "+CSQ:")) {
+            allOk = false;
+        }
+        i += 1;
+    }
+    assert("20 consecutive +CSQ round trips all frame correctly", allOk);
+
+    let bad = at.Send("AT+DEFINITELYNOTACOMMAND", 3000);
+    assert("an unknown command is a modem error", !bad["ok"] && bad["errorKind"] == "modem");
+
+    // ---- async on real timing ----------------------------------------------
+    section("Async");
+
+    let p = at.SendAsync("AT+CGMR", 5000);
+    var spins = 0;
+    while (!p.IsDone() && spins < 2000) { Fiber.Sleep(2); spins += 1; }
+    let pr = p.Await();
+    assert("SendAsync overlaps with the caller", spins > 0);
+    assert("  and Await() gives the result", pr["ok"] && len(pr["lines"]) > 0);
+
+    // Two commands started back to back must not interleave on the wire: the
+    // modem answers one at a time and _acquire has to hold the second back.
+    let q1 = at.SendAsync("AT+CGMI", 5000);
+    let q2 = at.SendAsync("AT+CGMM", 5000);
+    let r1 = q1.Await();
+    let r2 = q2.Await();
+    assert("two overlapping commands both succeed", r1["ok"] && r2["ok"]);
+    assert("  and each got its own reply", r1["lines"][0] != r2["lines"][0]);
+
+    // ---- cancellation recovers ----------------------------------------------
+    section("Cancellation");
+
+    let c = at.SendAsync("AT+CGSN", 5000);
+    if (c.IsDone()) {
+        skip("cancel a command in flight", "it finished before we could cancel");
+    } else {
+        Fiber.Cancel(c.Handle());
+        var cs = 0;
+        while (!c.IsDone() && cs < 2000) { Fiber.Sleep(2); cs += 1; }
+        assert("a cancelled command finishes unwinding", c.IsDone());
+        let cr = c.Await();
+        assert("  and answers a result rather than nil", cr != nil && !cr["ok"]);
+    }
+    // Whether or not the cancel landed, the port must still work: a fiber
+    // unwound mid-command used to leave its id at the head of the command
+    // queue and wedge every later Send.
+    assert("the instance still takes commands after a cancel",
+           at.Send("AT+CGMM", 3000)["ok"]);
+
+    // And the answers must still belong to the questions. The abandoned
+    // command's reply was left in the stream, so every later command used to
+    // read the previous one's answer - reporting ok with the wrong data.
+    let x1 = at.Send("AT+CGMI", 3000);
+    let x2 = at.Send("AT+CGMM", 3000);
+    let x3 = at.Send("AT+CSQ", 3000);
+    assert("after a cancel, +CGMI still answers the manufacturer",
+           x1["ok"] && x1["lines"][0] == info["manufacturer"]);
+    assert("  +CGMM still answers the model",
+           x2["ok"] && x2["lines"][0] == info["model"]);
+    assert("  +CSQ still answers a signal report",
+           x3["ok"] && String.StartsWith(x3["lines"][0], "+CSQ:"));
+
+    // ---- handing the port over ----------------------------------------------
+    section("Handover");
+
+    let slot = { m: nil, tried: false };
+    let w = Fiber.New(fn() {
+        slot["m"] = new Modem(port, 115200, { portWaitMs: 8000 });
+        slot["tried"] = true;
+        return 0;
+    });
+    Fiber.Resume(w, true);
+    Fiber.Sleep(100);
+    assert("a waiter stays out while the port is held", !slot["tried"]);
+    assert("  and the holder keeps working", m.SignalInfo()["ok"]);
+
+    m.Close();
+    if (!Fiber.IsDone(w)) { Fiber.Await(w); }
+    assert("the waiter takes the port once the holder closes", slot["m"].IsOpen());
+    assert("  and can drive the modem", slot["m"].Info()["ok"]);
+    slot["m"].Close();
+
+    // ---- back-compat ---------------------------------------------------------
+    section("Back-compat factories");
+
+    let a1 = AT.Open(port, 115200);
+    assert("AT.Open() returns an instance", a1 != nil && a1.IsOpen());
+    assert("AT.Open() returns nil when busy", AT.Open(port, 115200) == nil);
+    a1.Close();
+    let mo = Modem.Open(port, 115200);
+    assert("Modem.Open() still works", mo != nil && mo.IsOpen());
+    mo.Close();
+
+    Console.WriteLine("");
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Results: " + passed + " passed, " + failed + " failed, "
+                      + skipped + " skipped");
+    Console.WriteLine("================================================");
+    if (failed == 0) { return 0; }
+    return 1;
+}

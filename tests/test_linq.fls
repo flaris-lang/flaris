@@ -63,6 +63,8 @@ fn test_factories() {
     var r3 = Linq.Range(5, 0, -1).ToArray();
     checkArr(r3, [5, 4, 3, 2, 1], "Range desc");
 
+    checkArr(Linq.Range(2, 6).ToArray(), [2, 3, 4, 5], "Range step omitted");
+
     var rep = Linq.Repeat(7, 4).ToArray();
     checkArr(rep, [7, 7, 7, 7], "Repeat");
 
@@ -1180,13 +1182,13 @@ fn pred_fizzbuzz(x) {
 
 fn make_data(n) {
     var arr = [];
-    iter (i from 0 to n - 1) { Array.Append(arr, i); }
+    iter (i from 0 to n) { Array.Append(arr, i); }
     return arr;
 }
 
 fn bench(label, iterations, fn_subject) {
     var t0 = Time.Millis();
-    iter (i from 0 to iterations - 1) { fn_subject(); }
+    iter (i from 0 to iterations) { fn_subject(); }
     var elapsed = Time.Millis() - t0;
     Console.WriteLine("  ", label, ": ", elapsed, " ms  (", iterations, " iters)");
     return elapsed;
@@ -1247,6 +1249,26 @@ fn bench_pipeline() {
     bench_ratio("raw", "linq", ms_raw, ms_linq);
 }
 
+fn bench_chunk_intersect() {
+    Console.WriteLine("-- bench: Chunk (n=100000) / Intersect (5000 x 5000)");
+    let big = make_data(100000);
+    bench("Linq Chunk(10)    ", 10, fn() { Linq.From(big).Chunk(10).ToArray(); });
+    let a1 = make_data(5000);
+    let a2 = Array.Select(a1, fn(x) { return x * 2; });
+    bench("Linq Intersect    ", 10, fn() { Linq.From(a1).Intersect(a2).Count(nil); });
+    bench("Linq Except       ", 10, fn() { Linq.From(a1).Except(a2).Count(nil); });
+    checkEq(Linq.From(a1).Intersect(a2).Count(nil), 2500, "bench Intersect count");
+    checkEq(Linq.From(a1).Except(a2).Count(nil), 2500, "bench Except count");
+}
+
+fn bench_then_by() {
+    Console.WriteLine("-- bench: OrderBy + ThenByDesc (n=", N_SMALL, ", 50 iters)");
+    bench_data = make_data(N_SMALL);
+    bench("Linq OrderBy.ThenByDesc", 50, fn() {
+        Linq.From(bench_data).OrderBy(pred_mod7).ThenByDesc(pred_mod100).ToArray();
+    });
+}
+
 fn test_benchmarks() {
     Console.WriteLine("=== Linq benchmarks ===");
     bench_where_select();
@@ -1254,7 +1276,118 @@ fn test_benchmarks() {
     bench_aggregate();
     bench_group_by();
     bench_pipeline();
+    bench_chunk_intersect();
+    bench_then_by();
     Console.WriteLine("=== benchmarks done ===");
+}
+
+// ============================================================
+// Query values: every chain method returns a new Query
+// ============================================================
+
+fn _q_even(x) { return x % 2 == 0; }
+fn _q_odd(x)  { return x % 2 == 1; }
+
+fn test_query_values() {
+    Console.WriteLine("-- Queries are values");
+
+    let q = Linq.From([1, 2, 3, 4, 5, 6]);
+    let evens = q.Where(_q_even);
+    let odds  = q.Where(_q_odd);
+    checkArr(evens.ToArray(), [2, 4, 6], "two chains off one Query: first");
+    checkArr(odds.ToArray(),  [1, 3, 5], "two chains off one Query: second");
+    checkArr(q.ToArray(), [1, 2, 3, 4, 5, 6], "source Query unchanged");
+
+    let r = q.Reverse();
+    checkArr(q.ToArray(), [1, 2, 3, 4, 5, 6], "Reverse leaves its source");
+    checkEq(r.First(nil), 6, "Reverse result");
+    let s = Linq.From([3, 1, 2]);
+    let sorted = s.OrderByDesc(nil);
+    checkArr(s.ToArray(), [3, 1, 2], "OrderByDesc leaves its source");
+    checkArr(sorted.ToArray(), [3, 2, 1], "OrderByDesc result");
+    let a = s.Append(9);
+    checkEq(s.Size(), 3, "Append leaves its source");
+    checkEq(a.Size(), 4, "Append result");
+    checkEq(s.Prepend(0).First(nil), 0, "Prepend result");
+    checkEq(s.Size(), 3, "Prepend leaves its source");
+    checkEq(q.Take(2).Size() + q.Skip(4).Size() + q.Distinct().Size(), 10, "Take/Skip/Distinct share one source");
+
+    let arr = q.ToArray();
+    Array.Append(arr, 99);
+    checkEq(q.Size(), 6, "ToArray returns a copy");
+}
+
+// ============================================================
+// Stable descending sort and ThenBy
+// ============================================================
+
+fn test_stable_desc_then_by() {
+    Console.WriteLine("-- Stable OrderByDesc / ThenBy");
+
+    let recs = [{ n: "a", v: 1 }, { n: "b", v: 1 }, { n: "c", v: 0 }, { n: "d", v: 2 }, { n: "e", v: 1 }];
+    let byKey = Linq.From(recs).OrderByDesc(fn(o) { return o.v; }).Select(fn(o) { return o.n; }).ToArray();
+    checkArr(byKey, ["d", "a", "b", "e", "c"], "OrderByDesc key selector is stable");
+    let byCmp = Linq.From(recs).OrderByDesc(fn(x, y) { return x.v < y.v; }).Select(fn(o) { return o.n; }).ToArray();
+    checkArr(byCmp, ["d", "a", "b", "e", "c"], "OrderByDesc comparator is stable");
+
+    let people = [
+        { last: "Berg", first: "Eva", age: 30 },
+        { last: "Adams", first: "Bo", age: 40 },
+        { last: "Berg", first: "Al", age: 50 },
+        { last: "Adams", first: "Cy", age: 40 },
+        { last: "Berg", first: "Di", age: 30 },
+    ];
+    let names = fn(q) { return q.Select(fn(p) { return p.first; }).ToArray(); };
+
+    checkArr(names(Linq.From(people).OrderBy(fn(p) { return p.last; }).ThenBy(fn(p) { return p.first; })),
+             ["Bo", "Cy", "Al", "Di", "Eva"], "OrderBy.ThenBy");
+    checkArr(names(Linq.From(people).OrderBy(fn(p) { return p.last; }).ThenByDesc(fn(p) { return p.age; })),
+             ["Bo", "Cy", "Al", "Eva", "Di"], "OrderBy.ThenByDesc keeps ties in input order");
+    checkArr(names(Linq.From(people).OrderByDesc(fn(p) { return p.age; }).ThenBy(fn(p) { return p.last; })
+                                   .ThenByDesc(fn(p) { return p.first; })),
+             ["Al", "Cy", "Bo", "Eva", "Di"], "three keys");
+    checkArr(names(Linq.From(people).OrderBy(fn(p) { return p.last; })
+                                   .ThenBy(fn(x, y) { return x.age > y.age; })),
+             ["Bo", "Cy", "Al", "Eva", "Di"], "ThenBy with a comparator");
+
+    let ordered = Linq.From(people).OrderBy(fn(p) { return p.last; });
+    let t1 = names(ordered.ThenBy(fn(p) { return p.first; }));
+    let t2 = names(ordered.ThenByDesc(fn(p) { return p.first; }));
+    checkEq(t1[0], "Bo", "ThenBy off a shared ordered Query");
+    checkEq(t2[0], "Cy", "ThenByDesc off the same ordered Query");
+
+    var msg = "";
+    try { Linq.From(people).Where(fn(_p) { return true; }).ThenBy(fn(p) { return p.age; }); }
+    catch (e) { msg = e.Error; }
+    check(String.Contains(msg, "ThenBy"), "ThenBy without OrderBy raises");
+}
+
+// ============================================================
+// GroupBy keys, Intersect/Except membership
+// ============================================================
+
+fn test_keys_and_membership() {
+    Console.WriteLine("-- GroupBy keys / set membership");
+
+    let g = Linq.From(["a", "bb", "cc", "ddd"]).GroupBy(fn(s) { return len(s); });
+    check(Type.IsObject(g) == false, "GroupBy returns a HashMap, not an object");
+    checkArr(g.Get(2), ["bb", "cc"], "GroupBy int key");
+    checkEq(g.Get("2"), nil, "GroupBy int key is not the string key");
+    checkEq(g.Size(), 3, "GroupBy group count");
+
+    let i = Linq.From([[1, 2], [3], { k: 1 }, "x", 2]).Intersect([[3], { k: 1 }, 2.0, "x"]).ToArray();
+    checkEq(len(i), 3, "Intersect deep-equal arrays and objects");
+    checkArr(i[0], [3], "Intersect keeps the array");
+    checkEq(i[2], "x", "Intersect keeps strings");
+    let e = Linq.From([1, 2, 2.0, [4]]).Except([2, [4]]).ToArray();
+    checkEq(len(e), 2, "Except: 2 and 2.0 differ, arrays compare deeply");
+    checkEq(e[1], 2.0, "Except keeps the float");
+
+    let z = Linq.From([1, 2]).Zip(["a", "b", "c"]).ToArray();
+    checkArr(z[1], [2, "b"], "Zip yields [a, b] pairs");
+    let p = Linq.From([1, 2, 3]).Partition(fn(x) { return x > 1; });
+    checkArr(p.matching, [2, 3], "Partition matching");
+    checkArr(p.rest, [1], "Partition rest");
 }
 
 // ============================================================
@@ -1469,6 +1602,9 @@ fn Main() {
     test_stats_new();
     test_free_functions();
     test_free_functions_keys_and_builtins();
+    test_query_values();
+    test_stable_desc_then_by();
+    test_keys_and_membership();
     test_benchmarks();
 
     Console.WriteLine("=== Linq tests done ===");

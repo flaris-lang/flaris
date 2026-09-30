@@ -296,8 +296,14 @@
 // ParseProto stops after parsing and hands back the schema as plain data, for
 // inspection (`Json.Stringify`) or for building something else from it.
 //
-// PbWriter / PbReader are the low-level encoder and decoder. Reach for them to
-// hand-write a codec for a hot message; Pb.Encode/Decode are built on them.
+// PbWriter / PbReader are the low-level encoder and decoder, for hand-writing a
+// codec. Pb.Encode/Decode do not go through them: the first Encode or Decode of
+// a class turns its descriptor into a flat per-class plan (cached), and the
+// codec walks that plan straight over a block, one pass each way.
+//
+//   new PbWriter(capacity?)              initial capacity, default 256 bytes
+//   new PbReader(buf, offset?, length?)  buf is a block or string; reads
+//                                        [offset, offset+length), default all
 //
 //   PbWriter: Tag(num, wire) VarInt(v) ZigZag(v) Fixed32(v) Fixed64(v)
 //             Float(v) Double(v) Str(s) Bytes(blk) Raw(blk) Position() ToBuffer()
@@ -334,7 +340,7 @@ class PbWriter
     let _cap:int   = 0;
     let _pos:int   = 0;
 
-    fn Constructor(capacity:int|nil) {
+    fn Constructor(capacity?:int) {
         let c:int = 256;
         if (capacity != nil && capacity > 0) { c = capacity; }
         _buf = Buffer.Create(c, 1);
@@ -438,8 +444,9 @@ class PbReader
     let _buf:block = nil;
     let _pos:int   = 0;
     let _end:int   = 0;
+    let _bad:bool  = false;   // set by a kernel whose read would pass _end
 
-    fn Constructor(buf, offset:int|nil, length:int|nil) {
+    fn Constructor(buf, offset?:int, length?:int) {
         if (is_nil(buf)) { throw(1, "PbReader: buffer is nil"); }
         buf = _pb_asBlock(buf);
         _buf = buf;
@@ -468,53 +475,109 @@ class PbReader
 
     fn PopLimit(prev:int) { _end = prev; }
 
+    // The read primitives come in two layers. The kernels (_VarInt, _Fixed32,
+    // ...) never throw, so the JIT compiles them: a read that would pass _end
+    // leaves _pos alone, sets _bad and returns 0. The public methods wrap a
+    // kernel and turn _bad into the exception.
+    fn _Truncated(what:string) {
+        _bad = false;
+        throw(2, "Protobuf: truncated " + what);
+    }
+
+    fn _VarInt():int {
+        var p:int = _pos;
+        var v:int = 0;
+        var shift:int = 0;
+        while (p < _end && shift < 70) {
+            let b:int = Buffer.ReadU8At(_buf, p);
+            p += 1;
+            v = v | ((b & 127) << shift);
+            if (b < 128) {
+                _pos = p;
+                return v;
+            }
+            shift += 7;
+        }
+        _bad = true;
+        return 0;
+    }
+
+    fn _Fixed32():int {
+        if (_pos + 4 > _end) { _bad = true; return 0; }
+        let v:int = Buffer.ReadU32At(_buf, _pos, false);
+        _pos += 4;
+        return v;
+    }
+
+    fn _SFixed32():int {
+        if (_pos + 4 > _end) { _bad = true; return 0; }
+        let v:int = Buffer.ReadI32At(_buf, _pos, false);
+        _pos += 4;
+        return v;
+    }
+
+    fn _Fixed64():int {
+        if (_pos + 8 > _end) { _bad = true; return 0; }
+        let v:int = Buffer.ReadU64At(_buf, _pos, false);
+        _pos += 8;
+        return v;
+    }
+
+    fn _Float():float {
+        if (_pos + 4 > _end) { _bad = true; return 0.0; }
+        let v:float = Buffer.ReadFloat32At(_buf, _pos, false);
+        _pos += 4;
+        return v;
+    }
+
+    fn _Double():float {
+        if (_pos + 8 > _end) { _bad = true; return 0.0; }
+        let v:float = Buffer.ReadFloat64At(_buf, _pos, false);
+        _pos += 8;
+        return v;
+    }
+
     fn VarInt():int {
-        let r = Buffer.ReadVarintAt(_buf, _pos);
-        let n:int = r[1];
-        if (n == 0 || _pos + n > _end) { throw(2, "Protobuf: truncated varint"); }
-        _pos += n;
-        return r[0];
+        let v:int = _VarInt();
+        if (_bad) { _Truncated("varint"); }
+        return v;
     }
 
     fn ZigZag():int {
-        let v:int = VarInt();
+        let v:int = _VarInt();
+        if (_bad) { _Truncated("varint"); }
         return ((v >> 1) & 0x7FFFFFFFFFFFFFFF) ^ (0 - (v & 1));
     }
 
     fn Tag():int { return VarInt(); }
 
     fn Fixed32():int {
-        if (_pos + 4 > _end) { throw(2, "Protobuf: truncated fixed32"); }
-        let v:int = Buffer.ReadU32At(_buf, _pos, false);
-        _pos += 4;
+        let v:int = _Fixed32();
+        if (_bad) { _Truncated("fixed32"); }
         return v;
     }
 
     fn SFixed32():int {
-        if (_pos + 4 > _end) { throw(2, "Protobuf: truncated fixed32"); }
-        let v:int = Buffer.ReadI32At(_buf, _pos, false);
-        _pos += 4;
+        let v:int = _SFixed32();
+        if (_bad) { _Truncated("fixed32"); }
         return v;
     }
 
     fn Fixed64():int {
-        if (_pos + 8 > _end) { throw(2, "Protobuf: truncated fixed64"); }
-        let v:int = Buffer.ReadU64At(_buf, _pos, false);
-        _pos += 8;
+        let v:int = _Fixed64();
+        if (_bad) { _Truncated("fixed64"); }
         return v;
     }
 
     fn Float():float {
-        if (_pos + 4 > _end) { throw(2, "Protobuf: truncated float"); }
-        let v:float = Buffer.ReadFloat32At(_buf, _pos, false);
-        _pos += 4;
+        let v:float = _Float();
+        if (_bad) { _Truncated("float"); }
         return v;
     }
 
     fn Double():float {
-        if (_pos + 8 > _end) { throw(2, "Protobuf: truncated double"); }
-        let v:float = Buffer.ReadFloat64At(_buf, _pos, false);
-        _pos += 8;
+        let v:float = _Double();
+        if (_bad) { _Truncated("double"); }
         return v;
     }
 
@@ -561,7 +624,7 @@ class ProtoParser
     let _pos:int     = 0;
     let _file:string = "";
 
-    fn Constructor(source:string, filename:string|nil) {
+    fn Constructor(source:string, filename?:string) {
         if (is_nil(filename)) { _file = "<input>"; } else { _file = filename; }
         // No keyword table: proto has no reserved words, so `message` and `map`
         // are legal field names and must stay plain word tokens.
@@ -582,7 +645,7 @@ class ProtoParser
 
     fn AtEnd():bool { return _pos >= len(_toks); }
 
-    fn Peek(offset:int|nil) {
+    fn Peek(offset?:int) {
         let i:int = _pos + (offset ?? 0);
         if (i < 0 || i >= len(_toks)) { return nil; }
         return _toks[i];
@@ -1116,9 +1179,6 @@ class Pb
         return _pb_prepCache;
     }
 
-    // Resolve cls's Descriptor() into the flat form the codec walks: fields in
-    // declaration order with their tags precomputed, plus a field-number index
-    // for decoding and the oneof groupings.
     // Register(cls, descriptor) - give a class its wire descriptor explicitly,
     // for a class built at runtime by Class.Define which cannot carry a static
     // Descriptor() method. Same descriptor shape as Descriptor() returns.
@@ -1131,7 +1191,7 @@ class Pb
         if (is_nil(cls) || !Class.IsClass(cls)) {
             throw(1, "Pb.Register: expected a message class");
         }
-        if (is_nil(descriptor) || !is_object(descriptor)) {
+        if (is_nil(descriptor) || !Type.IsObject(descriptor)) {
             throw(1, "Pb.Register: expected a descriptor object");
         }
         if (is_nil(_pb_registry)) { _pb_registry = Collections.HashMap(); }
@@ -1160,6 +1220,9 @@ class Pb
         return Pb._ZeroFor(kind);
     }
 
+    // Resolve cls's descriptor, once per class, into the form the codec walks:
+    // field entries in declaration order with their tags precomputed, a
+    // field-number index, the oneof groupings and the codec plan (_Plan).
     fn static Prepare(cls) {
         if (is_nil(cls) || !Class.IsClass(cls)) {
             throw(1, "Protobuf: expected a message class");
@@ -1229,6 +1292,7 @@ class Pb
             }
 
             let e = {
+                index:   len(fields),
                 name:    fname,
                 num:     num,
                 kind:    kind,
@@ -1244,6 +1308,10 @@ class Pb
                 valKind: spec.val ?? Pb.STRING,
                 kTag:    (1 << 3) | Pb.WireFor(spec.key ?? Pb.STRING),
                 vTag:    (2 << 3) | Pb.WireFor(spec.val ?? Pb.STRING),
+                kCode:   Pb._CodeOf(spec.key ?? Pb.STRING),
+                vCode:   Pb._CodeOf(spec.val ?? Pb.STRING),
+                kZero:   Pb._ZeroFor(spec.key ?? Pb.STRING),
+                vZero:   Pb._ZeroFor(spec.val ?? Pb.STRING),
                 // Explicit presence: nil means absent and a zero value is still
                 // written. Message fields are always explicit.
                 explicit: (spec.optional == true) || !is_nil(oneof) || kind == Pb.MESSAGE,
@@ -1259,18 +1327,6 @@ class Pb
             byNum.Set(num, e);
         }
 
-        // True when some field's length cannot be known until its content has
-        // been written - a submessage, a map entry or a packed run. _WriteMsg
-        // consumes ctx only inside exactly those branches, so when this is false
-        // the writing pass needs no sizing pass and no context at all.
-        let twoPass:bool = false;
-        let k:int = 0;
-        while (k < len(fields)) {
-            let fe = fields[k];
-            k += 1;
-            if (fe.isMap || fe.packed || fe.kind == Pb.MESSAGE) { twoPass = true; }
-        }
-
         let byJson = Collections.HashMap();
         var bi:int = 0;
         while (bi < len(fields)) {
@@ -1280,19 +1336,92 @@ class Pb
             byJson.Set(fe.name, fe);        // the proto name is accepted too
         }
 
+        let probe = Pb._NewMessage(cls);
+        let declared = Object.Keys(probe);
         let prep = {
             cls:        cls,
             name:       Class.GetName(cls),
             fields:     fields,
             byNum:      byNum,
             oneofs:     oneofs,
-            twoPass:    twoPass,
             byJson:     byJson,
-            hasUnknown: Pb._HasField(cls, "_unknown"),
+            hasUnknown: Array.Contains(declared, "_unknown"),
             fqName:     is_nil(_pb_fqNames) ? nil : _pb_fqNames.Get(cls),
+            hint:       64,           // initial encode buffer: the last encoded size
         };
+        Pb._Plan(prep, declared);
         cache.Set(cls, prep);
         return prep;
+    }
+
+    // Codec plan: per-field parallel arrays the encoder and decoder index by
+    // field position, so the hot loops read small ints instead of descriptor
+    // properties and dispatch on literal codes.
+    //   info      value code (bits 0-7, see _CodeOf; 0 for a map), mode (bits
+    //             8-11: 0 singular, 1 singular with explicit presence,
+    //             2 repeated, 3 repeated and packed on encode, 4 map), wire
+    //             type (bits 12-15), the other wire type a decoder accepts, + 1
+    //             (bits 16-19, 0 = none), and bit 20 for a oneof member
+    //   slots     index of the field in Object.Values(msg), -1 if undeclared
+    //   numIdx    field number -> position + 1 (0 = unknown), for numbers
+    //             below its length; larger numbers go through byNum
+    fn static _Plan(prep, declared:array) {
+        let fields = prep.fields;
+        let n:int = len(fields);
+        let info    = Array.Create(n, Type.Int);
+        let slots   = Array.Create(n, Type.Int);
+        let tags    = Array.Create(n, Type.Int);
+        let lenTags = Array.Create(n, Type.Int);
+        let names   = Array.Create(n, Type.String);
+        let msgs    = Array.Create(n);
+        var maxNum:int = 0;
+        iter (i from 0 to n) {
+            let e = fields[i];
+            var mode:int = e.explicit ? 1 : 0;
+            if (e.rep)    { mode = e.packed ? 3 : 2; }
+            if (e.isMap)  { mode = 4; }
+            let code:int = e.isMap ? 0 : Pb._CodeOf(e.kind);
+            let alt:int  = e.packable ? Pb.WIRE_LEN : -1;
+            var f:int = code | (mode << 8) | (e.wire << 12) | ((alt + 1) << 16);
+            if (!is_nil(e.oneof)) { f = f | (1 << 20); }
+            info[i]    = f;
+            slots[i]   = Array.IndexOf(declared, e.name);
+            tags[i]    = e.tag;
+            lenTags[i] = e.lenTag;
+            names[i]   = e.name;
+            msgs[i]    = e.msg;
+            if (e.num > maxNum) { maxNum = e.num; }
+        }
+        let numIdx = Array.Create((maxNum < 2048) ? maxNum + 1 : 1, Type.Int);
+        iter (i from 0 to n) {
+            let num:int = fields[i].num;
+            if (num < len(numIdx)) { numIdx[num] = i + 1; }
+        }
+        prep.info = info;         prep.slots = slots;     prep.tags = tags;
+        prep.lenTags = lenTags;   prep.names = names;     prep.msgs = msgs;
+        prep.numIdx = numIdx;
+        prep.unknownSlot = Array.IndexOf(declared, "_unknown");
+    }
+
+    // Dense value code the codec dispatches on:
+    //   1 int64/uint64/enum  2 int32  3 uint32  4 bool  5 sint32  6 sint64
+    //   7 fixed32  8 sfixed32  9 fixed64/sfixed64  10 float  11 double
+    //   12 string  13 bytes  14 message
+    fn static _CodeOf(kind:int):int {
+        if (kind == Pb.INT32)    { return 2; }
+        if (kind == Pb.UINT32)   { return 3; }
+        if (kind == Pb.BOOL)     { return 4; }
+        if (kind == Pb.SINT32)   { return 5; }
+        if (kind == Pb.SINT64)   { return 6; }
+        if (kind == Pb.FIXED32)  { return 7; }
+        if (kind == Pb.SFIXED32) { return 8; }
+        if (kind == Pb.FIXED64 || kind == Pb.SFIXED64) { return 9; }
+        if (kind == Pb.FLOAT)    { return 10; }
+        if (kind == Pb.DOUBLE)   { return 11; }
+        if (kind == Pb.STRING)   { return 12; }
+        if (kind == Pb.BYTES)    { return 13; }
+        if (kind == Pb.MESSAGE)  { return 14; }
+        return 1;
     }
 
     // proto's field-name -> JSON-name rule: drop underscores, and uppercase a
@@ -1326,14 +1455,7 @@ class Pb
     }
 
     fn static _HasField(cls, name:string):bool {
-        let probe = Pb._NewMessage(cls);
-        let f = Class.Fields(probe);
-        let i:int = 0;
-        while (i < len(f)) {
-            if (f[i] == name) { return true; }
-            i += 1;
-        }
-        return false;
+        return Array.Contains(Object.Keys(Pb._NewMessage(cls)), name);
     }
 
     // A message instance carrying only its declared field defaults. Constructor()
@@ -1386,223 +1508,271 @@ class Pb
         return 9;
     }
 
-    // Payload bytes for one scalar - no tag, no length prefix.
-    fn static _SizeScalar(kind:int, v):int {
-        if (kind == Pb.BOOL)     { return 1; }
-        if (kind == Pb.FLOAT || kind == Pb.FIXED32 || kind == Pb.SFIXED32)  { return 4; }
-        if (kind == Pb.DOUBLE || kind == Pb.FIXED64 || kind == Pb.SFIXED64) { return 8; }
-        if (kind == Pb.SINT32 || kind == Pb.SINT64) {
-            let n:int = v ?? 0;
-            return Pb._SizeVarint((n << 1) ^ (n >> 63));
-        }
-        if (kind == Pb.STRING) {
-            let n:int = len(v ?? "");
-            return Pb._SizeVarint(n) + n;
-        }
-        if (kind == Pb.BYTES) {
-            let n:int = 0;
-            if (!is_nil(v)) { n = len(v); }
-            return Pb._SizeVarint(n) + n;
-        }
-        return Pb._SizeVarint(v ?? 0);
-    }
-
     // -------------------------------------------------------------------------
-    // Sizing pass
+    // Encoding
     //
-    // Every length-delimited region needs its byte count before its bytes, so
-    // encoding is two passes. The sizing pass appends each computed length to
-    // ctx.sizes and each map's key order to ctx.keys; the writing pass walks the
-    // message in the identical order and consumes both queues by index. The
-    // traversals must therefore stay structurally identical - a branch added to
-    // one belongs in the other.
+    // One pass straight into a growable block. Each length-delimited region -
+    // submessage, packed run, map entry - gets one reserved length byte, which
+    // _PatchLen fills in once the region is written, moving the payload up in
+    // the rare case the length needs a longer varint. The functions take the
+    // write position and return the new one; the block grows in place, so every
+    // caller's reference to it stays valid.
     // -------------------------------------------------------------------------
 
-    fn static _NewCtx() {
-        return { sizes: [], idx: 0, keys: [], kidx: 0 };
+    // Grow `buf` in place to at least `need` bytes; returns the new capacity.
+    fn static _Grow(buf:block, need:int):int {
+        var c:int = len(buf) * 2;
+        if (c < need) { c = need; }
+        Buffer.Reserve(buf, c);
+        return c;
     }
 
-    fn static _SizeSub(ctx, v, e, depth:int):int {
-        let slot:int = len(ctx.sizes);
-        Array.Append(ctx.sizes, 0);
-        let sub:int = 0;
-        if (!is_nil(v)) { sub = Pb._SizeMsg(ctx, v, Pb._PrepOf(e), depth + 1); }
-        ctx.sizes[slot] = sub;
-        return sub;
-    }
-
-    fn static _SizeMsg(ctx, msg, prep, depth:int):int {
-        if (depth > Pb.MAX_DEPTH) {
-            throw(2, "Protobuf: message nests deeper than " + str(Pb.MAX_DEPTH) + " levels");
+    // Store the length of the region written after the byte reserved at `at`,
+    // and return the region's end.
+    fn static _PatchLen(buf:block, at:int, end:int):int {
+        let n:int = end - at - 1;
+        if (n < 128) {
+            Buffer.WriteU8At(buf, at, n);
+            return end;
         }
-        let total:int = 0;
-        let fs = prep.fields;
-        let i:int = 0;
-        while (i < len(fs)) {
-            let e = fs[i];
-            i += 1;
-            let v = Class.GetField(msg, e.name);
+        let extra:int = Pb._SizeVarint(n) - 1;
+        if (end + extra > len(buf)) { Pb._Grow(buf, end + extra); }
+        Buffer.CopyWithin(buf, at + 1 + extra, at + 1, n);
+        Buffer.WriteVarintAt(buf, at, n);
+        return end + extra;
+    }
 
-            if (e.isMap) {
-                if (is_nil(v)) { continue; }
-                let keys = Object.Keys(v);
-                Array.Append(ctx.keys, keys);
-                let kTag:int = Pb._SizeVarint(e.kTag);
-                let vTag:int = Pb._SizeVarint(e.vTag);
-                let j:int = 0;
-                while (j < len(keys)) {
-                    let k:string = keys[j];
-                    j += 1;
-                    let slot:int = len(ctx.sizes);
-                    Array.Append(ctx.sizes, 0);
-                    let entry:int = kTag + Pb._SizeScalar(e.keyKind, Pb._MapKeyIn(e.keyKind, k)) + vTag;
-                    if (e.valKind == Pb.MESSAGE) {
-                        let sub:int = Pb._SizeSub(ctx, v[k], e, depth);
-                        entry += Pb._SizeVarint(sub) + sub;
-                    } else {
-                        entry += Pb._SizeScalar(e.valKind, v[k]);
-                    }
-                    ctx.sizes[slot] = entry;
-                    total += Pb._SizeVarint(e.lenTag) + Pb._SizeVarint(entry) + entry;
-                }
-                continue;
-            }
+    // True when `v` is the zero value of value code `code`, which an
+    // implicit-presence field leaves out.
+    fn static _IsZero(code:int, v):bool {
+        if (code == 12 || code == 13) { return len(v) == 0; }
+        if (code == 4) { return v == false; }
+        return v == 0;
+    }
 
-            if (e.rep) {
-                if (is_nil(v) || len(v) == 0) { continue; }
-                let n:int = len(v);
-                if (e.packed) {
-                    let slot:int = len(ctx.sizes);
-                    Array.Append(ctx.sizes, 0);
-                    let payload:int = 0;
-                    let j:int = 0;
-                    while (j < n) { payload += Pb._SizeScalar(e.kind, v[j]); j += 1; }
-                    ctx.sizes[slot] = payload;
-                    total += Pb._SizeVarint(e.lenTag) + Pb._SizeVarint(payload) + payload;
-                } else {
-                    let j:int = 0;
-                    while (j < n) {
-                        total += Pb._SizeVarint(e.tag);
-                        if (e.kind == Pb.MESSAGE) {
-                            let sub:int = Pb._SizeSub(ctx, v[j], e, depth);
-                            total += Pb._SizeVarint(sub) + sub;
-                        } else {
-                            total += Pb._SizeScalar(e.kind, v[j]);
-                        }
-                        j += 1;
-                    }
-                }
-                continue;
-            }
+    fn static _PutRaw(buf:block, pos:int, blk:block):int {
+        let n:int = len(blk);
+        if (n == 0) { return pos; }
+        if (pos + n > len(buf)) { Pb._Grow(buf, pos + n); }
+        Buffer.Copy(blk, 0, buf, pos, n);
+        return pos + n;
+    }
 
-            if (is_nil(v)) { continue; }
-            if (!e.explicit && Pb._IsDefault(e.kind, v)) { continue; }
+    // Write one scalar payload (no tag) of value code `code`; nil writes the
+    // zero value.
+    fn static _PutScalar(buf:block, pos:int, code:int, v):int {
+        if (pos + 16 > len(buf)) { Pb._Grow(buf, pos + 16); }
+        if (code <= 3) { return pos + Buffer.WriteVarintAt(buf, pos, v ?? 0); }
+        if (code == 12) {
+            let s:string = v ?? "";
+            let n:int = len(s);
+            if (pos + n + 10 > len(buf)) { Pb._Grow(buf, pos + n + 10); }
+            pos += Buffer.WriteVarintAt(buf, pos, n);
+            if (n > 0) { Buffer.CopyStringAt(buf, pos, s, n); }
+            return pos + n;
+        }
+        if (code == 4) { return pos + Buffer.WriteVarintAt(buf, pos, (v == true) ? 1 : 0); }
+        if (code <= 6) {
+            let z:int = v ?? 0;
+            return pos + Buffer.WriteVarintAt(buf, pos, (z << 1) ^ (z >> 63));
+        }
+        if (code <= 8) {
+            Buffer.WriteU32At(buf, pos, v ?? 0, false);
+            return pos + 4;
+        }
+        if (code == 9) {
+            Buffer.WriteU64At(buf, pos, v ?? 0, false);
+            return pos + 8;
+        }
+        if (code == 10) {
+            Buffer.WriteFloat32At(buf, pos, float(v ?? 0), false);
+            return pos + 4;
+        }
+        if (code == 11) {
+            Buffer.WriteFloat64At(buf, pos, float(v ?? 0), false);
+            return pos + 8;
+        }
+        var n:int = 0;
+        if (!is_nil(v)) { n = len(v); }
+        if (pos + n + 10 > len(buf)) { Pb._Grow(buf, pos + n + 10); }
+        pos += Buffer.WriteVarintAt(buf, pos, n);
+        if (n > 0) { Buffer.Copy(v, 0, buf, pos, n); }
+        return pos + n;
+    }
 
-            total += Pb._SizeVarint(e.tag);
-            if (e.kind == Pb.MESSAGE) {
-                let sub:int = Pb._SizeSub(ctx, v, e, depth);
-                total += Pb._SizeVarint(sub) + sub;
+    // The prepared plan of a message class, from the cache when it is there.
+    fn static _PlanOf(cls) {
+        let p = _pb_prepCache.Get(cls);
+        if (!is_nil(p)) { return p; }
+        return Pb.Prepare(cls);
+    }
+
+    // Raised past Pb.MAX_DEPTH levels. _EncMsg and _DecMsg compare depth with
+    // the literal 100, because reading a class constant costs a lookup per
+    // message.
+    fn static _TooDeep() {
+        throw(2, "Protobuf: message nests deeper than " + str(Pb.MAX_DEPTH) + " levels");
+    }
+
+    fn static _EncMsg(buf:block, pos:int, msg, prep, depth:int):int {
+        if (depth > 100) { Pb._TooDeep(); }
+        // One reflection call reads every field. A value of another class than
+        // the plan's is read field by field, by name.
+        let own:bool = Class.Of(msg) == prep.cls;
+        let vals = own ? Object.Values(msg) : nil;
+        let slots = prep.slots;
+        let info  = prep.info;
+        let tags  = prep.tags;
+        let n:int = len(info);
+        var cap:int = len(buf);
+        iter (i from 0 to n) {
+            var v = nil;
+            if (own) {
+                let s:int = slots[i];
+                if (s < 0) { continue; }
+                v = vals[s];
             } else {
-                total += Pb._SizeScalar(e.kind, v);
+                v = Class.GetField(msg, prep.names[i]);
             }
-        }
-
-        if (prep.hasUnknown) {
-            let u = Class.GetField(msg, "_unknown");
-            if (!is_nil(u)) { total += len(u); }
-        }
-        return total;
-    }
-
-    // -------------------------------------------------------------------------
-    // Writing pass - mirrors _SizeMsg step for step
-    // -------------------------------------------------------------------------
-
-    fn static _NextSize(ctx):int {
-        let s:int = ctx.sizes[ctx.idx];
-        ctx.idx += 1;
-        return s;
-    }
-
-    fn static _WriteScalar(w, kind:int, v) {
-        if (kind == Pb.BOOL)     { w.VarInt(v == true ? 1 : 0); return; }
-        if (kind == Pb.FLOAT)    { w.Float(float(v ?? 0)); return; }
-        if (kind == Pb.DOUBLE)   { w.Double(float(v ?? 0)); return; }
-        if (kind == Pb.FIXED32 || kind == Pb.SFIXED32) { w.Fixed32(v ?? 0); return; }
-        if (kind == Pb.FIXED64 || kind == Pb.SFIXED64) { w.Fixed64(v ?? 0); return; }
-        if (kind == Pb.SINT32 || kind == Pb.SINT64)    { w.ZigZag(v ?? 0); return; }
-        if (kind == Pb.STRING)   { w.Str(v ?? ""); return; }
-        if (kind == Pb.BYTES)    { w.Bytes(v); return; }
-        w.VarInt(v ?? 0);
-    }
-
-    fn static _WriteSub(ctx, w, v, e, depth:int) {
-        let sub:int = Pb._NextSize(ctx);
-        w.VarInt(sub);
-        if (sub > 0) { Pb._WriteMsg(ctx, w, v, Pb._PrepOf(e), depth + 1); }
-    }
-
-    fn static _WriteMsg(ctx, w, msg, prep, depth:int) {
-        let fs = prep.fields;
-        let i:int = 0;
-        while (i < len(fs)) {
-            let e = fs[i];
-            i += 1;
-            let v = Class.GetField(msg, e.name);
-
-            if (e.isMap) {
-                if (is_nil(v)) { continue; }
-                let keys = ctx.keys[ctx.kidx];
-                ctx.kidx += 1;
-                let kTag:int = e.kTag;
-                let vTag:int = e.vTag;
-                let j:int = 0;
-                while (j < len(keys)) {
-                    let k:string = keys[j];
-                    j += 1;
-                    w.VarInt(e.lenTag);
-                    w.VarInt(Pb._NextSize(ctx));
-                    w.VarInt(kTag);
-                    Pb._WriteScalar(w, e.keyKind, Pb._MapKeyIn(e.keyKind, k));
-                    w.VarInt(vTag);
-                    if (e.valKind == Pb.MESSAGE) { Pb._WriteSub(ctx, w, v[k], e, depth); }
-                    else                         { Pb._WriteScalar(w, e.valKind, v[k]); }
-                }
+            if (v == nil) { continue; }
+            let f:int = info[i];
+            let mode:int = (f >> 8) & 15;
+            if (mode >= 2) {
+                if (mode == 4) { pos = Pb._EncMap(buf, pos, v, i, prep, depth); }
+                else           { pos = Pb._EncRepeated(buf, pos, v, i, prep, depth); }
+                cap = len(buf);
                 continue;
             }
-
-            if (e.rep) {
-                if (is_nil(v) || len(v) == 0) { continue; }
-                let n:int = len(v);
-                if (e.packed) {
-                    w.VarInt(e.lenTag);
-                    w.VarInt(Pb._NextSize(ctx));
-                    let j:int = 0;
-                    while (j < n) { Pb._WriteScalar(w, e.kind, v[j]); j += 1; }
+            let code:int = f & 255;
+            if (pos + 24 > cap) { cap = Pb._Grow(buf, pos + 24); }
+            // A one-byte tag followed by a one-byte varint goes out as a single
+            // 16-bit store.
+            if (code <= 3) {
+                if (mode == 0 && v == 0) { continue; }
+                let t:int = tags[i];
+                if (t < 128 && v >= 0 && v < 128) {
+                    Buffer.WriteU16At(buf, pos, t | (v << 8));
+                    pos += 2;
                 } else {
-                    let j:int = 0;
-                    while (j < n) {
-                        w.VarInt(e.tag);
-                        if (e.kind == Pb.MESSAGE) { Pb._WriteSub(ctx, w, v[j], e, depth); }
-                        else                      { Pb._WriteScalar(w, e.kind, v[j]); }
-                        j += 1;
-                    }
+                    pos += Buffer.WriteVarintAt(buf, pos, t);
+                    pos += Buffer.WriteVarintAt(buf, pos, v);
                 }
-                continue;
+            } else if (code == 12) {
+                let sl:int = len(v);
+                if (mode == 0 && sl == 0) { continue; }
+                if (pos + sl + 24 > cap) { cap = Pb._Grow(buf, pos + sl + 24); }
+                let t:int = tags[i];
+                if (t < 128 && sl < 128) {
+                    Buffer.WriteU16At(buf, pos, t | (sl << 8));
+                    pos += 2;
+                } else {
+                    pos += Buffer.WriteVarintAt(buf, pos, t);
+                    pos += Buffer.WriteVarintAt(buf, pos, sl);
+                }
+                if (sl > 0) { Buffer.CopyStringAt(buf, pos, v, sl); }
+                pos += sl;
+            } else if (code == 14) {
+                let sub = Pb._PlanOf(prep.msgs[i]);
+                pos += Buffer.WriteVarintAt(buf, pos, tags[i]);
+                let at:int = pos;
+                pos = Pb._EncMsg(buf, at + 1, v, sub, depth + 1);
+                if (pos - at <= 128) { Buffer.WriteU8At(buf, at, pos - at - 1); }
+                else                 { pos = Pb._PatchLen(buf, at, pos); }
+                cap = len(buf);
+            } else {
+                if (mode == 0 && Pb._IsZero(code, v)) { continue; }
+                pos += Buffer.WriteVarintAt(buf, pos, tags[i]);
+                pos = Pb._PutScalar(buf, pos, code, v);
+                cap = len(buf);
             }
-
-            if (is_nil(v)) { continue; }
-            if (!e.explicit && Pb._IsDefault(e.kind, v)) { continue; }
-
-            w.VarInt(e.tag);
-            if (e.kind == Pb.MESSAGE) { Pb._WriteSub(ctx, w, v, e, depth); }
-            else                      { Pb._WriteScalar(w, e.kind, v); }
         }
-
         if (prep.hasUnknown) {
-            let u = Class.GetField(msg, "_unknown");
-            if (!is_nil(u)) { w.Raw(u); }
+            let u = own ? vals[prep.unknownSlot] : Class.GetField(msg, "_unknown");
+            if (!is_nil(u)) { pos = Pb._PutRaw(buf, pos, u); }
         }
+        return pos;
+    }
+
+    fn static _EncRepeated(buf:block, pos:int, arr, i:int, prep, depth:int):int {
+        let n:int = len(arr);
+        if (n == 0) { return pos; }
+        let f:int = prep.info[i];
+        let code:int = f & 255;
+        if (((f >> 8) & 15) == 3) {
+            if (pos + 16 > len(buf)) { Pb._Grow(buf, pos + 16); }
+            pos += Buffer.WriteVarintAt(buf, pos, prep.lenTags[i]);
+            let at:int = pos;
+            pos += 1;
+            if (code <= 3) {
+                var cap:int = len(buf);
+                iter (j from 0 to n) {
+                    if (pos + 10 > cap) { cap = Pb._Grow(buf, pos + 10); }
+                    pos += Buffer.WriteVarintAt(buf, pos, arr[j] ?? 0);
+                }
+            } else {
+                iter (j from 0 to n) { pos = Pb._PutScalar(buf, pos, code, arr[j]); }
+            }
+            return Pb._PatchLen(buf, at, pos);
+        }
+        let tag:int = prep.tags[i];
+        if (code == 14) {
+            let sub = Pb._PlanOf(prep.msgs[i]);
+            iter (j from 0 to n) {
+                if (pos + 16 > len(buf)) { Pb._Grow(buf, pos + 16); }
+                pos += Buffer.WriteVarintAt(buf, pos, tag);
+                let at:int = pos;
+                let item = arr[j];
+                pos = at + 1;
+                if (!is_nil(item)) { pos = Pb._EncMsg(buf, pos, item, sub, depth + 1); }
+                if (pos - at <= 128) { Buffer.WriteU8At(buf, at, pos - at - 1); }
+                else                 { pos = Pb._PatchLen(buf, at, pos); }
+            }
+            return pos;
+        }
+        iter (j from 0 to n) {
+            if (pos + 16 > len(buf)) { Pb._Grow(buf, pos + 16); }
+            pos += Buffer.WriteVarintAt(buf, pos, tag);
+            pos = Pb._PutScalar(buf, pos, code, arr[j]);
+        }
+        return pos;
+    }
+
+    // A map is the repeated key/value entry message the spec defines: every
+    // entry writes its key and its value, zero or not.
+    fn static _EncMap(buf:block, pos:int, obj, i:int, prep, depth:int):int {
+        let e = prep.fields[i];
+        let lenTag:int = e.lenTag;
+        let kTag:int   = e.kTag;
+        let vTag:int   = e.vTag;
+        let kCode:int  = e.kCode;
+        let vCode:int  = e.vCode;
+        var sub = nil;
+        if (vCode == 14) { sub = Pb._PlanOf(e.msg); }
+        foreach (k in Object.Keys(obj)) {
+            if (pos + 24 > len(buf)) { Pb._Grow(buf, pos + 24); }
+            pos += Buffer.WriteVarintAt(buf, pos, lenTag);
+            let at:int = pos;
+            pos += 1;
+            pos += Buffer.WriteVarintAt(buf, pos, kTag);
+            if (kCode == 12) { pos = Pb._PutScalar(buf, pos, 12, k); }
+            else             { pos = Pb._PutScalar(buf, pos, kCode, Pb._MapKeyIn(kCode, k)); }
+            if (pos + 16 > len(buf)) { Pb._Grow(buf, pos + 16); }
+            pos += Buffer.WriteVarintAt(buf, pos, vTag);
+            let val = obj[k];
+            if (vCode == 14) {
+                let vat:int = pos;
+                pos = vat + 1;
+                if (!is_nil(val)) { pos = Pb._EncMsg(buf, pos, val, sub, depth + 1); }
+                pos = Pb._PatchLen(buf, vat, pos);
+            } else if (vCode <= 3) {
+                pos += Buffer.WriteVarintAt(buf, pos, val ?? 0);
+            } else {
+                pos = Pb._PutScalar(buf, pos, vCode, val);
+            }
+            if (pos - at <= 128) { Buffer.WriteU8At(buf, at, pos - at - 1); }
+            else                 { pos = Pb._PatchLen(buf, at, pos); }
+        }
+        return pos;
     }
 
     // -------------------------------------------------------------------------
@@ -1613,157 +1783,304 @@ class Pb
     // canonical JSON mapping uses. These two convert in each direction.
     // -------------------------------------------------------------------------
 
-    fn static _MapKeyIn(kind:int, k:string) {
-        if (kind == Pb.STRING) { return k; }
-        if (kind == Pb.BOOL)   { return k == "true"; }
+    // Both take the key's value code (_CodeOf).
+    fn static _MapKeyIn(code:int, k:string) {
+        if (code == 12) { return k; }
+        if (code == 4)  { return k == "true"; }
         return int(k);
     }
 
-    fn static _MapKeyOut(kind:int, v):string {
-        if (kind == Pb.STRING) { return v ?? ""; }
-        if (kind == Pb.BOOL)   { return (v == true) ? "true" : "false"; }
+    fn static _MapKeyOut(code:int, v):string {
+        if (code == 12) { return v ?? ""; }
+        if (code == 4)  { return (v == true) ? "true" : "false"; }
         return str(v ?? 0);
     }
 
     // -------------------------------------------------------------------------
     // Decoding
+    //
+    // The reader state is (buf, pos, end) in locals. A varint whose first byte
+    // is below 0x80 is read inline; longer ones go through _VarintSlow. Helpers
+    // return the new position and hand a value back through box[0], a one-slot
+    // array allocated once per decode.
     // -------------------------------------------------------------------------
 
-    fn static _ReadScalar(r, kind:int) {
-        if (kind == Pb.BOOL)     { return r.VarInt() != 0; }
-        if (kind == Pb.INT32)    { return i32(r.VarInt()); }
-        if (kind == Pb.UINT32)   { return u32(r.VarInt()); }
-        if (kind == Pb.SINT32)   { return i32(r.ZigZag()); }
-        if (kind == Pb.SINT64)   { return r.ZigZag(); }
-        if (kind == Pb.FIXED32)  { return r.Fixed32(); }
-        if (kind == Pb.SFIXED32) { return r.SFixed32(); }
-        if (kind == Pb.FIXED64 || kind == Pb.SFIXED64) { return r.Fixed64(); }
-        if (kind == Pb.FLOAT)    { return r.Float(); }
-        if (kind == Pb.DOUBLE)   { return r.Double(); }
-        if (kind == Pb.STRING)   { return r.Str(r.VarInt()); }
-        if (kind == Pb.BYTES)    { return r.Bytes(r.VarInt()); }
-        return r.VarInt();
+    // A varint of two or more bytes at `pos`: value into box[0].
+    fn static _VarintSlow(buf:block, pos:int, end:int, box:array):int {
+        let r = Buffer.ReadVarintAt(buf, pos);
+        let n:int = r[1];
+        if (n == 0 || pos + n > end) { throw(2, "Protobuf: truncated varint"); }
+        box[0] = r[0];
+        return pos + n;
     }
 
-    fn static _ReadMsg(r, msg, prep, depth:int) {
-        if (depth > Pb.MAX_DEPTH) {
-            throw(2, "Protobuf: message nests deeper than " + str(Pb.MAX_DEPTH) + " levels");
-        }
-        let unknown = nil;
-        while (!r.AtEnd()) {
-            let start:int = r.Position();
-            let tag:int   = r.Tag();
-            let num:int   = tag >> 3;
-            let wire:int  = tag & 7;
-            if (num < 1) { throw(2, "Protobuf: field number 0 is not valid"); }
-            if (wire == 3 || wire == 4) { throw(2, "Protobuf: groups are not supported"); }
-
-            let e = prep.byNum.Get(num);
-            // An unrecognised field, or one whose wire type contradicts the
-            // descriptor, is not decodable here - keep the bytes if the message
-            // retains unknowns, otherwise step over them.
-            if (is_nil(e) || !Pb._WireOk(e, wire)) {
-                if (prep.hasUnknown) {
-                    if (is_nil(unknown)) { unknown = new PbWriter(32); }
-                    unknown.Raw(r.SkipRaw(start, wire));
-                } else {
-                    r.Skip(wire);
+    // One scalar payload of value code `code` (1..13) at `pos`: value into box[0].
+    fn static _ReadAt(buf:block, pos:int, end:int, code:int, box:array):int {
+        if (code <= 6 || code >= 12) {
+            var raw:int = 128;
+            if (pos < end) { raw = buf[pos]; }
+            if (raw < 128) { pos += 1; }
+            else { pos = Pb._VarintSlow(buf, pos, end, box); raw = box[0]; }
+            if (code >= 12) {
+                if (raw < 0 || pos + raw > end) {
+                    throw(2, (code == 12) ? "Protobuf: truncated string" : "Protobuf: truncated bytes");
                 }
-                continue;
+                if (code == 13)    { box[0] = Buffer.Slice(buf, pos, raw); }
+                else if (raw == 0) { box[0] = ""; }
+                else               { box[0] = Buffer.ToString(Buffer.Slice(buf, pos, raw)); }
+                return pos + raw;
             }
-            Pb._ReadField(r, msg, prep, e, wire, depth);
-        }
-
-        if (!is_nil(unknown) && unknown.Position() > 0) {
-            let prev = Class.GetField(msg, "_unknown");
-            if (is_nil(prev)) {
-                Class.SetField(msg, "_unknown", unknown.ToBuffer());
-            } else {
-                let m = new PbWriter(len(prev) + unknown.Position());
-                m.Raw(prev);
-                m.Raw(unknown.ToBuffer());
-                Class.SetField(msg, "_unknown", m.ToBuffer());
+            if (code == 1)      { box[0] = raw; }
+            else if (code == 2) { box[0] = i32(raw); }
+            else if (code == 3) { box[0] = u32(raw); }
+            else if (code == 4) { box[0] = raw != 0; }
+            else {
+                let z:int = ((raw >> 1) & 0x7FFFFFFFFFFFFFFF) ^ (0 - (raw & 1));
+                box[0] = (code == 5) ? i32(z) : z;
             }
+            return pos;
         }
+        if (code == 9 || code == 11) {
+            if (pos + 8 > end) {
+                throw(2, (code == 9) ? "Protobuf: truncated fixed64" : "Protobuf: truncated double");
+            }
+            if (code == 9) { box[0] = Buffer.ReadU64At(buf, pos, false); }
+            else           { box[0] = Buffer.ReadFloat64At(buf, pos, false); }
+            return pos + 8;
+        }
+        if (pos + 4 > end) {
+            throw(2, (code == 10) ? "Protobuf: truncated float" : "Protobuf: truncated fixed32");
+        }
+        if (code == 7)      { box[0] = Buffer.ReadU32At(buf, pos, false); }
+        else if (code == 8) { box[0] = Buffer.ReadI32At(buf, pos, false); }
+        else                { box[0] = Buffer.ReadFloat32At(buf, pos, false); }
+        return pos + 4;
     }
 
-    // A packable repeated field legitimately arrives either packed (WIRE_LEN) or
-    // as one tag per element, so both are accepted for it.
-    fn static _WireOk(e, wire:int):bool {
-        if (wire == e.wire) { return true; }
-        return e.packable && wire == Pb.WIRE_LEN;
-    }
-
-    fn static _ReadField(r, msg, prep, e, wire:int, depth:int) {
-        if (e.isMap) { Pb._ReadMapEntry(r, msg, e, depth); return; }
-
-        if (e.rep) {
-            let arr = Class.GetField(msg, e.name);
-            if (is_nil(arr)) { arr = []; Class.SetField(msg, e.name, arr); }
-            if (e.kind == Pb.MESSAGE) {
-                Array.Append(arr, Pb._ReadSub(r, nil, e, depth));
-                return;
-            }
-            if (e.packable && wire == Pb.WIRE_LEN) {
-                let n:int = r.VarInt();
-                let prevLimit:int = r.PushLimit(n);
-                while (!r.AtEnd()) { Array.Append(arr, Pb._ReadScalar(r, e.kind)); }
-                r.PopLimit(prevLimit);
-            } else {
-                Array.Append(arr, Pb._ReadScalar(r, e.kind));
-            }
-            return;
+    // Step over one field's payload given its wire type.
+    fn static _SkipField(buf:block, pos:int, end:int, wire:int, box:array):int {
+        if (wire == 0) { return Pb._ReadAt(buf, pos, end, 1, box); }
+        if (wire == 1) {
+            if (pos + 8 > end) { throw(2, "Protobuf: truncated fixed64"); }
+            return pos + 8;
         }
-
-        if (e.kind == Pb.MESSAGE) {
-            // Repeated occurrences of a singular message field merge, per spec.
-            let cur = Class.GetField(msg, e.name);
-            if (!is_nil(cur) && Class.Of(cur) != e.msg) { cur = nil; }
-            Class.SetField(msg, e.name, Pb._ReadSub(r, cur, e, depth));
-        } else {
-            Class.SetField(msg, e.name, Pb._ReadScalar(r, e.kind));
+        if (wire == 5) {
+            if (pos + 4 > end) { throw(2, "Protobuf: truncated fixed32"); }
+            return pos + 4;
         }
-
-        if (!is_nil(e.oneof)) { Pb._ClearSiblings(msg, prep, e); }
+        if (wire == 2) {
+            pos = Pb._ReadAt(buf, pos, end, 1, box);
+            let n:int = box[0];
+            if (n < 0 || pos + n > end) { throw(2, "Protobuf: truncated length-delimited field"); }
+            return pos + n;
+        }
+        throw(2, "Protobuf: unsupported wire type " + str(wire));
     }
 
-    // Read one length-delimited submessage into `into` (or a fresh instance).
-    fn static _ReadSub(r, into, e, depth:int) {
-        let n:int = r.VarInt();
-        let prevLimit:int = r.PushLimit(n);
-        let m = into;
-        if (is_nil(m)) { m = Pb._NewMessage(e.msg); }
-        Pb._ReadMsg(r, m, Pb._PrepOf(e), depth + 1);
-        r.PopLimit(prevLimit);
-        return m;
-    }
-
-    fn static _ReadMapEntry(r, msg, e, depth:int) {
-        let n:int = r.VarInt();
-        let prevLimit:int = r.PushLimit(n);
-
-        // An entry may omit a default key or value; the spec has the reader
-        // supply the zero value in that case.
-        let k = Pb._ZeroFor(e.keyKind);
-        let v = Pb._ZeroFor(e.valKind);
-        while (!r.AtEnd()) {
-            let tag:int  = r.Tag();
+    fn static _DecMsg(buf:block, pos:int, end:int, msg, prep, depth:int, box:array) {
+        if (depth > 100) { Pb._TooDeep(); }
+        let info   = prep.info;
+        let tags   = prep.tags;
+        let names  = prep.names;
+        let numIdx = prep.numIdx;
+        let nIdx:int = len(numIdx);
+        var unknown = nil;
+        while (pos < end) {
+            let start:int = pos;
+            var tag:int = buf[pos];
+            if (tag < 128) { pos += 1; }
+            else { pos = Pb._VarintSlow(buf, pos, end, box); tag = box[0]; }
             let num:int  = tag >> 3;
             let wire:int = tag & 7;
-            if (num == 1 && wire == (e.kTag & 7)) {
-                k = Pb._ReadScalar(r, e.keyKind);
-            } else if (num == 2 && wire == (e.vTag & 7)) {
-                if (e.valKind == Pb.MESSAGE) { v = Pb._ReadSub(r, nil, e, depth); }
-                else                         { v = Pb._ReadScalar(r, e.valKind); }
+
+            var fi:int = -1;
+            if (num < nIdx && num > 0) {
+                fi = numIdx[num] - 1;
+            } else if (num >= nIdx) {
+                let e = prep.byNum.Get(num);
+                if (!is_nil(e)) { fi = e.index; }
+            }
+            // An unrecognised field, or one whose wire type contradicts the
+            // descriptor, is not decodable here - keep the bytes if the message
+            // retains unknowns, otherwise step over them. A packable repeated
+            // field legitimately arrives either packed or one tag per element.
+            if (fi < 0 || (tag != tags[fi] && wire + 1 != ((info[fi] >> 16) & 15))) {
+                if (num < 1) { throw(2, "Protobuf: field number 0 is not valid"); }
+                if (wire == 3 || wire == 4) { throw(2, "Protobuf: groups are not supported"); }
+                let after:int = Pb._SkipField(buf, pos, end, wire, box);
+                if (prep.hasUnknown) {
+                    if (is_nil(unknown)) { unknown = []; }
+                    Array.Append(unknown, Buffer.Slice(buf, start, after - start));
+                }
+                pos = after;
+                continue;
+            }
+
+            let f:int = info[fi];
+            let mode:int = (f >> 8) & 15;
+            if (mode >= 2) {
+                if (mode == 4) { pos = Pb._DecMapEntries(buf, pos, end, msg, fi, prep, tag, depth, box); }
+                else           { pos = Pb._DecRepeated(buf, pos, end, msg, fi, prep, tag, depth, box); }
+                continue;
+            }
+
+            let code:int = f & 255;
+            var v = nil;
+            if (code <= 3) {
+                var raw:int = 128;
+                if (pos < end) { raw = buf[pos]; }
+                if (raw < 128) {
+                    pos += 1;               // 0..127: already a valid int32 / uint32
+                } else {
+                    pos = Pb._VarintSlow(buf, pos, end, box);
+                    raw = box[0];
+                    if (code == 2)      { raw = i32(raw); }
+                    else if (code == 3) { raw = u32(raw); }
+                }
+                v = raw;
+            } else if (code == 12) {
+                var sl:int = 128;
+                if (pos < end) { sl = buf[pos]; }
+                if (sl < 128) { pos += 1; }
+                else { pos = Pb._VarintSlow(buf, pos, end, box); sl = box[0]; }
+                if (sl < 0 || pos + sl > end) { throw(2, "Protobuf: truncated string"); }
+                v = "";
+                if (sl > 0) { v = Buffer.ToString(Buffer.Slice(buf, pos, sl)); }
+                pos += sl;
+            } else if (code == 14) {
+                // Repeated occurrences of a singular message field merge, per spec.
+                let cls = prep.msgs[fi];
+                pos = Pb._DecNested(buf, pos, end, Class.GetField(msg, names[fi]), cls,
+                                    Pb._PlanOf(cls), depth, box);
+                v = box[0];
             } else {
-                r.Skip(wire);
+                pos = Pb._ReadAt(buf, pos, end, code, box);
+                v = box[0];
+            }
+            Class.SetField(msg, names[fi], v);
+            if ((f & (1 << 20)) != 0) { Pb._ClearSiblings(msg, prep, prep.fields[fi]); }
+        }
+
+        if (!is_nil(unknown)) {
+            let w = new PbWriter(32);
+            let prev = Class.GetField(msg, "_unknown");
+            if (!is_nil(prev)) { w.Raw(prev); }
+            foreach (u in unknown) { w.Raw(u); }
+            Class.SetField(msg, "_unknown", w.ToBuffer());
+        }
+    }
+
+    // One length-delimited submessage of class `cls` (plan `sub`), decoded into
+    // `into` when that is an instance of `cls`, else into a fresh one: the
+    // message goes to box[0].
+    fn static _DecNested(buf:block, pos:int, end:int, into, cls, sub, depth:int, box:array):int {
+        var n:int = 128;
+        if (pos < end) { n = buf[pos]; }
+        if (n < 128) { pos += 1; }
+        else { pos = Pb._VarintSlow(buf, pos, end, box); n = box[0]; }
+        if (n < 0 || pos + n > end) { throw(2, "Protobuf: submessage length runs past its parent"); }
+        var m = into;
+        if (is_nil(m) || Class.Of(m) != cls) { m = Pb._NewMessage(cls); }
+        Pb._DecMsg(buf, pos, pos + n, m, sub, depth + 1, box);
+        box[0] = m;
+        return pos + n;
+    }
+
+    // One occurrence of a repeated field, and - since the elements usually
+    // arrive back to back - every directly following one with the same
+    // one-byte tag.
+    fn static _DecRepeated(buf:block, pos:int, end:int, msg, fi:int, prep, tag:int, depth:int, box:array):int {
+        let name:string = prep.names[fi];
+        var arr = Class.GetField(msg, name);
+        if (is_nil(arr)) { arr = []; Class.SetField(msg, name, arr); }
+        let code:int = prep.info[fi] & 255;
+        let again:int = (tag < 128) ? tag : -1;
+        if (code == 14) {
+            let cls = prep.msgs[fi];
+            let sub = Pb._PlanOf(cls);
+            while (true) {
+                pos = Pb._DecNested(buf, pos, end, nil, cls, sub, depth, box);
+                Array.Append(arr, box[0]);
+                if (pos >= end || buf[pos] != again) { return pos; }
+                pos += 1;
             }
         }
-        r.PopLimit(prevLimit);
+        if ((tag & 7) != 2 || code >= 12) {
+            while (true) {
+                pos = Pb._ReadAt(buf, pos, end, code, box);
+                Array.Append(arr, box[0]);
+                if (pos >= end || buf[pos] != again) { return pos; }
+                pos += 1;
+            }
+        }
+        // A packed run.
+        pos = Pb._ReadAt(buf, pos, end, 1, box);
+        let n:int = box[0];
+        if (n < 0 || pos + n > end) { throw(2, "Protobuf: submessage length runs past its parent"); }
+        let stop:int = pos + n;
+        if (code <= 3) {
+            while (pos < stop) {
+                var raw:int = buf[pos];
+                if (raw < 128) { pos += 1; }
+                else { pos = Pb._VarintSlow(buf, pos, stop, box); raw = box[0]; }
+                if (code == 2)      { raw = i32(raw); }
+                else if (code == 3) { raw = u32(raw); }
+                Array.Append(arr, raw);
+            }
+            return pos;
+        }
+        while (pos < stop) {
+            pos = Pb._ReadAt(buf, pos, stop, code, box);
+            Array.Append(arr, box[0]);
+        }
+        return pos;
+    }
 
-        let m = Class.GetField(msg, e.name);
+    // One map entry, and every directly following entry of the same map with
+    // the same one-byte tag.
+    fn static _DecMapEntries(buf:block, pos:int, end:int, msg, fi:int, prep, tag:int, depth:int, box:array):int {
+        let e = prep.fields[fi];
+        let kCode:int = e.kCode;
+        let vCode:int = e.vCode;
+        let kWire:int = e.kTag & 7;
+        let vWire:int = e.vTag & 7;
+        var sub = nil;
+        if (vCode == 14) { sub = Pb._PlanOf(e.msg); }
+        var m = Class.GetField(msg, e.name);
         if (is_nil(m)) { m = {}; Class.SetField(msg, e.name, m); }
-        m[Pb._MapKeyOut(e.keyKind, k)] = v;
+        let again:int = (tag < 128) ? tag : -1;
+        while (true) {
+            pos = Pb._ReadAt(buf, pos, end, 1, box);
+            let n:int = box[0];
+            if (n < 0 || pos + n > end) { throw(2, "Protobuf: submessage length runs past its parent"); }
+            let stop:int = pos + n;
+
+            // An entry may omit a default key or value; the spec has the reader
+            // supply the zero value in that case.
+            var k = e.kZero;
+            var v = e.vZero;
+            while (pos < stop) {
+                var t:int = buf[pos];
+                if (t < 128) { pos += 1; }
+                else { pos = Pb._VarintSlow(buf, pos, stop, box); t = box[0]; }
+                let num:int  = t >> 3;
+                let wire:int = t & 7;
+                if (num == 1 && wire == kWire) {
+                    pos = Pb._ReadAt(buf, pos, stop, kCode, box);
+                    k = box[0];
+                } else if (num == 2 && wire == vWire) {
+                    if (vCode == 14) { pos = Pb._DecNested(buf, pos, stop, nil, e.msg, sub, depth, box); }
+                    else             { pos = Pb._ReadAt(buf, pos, stop, vCode, box); }
+                    v = box[0];
+                } else {
+                    pos = Pb._SkipField(buf, pos, stop, wire, box);
+                }
+            }
+            m[Pb._MapKeyOut(kCode, k)] = v;
+            pos = stop;
+            if (pos >= end || buf[pos] != again) { return pos; }
+            pos += 1;
+        }
     }
 
     fn static _ClearSiblings(msg, prep, e) {
@@ -1801,7 +2118,7 @@ class Pb
 
     // Parse one .proto file's text into a plain-data schema. Inspect it with
     // Json.Stringify, or hand it to DefineSchema.
-    fn static ParseProto(source:string, name:string|nil) {
+    fn static ParseProto(source:string, name?:string) {
         let p = new ProtoParser(source, name);
         return p.ParseFile();
     }
@@ -1809,7 +2126,7 @@ class Pb
     // Parse a .proto and every file it imports. `includes` lists the directories
     // searched; the file's own directory is always searched last. Imported
     // schemas land in `schema.deps`.
-    fn static ParseProtoFile(path:string, includes:array|nil) {
+    fn static ParseProtoFile(path:string, includes?:array) {
         let inc:array = includes ?? [Path.GetDirectoryName(path)];
         let seen = {};
         let root = Pb._ReadProto(path, seen);
@@ -2227,7 +2544,7 @@ class Pb
     // so only the built-in google/protobuf ones are followed; any other import
     // is left alone and its types simply stay unknown. Use LoadProtoFile when
     // the schema imports a file of your own.
-    fn static LoadProto(source:string, name:string|nil) {
+    fn static LoadProto(source:string, name?:string) {
         let root = Pb.ParseProto(source, name);
         root.deps = Pb._WellKnownDeps(root);
         return Pb.DefineSchema(root);
@@ -2261,7 +2578,7 @@ class Pb
     }
 
     // ParseProtoFile + DefineSchema.
-    fn static LoadProtoFile(path:string, includes:array|nil) {
+    fn static LoadProtoFile(path:string, includes?:array) {
         return Pb.DefineSchema(Pb.ParseProtoFile(path, includes));
     }
 
@@ -2474,10 +2791,10 @@ class Pb
             if (is_nil(jv))                     { Class.SetField(msg, "null_value", 0); }
             else if (jv == true || jv == false) { Class.SetField(msg, "bool_value", jv); }
             else if (Type.Is(jv, Type.String))  { Class.SetField(msg, "string_value", jv); }
-            else if (is_array(jv)) {
+            else if (Type.Is(jv, Type.Array)) {
                 Class.SetField(msg, "list_value",
                     Pb._JsonRead(jv, prep.byNum.Get(6).msg, o, depth + 1));
-            } else if (is_object(jv)) {
+            } else if (Type.Is(jv, Type.Object)) {
                 Class.SetField(msg, "struct_value",
                     Pb._JsonRead(jv, prep.byNum.Get(5).msg, o, depth + 1));
             } else {
@@ -2486,7 +2803,7 @@ class Pb
             return msg;
         }
         if (t == "Any") {
-            if (!is_object(jv) || is_nil(jv["@type"])) {
+            if (!Type.Is(jv, Type.Object) || is_nil(jv["@type"])) {
                 throw(1, "Pb.FromJson: an Any needs an \"@type\" member");
             }
             let url:string = Convert.ToString(jv["@type"]);
@@ -2620,7 +2937,7 @@ class Pb
             let wk = Pb._JsonReadWellKnown(jv, cls, prep, o, depth);
             if (!is_nil(wk)) { return wk; }
         }
-        if (!is_object(jv)) {
+        if (!Type.Is(jv, Type.Object)) {
             throw(1, "Pb.FromJson: expected a JSON object for "
                    + (prep.fqName ?? prep.name));
         }
@@ -3065,26 +3382,18 @@ class Pb
             throw(1, "Pb.Encode: expected a message instance");
         }
         let prep = Pb.Prepare(Class.Of(msg));
-        if (!prep.twoPass) {
-            let wd = new PbWriter(64);
-            Pb._WriteMsg(nil, wd, msg, prep, 0);
-            return wd.ToBuffer();
-        }
-        let ctx = Pb._NewCtx();
-        let total:int = Pb._SizeMsg(ctx, msg, prep, 0);
-        ctx.idx  = 0;
-        ctx.kidx = 0;
-        let w = new PbWriter(total > 0 ? total : 16);
-        Pb._WriteMsg(ctx, w, msg, prep, 0);
-        return w.ToBuffer();
+        let buf:block = Buffer.Create(prep.hint, 1);
+        let n:int = Pb._EncMsg(buf, 0, msg, prep, 0);
+        prep.hint = (n < 65536) ? n + 32 : 65536;
+        return Buffer.Slice(buf, 0, n);
     }
 
-    // Byte length Encode would produce, without building the bytes.
+    // Byte length Encode produces.
     fn static EncodedSize(msg):int {
         if (is_nil(msg) || !Class.IsInstance(msg)) {
             throw(1, "Pb.EncodedSize: expected a message instance");
         }
-        return Pb._SizeMsg(Pb._NewCtx(), msg, Pb.Prepare(Class.Of(msg)), 0);
+        return len(Pb.Encode(msg));
     }
 
     // A new instance of `cls` decoded from `bytes`.
@@ -3093,7 +3402,8 @@ class Pb
         let msg  = Pb._NewMessage(cls);
         if (is_nil(bytes)) { return msg; }
         let blk:block = _pb_asBlock(bytes);
-        if (len(blk) > 0) { Pb._ReadMsg(new PbReader(blk, nil, nil), msg, prep, 0); }
+        let n:int = len(blk);
+        if (n > 0) { Pb._DecMsg(blk, 0, n, msg, prep, 0, [nil]); }
         return msg;
     }
 
@@ -3106,9 +3416,8 @@ class Pb
         }
         if (is_nil(bytes)) { return msg; }
         let blk:block = _pb_asBlock(bytes);
-        if (len(blk) > 0) {
-            Pb._ReadMsg(new PbReader(blk, nil, nil), msg, Pb.Prepare(Class.Of(msg)), 0);
-        }
+        let n:int = len(blk);
+        if (n > 0) { Pb._DecMsg(blk, 0, n, msg, Pb.Prepare(Class.Of(msg)), 0, [nil]); }
         return msg;
     }
 
@@ -3124,9 +3433,11 @@ class Pb
     // One length-prefixed message off a reader positioned at the length.
     fn static DecodeDelimited(r, cls) {
         let n:int = r.VarInt();
+        let start:int = r.Position();
         let prevLimit:int = r.PushLimit(n);
         let msg = Pb._NewMessage(cls);
-        Pb._ReadMsg(r, msg, Pb.Prepare(cls), 0);
+        Pb._DecMsg(r._buf, start, start + n, msg, Pb.Prepare(cls), 0, [nil]);
+        r.Seek(start + n);
         r.PopLimit(prevLimit);
         return msg;
     }

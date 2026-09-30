@@ -20,10 +20,11 @@ Spec Revision: 2026-07-25
 7. [Functions](#7-functions)
 8. [Classes](#8-classes)
 9. [Fibers & Async](#9-fibers--async)
-10. [Analyzer & Diagnostics](#10-analyzer--diagnostics)
-11. [Debugging](#11-debugging)
-12. [10-Minute Tours](#12-10-minute-tours)
-13. [Package Manager (flarispm)](#13-package-manager-flarispm)
+10. [Working with JSON](#10-working-with-json)
+11. [Analyzer & Diagnostics](#11-analyzer--diagnostics)
+12. [Debugging](#12-debugging)
+13. [10-Minute Tours](#13-10-minute-tours)
+14. [Package Manager (flarispm)](#14-package-manager-flarispm)
 
 ---
 
@@ -36,7 +37,7 @@ Flaris is:
 - **Deterministic** - execution order is always clear and reproducible.
 - **Fast** - written in C with a compact bytecode interpreter.
 - **Embeddable** - ideal for applications, tools, servers, and games.
-- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`). Optional static analysis helps catch mistakes early. Runtime-version only without compiler and eval/compile functionality provided (flarisrt)
+- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`). Static analysis runs on every compile and catches mistakes before the program starts. A runtime-only binary (`flaris`) ships without the compiler, `VM.Eval` or `VM.Compile`.
 - **Concurrent** - fibers and async functions allow concurrency without threads.
 
 **Three core principles:**
@@ -249,7 +250,8 @@ flarisvm --require-signed --exec app.flx
 | `--stats` | Statistics (allocations, counters) |
 | `--unsafe` | Enable FFI / unsafe code |
 | `--small` | Enable strip of symbols |
-| `--strip` | Strip debug symbols (production) |
+| `-g` / `--no-strip` | Keep debug info - line numbers in stack traces (off by default) |
+| `--strip` | No debug info - the default; overrides the `-g` that `--debug` implies |
 | `--no-opt` | Disable optimizations |
 | `--no-verify` | Disable FFI library SHA-256 checks (not `library()` pins) |
 | `--require-signed` | Refuse to load any `.flx` that is unsigned, tampered, or signed by an untrusted key |
@@ -274,7 +276,7 @@ flarisvm --exec app.flx
 
 ## 3. Lexical Structure
 
-Flaris source files are UTF-8 encoded. Identifiers use ASCII letters, digits, and underscores: `[A-Za-z_][A-Za-z0-9_]*`.
+Flaris source files are UTF-8 encoded and must not contain NUL bytes. Identifiers use ASCII letters, digits, and underscores: `[A-Za-z_][A-Za-z0-9_]*`.
 
 ### Keywords
 
@@ -443,13 +445,16 @@ const PI = 3.1415926535;
 const MAX = 128;
 ```
 
-`const` prevents rebinding, but not mutation of the object itself:
+`const` is deep: neither the binding nor the object it holds can change:
 
 ```js
 const cfg = { port: 8080 };
-cfg.port = 9090;   // ✅ allowed (mutating the object)
-cfg = {};          // ❌ illegal (reassigning the binding)
+cfg.port = 9090;   // ❌ compile error 1005 (a const's properties)
+cfg = {};          // ❌ compile error 1005 (reassigning the binding)
 ```
+
+A change that reaches a const object some other way, through a function
+parameter for example, raises at run time. Use `let` for an object you mutate.
 
 **Globals**
 
@@ -481,7 +486,7 @@ Flaris is dynamically typed. Every value has a type at runtime.
 
 **Binary:** `block`, `pointer`
 
-Type annotations on function signatures are **optional** and produce warnings, not errors. They don't change runtime behavior. See **Reference R3** for the full type annotation specification.
+Type annotations are **optional**. A value the compiler can see is of the wrong type is a compile error; a value whose type is only known when the program runs is checked as it enters an annotated variable, parameter, field or return value. See **Reference R3** for the full type annotation specification.
 
 Quick example:
 
@@ -626,6 +631,22 @@ Integers, booleans, strings, and other scalar values are snapshotted when the in
 function is created. Mutating the outer variable after the inner function is created
 does not affect the captured copy.
 
+Assigning to a captured variable inside the closure changes only the closure's own
+copy. The new value persists across later calls of that closure, but the enclosing
+function never sees it:
+
+```js
+fn makeCounter() {
+    let n = 0;
+    let f = fn() { n += 1; return n; };
+    n = 100;          // f captured n = 0 above; this does not reach it
+    return f;
+}
+let c = makeCounter();
+Console.WriteLine(c());  // 1
+Console.WriteLine(c());  // 2
+```
+
 Reference types (arrays, objects) share the same heap object - mutations are visible
 through the closure:
 
@@ -700,10 +721,10 @@ fn worker(id) {
 
 - `let x;` is illegal - always provide an initializer - forces developers to set a reasonable initial value
 - `let` and `var` at the top level are illegal - use `global name = value;` at module scope
-- `const` prevents rebinding the name, not mutating the value
+- `const` prevents rebinding the name and mutating the value it holds
 - Declaring `let x` inside a function does not modify a global `x` - use `global x = value;` to declare a new global from within a function
 - Reusing the same name in nested scopes shadows the outer variable
-- `global x = value;` on an already-declared global produces a warning and redefines it - not a silent no-op
+- `global x = value;` executed again for an existing global (a function that declares it, called twice) warns and redefines it - not a silent no-op; a `VM.Eval` unit may not redefine one at all (1004)
 
 ---
 
@@ -787,25 +808,21 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 - `x && y` yields the value of `y` when `x` is truthy, otherwise `false`; `x || y` yields `true` when `x` is truthy, otherwise the value of `y`
 - `and` / `or` are exact tokenizer aliases - identical precedence and behaviour to `&&` / `||`
 
-**Increment / Decrement:** `++` `--` (postfix)
+**Increment / Decrement:** `++` `--` (prefix or postfix)
 
-`++` and `--` only work on plain variables (locals and globals). They mutate in place and **produce no value** - they cannot be used inside expressions.
+`++` and `--` work on variables (locals and globals), fields and array elements, in
+either position. They mutate in place and **produce no value** - they are statements
+and cannot be used inside expressions. The target must be numeric.
 
 ```js
 let i = 0;
 let s = "";
 i++;          // ok - i is now 1
+++i;          // ok - same thing, i is now 2
+obj.count++;  // ok
+--arr[0];     // ok
 let x = i++;  // ❌ compile error - ++ produces no value
-obj.count++;  // ❌ compile error - use obj.count += 1 instead
-arr[0]++;     // ❌ compile error - use arr[0] += 1 instead
-s++;          // ❌ compile error          
-```
-
-For member properties and array elements, use compound assignment instead:
-
-```js
-obj.count += 1;
-arr[i] -= 1;
+s++;          // ❌ compile error - '++' requires a numeric type
 ```
 
 **Null coalescing:** `x ?? y` - returns `y` only if `x` is `nil`
@@ -850,9 +867,25 @@ conn?.Close();                        // no call when conn is nil
 array[i]       // 0-based integer index
 object["key"]  // string key (equivalent to object.key)
 string[i]      // byte at index i
+block[i]       // element i of a block, as an int
 ```
 
 Null-safe: `nil[x]` returns `nil`.
+
+A block element reads back **unsigned** when the block's elements are 1, 2 or
+4 bytes wide, and as the plain 64-bit value when they are 8 bytes wide. A write
+keeps only the element's low bytes, so a byte written as `-1` reads as `255`:
+
+```js
+let b = Buffer.Create(2, 1);
+b[0] = 200;
+b[1] = -1;
+Console.WriteLine(b[0], " ", b[1]);         // 200 255
+Console.WriteLine(Buffer.ReadI8At(b, 1));   // -1: the signed view
+```
+
+For signed data - PCM samples, signed fields in a binary format - read with
+`Buffer.ReadI8At`, `Buffer.ReadI16At` or `Buffer.ReadI32At` (byte offsets).
 
 ### `guard`
 
@@ -972,7 +1005,7 @@ for (let i = 0; ; i += 1) {   // no condition - step and break inside the body
 
 ## Foreach
 
-Iterates arrays, objects, and strings. Null-safe - iterating `nil` runs zero times.
+Iterates arrays, objects, strings, and collections. Any other value, `nil` included, raises `Exception.InvalidArguments`.
 
 ```js
 foreach (item in [1, 2, 3]) {
@@ -994,8 +1027,13 @@ foreach (ch in "hello") {
 | ---------- | ----- | ------- |
 | Array | integer index | element value |
 | Object | property name (string) | property value |
-| String | character index | UTF-8 character |
-| nil | - | no iterations |
+| String | byte index | byte, as a `char` |
+| Stack, Queue, Deque, Set | index | element (a snapshot taken when the loop starts) |
+| HashMap, OrderedMap | key | value (OrderedMap: insertion order) |
+
+The loop variables need no annotation: over an `[int]`, `[float]`, `[char]` or
+`[bool]` array the value has the element type, over a string it is a `char`,
+and the index is an `int`. They cannot be assigned inside the body.
 
 ## Iter
 
@@ -1154,9 +1192,17 @@ is fine (it does not leave the `finally`).
 If no handler exists, the exception propagates up through fibers. An uncaught
 exception terminates the VM.
 
-> Note: `case <ImportedClass>:` across module boundaries is matched by value,
-> not type, for now (cross-module type resolution is a later addition); the
-> compiler warns when a switch label's type is unknown.
+`case <ImportedClass>:` is an `instanceof` test exactly like a local class.
+Labels are tried top to bottom and the first match wins, so a base class listed
+before its subclass swallows it - here the `NetworkError` arm is unreachable, and
+the compiler warns that it can never match:
+
+```js
+switch (e) {
+    case Exception:    log(e);        break;   // matches every exception
+    case NetworkError: reconnect();   break;   // never reached
+}
+```
 
 ## Import
 
@@ -1356,6 +1402,9 @@ Functions are first-class values created with `fn`. The modifiers `static`, `asy
 
 `<static> <async> <inline> fn name(<args:?type) ?:type` or `fn <static> <async> <inline> name(...)`
 
+The same modifiers work on an anonymous function, where the name is simply
+absent: `fn async (x) { ... }` or `async fn (x) { ... }`.
+
 **Argument limit** - functions accept up to 16. For larger configurations, pass an object:
 
 ```js
@@ -1391,15 +1440,21 @@ apply(greet, "Carol");  // pass as argument
 
 ### Type Annotations (optional)
 
-Type annotations on parameters and return values produce compile-time warnings, not errors:
+Type annotations on parameters and return values are checked at compile time
+where the types are known, and at run time where they are not:
 
 ```js
 fn add(a: int, b: int): int {
     return a + b;
 }
 
-add(5, 10);       // ✓ OK
-add("x", "y");    // ⚠ Warning at compile time, still runs
+add(5, 10);         // ✓ OK
+add("x", "y");      // ❌ compile error 1000 - expected int, got string
+add(Json.Parse(s), 1); // checked when called: raises InvalidArgs unless it is an int
+
+fn count(o): int {
+    return o.n;     // o is untyped: the returned value is checked, and a
+}                   // non-int raises TypeMismatch (22)
 ```
 
 Use `any` to explicitly accept all types for a parameter - this disables type checking for that parameter while still annotating the others:
@@ -1507,6 +1562,25 @@ Array.Select([1, 2, 3], fn(x) { return x * 2; });
 
 Note: type annotations **are supported** on anonymous functions as well.
 
+An anonymous function can be `async`, with the modifier on either side of `fn`.
+It behaves exactly like a named async function: calling it returns a fiber, and
+`await` works inside its body. This matters for callback-shaped code - a route
+handler, an event callback - where the function is written inline at the point
+it is passed:
+
+```js
+app.Get("/report", fn async (req) {
+    let r = await Https.GetAsync("https://api.example.com/report");
+    return Response.Json(r.body);
+});
+
+let load = async fn (path) { return await File.ReadTextAsync(path); };
+let text = await load("/etc/hosts");
+```
+
+`static` is not allowed on an anonymous function - it describes a class member,
+and there is nothing for it to attach to here.
+
 ## Arrow Functions
 
 Single-expression shorthand - the expression is automatically returned:
@@ -1544,9 +1618,12 @@ static async fn fetch(url) { ... }  // combine modifiers
 ```
 
 `inline` is a hint: the compiler expands the body at each call site when it can
-do so without changing behavior, and otherwise emits a normal call (e.g. when a
-name in the body would collide with a caller local, on deep inline recursion,
-or on arity mismatch). Restrictions: the body may contain at most one `return`,
+do so without changing behavior - with or without `--no-opt` - and otherwise
+emits a normal call: when a name in the body would collide with a caller local,
+on deep inline recursion, when the call passes more arguments than there are
+parameters (too few is fine - the missing ones are `nil`), or when an argument
+is not provably of its parameter's declared type (the normal call is what checks
+it). Restrictions: the body may contain at most one `return`,
 and only as its last statement - a `return` inside a nested block (`if`, loop,
 `try`) is a compile error. Arguments are always evaluated exactly once, left to
 right. Note that `VM.PatchFunction` does not affect call sites that were
@@ -1746,15 +1823,15 @@ class User {
 class FileHandle {
     let file = nil;
     fn Constructor(path) {
-        this.file = File.Open(path, "w");
+        this.file = Stream.Open(path, "w");
     }
 
     fn Write(text) {
-        File.Write(this.file, text);
+        Stream.WriteString(this.file, text);
     }
 
     fn Destructor() {
-        File.Close(this.file);
+        Stream.Close(this.file);
     }
 }
 
@@ -2055,6 +2132,28 @@ let f = load();   // creates a fiber, does not run yet
 
 A newly created fiber does not run until resumed.
 
+### Waiting for several fibers
+
+Because a fiber starts only when it is first resumed or awaited, awaiting
+fibers one by one runs them one after another:
+
+```js
+fn async fetch(url) { /* ... */ }
+
+let a = await fetch(urlA);   // fetch(urlB) has not started yet
+let b = await fetch(urlB);
+```
+
+`Fiber.AwaitAll` starts them all first, so their waits overlap, and returns
+every result in the order given:
+
+```js
+let results = Fiber.AwaitAll([fetch(urlA), fetch(urlB)]);
+```
+
+If any of them fails, `AwaitAll` raises the first failure in array order once
+all of them have finished.
+
 ### Resuming
 
 `Fiber.Resume(f)` - runs the fiber until it yields or returns, then resumes the caller:
@@ -2134,6 +2233,7 @@ Several standard-library functions have an `Async` variant that offloads blockin
 | `File.WriteText(path, text)` | `File.WriteTextAsync(path, text)` | File |
 | `Net.ResolveDNS(host)` | `Net.ResolveDNSAsync(host)` | Net |
 | `Os.Execute(cmd)` | `Os.ExecuteAsync(cmd)` | Os |
+| `Os.WaitTimeout(pid, ms)` | `Os.WaitAsync(pid, ms?)` | Os |
 
 Usage - call with `await` inside an async function:
 
@@ -2154,6 +2254,21 @@ Fiber.Sleep(500);   // sleep 500ms, non-blocking for other fibers
 ```
 
 Other fibers continue to run while one is sleeping.
+
+### Waiting from a plain function
+
+`await` is only allowed inside an `async` function. `Fiber.Await` does the same thing as a call, so code that is not async - a request handler chain, a callback - can still wait for a fiber without blocking the VM:
+
+```js
+fn async fetch(url) { return await Https.GetAsync(url); }
+
+fn handler(req) {                                // not async
+    let r = Fiber.Await(fetch(req.query.url));   // parks this fiber only
+    return r.body;
+}
+```
+
+It also accepts the `nil` an `*Async` built-in returns, so `Fiber.Await(File.ReadTextAsync(path))` reads a file from a plain function. An exception that escapes the awaited fiber is raised at the `Fiber.Await` call.
 
 ### Error Handling
 
@@ -2256,7 +2371,121 @@ Console.WriteLine(await outer(5));  // 11
 
 ---
 
-## 10. Analyzer & Diagnostics
+## 10. Working with JSON
+
+The `Json` module is built in - no import. It follows the JSON standard strictly
+and never guesses: invalid input gives `nil`, and `Json.LastError()` tells you
+why and where.
+
+### Parse and serialize
+
+```flaris
+let order = Json.Parse("{\"id\": 7, \"items\": [{\"sku\": \"A1\", \"price\": 9.5}]}");
+Console.WriteLine(order.items[0].sku);          // A1
+
+let text = Json.Stringify(order);              // compact
+let pretty = Json.Stringify(order, true);      // 2-space indent
+let custom = Json.Stringify(order, { indent: 4, sortKeys: true });
+```
+
+Numbers keep their kind: `7` parses as an `int`, `9.5` as a `float`, and a
+float is written so it parses back as the same float (`1.0` stays `1.0`,
+`0.1` stays `0.1`). A value that has no JSON form - NaN, a function - becomes
+`null`.
+
+### When parsing fails
+
+`Parse` returns `nil` for invalid input - and also for the valid document
+`null`. When the difference matters, check the error:
+
+```flaris
+let v = Json.Parse(body);
+if (v == nil) {
+    let e = Json.LastError();
+    if (e != nil) {
+        Console.WriteLine("bad JSON at line ", e.line, ", column ", e.column, ": ", e.message);
+        return nil;
+    }
+}
+```
+
+A document that is valid but too large (over 4 million values, or a string
+over 128 MB) raises instead of returning `nil`, so it cannot pass as "no data".
+
+### Mapping JSON onto a class
+
+`Deserialize` fills the fields of a class by name - handy for request bodies
+and config files. Each value must fit the field's type, which is taken from the
+field's default:
+
+```flaris
+class Item {
+    let sku = "";
+    let price = 0.0;
+    let tags: [string] = nil;
+}
+
+let items = Json.Deserialize("[{\"sku\": \"A1\", \"price\": 9}]", Item);
+Console.WriteLine(type(items[0].price) == Type.Float); // true - an int fits a float field
+
+let bad = Json.Deserialize("{\"price\": \"cheap\"}", Item);
+Console.WriteLine(bad == nil, " ", Json.LastError().message);
+// true field 'price' expects a number, got a string
+```
+
+Unknown keys are ignored and missing ones keep their defaults; the constructor
+is not run. `Json.Stringify(instance)` writes the fields back out.
+
+### Reaching into a document
+
+Paths use JSONPath syntax (or a JSON Pointer when they start with `/`):
+
+```flaris
+let doc = Json.Parse(text);
+Json.Find("items[0].sku", doc);                // "A1"
+Json.Find("items[-1].price", doc);             // last item
+Json.Find("items[*].sku", doc);                // every sku, as an array
+Json.Find("$..price", doc);                    // every price, at any depth
+Json.Find("/items/0/sku", doc);                // JSON Pointer
+Json.Exists("items[*].discount", doc);         // false unless one has it
+
+Json.Set(doc, "meta.source", "import");        // creates `meta`
+Json.Remove(doc, "items[0]");
+```
+
+`Json.FastSelect(path, text)` answers a path straight from the text without
+building the whole tree - the fast choice for pulling one field out of a large
+response you otherwise do not need.
+
+### Changing documents
+
+```flaris
+// RFC 7386 merge-patch: null deletes, objects merge, the rest replaces
+Json.Merge(settings, { theme: "dark", beta: nil });
+
+// RFC 6902 JSON Patch: returns a patched copy, or nil if any step fails
+let next = Json.Patch(doc, [
+    { op: "replace", path: "/items/0/price", value: 8.5 },
+    { op: "add", path: "/items/-", value: { sku: "B2", price: 3.0 } }
+]);
+```
+
+`Set`, `Remove` and `Merge` change the value in place and refuse (raising
+`ConstAssign`) to touch a `const` or `Object.Freeze`d value; `Patch` works on
+a copy, so it can take a frozen one.
+
+### Canonical form, formatting, NDJSON
+
+- `Json.Canonicalize(v)` - RFC 8785 canonical JSON: the same bytes for equal
+  values however they were built, for hashing and signatures.
+- `Json.Format(text)` / `Json.Minify(text)` - re-lay out JSON text without
+  changing a single number or escape; `nil` if the text is not valid JSON.
+- `Json.ParseLines(text)` / `Json.StringifyLines(array)` - newline-delimited
+  JSON (one value per line), as used by log pipelines and streaming APIs.
+
+---
+
+## 11. Analyzer & Diagnostics
 
 After parsing, Flaris runs a semantic analyzer. It resolves names, builds scopes, validates language rules, and emits helpful errors and warnings before bytecode is generated.
 
@@ -2333,12 +2562,13 @@ by source position.
 
 **Symptom**
 
-- `Cannot assign to const 'X'.`
+- `Cannot modify const 'X' or its properties.`
 
 **Fix**
 
-- Use `let` if rebinding is intended.
-- Keep `const` if you only mutate object contents (e.g., `cfg.port = 1;` is OK) but do not rebind `cfg`.
+- `const` is deep: neither the binding nor its properties or elements can be
+  changed, so `cfg.port = 1;` on a `const cfg` is this error too.
+- Use `let` for a value you rebind or mutate.
 
 ### Missing return on some paths
 
@@ -2384,19 +2614,19 @@ to `a.b` or `a[i]`. If none of these fit, cast: `let ok: int = (int)a;`.
 
 **Symptom**
 
-- `Invalid assignment (produces no output) in if-statement` (also `in while-statement`, `in for condition-statement`)
+- `Assignment used as the 'if' condition; use '==' to compare.` (also `'while'` and `'for'`)
 
 **Fix**
-Assignments do not produce values in compiled bytecode. Rewrite:
+
+An assignment that is the whole condition is almost always a typo for `==`.
+To assign and test in one step, make the assignment an operand of the test:
 
 ```js
 // bad
 if (x = get()) { ... }
 
 // good
-let tmp = get();
-x = tmp;
-if (tmp) { ... }
+while ((line = Next()) != nil) { ... }
 ```
 
 ### Common Warnings and Fixes
@@ -2475,7 +2705,7 @@ if (tmp) { ... }
   `|` and `^` run on integers only and never widen to float. `+` is never
   reported: it falls back to string concatenation for any operand pair.
 
-## 11. Debugging
+## 12. Debugging
 
 Flaris debugging is built directly into the language and VM. No external debugger
 required - and no separate adapter process either: the VM speaks the Debug
@@ -2517,17 +2747,20 @@ or in a container.
 
 ### Debug Symbols
 
-Debug symbols map VM instructions back to source code (file, line, function). Enabled by default.
+Debug info maps VM instructions back to source lines. It is **off** by default;
+`-g` (alias `--no-strip`) turns it on, and `--debug` / `--dap` turn it on for you.
 
 ```bash
-flarisvm script.fls            # symbols enabled (default)
-flarisvm script.fls --strip         # strip symbols for production
+flarisvm script.fls            # no debug info (default)
+flarisvm -g script.fls         # line numbers in stack traces
 ```
 
-With symbols: error messages show file, line, and function name.  
-Without symbols: errors show only memory addresses.
+Function and file names are always recorded, so a stack trace names every frame
+either way. Without `-g` every frame reports line 0; with it, the real line
+(lines past 65,535 all report 65,535).
 
-Overhead is minimal (~5-10% bytecode size, ~2-3% runtime).
+Overhead: a compiled `.flx` grows by typically 7-17%, and each source line in a
+hot loop costs one extra dispatch per iteration when the code is interpreted.
 
 ### Breakpoints
 
@@ -2716,13 +2949,13 @@ flarisvm script.fls --verbose --time
 # Development - all debug features
 flarisvm script.fls --verbose --time
 
-# Production - stripped, fast (compiled with --small and --strip )
+# Production - no debug info (the default), compiled with --small
 flarisvm --exec app.flx 
 ```
 
 ## Best Practices
 
-- Always keep debug symbols during development (default, don't use `--strip`)
+- Run with `-g` during development so stack traces carry line numbers
 - Use meaningful breakpoint codes - treat them as documentation
 - Combine `--verbose` + `breakpoint` for step-through investigation
 - Use `Debug.Assert` liberally in test code
@@ -2732,7 +2965,7 @@ flarisvm --exec app.flx
 
 ---
 
-## 12. 10-Minute Tours
+## 13. 10-Minute Tours
 
 These tours help you get productive quickly if you're coming from another language.
 
@@ -2915,7 +3148,7 @@ x++;
 
 // Flaris
 let x = 10;
-x += 1;     // or: x++ (postfix only, no prefix ++)
+x += 1;     // or: x++ / ++x (a statement, not an expression)
 ```
 
 **Arrays:**
@@ -3017,7 +3250,7 @@ const MAX: i32 = 100;
 
 ```js
 let x = 10;
-x += 1;     // or: x++ (postfix only, no prefix ++)
+x += 1;     // or: x++ / ++x (a statement, not an expression)
 const MAX = 100;
 // All variables are mutable unless const. No type annotations required.
 ```
@@ -3108,7 +3341,7 @@ Think of Flaris as **a safe, dynamic VM - not a systems language**.
 
 ---
 
-## 13. Package Manager (flarispm)
+## 14. Package Manager (flarispm)
 
 `flarispm` is the official Flaris package manager - written entirely in Flaris itself. It installs third-party libraries from any public or private git repository (or from a direct `.flx` URL), compiles them to `.flx` bytecode, and places them in the per-user library directory (`~/.flaris/libs`, or `$FLARIS_LIBS`) where `flarisvm` resolves them automatically - no `--libs` flag needed.
 
