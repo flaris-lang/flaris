@@ -235,11 +235,6 @@ global _RANK_SCHEMA = nil;
 // Methods in the order a path item conventionally lists them.
 global _METHOD_ORDER = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
 
-// Documents currently served through Serve(), by key. The route handlers hold
-// only the key, so a Router never references the OpenApi that references it.
-global _servedRegistry = {};
-global _servedNext:int = 1;
-
 global _STATUS_TEXT = {
     "100": "Continue", "101": "Switching Protocols",
     "200": "OK", "201": "Created", "202": "Accepted", "204": "No Content",
@@ -351,14 +346,10 @@ fn _jsString(s:string): string {
     return String.Replace(Json.Stringify(s), "<", "\\u003c");
 }
 
-// Route handlers registered by Serve() land here with the registry key.
-fn _serveFromRegistry(key:string, what:string, req) {
-    let api = Object.TryGet(_servedRegistry, key, nil);
-    if (api == nil) {
-        return { status: 410, headers: { "Content-Type": "application/json" },
-                 body: Json.Stringify({ error: "This API documentation is no longer served" }) };
-    }
-    return (what == "spec") ? api._serveSpec(req) : api._serveDocs(req);
+// What the spec and docs routes answer once the document is unserved.
+fn _gone() {
+    return { status: 410, headers: { "Content-Type": "application/json" },
+             body: Json.Stringify({ error: "This API documentation is no longer served" }) };
 }
 
 fn _pascal(s:string): string {
@@ -1295,9 +1286,11 @@ class OpenApi
     let _extensions      = nil;   // _Ordered: "x-..." -> value
     let _componentsExtra = nil;   // other components.* sections, kept verbatim
     let _rootExtra       = nil;   // other root keys (webhooks, jsonSchemaDialect)
+    // A weak handle: the Router's handlers hold this document, so the document
+    // must not hold the Router, or neither could ever be freed.
     let _router          = nil;
     let _serveOpts       = nil;   // Serve() options while served, else nil
-    let _serveKey        = "";
+    let _detached:bool   = false; // Unserve() was called: routes answer 410, middleware passes through
     let _cacheJson       = nil;   // rendered document, its ETag and the docs page
     let _cacheEtag       = nil;
     let _cacheHtml       = nil;
@@ -1319,7 +1312,7 @@ class OpenApi
 
     fn static For(router, info?) {
         let api = new OpenApi(info);
-        api._router = router;
+        api._router = weak(router);
         return api;
     }
 
@@ -1442,7 +1435,8 @@ class OpenApi
 
     fn Group(prefix:string, opts?) {
         let tags = this._groupTags(opts);
-        let rg   = (_router != nil) ? _router.Group(prefix) : nil;
+        let r    = this._r();
+        let rg   = (r != nil) ? r.Group(prefix) : nil;
         return new OpenApiGroup(this, prefix, tags, rg);
     }
 
@@ -1487,13 +1481,20 @@ class OpenApi
     }
 
     fn _register(method:string, pattern:string, handler:fn) {
-        if (_router == nil) { return; }
-        if (method == "get")         { _router.Get(pattern, handler); }
-        else if (method == "post")   { _router.Post(pattern, handler); }
-        else if (method == "put")    { _router.Put(pattern, handler); }
-        else if (method == "patch")  { _router.Patch(pattern, handler); }
-        else if (method == "delete") { _router.Delete(pattern, handler); }
-        else if (method == "head")   { _router.Head(pattern, handler); }
+        let r = this._r();
+        if (r == nil) { return; }
+        if (method == "get")         { r.Get(pattern, handler); }
+        else if (method == "post")   { r.Post(pattern, handler); }
+        else if (method == "put")    { r.Put(pattern, handler); }
+        else if (method == "patch")  { r.Patch(pattern, handler); }
+        else if (method == "delete") { r.Delete(pattern, handler); }
+        else if (method == "head")   { r.Head(pattern, handler); }
+    }
+
+    // The attached Router, or nil when the document was created without one or
+    // the Router has since been released.
+    fn _r() {
+        return (_router != nil) ? Weak.Get(_router) : nil;
     }
 
     // Router pattern -> OpenAPI path template plus the path parameter names.
@@ -1869,7 +1870,7 @@ class OpenApi
     // sorted by path and method, so the result does not depend on hash order.
     fn Discover(router?) {
         this._touch();
-        let target = router ?? _router;
+        let target = router ?? this._r();
         if (target == nil) { return this; }
         let found = [];
         foreach (route in Object.Values(target._exact)) { Array.Append(found, route); }
@@ -1900,7 +1901,8 @@ class OpenApi
     // ---- serving ----
 
     fn Serve(opts?) {
-        if (_router == nil) {
+        let r = this._r();
+        if (r == nil) {
             throw(Exception.InvalidArguments,
                   "OpenApi.Serve needs a Router - create the document with OpenApi.For(router, info)");
         }
@@ -1915,18 +1917,17 @@ class OpenApi
             cors:     o.cors != false
         };
         this._touch();
-        let key = this._ensureKey();
-        _router.Get(_serveOpts.specPath, fn(req) { return _serveFromRegistry(key, "spec", req); });
+        _detached = false;
+        let me = this;
+        r.Get(_serveOpts.specPath, fn(req) { return me._serveSpec(req); });
         if (_serveOpts.ui != false && _serveOpts.ui != nil) {
-            _router.Get(_serveOpts.docsPath, fn(req) { return _serveFromRegistry(key, "docs", req); });
+            r.Get(_serveOpts.docsPath, fn(req) { return me._serveDocs(req); });
         }
         return this;
     }
 
     fn Unserve() {
-        if (_serveKey != "" && Object.HasKey(_servedRegistry, _serveKey)) {
-            Object.Delete(_servedRegistry, _serveKey);
-        }
+        _detached = true;
         return this;
     }
 
@@ -1938,6 +1939,7 @@ class OpenApi
     }
 
     fn _serveSpec(req) {
+        if (_detached) { return _gone(); }
         if (_cacheJson == nil) {
             _cacheJson = this.ToJson(_serveOpts.pretty);
             _cacheEtag = "\"" + String.Substr(Hash.Sha256(_cacheJson), 0, 32) + "\"";
@@ -1951,6 +1953,7 @@ class OpenApi
     }
 
     fn _serveDocs(_req) {
+        if (_detached) { return _gone(); }
         if (_cacheHtml == nil) {
             let o = { title: _serveOpts.title ?? _info.title ?? "API", cdn: _serveOpts.cdn };
             if (_serveOpts.ui == "swagger")    { _cacheHtml = OpenApi.SwaggerHtml(_serveOpts.specPath, o); }
@@ -2003,7 +2006,7 @@ class OpenApi
         let doc = Type.IsString(json) ? Json.Parse(json) : json;
         if (!Type.IsObject(doc)) { throw(Exception.InvalidArguments, "OpenApi.Load: expected a JSON object"); }
         let api = new OpenApi(nil);
-        api._router = router ?? nil;
+        api._router = (router != nil) ? weak(router) : nil;
         if (Type.IsString(doc.openapi)) { api._openapi = doc.openapi; }
         if (Type.IsObject(doc.info))    { api._info = doc.info; }
         if (Type.IsArray(doc.servers))  { api._servers = doc.servers; }
@@ -2307,15 +2310,6 @@ class OpenApi
         return nil;
     }
 
-    fn _ensureKey(): string {
-        if (_serveKey == "") {
-            _serveKey = str(_servedNext);
-            _servedNext += 1;
-        }
-        _servedRegistry[_serveKey] = this;
-        return _serveKey;
-    }
-
     // components.schemas as plain objects, for $ref resolution.
     fn _plainSchemas() {
         if (_cacheSchemas == nil) { _cacheSchemas = _plain(_schemas); }
@@ -2368,13 +2362,13 @@ class OpenApi
     // operation before the handler runs. opts: { status: 400, coerce: true,
     // responses: false }. Undocumented routes pass through untouched.
     fn Validate(opts?) {
-        let key = this._ensureKey();
+        _detached = false;
         let o = opts ?? {};
         let cfg = { status: o.status ?? 400, coerce: o.coerce != false, responses: o.responses == true };
+        let me = this;
         return fn(req, next) {
-            let api = Object.TryGet(_servedRegistry, key, nil);
-            if (api == nil) { return next(req); }
-            return api._validateRequest(req, next, cfg);
+            if (me._detached) { return next(req); }
+            return me._validateRequest(req, next, cfg);
         };
     }
 
@@ -2495,14 +2489,14 @@ class OpenApi
     // opts: { maxSamples: 50, examples: false, query: true, bodies: true,
     //         responses: true }
     fn Learn(opts?) {
-        let key = this._ensureKey();
+        _detached = false;
         let o = opts ?? {};
         let cfg = { maxSamples: o.maxSamples ?? 50, examples: o.examples == true,
                     query: o.query != false, bodies: o.bodies != false, responses: o.responses != false };
+        let me = this;
         return fn(req, next) {
             let resp = next(req);
-            let api = Object.TryGet(_servedRegistry, key, nil);
-            if (api != nil) { api._learn(req, resp, cfg); }
+            if (!me._detached) { me._learn(req, resp, cfg); }
             return resp;
         };
     }
@@ -2650,7 +2644,7 @@ class OpenApi
     // opts: { values: { paramName: value }, headers: {}, bodies: { operationId: body },
     //         only: [operationId], skip: [operationId] }
     fn Contract(opts?) {
-        if (_router == nil) {
+        if (this._r() == nil) {
             throw(Exception.InvalidArguments, "OpenApi.Contract needs a Router - create the document with OpenApi.For(router, info)");
         }
         let o = opts ?? {};
@@ -2701,7 +2695,7 @@ class OpenApi
                     headers: headers, cookies: {}, form: {}, peer: "127.0.0.1:0", secure: false, body: body };
         let errors = [];
         var resp = nil;
-        try { resp = _router._dispatch(req); }
+        try { resp = this._r()._dispatch(req); }
         catch (e) { _fail(errors, "handler", "raised: " + e.Error); }
         if (resp == nil) {
             if (len(errors) == 0) { _fail(errors, "handler", "returned nil"); }

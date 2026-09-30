@@ -1,0 +1,254 @@
+// test_ssh.fls - Tests for Ssh.fls
+// Run: flarisvm tests/test_ssh.fls --libs='./libs'
+//
+// Key parsing and the failure paths need nothing installed: they run against
+// fake servers on loopback. The live part is skipped unless you point it at
+// an SSH server of your own that accepts a password or public-key login - a
+// Linux box, a virtual machine, a router you administer - through these
+// environment variables:
+//
+//   SSH_TEST_HOST      the server's name or address              (required)
+//   SSH_TEST_PORT      its port                                  (default 22)
+//   SSH_TEST_USER      login name                                (default root)
+//   SSH_TEST_PASSWORD  password, for password authentication
+//   SSH_TEST_KEY       path to an unencrypted ssh-ed25519 private key whose
+//                      public line is in the server's authorized_keys
+//   SSH_TEST_HOSTKEY   "ssh-ed25519 AAAA..." as your known_hosts has it, to
+//                      pin the server; this also enables the wrong-pin check
+//
+//   SSH_TEST_HOST=10.0.0.5 SSH_TEST_USER=alice SSH_TEST_PASSWORD=secret \
+//       flarisvm tests/test_ssh.fls --libs='./libs'
+//
+// The server must offer curve25519-sha256, ssh-ed25519 and
+// chacha20-poly1305@openssh.com, which OpenSSH and Dropbear do by default.
+// Use a server you own: the test deliberately logs in with a wrong password
+// and a wrong host-key pin, which a shared or production server may log or
+// rate-limit.
+
+import { SshClient, SshKey } from library("Ssh", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+// A throwaway key made with ssh-keygen for this file; it authorises nothing.
+const FIXTURE_KEY = """
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDK5wFKSexS02bRdu2QxLzwom9BUD2o/6vwA04h+eklWAAAAJBP0A9dT9AP
+XQAAAAtzc2gtZWQyNTUxOQAAACDK5wFKSexS02bRdu2QxLzwom9BUD2o/6vwA04h+eklWA
+AAAEA0cP5WBQE0vxouFCW6/6bDRj+OyXt9Vr8jJW/LNTR6B8rnAUpJ7FLTZtF27ZDEvPCi
+b0FQPaj/q/ADTiH56SVYAAAADHRlc3QtZml4dHVyZQE=
+-----END OPENSSH PRIVATE KEY-----
+""";
+const FIXTURE_PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMrnAUpJ7FLTZtF27ZDEvPCib0FQPaj/q/ADTiH56SVY";
+
+fn hexOf(b): string {
+    let out = "";
+    iter (i from 0 to len(b)) {
+        let h = Convert.ToRadixString(Buffer.ReadU8At(b, i), 16);
+        out = out + ((String.Length(h) < 2) ? "0" + h : h);
+    }
+    return out;
+}
+
+fn test_key_parse() {
+    Console.WriteLine("== SshKey ==");
+    let key = SshKey.Parse(FIXTURE_KEY);
+    check(key != nil, "the fixture key parses");
+    if (key == nil) { return; }
+    checkEq(len(key.publicKey), 32, "public key is 32 bytes");
+    checkEq(len(key.secretKey), 64, "secret key is 64 bytes");
+    check(Buffer.Equals(Buffer.Slice(key.secretKey, 32, 32), key.publicKey), "secret key carries the public half");
+    checkEq(SshKey.PublicLine(key), FIXTURE_PUB, "PublicLine matches what ssh-keygen wrote");
+    checkEq(SshKey.PublicLine(key, "me@box"), FIXTURE_PUB + " me@box", "PublicLine appends the comment");
+
+    // The parsed key signs with the RFC 8032 Ed25519 the server will verify.
+    let sig = Crypto.Ed25519Sign(hexOf(key.secretKey), "hello");
+    check(Crypto.Ed25519Verify(sig, hexOf(key.publicKey), "hello"), "the key signs and verifies");
+
+    checkEq(SshKey.Parse("not a key"), nil, "plain text is not a key");
+    checkEq(SshKey.Parse("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----"), nil, "a truncated body is refused");
+    let encrypted = String.Replace(FIXTURE_KEY, "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU", "b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHI");
+    checkEq(SshKey.Parse(encrypted), nil, "an encrypted container is refused");
+}
+
+fn test_options() {
+    Console.WriteLine("== options ==");
+    let noUser = new SshClient("127.0.0.1", 1, {});
+    let r = noUser.Connect();
+    checkEq(r.ok, false, "no user: refused");
+    checkEq(r.errorKind, "auth", "no user: kind auth");
+
+    let refused = new SshClient("127.0.0.1", 1, { user: "x", password: "y" });
+    let rr = refused.Connect();
+    checkEq(rr.ok, false, "closed port: refused");
+    checkEq(rr.errorKind, "connect", "closed port: kind connect");
+    checkEq(refused.IsConnected(), false, "not connected afterwards");
+
+    let ex = refused.Exec("true");
+    checkEq(ex.ok, false, "Exec without a connection fails");
+    checkEq(ex.errorKind, "closed", "Exec without a connection: kind closed");
+    checkEq(ex.exitStatus, -1, "and reports no exit status");
+    checkEq(refused.HostKey(), nil, "no host key before a connection");
+}
+
+// A server that greets with `banner` and then does `after`: "close",
+// "silence" or "garbage". Returns the port.
+fn fakeServer(banner: string, after: string): int {
+    let port = 43000 + Math.RandomInt(0, 2000);
+    let ls = Stream.Listen("tcp", port);
+    if (ls == nil) { return 0; }
+    Fiber.Run(fn() {
+        if (Stream.WaitReadable(ls, 5000) != nil) {
+            let c = Stream.Accept(ls);
+            if (c != nil) {
+                Stream.WriteAll(c, banner);
+                if (after == "garbage") {
+                    Stream.WaitReadable(c, 2000);
+                    Stream.WriteAll(c, String.Repeat("\x01", 64));
+                    Fiber.Sleep(200);
+                } else if (after == "silence") {
+                    Fiber.Sleep(1500);
+                }
+                Stream.Close(c);
+            }
+        }
+        Stream.Close(ls);
+    });
+    Fiber.Sleep(20);
+    return port;
+}
+
+fn test_fake_servers() {
+    Console.WriteLine("== fake servers ==");
+    let p1 = fakeServer("HTTP/1.0 200 OK\r\n\r\n", "close");
+    let a = new SshClient("127.0.0.1", p1, { user: "x", password: "y", timeoutMs: 1000 });
+    let ra = a.Connect();
+    checkEq(ra.ok, false, "an HTTP server is not SSH");
+    check(ra.errorKind == "protocol" || ra.errorKind == "closed", "HTTP server: protocol or closed, got " + str(ra.errorKind));
+
+    let p2 = fakeServer("SSH-1.5-old\r\n", "close");
+    let b = new SshClient("127.0.0.1", p2, { user: "x", password: "y", timeoutMs: 1000 });
+    let rb = b.Connect();
+    checkEq(rb.ok, false, "SSH-1 is refused");
+    checkEq(rb.errorKind, "protocol", "SSH-1: kind protocol");
+
+    let p3 = fakeServer("SSH-2.0-quiet\r\n", "silence");
+    let c = new SshClient("127.0.0.1", p3, { user: "x", password: "y", timeoutMs: 300 });
+    let rc = c.Connect();
+    checkEq(rc.ok, false, "a silent server times out");
+    checkEq(rc.errorKind, "timeout", "silent server: kind timeout");
+
+    let p4 = fakeServer("banner line\r\nSSH-2.0-garbage\r\n", "garbage");
+    let d = new SshClient("127.0.0.1", p4, { user: "x", password: "y", timeoutMs: 1000 });
+    let rd = d.Connect();
+    checkEq(rd.ok, false, "garbage after the version is refused");
+    check(rd.errorKind == "protocol" || rd.errorKind == "closed" || rd.errorKind == "timeout",
+          "garbage: protocol, closed or timeout, got " + str(rd.errorKind));
+}
+
+fn test_live() {
+    let host = Os.GetEnv("SSH_TEST_HOST");
+    if (host == nil || host == "") {
+        Console.WriteLine("== live (skipped: SSH_TEST_HOST not set) ==");
+        return;
+    }
+    Console.WriteLine("== live against " + host + " ==");
+    let opts = { user: Os.GetEnv("SSH_TEST_USER") ?? "root", timeoutMs: 8000 };
+    let keyFile = Os.GetEnv("SSH_TEST_KEY");
+    if (keyFile != nil && keyFile != "") { opts["keyFile"] = keyFile; }
+    let pw = Os.GetEnv("SSH_TEST_PASSWORD");
+    if (pw != nil && pw != "") { opts["password"] = pw; }
+    let pin = Os.GetEnv("SSH_TEST_HOSTKEY");
+    if (pin != nil && pin != "") { opts["hostKey"] = pin; }
+    let port = Convert.ParseInt(Os.GetEnv("SSH_TEST_PORT") ?? "22") ?? 22;
+
+    let ssh = new SshClient(host, port, opts);
+    let c = ssh.Connect();
+    check(c.ok, "connects: " + str(c.error ?? ""));
+    if (!c.ok) { return; }
+    check(String.StartsWith(c.hostKey, "ssh-ed25519 "), "reports the host key");
+
+    let r = ssh.Exec("echo out; echo err 1>&2; exit 3");
+    check(r.ok, "exec runs");
+    checkEq(r.stdout, "out\n", "stdout collected");
+    checkEq(r.stderr, "err\n", "stderr collected");
+    checkEq(r.exitStatus, 3, "exit status reported");
+
+    let big = ssh.Exec("head -c 300000 /dev/zero | tr '\\0' 'x' | wc -c");
+    checkEq(String.Trim(big.stdout), "300000", "300 KB of output crosses the window adjust");
+    let zero = ssh.Exec("head -c 5000 /dev/zero");
+    checkEq(String.Length(zero.stdout), 5000, "NUL bytes survive");
+    ssh.Close();
+    checkEq(ssh.IsConnected(), false, "closed");
+
+    if (pin != nil && pin != "") {
+        let wrong = new SshClient(host, port, { user: opts.user, keyFile: keyFile, password: pw,
+            hostKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
+        let w = wrong.Connect();
+        checkEq(w.errorKind, "hostkey", "a wrong pin is refused before authentication");
+    }
+    let bad = new SshClient(host, port, { user: opts.user, password: "definitely-not-the-password" });
+    let b = bad.Connect();
+    checkEq(b.errorKind, "auth", "a wrong password is an auth failure");
+}
+
+fn Main() {
+    test_key_parse();
+    test_options();
+    test_fake_servers();
+    test_live();
+
+    Console.WriteLine("\nTests run: " + str(testsRun) + ", failed: " + str(testsFailed));
+
+    Console.WriteLine("\n\n=== Ssh Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+    bench("SshKey.Parse  fixture key", fn() {
+        _sink += len(SshKey.Parse(FIXTURE_KEY).publicKey);
+    }, 2000);
+    let key = SshKey.Parse(FIXTURE_KEY);
+    bench("SshKey.PublicLine", fn() {
+        _sink += String.Length(SshKey.PublicLine(key));
+    }, 2000);
+    bench("Connect  refused port (error path)", fn() {
+        let s = new SshClient("127.0.0.1", 1, { user: "x", password: "y" });
+        _sink += s.Connect().ok ? 1 : 0;
+    }, 200);
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

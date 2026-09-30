@@ -433,7 +433,7 @@ Magic is the four ASCII bytes `FLS2`. Total header size: 192 bytes
 | 72 | 4 | `codeEnd` | u32 | = `mainSectionEnd` in the current writer |
 | 76 | 4 | `mainSectionEnd` | u32 | |
 | 80 | 2 | — | | reserved; MUST be zero, a reader MUST reject nonzero |
-| 82 | 1 | `sigAlg` | u8 | 0 = unsigned, 1 = retired legacy Ed25519 (MUST be rejected), 2 = Ed25519 (§5.3). Any other value MUST be rejected |
+| 82 | 1 | `sigAlg` | u8 | 0 = unsigned, 1 and 2 = retired schemes (MUST be rejected), 3 = Ed25519 (§5.3). Any other value MUST be rejected |
 | 83 | 1 | — | | reserved; MUST be zero, a reader MUST reject nonzero |
 | 84 | 32 | `pubkey` | raw | Ed25519 public key; all-zero when unsigned |
 | 116 | 64 | `signature` | raw | Ed25519 signature; all-zero when unsigned |
@@ -447,8 +447,10 @@ extensibility only.
 
 ### 5.3 Signature and trust
 
-**Algorithm.** Ed25519 (as in RFC 8032; the reference implementation uses
-Monocypher). The 64-byte secret key is `seed ‖ pubkey`.
+**Algorithm.** Ed25519 as in RFC 8032, with SHA-512. The 64-byte secret key
+is `seed ‖ pubkey`; a signer derives the public half from the seed, so the
+header always carries the key this scheme gives that seed. Scheme 2 used the
+same curve arithmetic with BLAKE2b in place of SHA-512 and is retired.
 
 **Signed content.** `digest = SHA-256( file[0..116) ‖ 64 zero bytes ‖
 file[180..EOF) )` — the entire file with the 64-byte signature field masked to
@@ -472,11 +474,11 @@ the **complete final file including the signature** — identical to
 one of: `UNSIGNED` (sigAlg 0, key/sig fields zero), `VALID` (cryptographically
 valid, signer not trusted), `TRUSTED` (valid and signer key in the trust set),
 `BAD` (signature check failed), `STRIPPED` (sigAlg 0 but key/signature bytes
-nonzero — tamper evidence), `UNSUPPORTED` (sigAlg 1 or any unknown value).
+nonzero — tamper evidence), `UNSUPPORTED` (sigAlg 1, 2 or any unknown value).
 `BAD`, `STRIPPED` and `UNSUPPORTED` MUST always be rejected. `UNSIGNED` and
 `VALID` are rejected only under `--require-signed`. All rejects exit with code
 4. The reference trust set is one built-in anchor (`flaris-lang.org`,
-`b6e2237413be79854985a1d4650ddefca8bc9c517964e6b9814b887bc6b779be`) plus
+`d43ec4260fe82ee101a939caabff95358b0698718d7b8c38652b5457bdf59621`) plus
 `~/.flaris/trusted_keys` (path override `$FLARIS_TRUSTED_KEYS`; one
 `hex64 [label]` per line, `#` comments, ≤ 256 keys, unreadable file = fail
 closed).

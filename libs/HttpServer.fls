@@ -79,6 +79,8 @@
 //                            the handler to pull - see Uploads
 //       maxUploadBytes       ceiling for a streamed body        (default 0 = none)
 //       serverName           Server: header                    (default "Flaris")
+//       timing               per-request phase times           (default false)
+//                            see Timing below
 //       tls                  AcceptTls options -> serve HTTPS  (default nil)
 //                            { pkcs12File, password } on any platform, or
 //                            { certFile, keyFile } (PEM, OpenSSL only);
@@ -92,7 +94,9 @@
 //   .OnError(handler)          - fn(req, res, err); default sends a 500
 //   .OnTlsError(handler)       - fn(peer, message); default drops silently
 //   .OnAccess(handler)         - fn(entry) once per completed request; pair
-//                                with HttpStatus.CombinedLogLine(entry)
+//                                with HttpStatus.CombinedLogLine(entry).
+//                                With { timing: true } the entry also carries
+//                                `timing` - see Timing below
 //                                OnError, OnTlsError and OnAccess may be
 //                                `fn async` (they are awaited). One that throws
 //                                is contained: the exception is dropped and
@@ -157,6 +161,25 @@
 //   .Sent()                  - true once the response has been written
 //   .Hijack()                - take the raw socket; the server stops managing
 //                              the connection entirely (protocol upgrades)
+//   .Mark(name)              - close a timing phase under name (see Timing);
+//                              a no-op unless the server times requests
+//   .Timing()                - the phases so far, or nil when not timing
+//
+// Timing:
+//   { timing: true } measures every request in phases: `read` (request line,
+//   headers and body off the socket), `route` (matching, up to the moment a
+//   handler runs), then `handler` (until the response head is written). A
+//   handler may split its own time with res.Mark("db") - each mark closes a
+//   phase of that name, and whatever follows still ends as `handler`. The
+//   phases go out as a Server-Timing header, which browser dev tools show
+//   next to the request:
+//
+//       Server-Timing: read;dur=0.31, route;dur=0.05, db;dur=4.20, handler;dur=0.62
+//
+//   and the OnAccess entry carries the same figures plus `total` (through the
+//   last byte written) as `timing`, an object of milliseconds. Router marks
+//   `route` itself, so a routed app sees its middleware and handler under
+//   `handler`. Off, the option costs one nil test per response.
 //
 // Files:
 //   .File() and the static mounts answer with the validators a browser needs:
@@ -268,34 +291,30 @@ fn _fileExists(path:string): bool { return File.Exists(path); }
 fn _fileBytes(path:string)        { return File.ReadAllBytes(path); }
 fn _fileStat(path:string)         { return File.Stat(path); }
 
-fn _isTokenByte(v:int): bool {
-    if ((v >= 97 && v <= 122) || (v >= 65 && v <= 90) || (v >= 48 && v <= 57)) {
-        return true;
-    }
-    if (v == 33 || v == 35 || v == 36 || v == 37 || v == 38) { return true; }
-    if (v == 39 || v == 42 || v == 43 || v == 45 || v == 46) { return true; }
-    if (v == 94 || v == 95 || v == 96) { return true; }
-    if (v == 124 || v == 126) { return true; }
-    return false;
-}
-
 // RFC 9110 token characters - the only ones allowed in a header name (or a
 // method). Anything else and this server and a proxy in front may disagree
 // about what the header is even called, which is how a smuggled request hides.
-// Compared as bytes: String.CharAt yields a char, which will not index into a
-// string of allowed characters, and comparing one against a one-character
-// *string* silently never matches.
-fn _isToken(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (!_isTokenByte(v)) { return false; }
-        i += 1;
+// A leading '-' is the one spelling of a literal hyphen this regex engine
+// accepts inside a class.
+const _TOKEN_RE = "^[-A-Za-z0-9!#$%&'*+.^_`|~]+$";
+
+// Every byte a request line or header must not carry: 1-31 and DEL. NUL cannot
+// occur, a string ends there. Built on first use: a module global cannot call a
+// function of its own module in its initialiser.
+global _CTL_BYTES = nil;
+
+fn _ctlBytes(): string {
+    if (_CTL_BYTES == nil) {
+        let s = "";
+        let i = 1;
+        while (i < 32) { s = s + Char.FromInt(i); i += 1; }
+        _CTL_BYTES = s + Char.FromInt(127);
     }
-    return true;
+    return _CTL_BYTES;
+}
+
+fn _isToken(s:string): bool {
+    return String.Length(s) > 0 && Regex.IsMatch(s, _TOKEN_RE);
 }
 
 // Content-Length is DIGIT only. Convert.ParseInt would otherwise accept "+5"
@@ -333,64 +352,25 @@ fn _isValidHost(v:string): bool {
 // Validate one header line and return the index of its colon, or a negative
 // code: -1 malformed / bad name, -2 obsolete line folding, -3 a bare CR.
 //
-// One allocation and one pass. Done separately this was a String.Contains for
-// the CR, two String.StartsWith for the fold, a String.IndexOf, a String.Left
-// to cut the name out, and then a second buffer inside _isToken - per header,
-// on every request. Real requests carry ten or more headers, so this is the
-// hot loop of the whole parser.
+// Real requests carry ten or more headers, so this is the hot loop of the
+// whole parser: every check is one builtin scan of the line, never a byte
+// loop in script (that cost 2 ms per request on a 650 MHz router).
 fn _validateHeaderLine(hl:string): int {
-    let n:int = String.Length(hl);
-    if (n == 0) { return -1; }
-    let b = Buffer.FromString(hl);
-
-    let f:int = Buffer.ReadU8At(b, 0);
-    if (f == 32 || f == 9) { return -2; }        // SP or HTAB: obs-fold
-
-    let colon:int = -1;
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (v == 13) { return -3; }              // a bare CR anywhere in the line
-        if (colon < 0) {
-            if (v == 58) {                       // ':'
-                if (i == 0) { return -1; }
-                colon = i;
-            } else if (!_isTokenByte(v)) {
-                return -1;                        // not a token character
-            }
-        }
-        i += 1;
-    }
-    if (colon < 0) { return -1; }
+    if (String.Length(hl) == 0) { return -1; }
+    if (String.StartsWith(hl, " ") || String.StartsWith(hl, "\t")) { return -2; }  // obs-fold
+    if (String.IndexOf(hl, "\r") >= 0) { return -3; }         // a bare CR anywhere in the line
+    let colon:int = String.IndexOf(hl, ":");
+    if (colon <= 0) { return -1; }
+    if (!Regex.IsMatch(String.Left(hl, colon), _TOKEN_RE)) { return -1; }
     return colon;
 }
 
 fn _isHex(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (!((v >= 48 && v <= 57) || (v >= 97 && v <= 102) || (v >= 65 && v <= 70))) {
-            return false;
-        }
-        i += 1;
-    }
-    return true;
+    return String.Length(s) > 0 && Regex.IsMatch(s, "^[0-9A-Fa-f]+$");
 }
 
 fn _isDigits(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (v < 48 || v > 57) { return false; }
-        i += 1;
-    }
-    return true;
+    return String.Length(s) > 0 && Regex.IsMatch(s, "^[0-9]+$");
 }
 
 // Bodies at or below this size are written together with the header block in a
@@ -474,17 +454,10 @@ fn _sendFileAll(conn, path:string, offset:int, count:int): bool {
 // Any control byte in a decoded path. A "%00" would otherwise reach the
 // filesystem layer and truncate the name there, so a check on the extension
 // (".js", ".txt") can be walked straight past.
+// The charset scan cannot name NUL, so that byte is looked for on the bytes.
 fn _hasCtlBytes(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (v < 32 || v == 127) { return true; }
-        i += 1;
-    }
-    return false;
+    if (String.IndexOfAnyFrom(s, _ctlBytes(), 0) >= 0) { return true; }
+    return Buffer.IndexOf(Buffer.FromString(s), 0) >= 0;
 }
 
 // A path segment beginning with "." marks a file that is conventionally
@@ -1304,6 +1277,10 @@ class HttpResponse
     let _hijacked:bool   = false;  // the caller took the socket
     let _bodyBytes:int   = 0;      // payload written, for the access log
     let _req             = nil;    // the request being answered, for If-* / Range
+    let _tmStart:int     = 0;      // timing: request start; phases below are nil when off
+    let _tmNames         = nil;
+    let _tmTicks         = nil;
+    let _tmHead:int      = 0;      // when the response head was built
 
     fn Constructor(conn, headOnly:bool, keepAlive:bool, serverName:string, req?) {
         _conn       = conn;
@@ -1324,6 +1301,45 @@ class HttpResponse
     fn Hijacked(): bool    { return _hijacked; }
     fn StatusCode(): int   { return _status; }
     fn BodyBytes(): int    { return _bodyBytes; }
+
+    fn _timeFrom(start:int, read:int) {
+        _tmStart = start;
+        _tmNames = ["read"];
+        _tmTicks = [read];
+    }
+
+    // Repeating the last name moves that phase's end instead of adding a
+    // phase, so a router that marks "route" after the server did replaces it.
+    fn Mark(name:string) {
+        if (_tmTicks == nil) { return this; }
+        let n:int = len(_tmNames);
+        if (n > 0 && _tmNames[n - 1] == name) {
+            _tmTicks[n - 1] = Time.Ticks();
+        } else {
+            Array.Append(_tmNames, name);
+            Array.Append(_tmTicks, Time.Ticks());
+        }
+        return this;
+    }
+
+    fn _phases(end:int) {
+        let out  = {};
+        let prev:int = _tmStart;
+        iter (i from 0 to len(_tmNames)) {
+            out[_tmNames[i]] = Time.TicksToMs(_tmTicks[i] - prev);
+            prev = _tmTicks[i];
+        }
+        out["handler"] = Time.TicksToMs(end - prev);
+        return out;
+    }
+
+    fn Timing() {
+        if (_tmTicks == nil) { return nil; }
+        let now:int = Time.Ticks();
+        let out = this._phases((_tmHead > 0) ? _tmHead : now);
+        out["total"] = Time.TicksToMs(now - _tmStart);
+        return out;
+    }
 
     // Hand the raw connection to the caller and step out of its way: the server
     // writes nothing further, does not close it, and does not reuse it for
@@ -1439,6 +1455,15 @@ class HttpResponse
             }
         }
         foreach (c in _setCookies) { Array.Append(sb, "Set-Cookie: " + c); }
+        if (_tmTicks != nil && _tmHead == 0) {
+            _tmHead = Time.Ticks();
+            let ph    = this._phases(_tmHead);
+            let parts = [];
+            foreach (k in Object.Keys(ph)) {
+                Array.Append(parts, k + ";dur=" + String.FormatArray("{0:.2f}", [ph[k]]));
+            }
+            Array.Append(sb, "Server-Timing: " + String.Join(parts, ", "));
+        }
         if (bodyLen >= 0) {
             Array.Append(sb, "Content-Length: " + str(bodyLen));
         } else {
@@ -1809,6 +1834,7 @@ class HttpServer
     let _hookErrors:int        = 0;    // exceptions dropped from OnAccess/OnError/OnTlsError
     let _inFlight:int          = 0;    // requests being handled right now
     let _statics:array         = [];   // { prefix, root, index, cacheControl }
+    let _timing:bool           = false;
 
     fn Constructor(opts?) {
         _routes  = [];
@@ -1828,6 +1854,7 @@ class HttpServer
             _maxUploadBytes     = Object.TryGet(opts, "maxUploadBytes",     0);
             _serverName         = Object.TryGet(opts, "serverName",         "Flaris");
             _tls                = Object.TryGet(opts, "tls",                nil);
+            _timing             = Object.TryGet(opts, "timing",             false);
         }
     }
 
@@ -2086,6 +2113,7 @@ class HttpServer
     // Returns 1 to keep the connection, 0 to close it, 2 when a handler took it
     // over and this server must neither close nor touch it again.
     fn _serveOne(conn, peer:string, served:int): int {
+        let tStart:int = _timing ? Time.Ticks() : 0;
         let parsed = this._readRequest(conn, peer);
         let req    = parsed.req;
 
@@ -2102,6 +2130,7 @@ class HttpServer
         let keep = _keepAlive && req.keepAlive && _running
                    && (served + 1) < _maxRequestsPerConn;
         let res  = new HttpResponse(conn, req.method == "HEAD", keep, _serverName, req);
+        if (_timing) { res._timeFrom(tStart, Time.Ticks()); }
 
         let t0:int = Time.Millis();
         _inFlight = _inFlight + 1;
@@ -2121,7 +2150,8 @@ class HttpServer
                     bytes:      res.BodyBytes(),
                     durationMs: Time.Millis() - t0,
                     referer:    req.Header("Referer",    "") ?? "",
-                    userAgent:  req.Header("User-Agent", "") ?? ""
+                    userAgent:  req.Header("User-Agent", "") ?? "",
+                    timing:     res.Timing()
                 }));
             } catch (_e) {
                 _hookErrors = _hookErrors + 1;
@@ -2157,6 +2187,7 @@ class HttpServer
                         if (m == req.method || (req.method == "HEAD" && m == "GET")) {
                             req.params = p;
                             matched = true;
+                            res.Mark("route");
                             _settled(r.handler(req, res));
                         } else {
                             methodMismatch = true;
@@ -2167,17 +2198,20 @@ class HttpServer
 
             // 2. Static mounts.
             if (!matched) {
+                res.Mark("route");
                 matched = this._serveStatic(req, res);
             }
 
             // 3. Catch-all handler.
             if (!matched && _onRequest != nil) {
                 matched = true;
+                res.Mark("route");
                 _settled(_onRequest(req, res));
             }
 
             // 4. Nothing claimed it.
             if (!matched && !res.Sent()) {
+                res.Mark("route");
                 if (methodMismatch) {
                     res.Error(405, "method not allowed");
                 } else if (_notFound != nil) {

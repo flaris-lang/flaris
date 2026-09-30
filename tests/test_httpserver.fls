@@ -862,6 +862,60 @@ fn waitHookErrors(srv, n: int) {
     return srv.HookErrors();
 }
 
+// The access hook runs on the connection fiber after the reply is written, so
+// the client can be back before the entry exists.
+fn waitSeen(arr, n: int) {
+    let tries = 0;
+    while (len(arr) < n && tries < 500) { Fiber.Sleep(1); tries += 1; }
+    return len(arr);
+}
+
+fn test_timing() {
+    Console.WriteLine("== timing ==");
+
+    let seen = [];
+    let srv  = new HttpServer({ port: 0, timing: true });
+    srv.Get("/plain", fn(_req, res) { res.Text("ok"); });
+    srv.Get("/marked", fn(_req, res) { Fiber.Sleep(5); res.Mark("db"); res.Text("ok"); });
+    srv.OnAccess(fn(e) { Array.Append(seen, e); });
+    let port = srv.ListenAsync();
+
+    let r  = req1(port, "GET", "/plain");
+    let st = Object.TryGet(r.headers, "server-timing", "") ?? "";
+    check(String.StartsWith(st, "read;dur="), "Server-Timing opens with the read phase");
+    check(String.Contains(st, ", route;dur="), "then the route phase");
+    let phases = String.Split(st, ", ");
+    checkEq(len(phases), 3, "three phases for a plain handler");
+    check(String.StartsWith(phases[2], "handler;dur="), "and ends with the handler phase");
+
+    checkEq(waitSeen(seen, 1), 1, "the access hook fired");
+    let e = seen[len(seen) - 1];
+    check(e.timing != nil, "the access entry carries timing");
+    check(e.timing.total >= e.timing.handler, "total covers the handler");
+    check(e.timing.read >= 0.0 && e.timing.route >= 0.0, "read and route are ms figures");
+
+    let m   = req1(port, "GET", "/marked");
+    let stm = Object.TryGet(m.headers, "server-timing", "") ?? "";
+    check(String.Contains(stm, ", db;dur="), "a handler mark adds its own phase");
+    check(String.Contains(stm, ", handler;dur="), "the tail after the mark is still the handler phase");
+    checkEq(waitSeen(seen, 2), 2, "the access hook fired for the marked route");
+    let em = seen[len(seen) - 1];
+    check(em.timing.db >= 4.0, "the marked phase measured the sleep before it");
+    check(em.timing.handler < em.timing.db, "the handler phase excludes the marked one");
+
+    let r4  = req1(port, "GET", "/nope");
+    let st4 = Object.TryGet(r4.headers, "server-timing", "") ?? "";
+    check(String.Contains(st4, "handler;dur="), "a 404 is timed too");
+    srv.Stop();
+
+    // Off by default: no header, no timing on the entry.
+    gAccess = [];
+    let r0 = req1(gPort, "GET", "/");
+    checkEq(Object.HasKey(r0.headers, "server-timing"), false, "no Server-Timing unless asked for");
+    waitSeen(gAccess, 1);
+    checkEq(gAccess[len(gAccess) - 1].timing, nil, "entry.timing is nil when off");
+}
+
 fn test_hook_failures() {
     Console.WriteLine("== throwing hooks ==");
 
@@ -1647,6 +1701,7 @@ fn async Main() {
     test_streaming_bodies();
     test_multipart();
     test_access_log();
+    test_timing();
     test_hook_failures();
     test_graceful_shutdown();
     test_file_semantics();

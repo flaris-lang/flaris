@@ -1,0 +1,741 @@
+// Ssh.fls - SSH-2 client for Flaris: run commands on a remote host.
+// Version: 1.0
+//
+// A client written on Stream sockets and the Crypto builtins: curve25519
+// key exchange, ssh-ed25519 host keys, the chacha20-poly1305@openssh.com
+// cipher, password and Ed25519 public-key authentication, and a session
+// channel per command. That is the set every OpenSSH and Dropbear of the last
+// decade offers first, so nothing else is negotiated.
+//
+// Usage:
+//   import { SshClient } from library("Ssh", "1.0");
+//
+//   let ssh = new SshClient("192.168.1.1", 22, { user: "root", password: "secret" });
+//   let c = ssh.Connect();                 // { ok, hostKey } or { ok:false, error, errorKind }
+//   let r = ssh.Exec("uci show system");   // { ok, stdout, stderr, exitStatus }
+//   ssh.Close();
+//
+// Options:
+//   user        login name                                       (required)
+//   password    password authentication
+//   keyFile     an unencrypted OpenSSH private key file (ssh-ed25519)
+//   key         the same key as text, when it is not on disk
+//   hostKey     pin the server: its key as known_hosts shows it,
+//               "ssh-ed25519 AAAA..." or the base64 alone. Without a pin the
+//               first key seen is accepted and returned as hostKey, so the
+//               caller can store it and pin the next connection.
+//   timeoutMs   how long each socket wait may take                (default 10000)
+//   version     the client's version string                     (default "Flaris_1.0")
+//
+// Every call returns a result object with ok; on failure error tells what
+// happened and errorKind which side it was on: "connect", "hostkey", "auth",
+// "protocol", "timeout" or "closed". Nothing raises.
+//
+// Exec runs one command in its own channel and collects everything the
+// server sends until it closes the channel: stdout and stderr as strings and
+// exitStatus (-1 when the server reported none, e.g. a signal). Output is
+// capped by maxOutputBytes (default 16 MB); a channel that exceeds it fails.
+//
+// Socket waits park only the calling fiber, so other fibers keep running.
+//
+// SshKey:
+//   SshKey.Parse(text)          -> { publicKey: block(32), secretKey: block(64) } | nil
+//                                  an unencrypted OpenSSH ssh-ed25519 private key
+//   SshKey.PublicLine(key, comment?) -> "ssh-ed25519 AAAA... comment", the line
+//                                  to put in a server's authorized_keys
+
+import { Util } from library("Util", "1.0");
+
+// ---- message numbers (RFC 4253, 4252, 4254) ----
+const _DISCONNECT              = 1;
+const _IGNORE                  = 2;
+const _UNIMPLEMENTED           = 3;
+const _DEBUG                   = 4;
+const _SERVICE_REQUEST         = 5;
+const _SERVICE_ACCEPT          = 6;
+const _EXT_INFO                = 7;
+const _KEXINIT                 = 20;
+const _NEWKEYS                 = 21;
+const _KEX_ECDH_INIT           = 30;
+const _KEX_ECDH_REPLY          = 31;
+const _USERAUTH_REQUEST        = 50;
+const _USERAUTH_FAILURE        = 51;
+const _USERAUTH_SUCCESS        = 52;
+const _USERAUTH_BANNER         = 53;
+const _GLOBAL_REQUEST          = 80;
+const _REQUEST_FAILURE         = 82;
+const _CHANNEL_OPEN            = 90;
+const _CHANNEL_OPEN_CONFIRM    = 91;
+const _CHANNEL_OPEN_FAILURE    = 92;
+const _CHANNEL_WINDOW_ADJUST   = 93;
+const _CHANNEL_DATA            = 94;
+const _CHANNEL_EXTENDED_DATA   = 95;
+const _CHANNEL_EOF             = 96;
+const _CHANNEL_CLOSE           = 97;
+const _CHANNEL_REQUEST         = 98;
+const _CHANNEL_SUCCESS         = 99;
+const _CHANNEL_FAILURE         = 100;
+
+const _KEX_NAMES     = "curve25519-sha256,curve25519-sha256@libssh.org";
+const _HOSTKEY_NAMES = "ssh-ed25519";
+const _CIPHER_NAMES  = "chacha20-poly1305@openssh.com";
+const _MAC_NAMES     = "hmac-sha2-256";
+const _COMP_NAMES    = "none";
+
+// Messages a server may send at any time that need no answer.
+const _HARMLESS = [_CHANNEL_WINDOW_ADJUST, _IGNORE, _DEBUG, _EXT_INFO, _USERAUTH_BANNER, _UNIMPLEMENTED];
+
+const _WINDOW     = 2097152;   // bytes the server may send before we adjust
+const _MAX_PACKET = 32768;
+
+// ---- byte helpers -----------------------------------------------------------
+
+fn _hexToBlock(hex: string) {
+    let n = String.Length(hex) / 2;
+    let b = Buffer.Create(n, 1);
+    iter (i from 0 to n) {
+        Buffer.WriteU8At(b, i, Convert.ParseRadix(String.Substr(hex, i * 2, 2), 16));
+    }
+    return b;
+}
+
+fn _blockToHex(b): string {
+    let out = "";
+    iter (i from 0 to len(b)) {
+        let h = Convert.ToRadixString(Buffer.ReadU8At(b, i), 16);
+        out = out + ((String.Length(h) < 2) ? "0" + h : h);
+    }
+    return out;
+}
+
+fn _sha256(b) { return _hexToBlock(Hash.Sha256(b)); }
+
+// Builds a wire message from parts; Build() joins them once.
+class _Bytes
+{
+    let _parts = [];
+    let _size: int = 0;
+
+    fn Constructor() { _parts = []; _size = 0; }
+
+    fn Raw(v) {
+        Array.Append(_parts, v);
+        _size += Type.Is(v, Type.Block) ? len(v) : String.Length(v);
+        return this;
+    }
+    fn Byte(v: int) {
+        let b = Buffer.Create(1, 1);
+        Buffer.WriteU8At(b, 0, v);
+        return this.Raw(b);
+    }
+    fn Bool(v: bool) { return this.Byte(v ? 1 : 0); }
+    fn U32(v: int) {
+        let b = Buffer.Create(4, 1);
+        Buffer.WriteU32At(b, 0, v, true);
+        return this.Raw(b);
+    }
+    fn Str(v) {
+        this.U32(Type.Is(v, Type.Block) ? len(v) : String.Length(v));
+        if (Type.Is(v, Type.Block) ? len(v) > 0 : String.Length(v) > 0) { this.Raw(v); }
+        return this;
+    }
+    // A positive multiple-precision integer: no leading zeros, and a zero
+    // byte in front when the top bit is set.
+    fn Mpint(b) {
+        let start = 0;
+        while (start < len(b) && Buffer.ReadU8At(b, start) == 0) { start += 1; }
+        let body = Buffer.Slice(b, start, len(b) - start);
+        if (len(body) > 0 && Buffer.ReadU8At(body, 0) >= 128) {
+            let z = Buffer.Create(1, 1);
+            return this.Str(Buffer.Concat(z, body));
+        }
+        return this.Str(body);
+    }
+    fn Build() {
+        let out = Buffer.Create(_size, 1);
+        let at = 0;
+        foreach (p in _parts) {
+            if (Type.Is(p, Type.Block)) {
+                Buffer.Copy(p, 0, out, at, len(p));
+                at += len(p);
+            } else {
+                Buffer.CopyStringAt(out, at, p, String.Length(p));
+                at += String.Length(p);
+            }
+        }
+        return out;
+    }
+}
+
+// Reads a wire message; every Read* returns nil once the message runs out.
+class _Reader
+{
+    let _b = nil;
+    let _at: int = 0;
+
+    fn Constructor(b) { _b = b; _at = 0; }
+
+    fn Left(): int { return len(_b) - _at; }
+    fn Byte() {
+        if (_at + 1 > len(_b)) { return nil; }
+        let v = Buffer.ReadU8At(_b, _at);
+        _at += 1;
+        return v;
+    }
+    fn Bool() { let v = this.Byte(); return (v == nil) ? nil : v != 0; }
+    fn U32() {
+        if (_at + 4 > len(_b)) { return nil; }
+        let v = Buffer.ReadU32At(_b, _at, true);
+        _at += 4;
+        return v;
+    }
+    fn Bytes(n: int) {
+        if (n < 0 || _at + n > len(_b)) { return nil; }
+        let v = Buffer.Slice(_b, _at, n);
+        _at += n;
+        return v;
+    }
+    fn Str() {
+        let n = this.U32();
+        return (n == nil) ? nil : this.Bytes(n);
+    }
+    fn Text() {
+        let b = this.Str();
+        return (b == nil) ? nil : Buffer.ToString(b);
+    }
+}
+
+// ---- the client -------------------------------------------------------------
+
+class SshClient
+{
+    let _host: string = "";
+    let _port: int = 22;
+    let _opts = nil;
+    let _timeoutMs: int = 10000;
+    let _maxOutput: int = 16777216;
+    let _sock = nil;
+    let _connected: bool = false;
+
+    let _vc: string = "";        // our version line, without CRLF
+    let _vs: string = "";        // the server's
+    let _sessionId = nil;
+    let _hostKeyBlob = nil;
+
+    // chacha20-poly1305@openssh.com: two 32-byte keys per direction, the
+    // first for the payload and the second for the length field.
+    let _encrypted: bool = false;
+    let _cK2 = nil;
+    let _cK1 = nil;
+    let _sK2 = nil;
+    let _sK1 = nil;
+    let _seqOut: int = 0;
+    let _seqIn: int = 0;
+
+    let _nextChannel: int = 0;
+
+    fn Constructor(host: string, port: int, opts?) {
+        _host = host;
+        _port = port;
+        _opts = opts ?? {};
+        _timeoutMs = Object.TryGet(_opts, "timeoutMs", 10000);
+        _maxOutput = Object.TryGet(_opts, "maxOutputBytes", 16777216);
+        _vc = "SSH-2.0-" + Object.TryGet(_opts, "version", "Flaris_1.0");
+    }
+
+    fn IsConnected(): bool { return _connected; }
+
+    // The server's host key as known_hosts writes it, once connected.
+    fn HostKey() {
+        return (_hostKeyBlob == nil) ? nil : "ssh-ed25519 " + Util.Base64Encode(_hostKeyBlob);
+    }
+
+    fn Close() {
+        if (_sock != nil) {
+            if (_connected) {
+                let m = new _Bytes();
+                m.Byte(_DISCONNECT).U32(11).Str("closed by application").Str("");
+                this._send(m.Build());
+            }
+            Stream.Close(_sock);
+            _sock = nil;
+        }
+        _connected = false;
+        return nil;
+    }
+
+    fn _fail(kind: string, msg: string) {
+        this.Close();
+        return { ok: false, error: msg, errorKind: kind };
+    }
+
+    // ---- socket ----
+
+    fn _readExact(n: int) {
+        if (n == 0) { return Buffer.Create(1, 1); }
+        let out = Buffer.Create(n, 1);
+        let got = 0;
+        while (got < n) {
+            if (Stream.WaitReadable(_sock, _timeoutMs) == nil) { return nil; }
+            let chunk = Stream.ReadBytes(_sock, n - got);
+            if (chunk == nil || len(chunk) == 0) { return nil; }
+            Buffer.Copy(chunk, 0, out, got, len(chunk));
+            got += len(chunk);
+        }
+        return out;
+    }
+
+    fn _write(b): bool {
+        return Stream.WriteAll(_sock, b) == true;
+    }
+
+    // ---- packets (RFC 4253 section 6, and PROTOCOL.chacha20poly1305) ----
+
+    fn _nonce(seq: int) {
+        let b = Buffer.Create(8, 1);
+        Buffer.WriteU32At(b, 4, seq, true);
+        return b;
+    }
+
+    fn _send(payload): bool {
+        // Padding brings the padded length to a multiple of 8, at least 4
+        // bytes of it; the length field joins the alignment only in the clear.
+        let base = 1 + len(payload) + (_encrypted ? 0 : 4);
+        let pad = 8 - (base % 8);
+        if (pad < 4) { pad += 8; }
+        let body = new _Bytes();
+        body.Byte(pad).Raw(payload).Raw(Crypto.RandomBytes(pad));
+        let plain = body.Build();
+        let lenField = Buffer.Create(4, 1);
+        Buffer.WriteU32At(lenField, 0, len(plain), true);
+
+        let out = nil;
+        if (!_encrypted) {
+            out = Buffer.Concat(lenField, plain);
+        } else {
+            let nonce = this._nonce(_seqOut);
+            let encLen = Crypto.ChaCha20(_cK1, nonce, 0, lenField);
+            let encBody = Crypto.ChaCha20(_cK2, nonce, 1, plain);
+            let polyKey = Crypto.ChaCha20(_cK2, nonce, 0, Buffer.Create(32, 1));
+            let sealed = Buffer.Concat(encLen, encBody);
+            out = Buffer.Concat(sealed, Crypto.Poly1305(polyKey, sealed));
+        }
+        _seqOut += 1;
+        return this._write(out);
+    }
+
+    // The next payload, or nil; _lastError says why.
+    let _lastError: string = "";
+    let _lastKind: string = "protocol";
+
+    fn _recv() {
+        let lenField = this._readExact(4);
+        if (lenField == nil) { _lastError = "no reply from the server"; _lastKind = "timeout"; return nil; }
+        let plain = nil;
+        if (!_encrypted) {
+            let n = Buffer.ReadU32At(lenField, 0, true);
+            if (n < 5 || n > 262144) { _lastError = "bad packet length"; return nil; }
+            plain = this._readExact(n);
+            if (plain == nil) { _lastError = "connection closed mid-packet"; _lastKind = "closed"; return nil; }
+        } else {
+            let nonce = this._nonce(_seqIn);
+            let n = Buffer.ReadU32At(Crypto.ChaCha20(_sK1, nonce, 0, lenField), 0, true);
+            if (n < 5 || n > 262144) { _lastError = "bad packet length"; return nil; }
+            let rest = this._readExact(n + 16);
+            if (rest == nil) { _lastError = "connection closed mid-packet"; _lastKind = "closed"; return nil; }
+            let encBody = Buffer.Slice(rest, 0, n);
+            let tag = Buffer.Slice(rest, n, 16);
+            let polyKey = Crypto.ChaCha20(_sK2, nonce, 0, Buffer.Create(32, 1));
+            let expect = Crypto.Poly1305(polyKey, Buffer.Concat(lenField, encBody));
+            if (!Crypto.ConstantTimeEquals(tag, expect)) { _lastError = "packet authentication failed"; return nil; }
+            plain = Crypto.ChaCha20(_sK2, nonce, 1, encBody);
+        }
+        _seqIn += 1;
+        let pad = Buffer.ReadU8At(plain, 0);
+        let payloadLen = len(plain) - 1 - pad;
+        if (payloadLen < 1) { _lastError = "bad padding"; return nil; }
+        return Buffer.Slice(plain, 1, payloadLen);
+    }
+
+    // The next message of a wanted type, answering or dropping the ones any
+    // server may send in between. `wanted` is an array of message numbers.
+    fn _expect(wanted) {
+        while (true) {
+            let p = this._recv();
+            if (p == nil) { return nil; }
+            let t = Buffer.ReadU8At(p, 0);
+            if (Array.Contains(wanted, t)) { return p; }
+            if (t == _DISCONNECT) {
+                let r = new _Reader(p);
+                r.Byte(); r.U32();
+                _lastError = "server disconnected: " + (r.Text() ?? "");
+                _lastKind = "closed";
+                return nil;
+            }
+            if (t == _GLOBAL_REQUEST) {
+                let r = new _Reader(p);
+                r.Byte(); r.Str();
+                if (r.Bool() == true) {
+                    let m = new _Bytes();
+                    this._send(m.Byte(_REQUEST_FAILURE).Build());
+                }
+            } else if (!Array.Contains(_HARMLESS, t)) {
+                let m = new _Bytes();
+                this._send(m.Byte(_UNIMPLEMENTED).U32(_seqIn - 1).Build());
+            }
+        }
+    }
+
+    // ---- connect: version exchange, key exchange, authentication ----
+
+    fn Connect() {
+        let user = Object.TryGet(_opts, "user", nil);
+        if (user == nil || user == "") { return { ok: false, error: "user option is required", errorKind: "auth" }; }
+
+        _sock = Stream.Connect("tcp", _host, _port);
+        if (_sock == nil) { return { ok: false, error: "cannot connect to " + _host + ":" + str(_port), errorKind: "connect" }; }
+        Stream.SetTimeout(_sock, _timeoutMs);
+        _encrypted = false;
+        _seqOut = 0;
+        _seqIn = 0;
+
+        if (!this._write(_vc + "\r\n")) { return this._fail("connect", "write failed"); }
+        // The server may send banner lines before its version.
+        let tries = 0;
+        _vs = "";
+        while (tries < 20) {
+            if (Stream.WaitReadable(_sock, _timeoutMs) == nil) { return this._fail("timeout", "no version from the server"); }
+            let line = Stream.ReadLine(_sock);
+            if (line == nil) { return this._fail("closed", "connection closed before the version exchange"); }
+            if (String.StartsWith(line, "SSH-")) { _vs = line; break; }
+            tries += 1;
+        }
+        if (!String.StartsWith(_vs, "SSH-2.0-") && !String.StartsWith(_vs, "SSH-1.99-")) {
+            return this._fail("protocol", "not an SSH-2 server: " + _vs);
+        }
+
+        let kex = this._keyExchange();
+        if (!kex.ok) { return this._fail(kex.errorKind, kex.error); }
+        _connected = true;
+
+        let auth = this._authenticate(user);
+        if (!auth.ok) { return this._fail(auth.errorKind, auth.error); }
+        return { ok: true, hostKey: this.HostKey() };
+    }
+
+    fn _keyExchange() {
+        let init = new _Bytes();
+        init.Byte(_KEXINIT).Raw(Crypto.RandomBytes(16))
+            .Str(_KEX_NAMES).Str(_HOSTKEY_NAMES)
+            .Str(_CIPHER_NAMES).Str(_CIPHER_NAMES)
+            .Str(_MAC_NAMES).Str(_MAC_NAMES)
+            .Str(_COMP_NAMES).Str(_COMP_NAMES)
+            .Str("").Str("")
+            .Bool(false).U32(0);
+        let ic = init.Build();
+        if (!this._send(ic)) { return { ok: false, error: "write failed", errorKind: "closed" }; }
+
+        let sInit = this._expect([_KEXINIT]);
+        if (sInit == nil) { return { ok: false, error: _lastError, errorKind: _lastKind }; }
+        let sr = new _Reader(sInit);
+        sr.Byte(); sr.Bytes(16);
+        let names = [];
+        iter (i from 0 to 10) { Array.Append(names, sr.Text() ?? ""); }
+        if (!_listHas(names[0], "curve25519-sha256") && !_listHas(names[0], "curve25519-sha256@libssh.org")) {
+            return { ok: false, error: "server offers no curve25519-sha256 key exchange (" + names[0] + ")", errorKind: "protocol" };
+        }
+        if (!_listHas(names[1], "ssh-ed25519")) {
+            return { ok: false, error: "server has no ssh-ed25519 host key (" + names[1] + ")", errorKind: "protocol" };
+        }
+        if (!_listHas(names[3], "chacha20-poly1305@openssh.com")) {
+            return { ok: false, error: "server does not offer chacha20-poly1305@openssh.com (" + names[3] + ")", errorKind: "protocol" };
+        }
+        let firstFollows = sr.Bool();
+        if (firstFollows == true) {
+            // A guessed packet that cannot match our single choice is skipped.
+            this._recv();
+        }
+
+        let kp = Crypto.X25519KeyPair();
+        let qc = _hexToBlock(kp.PublicKey);
+        let ecdh = new _Bytes();
+        if (!this._send(ecdh.Byte(_KEX_ECDH_INIT).Str(qc).Build())) { return { ok: false, error: "write failed", errorKind: "closed" }; }
+
+        let reply = this._expect([_KEX_ECDH_REPLY]);
+        if (reply == nil) { return { ok: false, error: _lastError, errorKind: _lastKind }; }
+        let rr = new _Reader(reply);
+        rr.Byte();
+        let ks = rr.Str();
+        let qs = rr.Str();
+        let sigBlob = rr.Str();
+        if (ks == nil || qs == nil || sigBlob == nil || len(qs) != 32) {
+            return { ok: false, error: "malformed key exchange reply", errorKind: "protocol" };
+        }
+
+        // Host key: pinned, or trusted on first sight.
+        let kr = new _Reader(ks);
+        if (kr.Text() != "ssh-ed25519") { return { ok: false, error: "host key is not ssh-ed25519", errorKind: "hostkey" }; }
+        let hostPub = kr.Str();
+        if (hostPub == nil || len(hostPub) != 32) { return { ok: false, error: "malformed host key", errorKind: "hostkey" }; }
+        let pin = Object.TryGet(_opts, "hostKey", nil);
+        if (pin != nil) {
+            let expect = _pinBlob(pin);
+            if (expect == nil || !Buffer.Equals(expect, ks)) {
+                return { ok: false, error: "host key mismatch: server presents ssh-ed25519 " + Util.Base64Encode(ks), errorKind: "hostkey" };
+            }
+        }
+
+        let shared = _hexToBlock(Crypto.X25519Shared(kp.SecretKey, _blockToHex(qs)));
+        let hb = new _Bytes();
+        hb.Str(_vc).Str(_vs).Str(ic).Str(sInit).Str(ks).Str(qc).Str(qs).Mpint(shared);
+        let h = _sha256(hb.Build());
+
+        let sg = new _Reader(sigBlob);
+        if (sg.Text() != "ssh-ed25519") { return { ok: false, error: "host signature is not ssh-ed25519", errorKind: "hostkey" }; }
+        let sig = sg.Str();
+        if (sig == nil || len(sig) != 64 || !Crypto.Ed25519Verify(_blockToHex(sig), _blockToHex(hostPub), h)) {
+            return { ok: false, error: "host key signature does not verify", errorKind: "hostkey" };
+        }
+        _hostKeyBlob = ks;
+        if (_sessionId == nil) { _sessionId = h; }
+
+        // Keys: HASH(K || H || letter || session_id), extended by hashing again.
+        let km = new _Bytes();
+        km.Mpint(shared);
+        let kEnc = km.Build();
+        _cK2 = this._deriveKey(kEnc, h, "C", 64);
+        _cK1 = Buffer.Slice(_cK2, 32, 32);
+        _cK2 = Buffer.Slice(_cK2, 0, 32);
+        _sK2 = this._deriveKey(kEnc, h, "D", 64);
+        _sK1 = Buffer.Slice(_sK2, 32, 32);
+        _sK2 = Buffer.Slice(_sK2, 0, 32);
+
+        let nk = new _Bytes();
+        if (!this._send(nk.Byte(_NEWKEYS).Build())) { return { ok: false, error: "write failed", errorKind: "closed" }; }
+        if (this._expect([_NEWKEYS]) == nil) { return { ok: false, error: _lastError, errorKind: _lastKind }; }
+        _encrypted = true;
+        return { ok: true };
+    }
+
+    fn _deriveKey(kEnc, h, letter: string, need: int) {
+        let seed = new _Bytes();
+        seed.Raw(kEnc).Raw(h).Raw(letter).Raw(_sessionId);
+        let out = _sha256(seed.Build());
+        while (len(out) < need) {
+            let more = new _Bytes();
+            more.Raw(kEnc).Raw(h).Raw(out);
+            out = Buffer.Concat(out, _sha256(more.Build()));
+        }
+        return Buffer.Slice(out, 0, need);
+    }
+
+    // ---- authentication (RFC 4252) ----
+
+    fn _authenticate(user: string) {
+        let sr = new _Bytes();
+        if (!this._send(sr.Byte(_SERVICE_REQUEST).Str("ssh-userauth").Build())) { return { ok: false, error: "write failed", errorKind: "closed" }; }
+        if (this._expect([_SERVICE_ACCEPT]) == nil) { return { ok: false, error: _lastError, errorKind: _lastKind }; }
+
+        let keyText = Object.TryGet(_opts, "key", nil);
+        let keyFile = Object.TryGet(_opts, "keyFile", nil);
+        if (keyText == nil && keyFile != nil) {
+            keyText = File.ReadText(keyFile);
+            if (keyText == nil) { return { ok: false, error: "cannot read key file " + keyFile, errorKind: "auth" }; }
+        }
+        let tried = [];
+        if (keyText != nil) {
+            let key = _parseOpenSshKey(keyText);
+            if (key == nil) { return { ok: false, error: "key is not an unencrypted OpenSSH ssh-ed25519 private key", errorKind: "auth" }; }
+            let r = this._authPublicKey(user, key);
+            if (r.ok || r.errorKind != "auth") { return r; }
+            Array.Append(tried, "publickey");
+        }
+        let password = Object.TryGet(_opts, "password", nil);
+        if (password != nil) {
+            let r = this._authPassword(user, password);
+            if (r.ok || r.errorKind != "auth") { return r; }
+            Array.Append(tried, "password");
+        }
+        if (len(tried) == 0) { return { ok: false, error: "no credentials: give password, keyFile or key", errorKind: "auth" }; }
+        return { ok: false, error: "authentication failed (" + String.Join(tried, ", ") + ")", errorKind: "auth" };
+    }
+
+    fn _authResult() {
+        let p = this._expect([_USERAUTH_SUCCESS, _USERAUTH_FAILURE]);
+        if (p == nil) { return { ok: false, error: _lastError, errorKind: _lastKind }; }
+        if (Buffer.ReadU8At(p, 0) == _USERAUTH_SUCCESS) { return { ok: true }; }
+        let r = new _Reader(p);
+        r.Byte();
+        let methods = r.Text() ?? "";
+        return { ok: false, error: "rejected; server accepts " + methods, errorKind: "auth" };
+    }
+
+    fn _authPassword(user: string, password: string) {
+        let m = new _Bytes();
+        m.Byte(_USERAUTH_REQUEST).Str(user).Str("ssh-connection").Str("password").Bool(false).Str(password);
+        if (!this._send(m.Build())) { return { ok: false, error: "write failed", errorKind: "closed" }; }
+        return this._authResult();
+    }
+
+    fn _authPublicKey(user: string, key) {
+        let blob = new _Bytes();
+        let pubBlob = blob.Str("ssh-ed25519").Str(key.publicKey).Build();
+
+        let signed = new _Bytes();
+        signed.Str(_sessionId).Byte(_USERAUTH_REQUEST).Str(user).Str("ssh-connection")
+              .Str("publickey").Bool(true).Str("ssh-ed25519").Str(pubBlob);
+        let sigHex = Crypto.Ed25519Sign(_blockToHex(key.secretKey), signed.Build());
+        let sb = new _Bytes();
+        let sigBlob = sb.Str("ssh-ed25519").Str(_hexToBlock(sigHex)).Build();
+
+        let m = new _Bytes();
+        m.Byte(_USERAUTH_REQUEST).Str(user).Str("ssh-connection").Str("publickey")
+         .Bool(true).Str("ssh-ed25519").Str(pubBlob).Str(sigBlob);
+        if (!this._send(m.Build())) { return { ok: false, error: "write failed", errorKind: "closed" }; }
+        return this._authResult();
+    }
+
+    // ---- channels (RFC 4254) ----
+
+    fn Exec(command: string) {
+        if (!_connected) { return { ok: false, error: "not connected", errorKind: "closed", stdout: "", stderr: "", exitStatus: -1 }; }
+        let mine = _nextChannel;
+        _nextChannel += 1;
+
+        let open = new _Bytes();
+        open.Byte(_CHANNEL_OPEN).Str("session").U32(mine).U32(_WINDOW).U32(_MAX_PACKET);
+        if (!this._send(open.Build())) { return this._execFail("closed", "write failed"); }
+        let conf = this._expect([_CHANNEL_OPEN_CONFIRM, _CHANNEL_OPEN_FAILURE]);
+        if (conf == nil) { return this._execFail(_lastKind, _lastError); }
+        let cr = new _Reader(conf);
+        if (cr.Byte() == _CHANNEL_OPEN_FAILURE) {
+            cr.U32(); cr.U32();
+            return this._execFail("protocol", "channel refused: " + (cr.Text() ?? ""));
+        }
+        cr.U32();
+        let theirs = cr.U32();
+        if (theirs == nil) { return this._execFail("protocol", "malformed channel confirmation"); }
+
+        let req = new _Bytes();
+        req.Byte(_CHANNEL_REQUEST).U32(theirs).Str("exec").Bool(true).Str(command);
+        if (!this._send(req.Build())) { return this._execFail("closed", "write failed"); }
+
+        let stdout = [];
+        let stderr = [];
+        let outBytes = 0;
+        let exitStatus = -1;
+        let accepted = false;
+        let closed = false;
+        let consumed = 0;
+        let wanted = [_CHANNEL_SUCCESS, _CHANNEL_FAILURE, _CHANNEL_DATA, _CHANNEL_EXTENDED_DATA,
+                      _CHANNEL_EOF, _CHANNEL_CLOSE, _CHANNEL_REQUEST];
+        while (!closed) {
+            let p = this._expect(wanted);
+            if (p == nil) { return this._execFail(_lastKind, _lastError); }
+            let r = new _Reader(p);
+            let t = r.Byte();
+            r.U32(); // our channel number; one channel at a time
+            if (t == _CHANNEL_FAILURE) { return this._execFail("protocol", "server refused to run the command"); }
+            if (t == _CHANNEL_SUCCESS) { accepted = true; }
+            else if (t == _CHANNEL_DATA || t == _CHANNEL_EXTENDED_DATA) {
+                let kind = 0;
+                if (t == _CHANNEL_EXTENDED_DATA) { kind = r.U32() ?? 0; }
+                let data = r.Str();
+                if (data != nil) {
+                    outBytes += len(data);
+                    if (outBytes > _maxOutput) { return this._execFail("protocol", "output exceeds maxOutputBytes"); }
+                    Array.Append((kind == 1) ? stderr : stdout, Buffer.ToString(data));
+                    consumed += len(data);
+                    if (consumed >= _WINDOW / 2) {
+                        let adj = new _Bytes();
+                        this._send(adj.Byte(_CHANNEL_WINDOW_ADJUST).U32(theirs).U32(consumed).Build());
+                        consumed = 0;
+                    }
+                }
+            } else if (t == _CHANNEL_REQUEST) {
+                let name = r.Text() ?? "";
+                let wantReply = r.Bool();
+                if (name == "exit-status") { exitStatus = r.U32() ?? -1; }
+                if (wantReply == true) {
+                    let no = new _Bytes();
+                    this._send(no.Byte(_CHANNEL_FAILURE).U32(theirs).Build());
+                }
+            } else if (t == _CHANNEL_CLOSE) {
+                let cl = new _Bytes();
+                this._send(cl.Byte(_CHANNEL_CLOSE).U32(theirs).Build());
+                closed = true;
+            }
+            // EOF: nothing more will come, but the close follows on its own.
+        }
+        if (!accepted) { return this._execFail("protocol", "the command was never accepted"); }
+        return { ok: true, stdout: String.Join(stdout, ""), stderr: String.Join(stderr, ""), exitStatus: exitStatus };
+    }
+
+    fn _execFail(kind: string, msg: string) {
+        if (kind == "closed" || kind == "timeout") { this.Close(); }
+        return { ok: false, error: msg, errorKind: kind, stdout: "", stderr: "", exitStatus: -1 };
+    }
+}
+
+fn _listHas(list: string, name: string): bool {
+    return Array.Contains(String.Split(list, ","), name);
+}
+
+// "ssh-ed25519 AAAA... comment" or the base64 alone -> the key blob.
+fn _pinBlob(pin: string) {
+    let parts = String.Split(String.Trim(pin), " ");
+    let b64 = parts[0];
+    if (len(parts) > 1 && parts[0] == "ssh-ed25519") { b64 = parts[1]; }
+    return Util.Base64DecodeBlock(b64);
+}
+
+// The OpenSSH private key container (openssh-key-v1), unencrypted, holding
+// one ssh-ed25519 key. Returns { publicKey: block(32), secretKey: block(64) }.
+fn _parseOpenSshKey(text: string) {
+    let lines = String.Split(text, "\n");
+    let body = [];
+    let inside = false;
+    foreach (raw in lines) {
+        let line = String.Trim(raw);
+        if (String.StartsWith(line, "-----BEGIN OPENSSH PRIVATE KEY")) { inside = true; }
+        else if (String.StartsWith(line, "-----END")) { inside = false; }
+        else if (inside && line != "") { Array.Append(body, line); }
+    }
+    if (len(body) == 0) { return nil; }
+    let blob = Util.Base64DecodeBlock(String.Join(body, ""));
+    if (blob == nil || len(blob) < 16) { return nil; }
+    if (Buffer.ToString(Buffer.Slice(blob, 0, 14)) != "openssh-key-v1") { return nil; }
+    let r = new _Reader(Buffer.Slice(blob, 15, len(blob) - 15));
+    let cipher = r.Text();
+    let kdf = r.Text();
+    r.Str();
+    if (cipher != "none" || kdf != "none") { return nil; }
+    let n = r.U32();
+    if (n != 1) { return nil; }
+    r.Str();
+    let priv = r.Str();
+    if (priv == nil) { return nil; }
+    let pr = new _Reader(priv);
+    let c1 = pr.U32();
+    let c2 = pr.U32();
+    if (c1 == nil || c1 != c2) { return nil; }
+    if (pr.Text() != "ssh-ed25519") { return nil; }
+    let pub = pr.Str();
+    let sec = pr.Str();
+    if (pub == nil || sec == nil || len(pub) != 32 || len(sec) != 64) { return nil; }
+    return { publicKey: pub, secretKey: sec };
+}
+
+class SshKey
+{
+    fn static Parse(text: string) { return _parseOpenSshKey(text); }
+
+    fn static PublicLine(key, comment?: string): string {
+        let b = new _Bytes();
+        let blob = b.Str("ssh-ed25519").Str(key.publicKey).Build();
+        let line = "ssh-ed25519 " + Util.Base64Encode(blob);
+        return (comment == nil || comment == "") ? line : line + " " + comment;
+    }
+}
+
+export { SshClient, SshKey };

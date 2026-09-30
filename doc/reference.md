@@ -109,6 +109,7 @@ flarisvm --format-write src/app.fls   # rewrite in place
 | `--allow-ffi` | Enable `Ffi.*` only, leaving the rest of `--unsafe` refused |
 | `--mem` | Memory report at shutdown: peak RSS, slab footprint, peak/total object counts, heap bytes, block regions, and leak count. Exits non-zero if leaks are detected. |
 | `--stats` | Print VM statistics after execution (implies `--time`) |
+| `--prof[=hz]` | Sample the running script `hz` times a second (1-10000, default 1000) from a CPU timer and print a per-function table at exit. A sample is charged to the script function running, builtin time included, and to every caller on its stack (`self` / `total`); objects allocated are charged the same way; native (JIT) kernels are charged to their interpreted caller. Lines with `-g`; a per-fiber table when several fibers ran. `flarisvm` only; Windows caps the rate at 1000 |
 | `--time` | Print timing report |
 | `--verbose` | Verbose output (also enables the timing report) |
 | `--list-keys` | Print the built-in and trusted signing keys, then exit |
@@ -589,7 +590,7 @@ compile errors.
 
 **Keywords.** `fn` `async` `static` `inline` `let` `var` `const` `global`
 `if` `else` `for` `foreach` `iter` `from` `to` `while` `do` `switch` `case`
-`default` `break` `continue` `return` `yield` `await` `guard` `nil` `true`
+`default` `break` `continue` `return` `yield` `await` `guard` `weak` `nil` `true`
 `false` `class` `this` `super` `new` `enum` `import` `export` `library` `as`
 `try` `catch` `finally` `throw` `breakpoint`. The words `and` `or` `in` `is`
 are operators. (`var` is an alias for `let`.) Every keyword, plus the operator
@@ -1451,6 +1452,18 @@ guard(expr)   // Raises Exception.GuardCheck if expr evaluates to nil
 
 ---
 
+### Weak handle
+
+```js
+this.parent = weak(expr);   // a handle on expr that does not keep it alive
+```
+
+`weak(expr)` is `Weak.Create(expr)` in expression form: the same prefix
+position and precedence as `guard`. Read the value back with `Weak.Get`, which
+yields `nil` once the target is gone - see the `Weak` module.
+
+---
+
 ## R4 - The Exception class
 
 `Exception` is a built-in base **class**. Every thrown value - whether from a
@@ -1545,7 +1558,7 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | 1 | Primary | literals, identifiers, `(...)` | N/A |
 | 2 | Postfix | `obj.prop` `obj?.prop` `arr[i]` `arr?.[i]` `fn(...)` `x++` `x--` | Left |
 | 3 | Power | `^^` | Right |
-| 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` | Right |
+| 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` `weak()` | Right |
 | 5 | Multiplicative & Bitwise | `*` `/` `%` `<<` `>>` `>>>` `&` `\|` `^` | Left |
 | 6 | Additive | `+` `-` | Left |
 | 7 | Comparison | `<` `<=` `>` `>=` | Left |
@@ -1865,7 +1878,12 @@ class Node {
 // ...while the parent holds the child. Neither is ever freed.
 ```
 
-Flaris has no `weak` reference, so the fix is structural. In order of preference:
+The fix is a weak handle for the back-reference, or a structural change. In
+order of preference:
+
+0. **Observe the parent through a handle.** `Weak.Create(parent)` does not
+   keep the parent alive and `Weak.Get` yields `nil` once it is gone - see the
+   `Weak` module.
 
 1. **Do not store the parent.** Most back-references exist to read one or two
    values. Copy those values into the child at construction instead of the object.
@@ -2718,15 +2736,17 @@ Authenticated encryption (XChaCha20-Poly1305), Ed25519 signatures, X25519 key ex
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Argon2** | `Argon2(password:string\|block, salt:string\|block, iterations?:int, memKiB?:int) - string` | Argon2id password hash (64-hex). `salt` >= 8 bytes (16 recommended); `iterations` 1-1024, default 3; `memKiB` memory cost in KiB, 8-1048576 (1 GiB), default 65536 (64 MiB). A value outside those ranges raises `InvalidArgs`. | — |
+| **ChaCha20** | `ChaCha20(key:string\|block, nonce:string\|block, counter:int, data:string\|block) - block` | The raw ChaCha20 stream cipher: XOR `data` with the keystream under the 32-byte `key`, starting at block `counter`, and return the result as a block; the same call encrypts and decrypts. An 8-byte `nonce` selects the original variant with a 64-bit counter, a 12-byte `nonce` the IETF (RFC 8439) one with a 32-bit counter. No authentication - pair it with `Poly1305`. For ordinary encryption use `Encrypt`, which does both and picks the nonce. Raises on any other key or nonce length, a negative counter, or more than 256 MB. | ✓ owned¹ |
 | **ConstantTimeEquals** | `ConstantTimeEquals(a:string\|block, b:string\|block) - bool` | Compare two byte sequences in constant time (no early exit). Use instead of `==` when verifying MACs, signatures, or tokens so equality checks don't leak timing. Only length inequality returns early. | ✓ |
 | **Decrypt** | `Decrypt(cipher:string\|block, cipherLen:int, key:string\|block, nonce:string\|block, tag:string) - object` | Decrypt `cipherLen` bytes of XChaCha20-Poly1305 `cipher` with the 32-byte `key`, 24-byte `nonce`, and hex `tag` returned by `Encrypt`. Returns `{Ok:bool, Plain:block}`. On authentication failure `Ok` is `false` and `Plain` is zeroed - always check `Ok` before using `Plain`. | — |
-| **Ed25519KeyPair** | `Ed25519KeyPair() - object` | Generate an Ed25519 signing key pair. Returns `{PublicKey:string(64 hex), SecretKey:string(128 hex)}`. | — |
+| **Ed25519KeyPair** | `Ed25519KeyPair() - object` | Generate an Ed25519 (RFC 8032, SHA-512) signing key pair, interoperable with OpenSSH, libsodium and JWT `EdDSA`. The secret key is the 32-byte seed followed by the public key. Keys and signatures made before 1.0.5 used a different hash and do not verify against these. Returns `{PublicKey:string(64 hex), SecretKey:string(128 hex)}`. | — |
 | **Ed25519Sign** | `Ed25519Sign(secretKey:string, message:string\|block) - string` | Sign `message` with a hex secret key; returns a 128-hex signature. | ✓ owned¹ |
 | **Ed25519Verify** | `Ed25519Verify(signature:string, publicKey:string, message:string\|block) - bool` | Verify a hex signature against a hex public key and message. | ✓ |
 | **Encrypt** | `Encrypt(data:string\|block, dataLen:int, key:string\|block) - object` | Encrypt `dataLen` bytes of `data` with XChaCha20-Poly1305 under a 32-byte `key`. A fresh 24-byte nonce is generated per call (never supply your own). Returns `{Ok:bool, Cipher:block, Nonce:block, Tag:string(32 hex)}`. Max 256 MB. | — |
 | **HmacSha1** | `HmacSha1(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA1 (40-hex). Legacy/interop: TOTP/HOTP 2FA, OAuth1, AWS SigV2. | ✓ owned¹ |
 | **HmacSha256** | `HmacSha256(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA256 (64-hex). | ✓ owned¹ |
 | **HmacSha512** | `HmacSha512(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA512 (128-hex). E.g. JWT HS512. | ✓ owned¹ |
+| **Poly1305** | `Poly1305(key:string\|block, data:string\|block) - block` | The Poly1305 one-time authenticator (RFC 8439): a 16-byte tag over `data` under the 32-byte `key`. The key must never authenticate two messages - protocols derive it per message from `ChaCha20`. Compare tags with `ConstantTimeEquals`. | ✓ owned¹ |
 | **RandomBytes** | `RandomBytes(count:int) - block` | Generate `count` cryptographically random bytes (CSPRNG). Raises if `count` is not in `1..67108864`. | ✓ owned¹ |
 | **X25519KeyPair** | `X25519KeyPair() - object` | Generate an X25519 key-exchange key pair. Returns `{PublicKey:string(64 hex), SecretKey:string(64 hex)}`. | — |
 | **X25519Shared** | `X25519Shared(secretKey:string, peerPublicKey:string) - string` | X25519 ECDH; returns the 64-hex raw shared secret. Hash it (e.g. `Hash.Blake2b`) before using it as a key. | ✓ owned¹ |
@@ -3269,6 +3289,45 @@ Generator methods:
 let r = Random.New(42);
 r.NextInt(1, 6);     // same die roll on every run
 r.NextFloat();       // deterministic [0,1)
+```
+
+---
+
+### Weak
+
+Namespace: **`Weak`**
+
+Non-owning handles. `Weak.Create(v)` returns a handle that does not keep `v`
+alive; `Weak.Get(h)` returns `v` while something else still owns it and `nil`
+afterwards. Every handle on a value is nilled the moment the value's last owner
+lets go - before its `Destructor` runs - so a `Destructor` can never hand a
+dying object back out through a handle. Use a handle for the back-reference in
+a pair (a child's link to its parent, an observer's link to its subject) so the
+pair forms no reference cycle - see *Reference cycles are never collected*.
+
+| Function | Signature | Description | JIT |
+| -------- | --------- | ----------- | --- |
+| **Alive** | `Alive(h:instance) - bool` | `true` while the handle's target lives. | — |
+| **Create** | `Create(v:any) - instance` | A handle on `v`. Raises `Exception.InvalidArguments` for `nil`, a number, a bool or a char - values with no lifetime to observe. | — |
+| **Get** | `Get(h:instance) - any` | The target while it lives, `nil` afterwards. The result is an ordinary owning reference: keep it only as long as needed. Raises `Exception.InvalidArguments` for an instance that is not a handle. | — |
+
+- Handles never extend a lifetime: a value reached only through handles is
+  freed as soon as its last owner lets go.
+- `Object.Clone(h)` is a second, independent handle on the same target.
+- A value owned by a structure that was just dropped dies when the deferred-free
+  queue next drains, not on the same instruction as its owner; a handle on it
+  resolves until then.
+- A handle on a static value (a class, a module) always resolves.
+
+`weak(v)` is the keyword form of `Create`.
+
+```flaris
+class Node {
+    let child = nil;    // owned
+    let parent = nil;   // observed
+    fn Adopt(c) { this.child = c; c.parent = weak(this); }
+    fn Up() { return Weak.Get(this.parent); }   // nil once the parent is gone
+}
 ```
 
 ---

@@ -1,0 +1,168 @@
+// Profiler.fls - Wall-clock section profiler for Flaris.
+// Version: 1.0
+//
+// Names the places where the time goes: wrap a call in a named section, or
+// bracket a stretch of code with Begin/End, and read the totals back as an
+// object or a table. Times are inclusive - a section that calls another
+// section counts the inner time too - and come from Time.Ticks, so nested
+// fibers and interleaved requests each measure their own span.
+//
+// Usage:
+//   import { Profiler } from library("Profiler", "1.0");
+//
+//   let user = Profiler.Section("jwt", fn() { return verify(token); });
+//
+//   let t = Profiler.Begin();                 // a span that spans statements
+//   let cfg = readConfig();
+//   Profiler.End("uci", t);
+//
+//   Profiler.Count("cache-hit");              // an event with no duration
+//
+//   Console.WriteLine(Profiler.Report());
+//
+//   name                      calls   total ms    avg µs    min µs    max µs
+//   ----------------------------------------------------------------------
+//   jwt                         412      92.10    223.54    180.21   1204.90
+//   uci                          58       9.41    162.24    150.03    401.77
+//   cache-hit                   380          -         -         -         -
+//
+// API:
+//   Section(name, fn)      - run fn, account its time under name, return its
+//                            value; the time is recorded even when fn throws
+//   Begin()  → int         - start of a manual span (a tick count)
+//   End(name, t0)  → float - close the span started at t0, return its ms
+//   Count(name, n?)        - add n (default 1) to a counter
+//   Stats()  → object      - name → { calls, totalMs, avgUs, minUs, maxUs };
+//                            a counter has calls only, its times are nil
+//   Report(opts?) → string - table sorted by total time, then by calls
+//       top       rows to show                        (default all)
+//       sort      "total" | "calls" | "avg" | "max"  (default "total")
+//   Reset()                - forget every section and counter
+//   Enable() / Disable()   - a disabled profiler records nothing; Section
+//   IsEnabled() → bool       still runs fn, End still returns the elapsed ms
+//                            (on by default)
+//
+// Cost: a Section is a closure call plus two Time.Ticks reads and a map
+// update, about a quarter of a microsecond on a desktop. Disabled, it is one
+// field test.
+
+global _sections = {};
+global _enabled:bool = true;
+
+class Profiler
+{
+    fn static Enable()  { _enabled = true; }
+    fn static Disable() { _enabled = false; }
+    fn static IsEnabled(): bool { return _enabled; }
+
+    fn static Reset() { _sections = {}; }
+
+    fn static Begin(): int { return Time.Ticks(); }
+
+    fn static End(name:string, t0:int): float {
+        let dt:int = Time.Ticks() - t0;
+        if (_enabled) { Profiler._record(name, dt); }
+        return Time.TicksToMs(dt);
+    }
+
+    fn static Section(name:string, body:fn) {
+        if (!_enabled) { return body(); }
+        let t0:int = Time.Ticks();
+        try {
+            return body();
+        } finally {
+            Profiler._record(name, Time.Ticks() - t0);
+        }
+    }
+
+    fn static Count(name:string, n?: int) {
+        if (!_enabled) { return; }
+        let e = Object.TryGet(_sections, name, nil);
+        if (e == nil) {
+            _sections[name] = { calls: n ?? 1, total: 0, min: -1, max: 0 };
+        } else {
+            e.calls = e.calls + (n ?? 1);
+        }
+    }
+
+    fn static _record(name:string, dt:int) {
+        let e = Object.TryGet(_sections, name, nil);
+        if (e == nil) {
+            _sections[name] = { calls: 1, total: dt, min: dt, max: dt };
+            return;
+        }
+        e.calls = e.calls + 1;
+        e.total = e.total + dt;
+        if (e.min < 0 || dt < e.min) { e.min = dt; }
+        if (dt > e.max) { e.max = dt; }
+    }
+
+    fn static Stats() {
+        let out = {};
+        foreach (name in Object.Keys(_sections)) {
+            let e = _sections[name];
+            if (e.min < 0) {
+                out[name] = { calls: e.calls, totalMs: nil, avgUs: nil, minUs: nil, maxUs: nil };
+            } else {
+                out[name] = {
+                    calls:   e.calls,
+                    totalMs: Time.TicksToMs(e.total),
+                    avgUs:   Time.TicksToUs(e.total) / float(e.calls),
+                    minUs:   Time.TicksToUs(e.min),
+                    maxUs:   Time.TicksToUs(e.max)
+                };
+            }
+        }
+        return out;
+    }
+
+    fn static Report(opts?): string {
+        let o = opts ?? {};
+        let top:int = Object.TryGet(o, "top", 0);
+        let key = Object.TryGet(o, "sort", "total");
+
+        let rows = [];
+        let stats = Profiler.Stats();
+        foreach (name in Object.Keys(stats)) {
+            let s = stats[name];
+            Array.Append(rows, {
+                name:  name,
+                calls: s.calls,
+                total: s.totalMs ?? -1.0,
+                avg:   s.avgUs ?? -1.0,
+                min:   s.minUs ?? -1.0,
+                max:   s.maxUs ?? -1.0
+            });
+        }
+        Array.Sort(rows, fn(a, b) {
+            let x = (key == "calls") ? float(a.calls) : a[key];
+            let y = (key == "calls") ? float(b.calls) : b[key];
+            if (x != y) { return x > y; }
+            if (a.calls != b.calls) { return a.calls > b.calls; }
+            return a.name < b.name;
+        });
+
+        let lines = [];
+        Array.Append(lines,
+            String.PadRight("name", 24) + String.PadLeft("calls", 7)
+            + String.PadLeft("total ms", 11) + String.PadLeft("avg µs", 10)
+            + String.PadLeft("min µs", 10) + String.PadLeft("max µs", 10));
+        Array.Append(lines, String.Repeat("-", 72));
+        let n:int = 0;
+        foreach (r in rows) {
+            if (top > 0 && n >= top) { break; }
+            n += 1;
+            Array.Append(lines,
+                String.PadRight(r.name, 24) + String.PadLeft(str(r.calls), 7)
+                + String.PadLeft(_num(r.total), 11) + String.PadLeft(_num(r.avg), 10)
+                + String.PadLeft(_num(r.min), 10) + String.PadLeft(_num(r.max), 10));
+        }
+        return String.Join(lines, "\n");
+    }
+}
+
+fn _num(v:float): string {
+    return (v < 0.0) ? "-" : String.FormatArray("{0:.2f}", [v]);
+}
+
+export { Profiler };
