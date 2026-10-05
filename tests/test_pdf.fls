@@ -1,0 +1,767 @@
+// Test suite for Pdf.fls
+//
+// Every document built here is checked structurally: the xref table must
+// point at each object, page content must inflate back to what an
+// uncompressed build writes, and pass-through images must land byte for byte.
+// Content-stream assertions use { compress: false } so operators are readable.
+//
+// Run: ./flarisvm ./tests/test_pdf.fls
+
+import { PdfWriter, PdfLayout } from library("Pdf", "1.0");
+import { Png } from library("Png", "1.0");
+import { Inflate, Deflate } from library("Deflate", "1.0");
+import { QRCode } from library("QRCode", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+// 16x8 grayscale baseline JPEG.
+const TINY_JPEG = "ffd8ffe000104a46494600010100000100010000ffdb0043001b12141714111b1716171e1c1b2028422b28252528513a3d3042605565645f555d5b6a7899816a7190735b5d85b586909ea3abadab6780bcc9baa6c799a8aba4ffc0000b080008001001011100ffc4001500010100000000000000000000000000000002ffc4001f10000003090000000000000000000000000011130105122123316182a1ffda0008010100003f00963a122ae86911db32e031ee915043788ed89707ffd9";
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + "  expected=" + str(expected) + " got=" + str(actual));
+    }
+}
+
+fn near(a, b): bool { return Math.AbsF(a - b) < 0.001; }
+
+fn hexDigit(c: int): int { return c <= 57 ? c - 48 : (c | 32) - 87; }
+
+fn fromHex(hex: string): block {
+    let n = len(hex) / 2;
+    let b = Buffer.Create(n, 1);
+    iter (i from 0 to n) { b[i] = hexDigit(Char.Code(hex[i * 2])) * 16 + hexDigit(Char.Code(hex[i * 2 + 1])); }
+    return b;
+}
+
+fn has(pdf: block, needle: string): bool { return Buffer.IndexOf(pdf, needle, 0) >= 0; }
+
+fn countOf(pdf: block, needle: string): int {
+    var n = 0;
+    var p = Buffer.IndexOf(pdf, needle, 0);
+    while (p >= 0) { n += 1; p = Buffer.IndexOf(pdf, needle, p + len(needle)); }
+    return n;
+}
+
+// Decimal integer starting at byte p.
+fn intAt(pdf: block, p: int): int {
+    var v = 0;
+    var i = p;
+    while (i < len(pdf)) {
+        let c = Buffer.ReadU8At(pdf, i);
+        if (c < 48 || c > 57) { break; }
+        v = v * 10 + (c - 48);
+        i += 1;
+    }
+    return v;
+}
+
+// Bytes of the first stream whose dictionary contains `marker`.
+fn streamOf(pdf: block, marker: string): block {
+    let m = Buffer.IndexOf(pdf, marker, 0);
+    if (m < 0) return nil;
+    let lp = Buffer.IndexOf(pdf, "/Length ", m);
+    let sp = Buffer.IndexOf(pdf, "stream\n", lp);
+    if (lp < 0 || sp < 0) return nil;
+    let n = intAt(pdf, lp + 8);
+    if (n == 0) return Buffer.FromString("");
+    return Buffer.Slice(pdf, sp + 7, n);
+}
+
+// Page content of a { compress: false } document, as text.
+fn contentOf(pdf: block, page: int): string {
+    var p = 0;
+    var k = 0;
+    while (true) {
+        p = Buffer.IndexOf(pdf, "0 obj\n<< /Length ", p);
+        if (p < 0) return "";
+        if (k == page) {
+            let n = intAt(pdf, p + 17);
+            let sp = Buffer.IndexOf(pdf, "stream\n", p);
+            if (n == 0) return "";
+            return Buffer.ToString(Buffer.Slice(pdf, sp + 7, n));
+        }
+        k += 1;
+        p += 1;
+    }
+}
+
+// startxref -> xref; every in-use entry must point at "<n> 0 obj".
+fn xrefValid(pdf: block): bool {
+    let total = len(pdf);
+    if (Buffer.IndexOf(pdf, "%PDF-1.4\n", 0) != 0) return false;
+    if (Buffer.LastIndexOf(pdf, "%%EOF\n") != total - 6) return false;
+    let sx = Buffer.LastIndexOf(pdf, "startxref\n");
+    if (sx < 0) return false;
+    let xp = intAt(pdf, sx + 10);
+    if (Buffer.IndexOf(pdf, "xref\n0 ", xp) != xp) return false;
+    let count = intAt(pdf, xp + 7);
+    let first = Buffer.IndexOf(pdf, "\n", xp + 5) + 1;
+    if (count < 2) return false;
+    iter (i from 1 to count) {
+        let e = first + i * 20;
+        let off = intAt(pdf, e);
+        let want = str(i) + " 0 obj\n";
+        if (Buffer.IndexOf(pdf, want, off) != off) return false;
+    }
+    return true;
+}
+
+fn mkChunk(tag: string, data): block {
+    var body = Buffer.FromString(tag);
+    if (data != nil) { body = Buffer.Concat(body, data); }
+    let n = len(body) - 4;
+    let out = Buffer.Create(n + 12, 1);
+    Buffer.WriteU32At(out, 0, n, true);
+    Buffer.Copy(body, 0, out, 4, len(body));
+    Buffer.WriteU32At(out, n + 8, Hash.Crc32(body) & 0xFFFFFFFF, true);
+    return out;
+}
+
+// RGB8 PNG (colour type 2) - a type a PDF reader decodes as it is.
+fn mkRgbPng(w: int, h: int): object {
+    let raw = Buffer.Create(h * (w * 3 + 1), 1);
+    var p = 0;
+    iter (y from 0 to h) {
+        raw[p] = 0;
+        p += 1;
+        iter (x from 0 to w) {
+            raw[p] = (x * 40) & 255; raw[p + 1] = (y * 60) & 255; raw[p + 2] = 128;
+            p += 3;
+        }
+    }
+    let idat = Deflate.Zlib(raw);
+    let ihdr = Buffer.Create(13, 1);
+    Buffer.WriteU32At(ihdr, 0, w, true);
+    Buffer.WriteU32At(ihdr, 4, h, true);
+    ihdr[8] = 8; ihdr[9] = 2;
+    let sig = fromHex("89504e470d0a1a0a");
+    let png = Buffer.Concat(Buffer.Concat(Buffer.Concat(sig, mkChunk("IHDR", ihdr)), mkChunk("IDAT", idat)), mkChunk("IEND", nil));
+    return { png: png, idat: idat };
+}
+
+fn mkRgbaPng(w: int, h: int): block {
+    let px = Buffer.Create(w * h, 4);
+    iter (i from 0 to w * h) { px[i] = ((i * 37) & 255) << 24 | 0x336699; }
+    return Png.Encode(px, w, h);
+}
+
+fn plain(opts?: object): instance {
+    let o = opts ?? {};
+    o["compress"] = false;
+    return new PdfWriter(o);
+}
+
+fn test_structure() {
+    let empty = new PdfWriter();
+    let b = empty.ToBlock();
+    check(xrefValid(b), "empty document has a valid xref");
+    checkEq(empty.PageCount(), 1, "an empty document gets one page");
+    check(has(b, "/Count 1"), "page tree counts one page");
+
+    let pdf = new PdfWriter({ unit: "mm" });
+    pdf.SetFont("Helvetica", 12);
+    pdf.DrawText(10, 10, "Hello");
+    pdf.AddPage();
+    pdf.SetFont("Times", 12, "bold");
+    pdf.DrawText(10, 10, "World");
+    pdf.SetOpacity(0.5);
+    pdf.FillRect(10, 20, 30, 10);
+    pdf.Link(10, 20, 30, 10, "https://example.com/a(b)");
+    let out = pdf.ToBlock();
+    check(xrefValid(out), "multi-page document has a valid xref");
+    check(has(out, "/Count 2"), "page tree counts two pages");
+    check(has(out, "/BaseFont /Helvetica /Encoding /WinAnsiEncoding"), "Helvetica resource");
+    check(has(out, "/BaseFont /Times-Bold "), "Times-Bold resource");
+    checkEq(countOf(out, "/Type /Font"), 2, "only used fonts are written");
+    check(has(out, "/URI (https://example.com/a\\(b\\))"), "link URI with escaped parens");
+    check(has(out, "/ca 0.5 /CA 0.5"), "opacity ExtGState");
+    check(Buffer.Equals(out, pdf.ToBlock()), "ToBlock twice gives identical bytes");
+    return 0;
+}
+
+fn test_compression() {
+    let build = fn(compress: bool): block {
+        let pdf = new PdfWriter({ compress: compress });
+        pdf.SetInfo({ created: 1790000000 });
+        pdf.SetFont("Courier", 9);
+        iter (i from 0 to 40) { pdf.DrawText(20, 20 + i * 12, "Line " + str(i) + " of repetitive content"); }
+        return pdf.ToBlock();
+    };
+    let z = build(true);
+    let raw = build(false);
+    check(xrefValid(z), "compressed document has a valid xref");
+    check(len(z) < len(raw), "compressed is smaller (" + str(len(z)) + " < " + str(len(raw)) + ")");
+    let zs = streamOf(z, "/Filter /FlateDecode");
+    let inflated = Inflate.Zlib(zs);
+    check(inflated != nil, "content stream inflates");
+    if (inflated != nil) {
+        checkEq(Buffer.ToString(inflated), contentOf(raw, 0), "inflated content equals the uncompressed content");
+    }
+    let again = build(true);
+    check(Buffer.Equals(z, again), "same input and created date give identical bytes");
+    return 0;
+}
+
+fn test_geometry() {
+    let pdf = plain({ unit: "pt" });
+    pdf.Line(0, 0, 10, 10);
+    pdf.SetThickness(2);
+    pdf.SetStroke(0xFF0000);
+    pdf.Rect(10, 20, 30, 40);
+    pdf.SetFill(0x00FF00);
+    pdf.FillRect(0, 0, 1.5, 2.25);
+    pdf.DrawRect(1, 2, 3, 4);
+    pdf.SetDash(3);
+    pdf.Circle(100, 100, 10);
+    pdf.SetDash();
+    pdf.Polyline([0, 0, 5, 5, 10, 0]);
+    pdf.FillPolygon([0, 0, 5, 5, 10, 0]);
+    pdf.Polyline([1, 2, 3]);
+    pdf.MoveTo(0, 0); pdf.LineTo(1, 1); pdf.ClosePath(); pdf.FillPath();
+    pdf.StrokePath();
+    let c = contentOf(pdf.ToBlock(), 0);
+    check(String.Contains(c, "0 841.89 m 10 831.89 l S"), "Line flips y against the A4 height");
+    check(String.Contains(c, "1 0 0 RG"), "stroke colour");
+    check(String.Contains(c, "2 w"), "line width");
+    check(String.Contains(c, "10 781.89 30 40 re S"), "Rect uses the lower-left corner");
+    check(String.Contains(c, "0 1 0 rg"), "fill colour");
+    check(String.Contains(c, "0 839.64 1.5 2.25 re f"), "fractional coordinates");
+    check(String.Contains(c, "re B"), "DrawRect fills and strokes");
+    check(String.Contains(c, "[3 3] 0 d"), "SetDash(on) uses on for the gap");
+    check(String.Contains(c, "[] 0 d"), "SetDash() returns to solid");
+    checkEq(String.Count(c, " c"), 4 + 0, "a circle is four Bezier segments");
+    check(String.Contains(c, "0 841.89 m 5 836.89 l 10 841.89 l S"), "Polyline");
+    check(String.Contains(c, "10 841.89 l h f"), "FillPolygon closes the path");
+    check(String.Contains(c, "0 841.89 m 1 840.89 l h f"), "path API");
+    checkEq(String.Count(c, "RG"), 1, "an unchanged stroke colour is written once");
+    checkEq(String.Count(c, " w\n"), 1, "an unchanged line width is written once");
+
+    let mm = plain({ unit: "mm" });
+    mm.FillRect(10, 10, 10, 10);
+    check(String.Contains(contentOf(mm.ToBlock(), 0), "28.346 785.197 28.346 28.346 re f"), "mm converts to points");
+
+    let pie = plain();
+    pie.FillPie(50, 50, 10, 0, 90);
+    let pc = contentOf(pie.ToBlock(), 0);
+    check(String.Contains(pc, "50 791.89 m 60 791.89 l"), "pie starts at the centre, then 3 o'clock");
+    check(String.Contains(pc, "50 781.89 c h f"), "a 90-degree pie ends at 6 o'clock (y down)");
+    return 0;
+}
+
+fn test_text() {
+    let pdf = plain();
+    pdf.SetFont("Helvetica", 12);
+    check(near(pdf.TextWidth("Hello"), 27.336), "Helvetica 'Hello' at 12 pt");
+    check(near(pdf.TextWidth("å"), 6.672), "Helvetica å uses the aring width");
+    check(near(pdf.TextWidth("€"), 6.672), "euro sign width");
+    check(near(pdf.TextWidth("中"), pdf.TextWidth("?")), "unmapped characters measure as '?'");
+    check(near(pdf.TextWidth("a\tb"), pdf.TextWidth("a b")), "tab measures as a space");
+    check(near(pdf.TextWidth("a\u0001b"), pdf.TextWidth("ab")), "control characters measure nothing");
+    checkEq(pdf.TextWidth(""), 0.0, "empty string");
+    pdf.SetFont("Times", 10);
+    check(near(pdf.TextWidth("Hello"), 22.22), "Times-Roman 'Hello' at 10 pt");
+    pdf.SetFont("Courier", 10, "bold");
+    check(near(pdf.TextWidth("abc"), 18.0), "Courier glyphs are 600 units");
+    checkEq(pdf.FontName(), "Courier-Bold", "family + style");
+
+    check(pdf.SetFont("Helvetica", 10, "bolditalic"), "bolditalic accepted");
+    checkEq(pdf.FontName(), "Helvetica-BoldOblique", "italic Helvetica is the Oblique face");
+    check(pdf.SetFont("times-bold", 10, "italic"), "full name + style");
+    checkEq(pdf.FontName(), "Times-Italic", "style replaces the name's style");
+    check(pdf.SetFont("Times-BoldItalic"), "full name without size");
+    checkEq(pdf.FontSize(), 10.0, "size kept when omitted");
+    check(!pdf.SetFont("Comic Sans", 10), "unknown family rejected");
+    check(!pdf.SetFont("Helvetica", 10, "wide"), "unknown style rejected");
+    checkEq(pdf.FontName(), "Times-BoldItalic", "a rejected SetFont keeps the font");
+
+    pdf.SetFont("Helvetica", 10);
+    check(near(pdf.Ascent(), 7.18), "Helvetica ascent");
+    check(near(pdf.Descent(), 2.07), "Helvetica descent");
+    check(near(pdf.LineHeight(), 12.0), "line height is 1.2 em");
+
+    pdf.SetTextColor(0x0000FF);
+    pdf.DrawText(10, 20, "Räksmörgås (€) \\ “q” – x中");
+    pdf.DrawTextRight(100, 40, "R");
+    pdf.DrawTextCenter(100, 60, "C");
+    pdf.DrawText(10, 80, "");
+    let c = contentOf(pdf.ToBlock(), 0);
+    check(String.Contains(c, "0 0 1 rg"), "text colour");
+    check(String.Contains(c, "/F1 10 Tf"), "font selected once");
+    checkEq(String.Count(c, "Tf"), 1, "an unchanged font is not re-selected");
+    check(String.Contains(c, "BT /F1 10 Tf 10 814.71 Td"), "baseline sits one ascent below y");
+    check(String.Contains(c, "(R\\344ksm\\366rg\\345s \\(\\200\\) \\\\ \\223q\\224 \\226 x\\077) Tj"), "WinAnsi octal escapes");
+    check(String.Contains(c, "BT 92.78 794.71 Td (R) Tj"), "DrawTextRight ends at x");
+    check(String.Contains(c, "BT 96.39 774.71 Td (C) Tj"), "DrawTextCenter centres on x");
+    checkEq(String.Count(c, "BT"), 3, "empty text draws nothing");
+    return 0;
+}
+
+fn test_extended_text() {
+    let pdf = plain();
+    pdf.SetFont("Helvetica", 10);
+    check(near(pdf.TextWidth("ł"), 2.22), "Helvetica lslash width");
+    check(near(pdf.TextWidth("Ł"), 5.56), "Helvetica Lslash width");
+    check(near(pdf.TextWidth("−"), 5.84), "the minus sign is its own glyph, not a hyphen");
+    check(near(pdf.TextWidth("ț"), pdf.TextWidth("ţ")), "t with comma below uses tcommaaccent");
+    check(near(pdf.TextWidth("Δ"), pdf.TextWidth("∆")), "Greek Delta uses the increment glyph");
+    check(near(pdf.TextWidth("μ"), pdf.TextWidth("µ")), "Greek mu uses the micro sign");
+    check(near(pdf.TextWidth("ж"), pdf.TextWidth("?")), "Cyrillic is still '?'");
+    pdf.SetFont("Times", 10, "italic");
+    check(near(pdf.TextWidth("ő"), 5.0), "Times-Italic odblacute width");
+    pdf.SetFont("Courier", 10);
+    check(near(pdf.TextWidth("żółć"), 24.0), "Courier extended glyphs are 600 units");
+
+    pdf.SetFont("Helvetica", 10);
+    pdf.DrawText(10, 20, "aŁb");
+    pdf.DrawText(10, 40, "ść");
+    pdf.DrawText(10, 60, "plain");
+    let out = pdf.ToBlock();
+    let c = contentOf(out, 0);
+    check(String.Contains(c, "BT /F1 10 Tf 10 814.71 Td (a) Tj /F13 10 Tf (\\250) Tj /F1 10 Tf (b) Tj ET"),
+          "a mixed line switches to the extended font and back");
+    check(String.Contains(c, "BT /F13 10 Tf 10 794.71 Td (\\273\\207) Tj ET"), "a line of extended glyphs is one run");
+    check(String.Contains(c, "BT /F1 10 Tf 10 774.71 Td (plain) Tj ET"), "the font switches back for the next line");
+    check(has(out, "/BaseFont /Helvetica /Encoding " ), "extended face is the same base font");
+    check(has(out, "/Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [128 /Amacron /amacron"), "shared Differences encoding");
+    checkEq(countOf(out, "/Type /Encoding"), 1, "one encoding object for every extended face");
+    check(xrefValid(out), "extended document xref");
+
+    let ascii = plain();
+    ascii.DrawText(10, 10, "Räksmörgås");
+    let ao = ascii.ToBlock();
+    check(!has(ao, "/Differences") && !has(ao, "/F13"), "Latin-1 text needs no extended font");
+
+    let lines = pdf.WrapText("Zażółć gęślą jaźń Příliš žluťoučký kůň úpěl ďábelské ódy", 120);
+    checkEq(String.Join(lines, " "), "Zażółć gęślą jaźń Příliš žluťoučký kůň úpěl ďábelské ódy", "wrapping keeps extended letters");
+    var fits = true;
+    foreach (l in lines) { if (pdf.TextWidth(l) > 120.0001) { fits = false; } }
+    check(len(lines) > 1 && fits, "extended lines are measured when wrapping");
+    return 0;
+}
+
+fn test_wrap() {
+    let pdf = plain({ unit: "mm" });
+    pdf.SetFont("Helvetica", 10);
+    let text = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.";
+    let lines = pdf.WrapText(text, 50);
+    check(len(lines) > 1, "long text wraps");
+    var fits = true;
+    foreach (l in lines) { if (pdf.TextWidth(l) > 50.0001) { fits = false; } }
+    check(fits, "every wrapped line fits");
+    checkEq(String.Join(lines, " "), text, "wrapping only replaces spaces");
+
+    let broken = pdf.WrapText(String.Repeat("W", 40), 30);
+    check(len(broken) > 1, "an over-long word is broken");
+    var bfits = true;
+    foreach (l in broken) { if (pdf.TextWidth(l) > 30.0001) { bfits = false; } }
+    check(bfits, "broken pieces fit");
+    checkEq(String.Join(broken, ""), String.Repeat("W", 40), "breaking keeps every character");
+
+    let para = pdf.WrapText("a\n\nb   c\r\n", 100);
+    checkEq(len(para), 4, "newlines force breaks and keep blank lines");
+    checkEq(para[0], "a", "first line");
+    checkEq(para[1], "", "blank line");
+    checkEq(para[2], "b c", "runs of spaces collapse");
+    checkEq(len(pdf.WrapText("", 50)), 1, "empty text is one empty line");
+
+    let h = pdf.DrawTextBox(20, 20, 50, text, "right");
+    check(near(h, len(lines) * pdf.LineHeight()), "DrawTextBox returns lines x line height");
+    let c = contentOf(pdf.ToBlock(), 0);
+    checkEq(String.Count(c, "Tj"), len(lines), "one text op per line");
+    return 0;
+}
+
+fn test_pages() {
+    let pdf = new PdfWriter({ unit: "mm", size: "A4" });
+    check(near(pdf.PageWidth(), 210.0) && near(pdf.PageHeight(), 297.0), "A4 in mm before the first page");
+    checkEq(pdf.PageCount(), 0, "querying the size creates no page");
+    checkEq(pdf.AddPage(), 0, "first page index");
+    checkEq(pdf.AddPage("A5", true), 1, "second page index");
+    check(near(pdf.PageWidth(), 210.0) && near(pdf.PageHeight(), 148.0), "A5 landscape");
+    checkEq(pdf.AddPage([100, 50]), 2, "custom size page");
+    check(near(pdf.PageWidth(), 100.0) && near(pdf.PageHeight(), 50.0), "custom size in units");
+    pdf.AddPage("nonsense");
+    check(near(pdf.PageWidth(), 210.0), "unknown size falls back to the document size");
+    check(pdf.SetPage(1), "SetPage in range");
+    checkEq(pdf.PageIndex(), 1, "PageIndex follows SetPage");
+    check(!pdf.SetPage(9) && !pdf.SetPage(-1), "SetPage out of range");
+    checkEq(pdf.PageIndex(), 1, "a failed SetPage keeps the page");
+
+    let land = new PdfWriter({ size: "Letter", landscape: true });
+    check(near(land.PageWidth(), 792.0) && near(land.PageHeight(), 612.0), "Letter landscape in points");
+    let inch = new PdfWriter({ unit: "in", size: "Legal" });
+    check(near(inch.PageHeight(), 14.0), "Legal is 14 inches tall");
+
+    let lazy = plain();
+    lazy.DrawText(0, 0, "x");
+    checkEq(lazy.PageCount(), 1, "drawing starts the first page");
+
+    let foot = plain();
+    foot.AddPage(); foot.AddPage(); foot.AddPage();
+    foot.SetFont("Helvetica", 8);
+    iter (i from 0 to foot.PageCount()) {
+        foot.SetPage(i);
+        foot.DrawText(10, 10, "Page " + str(i + 1) + " of " + str(foot.PageCount()));
+    }
+    let fb = foot.ToBlock();
+    check(xrefValid(fb), "footer document xref");
+    check(String.Contains(contentOf(fb, 2), "(Page 3 of 3)"), "SetPage writes to an earlier page");
+    check(String.Contains(contentOf(fb, 0), "/F1 8 Tf"), "each page selects its own font");
+    check(String.Contains(contentOf(fb, 1), "/F1 8 Tf"), "font state is per page");
+    return 0;
+}
+
+fn test_images() {
+    let rgb = mkRgbPng(5, 3);
+    let pdf = plain({ unit: "pt" });
+    let id = pdf.LoadImage(rgb.png);
+    checkEq(id, 0, "PNG loads");
+    let sz = pdf.ImageSize(id);
+    check(sz != nil && sz.Width == 5 && sz.Height == 3, "PNG size");
+    check(pdf.DrawImage(id, 10, 20, 50), "draw by id");
+    check(pdf.DrawImage(id, 10, 100, nil, 30), "draw with height only");
+    check(pdf.DrawImage(id, 10, 200), "draw at natural size");
+    let jpg = pdf.LoadImage(fromHex(TINY_JPEG));
+    checkEq(jpg, 1, "JPEG loads");
+    let js = pdf.ImageSize(jpg);
+    check(js != nil && js.Width == 16 && js.Height == 8, "JPEG width and height from SOF");
+    let rgba = pdf.LoadImage(mkRgbaPng(4, 4));
+    checkEq(rgba, 2, "RGBA PNG loads");
+    pdf.SetOpacity(0.25);
+    pdf.DrawImage(rgba, 0, 0, 10, 10);
+
+    check(pdf.LoadImage(Buffer.FromString("not an image at all")) == nil, "unknown bytes -> nil");
+    check(pdf.LoadImage(fromHex("ffd8ffd9")) == nil, "truncated JPEG -> nil");
+    check(pdf.LoadImage("/definitely/missing.png") == nil, "missing file -> nil");
+    check(!pdf.DrawImage(42, 0, 0, 10), "unknown id -> false");
+    check(pdf.ImageSize(42) == nil, "ImageSize of unknown id -> nil");
+
+    let out = pdf.ToBlock();
+    check(xrefValid(out), "image document xref");
+    check(has(out, "/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns 5 >>"), "RGB PNG passes through with PNG predictors");
+    let data = streamOf(out, "/Columns 5 >>");
+    check(data != nil && Buffer.Equals(data, rgb.idat), "pass-through stream is the IDAT data byte for byte");
+    check(has(out, "/Width 16 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode"), "JPEG as DCTDecode");
+    check(has(out, "/SMask "), "alpha becomes a soft mask");
+    checkEq(countOf(out, "/Subtype /Image"), 4, "three images plus one soft mask");
+    let c = contentOf(out, 0);
+    check(String.Contains(c, "q 50 0 0 30 10 791.89 cm /Im1 Do Q"), "width-only keeps the aspect ratio");
+    check(String.Contains(c, "q 50 0 0 30 10 711.89 cm /Im1 Do Q"), "height-only keeps the aspect ratio");
+    check(String.Contains(c, "q 5 0 0 3 10 638.89 cm /Im1 Do Q"), "natural size is one point per pixel");
+    check(String.Contains(c, "/GS1 gs\nq 10 0 0 10 0 831.89 cm /Im3 Do Q"), "opacity applies to images");
+
+    let path = Os.TempDir() + "/flaris_test_pdf.png";
+    File.WriteAllBytes(path, rgb.png);
+    let byPath = plain();
+    check(byPath.DrawImage(path, 0, 0, 10), "draw by path");
+    check(byPath.DrawImage(path, 20, 0, 10), "draw the same path again");
+    checkEq(countOf(byPath.ToBlock(), "/Subtype /Image"), 1, "a path is stored once");
+    File.Delete(path);
+    return 0;
+}
+
+fn test_cells_info() {
+    let url = "https://flaris.dev/pay?id=1042";
+    let px = QRCode.ToPixels(url, 1);
+    let n = QRCode.PixelSize(url, 1);
+    let pdf = plain({ unit: "mm" });
+    check(pdf.DrawCells(10, 10, 40, px, n), "DrawCells accepts QRCode.ToPixels output");
+    check(!pdf.DrawCells(10, 10, 40, px, n + 1), "too few cells -> false");
+    check(!pdf.DrawCells(10, 10, 40, nil, 3), "nil cells -> false");
+    let c = contentOf(pdf.ToBlock(), 0);
+    let rects = String.Count(c, " re");
+    check(rects > 0 && rects < n * n / 2, "dark runs merge into rectangles (" + str(rects) + ")");
+    checkEq(String.Count(c, " f"), 1, "one fill for the whole grid");
+
+    let doc = plain();
+    doc.SetInfo({ title: "Årsrapport 😀", author: "Acme (AB)", subject: "Q3", created: 1790000000 });
+    let out = doc.ToBlock();
+    check(has(out, "/Title <FEFF00C5007200730072006100700070006F007200740020D83DDE00>"), "non-ASCII title as UTF-16BE with a surrogate pair");
+    check(has(out, "/Author (Acme \\(AB\\))"), "ASCII author as an escaped literal");
+    check(has(out, "/Subject (Q3)"), "subject");
+    check(has(out, "/CreationDate (D:" + Time.Format(1790000000, "%Y%m%d%H%M%S") + "Z)"), "creation date from created");
+    check(has(out, "/Producer (Flaris Pdf)"), "producer");
+
+    let path = Os.TempDir() + "/flaris_test_pdf.pdf";
+    check(doc.Save(path), "Save writes a file");
+    let back = File.ReadAllBytes(path);
+    check(back != nil && Buffer.Equals(back, doc.ToBlock()), "saved bytes equal ToBlock");
+    File.Delete(path);
+    return 0;
+}
+
+// y operands of every text position on a page, in points from the bottom.
+fn tdYs(c: string): array {
+    let ys = [];
+    foreach (line in String.Split(c, "\n")) {
+        let p = String.IndexOf(line, " Td (");
+        if (p < 0) { continue; }
+        let parts = String.Split(String.Left(line, p), " ");
+        Array.Append(ys, Convert.ParseFloat(parts[len(parts) - 1]));
+    }
+    return ys;
+}
+
+// Every line box of 10 pt Helvetica (ascent 7.18, line 12) inside the margin m.
+fn linesInside(out: block, pages: int, m: number): bool {
+    iter (p from 0 to pages) {
+        foreach (y in tdYs(contentOf(out, p))) {
+            if (y + 7.18 > 841.89 - m + 0.01 || y - 4.82 < m - 0.01) return false;
+        }
+    }
+    return true;
+}
+
+fn tjCount(out: block, pages: int, needle: string): int {
+    var n = 0;
+    iter (p from 0 to pages) { n += String.Count(contentOf(out, p), needle); }
+    return n;
+}
+
+fn test_layout_flow() {
+    let pdf = plain();
+    pdf.SetFont("Helvetica", 10);
+    let doc = new PdfLayout(pdf, { margins: 50 });
+    checkEq(pdf.PageCount(), 1, "a layout starts the first page");
+    checkEq(doc.Y(), 50.0, "the cursor starts at the top margin");
+    check(near(doc.ContentWidth(), pdf.PageWidth() - 100.0), "content width inside the margins");
+    check(near(doc.Bottom(), pdf.PageHeight() - 50.0), "bottom of the content area");
+    let text = String.Repeat("Lorem ipsum dolor sit amet, consectetur adipiscing elit. ", 300);
+    let expected = len(pdf.WrapText(text, doc.ContentWidth()));
+    doc.Paragraph(text);
+    check(doc.PageCount() > 1, "a long paragraph continues on new pages");
+    checkEq(pdf.PageCount(), doc.PageCount(), "every layout page is a writer page");
+    let out = pdf.ToBlock();
+    check(xrefValid(out), "flowed document xref");
+    check(linesInside(out, pdf.PageCount(), 50), "every line lies inside the margins");
+    checkEq(tjCount(out, pdf.PageCount(), " Tj"), expected, "no line lost or repeated at page breaks");
+
+    pdf.SetFont("Times", 11);
+    pdf.SetTextColor(0x112233);
+    doc.Paragraph("styled", { font: "Courier", size: 20, style: "bold", color: 0xFF0000, align: "right" });
+    checkEq(pdf.FontName(), "Times-Roman", "Paragraph restores the font");
+    checkEq(pdf.FontSize(), 11.0, "Paragraph restores the size");
+    checkEq(pdf.TextColor(), 0x112233, "Paragraph restores the text colour");
+
+    let m = new PdfLayout(new PdfWriter({ unit: "mm" }));
+    check(near(m.Left(), 20.0) && near(m.Y(), 20.0), "default margins are 20 mm in the writer's unit");
+    let two = new PdfLayout(plain(), { margins: [30, 10] });
+    check(near(two.Left(), 10.0) && near(two.Y(), 30.0) && near(two.Remaining(), 841.89 - 60.0), "[vertical, horizontal] margins");
+
+    let lh = plain();
+    lh.DrawText(0, 0, "letterhead");
+    let onFirst = new PdfLayout(lh);
+    onFirst.SetY(300);
+    onFirst.Paragraph("body");
+    checkEq(lh.PageCount(), 1, "a layout continues on the writer's current page");
+    check(String.Contains(contentOf(lh.ToBlock(), 0), "(body) Tj"), "body lands below the letterhead");
+
+    let moved = plain();
+    let mv = new PdfLayout(moved);
+    mv.NewPage();
+    moved.SetPage(0);
+    mv.Paragraph("second");
+    let mo = moved.ToBlock();
+    check(String.Contains(contentOf(mo, 1), "(second)") && !String.Contains(contentOf(mo, 0), "(second)"),
+          "the layout returns to its own page after the writer moved");
+
+    let sp = new PdfLayout(plain(), { margins: 50 });
+    sp.SetY(sp.Bottom() - 5);
+    check(sp.EnsureSpace(20), "EnsureSpace breaks when the space is short");
+    checkEq(sp.Y(), 50.0, "a new page starts at the top margin");
+    check(!sp.EnsureSpace(100000), "at the top of a page EnsureSpace never breaks");
+    sp.Space(10);
+    checkEq(sp.Y(), 60.0, "Space moves the cursor");
+    sp.Space(10000);
+    checkEq(sp.PageCount(), 3, "Space past the bottom starts a page");
+
+    let hp = plain();
+    hp.SetFont("Helvetica", 10);
+    let hd = new PdfLayout(hp, { margins: 50 });
+    hd.SetY(hd.Bottom() - 40);
+    hd.Heading("Chapter");
+    checkEq(hd.PageCount(), 2, "a heading without room for two lines after it moves on");
+    let ho = hp.ToBlock();
+    check(String.Contains(contentOf(ho, 1), "(Chapter)") && String.Contains(contentOf(ho, 1), "/F2 18 Tf"), "heading is bold 18 pt on the new page");
+
+    let ip = plain();
+    let id = new PdfLayout(ip, { margins: 50 });
+    let png = mkRgbPng(5, 3).png;
+    check(id.Image(png, 50), "Image in the flow");
+    check(near(id.Y(), 50.0 + 30.0 + ip.LineHeight() * 0.5), "Image advances the cursor");
+    check(id.Image(png, 100000), "an over-wide image is scaled to the content width");
+    check(!id.Image(Buffer.FromString("junk"), 10), "Image with bad bytes -> false");
+    check(String.Contains(contentOf(ip.ToBlock(), 0), "q 495.276 0 0 297.165 "), "clamped image keeps its aspect ratio");
+    return 0;
+}
+
+fn test_layout_table() {
+    let pdf = plain();
+    pdf.SetFont("Helvetica", 9);
+    let doc = new PdfLayout(pdf, { margins: 40 });
+    let rows = [];
+    iter (i from 0 to 200) { Array.Append(rows, [i, "Name " + str(i), str(i * 3) + ",00"]); }
+    Array.Append(rows, { cells: ["", "Total", "59700,00"], style: "bold", fill: 0xDDE5F0 });
+    check(doc.Table([{ title: "No", width: 40 }, "Name", { title: "Amount", width: 80, align: "right" }], rows,
+                    { zebra: 0xF5F7FA }), "Table draws");
+    let pages = pdf.PageCount();
+    check(pages > 1, "a long table spans pages");
+    let out = pdf.ToBlock();
+    check(xrefValid(out), "table document xref");
+    var headers = 0;
+    iter (p from 0 to pages) { if (String.Count(contentOf(out, p), "(Amount) Tj") == 1) { headers += 1; } }
+    checkEq(headers, pages, "the header row repeats once on every page");
+    checkEq(tjCount(out, pages, "(Name "), 200, "every row drawn exactly once");
+    let last = contentOf(out, pages - 1);
+    check(String.Contains(last, "/F2 9 Tf") && String.Contains(last, "(Total)"), "a styled row is bold");
+    check(String.Contains(last, "0.867 0.898 0.941 rg"), "a styled row has its fill");
+    check(String.Contains(contentOf(out, 0), "0.961 0.969 0.98 rg"), "zebra rows");
+    check(String.Contains(contentOf(out, 0), "BT 83.15 "), "a flexible column starts after the fixed one, plus padding");
+    check(String.Contains(contentOf(out, 0), "BT 518.133 "), "a right-aligned header ends at the column edge minus padding");
+    var below = false;
+    iter (p from 0 to pages) {
+        foreach (y in tdYs(contentOf(out, p))) { if (y < 40.0) { below = true; } }
+    }
+    check(!below, "no row runs into the bottom margin");
+    checkEq(pdf.FontSize(), 9.0, "Table restores the size");
+    checkEq(pdf.FontName(), "Helvetica", "Table restores the font");
+
+    let once = plain();
+    once.SetFont("Helvetica", 9);
+    let od = new PdfLayout(once, { margins: 40 });
+    od.Table(["A", "B"], rows, { repeatHeader: false, grid: "all" });
+    let oo = once.ToBlock();
+    checkEq(tjCount(oo, once.PageCount(), "(A) Tj"), 1, "repeatHeader false draws the header once");
+    check(String.Count(contentOf(oo, 0), " l S") > 3 * 40, "grid all draws cell borders");
+
+    let bare = plain();
+    let bd = new PdfLayout(bare);
+    bd.Table(["", ""], [["x", "y"]], { grid: "none" });
+    let bc = contentOf(bare.ToBlock(), 0);
+    check(!String.Contains(bc, "/F2"), "empty titles mean no header row");
+    check(!String.Contains(bc, " l S"), "grid none draws no lines");
+    check(!bd.Table([], [], nil) && !bd.Table(["a"], nil), "Table without columns or rows -> false");
+    return 0;
+}
+
+fn test_layout_finish() {
+    let pdf = plain();
+    pdf.SetFont("Helvetica", 10);
+    let doc = new PdfLayout(pdf, { margins: 50,
+        header: { right: "Hdr" },
+        footer: { center: "Page {page} of {pages}", rule: true } });
+    doc.Paragraph(String.Repeat("Some words to fill the pages. ", 900));
+    let pages = doc.PageCount();
+    check(pages >= 3, "three or more pages to decorate");
+    let n = doc.Finish(fn(p, i, count) { p.DrawText(10, 10, "deco " + str(i) + "/" + str(count)); });
+    checkEq(n, pages, "Finish returns the page count");
+    checkEq(doc.Finish(), pages, "a second Finish only returns the count");
+    let out = pdf.ToBlock();
+    let p2 = contentOf(out, 1);
+    check(String.Contains(p2, "(Page 2 of " + str(pages) + ")"), "footer with page and page count");
+    check(String.Contains(p2, "(Hdr)"), "header on every page");
+    check(String.Contains(p2, "(deco 1/" + str(pages) + ")"), "decorate runs per page");
+    checkEq(tjCount(out, pages, "(Page 1 of"), 1, "Finish draws each band once");
+    foreach (line in String.Split(contentOf(out, 0), "\n")) {
+        if (String.Contains(line, "(Page 1 of")) {
+            let footY = tdYs(line)[0];
+            check(footY < 50.0 && footY > 0.0, "the footer sits in the bottom margin (" + str(footY) + ")");
+        }
+        if (String.Contains(line, "(Hdr)")) {
+            check(tdYs(line)[0] > 841.89 - 50.0, "the header sits in the top margin");
+        }
+    }
+    check(String.Contains(contentOf(out, 0), "/F1 8 Tf"), "bands default to 8 pt Helvetica");
+    checkEq(pdf.FontSize(), 10.0, "Finish restores the writer's style");
+    checkEq(pdf.PageIndex(), pages - 1, "Finish leaves the writer on the last page");
+    return 0;
+}
+
+fn test_benchmarks() {
+    Console.WriteLine("=== Pdf benchmarks ===");
+    let pages = 20;
+    let rows = 45;
+    let t = Time.Millis();
+    let pdf = new PdfWriter({ unit: "mm" });
+    iter (p from 0 to pages) {
+        pdf.AddPage();
+        pdf.SetFont("Helvetica", 14, "bold");
+        pdf.DrawText(20, 15, "Monthly report - page " + str(p + 1));
+        pdf.SetFont("Helvetica", 9);
+        iter (r from 0 to rows) {
+            let y = 30 + r * 5.5;
+            if (r % 2 == 0) { pdf.SetFill(0xF2F4F7); pdf.FillRect(20, y - 1, 170, 5.5); }
+            pdf.DrawText(22, y, "Item " + str(p * rows + r));
+            pdf.DrawText(80, y, "Category " + str(r % 7));
+            pdf.DrawTextRight(150, y, str(r * 17 % 100) + " st");
+            pdf.DrawTextRight(188, y, str(r * 1234 % 99999) + ",00 kr");
+        }
+    }
+    let draw = Time.Millis() - t;
+    t = Time.Millis();
+    let out = pdf.ToBlock();
+    let build = Time.Millis() - t;
+    Console.WriteLine("  " + str(pages) + " pages x " + str(rows) + " rows -> " + str(len(out)) + " B"
+                      + "   draw " + str(draw) + " ms   ToBlock " + str(build) + " ms");
+    check(xrefValid(out), "benchmark document xref");
+
+    let text = String.Repeat("Lorem ipsum dolor sit amet, consectetur adipiscing elit. ", 200);
+    t = Time.Millis();
+    let lines = pdf.WrapText(text, 120);
+    let wrap = Time.Millis() - t;
+    t = Time.Millis();
+    var total = 0.0;
+    iter (i from 0 to 10000) { total += pdf.TextWidth("Räksmörgås 1234,50 kr"); }
+    let widths = Time.Millis() - t;
+    Console.WriteLine("  WrapText " + str(len(text)) + " B -> " + str(len(lines)) + " lines " + str(wrap)
+                      + " ms   TextWidth x10000 " + str(widths) + " ms");
+    check(total > 0.0, "TextWidth loop");
+
+    let tp = new PdfWriter({ unit: "mm" });
+    tp.SetFont("Helvetica", 9);
+    let layout = new PdfLayout(tp, { footer: { center: "Page {page} of {pages}" } });
+    let tableRows = [];
+    iter (i from 0 to 1000) { Array.Append(tableRows, [str(10000 + i), "Article " + str(i), str(i % 13), str(i * 7) + ",00"]); }
+    t = Time.Millis();
+    layout.Table([{ title: "No", width: 20 }, "Description", { title: "Qty", width: 15, align: "right" },
+                  { title: "Amount", width: 30, align: "right" }], tableRows, { zebra: 0xF5F7FA });
+    layout.Finish();
+    let tableMs = Time.Millis() - t;
+    t = Time.Millis();
+    let tb = tp.ToBlock();
+    Console.WriteLine("  Table 1000 rows -> " + str(tp.PageCount()) + " pages, " + str(len(tb)) + " B   layout "
+                      + str(tableMs) + " ms   ToBlock " + str(Time.Millis() - t) + " ms");
+    check(xrefValid(tb), "benchmark table xref");
+    return 0;
+}
+
+fn Main() {
+    Console.WriteLine("=== Pdf tests ===");
+    test_structure();
+    test_compression();
+    test_geometry();
+    test_text();
+    test_extended_text();
+    test_wrap();
+    test_pages();
+    test_images();
+    test_cells_info();
+    test_layout_flow();
+    test_layout_table();
+    test_layout_finish();
+    test_benchmarks();
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All Pdf tests passed!");
+    return 0;
+}

@@ -76,7 +76,7 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 
 ## The libraries
 
-43 libraries, all pure Flaris unless noted:
+53 libraries, all pure Flaris unless noted:
 
 **Data & formats** — `CSV`, `XML`, `BinaryIO`, `BitConverter`, `Config`,
 `Template`, `Lexer`
@@ -103,7 +103,10 @@ sealed blobs, streaming MD5/SHA-1/SHA-256/SHA-384/SHA-512/SHA-3/Keccak-256/SHAKE
 PIN, signal, registration, operator scan, SMS in PDU mode, data contexts, USSD
 and call control)
 
-**Media** — `Graphics`, `Audio`, `QRCode`, `Png`
+**Hardware** — `I2c`, `Spi` (chips on Linux I2C and SPI buses, through i2c-tools
+and spi-tools)
+
+**Media** — `Graphics`, `Audio`, `QRCode`, `Png`, `Pdf`
 
 **AI** — `AI` (Ollama client)
 

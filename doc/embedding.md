@@ -23,6 +23,7 @@ process, with nothing copied between them.
 - [10a. Signals from the script](#10a-signals-from-the-script)
 - [10b. Stopping a running script](#10b-stopping-a-running-script)
 - [10c. Embedding from C#](#10c-embedding-from-c)
+- [10d. Embedding from JavaScript](#10d-embedding-from-javascript)
 - [11. Driving the scheduler](#11-driving-the-scheduler)
 - [12. Errors and diagnostics](#12-errors-and-diagnostics)
 - [12a. Threads: one VM per thread](#12a-threads-one-vm-per-thread)
@@ -65,7 +66,7 @@ library, and add the system libraries the VM needs:
 ```bash
 # macOS
 cc host.c flaris-lib/lib/libflaris.a -Iflaris-lib/include -o host \
-   -lm -framework Security -framework CoreFoundation
+   -lm -framework Security -framework CoreFoundation -lobjc
 
 # Linux
 cc host.c flaris-lib/lib/libflaris.a -Iflaris-lib/include -o host \
@@ -152,7 +153,7 @@ int main(void)
 
 ```
 $ cc host.c flaris-lib/lib/libflaris.a -Iflaris-lib/include -o host \
-     -lm -framework Security -framework CoreFoundation
+     -lm -framework Security -framework CoreFoundation -lobjc
 $ ./host
 hello, world
 ```
@@ -440,7 +441,8 @@ and let it keep its own functions.
 
 `FlarisDestroyContext` cancels every fiber the context's code spawned and
 removes every timer, signal handler and file watch it registered, then releases
-its environment. Nothing it left behind can run afterwards.
+its environment. A completion callback it handed to another context's read is
+dropped too; the read still ends. Nothing it left behind can run afterwards.
 
 It returns `FLARIS_ERR_BUSY`, and destroys nothing, if the context's own code is
 on the stack — a native module reached from one of its fibers cannot destroy the
@@ -846,7 +848,9 @@ The same mask on `FlarisOptions.deniedModules` denies modules for one context
 only, on top of whatever the VM already withholds — see section 6a.
 
 A call into a denied module raises `Exception.ModuleDenied` (code 25), which the
-script can catch and your `FlarisCall` sees as `FLARIS_ERR_RAISED`. Nothing else
+script can catch and your `FlarisCall` sees as `FLARIS_ERR_RAISED`. A completion
+callback (the `cb` of `Stream.ReadLineAsync` or `ReadAsync`) runs under the mask
+of the context that started the read, wherever the callback was defined. Nothing else
 about the script changes, and an allowed module costs nothing — the check is a
 bit test on an operand the call already carries.
 
@@ -1102,6 +1106,167 @@ thread and keep it there.
 Note also that a native module function running on the VM thread must not block
 for long: the scheduler is cooperative, so a C# method that waits stalls every
 fiber.
+
+---
+
+## 10d. Embedding from JavaScript
+
+The VM also comes as a WebAssembly ES module that runs in a browser, a web
+worker and Node.js 18.3 or later. Download `flaris-lib-wasm.zip` from the
+[downloads page](https://www.flaris-lang.org/#downloads) - one archive serves
+every platform - and it unpacks to:
+
+```
+flaris-lib-wasm/
+├── flaris.mjs              # the API below - the file you import
+├── flaris-core.mjs         # the loader flaris.mjs imports
+├── flaris-core.wasm        # the VM, compiler included
+├── README.md
+└── THIRD_PARTY_NOTICES.md
+```
+
+```js
+import { createFlaris, FlarisError } from "./flaris.mjs";
+
+const vm  = await createFlaris({ print: (line) => console.log(line) });
+const ctx = vm.createContext();
+ctx.load(`fn add(a, b) { return a + b; }`);
+
+ctx.call("add", 2, 3);          // 5
+ctx.call("add", "a", "b");      // "ab"
+
+ctx.destroy();
+vm.shutdown();
+```
+
+It is the C API of sections 6a-8 with the handles taken care of: each
+`createFlaris()` is one VM, `createContext()` an isolated context, and `call`
+finds a function by name in that context alone. Arguments and results are
+converted, so nothing needs releasing.
+
+| Call | Does |
+|------|------|
+| `createFlaris(options?)` | Start a VM. `options.print` / `options.printErr` receive the script's stdout and stderr lines (default: `console.log` / `console.error`) |
+| `vm.createContext()` | A new context at the VM's authority |
+| `ctx.load(source, name?)` | Compile `source` and run its top level into the context. `name` is what diagnostics call it (default `<host>`) |
+| `ctx.has(name)` | `true` when the context defines a callable `name` |
+| `ctx.call(name, ...args)` | Call it and return the converted result |
+| `ctx.destroy()` | Cancel the context's fibers and timers and free its globals |
+| `vm.registerModule(name, functions)` | Publish JavaScript functions a script calls as `name.fn(...)` - see below |
+| `vm.fs` | The module's in-memory filesystem; write a `.flx` to `/libs` and a script can import it |
+| `vm.shutdown()` | Destroy every context, then the VM |
+
+### Values
+
+| JavaScript | Flaris | Back to JavaScript |
+|------------|--------|--------------------|
+| `null`, `undefined` | `nil` | `null` |
+| `true` / `false` | bool | boolean |
+| a safe integer (`Number.isSafeInteger`) | int | number |
+| any other number | float | number |
+| `bigint` within 64 bits | int | number when safe, otherwise `bigint` |
+| string | string (UTF-8) | string |
+| array | array | array |
+| plain object | object | object |
+| — | char | a one-character string |
+| — | class instance | a plain object of its fields |
+| — | block | a `Uint8Array` copy |
+| — | function, method, builtin | `undefined`; left out of an object |
+
+JavaScript has one number type, so an integral value such as `2.0` arrives as the
+int `2`. Values are copied each way: a script that changes an array it was
+given does not change the caller's array. Nesting is limited to 256 levels, which
+is also what stops a reference cycle. Anything else - a `Map`, a class instance,
+a typed array - throws a `TypeError`.
+
+Callables never leave a context, as in C: call a function by its name.
+
+### Calling JavaScript from a script
+
+`registerModule` is section 9 for JavaScript. Each function becomes a member a
+script calls like a built-in namespace. Its arguments arrive converted the way
+a result is (the last column of the table above), and what it returns is
+converted the way an argument is:
+
+```js
+vm.registerModule("Device", {
+    read: (pin) => sensors[pin].value,
+    status: () => ({ online: true, uptime: performance.now() }),
+    log: { fn: (msg, level) => console.log(level ?? "info", msg), required: 1, optional: 1 },
+});
+
+const ctx = vm.createContext();          // after registering: see below
+ctx.load(`fn Sample(pin) { return Device.read(pin) * 2.0; }`);
+```
+
+- **Register before loading.** The compiler checks `Device.read(...)` against
+  the registered module, so a script loaded first fails to compile. A module is
+  registered for the VM, so every context sees it; names cannot be removed or
+  replaced, and taking a built-in namespace (`Math`, `Json`, ...) or an earlier
+  module's name throws `registered`.
+- **Arguments.** A plain function takes `fn.length` required arguments and up to
+  six in all. `{ fn, required, optional }` sets the counts exactly, and a call
+  with the wrong number is a compile error. Every argument and the result are
+  typed `any`.
+- **A throw is a script exception.** The script can catch it; `Code` is the
+  error's integer `code` property when it has one, otherwise `6`
+  (`Exception.RuntimeError`), and `Error` is its message. Uncaught, it reaches
+  the JavaScript caller as a `FlarisError` of kind `raised`.
+- **Synchronous only.** Returning a `Promise` raises in the script instead of
+  waiting for it.
+- **Calling back in is allowed.** A JavaScript function may `call` into a
+  context while the script that called it waits.
+
+### Errors
+
+Every failure throws a `FlarisError`, whose `kind` says what happened:
+
+| `kind` | When |
+|--------|------|
+| `raised` | The script threw. `code` is its exception code and `message` its message |
+| `compile` | `load` failed to compile. `message` holds the diagnostics; warnings of a successful load go to `printErr` instead |
+| `not-found` | No function of that name in this context |
+| `suspended` | The function slept, yielded or awaited. A call cannot be resumed, so do that work inside the script |
+| `arguments` | An argument nested deeper than 256 levels, or contained a cycle |
+| `registered` | `registerModule` was given a name already taken |
+| `no-vm` | The context was destroyed, or the VM shut down |
+
+```js
+try { ctx.call("charge", order); }
+catch (e) {
+    if (e instanceof FlarisError && e.kind === "raised") console.log(e.code, e.message);
+    else throw e;
+}
+```
+
+### Serving it
+
+- **Keep the three files together.** `flaris.mjs` imports the loader, and the
+  loader fetches the `.wasm`, each relative to its own URL - so the directory
+  can live anywhere, but not be split up.
+- **Serve over HTTP(S).** Browsers do not import modules into a page opened
+  from disk.
+- **Serve `.wasm` as `application/wasm`.** Most servers do. One that does not
+  still works - the browser compiles from a buffer instead of while
+  downloading, which only makes start-up slower - but on Apache
+  `AddType application/wasm .wasm` fixes it.
+- **From another origin** (a CDN, a separate static host), the server must send
+  `Access-Control-Allow-Origin` for all three files, or the browser refuses the
+  import.
+- **Compress it.** The `.wasm` is about 860 KB raw and 300 KB with brotli, so
+  turn on compression for it if your host does not already.
+- **In Node**, import `flaris.mjs` by its path; there is nothing to serve.
+
+### What it does not do yet
+
+- **No asynchronous calls.** `call` runs to completion; a function that awaits
+  throws `suspended`, and a host function cannot return a `Promise`.
+- **No JIT.** The WebAssembly VM interprets, at roughly 4x the native
+  interpreter's time.
+- **One thread.** A call blocks the thread it runs on, so run long scripts in a
+  web worker. A runaway loop cannot be interrupted from the same thread;
+  terminate the worker.
+- **No processes, sockets, FFI or TLS** - the limits of the browser sandbox.
 
 ---
 

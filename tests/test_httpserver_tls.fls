@@ -1,35 +1,83 @@
-// test_httpserver_tls.fls
-// HTTPS server: HttpServer terminating TLS itself via Stream.AcceptTls.
-// Run via tests/test_httpserver_tls.sh, which generates the certificate,
-// starts this server, then drives it with curl.
+// test_httpserver_tls.fls - HttpServer terminating TLS, end to end.
 //
-//   flarisvm ./tests/test_httpserver_tls.fls --libs='./libs'
+//   flarisvm tests/test_httpserver_tls.fls --libs=./libs
 //
-// The certificate is written by the shell driver into TLS_DIR below.
+// Makes a self-signed certificate with openssl, starts this file again in a
+// child VM as the HTTPS server ("serve <dir>"), and drives it from here with
+// the Https library and raw TLS streams: handshake, Date header, keep-alive
+// reuse, chunked streaming, a body above the write-coalescing threshold,
+// byte-exact static binary, and the handshake-failure path.
+// Skips (exit 0) when openssl is missing or this build cannot terminate TLS.
+//
+// The server prints its port as its first stdout line and runs until its
+// stdin closes, so it never outlives this process.
 
 import { HttpServer } from library("HttpServer", "1.0");
+import { Https } from library("Https", "1.0");
+import { HttpUtil } from library("HttpUtil", "1.0");
 
-global TLS_DIR = "/tmp/flaris_tls_test";
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
 
-fn Main() {
-    // A build without a server-capable TLS backend cannot run this test at all;
-    // say so on stdout so the driver can skip rather than report failures.
+const SCRIPT   = "tests/test_httpserver_tls.fls";
+const PASSWORD = "testpass";
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: ", msg);
+    } else {
+        Console.WriteLine("ok:   ", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", expected, " got=", actual);
+    } else {
+        Console.WriteLine("ok:   ", msg);
+    }
+    return 0;
+}
+
+fn bench(name: string, f: fn, n: int) {
+    f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    Console.WriteLine(
+        String.PadRight(name, 44),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.1f}", [Time.TicksToUs(dt) / float(n)]), 9), " µs/call"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Server half (child VM)
+// ---------------------------------------------------------------------------
+
+fn async serve(dir: string) {
     if (!Stream.TlsServerAvailable()) {
         Console.WriteLine("TLS_UNAVAILABLE");
         return 0;
     }
 
     let srv = new HttpServer({
-        port: 8453,
+        port: 0,
+        host: "127.0.0.1",
         tls: {
-            pkcs12File:         Path.Combine(TLS_DIR, "server.p12"),
-            password:           "testpass",
+            pkcs12File:         Path.Combine(dir, "server.p12"),
+            password:           PASSWORD,
             handshakeTimeoutMs: 5000
         }
     });
 
-    // Handshake failures are expected here - the driver sends plain HTTP to the
-    // TLS port on purpose - so record them instead of dropping them silently.
+    // The client sends plain HTTP to this port on purpose; report it.
     srv.OnTlsError(fn(peer, msg) { Console.WriteLine("TLS_HANDSHAKE_FAILED ", peer, " ", msg); });
 
     srv.Get("/",     fn(req, res) { res.Text("secure=" + str(req.secure)); });
@@ -46,9 +94,229 @@ fn Main() {
         res.EndChunked();
     });
 
-    srv.Static("/pub", Path.Combine(TLS_DIR, "pub"));
+    srv.Static("/pub", Path.Combine(dir, "pub"));
 
-    Console.WriteLine("TLS_READY secure=", srv.IsSecure());
-    srv.Listen();
+    srv.ListenAsync();
+    Console.WriteLine("TLS_READY ", srv.Port(), " secure=", srv.IsSecure());
+
+    let stdin = Stream.Stdin();
+    var line = await Stream.ReadLineAsync(stdin);
+    while (line != nil) { line = await Stream.ReadLineAsync(stdin); }
+    srv.Stop(1000);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Client half
+// ---------------------------------------------------------------------------
+
+// The certificate's SHA-256 fingerprint as lowercase hex, the form TlsPeerCert uses.
+fn fingerprint(certPath: string) {
+    let r = Os.RunEx("openssl", ["x509", "-in", certPath, "-noout", "-fingerprint", "-sha256"]);
+    if (r == nil || r.Exit != 0) { return nil; }
+    let eq = String.IndexOf(r.Stdout, "=");
+    if (eq < 0) { return nil; }
+    let hex = String.Trim(String.Substr(r.Stdout, eq + 1, String.Length(r.Stdout) - eq - 1));
+    return String.ToLower(String.Replace(hex, ":", ""));
+}
+
+// Certificate, key bundle and web root under dir; false when openssl cannot make them.
+fn makeFixtures(dir: string): bool {
+    let key  = Path.Combine(dir, "key.pem");
+    let cert = Path.Combine(dir, "cert.pem");
+    let req = Os.RunEx("openssl", ["req", "-x509", "-newkey", "rsa:2048",
+                                   "-keyout", key, "-out", cert, "-days", "2", "-nodes",
+                                   "-subj", "/CN=localhost",
+                                   "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"]);
+    if (req == nil || req.Exit != 0) { return false; }
+    let p12 = Os.RunEx("openssl", ["pkcs12", "-export", "-out", Path.Combine(dir, "server.p12"),
+                                   "-inkey", key, "-in", cert, "-passout", "pass:" + PASSWORD]);
+    if (p12 == nil || p12.Exit != 0) { return false; }
+
+    let pub = Path.Combine(dir, "pub");
+    Directory.Create(pub);
+    File.WriteText(Path.Combine(pub, "a.txt"), "STATIC_OK");
+    File.WriteAllBytes(Path.Combine(pub, "bin.dat"), binaryFixture());
+    return true;
+}
+
+// NULs, high bytes and text mixed, so any text handling on the way corrupts it.
+fn binaryFixture() {
+    let bytes = [0x00, 0x01, 0x02, 0x00, 0xff, 0xfe, 0x00, 0x54, 0x4c, 0x53, 0x00];
+    let b = Buffer.Create(len(bytes), 1);
+    iter (i from 0 to len(bytes)) { Buffer.WriteU8At(b, i, bytes[i]); }
+    return b;
+}
+
+// One GET on an open connection, read back by its framing: { code, headers, body } or nil.
+fn exchange(s, path: string) {
+    if (!Stream.WriteString(s, "GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n")) { return nil; }
+    let statusLine = Stream.ReadLine(s);
+    if (statusLine == nil || statusLine == "") { return nil; }
+    let sp   = String.Split(statusLine, " ");
+    let code = (len(sp) > 1) ? (Convert.ParseInt(sp[1]) ?? 0) : 0;
+
+    let raw = [];
+    let h   = Stream.ReadLine(s);
+    while (h != nil && h != "") { Array.Append(raw, h); h = Stream.ReadLine(s); }
+    let headers = HttpUtil.ParseHeaders(String.Join(raw, "\r\n") + "\r\n") ?? {};
+
+    let body = "";
+    let te = String.ToLower(Object.TryGet(headers, "transfer-encoding", "") ?? "");
+    if (String.Contains(te, "chunked")) {
+        var size = Convert.ParseInt("0x" + String.Trim(Stream.ReadLine(s) ?? "")) ?? 0;
+        while (size > 0) {
+            body = body + Stream.ReadString(s, size);
+            Stream.ReadLine(s);
+            size = Convert.ParseInt("0x" + String.Trim(Stream.ReadLine(s) ?? "")) ?? 0;
+        }
+        Stream.ReadLine(s);
+    } else {
+        let n = Convert.ParseInt(Object.TryGet(headers, "content-length", "0") ?? "0") ?? 0;
+        if (n > 0) { body = Stream.ReadString(s, n); }
+    }
+    return { code: code, headers: headers, body: body };
+}
+
+// Wait for a server stdout line starting with prefix; nil after timeoutMs.
+fn async waitForLine(out, prefix: string, timeoutMs: int) {
+    let deadline = Time.Millis() + timeoutMs;
+    while (Time.Millis() < deadline) {
+        let line = await Stream.ReadLineAsync(out, deadline - Time.Millis() + 1);
+        if (line == nil) { return nil; }
+        if (String.StartsWith(line, prefix)) { return line; }
+    }
+    return nil;
+}
+
+fn async runChecks(dir: string, port: int, out) {
+    let base = "https://127.0.0.1:" + str(port);
+
+    Console.WriteLine("\n[ Handshake and request ]");
+    let root = Https.GetInsecure(base + "/");
+    checkEq(root == nil ? 0 : root.status, 200, "GET / over TLS");
+    check(root != nil && String.Contains(root.body, "secure=true"), "  req.secure is true");
+    check(root != nil && Object.TryGet(root.headers, "date", "") != "", "  Date header present");
+    check(root != nil && String.Contains(Object.TryGet(root.headers, "server", "") ?? "", "Flaris"),
+          "  Server header");
+
+    // The certificate really is the one generated here, not an accidental plaintext path.
+    let conn = Stream.ConnectTls("127.0.0.1", port, { insecure: true, timeoutMs: 5000 });
+    let cert = conn == nil ? nil : Stream.TlsPeerCert(conn);
+    check(cert != nil && cert.sha256 == fingerprint(Path.Combine(dir, "cert.pem")) &&
+          String.Contains(cert.subject, "localhost"),
+          "server presents the test certificate");
+
+    let js = Https.GetInsecure(base + "/json");
+    check(js != nil && String.Contains(js.body, "\"ok\":true"), "GET /json");
+
+    Console.WriteLine("\n[ Keep-alive ]");
+    let first  = conn == nil ? nil : exchange(conn, "/");
+    let second = first == nil ? nil : exchange(conn, "/json");
+    check(first != nil && first.code == 200 && second != nil && second.code == 200 &&
+          String.Contains(second.body, "\"ok\":true"),
+          "two requests reuse one TLS connection");
+    if (conn != nil) { Stream.Close(conn); }
+
+    Console.WriteLine("\n[ Bodies ]");
+    let streamed = Https.GetInsecure(base + "/stream");
+    checkEq(streamed == nil ? nil : streamed.body, "abc", "chunked streaming over TLS");
+
+    let big = Https.GetInsecure(base + "/big");
+    checkEq(big == nil ? 0 : String.Length(big.body), 40000, "40 KB body complete over TLS");
+
+    let txt = Https.GetInsecure(base + "/pub/a.txt");
+    check(txt != nil && String.Contains(txt.body, "STATIC_OK"), "static file over TLS");
+
+    let bin = Https.GetInsecure(base + "/pub/bin.dat");
+    check(bin != nil && Buffer.Equals(Buffer.FromString(bin.body), binaryFixture()),
+          "static binary byte-exact over TLS");
+
+    Console.WriteLine("\n[ Failed handshake ]");
+    // Some TLS stacks wait for the rest of the bogus record; give up after a
+    // short wait, as a client would, and the handshake fails either way.
+    let plain = Stream.Connect("tcp", "127.0.0.1", port, 2000);
+    if (plain != nil) {
+        Stream.SetTimeout(plain, 300);
+        Stream.WriteString(plain, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        Stream.ReadBytes(plain, 4096);
+        Stream.Close(plain);
+    }
+    check(await waitForLine(out, "TLS_HANDSHAKE_FAILED", 3000) != nil,
+          "plain HTTP to the TLS port reports a handshake failure");
+    let after = Https.GetInsecure(base + "/json");
+    checkEq(after == nil ? 0 : after.status, 200, "server still serving after a failed handshake");
+
+    Console.WriteLine("===========================");
+    Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
+    if (testsFailed > 0) { return; }
+
+    Console.WriteLine("\n=== HttpServer TLS Benchmarks ===");
+    let kc = Stream.ConnectTls("127.0.0.1", port, { insecure: true, timeoutMs: 5000 });
+    if (kc != nil) {
+        bench("GET /json, one keep-alive TLS connection", fn() {
+            let r = exchange(kc, "/json"); _sink = _sink + (r == nil ? 0 : r.code);
+        }, 100);
+        Stream.Close(kc);
+    }
+    bench("handshake + GET / (Https.GetInsecure)", fn() {
+        let r = Https.GetInsecure(base + "/"); _sink = _sink + (r == nil ? 0 : r.status);
+    }, 10);
+    Console.WriteLine("_sink=" + str(_sink));
+}
+
+fn async Main() {
+    let argv = Os.Args();
+    if (len(argv) >= 2 && argv[0] == "serve") { return await serve(argv[1]); }
+
+    Console.WriteLine("=== HttpServer TLS Test Suite ===");
+    if (Os.Which("openssl") == nil) {
+        Console.WriteLine("SKIP: openssl not available");
+        return 0;
+    }
+    let dir = Directory.CreateTemp("flaris_tls");
+    if (!makeFixtures(dir)) {
+        Console.WriteLine("SKIP: could not build a test certificate");
+        Directory.DeleteAll(dir);
+        return 0;
+    }
+
+    let vm  = Os.GetEnv("FLARISVM") ?? "flarisvm";
+    let srv = Os.Spawn(vm, [SCRIPT, "--libs=./libs", "serve", dir]);
+    if (srv == nil) {
+        Console.Error("could not start " + vm);
+        Directory.DeleteAll(dir);
+        return 1;
+    }
+
+    let ready = await Stream.ReadLineAsync(srv.Stdout, 10000);
+    if (ready == "TLS_UNAVAILABLE") {
+        Console.WriteLine("SKIP: this build cannot terminate TLS");
+    } else if (ready == nil || !String.StartsWith(ready, "TLS_READY ")) {
+        check(false, "server starts (got " + str(ready) + ")");
+    } else {
+        check(String.Contains(ready, "secure=true"), "server reports IsSecure()");
+        await runChecks(dir, Convert.ParseInt(String.Split(ready, " ")[1]) ?? 0, srv.Stdout);
+    }
+
+    Stream.Close(srv.Stdin);
+    let done = await Os.WaitAsync(srv.Pid, 3000);
+    if (done == nil || done.Alive) {
+        Os.KillChild(srv.Pid, 9);
+        await Os.WaitAsync(srv.Pid, 3000);
+    }
+    let errText = Stream.ReadAll(srv.Stderr);
+    if (testsFailed > 0 && errText != nil && len(errText) > 0) {
+        Console.WriteLine("server stderr:\n" + Buffer.ToString(errText));
+    }
+    Stream.Close(srv.Stdout);
+    Stream.Close(srv.Stderr);
+    Directory.DeleteAll(dir);
+
+    if (testsFailed > 0) {
+        Console.Error("Some HttpServer TLS tests FAILED.");
+        return 1;
+    }
+    Console.Ok("All HttpServer TLS tests passed!");
     return 0;
 }

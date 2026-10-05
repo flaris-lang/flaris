@@ -582,6 +582,10 @@ fn label(l) {
 }
 ```
 
+A `switch` that labels only members of one enum and has no `default` must
+handle every member; the analyzer warns about the ones it misses (warning
+2021).
+
 Values must be integer literals, optionally negative - `A = 1 + 2` and `B = A`
 `A = -1` are all rejected. Declare an enum at the top level or inside a
 function, and `export` it like any other symbol.
@@ -2965,9 +2969,9 @@ exit:
 ```
 [Profile] 1000 Hz: 812 samples on script code (812.0 ms), 2 in the VM, 40.0 ms waiting, 855.0 ms wall
 [Profile] objects: 12034 allocated, 61 live at peak, 12 live at start
-     %      self     total   objects  function                          location
-  91.3%       741       741     12000  hot                               script.fls:4
-   8.7%        71       812        20  Main                              script.fls:11
+     %      self     total   objects  function                          location                interpreted because
+  91.3%       741       741     12000  hot                               script.fls:4            a parameter is untyped, or not a JIT type (...)
+   8.7%        71       812        20  Main                              script.fls:11           reads a global variable
 ```
 
 `self` is the samples taken while the function was running, including the
@@ -2985,7 +2989,21 @@ lists the fibers by their entry function.
 
 A function the JIT has compiled to native code has no sampling points of its
 own, so its time is charged to the interpreted function that called it; run
-with `--jit-disable` when you want exact attribution. Lines need debug info
+with `--jit-disable` when you want exact attribution.
+
+Every row is therefore a function that ran in the interpreter, and the last
+column says why - the same reason `--check` gives, without a second run:
+
+| Column says | Meaning |
+|-------------|---------|
+| a `--check` reason | The function is not JIT-eligible; fix what it names to make it native |
+| `compiled, but these calls failed the native entry check` | Native code exists, but the arguments these calls passed did not match it - most often a `[int]`/`[float]` parameter given an array that is not internally typed - so they ran interpreted |
+| `eligible, but the backend did not compile it` | The analyzer accepted the function and the native compiler declined it, for example because its body is too large |
+| `top-level code is never compiled` | Statements outside any function |
+| `not JIT-eligible; --check on the source says why` | The code was loaded from a `.flx`, which does not keep the reason |
+
+With `--jit-disable` the column is left out, since everything is interpreted
+by request. Lines need debug info
 (`-g`); without it the table shows files only. The profiler is part of
 `flarisvm`, not of the runtime-only `flaris`. macOS and Linux sample from the
 process CPU timer; Windows ticks a sampler thread at up to 1000 Hz and counts a

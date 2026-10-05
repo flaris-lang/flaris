@@ -62,6 +62,8 @@
 // HttpServer:
 //   new HttpServer(opts?)
 //       port                 listen port; 0 binds an ephemeral port (see Port())
+//       host                 listen address; "127.0.0.1" or    (default nil:
+//                            "::1" serves this machine only     every interface)
 //       backlog              listen backlog                    (default 128)
 //       keepAlive            allow connection reuse            (default true)
 //       idleTimeoutMs        keep-alive idle wait              (default 5000)
@@ -157,7 +159,8 @@
 //       produce repeated Set-Cookie lines.
 //   .Redirect(url, status?)  .NoContent()   .Error(status, message)
 //   .StartChunked(contentType?)  .WriteChunk(data)  .EndChunked()
-//                            - stream a response of unknown length
+//                            - stream a response of unknown length; WriteChunk
+//                              returns false once the client has gone
 //   .Sent()                  - true once the response has been written
 //   .Hijack()                - take the raw socket; the server stops managing
 //                              the connection entirely (protocol upgrades)
@@ -500,12 +503,11 @@ fn _crossesSymlink(root:string, rel:string): bool {
 
 // Read exactly `count` bytes, or nil if the peer stops first.
 //
-// Stream.ReadBytes returns whatever has already arrived and does not wait, so
-// on a body larger than the socket buffer it runs dry and returns nil long
-// before the body is complete - and after a 100-continue it returns nil
-// immediately, because the client has not started sending. Parking on
-// WaitReadable first is what turns that into a real read; it also suspends only
-// this fiber, so a slow upload does not hold up anything else.
+// Stream.ReadBytes hands over what has arrived, so a body larger than the
+// socket buffer takes several reads, and with nothing there it waits as long
+// as the socket allows. Parking on WaitReadable first gives every read this
+// request's own deadline - after a 100-continue the client may never start -
+// and suspends only this fiber, so a slow upload holds up nothing else.
 fn _readChunk(conn, want:int, timeoutMs:int) {
     let ms = (timeoutMs > 0) ? timeoutMs : 10000;
     if (Stream.WaitReadable(conn, ms) == nil) { return nil; }
@@ -534,7 +536,7 @@ fn _streamChunked(conn, maxBytes:int, sink, timeoutMs:int) {
     let done:bool = false;
     while (!done) {
         let line = Stream.ReadLine(conn);
-        // nil is a stalled peer, "" is EOF; neither is a chunk header.
+        // nil is EOF or a stalled peer, "" a blank line; neither is a chunk header.
         if (line == nil || line == "") { return { ok: false, status: 400, total: total }; }
 
         let semi = String.IndexOf(line, ";");     // drop any chunk extension
@@ -554,7 +556,9 @@ fn _streamChunked(conn, maxBytes:int, sink, timeoutMs:int) {
             let part = _readExact(conn, n, timeoutMs);
             if (part == nil || len(part) != n) { return { ok: false, status: 400, total: total }; }
             if (!sink(part)) { return { ok: false, status: 0, total: total }; }
-            Stream.ReadLine(conn);                // CRLF after the chunk
+            // Only the CRLF may follow the chunk data: anything else would let
+            // a front end and this server disagree on where the body ends.
+            if (Stream.ReadLine(conn) != "") { return { ok: false, status: 400, total: total }; }
         }
     }
     return { ok: true, status: 0, total: total };
@@ -627,9 +631,9 @@ fn _isUnder(child:string, root:string): bool {
         || String.StartsWith(child, root + "\\");
 }
 
-// Stream.WriteBytes may come up short on a slow socket, and unlike WriteAll it
-// has no offset argument to resume from. Re-slice only when a write is actually
-// partial, so the common case allocates nothing.
+// Stream.WriteBytes comes up short when the socket's write timeout cuts it
+// off, and it has no offset argument to resume from. Re-slice only when a
+// write is actually partial, so the common case allocates nothing.
 fn _writeBlock(conn, buf, count:int): bool {
     let off:int = 0;
     while (off < count) {
@@ -1718,17 +1722,16 @@ class HttpResponse
 
         // Size line, payload and terminator in one write when the chunk is
         // small - three syscalls per chunk is the dominant cost of streaming.
+        // false once the client is gone, so a streaming handler can stop.
         if (!isBlock && n <= _COALESCE_MAX) {
-            Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n" + data + "\r\n");
             _bodyBytes = _bodyBytes + n;
-            return true;
+            return Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n" + data + "\r\n");
         }
-        Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n");
-        if (isBlock) { _writeBlock(_conn, data, n); }
-        else         { Stream.WriteAll(_conn, data); }
-        Stream.WriteAll(_conn, "\r\n");
+        let ok = Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n");
+        if (ok) { ok = isBlock ? _writeBlock(_conn, data, n) : Stream.WriteAll(_conn, data); }
+        if (ok) { ok = Stream.WriteAll(_conn, "\r\n"); }
         _bodyBytes = _bodyBytes + n;
-        return true;
+        return ok;
     }
 
     fn EndChunked(): bool {
@@ -1802,6 +1805,7 @@ fn _splitPath(path:string): array {
 class HttpServer
 {
     let _port:int              = 8080;
+    let _host                   = nil;   // nil = every interface
     let _backlog:int           = 128;
     let _keepAlive:bool        = true;
     let _idleTimeoutMs:int     = 5000;
@@ -1841,6 +1845,7 @@ class HttpServer
         _statics = [];
         if (opts != nil) {
             _port               = Object.TryGet(opts, "port",               8080);
+            _host               = Object.TryGet(opts, "host",               nil);
             _backlog            = Object.TryGet(opts, "backlog",            128);
             _keepAlive          = Object.TryGet(opts, "keepAlive",          true);
             _idleTimeoutMs      = Object.TryGet(opts, "idleTimeoutMs",      5000);
@@ -1943,9 +1948,9 @@ class HttpServer
             throw(1, "HttpServer: this build cannot terminate TLS "
                      + "(no server-capable TLS backend for Stream.AcceptTls)");
         }
-        let s = Stream.Listen("tcp", _port, _backlog);
+        let s = Stream.Listen("tcp", _port, _backlog, _host);
         if (s == nil) {
-            throw(1, "HttpServer: could not bind port " + str(_port));
+            throw(1, "HttpServer: could not bind port " + str(_port) + (_host == nil ? "" : " on " + _host));
         }
         _sock      = s;
         _boundPort = _port;
@@ -2047,8 +2052,8 @@ class HttpServer
 
     // Serve requests on one connection until it closes or the limits run out.
     fn _serveConnection(conn) {
-        // Read the peer from the raw socket first: AcceptTls detaches it, so
-        // this is the last point where the address is available.
+        // Read the peer first: a failed TLS handshake closes the socket, and
+        // the address with it.
         let peer = Stream.PeerAddr(conn) ?? "";
         let c    = conn;
 
@@ -2059,8 +2064,8 @@ class HttpServer
 
         // TLS terminates here, inside the connection fiber - never in the accept
         // loop, where one slow handshake would hold up every other client.
-        // AcceptTls takes ownership of the raw socket and detaches it either
-        // way, so the failure path must not close it.
+        // AcceptTls upgrades the socket in place, or closes it when the
+        // handshake fails.
         if (_tls != nil) {
             c = Stream.AcceptTls(c, _tls);
             if (c == nil) {
@@ -2334,6 +2339,9 @@ class HttpServer
     // code to report, -1 means the peer closed and nothing should be sent.
     fn _readRequest(conn, peer:string) {
         let line = Stream.ReadLine(conn);
+        // RFC 9112 asks a server to ignore an empty line before the request
+        // line; a client may send one after the previous request's body.
+        if (line == "") { line = Stream.ReadLine(conn); }
         if (line == nil || line == "") {
             return { req: nil, status: -1, message: "closed" };
         }
@@ -2389,11 +2397,11 @@ class HttpServer
             Array.Append(raw, h);
             h = Stream.ReadLine(conn);
         }
-        // ReadLine returns "" for a genuine blank line (and at EOF) but nil
-        // when the peer went silent for readTimeoutMs or closed mid-line.
-        // Treating the two alike answers a
-        // request the client never finished sending - and leaves whatever it
-        // sends next to be read as a second request.
+        // ReadLine returns "" for the blank line that ends the headers, and nil
+        // when the peer closed or went silent for readTimeoutMs before it.
+        // Treating the two alike answers a request the client never finished
+        // sending - and leaves whatever it sends next to be read as a second
+        // request.
         if (h == nil) {
             return { req: nil, status: 400, message: "incomplete request headers" };
         }

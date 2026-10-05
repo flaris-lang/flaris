@@ -1,22 +1,25 @@
-// test_https_builtin.fls - Built-in TLS (no FFI, no --unsafe) smoke test.
+// test_https_builtin.fls - Built-in TLS (no FFI, no --unsafe), end to end against a
+// local server.
 //
-//   flarisvm tests/test_https_builtin.fls --libs='./libs'
+//   flarisvm tests/test_https_builtin.fls --libs=./libs
 //
 // Verifies that HTTPS works through the built-in TLS transport (OS-native TLS:
 // Secure Transport on macOS, dlopen'd OpenSSL on Linux) with no unsafe flag and
-// no compiled plugin. This is the test the Linux Docker image runs.
+// no compiled plugin. A TLS stream is an ordinary stream, so the transport checks
+// below are the plain Stream reads and writes - only opening it differs.
 //
-// A TLS stream is an ordinary stream, so the transport checks below are the
-// plain Stream reads and writes - only opening it differs.
-//
-// Hard checks (gate the exit code) cover the TLS path only: backend present, a
-// response comes back, its body is well-formed JSON, the async handles work.
-// api.github.com rate-limits unauthenticated callers at 60 requests/hour per
-// source IP and CI runners share addresses, so its status code is not something
-// this build controls - a 403 there still proves TLS end to end. Status codes
-// and cert-verification behaviour are printed, not gated.
+// Makes a self-signed certificate with openssl and starts this file again in a
+// child VM as the HTTPS server ("serve <dir>"); its first stdout line carries the
+// port, and it stops when its stdin closes. The certificate is trusted by nothing,
+// so every verified request must be refused and the transport is driven through
+// the insecure variants. Skips (exit 0) when openssl is missing or this build
+// cannot terminate TLS.
 
 import { Https, Status } from library("Https", "1.0");
+import { HttpServer } from library("HttpServer", "1.0");
+
+const SCRIPT   = "tests/test_https_builtin.fls";
+const PASSWORD = "flaristest";
 
 global fails = 0;
 
@@ -25,103 +28,180 @@ fn check(cond, msg) {
     else       { Console.WriteLine("ok:   ", msg); }
 }
 
-fn note(cond, msg) {
-    Console.WriteLine(cond ? "ok:   " : "WARN: ", msg);
+// ---------------------------------------------------------------------------
+// Server half (child VM)
+// ---------------------------------------------------------------------------
+
+fn async serve(dir: string) {
+    if (!Stream.TlsServerAvailable()) {
+        Console.WriteLine("TLS_UNAVAILABLE");
+        return 0;
+    }
+    let srv = new HttpServer({
+        port: 0,
+        host: "127.0.0.1",
+        tls: { pkcs12File: Path.Combine(dir, "server.p12"), password: PASSWORD, handshakeTimeoutMs: 5000 }
+    });
+    srv.Get("/", fn(_req, res) { res.Json({ current_user_url: "https://127.0.0.1/user", ok: true }); });
+    srv.Post("/post", fn(req, res) { res.Json({ json: req.Json() }); });
+    srv.ListenAsync();
+    Console.WriteLine("TLS_READY ", srv.Port());
+
+    let stdin = Stream.Stdin();
+    var line = await Stream.ReadLineAsync(stdin);
+    while (line != nil) { line = await Stream.ReadLineAsync(stdin); }
+    srv.Stop(1000);
+    return 0;
 }
 
-fn async Main() {
-    Console.WriteLine("=== built-in TLS smoke test (no --unsafe) ===");
+// ---------------------------------------------------------------------------
+// Client half
+// ---------------------------------------------------------------------------
 
-    // No standalone availability call: a build without TLS fails at connect
-    // time and names the reason through TlsLastError.
-    let probe = Stream.ConnectTls("api.github.com", 443);
+// The certificate's SHA-256 fingerprint as lowercase hex, the form TlsPeerCert uses.
+fn fingerprint(certPath: string) {
+    let r = Os.RunEx("openssl", ["x509", "-in", certPath, "-noout", "-fingerprint", "-sha256"]);
+    if (r == nil || r.Exit != 0) { return nil; }
+    let eq = String.IndexOf(r.Stdout, "=");
+    if (eq < 0) { return nil; }
+    return String.ToLower(String.Replace(String.Trim(String.Substr(r.Stdout, eq + 1)), ":", ""));
+}
+
+// A self-signed certificate and its PKCS#12 bundle under dir; false when openssl cannot make them.
+fn makeCertificate(dir: string): bool {
+    let key  = Path.Combine(dir, "key.pem");
+    let cert = Path.Combine(dir, "cert.pem");
+    let req = Os.RunEx("openssl", ["req", "-x509", "-newkey", "rsa:2048",
+                                   "-keyout", key, "-out", cert, "-days", "2", "-nodes",
+                                   "-subj", "/CN=localhost",
+                                   "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"]);
+    if (req == nil || req.Exit != 0) { return false; }
+    let p12 = Os.RunEx("openssl", ["pkcs12", "-export", "-out", Path.Combine(dir, "server.p12"),
+                                   "-inkey", key, "-in", cert, "-passout", "pass:" + PASSWORD]);
+    return p12 != nil && p12.Exit == 0;
+}
+
+fn async runChecks(dir: string, port: int) {
+    let base = "https://127.0.0.1:" + str(port);
+
+    // No standalone availability call: a build without TLS fails at connect time and
+    // names the reason through TlsLastError.
+    let probe = Stream.ConnectTls("127.0.0.1", port, { insecure: true, timeoutMs: 5000 });
     check(probe != nil, "built-in TLS backend available" +
                         (probe == nil ? " (" + (Stream.TlsLastError() ?? "no reason") + ")" : ""));
     if (probe != nil) { Stream.Close(probe); }
 
-    let r = Https.Get("https://api.github.com/", { "User-Agent": "flaris-builtin-test" });
-    check(r != nil, "GET https://api.github.com/ returns a response");
+    // The certificate is trusted by nothing, so verification must refuse it.
+    check(Https.Get(base + "/") == nil, "verified GET refuses an untrusted certificate");
+    let refused = Stream.ConnectTls("127.0.0.1", port, { timeoutMs: 5000 });
+    check(refused == nil, "verified ConnectTls refuses an untrusted certificate");
+    if (refused != nil) { Stream.Close(refused); }
+    let wrong = Stream.ConnectTls("127.0.0.1", port, { sni: "wrong.host.example", timeoutMs: 5000 });
+    check(wrong == nil, "wrong SNI override rejected by verification");
+    if (wrong != nil) { Stream.Close(wrong); }
+
+    let r = Https.GetInsecure(base + "/", { "User-Agent": "flaris-builtin-test" });
+    check(r != nil && r.status == Status.OK, "insecure GET returns 200");
     if (r != nil) {
-        // Only a 2xx is required to carry a JSON body. Rate limiting (403/429)
-        // and edge failures (5xx) both answer with HTML, and neither says
-        // anything about the TLS layer - the response arrived over a completed
-        // handshake either way, which is what this test exists to prove.
-        note(r.status == Status.OK, "GET status == 200 (got " + Convert.ToString(r.status) + ")");
-        if (r.status >= 200 && r.status < 300) {
-            let j = Json.Parse(r.body);
-            check(j != nil, "response body parses as JSON (status " + Convert.ToString(r.status) + ")");
-            note(j != nil && Object.HasKey(j, "current_user_url"), "body is the API root payload");
-        } else {
-            Console.WriteLine("      (api.github.com answered " + Convert.ToString(r.status) +
-                              " - unauthenticated callers get 60 requests/hour per IP and CI " +
-                              "runners share one; edge 5xx happens too. TLS itself is fine.)");
-        }
+        let j = Json.Parse(r.body);
+        check(j != nil && Object.HasKey(j, "current_user_url"), "response body parses as the expected JSON");
     }
 
     // Object body must arrive as JSON over TLS.
-    let p = Https.Post("https://postman-echo.com/post", { name: "Linux", n: 3 });
-    if (p != nil) {
-        let pj = Json.Parse(p.body);
-        note(pj != nil && pj.json != nil && pj.json.name == "Linux", "POST object body round-trips as JSON");
-    } else {
-        note(false, "POST round-trip (no network?)");
-    }
-
-    // Certificate + hostname verification (informational; needs badssl.com).
-    let bad = Https.Get("https://wrong.host.badssl.com/");
-    note(bad == nil, "verified GET rejects wrong-hostname cert");
-    let ins = Https.GetInsecure("https://wrong.host.badssl.com/");
-    note(ins != nil, "insecure GET accepts wrong-hostname cert");
+    let p = Https.PostInsecure(base + "/post", { name: "Linux", n: 3 });
+    let pj = p == nil ? nil : Json.Parse(p.body);
+    check(pj != nil && pj.json != nil && pj.json.name == "Linux" && pj.json.n == 3, "POST object body round-trips as JSON");
 
     // Async transport round-trip (io-pool offload): ConnectAsync -> WriteAsync ->
-    // ReadLineAsync -> ReadAllAsync directly against a real server.
-    let ah = await Stream.ConnectTlsAsync("api.github.com", 443);
+    // ReadLineAsync -> ReadAsync to EOF.
+    let ah = await Stream.ConnectTlsAsync("127.0.0.1", port, { insecure: true, timeoutMs: 5000 });
     check(ah != nil, "ConnectTlsAsync opens a TLS connection");
     if (ah != nil) {
         let sent = await Stream.WriteAsync(ah,
-            "GET / HTTP/1.1\r\nHost: api.github.com\r\nUser-Agent: flaris\r\nConnection: close\r\n\r\n");
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: flaris\r\nConnection: close\r\n\r\n");
         check(sent != nil && sent > 0, "WriteAsync sends the request");
         let line = await Stream.ReadLineAsync(ah);
-        check(line != nil && String.StartsWith(line, "HTTP/1."), "ReadLineAsync reads the status line");
-        if (line != nil) {
-            note(String.Contains(line, " 200 "), "async status line == 200 (got " + String.Trim(line) + ")");
-        }
-        // ReadAsync with no count reads to EOF - the async read-all.
+        check(line != nil && String.StartsWith(line, "HTTP/1.1 200"), "ReadLineAsync reads a 200 status line");
         let body = await Stream.ReadAsync(ah);
-        check(body != nil, "ReadAsync reads the body to EOF");
+        check(body != nil && len(body) > 0, "ReadAsync reads the rest to EOF");
         Stream.Close(ah);
     }
 
     // TlsPeerCert exposes a pinnable fingerprint + subject.
-    let ph = Stream.ConnectTls("api.github.com", 443);
+    let ph = Stream.ConnectTls("127.0.0.1", port, { insecure: true, timeoutMs: 5000 });
     if (ph != nil) {
         let cert = Stream.TlsPeerCert(ph);
         check(cert != nil && len(cert.sha256) == 64, "TlsPeerCert returns a 64-hex sha256");
-        check(cert != nil && cert.subject != "",     "TlsPeerCert returns a subject");
+        check(cert != nil && cert.sha256 == fingerprint(Path.Combine(dir, "cert.pem")), "... equal to the certificate's own fingerprint");
+        check(cert != nil && String.Contains(cert.subject, "localhost"), "TlsPeerCert returns the subject");
         Stream.Close(ph);
+    } else {
+        check(false, "a connection for TlsPeerCert");
     }
-    // SNI override: a wrong SNI must fail hostname verification.
-    let wrong = Stream.ConnectTls("api.github.com", 443,
-                                  { sni: "wrong.host.example", timeoutMs: 15000 });
-    check(wrong == nil, "wrong SNI override rejected by verification");
-    if (wrong != nil) { Stream.Close(wrong); }
 
-    // Https.GetAsync drives the async HTTP engine over async TLS: resolves to a
-    // real response, and two started together run concurrently (overlapping I/O).
-    let ar = await Https.GetAsync("https://api.github.com/");
-    check(ar != nil, "Https.GetAsync resolves to a response");
-    note(ar != nil && ar.status == Status.OK, "Https.GetAsync status == 200");
-    let ca = Https.GetAsync("https://api.github.com/");
-    let cb = Https.GetAsync("https://api.github.com/");
+    // The async HTTP engine over async TLS: verified refuses, insecure resolves, and two
+    // started together run concurrently (overlapping I/O).
+    check(await Https.GetAsync(base + "/") == nil, "Https.GetAsync refuses an untrusted certificate");
+    let ar = await Https.GetInsecureAsync(base + "/");
+    check(ar != nil && ar.status == Status.OK, "Https.GetInsecureAsync resolves to a 200");
+    let ca = Https.GetInsecureAsync(base + "/");
+    let cb = Https.GetInsecureAsync(base + "/");
     Scheduler.Schedule(ca);
     Scheduler.Schedule(cb);
     let cra = await ca;
     let crb = await cb;
-    check(cra != nil && crb != nil, "two Https.GetAsync requests run concurrently");
-    note(cra != nil && crb != nil && cra.status == Status.OK && crb.status == Status.OK,
-         "both concurrent responses are 200");
+    check(cra != nil && crb != nil && cra.status == Status.OK && crb.status == Status.OK,
+          "two Https.GetInsecureAsync requests run concurrently");
+    return 0;
+}
 
-    Console.WriteLine(fails == 0 ? "=== ALL HARD CHECKS PASSED ===" :
+fn async Main() {
+    let argv = Os.Args();
+    if (len(argv) >= 2 && argv[0] == "serve") { return await serve(argv[1]); }
+
+    Console.WriteLine("=== built-in TLS test (no --unsafe) ===");
+    if (Os.Which("openssl") == nil) {
+        Console.WriteLine("SKIP: openssl not available");
+        return 0;
+    }
+    let dir = Directory.CreateTemp("flaris_https");
+    if (!makeCertificate(dir)) {
+        Console.WriteLine("SKIP: could not build a test certificate");
+        Directory.DeleteAll(dir);
+        return 0;
+    }
+
+    let vm  = Os.GetEnv("FLARISVM") ?? "flarisvm";
+    let srv = Os.Spawn(vm, [SCRIPT, "--libs=./libs", "serve", dir]);
+    if (srv == nil) {
+        Console.Error("could not start " + vm);
+        Directory.DeleteAll(dir);
+        return 1;
+    }
+    let ready = await Stream.ReadLineAsync(srv.Stdout, 10000);
+    if (ready == "TLS_UNAVAILABLE") {
+        Console.WriteLine("SKIP: this build cannot terminate TLS");
+    } else if (ready == nil || !String.StartsWith(ready, "TLS_READY ")) {
+        check(false, "server starts (got " + str(ready) + ")");
+    } else {
+        await runChecks(dir, Convert.ParseInt(String.Split(ready, " ")[1]) ?? 0);
+    }
+
+    Stream.Close(srv.Stdin);
+    let done = await Os.WaitAsync(srv.Pid, 3000);
+    if (done == nil || done.Alive) {
+        Os.KillChild(srv.Pid, 9);
+        await Os.WaitAsync(srv.Pid, 3000);
+    }
+    let errText = Stream.ReadAll(srv.Stderr);
+    if (fails > 0 && errText != nil && len(errText) > 0) {
+        Console.WriteLine("server stderr:\n" + Buffer.ToString(errText));
+    }
+    Stream.Close(srv.Stdout);
+    Stream.Close(srv.Stderr);
+    Directory.DeleteAll(dir);
+
+    Console.WriteLine(fails == 0 ? "=== ALL CHECKS PASSED ===" :
                                    ("=== FAILURES: " + Convert.ToString(fails) + " ==="));
     return fails;
 }

@@ -36,6 +36,8 @@
 //                                          keys lowercased, values left-trimmed
 //
 // Bodies:
+//   ReadExact(s, n)            -> block|nil   exactly n bytes from a stream, or nil
+//                                             if it ends or times out first
 //   DecodeChunked(s, cap?)     -> block|nil   read HTTP/1.1 chunked encoding from
 //                                          a stream; extensions and trailers are
 //                                          ignored, cap bounds the total size
@@ -283,10 +285,24 @@ class HttpUtil
     // Read HTTP/1.1 chunked transfer-encoding from a stream. Chunk extensions
     // and trailers are ignored. Returns the decoded bytes, or nil on a
     // malformed frame / past `cap` bytes.
+    // Stream.ReadBytes hands over what has arrived, which on a socket can be
+    // less than asked for; this loops until the count is in.
+    fn static ReadExact(s: stream, n: int): block|nil {
+        if (s == nil || n <= 0) { return nil; }
+        let out = Stream.ReadBytes(s, n);
+        while (out != nil && len(out) < n) {
+            let more = Stream.ReadBytes(s, n - len(out));
+            if (more == nil) { return nil; }
+            Buffer.Append(out, more);
+        }
+        return out;
+    }
+
     fn static DecodeChunked(s: stream, cap?: int): block {
         if (s == nil) { return nil; }
         let limit = cap ?? 268435456;
-        let out: string = "";
+        let out = nil;
+        var total: int = 0;
         while (true) {
             let line = Stream.ReadLine(s);
             if (line == nil) { return nil; }
@@ -299,14 +315,19 @@ class HttpUtil
             let n: int = Convert.ParseRadix(line, 16) ?? -1;
             if (n < 0) { return nil; }
             if (n == 0) { break; }
-            if (String.Length(out) + n > limit) { return nil; }
+            if (total + n > limit) { return nil; }
 
-            let chunk = Stream.ReadBytes(s, n);
+            let chunk = HttpUtil.ReadExact(s, n);
             if (chunk == nil) { return nil; }
-            out = out + Buffer.ToString(chunk);
-            Stream.ReadLine(s);          // trailing CRLF after the chunk body
+            if (out == nil) { out = chunk; } else { Buffer.Append(out, chunk); }
+            total += n;
+            if (Stream.ReadLine(s) != "") { return nil; } // only the CRLF may follow the chunk data
         }
-        return Buffer.FromString(out);
+        // Trailer fields, if any, end at an empty line. Reading them keeps the
+        // next response on the same connection in step.
+        var t = Stream.ReadLine(s);
+        while (t != nil && t != "") { t = Stream.ReadLine(s); }
+        return out ?? Buffer.FromString("");
     }
 }
 

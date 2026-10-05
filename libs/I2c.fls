@@ -1,0 +1,419 @@
+// I2c.fls - I2C chips on Linux for Flaris.
+// Version: 1.0
+//
+// One I2c object is one chip: a bus number and the chip's 7-bit address. Bus
+// N is the kernel's /dev/i2c-N; on a Raspberry Pi, header pins 3 (SDA) and
+// 5 (SCL) are bus 1.
+//
+// Usage:
+//   import { I2c } from library("I2c", "1.0");
+//
+//   let bus = new I2c(1);
+//   Console.WriteLine(bus.Scan());               // addresses that answer: [118]
+//
+//   let sensor = new I2c(1, 0x76);               // a BME280 on bus 1
+//   let id = sensor.ReadReg8(0xD0);              // 96 (0x60)
+//   if (id == nil) { Console.WriteLine(sensor.Error()); return 1; }
+//
+//   sensor.WriteReg8(0xF4, 0x27);
+//   let cal = sensor.ReadRegs(0x88, 6);          // [int], one entry per byte
+//   let t1  = I2c.Word(cal, 0, "le");            // bytes 0-1, low byte first
+//   let t2  = I2c.ToSigned(I2c.Word(cal, 2, "le"), 16);
+//
+// Registers. Most chips number their registers: the first byte written sets
+// the chip's register pointer, and the bytes after it are written to (or read
+// from) that register and the ones following. ReadReg8, WriteReg8, ReadRegs
+// and WriteRegs do exactly that. A register read is one bus transaction - the
+// register number is written and the data read back with a repeated start in
+// between, which is what chips expect. A chip that works differently is
+// reached with Read, Write and WriteRead.
+//
+// Byte order is never assumed. Every 16-bit call takes "be" (high byte first,
+// the common case on I2C) or "le" (low byte first - the BME280 calibration
+// block, for one). Guessing wrong gives a reading that looks plausible and is
+// wrong, which is harder to notice than an error.
+//
+// Errors. Nothing here raises for a bus problem or a value out of range. A
+// read that fails returns nil, a write that fails returns false, Error() says
+// why and ErrorKind() names the class:
+//   "nack"        no chip answered at the address: wiring, power or address
+//   "bus"         no /dev/i2c-N: the bus is not enabled or does not exist
+//   "permission"  this user may not open /dev/i2c-N
+//   "busy"        a kernel driver already owns the address
+//   "timeout"     the transfer did not finish in time
+//   "tool"        i2c-tools is not installed
+//   "usage"       a bad argument: address, register, byte value or length
+//   "io"          anything else, with the tool's own message
+// Both go back to nil on the next call that succeeds.
+//
+// How it reaches the bus. Through i2ctransfer and i2cdetect from i2c-tools
+// (`sudo apt install i2c-tools` where they are missing). Each call starts one
+// process, which takes a few milliseconds and pauses every fiber while it
+// runs: fine for a sensor read a few times a second, too slow for anything
+// that streams. opts.timeoutMs (default 2000) bounds one call.
+//
+// Any other transport - a simulated chip for working without the hardware, a
+// bridge to a bus on another machine - is passed as opts.backend. It is any
+// object with these two methods, where tx may be empty (a plain read) and
+// rxLen may be 0 (a plain write):
+//   Transfer(bus, addr, tx: [int], rxLen: int) -> { ok, data: [int], error, errorKind }
+//   Scan(bus)                                  -> { ok, addresses: [int], error, errorKind }
+//
+// Exported:
+//   I2c - new I2c(bus, address?, opts?)        opts: { timeoutMs, backend }
+//         raw        : Read / Write / WriteRead
+//         registers  : ReadReg8 / WriteReg8 / ReadReg16 / WriteReg16 /
+//                      ReadRegs / WriteRegs
+//         bus        : Scan
+//         state      : Bus / Address / Error / ErrorKind
+//         static     : Word / ToSigned
+
+const _MAX_MSG = 8192;          // the kernel's limit for one I2C message
+
+fn _hex(v: int): string { return String.Format("0x{0:x2}", v); }
+
+fn _fail(kind: string, msg: string): object {
+    return { ok: false, error: msg, errorKind: kind };
+}
+
+// "0x12 0x34" -> [18, 52]; nil when any token is not a 0x byte.
+fn _parseHexBytes(text: string) {
+    let out: [int] = [];
+    foreach (tok in String.Fields(text)) {
+        if (!String.StartsWith(tok, "0x")) { return nil; }
+        let v = Convert.ParseInt(tok);
+        if (v == nil || v < 0 || v > 255) { return nil; }
+        Array.Append(out, v);
+    }
+    return out;
+}
+
+// i2cdetect prints a 16-column grid: "70: -- -- -- -- -- -- 76 --". Each row
+// label is "NN: " and each cell three characters wide, so cell j sits at
+// column 4 + 3j. "--" is silence, "UU" a chip a kernel driver has claimed,
+// and anything else is the address of a chip that answered.
+fn _parseDetect(text: string): [int] {
+    let found: [int] = [];
+    foreach (line in String.Split(text, "\n")) {
+        if (len(line) < 4 || String.Substr(line, 2, 2) != ": ") { continue; }
+        let row = Convert.ParseInt("0x" + String.Left(line, 2));
+        if (row == nil) { continue; }
+        iter (j from 0 to 16) {
+            let at = 4 + 3 * j;
+            if (at + 2 > len(line)) { break; }
+            let cell = String.Substr(line, at, 2);
+            if (cell == "--" || cell == "  ") { continue; }
+            Array.Append(found, row + j);
+        }
+    }
+    return found;
+}
+
+// Turn a failed i2c-tools run into an error result, or nil when it succeeded.
+// The tools print strerror() text, so the kernel's error is recognised by it.
+fn _toolFailure(r, tool: string, bus: int, addr) {
+    if (r == nil) { return _fail("tool", tool + " could not be started"); }
+    if (r.TimedOut) { return _fail("timeout", tool + " did not finish in time - the bus may be stuck"); }
+    if (r.Exit == 0) { return nil; }
+    let msg = String.Trim(r.Stderr);
+    let dev = "/dev/i2c-" + str(bus);
+    let at  = (addr == nil) ? "" : " at address " + _hex(addr);
+    if (String.Contains(msg, "No such file or directory")) {
+        return _fail("bus", "I2C bus " + str(bus) + " not found (" + dev + "): the bus is not enabled - on a Raspberry Pi: sudo raspi-config nonint do_i2c 0");
+    }
+    if (String.Contains(msg, "Permission denied")) {
+        return _fail("permission", "no permission to open " + dev + ": add the user to the i2c group (sudo usermod -aG i2c $USER) and log in again");
+    }
+    if (String.Contains(msg, "Device or resource busy")) {
+        return _fail("busy", "the chip" + at + " on bus " + str(bus) + " is in use by a kernel driver");
+    }
+    if (String.Contains(msg, "Remote I/O error") || String.Contains(msg, "No such device or address")) {
+        return _fail("nack", "no chip answered" + at + " on bus " + str(bus) + " - check wiring, power and the address");
+    }
+    if (String.Contains(msg, "timed out")) {
+        return _fail("timeout", tool + ": " + msg);
+    }
+    if (len(msg) == 0) { msg = "exit code " + str(r.Exit); }
+    return _fail("io", tool + ": " + msg);
+}
+
+fn _toolMissing(tool: string): object {
+    return _fail("tool", tool + " not found - install i2c-tools (sudo apt install i2c-tools)");
+}
+
+// The default backend: one i2c-tools process per call.
+class _I2cTools {
+    let _timeoutMs = 2000;
+    let _transfer  = nil;       // path of i2ctransfer, resolved on first use
+    let _detect    = nil;       // path of i2cdetect, resolved on first use
+
+    fn Constructor(timeoutMs: int) {
+        this._timeoutMs = timeoutMs;
+        this._transfer  = nil;
+        this._detect    = nil;
+    }
+
+    // A write message followed by a read message with no stop between them;
+    // the read reuses the write's address, as i2ctransfer allows.
+    fn Transfer(bus: int, addr: int, tx: [int], rxLen: int): object {
+        if (this._transfer == nil) { this._transfer = Os.Which("i2ctransfer"); }
+        if (this._transfer == nil) { return _toolMissing("i2ctransfer"); }
+        let args = ["-y", str(bus)];
+        var at = "@" + _hex(addr);
+        if (len(tx) > 0) {
+            Array.Append(args, "w" + str(len(tx)) + at);
+            foreach (b in tx) { Array.Append(args, _hex(b)); }
+            at = "";
+        }
+        if (rxLen > 0) { Array.Append(args, "r" + str(rxLen) + at); }
+        let r = Os.RunEx(this._transfer, args, { Stdin: "", Timeout: this._timeoutMs });
+        let fail = _toolFailure(r, "i2ctransfer", bus, addr);
+        if (fail != nil) { return fail; }
+        if (rxLen == 0) { return { ok: true, data: [] }; }
+        let data = _parseHexBytes(r.Stdout);
+        if (data == nil || len(data) != rxLen) {
+            return _fail("io", "i2ctransfer printed something unexpected: " + String.Trim(r.Stdout));
+        }
+        return { ok: true, data: data };
+    }
+
+    // i2cdetect's default probe per address, which is the one its manual
+    // recommends: a quick write, or a byte read in the EEPROM ranges where a
+    // quick write could change a chip's state.
+    fn Scan(bus: int): object {
+        if (this._detect == nil) { this._detect = Os.Which("i2cdetect"); }
+        if (this._detect == nil) { return _toolMissing("i2cdetect"); }
+        let r = Os.RunEx(this._detect, ["-y", str(bus)], { Stdin: "", Timeout: this._timeoutMs * 5 });
+        let fail = _toolFailure(r, "i2cdetect", bus, nil);
+        if (fail != nil) { return fail; }
+        return { ok: true, addresses: _parseDetect(r.Stdout) };
+    }
+}
+
+class I2c {
+    let _bus     = 0;
+    let _addr    = nil;
+    let _backend = nil;
+    let _bad     = nil;     // why the constructor arguments are unusable, or nil
+    let _err     = nil;
+    let _errKind = nil;
+
+    // A bad bus or address does not raise: the object is returned anyway and
+    // every call on it fails with errorKind "usage" and the reason.
+    fn Constructor(bus: int, address?, opts?) {
+        this._bus     = (bus == nil) ? -1 : bus;
+        this._addr    = address;
+        this._bad     = nil;
+        this._err     = nil;
+        this._errKind = nil;
+        var timeoutMs = 2000;
+        if (opts != nil && ("timeoutMs" in opts) && opts["timeoutMs"] != nil) { timeoutMs = opts["timeoutMs"]; }
+        if (opts != nil && ("backend" in opts) && opts["backend"] != nil) {
+            this._backend = opts["backend"];
+        } else {
+            this._backend = new _I2cTools(timeoutMs);
+        }
+        if (bus == nil || bus < 0) {
+            this._bad = "bus must be 0 or more";
+        } else if (address != nil && (Type.Of(address) != Type.Int || address < 0x08 || address > 0x77)) {
+            this._bad = "address must be a 7-bit address from 0x08 to 0x77";
+        }
+        if (this._bad != nil) { this._setError("usage", this._bad); }
+    }
+
+    fn Bus(): int { return this._bus; }
+    fn Address() { return this._addr; }
+
+    // Why the last call failed, or nil when it succeeded.
+    fn Error() { return this._err; }
+    fn ErrorKind() { return this._errKind; }
+
+    // -- raw transfers -----------------------------------------------------
+
+    // count bytes from the chip, as [int]; nil on failure.
+    fn Read(count: int) {
+        if (!this._countOk(count)) { return nil; }
+        return this._xfer([], count);
+    }
+
+    fn Write(data): bool {
+        let tx = this._bytes(data);
+        if (tx == nil) { return false; }
+        if (len(tx) == 0) { return this._usage("nothing to write"); }
+        return this._xfer(tx, 0) != nil;
+    }
+
+    // Write data, then read count bytes, in one transaction.
+    fn WriteRead(data, count: int) {
+        let tx = this._bytes(data);
+        if (tx == nil || !this._countOk(count)) { return nil; }
+        if (len(tx) == 0) { this._usage("nothing to write"); return nil; }
+        return this._xfer(tx, count);
+    }
+
+    // -- registers ---------------------------------------------------------
+
+    fn ReadReg8(reg: int) {
+        let d = this.ReadRegs(reg, 1);
+        if (d == nil) { return nil; }
+        return d[0];
+    }
+
+    fn WriteReg8(reg: int, value: int): bool {
+        return this.WriteRegs(reg, [value]);
+    }
+
+    // Unsigned 16-bit value from reg and reg + 1. order is "be" or "le".
+    fn ReadReg16(reg: int, order: string) {
+        if (!this._orderOk(order)) { return nil; }
+        let d = this.ReadRegs(reg, 2);
+        if (d == nil) { return nil; }
+        return I2c.Word(d, 0, order);
+    }
+
+    // value is 0..65535, or -32768..-1 for a signed register.
+    fn WriteReg16(reg: int, value: int, order: string): bool {
+        if (!this._orderOk(order)) { return false; }
+        if (value == nil || value < -32768 || value > 0xFFFF) {
+            return this._usage("value must be from -32768 to 65535");
+        }
+        let v = value & 0xFFFF;
+        if (order == "be") { return this.WriteRegs(reg, [v >> 8, v & 0xFF]); }
+        return this.WriteRegs(reg, [v & 0xFF, v >> 8]);
+    }
+
+    // count bytes starting at reg, as [int].
+    fn ReadRegs(reg: int, count: int) {
+        if (!this._regOk(reg) || !this._countOk(count)) { return nil; }
+        return this._xfer([reg], count);
+    }
+
+    fn WriteRegs(reg: int, data): bool {
+        if (!this._regOk(reg)) { return false; }
+        let tx = this._bytes(data);
+        if (tx == nil) { return false; }
+        if (len(tx) + 1 > _MAX_MSG) { return this._usage("at most " + str(_MAX_MSG - 1) + " bytes per write"); }
+        let msg: [int] = [reg];
+        foreach (b in tx) { Array.Append(msg, b); }
+        return this._xfer(msg, 0) != nil;
+    }
+
+    // -- bus ---------------------------------------------------------------
+
+    // Addresses on this bus that answered, as [int]; nil on failure. Chips a
+    // kernel driver has claimed are included - they are there, just not free.
+    fn Scan() {
+        if (this._bus == nil || this._bus < 0) {
+            this._setError("usage", "bus must be 0 or more");
+            return nil;
+        }
+        var r = nil;
+        try { r = this._backend.Scan(this._bus); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return nil; }
+        if (r == nil || !r["ok"]) { this._setFailure(r); return nil; }
+        this._clearError();
+        return r["addresses"];
+    }
+
+    // -- static helpers ----------------------------------------------------
+
+    // Two bytes of data, starting at index, as one unsigned 16-bit number.
+    // nil when index is out of range or order is not "be"/"le".
+    fn static Word(data, index: int, order: string) {
+        if (data == nil || index == nil || index < 0 || index + 1 >= len(data)) { return nil; }
+        let a = data[index];
+        let b = data[index + 1];
+        if (order == "be") { return (a << 8) | b; }
+        if (order == "le") { return (b << 8) | a; }
+        return nil;
+    }
+
+    // Reinterpret the low `bits` bits of value as two's complement:
+    // ToSigned(0xFFFE, 16) is -2. bits is 1..63.
+    fn static ToSigned(value: int, bits: int) {
+        if (value == nil || bits == nil || bits < 1 || bits > 63) { return nil; }
+        let v = value & ((1 << bits) - 1);
+        if (((v >> (bits - 1)) & 1) == 1) { return v - (1 << bits); }
+        return v;
+    }
+
+    // -- internals ---------------------------------------------------------
+
+    fn _xfer(tx: [int], rxLen: int) {
+        if (this._bad != nil) { this._setError("usage", this._bad); return nil; }
+        if (this._addr == nil) {
+            this._usage("this I2c has no address - give one: new I2c(bus, address)");
+            return nil;
+        }
+        var r = nil;
+        try { r = this._backend.Transfer(this._bus, this._addr, tx, rxLen); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return nil; }
+        if (r == nil || !r["ok"]) { this._setFailure(r); return nil; }
+        let data = r["data"];
+        if (rxLen > 0 && (data == nil || len(data) != rxLen)) {
+            this._setError("io", "expected " + str(rxLen) + " bytes from the bus");
+            return nil;
+        }
+        this._clearError();
+        if (rxLen == 0) { return []; }
+        return data;
+    }
+
+    // An array of byte values, or a block, as a fresh [int]; nil (and a usage
+    // error) when anything in it is not a byte.
+    fn _bytes(data) {
+        if (data == nil) { this._usage("no data given"); return nil; }
+        if (Type.Of(data) == Type.Block) { return Buffer.ToArray(data); }
+        if (Type.Of(data) != Type.Array) { this._usage("data must be an array of bytes or a block"); return nil; }
+        let out: [int] = [];
+        foreach (b in data) {
+            if (Type.Of(b) != Type.Int || b < 0 || b > 255) {
+                this._usage("every byte must be an int from 0 to 255");
+                return nil;
+            }
+            Array.Append(out, b);
+        }
+        return out;
+    }
+
+    fn _regOk(reg): bool {
+        if (reg == nil || reg < 0 || reg > 255) { return this._usage("register must be from 0 to 255"); }
+        return true;
+    }
+
+    fn _countOk(count): bool {
+        if (count == nil || count < 1 || count > _MAX_MSG) {
+            return this._usage("count must be from 1 to " + str(_MAX_MSG));
+        }
+        return true;
+    }
+
+    fn _orderOk(order): bool {
+        if (order == "be" || order == "le") { return true; }
+        return this._usage("byte order must be \"be\" or \"le\"");
+    }
+
+    fn _usage(msg: string): bool {
+        this._setError("usage", msg);
+        return false;
+    }
+
+    fn _setFailure(r) {
+        if (r == nil) { this._setError("io", "the backend returned nothing"); return; }
+        let kind = ("errorKind" in r && r["errorKind"] != nil) ? r["errorKind"] : "io";
+        let msg  = ("error" in r && r["error"] != nil) ? r["error"] : "transfer failed";
+        this._setError(kind, msg);
+    }
+
+    fn _setError(kind: string, msg: string) {
+        this._errKind = kind;
+        this._err     = msg;
+    }
+
+    fn _clearError() {
+        this._errKind = nil;
+        this._err     = nil;
+    }
+}
+
+export { I2c };

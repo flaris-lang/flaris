@@ -66,13 +66,13 @@
 //
 // Testing without hardware: tests/fake_modem.py answers AT commands on a
 // pseudo-terminal, and Stream.OpenSerial cannot tell it from a real device.
-// tests/test_modem.sh drives the library against it through the awkward cases -
-// a line split across two reads, a URC racing a reply, a silent modem, a bare
-// ERROR and a +CME ERROR, two instances contending for one port, and a waiter
-// taking the port over when the holder closes. No modem, and no --unsafe: the
-// whole library runs sandboxed.
+// tests/test_modem.fls starts it and drives the library against it through the
+// awkward cases - a line split across two reads, a URC racing a reply, a silent
+// modem, a bare ERROR and a +CME ERROR, two instances contending for one port,
+// and a waiter taking the port over when the holder closes. No modem, and no
+// --unsafe: the whole library runs sandboxed.
 //
-//   VM=/path/to/flarisvm bash tests/test_modem.sh
+//   flarisvm tests/test_modem.fls --libs=./libs
 //
 // Baud is passed straight through to Stream.OpenSerial - no rate list is baked
 // in here, because which rates are usable is a property of the VM build and the
@@ -1605,6 +1605,13 @@ fn _regName(n): string {
     return "unknown";
 }
 
+fn _toModem(w, handler: fn): fn {
+    return fn(_line, args) {
+        let modem = Weak.Get(w);
+        if (modem != nil) { handler(modem, args); }
+    };
+}
+
 class Modem {
     let _at   = nil;
     let _ref  = 0;        // rolling concatenation reference
@@ -1994,31 +2001,32 @@ class Modem {
     // ---- messages --------------------------------------------------------
 
     fn _wireUrcs(): int {
+        let w = weak(this);
         // New message stored on the card: read it out and hand it over.
-        this._at.OnUrc("+CMTI", fn(_line, args) { this._onCmti(args); });
+        this._at.OnUrc("+CMTI", _toModem(w, fn(m, args) { m._onCmti(args); }));
         // Some modems deliver the message inline instead of storing it.
-        this._at.OnUrc("+CMT",  fn(_line, args) { this._onCmt(args); });
+        this._at.OnUrc("+CMT",  _toModem(w, fn(m, args) { m._onCmt(args); }));
         // USSD answers arrive unsolicited, after the command has already
         // returned OK.
-        this._at.OnUrc("+CUSD", fn(_line, args) { this._onCusd(args); });
+        this._at.OnUrc("+CUSD", _toModem(w, fn(m, args) { m._onCusd(args); }));
         // Registration changes arrive unsolicited once +CEREG=2 has been set,
         // which Registration() does. Registering them here means they are
         // recognised as notifications rather than mistaken for the response
         // data of whatever command happened to be running.
-        this._at.OnUrc("+CEREG", fn(_line, args) { this._onReg("+CEREG", args); });
-        this._at.OnUrc("+CGREG", fn(_line, args) { this._onReg("+CGREG", args); });
-        this._at.OnUrc("+CREG",  fn(_line, args) { this._onReg("+CREG",  args); });
+        this._at.OnUrc("+CEREG", _toModem(w, fn(m, args) { m._onReg("+CEREG", args); }));
+        this._at.OnUrc("+CGREG", _toModem(w, fn(m, args) { m._onReg("+CGREG", args); }));
+        this._at.OnUrc("+CREG",  _toModem(w, fn(m, args) { m._onReg("+CREG",  args); }));
         // An incoming call announces itself as bare RING lines, with the
         // caller id on a separate +CLIP when it is enabled.
-        this._at.OnUrc("RING",  fn(_line, _args) {
-            if (this._onRing != nil) { this._onRing({ number: nil }); }
-        });
-        this._at.OnUrc("+CLIP", fn(_line, args) {
-            if (this._onRing != nil) {
+        this._at.OnUrc("RING",  _toModem(w, fn(m, _args) {
+            if (m._onRing != nil) { m._onRing({ number: nil }); }
+        }));
+        this._at.OnUrc("+CLIP", _toModem(w, fn(m, args) {
+            if (m._onRing != nil) {
                 let a = _splitArgs(args);
-                this._onRing({ number: (len(a) > 0) ? _unquote(a[0]) : nil });
+                m._onRing({ number: (len(a) > 0) ? _unquote(a[0]) : nil });
             }
-        });
+        }));
         return 0;
     }
 

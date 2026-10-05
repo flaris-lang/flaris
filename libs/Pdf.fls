@@ -1,0 +1,1952 @@
+// =============================================================================
+// Pdf.fls - PDF writer for Flaris: pages, vector drawing, text, images and a
+// flowing layout with tables, headers and footers.
+// Version: 1.0
+//
+// Writes PDF 1.4 documents from scratch, in Flaris: the object table, the
+// cross-reference table and the content streams are assembled here, page
+// content is compressed with Deflate.Zlib, and images either pass through
+// unchanged (JPEG, and the PNGs a PDF reader can decode as they are) or are
+// decoded by Png.fls. PdfWriter places everything at coordinates you give;
+// PdfLayout (below) flows paragraphs and tables down the page for you.
+//
+// Usage:
+//   import { PdfWriter, PdfLayout } from library("Pdf", "1.0");
+//
+//   let pdf = new PdfWriter({ size: "A4", unit: "mm" });
+//   pdf.SetInfo({ title: "Invoice 1042", author: "Acme AB" });
+//   pdf.SetFont("Helvetica", 18, "bold");
+//   pdf.DrawText(20, 20, "Invoice 1042");
+//   pdf.SetFont("Helvetica", 10);
+//   pdf.DrawTextRight(190, 22, "2026-10-02");
+//   pdf.SetStroke(0x999999);
+//   pdf.Line(20, 32, 190, 32);
+//   pdf.DrawImage("logo.png", 160, 40, 30);     // 30 mm wide, height from aspect
+//   pdf.Save("invoice.pdf");
+//
+// Coordinates:
+//   The origin is the top-left corner of the page and y grows downwards, as
+//   on a screen. Every coordinate and length is in the document's unit; font
+//   sizes are always points. DrawText's y is the top of the line: the
+//   baseline sits one Ascent() below it.
+//
+// Options (constructor, all optional):
+//   size       "A3" | "A4" (default) | "A5" | "Letter" | "Legal" | [w, h] in units
+//   landscape  turn named sizes sideways (default false)
+//   unit       "pt" (1/72 inch, default) | "mm" | "cm" | "in"
+//   compress   deflate the page content streams (default true)
+//
+// Colours are 0xRRGGBB ints. The alpha byte of a 0xAARRGGBB value is ignored,
+// so colours written for Graphics.fls work unchanged; transparency is
+// SetOpacity. Outlines use the stroke colour and thickness, Fill* the fill
+// colour, Draw* fill and then outline, text the text colour. All three
+// default to black.
+//
+// Pages:
+//   AddPage(size?, landscape?) -> index   PageCount()   PageIndex()   SetPage(i)
+//   PageWidth()   PageHeight()
+//   Drawing before the first AddPage starts page 0. SetPage returns to an
+//   earlier page, which is how "Page 3 of 7" footers are written once the
+//   page count is known.
+//
+// Style:
+//   SetStroke(rgb)  SetFill(rgb)  SetTextColor(rgb)  SetThickness(t)
+//   SetDash(on?, off?)   no arguments for a solid line
+//   SetOpacity(a)        0.0 .. 1.0, for everything drawn afterwards
+//   SaveStyle() -> style   RestoreStyle(style)   colours, line, opacity and font
+//   PointsPerUnit()
+//
+// Shapes (point lists are flat [x0,y0, x1,y1, ...]; angles are degrees,
+// clockwise from 3 o'clock, as in Graphics.fls):
+//   Line(x0,y0,x1,y1)      Polyline(pts)   Polygon(pts)  FillPolygon  DrawPolygon
+//   Rect(x,y,w,h)          FillRect        DrawRect
+//   RoundRect(x,y,w,h,r)   FillRoundRect   DrawRoundRect
+//   Circle(cx,cy,r)        FillCircle      DrawCircle
+//   Ellipse(cx,cy,rx,ry)   FillEllipse     DrawEllipse
+//   Arc(cx,cy,r,a0,a1)     Pie(cx,cy,r,a0,a1)   FillPie   DrawPie
+//   MoveTo LineTo CurveTo ClosePath, then StrokePath | FillPath | DrawPath
+//
+// Text:
+//   SetFont(name, size?, style?) -> bool
+//       name "Helvetica" | "Times" | "Courier", or a full name such as
+//       "Times-BoldItalic"; style "bold" | "italic" | "bolditalic" | "regular"
+//   DrawText(x,y,text)   DrawTextRight(x,y,text)   DrawTextCenter(x,y,text)
+//   TextWidth(text)   LineHeight()   Ascent()   Descent()   (lengths, positive)
+//   WrapText(text, width) -> array of lines; "\n" forces a break
+//   DrawTextBox(x, y, width, text, align?) -> height used
+//       align "left" (default) | "right" | "center"
+//
+// Images:
+//   LoadImage(pathOrBytes) -> id|nil     ImageSize(id) -> { Width, Height }
+//   DrawImage(id|path|bytes, x, y, w?, h?) -> bool
+//       Leave w or h nil to keep the aspect ratio; with both nil one pixel is
+//       one point. An image is stored once however often it is drawn, and a
+//       path is read once.
+//   DrawCells(x, y, size, cells, n) -> bool
+//       An n x n grid of ARGB values, darker-than-grey cells filled with the
+//       fill colour - the shape QRCode.ToPixels(text, 1) returns:
+//         let px = QRCode.ToPixels(url, 1);
+//         pdf.DrawCells(150, 250, 40, px, QRCode.PixelSize(url, 1));
+//
+// Links:
+//   Link(x, y, w, h, url)   a clickable area on the current page
+//
+// Output:
+//   SetInfo({ title, author, subject, keywords, creator, created })
+//       created is Unix seconds (default: when ToBlock runs)
+//   ToBlock() -> block     Save(path) -> bool
+//
+// PdfLayout - content that flows down the page and onto new ones:
+//   let doc = new PdfLayout(pdf, {
+//       margins: [25, 18, 22, 18],                 // top, right, bottom, left
+//       header:  { left: "Acme AB", right: "Report", rule: true },
+//       footer:  { center: "Page {page} of {pages}" }
+//   });
+//   doc.Heading("Stock report");
+//   doc.Paragraph("Values in SEK excluding VAT.");
+//   doc.Table([{ title: "Item" }, { title: "Qty", width: 20, align: "right" }],
+//             [["Bolt", "120"], ["Nut", "80"],
+//              { cells: ["Total", "200"], style: "bold", fill: 0xDDE5F0 }],
+//             { zebra: 0xF5F7FA });
+//   doc.Finish();                                  // headers, footers, page count
+//   pdf.Save("report.pdf");
+//
+//   new PdfLayout(pdf, opts?)   writes on the writer's current page (the first
+//       one is added if there is none) and adds pages as they fill.
+//       margins   one number, [vertical, horizontal] or [top, right, bottom,
+//                 left]; default 20 mm
+//       header, footer  { left, center, right, font, size (8), style,
+//                 color (0x666666), rule, ruleColor } drawn in the margin by
+//                 Finish; {page} and {pages} are replaced in the texts
+//   Heading(text, level?, opts?)   bold 18/14/12 pt; never left alone at the
+//       bottom of a page - it moves on with room for two lines after it
+//   Paragraph(text, opts?)   opts: font, size, style, color, align, indent,
+//       spaceAfter (default half a line)
+//   Table(columns, rows, opts?) -> bool
+//       columns  titles, or { title, width?, align? }; columns without a width
+//                share what the fixed ones leave
+//       rows     arrays of cells (any value, shown with str()), or
+//                { cells, style?, fill?, color? } for a row such as a total
+//       opts     size, padding, grid "rows" (default) | "all" | "none",
+//                border, thickness, headerFill, headerColor, zebra,
+//                repeatHeader (default true), spaceAfter
+//       Cells wrap; a row that does not fit starts a new page, which repeats
+//       the header row. A row taller than a whole page overflows it.
+//   Image(src, w?, h?, align?) -> bool   at most the content width
+//   Rule(opts?)   Space(h)   EnsureSpace(h) -> bool   NewPage()
+//   Y()   SetY(y)   Left()   ContentWidth()   Bottom()   Remaining()   PageCount()
+//   Finish(decorate?) -> page count
+//       Draws header and footer on every page of the layout, then calls
+//       decorate(pdf, index, count) per page for anything else (a logo, a
+//       watermark). Runs once. Pass decorate here rather than keeping a
+//       closure around: a closure that captures the layout and is stored on
+//       it would be a reference cycle, which is never freed.
+//   Styles set through opts last for that call only; the writer's style is
+//   restored afterwards.
+//
+// Fonts and characters:
+//   The twelve Latin standard fonts - Helvetica, Times and Courier in four
+//   styles each - are built into every PDF reader, so nothing is embedded and
+//   a page of text stays a few KB. They draw ASCII, Latin-1 (å ä ö é ü ß
+//   ...), Latin Extended-A - Polish, Czech, Slovak, Hungarian, Romanian,
+//   Turkish and Baltic letters (ł ś ż č ě ř ő ű ğ ş ș ț ā ų ...) - the euro
+//   sign, typographic quotes and dashes, − ≤ ≥ ≠ ∑ √ ∂ Δ and the fi/fl
+//   ligatures. Any other character (Greek, Cyrillic, CJK, emoji) becomes '?'.
+//   Copied out of a reader, Romanian ș/ț come back as their cedilla forms
+//   ş/ţ: the glyphs draw a comma, but their standard names map to cedillas.
+//   The reader supplies these fonts, so a glyph its copy lacks shows as a
+//   gap of the right width - macOS's Times Italic has no Latvian ķ ļ ņ.
+//   TextWidth uses the fonts' published metrics, so measured text lines up
+//   with what the reader draws.
+//
+// Image formats:
+//   JPEG is embedded as it is (grayscale, RGB or CMYK; baseline or
+//   progressive), and so is a non-interlaced grayscale (1-8 bit), RGB
+//   (8 bit) or palette PNG without transparency. Any other PNG - alpha,
+//   tRNS, 16-bit - is decoded and recompressed, its alpha becoming a soft
+//   mask. Interlaced PNGs are not supported: LoadImage returns nil.
+// =============================================================================
+
+import { Png } from library("Png", "1.0");
+import { Deflate } from library("Deflate", "1.0");
+
+const MM = 72.0 / 25.4;
+
+// Font id = family * 4 + style bits (1 bold, 2 italic). Resource /F<id+1>.
+const FONT_NAMES = ["Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+                    "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+                    "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"];
+const FONT_ASC  = [718, 718, 718, 718, 683, 683, 683, 683, 629, 629, 629, 629];
+const FONT_DESC = [207, 207, 207, 207, 217, 217, 217, 217, 157, 157, 157, 157];
+
+// Glyph widths in 1/1000 em for WinAnsi codes 32..255, from Adobe's Core14
+// AFM files. An oblique has its upright's widths and every Courier glyph is
+// 600, so six tables cover the twelve fonts. 0 marks a code WinAnsi leaves
+// undefined; the encoder never produces one.
+const W_HELV = [
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+    1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+    333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+    556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584, 0,
+    556, 0, 222, 556, 333, 1000, 556, 556, 333, 1000, 667, 333, 1000, 0, 611, 0,
+    0, 222, 222, 333, 333, 350, 556, 1000, 333, 1000, 500, 333, 944, 0, 500, 667,
+    278, 333, 556, 556, 556, 556, 260, 556, 333, 737, 370, 556, 584, 333, 737, 333,
+    400, 584, 333, 333, 333, 556, 537, 278, 333, 333, 365, 556, 834, 834, 834, 611,
+    667, 667, 667, 667, 667, 667, 1000, 722, 667, 667, 667, 667, 278, 278, 278, 278,
+    722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722, 722, 667, 667, 611,
+    556, 556, 556, 556, 556, 556, 889, 500, 556, 556, 556, 556, 278, 278, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 584, 611, 556, 556, 556, 556, 500, 556, 500
+];
+
+const W_HELV_B = [
+    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278,
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611,
+    975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556,
+    333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611,
+    611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584, 0,
+    556, 0, 278, 556, 500, 1000, 556, 556, 333, 1000, 667, 333, 1000, 0, 611, 0,
+    0, 278, 278, 500, 500, 350, 556, 1000, 333, 1000, 556, 333, 944, 0, 500, 667,
+    278, 333, 556, 556, 556, 556, 280, 556, 333, 737, 370, 556, 584, 333, 737, 333,
+    400, 584, 333, 333, 333, 611, 556, 278, 333, 333, 365, 556, 834, 834, 834, 611,
+    722, 722, 722, 722, 722, 722, 1000, 722, 667, 667, 667, 667, 278, 278, 278, 278,
+    722, 722, 778, 778, 778, 778, 778, 584, 778, 722, 722, 722, 722, 667, 667, 611,
+    556, 556, 556, 556, 556, 556, 889, 556, 556, 556, 556, 556, 278, 278, 278, 278,
+    611, 611, 611, 611, 611, 611, 611, 584, 611, 611, 611, 611, 611, 556, 611, 556
+];
+
+const W_TIMES = [
+    250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278,
+    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
+    921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
+    556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
+    333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
+    500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541, 0,
+    500, 0, 333, 500, 444, 1000, 500, 500, 333, 1000, 556, 333, 889, 0, 611, 0,
+    0, 333, 333, 444, 444, 350, 500, 1000, 333, 980, 389, 333, 722, 0, 444, 722,
+    250, 333, 500, 500, 500, 500, 200, 500, 333, 760, 276, 500, 564, 333, 760, 333,
+    400, 564, 300, 300, 333, 500, 453, 250, 333, 300, 310, 500, 750, 750, 750, 444,
+    722, 722, 722, 722, 722, 722, 889, 667, 611, 611, 611, 611, 333, 333, 333, 333,
+    722, 722, 722, 722, 722, 722, 722, 564, 722, 722, 722, 722, 722, 722, 556, 500,
+    444, 444, 444, 444, 444, 444, 667, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+    500, 500, 500, 500, 500, 500, 500, 564, 500, 500, 500, 500, 500, 500, 500, 500
+];
+
+const W_TIMES_B = [
+    250, 333, 555, 500, 500, 1000, 833, 278, 333, 333, 500, 570, 250, 333, 250, 278,
+    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500,
+    930, 722, 667, 722, 722, 667, 611, 778, 778, 389, 500, 778, 667, 944, 722, 778,
+    611, 778, 722, 556, 667, 722, 722, 1000, 722, 722, 667, 333, 278, 333, 581, 500,
+    333, 500, 556, 444, 556, 444, 333, 500, 556, 278, 333, 556, 278, 833, 556, 500,
+    556, 556, 444, 389, 333, 556, 500, 722, 500, 500, 444, 394, 220, 394, 520, 0,
+    500, 0, 333, 500, 500, 1000, 500, 500, 333, 1000, 556, 333, 1000, 0, 667, 0,
+    0, 333, 333, 500, 500, 350, 500, 1000, 333, 1000, 389, 333, 722, 0, 444, 722,
+    250, 333, 500, 500, 500, 500, 220, 500, 333, 747, 300, 500, 570, 333, 747, 333,
+    400, 570, 300, 300, 333, 556, 540, 250, 333, 300, 330, 500, 750, 750, 750, 500,
+    722, 722, 722, 722, 722, 722, 1000, 722, 667, 667, 667, 667, 389, 389, 389, 389,
+    722, 722, 778, 778, 778, 778, 778, 570, 778, 722, 722, 722, 722, 722, 611, 556,
+    500, 500, 500, 500, 500, 500, 722, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+    500, 556, 500, 500, 500, 500, 500, 570, 500, 556, 556, 556, 556, 500, 556, 500
+];
+
+const W_TIMES_I = [
+    250, 333, 420, 500, 500, 833, 778, 214, 333, 333, 500, 675, 250, 333, 250, 278,
+    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 675, 675, 675, 500,
+    920, 611, 611, 667, 722, 611, 611, 722, 722, 333, 444, 667, 556, 833, 667, 722,
+    611, 722, 611, 500, 556, 722, 611, 833, 611, 556, 556, 389, 278, 389, 422, 500,
+    333, 500, 500, 444, 500, 444, 278, 500, 500, 278, 278, 444, 278, 722, 500, 500,
+    500, 500, 389, 389, 278, 500, 444, 667, 444, 444, 389, 400, 275, 400, 541, 0,
+    500, 0, 333, 500, 556, 889, 500, 500, 333, 1000, 500, 333, 944, 0, 556, 0,
+    0, 333, 333, 556, 556, 350, 500, 889, 333, 980, 389, 333, 667, 0, 389, 556,
+    250, 389, 500, 500, 500, 500, 275, 500, 333, 760, 276, 500, 675, 333, 760, 333,
+    400, 675, 300, 300, 333, 500, 523, 250, 333, 300, 310, 500, 750, 750, 750, 500,
+    611, 611, 611, 611, 611, 611, 889, 667, 611, 611, 611, 611, 333, 333, 333, 333,
+    722, 667, 722, 722, 722, 722, 722, 675, 722, 722, 722, 722, 722, 556, 611, 500,
+    500, 500, 500, 500, 500, 500, 667, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+    500, 500, 500, 500, 500, 500, 500, 675, 500, 500, 500, 500, 500, 444, 500, 444
+];
+
+const W_TIMES_BI = [
+    250, 389, 555, 500, 500, 833, 778, 278, 333, 333, 500, 570, 250, 333, 250, 278,
+    500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 333, 333, 570, 570, 570, 500,
+    832, 667, 667, 667, 722, 667, 667, 722, 778, 389, 500, 667, 611, 889, 722, 722,
+    611, 722, 667, 556, 611, 722, 667, 889, 667, 611, 611, 333, 278, 333, 570, 500,
+    333, 500, 500, 444, 500, 444, 333, 500, 556, 278, 278, 500, 278, 778, 556, 500,
+    500, 500, 389, 389, 278, 556, 444, 667, 500, 444, 389, 348, 220, 348, 570, 0,
+    500, 0, 333, 500, 500, 1000, 500, 500, 333, 1000, 556, 333, 944, 0, 611, 0,
+    0, 333, 333, 500, 500, 350, 500, 1000, 333, 1000, 389, 333, 722, 0, 389, 611,
+    250, 389, 500, 500, 500, 500, 220, 500, 333, 747, 266, 500, 606, 333, 747, 333,
+    400, 570, 300, 300, 333, 576, 500, 250, 333, 300, 300, 500, 750, 750, 750, 500,
+    667, 667, 667, 667, 667, 667, 944, 667, 667, 667, 667, 667, 389, 389, 389, 389,
+    722, 722, 722, 722, 722, 722, 722, 570, 722, 722, 722, 722, 722, 611, 611, 500,
+    500, 500, 500, 500, 500, 500, 722, 444, 444, 444, 444, 444, 278, 278, 278, 278,
+    500, 556, 500, 500, 500, 500, 500, 570, 500, 556, 556, 556, 556, 444, 500, 444
+];
+
+// The other glyphs every standard Latin font carries: Latin Extended-A
+// (Polish, Czech, Slovak, Hungarian, Romanian, Turkish, Baltic) and a few
+// symbols. Code points ascending; entry i is code 128 + i in the second font
+// object of each face, whose /Differences encoding names these glyphs.
+const EXT_CP = [
+    0x0100, 0x0101, 0x0102, 0x0103, 0x0104, 0x0105, 0x0106, 0x0107, 0x010C, 0x010D,
+    0x010E, 0x010F, 0x0110, 0x0111, 0x0112, 0x0113, 0x0116, 0x0117, 0x0118, 0x0119,
+    0x011A, 0x011B, 0x011E, 0x011F, 0x0122, 0x0123, 0x012A, 0x012B, 0x012E, 0x012F,
+    0x0130, 0x0131, 0x0136, 0x0137, 0x0139, 0x013A, 0x013B, 0x013C, 0x013D, 0x013E,
+    0x0141, 0x0142, 0x0143, 0x0144, 0x0145, 0x0146, 0x0147, 0x0148, 0x014C, 0x014D,
+    0x0150, 0x0151, 0x0154, 0x0155, 0x0156, 0x0157, 0x0158, 0x0159, 0x015A, 0x015B,
+    0x015E, 0x015F, 0x0162, 0x0163, 0x0164, 0x0165, 0x016A, 0x016B, 0x016E, 0x016F,
+    0x0170, 0x0171, 0x0172, 0x0173, 0x0179, 0x017A, 0x017B, 0x017C, 0x0218, 0x0219,
+    0x02C7, 0x02D8, 0x02D9, 0x02DA, 0x02DB, 0x02DD, 0x2044, 0x2202, 0x2206, 0x2211,
+    0x2212, 0x221A, 0x2260, 0x2264, 0x2265, 0x25CA, 0xFB01, 0xFB02
+];
+const EXT_NAMES = [
+    "Amacron", "amacron", "Abreve", "abreve", "Aogonek", "aogonek",
+    "Cacute", "cacute", "Ccaron", "ccaron", "Dcaron", "dcaron",
+    "Dcroat", "dcroat", "Emacron", "emacron", "Edotaccent", "edotaccent",
+    "Eogonek", "eogonek", "Ecaron", "ecaron", "Gbreve", "gbreve",
+    "Gcommaaccent", "gcommaaccent", "Imacron", "imacron", "Iogonek", "iogonek",
+    "Idotaccent", "dotlessi", "Kcommaaccent", "kcommaaccent", "Lacute", "lacute",
+    "Lcommaaccent", "lcommaaccent", "Lcaron", "lcaron", "Lslash", "lslash",
+    "Nacute", "nacute", "Ncommaaccent", "ncommaaccent", "Ncaron", "ncaron",
+    "Omacron", "omacron", "Ohungarumlaut", "ohungarumlaut", "Racute", "racute",
+    "Rcommaaccent", "rcommaaccent", "Rcaron", "rcaron", "Sacute", "sacute",
+    "Scedilla", "scedilla", "Tcommaaccent", "tcommaaccent", "Tcaron", "tcaron",
+    "Umacron", "umacron", "Uring", "uring", "Uhungarumlaut", "uhungarumlaut",
+    "Uogonek", "uogonek", "Zacute", "zacute", "Zdotaccent", "zdotaccent",
+    "Scommaaccent", "scommaaccent", "caron", "breve", "dotaccent", "ring",
+    "ogonek", "hungarumlaut", "fraction", "partialdiff", "Delta", "summation",
+    "minus", "radical", "notequal", "lessequal", "greaterequal", "lozenge",
+    "fi", "fl"
+];
+const EXT_W_HELV = [
+    667, 556, 667, 556, 667, 556, 722, 500, 722, 500, 722, 643, 722, 556, 667, 556,
+    667, 556, 667, 556, 667, 556, 778, 556, 778, 556, 278, 278, 278, 222, 278, 278,
+    667, 500, 556, 222, 556, 222, 556, 299, 556, 222, 722, 556, 722, 556, 722, 556,
+    778, 556, 778, 556, 722, 333, 722, 333, 722, 333, 667, 500, 667, 500, 611, 278,
+    611, 317, 722, 556, 722, 556, 722, 556, 722, 556, 611, 500, 611, 500, 667, 500,
+    333, 333, 333, 333, 333, 333, 167, 476, 612, 600, 584, 453, 549, 549, 549, 471,
+    500, 500
+];
+const EXT_W_HELV_B = [
+    722, 556, 722, 556, 722, 556, 722, 556, 722, 556, 722, 743, 722, 611, 667, 556,
+    667, 556, 667, 556, 667, 556, 778, 611, 778, 611, 278, 278, 278, 278, 278, 278,
+    722, 556, 611, 278, 611, 278, 611, 400, 611, 278, 722, 611, 722, 611, 722, 611,
+    778, 611, 778, 611, 722, 389, 722, 389, 722, 389, 667, 556, 667, 556, 611, 333,
+    611, 389, 722, 611, 722, 611, 722, 611, 722, 611, 611, 500, 611, 500, 667, 556,
+    333, 333, 333, 333, 333, 333, 167, 494, 612, 600, 584, 549, 549, 549, 549, 494,
+    611, 611
+];
+const EXT_W_TIMES = [
+    722, 444, 722, 444, 722, 444, 667, 444, 667, 444, 722, 588, 722, 500, 611, 444,
+    611, 444, 611, 444, 611, 444, 722, 500, 722, 500, 333, 278, 333, 278, 333, 278,
+    722, 500, 611, 278, 611, 278, 611, 344, 611, 278, 722, 500, 722, 500, 722, 500,
+    722, 500, 722, 500, 667, 333, 667, 333, 667, 333, 556, 389, 556, 389, 611, 278,
+    611, 326, 722, 500, 722, 500, 722, 500, 722, 500, 611, 444, 611, 444, 556, 389,
+    333, 333, 333, 333, 333, 333, 167, 476, 612, 600, 564, 453, 549, 549, 549, 471,
+    556, 556
+];
+const EXT_W_TIMES_B = [
+    722, 500, 722, 500, 722, 500, 722, 444, 722, 444, 722, 672, 722, 556, 667, 444,
+    667, 444, 667, 444, 667, 444, 778, 500, 778, 500, 389, 278, 389, 278, 389, 278,
+    778, 556, 667, 278, 667, 278, 667, 394, 667, 278, 722, 556, 722, 556, 722, 556,
+    778, 500, 778, 500, 722, 444, 722, 444, 722, 444, 556, 389, 556, 389, 667, 333,
+    667, 416, 722, 556, 722, 556, 722, 556, 722, 556, 667, 444, 667, 444, 556, 389,
+    333, 333, 333, 333, 333, 333, 167, 494, 612, 600, 570, 549, 549, 549, 549, 494,
+    556, 556
+];
+const EXT_W_TIMES_I = [
+    611, 500, 611, 500, 611, 500, 667, 444, 667, 444, 722, 544, 722, 500, 611, 444,
+    611, 444, 611, 444, 611, 444, 722, 500, 722, 500, 333, 278, 333, 278, 333, 278,
+    667, 444, 556, 278, 556, 278, 611, 300, 556, 278, 667, 500, 667, 500, 667, 500,
+    722, 500, 722, 500, 611, 389, 611, 389, 611, 389, 500, 389, 500, 389, 556, 278,
+    556, 300, 722, 500, 722, 500, 722, 500, 722, 500, 556, 389, 556, 389, 500, 389,
+    333, 333, 333, 333, 333, 333, 167, 476, 612, 600, 675, 453, 549, 549, 549, 471,
+    500, 500
+];
+const EXT_W_TIMES_BI = [
+    667, 500, 667, 500, 667, 500, 667, 444, 667, 444, 722, 608, 722, 500, 667, 444,
+    667, 444, 667, 444, 667, 444, 722, 500, 722, 500, 389, 278, 389, 278, 389, 278,
+    667, 500, 611, 278, 611, 278, 611, 382, 611, 278, 722, 556, 722, 556, 722, 556,
+    722, 500, 722, 500, 667, 389, 667, 389, 667, 389, 556, 389, 556, 389, 611, 278,
+    611, 366, 722, 556, 722, 556, 722, 556, 722, 556, 611, 389, 611, 389, 556, 389,
+    333, 333, 333, 333, 333, 333, 167, 494, 612, 600, 606, 549, 549, 549, 549, 494,
+    556, 556
+];
+
+fn _pdfWidths(font: int) : array|nil {
+    if (font == 0 || font == 2) return W_HELV;
+    if (font == 1 || font == 3) return W_HELV_B;
+    if (font == 4) return W_TIMES;
+    if (font == 5) return W_TIMES_B;
+    if (font == 6) return W_TIMES_I;
+    if (font == 7) return W_TIMES_BI;
+    return nil;
+}
+
+fn _pdfExtWidths(font: int) : array|nil {
+    if (font == 0 || font == 2) return EXT_W_HELV;
+    if (font == 1 || font == 3) return EXT_W_HELV_B;
+    if (font == 4) return EXT_W_TIMES;
+    if (font == 5) return EXT_W_TIMES_B;
+    if (font == 6) return EXT_W_TIMES_I;
+    if (font == 7) return EXT_W_TIMES_BI;
+    return nil;
+}
+
+// -1 for an unknown name or style.
+fn _pdfFontId(name: string, style) : int {
+    var id = -1;
+    iter (i from 0 to 12) {
+        if (String.EqualsIgnoreCase(name, FONT_NAMES[i])) { id = i; break; }
+    }
+    if (id < 0) {
+        let n = String.ToLower(name);
+        if (n == "helvetica") { id = 0; }
+        else if (n == "times") { id = 4; }
+        else if (n == "courier") { id = 8; }
+        else { return -1; }
+    }
+    if (style == nil) return id;
+    let s = String.ToLower(style);
+    var bits = 0;
+    if (String.Contains(s, "bold")) { bits = bits | 1; }
+    if (String.Contains(s, "italic") || String.Contains(s, "oblique")) { bits = bits | 2; }
+    if (bits == 0 && s != "regular" && s != "normal" && s != "") return -1;
+    return (id / 4) * 4 + bits;
+}
+
+// WinAnsi code for a Unicode code point, or -1.
+fn _pdfWinAnsi(cp: int) : int {
+    if (cp < 128 || (cp >= 160 && cp <= 255)) return cp;
+    if (cp == 0x2019) return 146;
+    if (cp == 0x2018) return 145;
+    if (cp == 0x201C) return 147;
+    if (cp == 0x201D) return 148;
+    if (cp == 0x2013) return 150;
+    if (cp == 0x2014) return 151;
+    if (cp == 0x20AC) return 128;
+    if (cp == 0x2022) return 149;
+    if (cp == 0x2026) return 133;
+    if (cp == 0x201A) return 130;
+    if (cp == 0x201E) return 132;
+    if (cp == 0x2039) return 139;
+    if (cp == 0x203A) return 155;
+    if (cp == 0x2020) return 134;
+    if (cp == 0x2021) return 135;
+    if (cp == 0x2030) return 137;
+    if (cp == 0x2122) return 153;
+    if (cp == 0x0152) return 140;
+    if (cp == 0x0153) return 156;
+    if (cp == 0x0160) return 138;
+    if (cp == 0x0161) return 154;
+    if (cp == 0x017D) return 142;
+    if (cp == 0x017E) return 158;
+    if (cp == 0x0178) return 159;
+    if (cp == 0x0192) return 131;
+    if (cp == 0x02C6) return 136;
+    if (cp == 0x02DC) return 152;
+    if (cp == 0x2010 || cp == 0x2011) return 45;
+    if (cp == 0x03BC) return 181;               // Greek mu as the micro sign
+    if (cp == 0x2002 || cp == 0x2003 || cp == 0x2007 || cp == 0x2009 || cp == 0x202F) return 32;
+    return -1;
+}
+
+// Index into EXT_CP, or -1.
+fn _pdfExt(cp: int) : int {
+    var c = cp;
+    // Romanian t with comma below: Adobe's tcommaaccent glyphs draw exactly
+    // that. Greek capital delta: the same shape as the increment sign.
+    if (c == 0x021A) { c = 0x0162; } else if (c == 0x021B) { c = 0x0163; }
+    else if (c == 0x0394) { c = 0x2206; }
+    var lo = 0;
+    var hi = len(EXT_CP) - 1;
+    while (lo <= hi) {
+        let mid = (lo + hi) / 2;
+        let v = EXT_CP[mid];
+        if (v == c) return mid;
+        if (v < c) { lo = mid + 1; } else { hi = mid - 1; }
+    }
+    return -1;
+}
+
+// A WinAnsi code (< 256), 256 + an EXT_CP index, or '?' (63).
+fn _pdfGlyph(cp: int) : int {
+    let w = _pdfWinAnsi(cp);
+    if (w >= 0) return w;
+    let e = _pdfExt(cp);
+    if (e >= 0) return 256 + e;
+    return 63;
+}
+
+// Sum of glyph widths in 1/1000 em. Skips exactly what _pdfTextRuns drops,
+// so a measured string and a drawn one always agree.
+fn _pdfTextUnits(text: string, font: int) : int {
+    let tbl = _pdfWidths(font);
+    let n = len(text);
+    var units = 0;
+    var i = 0;
+    while (i < n) {
+        var c = Char.Code(text[i]);
+        if (c < 128) {
+            i += 1;
+            if (c == 9) { c = 32; }
+            if (c < 32 || c == 127) { continue; }
+        } else {
+            c = _pdfGlyph(Char.Code(String.Utf8CpAt(text, i)));
+            i = String.Utf8CpNext(text, i);
+            if (c >= 256) {
+                let ext = _pdfExtWidths(font);
+                if (ext == nil) { units += 600; } else { units += ext[c - 256]; }
+                continue;
+            }
+        }
+        if (tbl == nil) { units += 600; } else { units += tbl[c - 32]; }
+    }
+    return units;
+}
+
+fn _pdfOct(code: int) : string {
+    return "\\" + str((code >> 6) & 7) + str((code >> 3) & 7) + str(code & 7);
+}
+
+// UTF-8 text as literal-string bodies, [kind, body, kind, body, ...]: kind 0
+// is WinAnsi, kind 1 the extended encoding (code 128 + EXT_CP index).
+// Non-ASCII goes in as octal escapes so content streams stay 7-bit. Tab
+// becomes a space; other control characters are dropped.
+fn _pdfTextRuns(text: string) : array {
+    let n = len(text);
+    let runs = [];
+    var parts = [];
+    var kind = 0;
+    var start = 0;              // pending plain ASCII, always kind 0
+    var i = 0;
+    while (i < n) {
+        let c = Char.Code(text[i]);
+        if (c >= 32 && c < 127 && c != 40 && c != 41 && c != 92) {
+            if (kind != 0) {
+                Array.Append(runs, kind);
+                Array.Append(runs, String.Join(parts, ""));
+                parts = [];
+                kind = 0;
+                start = i;
+            }
+            i += 1;
+            continue;
+        }
+        if (i > start) { Array.Append(parts, String.Substr(text, start, i - start)); }
+        var piece = "";
+        var k = 0;
+        var next = i + 1;
+        if (c == 40 || c == 41 || c == 92) {
+            piece = "\\" + String.Substr(text, i, 1);
+        } else if (c < 128) {
+            if (c == 9) { piece = " "; }
+        } else {
+            let g = _pdfGlyph(Char.Code(String.Utf8CpAt(text, i)));
+            next = String.Utf8CpNext(text, i);
+            if (g >= 256) {
+                k = 1;
+                piece = _pdfOct(g - 128);
+            } else {
+                piece = _pdfOct(g);
+            }
+        }
+        if (len(piece) > 0) {
+            if (k != kind) {
+                if (len(parts) > 0) {
+                    Array.Append(runs, kind);
+                    Array.Append(runs, String.Join(parts, ""));
+                    parts = [];
+                }
+                kind = k;
+            }
+            Array.Append(parts, piece);
+        }
+        i = next;
+        start = i;
+    }
+    if (start == 0 && len(runs) == 0) return [0, text];
+    if (n > start) { Array.Append(parts, String.Substr(text, start, n - start)); }
+    if (len(parts) > 0) {
+        Array.Append(runs, kind);
+        Array.Append(runs, String.Join(parts, ""));
+    }
+    return runs;
+}
+
+// PDF numbers have no exponent form, so str() of a float is not safe to
+// write: at most three decimals, trailing zeros trimmed.
+fn _pdfNum(v) : string {
+    if (type(v) == Type.Int) return str(v);
+    var r = Math.Round(v * 1000.0);
+    if (r % 1000 == 0) return str(r / 1000);
+    var sign = "";
+    if (r < 0) { sign = "-"; r = -r; }
+    var frac = r % 1000;
+    var digits = 3;
+    while (frac % 10 == 0) { frac = frac / 10; digits -= 1; }
+    return sign + str(r / 1000) + "." + String.PadLeft(str(frac), digits, "0");
+}
+
+fn _pdfRgb(c: int) : string {
+    return _pdfNum(((c >> 16) & 255) / 255.0) + " " + _pdfNum(((c >> 8) & 255) / 255.0)
+         + " " + _pdfNum((c & 255) / 255.0);
+}
+
+// Literal string for ASCII text (URLs, ASCII metadata).
+fn _pdfLit(s: string) : string {
+    var e = String.Replace(s, "\\", "\\\\");
+    e = String.Replace(e, "(", "\\(");
+    e = String.Replace(e, ")", "\\)");
+    return "(" + e + ")";
+}
+
+// Text string for the document information dictionary: a literal when the
+// text is ASCII, UTF-16BE with a byte-order mark otherwise.
+fn _pdfTextString(s: string) : string {
+    if (String.Utf8Length(s) == len(s)) return _pdfLit(s);
+    let parts = ["<FEFF"];
+    let n = len(s);
+    var i = 0;
+    while (i < n) {
+        var cp = Char.Code(String.Utf8CpAt(s, i));
+        i = String.Utf8CpNext(s, i);
+        if (cp > 0xFFFF) {
+            cp -= 0x10000;
+            Array.Append(parts, String.Format("{0:X4}{1:X4}", 0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)));
+        } else {
+            Array.Append(parts, String.Format("{0:X4}", cp));
+        }
+    }
+    Array.Append(parts, ">");
+    return String.Join(parts, "");
+}
+
+fn _pdfUnit(u) : float {
+    if (type(u) != Type.String) return 0.0;
+    let s = String.ToLower(u);
+    if (s == "pt") return 1.0;
+    if (s == "mm") return MM;
+    if (s == "cm") return MM * 10.0;
+    if (s == "in") return 72.0;
+    return 0.0;
+}
+
+// [w, h] in points, or nil. Orientation applies to named sizes only; an
+// explicit [w, h] is taken as given.
+fn _pdfPageSize(size, k: float, land: bool) : array|nil {
+    if (type(size) == Type.Array) {
+        if (len(size) != 2) return nil;
+        let a = size[0];
+        let b = size[1];
+        if ((type(a) != Type.Int && type(a) != Type.Float) || (type(b) != Type.Int && type(b) != Type.Float)) return nil;
+        if (a <= 0 || b <= 0) return nil;
+        return [a * k, b * k];
+    }
+    if (type(size) != Type.String) return nil;
+    let s = String.ToLower(size);
+    var w = 0.0;
+    var h = 0.0;
+    if (s == "a4") { w = 210 * MM; h = 297 * MM; }
+    else if (s == "a3") { w = 297 * MM; h = 420 * MM; }
+    else if (s == "a5") { w = 148 * MM; h = 210 * MM; }
+    else if (s == "letter") { w = 612.0; h = 792.0; }
+    else if (s == "legal") { w = 612.0; h = 1008.0; }
+    else { return nil; }
+    if (land) return [h, w];
+    return [w, h];
+}
+
+fn _pdfDark(v) : bool {
+    if (type(v) != Type.Int) return false;
+    return ((v >> 16) & 255) + ((v >> 8) & 255) + (v & 255) < 384;
+}
+
+fn _pdfHex(b: block, off: int, n: int) : string {
+    let parts = [];
+    iter (i from 0 to n) { Array.Append(parts, String.Format("{0:X2}", Buffer.ReadU8At(b, off + i))); }
+    return String.Join(parts, "");
+}
+
+// Image record: w, h (pixels), cs, bpc, filter, parms, decode (dictionary
+// entries, "" when absent), data (the stream bytes), smask (zlib alpha or nil).
+fn _pdfJpeg(b: block) : object|nil {
+    let n = len(b);
+    var p = 2;
+    var adobe = false;
+    while (p + 4 <= n) {
+        if (Buffer.ReadU8At(b, p) != 0xFF) return nil;
+        let m = Buffer.ReadU8At(b, p + 1);
+        if (m == 0xFF) { p += 1; continue; }
+        if (m == 0x01 || (m >= 0xD0 && m <= 0xD8)) { p += 2; continue; }
+        if (m == 0xD9 || m == 0xDA) return nil;
+        // Photoshop writes CMYK inverted and marks it with an Adobe APP14.
+        if (m == 0xEE) { adobe = true; }
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            if (p + 10 > n) return nil;
+            let h = Buffer.ReadU16At(b, p + 5, true);
+            let w = Buffer.ReadU16At(b, p + 7, true);
+            let comps = Buffer.ReadU8At(b, p + 9);
+            if (w == 0 || h == 0) return nil;
+            var cs = "/DeviceRGB";
+            var decode = "";
+            if (comps == 1) { cs = "/DeviceGray"; }
+            else if (comps == 4) {
+                cs = "/DeviceCMYK";
+                if (adobe) { decode = "/Decode [1 0 1 0 1 0 1 0]"; }
+            }
+            else if (comps != 3) { return nil; }
+            return { w: w, h: h, cs: cs, bpc: 8, filter: "/DCTDecode", parms: "",
+                     decode: decode, data: b, smask: nil };
+        }
+        p += 2 + Buffer.ReadU16At(b, p + 2, true);
+    }
+    return nil;
+}
+
+fn _pdfPng(b: block) : object|nil {
+    let n = len(b);
+    var w = 0;
+    var h = 0;
+    var depth = 0;
+    var ctype = -1;
+    var interlace = 0;
+    var plte = nil;
+    var trns = false;
+    let idat = [];
+    var idatLen = 0;
+    var p = 8;
+    while (p + 8 <= n) {
+        let clen = Buffer.ReadU32At(b, p, true);
+        let tag = Buffer.ReadU32At(b, p + 4, true);
+        let d = p + 8;
+        if (d + clen > n) return nil;
+        if (tag == 0x49484452 && clen >= 13) {
+            w = Buffer.ReadU32At(b, d, true);
+            h = Buffer.ReadU32At(b, d + 4, true);
+            depth = Buffer.ReadU8At(b, d + 8);
+            ctype = Buffer.ReadU8At(b, d + 9);
+            interlace = Buffer.ReadU8At(b, d + 12);
+        } else if (tag == 0x504C5445) {
+            plte = [d, clen];
+        } else if (tag == 0x74524E53) {
+            trns = true;
+        } else if (tag == 0x49444154) {
+            Array.Append(idat, [d, clen]);
+            idatLen += clen;
+        } else if (tag == 0x49454E44) {
+            break;
+        }
+        p = d + clen + 4;
+    }
+    if (w <= 0 || h <= 0 || idatLen == 0) return nil;
+
+    // These decode with the PNG predictors a PDF reader already implements,
+    // so the IDAT stream goes in byte for byte.
+    let direct = interlace == 0 && !trns
+              && ((ctype == 0 && depth <= 8) || (ctype == 2 && depth == 8) || (ctype == 3 && plte != nil));
+    if (direct) {
+        let data = Buffer.Create(idatLen, 1);
+        var q = 0;
+        foreach (c in idat) {
+            Buffer.Copy(b, c[0], data, q, c[1]);
+            q += c[1];
+        }
+        var cs = "/DeviceGray";
+        var colors = 1;
+        if (ctype == 2) { cs = "/DeviceRGB"; colors = 3; }
+        else if (ctype == 3) {
+            cs = "[/Indexed /DeviceRGB " + str(plte[1] / 3 - 1) + " <" + _pdfHex(b, plte[0], plte[1]) + ">]";
+        }
+        return { w: w, h: h, cs: cs, bpc: depth, filter: "/FlateDecode",
+                 parms: "/DecodeParms << /Predictor 15 /Colors " + str(colors) + " /BitsPerComponent "
+                        + str(depth) + " /Columns " + str(w) + " >>",
+                 decode: "", data: data, smask: nil };
+    }
+
+    let img = Png.Decode(b);
+    if (img == nil) return nil;
+    let px = img.Pixels;
+    let npx = img.Width * img.Height;
+    let rgb = Buffer.Create(npx * 3, 1);
+    let alpha = Buffer.Create(npx, 1);
+    var opaque = true;
+    var j = 0;
+    iter (i from 0 to npx) {
+        let v = px[i];
+        rgb[j] = (v >> 16) & 255;
+        rgb[j + 1] = (v >> 8) & 255;
+        rgb[j + 2] = v & 255;
+        let a = (v >> 24) & 255;
+        alpha[i] = a;
+        if (a != 255) { opaque = false; }
+        j += 3;
+    }
+    return { w: img.Width, h: img.Height, cs: "/DeviceRGB", bpc: 8, filter: "/FlateDecode",
+             parms: "", decode: "", data: Deflate.Zlib(rgb), smask: opaque ? nil : Deflate.Zlib(alpha) };
+}
+
+class PdfWriter {
+
+    let _k = 1.0;               // points per user unit
+    let _sizeSpec = "A4";
+    let _land = false;
+    let _compress = true;
+
+    // Each page: { w, h (points), ops, links } plus the graphics state its
+    // content stream is in - font, size, fill, stroke, lw, dash, alpha - so
+    // an operator is written only when the state actually changes.
+    let _pages = nil;
+    let _cur = -1;
+    let _page = nil;
+    let _ph = 0.0;              // current page height in points
+    let _path = nil;            // MoveTo/LineTo/CurveTo ops awaiting a paint
+
+    let _stroke = 0;
+    let _fill = 0;
+    let _text = 0;
+    let _lw = 1.0;              // points
+    let _dash = "[] 0";
+    let _alpha = 1.0;
+    let _font = 0;
+    let _size = 12.0;           // points
+
+    let _fontUsed = nil;
+    let _alphas = nil;          // opacity of /GS1, /GS2, ...
+    let _images = nil;          // records of /Im1, /Im2, ...
+    let _imageKeys = nil;       // path -> image id
+    let _info = nil;
+    let _created = 0;
+
+    let _out = nil;             // serialisation state of ToBlock
+    let _pos = 0;
+    let _offs = nil;
+
+    fn Constructor(opts?: object) {
+        this._pages = [];
+        this._path = [];
+        this._alphas = [];
+        this._images = [];
+        this._imageKeys = {};
+        this._info = {};
+        this._fontUsed = Array.Create(24, Type.Bool);
+        if (opts == nil) return;
+        if ("unit" in opts) {
+            let k = _pdfUnit(opts["unit"]);
+            if (k > 0) { this._k = k; }
+        }
+        if ("landscape" in opts) { this._land = opts["landscape"] == true; }
+        if ("size" in opts && _pdfPageSize(opts["size"], this._k, false) != nil) { this._sizeSpec = opts["size"]; }
+        if ("compress" in opts) { this._compress = opts["compress"] != false; }
+    }
+
+    fn static Create(opts?: object) : instance { return new PdfWriter(opts); }
+
+    // ----------------------------------------------------------------
+    // Pages
+    // ----------------------------------------------------------------
+
+    fn AddPage(size?, landscape?: bool) : int {
+        let land = landscape == nil ? _land : landscape;
+        var dims = nil;
+        if (size != nil) { dims = _pdfPageSize(size, _k, land); }
+        if (dims == nil) { dims = _pdfPageSize(_sizeSpec, _k, land); }
+        Array.Append(_pages, { w: dims[0], h: dims[1], ops: [], links: [],
+                               font: -1, size: 0.0, fill: 0, stroke: 0, lw: 1.0, dash: "[] 0", alpha: 1.0 });
+        _select(len(_pages) - 1);
+        return _cur;
+    }
+
+    fn PageCount() : int { return len(_pages); }
+    fn PageIndex() : int { return _cur; }
+
+    fn SetPage(i: int) : bool {
+        if (i < 0 || i >= len(_pages)) return false;
+        _select(i);
+        return true;
+    }
+
+    // Before the first page exists these report the size it will get.
+    fn PageWidth() : float {
+        if (_cur >= 0) return _page.w / _k;
+        let dims:array = _pdfPageSize(_sizeSpec, _k, _land);
+        return dims[0] / _k;
+    }
+
+    fn PageHeight() : float {
+        if (_cur >= 0) return _page.h / _k;
+        let dims:array = _pdfPageSize(_sizeSpec, _k, _land);
+        return dims[1] / _k;
+    }
+
+    fn _select(i: int) {
+        _cur = i;
+        _page = _pages[i];
+        _ph = _page.h;
+        _path = [];
+    }
+
+    fn _pg() : object {
+        if (_cur < 0) { AddPage(); }
+        return _page;
+    }
+
+    // ----------------------------------------------------------------
+    // Style
+    // ----------------------------------------------------------------
+
+    fn SetStroke(rgb: int) { _stroke = rgb & 0xFFFFFF; }
+    fn SetFill(rgb: int) { _fill = rgb & 0xFFFFFF; }
+    fn SetTextColor(rgb: int) { _text = rgb & 0xFFFFFF; }
+    fn StrokeColor() : int { return _stroke; }
+    fn FillColor() : int { return _fill; }
+    fn TextColor() : int { return _text; }
+
+    // 0 is the thinnest line the device can draw.
+    fn SetThickness(t: number) {
+        if (t <= 0) { _lw = 0.0; } else { _lw = float(t * _k); }
+    }
+
+    fn Thickness() : float { return _lw / _k; }
+
+    fn SetDash(on?: number, off?: number) {
+        if (on == nil || on <= 0) { _dash = "[] 0"; return; }
+        let gap = (off == nil || off <= 0) ? on : off;
+        _dash = "[" + _pdfNum(float(on * _k)) + " " + _pdfNum(float(gap * _k)) + "] 0";
+    }
+
+    fn SetOpacity(a: number) {
+        var v = float(a);
+        if (v < 0.0) { v = 0.0; }
+        if (v > 1.0) { v = 1.0; }
+        _alpha = Math.RoundTo(v, 2);
+    }
+
+    fn Opacity() : float { return _alpha; }
+
+    fn PointsPerUnit() : float { return _k; }
+
+    // Colours, thickness, dash, opacity, font and size - everything the Set*
+    // calls change - as a value RestoreStyle takes back.
+    fn SaveStyle() : object {
+        return { stroke: _stroke, fill: _fill, text: _text, lw: _lw, dash: _dash,
+                 alpha: _alpha, font: _font, size: _size };
+    }
+
+    fn RestoreStyle(s: object) {
+        if (s == nil) return;
+        _stroke = s.stroke;
+        _fill = s.fill;
+        _text = s.text;
+        _lw = s.lw;
+        _dash = s.dash;
+        _alpha = s.alpha;
+        _font = s.font;
+        _size = s.size;
+    }
+
+    fn _syncStroke(pg: object) {
+        if (pg.stroke != _stroke) { Array.Append(pg.ops, _pdfRgb(_stroke) + " RG"); pg.stroke = _stroke; }
+        if (pg.lw != _lw) { Array.Append(pg.ops, _pdfNum(_lw) + " w"); pg.lw = _lw; }
+        if (pg.dash != _dash) { Array.Append(pg.ops, _dash + " d"); pg.dash = _dash; }
+        _syncAlpha(pg);
+    }
+
+    fn _syncFill(pg: object, color: int) {
+        if (pg.fill != color) { Array.Append(pg.ops, _pdfRgb(color) + " rg"); pg.fill = color; }
+        _syncAlpha(pg);
+    }
+
+    fn _syncAlpha(pg: object) {
+        if (pg.alpha == _alpha) return;
+        var gi = -1;
+        iter (i from 0 to len(_alphas)) {
+            if (_alphas[i] == _alpha) { gi = i; break; }
+        }
+        if (gi < 0) {
+            Array.Append(_alphas, _alpha);
+            gi = len(_alphas) - 1;
+        }
+        Array.Append(pg.ops, "/GS" + str(gi + 1) + " gs");
+        pg.alpha = _alpha;
+    }
+
+    // ----------------------------------------------------------------
+    // Shapes
+    // ----------------------------------------------------------------
+
+    fn _pt(x: number, y: number) : string {
+        return _pdfNum(float(x * _k)) + " " + _pdfNum(_ph - y * _k);
+    }
+
+    fn _rect(x: number, y: number, w: number, h: number) : string {
+        return _pdfNum(float(x * _k)) + " " + _pdfNum(_ph - (y + h) * _k) + " "
+             + _pdfNum(float(w * _k)) + " " + _pdfNum(float(h * _k)) + " re";
+    }
+
+    // Appends Bezier segments (at most 90 degrees each) for an elliptical arc;
+    // with move=false the path must already stand at the arc's start.
+    fn _arc(parts: array, cx: number, cy: number, rx: number, ry: number, a0: number, a1: number, move: bool) {
+        let sweep = float(a1 - a0);
+        var segs = Math.Ceil(Math.AbsF(sweep) / 90.0);
+        if (segs < 1) { segs = 1; }
+        let step = sweep / segs * Math.PI / 180.0;
+        let kk = 4.0 / 3.0 * Math.Tan(step / 4.0);
+        var t0 = a0 * Math.PI / 180.0;
+        if (move) { Array.Append(parts, _pt(cx + rx * Math.Cos(t0), cy + ry * Math.Sin(t0)) + " m"); }
+        iter (s from 0 to segs) {
+            let t1 = t0 + step;
+            let c0 = Math.Cos(t0);
+            let s0 = Math.Sin(t0);
+            let c1 = Math.Cos(t1);
+            let s1 = Math.Sin(t1);
+            Array.Append(parts, _pt(cx + rx * (c0 - kk * s0), cy + ry * (s0 + kk * c0)) + " "
+                              + _pt(cx + rx * (c1 + kk * s1), cy + ry * (s1 - kk * c1)) + " "
+                              + _pt(cx + rx * c1, cy + ry * s1) + " c");
+            t0 = t1;
+        }
+    }
+
+    fn _poly(pts: array, close: bool) : string|nil {
+        let n = len(pts);
+        if (n < 4 || (n & 1) == 1) return nil;
+        let parts = [_pt(pts[0], pts[1]) + " m"];
+        var i = 2;
+        while (i < n) {
+            Array.Append(parts, _pt(pts[i], pts[i + 1]) + " l");
+            i += 2;
+        }
+        if (close) { Array.Append(parts, "h"); }
+        return String.Join(parts, " ");
+    }
+
+    fn _roundRect(x: number, y: number, w: number, h: number, r: number) : string {
+        var rr = float(r);
+        let maxr = Math.MinF(Math.AbsF(w), Math.AbsF(h)) / 2.0;
+        if (rr > maxr) { rr = maxr; }
+        if (rr <= 0.0) return _rect(x, y, w, h);
+        let parts = [_pt(x + rr, y) + " m", _pt(x + w - rr, y) + " l"];
+        _arc(parts, x + w - rr, y + rr, rr, rr, 270, 360, false);
+        Array.Append(parts, _pt(x + w, y + h - rr) + " l");
+        _arc(parts, x + w - rr, y + h - rr, rr, rr, 0, 90, false);
+        Array.Append(parts, _pt(x + rr, y + h) + " l");
+        _arc(parts, x + rr, y + h - rr, rr, rr, 90, 180, false);
+        Array.Append(parts, _pt(x, y + rr) + " l");
+        _arc(parts, x + rr, y + rr, rr, rr, 180, 270, false);
+        Array.Append(parts, "h");
+        return String.Join(parts, " ");
+    }
+
+    fn _ellipse(cx: number, cy: number, rx: number, ry: number) : string {
+        let parts = [];
+        _arc(parts, cx, cy, rx, ry, 0, 360, true);
+        Array.Append(parts, "h");
+        return String.Join(parts, " ");
+    }
+
+    fn _pie(cx: number, cy: number, r: number, a0: number, a1: number) : string {
+        let t0 = a0 * Math.PI / 180.0;
+        let parts = [_pt(cx, cy) + " m", _pt(cx + r * Math.Cos(t0), cy + r * Math.Sin(t0)) + " l"];
+        _arc(parts, cx, cy, r, r, a0, a1, false);
+        Array.Append(parts, "h");
+        return String.Join(parts, " ");
+    }
+
+    // mode: 1 stroke, 2 fill, 3 fill then stroke.
+    fn _paint(pg: object, path, mode: int) {
+        if (path == nil) return;
+        if ((mode & 2) != 0) { _syncFill(pg, _fill); }
+        if ((mode & 1) != 0) { _syncStroke(pg); }
+        var op = " B";
+        if (mode == 1) { op = " S"; } else if (mode == 2) { op = " f"; }
+        Array.Append(pg.ops, path + op);
+    }
+
+    fn Line(x0: number, y0: number, x1: number, y1: number) {
+        let pg = _pg();
+        _paint(pg, _pt(x0, y0) + " m " + _pt(x1, y1) + " l", 1);
+    }
+
+    fn Polyline(pts: array)    { let pg = _pg(); _paint(pg, _poly(pts, false), 1); }
+    fn Polygon(pts: array)     { let pg = _pg(); _paint(pg, _poly(pts, true), 1); }
+    fn FillPolygon(pts: array) { let pg = _pg(); _paint(pg, _poly(pts, true), 2); }
+    fn DrawPolygon(pts: array) { let pg = _pg(); _paint(pg, _poly(pts, true), 3); }
+
+    fn Rect(x: number, y: number, w: number, h: number)     { let pg = _pg(); _paint(pg, _rect(x, y, w, h), 1); }
+    fn FillRect(x: number, y: number, w: number, h: number) { let pg = _pg(); _paint(pg, _rect(x, y, w, h), 2); }
+    fn DrawRect(x: number, y: number, w: number, h: number) { let pg = _pg(); _paint(pg, _rect(x, y, w, h), 3); }
+
+    fn RoundRect(x: number, y: number, w: number, h: number, r: number) {
+        let pg = _pg(); _paint(pg, _roundRect(x, y, w, h, r), 1);
+    }
+    fn FillRoundRect(x: number, y: number, w: number, h: number, r: number) {
+        let pg = _pg(); _paint(pg, _roundRect(x, y, w, h, r), 2);
+    }
+    fn DrawRoundRect(x: number, y: number, w: number, h: number, r: number) {
+        let pg = _pg(); _paint(pg, _roundRect(x, y, w, h, r), 3);
+    }
+
+    fn Circle(cx: number, cy: number, r: number)     { let pg = _pg(); _paint(pg, _ellipse(cx, cy, r, r), 1); }
+    fn FillCircle(cx: number, cy: number, r: number) { let pg = _pg(); _paint(pg, _ellipse(cx, cy, r, r), 2); }
+    fn DrawCircle(cx: number, cy: number, r: number) { let pg = _pg(); _paint(pg, _ellipse(cx, cy, r, r), 3); }
+
+    fn Ellipse(cx: number, cy: number, rx: number, ry: number)     { let pg = _pg(); _paint(pg, _ellipse(cx, cy, rx, ry), 1); }
+    fn FillEllipse(cx: number, cy: number, rx: number, ry: number) { let pg = _pg(); _paint(pg, _ellipse(cx, cy, rx, ry), 2); }
+    fn DrawEllipse(cx: number, cy: number, rx: number, ry: number) { let pg = _pg(); _paint(pg, _ellipse(cx, cy, rx, ry), 3); }
+
+    fn Arc(cx: number, cy: number, r: number, a0: number, a1: number) {
+        let pg = _pg();
+        let parts = [];
+        _arc(parts, cx, cy, r, r, a0, a1, true);
+        _paint(pg, String.Join(parts, " "), 1);
+    }
+
+    fn Pie(cx: number, cy: number, r: number, a0: number, a1: number)     { let pg = _pg(); _paint(pg, _pie(cx, cy, r, a0, a1), 1); }
+    fn FillPie(cx: number, cy: number, r: number, a0: number, a1: number) { let pg = _pg(); _paint(pg, _pie(cx, cy, r, a0, a1), 2); }
+    fn DrawPie(cx: number, cy: number, r: number, a0: number, a1: number) { let pg = _pg(); _paint(pg, _pie(cx, cy, r, a0, a1), 3); }
+
+    fn MoveTo(x: number, y: number) { _pg(); Array.Append(_path, _pt(x, y) + " m"); }
+    fn LineTo(x: number, y: number) { _pg(); Array.Append(_path, _pt(x, y) + " l"); }
+
+    fn CurveTo(x1: number, y1: number, x2: number, y2: number, x3: number, y3: number) {
+        _pg();
+        Array.Append(_path, _pt(x1, y1) + " " + _pt(x2, y2) + " " + _pt(x3, y3) + " c");
+    }
+
+    fn ClosePath() { if (len(_path) > 0) { Array.Append(_path, "h"); } }
+    fn StrokePath() { _flushPath(1); }
+    fn FillPath()   { _flushPath(2); }
+    fn DrawPath()   { _flushPath(3); }
+
+    fn _flushPath(mode: int) {
+        if (len(_path) == 0) return;
+        let p = String.Join(_path, " ");
+        _path = [];
+        _paint(_pg(), p, mode);
+    }
+
+    // ----------------------------------------------------------------
+    // Text
+    // ----------------------------------------------------------------
+
+    fn SetFont(name: string, size?: number, style?: string) : bool {
+        if (name == nil) return false;
+        let f = _pdfFontId(name, style);
+        if (f < 0) return false;
+        _font = f;
+        if (size != nil && size > 0) { _size = float(size); }
+        return true;
+    }
+
+    fn FontName() : string { return FONT_NAMES[_font]; }
+    fn FontSize() : float { return _size; }
+
+    fn TextWidth(text: string) : float {
+        if (text == nil) return 0.0;
+        return _pdfTextUnits(text, _font) * _size / 1000.0 / _k;
+    }
+
+    fn LineHeight() : float { return _size * 1.2 / _k; }
+    fn Ascent() : float { return FONT_ASC[_font] * _size / 1000.0 / _k; }
+    fn Descent() : float { return FONT_DESC[_font] * _size / 1000.0 / _k; }
+
+    // xpt is in points; y in user units, the top of the line.
+    // Font resource res is _font for WinAnsi text and _font + 12 for the same
+    // face with the extended encoding; consecutive Tj runs advance on their own.
+    fn _textAt(pg: object, xpt: number, y: number, text) {
+        if (text == nil || len(text) == 0) return;
+        let runs = _pdfTextRuns(text);
+        if (len(runs) == 0) return;
+        _syncFill(pg, _text);
+        let base = _ph - y * _k - FONT_ASC[_font] * _size / 1000.0;
+        let ops = ["BT"];
+        var r = 0;
+        while (r < len(runs)) {
+            let res = runs[r] == 0 ? _font : _font + 12;
+            _fontUsed[res] = true;
+            if (pg.font != res || pg.size != _size) {
+                Array.Append(ops, "/F" + str(res + 1) + " " + _pdfNum(_size) + " Tf");
+                pg.font = res;
+                pg.size = _size;
+            }
+            if (r == 0) { Array.Append(ops, _pdfNum(float(xpt)) + " " + _pdfNum(base) + " Td"); }
+            Array.Append(ops, "(" + runs[r + 1] + ") Tj");
+            r += 2;
+        }
+        Array.Append(ops, "ET");
+        Array.Append(pg.ops, String.Join(ops, " "));
+    }
+
+    fn DrawText(x: number, y: number, text: string) {
+        let pg = _pg();
+        _textAt(pg, x * _k, y, text);
+    }
+
+    fn DrawTextRight(x: number, y: number, text: string) {
+        if (text == nil) return;
+        let pg = _pg();
+        _textAt(pg, x * _k - _pdfTextUnits(text, _font) * _size / 1000.0, y, text);
+    }
+
+    fn DrawTextCenter(x: number, y: number, text: string) {
+        if (text == nil) return;
+        let pg = _pg();
+        _textAt(pg, x * _k - _pdfTextUnits(text, _font) * _size / 2000.0, y, text);
+    }
+
+    // Greedy word wrap at spaces; runs of spaces collapse to one, and a word
+    // wider than the box is broken between characters.
+    fn WrapText(text: string, width: number) : array {
+        let lines = [];
+        if (text == nil) return lines;
+        let maxU = width * _k * 1000.0 / _size;
+        let spaceU = _pdfTextUnits(" ", _font);
+        foreach (raw in String.Split(text, "\n")) {
+            var line = "";
+            var lineU = 0;
+            foreach (word in String.Split(String.TrimRight(raw, "\r"), " ")) {
+                if (len(word) == 0) { continue; }
+                let wu = _pdfTextUnits(word, _font);
+                if (len(line) > 0 && lineU + spaceU + wu <= maxU) {
+                    line = line + " " + word;
+                    lineU = lineU + spaceU + wu;
+                    continue;
+                }
+                if (len(line) > 0) { Array.Append(lines, line); }
+                if (wu <= maxU) {
+                    line = word;
+                    lineU = wu;
+                    continue;
+                }
+                let pieces = _breakWord(word, maxU);
+                iter (p from 0 to len(pieces) - 1) { Array.Append(lines, pieces[p]); }
+                line = pieces[len(pieces) - 1];
+                lineU = _pdfTextUnits(line, _font);
+            }
+            Array.Append(lines, line);
+        }
+        return lines;
+    }
+
+    fn _breakWord(word: string, maxU: number) : array {
+        let pieces = [];
+        let n = len(word);
+        var start = 0;
+        var units = 0;
+        var i = 0;
+        while (i < n) {
+            let next = String.Utf8CpNext(word, i);
+            let cu = _pdfTextUnits(String.Substr(word, i, next - i), _font);
+            if (units + cu > maxU && i > start) {
+                Array.Append(pieces, String.Substr(word, start, i - start));
+                start = i;
+                units = 0;
+            }
+            units += cu;
+            i = next;
+        }
+        Array.Append(pieces, String.Substr(word, start, n - start));
+        return pieces;
+    }
+
+    fn DrawTextBox(x: number, y: number, width: number, text: string, align?: string) : float {
+        let pg = _pg();
+        let lines = WrapText(text, width);
+        let a = align == nil ? "left" : String.ToLower(align);
+        let lh = _size * 1.2 / _k;
+        var top = float(y);
+        foreach (line in lines) {
+            if (len(line) > 0) {
+                var xpt = x * _k;
+                if (a == "right" || a == "center") {
+                    let wpt = _pdfTextUnits(line, _font) * _size / 1000.0;
+                    if (a == "right") { xpt = (x + width) * _k - wpt; }
+                    else { xpt = x * _k + (width * _k - wpt) / 2.0; }
+                }
+                _textAt(pg, xpt, top, line);
+            }
+            top += lh;
+        }
+        return len(lines) * lh;
+    }
+
+    // ----------------------------------------------------------------
+    // Images and cells
+    // ----------------------------------------------------------------
+
+    fn LoadImage(src) : int|nil {
+        var bytes = nil;
+        var key = nil;
+        if (type(src) == Type.String) {
+            if (src in _imageKeys) return _imageKeys[src];
+            key = src;
+            bytes = File.ReadAllBytes(src);
+        } else if (type(src) == Type.Block) {
+            bytes = src;
+        }
+        if (bytes == nil || len(bytes) < 8) return nil;
+        var img = nil;
+        if (Buffer.ReadU8At(bytes, 0) == 0xFF && Buffer.ReadU8At(bytes, 1) == 0xD8) {
+            img = _pdfJpeg(bytes);
+        } else if (Buffer.ReadU32At(bytes, 0, true) == 0x89504E47 && Buffer.ReadU32At(bytes, 4, true) == 0x0D0A1A0A) {
+            img = _pdfPng(bytes);
+        }
+        if (img == nil) return nil;
+        Array.Append(_images, img);
+        let id = len(_images) - 1;
+        if (key != nil) { _imageKeys[key] = id; }
+        return id;
+    }
+
+    fn ImageSize(id: int) : object|nil {
+        if (id == nil || id < 0 || id >= len(_images)) return nil;
+        return { Width: _images[id].w, Height: _images[id].h };
+    }
+
+    fn DrawImage(src, x: number, y: number, w?: number, h?: number) : bool {
+        let pg = _pg();
+        var id = src;
+        if (type(src) != Type.Int) { id = LoadImage(src); }
+        if (id == nil || id < 0 || id >= len(_images)) return false;
+        let img = _images[id];
+        var dw = w;
+        var dh = h;
+        if (dw == nil && dh == nil) {
+            dw = img.w / _k;
+            dh = img.h / _k;
+        } else if (dw == nil) {
+            dw = dh * float(img.w) / img.h;
+        } else if (dh == nil) {
+            dh = dw * float(img.h) / img.w;
+        }
+        _syncAlpha(pg);
+        Array.Append(pg.ops, "q " + _pdfNum(float(dw * _k)) + " 0 0 " + _pdfNum(float(dh * _k)) + " "
+                             + _rectOrigin(x, y, dh) + " cm /Im" + str(id + 1) + " Do Q");
+        return true;
+    }
+
+    fn _rectOrigin(x: number, y: number, h: number) : string {
+        return _pdfNum(float(x * _k)) + " " + _pdfNum(_ph - (y + h) * _k);
+    }
+
+    fn DrawCells(x: number, y: number, size: number, cells: array, n: int) : bool {
+        if (cells == nil || n <= 0 || len(cells) < n * n) return false;
+        let pg = _pg();
+        let cell = size / float(n);
+        let parts = [];
+        iter (r from 0 to n) {
+            let row = r * n;
+            var c = 0;
+            while (c < n) {
+                if (!_pdfDark(cells[row + c])) { c += 1; continue; }
+                let start = c;
+                while (c < n && _pdfDark(cells[row + c])) { c += 1; }
+                Array.Append(parts, _rect(x + start * cell, y + r * cell, (c - start) * cell, cell));
+            }
+        }
+        if (len(parts) > 0) { _paint(pg, String.Join(parts, " "), 2); }
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Links and metadata
+    // ----------------------------------------------------------------
+
+    fn Link(x: number, y: number, w: number, h: number, url: string) {
+        if (url == nil) return;
+        let pg = _pg();
+        Array.Append(pg.links, { rect: "[" + _pdfNum(float(x * _k)) + " " + _pdfNum(_ph - (y + h) * _k) + " "
+                                        + _pdfNum(float((x + w) * _k)) + " " + _pdfNum(_ph - y * _k) + "]",
+                                 url: url });
+    }
+
+    fn SetInfo(info: object) {
+        if (info == nil) return;
+        foreach (k in ["title", "author", "subject", "keywords", "creator"]) {
+            if (k in info && info[k] != nil) { _info[k] = str(info[k]); }
+        }
+        if ("created" in info && info["created"] != nil) { _created = int(info["created"]); }
+    }
+
+    fn _infoDict() : string {
+        let parts = ["<< /Producer (Flaris Pdf)"];
+        let keys = ["title", "author", "subject", "keywords", "creator"];
+        let names = ["Title", "Author", "Subject", "Keywords", "Creator"];
+        iter (i from 0 to 5) {
+            if (keys[i] in _info) { Array.Append(parts, "/" + names[i] + " " + _pdfTextString(_info[keys[i]])); }
+        }
+        let t = _created > 0 ? _created : Time.Now();
+        Array.Append(parts, "/CreationDate (D:" + Time.Format(t, "%Y%m%d%H%M%S") + "Z) >>");
+        return String.Join(parts, " ");
+    }
+
+    // ----------------------------------------------------------------
+    // Output
+    // ----------------------------------------------------------------
+
+    fn _put(part) {
+        Array.Append(_out, part);
+        _pos += len(part);
+    }
+
+    fn _obj(num: int, body: string) {
+        _offs[num] = _pos;
+        _put(str(num) + " 0 obj\n" + body + "\nendobj\n");
+    }
+
+    // dict is an open dictionary; /Length and the closing >> are added here.
+    fn _stream(num: int, dict: string, data) {
+        _offs[num] = _pos;
+        _put(str(num) + " 0 obj\n" + dict + " /Length " + str(len(data)) + " >>\nstream\n");
+        _put(data);
+        _put("\nendstream\nendobj\n");
+    }
+
+    fn ToBlock() : block {
+        if (_cur < 0) {
+            AddPage();
+            _select(0);
+        }
+
+        // Object numbers: 1 catalog, 2 page tree, 3 shared resources, 4 info,
+        // then fonts, ExtGStates, images (+ soft masks), and per page the page,
+        // its content stream and its link annotations.
+        var next = 5;
+        let fontObj = [];
+        var encObj = 0;
+        iter (f from 0 to 24) {
+            if (_fontUsed[f]) { Array.Append(fontObj, next); next += 1; } else { Array.Append(fontObj, 0); }
+            if (f >= 12 && _fontUsed[f] && encObj == 0) { encObj = -1; }
+        }
+        if (encObj < 0) { encObj = next; next += 1; }
+        let gsFirst = next;
+        next += len(_alphas);
+        let imgObj = [];
+        let maskObj = [];
+        foreach (img in _images) {
+            Array.Append(imgObj, next);
+            next += 1;
+            if (img.smask != nil) { Array.Append(maskObj, next); next += 1; } else { Array.Append(maskObj, 0); }
+        }
+        let pageObj = [];
+        foreach (pg in _pages) {
+            Array.Append(pageObj, next);
+            next += 2 + len(pg.links);
+        }
+
+        _out = [];
+        _pos = 0;
+        _offs = Array.Create(next, Type.Int);
+
+        _put("%PDF-1.4\n%âãÏÓ\n");
+        let kids = [];
+        foreach (o in pageObj) { Array.Append(kids, str(o) + " 0 R"); }
+        _obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        _obj(2, "<< /Type /Pages /Kids [" + String.Join(kids, " ") + "] /Count " + str(len(_pages)) + " >>");
+
+        let res = ["<< /ProcSet [/PDF /Text /ImageB /ImageC /ImageI]"];
+        let fonts = [];
+        iter (f from 0 to 24) {
+            if (fontObj[f] > 0) { Array.Append(fonts, "/F" + str(f + 1) + " " + str(fontObj[f]) + " 0 R"); }
+        }
+        if (len(fonts) > 0) { Array.Append(res, "/Font << " + String.Join(fonts, " ") + " >>"); }
+        if (len(_alphas) > 0) {
+            let gs = [];
+            iter (i from 0 to len(_alphas)) { Array.Append(gs, "/GS" + str(i + 1) + " " + str(gsFirst + i) + " 0 R"); }
+            Array.Append(res, "/ExtGState << " + String.Join(gs, " ") + " >>");
+        }
+        if (len(_images) > 0) {
+            let xo = [];
+            iter (i from 0 to len(_images)) { Array.Append(xo, "/Im" + str(i + 1) + " " + str(imgObj[i]) + " 0 R"); }
+            Array.Append(res, "/XObject << " + String.Join(xo, " ") + " >>");
+        }
+        _obj(3, String.Join(res, " ") + " >>");
+        _obj(4, _infoDict());
+
+        iter (f from 0 to 24) {
+            if (fontObj[f] > 0) {
+                let enc = f < 12 ? "/WinAnsiEncoding" : str(encObj) + " 0 R";
+                _obj(fontObj[f], "<< /Type /Font /Subtype /Type1 /BaseFont /" + FONT_NAMES[f % 12]
+                                 + " /Encoding " + enc + " >>");
+            }
+        }
+        if (encObj > 0) {
+            let names = [];
+            foreach (g in EXT_NAMES) { Array.Append(names, "/" + g); }
+            _obj(encObj, "<< /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [128 "
+                         + String.Join(names, " ") + "] >>");
+        }
+        iter (i from 0 to len(_alphas)) {
+            let a = _pdfNum(_alphas[i]);
+            _obj(gsFirst + i, "<< /Type /ExtGState /ca " + a + " /CA " + a + " >>");
+        }
+        iter (i from 0 to len(_images)) {
+            let img = _images[i];
+            var dict = "<< /Type /XObject /Subtype /Image /Width " + str(img.w) + " /Height " + str(img.h)
+                     + " /ColorSpace " + img.cs + " /BitsPerComponent " + str(img.bpc) + " /Filter " + img.filter;
+            if (img.parms != "") { dict = dict + " " + img.parms; }
+            if (img.decode != "") { dict = dict + " " + img.decode; }
+            if (maskObj[i] > 0) {
+                dict = dict + " /SMask " + str(maskObj[i]) + " 0 R";
+                _stream(maskObj[i], "<< /Type /XObject /Subtype /Image /Width " + str(img.w) + " /Height "
+                                    + str(img.h) + " /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
+                        img.smask);
+            }
+            _stream(imgObj[i], dict, img.data);
+        }
+
+        iter (i from 0 to len(_pages)) {
+            let pg = _pages[i];
+            let num = pageObj[i];
+            var page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + _pdfNum(pg.w) + " " + _pdfNum(pg.h)
+                     + "] /Resources 3 0 R /Contents " + str(num + 1) + " 0 R";
+            let nl = len(pg.links);
+            if (nl > 0) {
+                let annots = [];
+                iter (j from 0 to nl) { Array.Append(annots, str(num + 2 + j) + " 0 R"); }
+                page = page + " /Annots [" + String.Join(annots, " ") + "]";
+            }
+            _obj(num, page + " >>");
+            let content = String.Join(pg.ops, "\n");
+            if (_compress && len(content) > 0) { _stream(num + 1, "<< /Filter /FlateDecode", Deflate.Zlib(content)); }
+            else { _stream(num + 1, "<<", content); }
+            iter (j from 0 to nl) {
+                let l = pg.links[j];
+                _obj(num + 2 + j, "<< /Type /Annot /Subtype /Link /Rect " + l.rect
+                                  + " /Border [0 0 0] /A << /S /URI /URI " + _pdfLit(l.url) + " >> >>");
+            }
+        }
+
+        let xrefPos = _pos;
+        let xref = ["xref\n0 " + str(next) + "\n0000000000 65535 f \n"];
+        iter (i from 1 to next) { Array.Append(xref, String.Format("{0:D10} 00000 n \n", _offs[i])); }
+        _put(String.Join(xref, ""));
+        _put("trailer\n<< /Size " + str(next) + " /Root 1 0 R /Info 4 0 R >>\nstartxref\n" + str(xrefPos) + "\n%%EOF\n");
+
+        let out = Buffer.Create(_pos, 1);
+        var p = 0;
+        foreach (part in _out) {
+            let n = len(part);
+            if (n > 0) {
+                if (type(part) == Type.String) { Buffer.CopyStringAt(out, p, part, n); }
+                else { Buffer.Copy(part, 0, out, p, n); }
+            }
+            p += n;
+        }
+        _out = nil;
+        _offs = nil;
+        return out;
+    }
+
+    fn Save(path: string) : bool {
+        if (path == nil) return false;
+        return File.WriteAllBytes(path, ToBlock()) == true;
+    }
+}
+
+// opts[key], or def when opts is nil, lacks the key or holds nil there.
+fn _pdfOpt(opts, key: string, def) {
+    if (opts == nil || !(key in opts)) return def;
+    let v = opts[key];
+    if (v == nil) return def;
+    return v;
+}
+
+fn _pdfCell(v) : string {
+    if (v == nil) return "";
+    if (type(v) == Type.String) return v;
+    return str(v);
+}
+
+// [top, right, bottom, left] from one number, [vertical, horizontal] or four.
+fn _pdfMargins(m) : array|nil {
+    if (type(m) == Type.Int || type(m) == Type.Float) return [float(m), float(m), float(m), float(m)];
+    if (type(m) != Type.Array) return nil;
+    if (len(m) == 2) return [float(m[0]), float(m[1]), float(m[0]), float(m[1])];
+    if (len(m) == 4) return [float(m[0]), float(m[1]), float(m[2]), float(m[3])];
+    return nil;
+}
+
+fn _pdfBandText(spec: object, key: string, i: int, n: int) : string|nil {
+    let v = _pdfOpt(spec, key, nil);
+    if (v == nil) return nil;
+    return String.Replace(String.Replace(str(v), "{page}", str(i + 1)), "{pages}", str(n));
+}
+
+// Writes on its PdfWriter top to bottom inside the margins and adds pages as
+// they fill. Holds the writer; the writer never refers back.
+class PdfLayout {
+
+    let _pdf = nil;
+    let _top = 0.0;             // margins, in the writer's unit
+    let _right = 0.0;
+    let _bottom = 0.0;
+    let _left = 0.0;
+    let _y = 0.0;
+    let _pages = nil;           // writer page indexes this layout writes on, in order
+    let _header = nil;
+    let _footer = nil;
+    let _finished = false;
+
+    fn Constructor(pdf: instance, opts?: object) {
+        this._pdf = pdf;
+        this._pages = [];
+        let m = 20.0 * MM / pdf.PointsPerUnit();
+        var margins = [m, m, m, m];
+        if (opts != nil) {
+            let parsed = _pdfMargins(_pdfOpt(opts, "margins", nil));
+            if (parsed != nil) { margins = parsed; }
+            this._header = _pdfOpt(opts, "header", nil);
+            this._footer = _pdfOpt(opts, "footer", nil);
+        }
+        this._top = margins[0];
+        this._right = margins[1];
+        this._bottom = margins[2];
+        this._left = margins[3];
+        if (pdf.PageCount() == 0) { pdf.AddPage(); }
+        Array.Append(this._pages, pdf.PageIndex());
+        this._y = this._top;
+    }
+
+    // ----------------------------------------------------------------
+    // Cursor and pages
+    // ----------------------------------------------------------------
+
+    fn Y() : float { return _y; }
+    fn SetY(y: number) { _y = float(y); }
+    fn Left() : float { return _left; }
+    fn PageCount() : int { return len(_pages); }
+
+    fn ContentWidth() : float {
+        _sync();
+        return _pdf.PageWidth() - _left - _right;
+    }
+
+    fn Bottom() : float {
+        _sync();
+        return _pdf.PageHeight() - _bottom;
+    }
+
+    fn Remaining() : float { return Bottom() - _y; }
+
+    // The writer may have been moved to another page in between.
+    fn _sync() {
+        let cur = _pages[len(_pages) - 1];
+        if (_pdf.PageIndex() != cur) { _pdf.SetPage(cur); }
+    }
+
+    fn NewPage() {
+        _pdf.AddPage();
+        Array.Append(_pages, _pdf.PageIndex());
+        _y = _top;
+    }
+
+    // Starts a new page unless h fits below the cursor; true when it did. At
+    // the top of a page a new one gains nothing, so content taller than a
+    // page is placed anyway and overflows.
+    fn EnsureSpace(h: number) : bool {
+        _sync();
+        if (_y + h <= Bottom() + 0.000001 || _y <= _top + 0.000001) return false;
+        NewPage();
+        return true;
+    }
+
+    fn Space(h: number) {
+        _sync();
+        _y += h;
+        if (_y > Bottom()) { NewPage(); }
+    }
+
+    // ----------------------------------------------------------------
+    // Text, rules and images
+    // ----------------------------------------------------------------
+
+    fn _applyText(opts) {
+        if (opts == nil) return;
+        if ("font" in opts || "size" in opts || "style" in opts) {
+            _pdf.SetFont(_pdfOpt(opts, "font", _pdf.FontName()), _pdfOpt(opts, "size", nil), _pdfOpt(opts, "style", nil));
+        }
+        if ("color" in opts) { _pdf.SetTextColor(opts["color"]); }
+    }
+
+    fn _line(text: string, x: number, w: number, y: number, align) {
+        if (align == "right") { _pdf.DrawTextRight(x + w, y, text); }
+        else if (align == "center") { _pdf.DrawTextCenter(x + w / 2.0, y, text); }
+        else { _pdf.DrawText(x, y, text); }
+    }
+
+    fn Paragraph(text: string, opts?: object) {
+        _sync();
+        let pdf = _pdf;
+        let saved = pdf.SaveStyle();
+        _applyText(opts);
+        let align = _pdfOpt(opts, "align", "left");
+        let indent = _pdfOpt(opts, "indent", 0.0);
+        let lh = pdf.LineHeight();
+        foreach (line in pdf.WrapText(text, ContentWidth() - indent)) {
+            EnsureSpace(lh);
+            _line(line, _left + indent, ContentWidth() - indent, _y, align);
+            _y += lh;
+        }
+        _y += _pdfOpt(opts, "spaceAfter", lh * 0.5);
+        pdf.RestoreStyle(saved);
+    }
+
+    fn Heading(text: string, level?: int, opts?: object) {
+        _sync();
+        let pdf = _pdf;
+        let saved = pdf.SaveStyle();
+        let bodyLh = pdf.LineHeight();
+        let lvl = level ?? 1;
+        var size = 12;
+        if (lvl <= 1) { size = 18; } else if (lvl == 2) { size = 14; }
+        pdf.SetFont(pdf.FontName(), size, "bold");
+        _applyText(opts);
+        let lh = pdf.LineHeight();
+        let lines = pdf.WrapText(text, ContentWidth());
+        let before = _y > _top + 0.000001 ? lh * 0.4 : 0.0;
+        // A heading never ends a page: it moves on with room for two lines of what follows.
+        if (!EnsureSpace(before + len(lines) * lh + 2.0 * bodyLh)) { _y += before; }
+        let align = _pdfOpt(opts, "align", "left");
+        foreach (line in lines) {
+            _line(line, _left, ContentWidth(), _y, align);
+            _y += lh;
+        }
+        _y += lh * 0.25;
+        pdf.RestoreStyle(saved);
+    }
+
+    fn Rule(opts?: object) {
+        _sync();
+        let pdf = _pdf;
+        let saved = pdf.SaveStyle();
+        let k = pdf.PointsPerUnit();
+        let space = _pdfOpt(opts, "space", 8.0 / k);
+        EnsureSpace(space);
+        pdf.SetStroke(_pdfOpt(opts, "color", 0xBBBBBB));
+        pdf.SetThickness(_pdfOpt(opts, "thickness", 0.5 / k));
+        pdf.SetDash();
+        let y = _y + space / 2.0;
+        pdf.Line(_left, y, _left + ContentWidth(), y);
+        _y += space;
+        pdf.RestoreStyle(saved);
+    }
+
+    fn Image(src, w?: number, h?: number, align?: string) : bool {
+        _sync();
+        let pdf = _pdf;
+        var id = src;
+        if (type(src) != Type.Int) { id = pdf.LoadImage(src); }
+        if (id == nil) return false;
+        let sz = pdf.ImageSize(id);
+        if (sz == nil) return false;
+        let ratio = float(sz.Height) / sz.Width;
+        var dw = w;
+        var dh = h;
+        if (dw == nil && dh == nil) { dw = sz.Width / pdf.PointsPerUnit(); dh = dw * ratio; }
+        else if (dw == nil) { dw = dh / ratio; }
+        else if (dh == nil) { dh = dw * ratio; }
+        let cw = ContentWidth();
+        if (dw > cw) {
+            dh = dh * cw / dw;
+            dw = cw;
+        }
+        EnsureSpace(dh);
+        var x = _left;
+        if (align == "center") { x = _left + (cw - dw) / 2.0; }
+        else if (align == "right") { x = _left + cw - dw; }
+        pdf.DrawImage(id, x, _y, dw, dh);
+        _y += dh + pdf.LineHeight() * 0.5;
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Tables
+    // ----------------------------------------------------------------
+
+    fn _tableRow(cells: array, t: object) : object {
+        let lines = [];
+        var most = 1;
+        iter (i from 0 to len(t.widths)) {
+            let text = i < len(cells) ? _pdfCell(cells[i]) : "";
+            let wrapped = _pdf.WrapText(text, t.widths[i] - 2.0 * t.pad);
+            Array.Append(lines, wrapped);
+            if (len(wrapped) > most) { most = len(wrapped); }
+        }
+        return { lines: lines, h: most * _pdf.LineHeight() + 2.0 * t.pad };
+    }
+
+    fn _drawRow(row: object, t: object, fill: int) {
+        let pdf = _pdf;
+        let h = row.h;
+        if (fill >= 0) {
+            pdf.SetFill(fill);
+            pdf.FillRect(_left, _y, t.total, h);
+        }
+        let lh = pdf.LineHeight();
+        let lift = (lh - pdf.Ascent() - pdf.Descent()) / 2.0;
+        iter (i from 0 to len(t.xs)) {
+            var ty = _y + t.pad + lift;
+            foreach (line in row.lines[i]) {
+                _line(line, t.xs[i] + t.pad, t.widths[i] - 2.0 * t.pad, ty, t.aligns[i]);
+                ty += lh;
+            }
+        }
+        if (t.grid != "none") {
+            pdf.SetStroke(t.border);
+            pdf.Line(_left, _y + h, _left + t.total, _y + h);
+            if (t.grid == "all") {
+                pdf.Line(_left, _y, _left + t.total, _y);
+                foreach (x in t.xs) { pdf.Line(x, _y, x, _y + h); }
+                pdf.Line(_left + t.total, _y, _left + t.total, _y + h);
+            }
+        }
+        _y += h;
+    }
+
+    fn _tableHeader(t: object) {
+        _pdf.SetFont(t.font, t.size, "bold");
+        _pdf.SetTextColor(t.headerColor);
+        _drawRow(_tableRow(t.titles, t), t, t.headerFill);
+    }
+
+    fn Table(columns: array, rows: array, opts?: object) : bool {
+        if (columns == nil || len(columns) == 0 || rows == nil) return false;
+        _sync();
+        let pdf = _pdf;
+        let saved = pdf.SaveStyle();
+        let k = pdf.PointsPerUnit();
+        let size = _pdfOpt(opts, "size", pdf.FontSize());
+        let t = { font: pdf.FontName(), size: size, pad: _pdfOpt(opts, "padding", size * 0.35 / k),
+                  grid: _pdfOpt(opts, "grid", "rows"), border: _pdfOpt(opts, "border", 0xC8CDD3),
+                  headerFill: _pdfOpt(opts, "headerFill", 0xE9EDF2),
+                  headerColor: _pdfOpt(opts, "headerColor", saved.text),
+                  titles: [], aligns: [], widths: [], xs: [], total: 0.0 };
+        let zebra = _pdfOpt(opts, "zebra", -1);
+        let repeat = _pdfOpt(opts, "repeatHeader", true) == true;
+
+        var fixed = 0.0;
+        var flex = 0;
+        foreach (c in columns) {
+            var w = nil;
+            if (type(c) == Type.Object) {
+                Array.Append(t.titles, _pdfCell(_pdfOpt(c, "title", "")));
+                Array.Append(t.aligns, _pdfOpt(c, "align", "left"));
+                w = _pdfOpt(c, "width", nil);
+            } else {
+                Array.Append(t.titles, _pdfCell(c));
+                Array.Append(t.aligns, "left");
+            }
+            Array.Append(t.widths, w);
+            if (w == nil) { flex += 1; } else { fixed += w; }
+        }
+        let share = flex > 0 ? Math.MaxF(0.0, (ContentWidth() - fixed) / flex) : 0.0;
+        var x = _left;
+        iter (i from 0 to len(t.widths)) {
+            if (t.widths[i] == nil) { t.widths[i] = share; }
+            Array.Append(t.xs, x);
+            x += t.widths[i];
+        }
+        t.total = x - _left;
+
+        pdf.SetThickness(_pdfOpt(opts, "thickness", 0.5 / k));
+        pdf.SetDash();
+        var showHeader = false;
+        foreach (title in t.titles) { if (len(title) > 0) { showHeader = true; } }
+        if (showHeader) {
+            pdf.SetFont(t.font, size, "bold");
+            // Keep the header with at least one one-line row.
+            EnsureSpace(_tableRow(t.titles, t).h + pdf.LineHeight() + 2.0 * t.pad);
+            _tableHeader(t);
+        }
+        var bodyTop = _y;
+        var i = 0;
+        foreach (row in rows) {
+            var cells = row;
+            var style = nil;
+            var fill = -1;
+            var color = saved.text;
+            if (type(row) == Type.Object) {
+                cells = _pdfOpt(row, "cells", []);
+                style = _pdfOpt(row, "style", nil);
+                fill = _pdfOpt(row, "fill", -1);
+                color = _pdfOpt(row, "color", saved.text);
+            }
+            if (type(cells) != Type.Array) { cells = [cells]; }
+            if (fill < 0 && zebra >= 0 && i % 2 == 1) { fill = zebra; }
+            pdf.SetFont(t.font, size, style);
+            let m = _tableRow(cells, t);
+            if (_y + m.h > Bottom() + 0.000001 && _y > bodyTop + 0.000001) {
+                NewPage();
+                if (showHeader && repeat) {
+                    _tableHeader(t);
+                    pdf.SetFont(t.font, size, style);
+                }
+                bodyTop = _y;
+            }
+            pdf.SetTextColor(color);
+            _drawRow(m, t, fill);
+            i += 1;
+        }
+        _y += _pdfOpt(opts, "spaceAfter", pdf.LineHeight() * 0.5);
+        pdf.RestoreStyle(saved);
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Header, footer and page decoration
+    // ----------------------------------------------------------------
+
+    fn _band(spec: object, i: int, n: int, top: bool) {
+        let pdf = _pdf;
+        let k = pdf.PointsPerUnit();
+        pdf.SetFont(_pdfOpt(spec, "font", "Helvetica"), _pdfOpt(spec, "size", 8), _pdfOpt(spec, "style", nil));
+        pdf.SetTextColor(_pdfOpt(spec, "color", 0x666666));
+        let lh = pdf.LineHeight();
+        let gap = 4.0 / k;
+        let right = pdf.PageWidth() - _right;
+        var y = _top - gap - lh;
+        var ruleY = _top - gap / 2.0;
+        if (!top) {
+            y = pdf.PageHeight() - _bottom + gap;
+            ruleY = pdf.PageHeight() - _bottom + gap / 2.0;
+        }
+        let l = _pdfBandText(spec, "left", i, n);
+        let c = _pdfBandText(spec, "center", i, n);
+        let r = _pdfBandText(spec, "right", i, n);
+        if (l != nil) { pdf.DrawText(_left, y, l); }
+        if (c != nil) { pdf.DrawTextCenter((_left + right) / 2.0, y, c); }
+        if (r != nil) { pdf.DrawTextRight(right, y, r); }
+        if (_pdfOpt(spec, "rule", false) == true) {
+            pdf.SetStroke(_pdfOpt(spec, "ruleColor", 0xBBBBBB));
+            pdf.SetThickness(0.5 / k);
+            pdf.SetDash();
+            pdf.Line(_left, ruleY, right, ruleY);
+        }
+    }
+
+    // Draws the header and footer on every page of the layout, now that the
+    // page count is known, and calls decorate(pdf, index, count) per page.
+    // Runs once; later calls only return the page count.
+    fn Finish(decorate?: fn) : int {
+        let n = len(_pages);
+        if (_finished) return n;
+        _finished = true;
+        let pdf = _pdf;
+        let saved = pdf.SaveStyle();
+        iter (i from 0 to n) {
+            pdf.SetPage(_pages[i]);
+            pdf.RestoreStyle(saved);
+            if (_header != nil) { _band(_header, i, n, true); }
+            if (_footer != nil) { _band(_footer, i, n, false); }
+            if (decorate != nil) { decorate(pdf, i, n); }
+        }
+        pdf.SetPage(_pages[n - 1]);
+        pdf.RestoreStyle(saved);
+        return n;
+    }
+}
+
+export { PdfWriter, PdfLayout };

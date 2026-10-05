@@ -118,11 +118,11 @@ class Ws {
     }
 
     fn static ReadHttpHeaders(sock: stream): object {
-        // Park until the peer has actually replied. Stream.ReadLine returns
-        // what has already arrived rather than waiting, so reading straight
-        // after sending the request yields an empty status line - and against a
+        // Park until the peer has actually replied. A ReadLine on a blocking
+        // socket would hold up every fiber while it waited - and against a
         // server sharing this VM, the server fiber would never get a turn to
-        // write one.
+        // write the reply. WaitReadable waits for this fiber alone, and leaves
+        // the socket non-blocking so the reads after it park the same way.
         if (Stream.WaitReadable(sock, 15000) != true) {
             return { _statusLine: "" };
         }
@@ -316,16 +316,17 @@ class WebSocketClient {
     let requireMask = false; // servers must refuse an unmasked client frame
     fn static Connect(host: string, port: int, path, headers, secure): instance {
         // wss:// and ws:// differ only in how the stream is opened; the framing
-        // below is identical for both.
+        // below is identical for both. The connect (and TLS handshake) runs on
+        // the I/O pool, so only this fiber waits for it.
         let sock = nil;
         if (secure == true) {
-            sock = Stream.ConnectTls(host, port, { timeoutMs: 5000 });
+            sock = Fiber.Await(Stream.ConnectTlsAsync(host, port, { timeoutMs: 5000 }));
             if (sock == nil) {
                 throw(Exception.IOError, "Failed to establish TLS connection: " +
                                          (Stream.TlsLastError() ?? "unknown"));
             }
         } else {
-            sock = Stream.Connect("tcp", host, port);
+            sock = Fiber.Await(Stream.ConnectAsync("tcp", host, port, 5000));
             if (sock == nil) {
                 throw(Exception.IOError, "Failed to connect socket");
             }
@@ -537,25 +538,18 @@ class WebSocketClient {
 
     // Read exactly `count` bytes, or nil if the peer stops first.
     //
-    // Stream.ReadBytes is "up to count", not "exactly count". It comes up short
-    // whenever the rest of the frame has not arrived yet, and on a socket that
-    // is the common case rather than the rare one: any async call - including
-    // the WaitReadable in ReceiveWhenReady - leaves the socket permanently
-    // non-blocking, so SO_RCVTIMEO stops applying and a read returns EAGAIN the
-    // moment the next byte is still in flight. Treating that as a dead
-    // connection drops frames that were merely late; wait and keep reading.
+    // Stream.ReadBytes is "up to count", not "exactly count": it hands over
+    // what has arrived, so a frame that spans several TCP segments takes
+    // several reads. Each part gets WS_READ_WAIT_MS to arrive - a peer that
+    // goes quiet mid-frame is dead - and a nil read means the peer closed.
     fn _readExact(count:int) {
         if (count == 0) { return Buffer.Create(0, 1); }
         let out = Buffer.Create(count, 1);
         var off:int = 0;
         while (off < count) {
+            if (Stream.WaitReadable(this.sock, WS_READ_WAIT_MS) != true) { return nil; }
             let chunk = Stream.ReadBytes(this.sock, count - off);
-            if (chunk == nil || len(chunk) == 0) {
-                // Nothing at all this time round: give the peer one bounded
-                // chance to catch up before declaring the connection dead.
-                if (Stream.WaitReadable(this.sock, WS_READ_WAIT_MS) != true) { return nil; }
-                continue;
-            }
+            if (chunk == nil) { return nil; }
             Buffer.Copy(chunk, 0, out, off, len(chunk));
             off += len(chunk);
         }

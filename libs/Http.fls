@@ -199,23 +199,34 @@ class Http {
     //
     // `opts` (TLS only): { insecure, timeoutMs, sni }.
     fn static _streamTransport(secure: bool, opts) {
+        // The connect and every synchronous read wait at most this long, so a
+        // host that never answers or a server that stalls ends the request
+        // instead of holding every fiber.
+        let ms = (opts != nil && ("timeoutMs" in opts)) ? opts["timeoutMs"] : 30000;
+        let idleSec = ms >= 1000 ? ms / 1000 : 1;
         return {
             secure:   secure,
             connect:  fn(host, port) {
                           if (secure) { return Stream.ConnectTls(host, port, opts); }
-                          return Stream.Connect("tcp", host, port);
+                          return Stream.Connect("tcp", host, port, ms);
                       },
             write:    fn(c, d)       { Stream.WriteAll(c, d); },
             readLine: fn(c)          { return Stream.ReadLine(c); },
-            readN:    fn(c, n)       { return Stream.ReadString(c, n); },
-            readAll:  fn(c)          { return Buffer.ToString(Stream.ReadAll(c)); },
+            readN:    fn(c, n)       {
+                          let b = HttpUtil.ReadExact(c, n);
+                          return b == nil ? nil : Buffer.ToString(b);
+                      },
+            readAll:  fn(c)          {
+                          let b = Stream.ReadAll(c, nil, idleSec);
+                          return b == nil ? nil : Buffer.ToString(b);
+                      },
             close:    fn(c)          { Stream.Close(c); },
 
             // Async closures the engine awaits, so requests overlap instead of
             // taking the scheduler one at a time.
             connectAsync:  fn(host, port) {
                                if (secure) { return Stream.ConnectTlsAsync(host, port, opts); }
-                               return Stream.ConnectAsync("tcp", host, port);
+                               return Stream.ConnectAsync("tcp", host, port, ms);
                            },
             writeAsync:    fn(c, d)  { return Stream.WriteAsync(c, d); },
             readLineAsync: fn(c)     { return Stream.ReadLineAsync(c); },
@@ -257,6 +268,14 @@ class Http {
             }
         }
         return dropped ? out : userHeaders;
+    }
+
+    // The Host header carries the URL's authority: a non-default port is part
+    // of it, and an IPv6 literal keeps its brackets.
+    fn static _hostHeader(scheme, host, port) {
+        let h = String.Contains(host, ":") ? "[" + host + "]" : host;
+        let dflt = (scheme == "https") ? 443 : 80;
+        return (port == nil || port == dflt) ? h : h + ":" + Convert.ToString(port);
     }
 
     // scheme://host:port, with the default port made explicit so that
@@ -371,17 +390,25 @@ class Http {
             if (String.Contains(te, "chunked")) {
                 // Pure-string chunked decoder - avoids block allocations that can
                 // confuse the GC when mixed with later string-only operations.
+                // A chunk that stops short, anything but the CRLF after its data,
+                // or a stream that ends before the last chunk is a broken body.
                 let result = "";
                 let sizeLine = tr.readLine(s);
                 while (sizeLine != nil) {
                     let n = Http._parseHexSize(sizeLine);
-                    if (n == 0) { break; }
+                    if (n == 0) {
+                        // Trailer fields, if any, end at an empty line.
+                        let t = tr.readLine(s);
+                        while (t != nil && len(t) > 0) { t = tr.readLine(s); }
+                        return result;
+                    }
                     let chunk = tr.readN(s, n);
-                    if (chunk != nil) { result = result + chunk; }
-                    tr.readLine(s);   // consume trailing CRLF after chunk data
+                    if (chunk == nil) { return nil; }
+                    result = result + chunk;
+                    if (tr.readLine(s) != "") { return nil; }
                     sizeLine = tr.readLine(s);
                 }
-                return result;
+                return nil;
             }
 
             if (len(cl) > 0) {
@@ -460,7 +487,8 @@ class Http {
             try {
                 // Assemble the request; nil means a CR/LF injection was detected
                 // in the path/host/headers - drop the connection and fail.
-                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, curHeaders);
+                let req = Http._buildRequestStr(curMethod, path, Http._hostHeader(parsed.scheme, host, port),
+                                                 curBody, contentType, curHeaders);
                 if (req == nil) { tr.close(s); return nil; }
                 tr.write(s, req);
 
@@ -554,13 +582,18 @@ class Http {
                 let sizeLine = await tr.readLineAsync(s);
                 while (sizeLine != nil) {
                     let n = Http._parseHexSize(sizeLine);
-                    if (n == 0) { break; }
+                    if (n == 0) {
+                        let t = await tr.readLineAsync(s);
+                        while (t != nil && len(t) > 0) { t = await tr.readLineAsync(s); }
+                        return result;
+                    }
                     let chunk = Http._asText(await tr.readNAsync(s, n));
-                    if (chunk != nil) { result = result + chunk; }
-                    await tr.readLineAsync(s);   // consume trailing CRLF
+                    if (chunk == nil || len(chunk) < n) { return nil; }
+                    result = result + chunk;
+                    if ((await tr.readLineAsync(s)) != "") { return nil; }
                     sizeLine = await tr.readLineAsync(s);
                 }
-                return result;
+                return nil;
             }
             if (len(cl) > 0) {
                 let n = Convert.ParseInt(cl);
@@ -619,7 +652,8 @@ class Http {
             let response    = nil;
 
             try {
-                let req = Http._buildRequestStr(curMethod, path, host, curBody, contentType, curHeaders);
+                let req = Http._buildRequestStr(curMethod, path, Http._hostHeader(parsed.scheme, host, port),
+                                                 curBody, contentType, curHeaders);
                 if (req == nil) { tr.close(s); return nil; }
                 await tr.writeAsync(s, req);
 
@@ -884,6 +918,34 @@ class Http {
         return { status: status, path: path };
     }
 
+    // A chunked NDJSON body: decode the chunks and carry a partial line across
+    // them, since a line can end in one chunk and continue in the next.
+    fn static _ndjsonChunked(s: stream, onLine: fn) {
+        let pending = "";
+        let sizeLine = Stream.ReadLine(s);
+        while (sizeLine != nil) {
+            let n = Http._parseHexSize(sizeLine);
+            if (n == 0) { break; }
+            let data = HttpUtil.ReadExact(s, n);
+            if (data == nil) { break; }
+            Stream.ReadLine(s); // the CRLF after the chunk data
+            pending = pending + Buffer.ToString(data);
+            var nl = String.IndexOf(pending, "\n");
+            while (nl >= 0) {
+                Http._ndjsonLine(String.Left(pending, nl), onLine);
+                pending = String.Substr(pending, nl + 1);
+                nl = String.IndexOf(pending, "\n");
+            }
+            sizeLine = Stream.ReadLine(s);
+        }
+        Http._ndjsonLine(pending, onLine);
+    }
+
+    fn static _ndjsonLine(line: string, onLine: fn) {
+        if (String.EndsWith(line, "\r")) { line = String.Left(line, len(line) - 1); }
+        if (len(line) > 0 && String.StartsWith(line, "{")) { onLine(line); }
+    }
+
     // --------------------------------------------------------
     //  Http.StreamPost(url, body, onLine, headers?)
     //
@@ -907,13 +969,14 @@ class Http {
         let query = parsed.query;
         if (len(query) > 0) { path = path + "?" + query; }
 
-        let s = Stream.Connect("tcp", host, port);
+        let s = Stream.Connect("tcp", host, port, 30000);
         if (s == nil) { return nil; }
+        Stream.SetTimeout(s, 0); // only the connect is bounded: a stream may pause for minutes between lines
 
         let status = nil;
         try {
             let req = "POST " + path + " HTTP/1.1\r\n";
-            req = req + "Host: " + host + "\r\n";
+            req = req + "Host: " + Http._hostHeader(parsed.scheme, host, port) + "\r\n";
             req = req + "Connection: close\r\n";
             req = req + "User-Agent: Flaris/1.0\r\n";
             req = req + "Accept: */*\r\n";
@@ -934,17 +997,25 @@ class Http {
             }
 
             // Consume response headers (blank line terminates)
+            let chunked = false;
             let hline = Stream.ReadLine(s);
-            while (hline != nil && len(hline) > 0) { hline = Stream.ReadLine(s); }
-
-            // Read body line-by-line; skip chunked-TE size markers and blank lines.
-            // Ollama NDJSON lines always start with '{'.
-            let line = Stream.ReadLine(s);
-            while (line != nil) {
-                if (len(line) > 0 && String.StartsWith(line, "{")) {
-                    onLine(line);
+            while (hline != nil && len(hline) > 0) {
+                let lower = String.ToLower(hline);
+                if (String.StartsWith(lower, "transfer-encoding:") && String.Contains(lower, "chunked")) {
+                    chunked = true;
                 }
-                line = Stream.ReadLine(s);
+                hline = Stream.ReadLine(s);
+            }
+
+            // NDJSON lines (Ollama's always start with '{').
+            if (chunked) {
+                Http._ndjsonChunked(s, onLine);
+            } else {
+                let line = Stream.ReadLine(s);
+                while (line != nil) {
+                    Http._ndjsonLine(line, onLine);
+                    line = Stream.ReadLine(s);
+                }
             }
         } catch (e) {
             // A read error mid-stream just ends the line loop: report whatever

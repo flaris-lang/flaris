@@ -1,0 +1,307 @@
+// Spi.fls - SPI chips on Linux for Flaris.
+// Version: 1.0
+//
+// One Spi object is one chip: an SPI bus and the chip-select line the chip is
+// wired to, which the kernel exposes as /dev/spidevB.C. On a Raspberry Pi,
+// a chip on header pins 19 (MOSI), 21 (MISO), 23 (SCLK) and 24 (CE0) is bus
+// 0, chip select 0; with pin 26 (CE1) instead of 24 it is chip select 1.
+//
+// Usage:
+//   import { Spi } from library("Spi", "1.0");
+//
+//   let adc = new Spi(0, 0, { speedHz: 1000000 });   // an MCP3008 on CE0
+//   let rx  = adc.Transfer([0x01, 0x80, 0x00]);       // start bit, channel 0
+//   if (rx == nil) { Console.WriteLine(adc.Error()); return 1; }
+//   let value = ((rx[1] & 0x03) << 8) | rx[2];        // 0..1023
+//
+// Full duplex. Every byte clocked out clocks one byte in, so Transfer(tx)
+// returns exactly len(tx) bytes: the ones that arrived while tx went out.
+// Write ignores them. Read(count) sends count filler bytes (0 unless given)
+// to clock the chip's answer in. Chip select stays active for the whole of
+// one call, which is what makes a command and its reply one exchange.
+//
+// Settings, fixed when the object is made (opts):
+//   mode      0-3, default 0 - clock polarity and phase, from the chip's datasheet
+//   speedHz   default 1000000 - the controller may round it down
+//   bits      default 8 - bits per word
+//   lsbFirst  default false - most significant bit first, as nearly every chip wants
+// Data is always bytes. With bits above 8 a word takes two bytes (four above
+// 16), low byte first, as the kernel lays it out, and the length of every
+// transfer must be a whole number of words.
+//
+// Errors. Nothing here raises for a bus problem or a value out of range. A
+// call that fails returns nil (false for Write), Error() says why and
+// ErrorKind() names the class:
+//   "bus"         no /dev/spidevB.C: SPI is not enabled, or no such chip select
+//   "permission"  this user may not open the device
+//   "config"      the controller refused the mode, bits or bit order
+//   "timeout"     the transfer did not finish in time
+//   "tool"        spi-tools is not installed
+//   "usage"       a bad argument: setting, byte value or length
+//   "io"          anything else, with the tool's own message
+// Both go back to nil on the next call that succeeds.
+//
+// How it reaches the bus. Through spi-config and spi-pipe from spi-tools
+// (`sudo apt install spi-tools`). spi-config sets the mode, bits and bit order
+// once, before the first transfer; the kernel keeps them for the device. Each
+// transfer is one spi-pipe run with the clock rate on its command line,
+// because the kernel puts the rate back to its default whenever the device is
+// closed. Every call starts a process, which takes a few milliseconds and
+// pauses every fiber while it runs. At most 4096 bytes go in one transfer,
+// the kernel driver's default buffer. opts.timeoutMs (default 2000) bounds
+// one call.
+//
+// Any other transport is passed as opts.backend: any object with
+//   Configure(device, mode, bits, lsbFirst) -> { ok, error, errorKind }
+//   Transfer(device, speedHz, tx: [int])    -> { ok, data: [int], error, errorKind }
+//
+// Exported:
+//   Spi - new Spi(bus, chipSelect, opts?)    opts: { mode, speedHz, bits, lsbFirst, timeoutMs, backend }
+//         transfers : Transfer / Write / Read
+//         settings  : Device / Mode / SpeedHz / Bits / LsbFirst
+//         state     : Error / ErrorKind
+
+const _MAX_XFER = 4096;         // spidev's default buffer size
+
+fn _fail(kind: string, msg: string): object {
+    return { ok: false, error: msg, errorKind: kind };
+}
+
+fn _toBytesString(tx: [int]): string {
+    let b = Buffer.Create(len(tx), 1);
+    Buffer.FromArray(b, tx);
+    return Buffer.ToString(b);
+}
+
+// Turn a failed spi-tools run into an error result, or nil when it succeeded.
+// The tools report through perror(), so the kernel's error is recognised by
+// its strerror() text.
+fn _toolFailure(r, tool: string, device: string) {
+    if (r == nil) { return _fail("tool", tool + " could not be started"); }
+    if (r.TimedOut) { return _fail("timeout", tool + " did not finish in time"); }
+    if (r.Exit == 0) { return nil; }
+    let msg = String.Trim(r.Stderr);
+    if (String.Contains(msg, "No such file or directory")) {
+        return _fail("bus", device + " not found: SPI is not enabled, or nothing is on that chip select - on a Raspberry Pi: sudo raspi-config nonint do_spi 0");
+    }
+    if (String.Contains(msg, "Permission denied")) {
+        return _fail("permission", "no permission to open " + device + ": add the user to the spi group (sudo usermod -aG spi $USER) and log in again");
+    }
+    if (tool == "spi-config" && String.Contains(msg, "Invalid argument")) {
+        return _fail("config", "the controller refused the settings: " + msg);
+    }
+    if (String.Contains(msg, "timed out")) {
+        return _fail("timeout", tool + ": " + msg);
+    }
+    if (len(msg) == 0) { msg = "exit code " + str(r.Exit); }
+    return _fail("io", tool + ": " + msg);
+}
+
+fn _toolMissing(tool: string): object {
+    return _fail("tool", tool + " not found - install spi-tools (sudo apt install spi-tools)");
+}
+
+// The default backend: one spi-tools process per call.
+class _SpiTools {
+    let _timeoutMs = 2000;
+    let _config    = nil;       // path of spi-config, resolved on first use
+    let _pipe      = nil;       // path of spi-pipe, resolved on first use
+
+    fn Constructor(timeoutMs: int) {
+        this._timeoutMs = timeoutMs;
+        this._config    = nil;
+        this._pipe      = nil;
+    }
+
+    fn Configure(device: string, mode: int, bits: int, lsbFirst: bool): object {
+        if (this._config == nil) { this._config = Os.Which("spi-config"); }
+        if (this._config == nil) { return _toolMissing("spi-config"); }
+        let args = ["-d", device, "-m", str(mode), "-l", lsbFirst ? "1" : "0", "-b", str(bits)];
+        let r = Os.RunEx(this._config, args, { Stdin: "", Timeout: this._timeoutMs });
+        let fail = _toolFailure(r, "spi-config", device);
+        if (fail != nil) { return fail; }
+        return { ok: true };
+    }
+
+    // One block of len(tx) bytes: spi-pipe sends stdin and prints what came back.
+    fn Transfer(device: string, speedHz: int, tx: [int]): object {
+        if (this._pipe == nil) { this._pipe = Os.Which("spi-pipe"); }
+        if (this._pipe == nil) { return _toolMissing("spi-pipe"); }
+        let args = ["-d", device, "-s", str(speedHz), "-b", str(len(tx)), "-n", "1"];
+        let r = Os.RunEx(this._pipe, args, { Stdin: _toBytesString(tx), Timeout: this._timeoutMs });
+        let fail = _toolFailure(r, "spi-pipe", device);
+        if (fail != nil) { return fail; }
+        if (len(r.Stdout) != len(tx)) {
+            return _fail("io", "spi-pipe returned " + str(len(r.Stdout)) + " bytes for a " + str(len(tx)) + "-byte transfer");
+        }
+        return { ok: true, data: Buffer.ToArray(Buffer.FromString(r.Stdout)) };
+    }
+}
+
+class Spi {
+    let _device     = "";
+    let _mode       = 0;
+    let _speedHz    = 1000000;
+    let _bits       = 8;
+    let _lsbFirst   = false;
+    let _wordBytes  = 1;
+    let _backend    = nil;
+    let _configured = false;
+    let _bad        = nil;  // why the constructor arguments are unusable, or nil
+    let _err        = nil;
+    let _errKind    = nil;
+
+    // A bad bus, chip select or setting does not raise: the object is returned
+    // anyway and every call on it fails with errorKind "usage" and the reason.
+    fn Constructor(bus: int, chipSelect: int, opts?) {
+        this._configured = false;
+        this._bad        = nil;
+        this._err        = nil;
+        this._errKind    = nil;
+        let backend = Spi._opt(opts, "backend", nil);
+        this._backend = (backend != nil) ? backend : new _SpiTools(Spi._opt(opts, "timeoutMs", 2000));
+
+        // Checked as locals first: the fields are typed, and a wrong type
+        // stored into one would raise instead of becoming a usage error.
+        let mode     = Spi._opt(opts, "mode", 0);
+        let speedHz  = Spi._opt(opts, "speedHz", 1000000);
+        let bits     = Spi._opt(opts, "bits", 8);
+        let lsbFirst = Spi._opt(opts, "lsbFirst", false);
+        if (bus == nil || bus < 0 || chipSelect == nil || chipSelect < 0) {
+            this._bad = "bus and chip select must be 0 or more";
+        } else if (Type.Of(mode) != Type.Int || mode < 0 || mode > 3) {
+            this._bad = "mode must be 0, 1, 2 or 3";
+        } else if (Type.Of(speedHz) != Type.Int || speedHz < 1) {
+            this._bad = "speedHz must be a positive int";
+        } else if (Type.Of(bits) != Type.Int || bits < 1 || bits > 32) {
+            this._bad = "bits must be from 1 to 32";
+        } else if (Type.Of(lsbFirst) != Type.Bool) {
+            this._bad = "lsbFirst must be true or false";
+        }
+        if (this._bad != nil) {
+            this._setError("usage", this._bad);
+            return;
+        }
+        this._device    = "/dev/spidev" + str(bus) + "." + str(chipSelect);
+        this._mode      = mode;
+        this._speedHz   = speedHz;
+        this._bits      = bits;
+        this._lsbFirst  = lsbFirst;
+        this._wordBytes = (bits <= 8) ? 1 : ((bits <= 16) ? 2 : 4);
+    }
+
+    fn Device(): string { return this._device; }
+    fn Mode() { return this._mode; }
+    fn SpeedHz() { return this._speedHz; }
+    fn Bits() { return this._bits; }
+    fn LsbFirst() { return this._lsbFirst; }
+
+    // Why the last call failed, or nil when it succeeded.
+    fn Error() { return this._err; }
+    fn ErrorKind() { return this._errKind; }
+
+    // Send data and return the len(data) bytes that came back, as [int].
+    fn Transfer(data) {
+        let tx = this._bytes(data);
+        if (tx == nil) { return nil; }
+        return this._xfer(tx);
+    }
+
+    fn Write(data): bool {
+        let tx = this._bytes(data);
+        if (tx == nil) { return false; }
+        return this._xfer(tx) != nil;
+    }
+
+    // Clock count bytes in by sending count copies of fill (default 0).
+    fn Read(count: int, fill?) {
+        if (fill == nil) { fill = 0; }
+        if (count == nil || count < 1 || count > _MAX_XFER) {
+            this._usage("count must be from 1 to " + str(_MAX_XFER));
+            return nil;
+        }
+        if (Type.Of(fill) != Type.Int || fill < 0 || fill > 255) {
+            this._usage("fill must be a byte from 0 to 255");
+            return nil;
+        }
+        let tx: [int] = [];
+        iter (i from 0 to count) { Array.Append(tx, fill); }
+        return this._xfer(tx);
+    }
+
+    // -- internals ---------------------------------------------------------
+
+    fn static _opt(opts, key: string, fallback) {
+        if (opts == nil || !(key in opts) || opts[key] == nil) { return fallback; }
+        return opts[key];
+    }
+
+    fn _xfer(tx: [int]) {
+        if (this._bad != nil) { this._setError("usage", this._bad); return nil; }
+        if (len(tx) == 0) { this._usage("nothing to send"); return nil; }
+        if (len(tx) > _MAX_XFER) { this._usage("at most " + str(_MAX_XFER) + " bytes per transfer"); return nil; }
+        if (len(tx) % this._wordBytes != 0) {
+            this._usage("with " + str(this._bits) + "-bit words the length must be a multiple of " + str(this._wordBytes));
+            return nil;
+        }
+        if (!this._configured) {
+            var c = nil;
+            try { c = this._backend.Configure(this._device, this._mode, this._bits, this._lsbFirst); }
+            catch (e) { this._setError("io", "backend failed: " + e.Error); return nil; }
+            if (c == nil || !c["ok"]) { this._setFailure(c); return nil; }
+            this._configured = true;
+        }
+        var r = nil;
+        try { r = this._backend.Transfer(this._device, this._speedHz, tx); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return nil; }
+        if (r == nil || !r["ok"]) { this._setFailure(r); return nil; }
+        let rx = r["data"];
+        if (rx == nil || len(rx) != len(tx)) {
+            this._setError("io", "expected " + str(len(tx)) + " bytes back from the bus");
+            return nil;
+        }
+        this._clearError();
+        return rx;
+    }
+
+    // An array of byte values, or a block, as a fresh [int]; nil (and a usage
+    // error) when anything in it is not a byte.
+    fn _bytes(data) {
+        if (data == nil) { this._usage("no data given"); return nil; }
+        if (Type.Of(data) == Type.Block) { return Buffer.ToArray(data); }
+        if (Type.Of(data) != Type.Array) { this._usage("data must be an array of bytes or a block"); return nil; }
+        let out: [int] = [];
+        foreach (b in data) {
+            if (Type.Of(b) != Type.Int || b < 0 || b > 255) {
+                this._usage("every byte must be an int from 0 to 255");
+                return nil;
+            }
+            Array.Append(out, b);
+        }
+        return out;
+    }
+
+    fn _usage(msg: string): bool {
+        this._setError("usage", msg);
+        return false;
+    }
+
+    fn _setFailure(r) {
+        if (r == nil) { this._setError("io", "the backend returned nothing"); return; }
+        let kind = ("errorKind" in r && r["errorKind"] != nil) ? r["errorKind"] : "io";
+        let msg  = ("error" in r && r["error"] != nil) ? r["error"] : "transfer failed";
+        this._setError(kind, msg);
+    }
+
+    fn _setError(kind: string, msg: string) {
+        this._errKind = kind;
+        this._err     = msg;
+    }
+
+    fn _clearError() {
+        this._errKind = nil;
+        this._err     = nil;
+    }
+}
+
+export { Spi };
