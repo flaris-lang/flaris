@@ -1,15 +1,267 @@
-// test_router_full.fls
-// Run: flarisvm --unsafe ./tests/test_router_full.fls --libs='./libs'
+// test_router_full.fls - Router end to end over real HTTP: public and async
+// routes, CORS preflight, JWT login and protected routes, a route group, and
+// the custom 404.
+//
+// The test starts this same file a second time with "serve" as the server: the
+// Http client blocks the scheduler, so client and server need two processes.
+// The server binds an ephemeral port, prints it as "PORT=<n>", and stops when
+// the test closes its stdin.
+//
+//   flarisvm tests/test_router_full.fls --libs=./libs
 
 import { Router, Response, JwtMiddleware, JwtSign, LoggerMiddleware, CorsMiddleware }
     from library("Router", "1.0");
+import { Http } from library("Http", "1.0");
 
 global secret = "test-secret-key";
 global app    = nil;
+global server = nil;
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn pass(msg) {
+    testsRun += 1;
+    Console.WriteLine("[PASS] " + msg);
+}
+
+fn fail(msg) {
+    testsRun += 1;
+    testsFailed += 1;
+    Console.WriteLine("[FAIL] " + msg);
+}
+
+fn statusOf(res): int { return res == nil ? -1 : res.status; }
+fn bodyOf(res): string { return res == nil ? "" : str(res.body); }
+
+fn checkStatus(label, expected: int, res) {
+    let got = statusOf(res);
+    if (got == expected) { pass(label + " (HTTP " + str(got) + ")"); }
+    else { fail(label + " - expected HTTP " + str(expected) + ", got HTTP " + str(got) + "  body: " + bodyOf(res)); }
+}
+
+fn checkBody(label, needle: string, res) {
+    if (String.Contains(bodyOf(res), needle)) { pass(label + " (body contains '" + needle + "')"); }
+    else { fail(label + " - expected body to contain '" + needle + "'  body: " + bodyOf(res)); }
+}
+
+// ============================================================
+// Server half
+// ============================================================
 
 // An async route: the router awaits its fiber before middleware sees the response.
 fn async asyncWork(v) { Fiber.Sleep(1); return v; }
 fn async asyncHello(_req) { let v = await asyncWork("async-hello"); return Response.Text(v, nil); }
+
+fn buildApp() {
+    let r = new Router();
+    global logMw  = new LoggerMiddleware();
+    global corsMw = new CorsMiddleware("*");
+    global jwtMw  = new JwtMiddleware(secret, ["/auth/login", "/health", "/async"]);
+
+    r.Use(fn(req, next) { return logMw.Handle(req, next); });
+    r.Use(fn(req, next) { return corsMw.Handle(req, next); });
+    r.Use(fn(req, next) { return jwtMw.Handle(req, next); });
+
+    r.Get("/health", fn(_req) {
+        return Response.Json({status: "ok"}, nil);
+    });
+
+    r.Post("/auth/login", fn(req) {
+        let body  = nil;
+        let error = false;
+        try {
+            body = Json.Parse(req.body);
+        } catch(e) {
+            error = true;
+        }
+
+        if (error)
+            return Response.Error(400, "Invalid JSON");
+
+        if (body == nil || body.username == nil)
+            return Response.Error(400, "Missing username");
+
+        let token = JwtSign({sub: body.username, role: "user"}, secret, 3600);
+        return Response.Json({token: token}, nil);
+    });
+
+    r.Get("/async", asyncHello);
+
+    // Protected by the JWT middleware: only the paths above skip it.
+    let api = r.Group("/api");
+
+    api.Get("/me", fn(req) {
+        return Response.Json({user: req.jwt.sub, role: req.jwt.role}, nil);
+    });
+
+    api.Get("/users", fn(_req) {
+        return Response.Json([
+            {id: 1, name: "Alice"},
+            {id: 2, name: "Bob"}
+        ], nil);
+    });
+
+    api.Get("/users/:id", fn(req) {
+        return Response.Json({id: req.params.id, name: "Alice"}, nil);
+    });
+
+    api.Post("/users", fn(req) {
+        let body  = nil;
+        let error = false;
+        try {
+            body = Json.Parse(req.body);
+        } catch(e) {
+            error = true;
+        }
+        if (error)
+            return Response.Error(400, "Invalid JSON body");
+        if (body == nil || body.name == nil)
+            return Response.Error(400, "Missing name field");
+        return Response.Json({id: 3, name: body.name, created: true}, 201);
+    });
+
+    api.Put("/users/:id", fn(req) {
+        let body  = nil;
+        let error = false;
+        try {
+            body = Json.Parse(req.body);
+        } catch(e) {
+            error = true;
+        }
+        if (error)
+            return Response.Error(400, "Invalid JSON body");
+        return Response.Json({id: req.params.id, updated: true}, nil);
+    });
+
+    api.Delete("/users/:id", fn(req) {
+        return Response.Json({id: req.params.id, deleted: true}, nil);
+    });
+
+    r.NotFound(fn(req) {
+        return Response.Error(404, "Route not found: " + req.path);
+    });
+    return r;
+}
+
+fn serve() {
+    app = buildApp();
+    // Report the port once Listen has bound it, then serve until stdin closes.
+    Fiber.Run(fn() {
+        let t0 = Time.Millis();
+        while (app.Port() == 0 && Time.Millis() - t0 < 5000) { Fiber.Sleep(5); }
+        Console.WriteLine("PORT=" + str(app.Port()));
+        let stdin = Stream.Stdin();
+        var line = Fiber.Await(Stream.ReadLineAsync(stdin));
+        while (line != nil) { line = Fiber.Await(Stream.ReadLineAsync(stdin)); }
+        app.Stop(1000);
+    });
+    app.Listen(0, { host: "127.0.0.1" });
+    return 0;
+}
+
+// ============================================================
+// Test half
+// ============================================================
+
+fn vmPath(): string {
+    let vm = Os.GetEnv("FLARISVM");
+    return (vm == nil || vm == "") ? "flarisvm" : vm;
+}
+
+// Start the server child and return the port it reports, or 0.
+fn async startServer(): int {
+    server = Os.Spawn(vmPath(), ["--libs=./libs", "tests/test_router_full.fls", "serve"]);
+    if (server == nil) { return 0; }
+    let deadline = Time.Millis() + 10000;
+    while (Time.Millis() < deadline) {
+        let line = await Stream.ReadLineAsync(server.Stdout, deadline - Time.Millis());
+        if (line == nil) { return 0; }
+        if (String.StartsWith(line, "PORT=")) { return Convert.ParseInt(String.Substr(line, 5)) ?? 0; }
+    }
+    return 0;
+}
+
+// Closing its stdin stops the server; reap it either way.
+fn async stopServer() {
+    if (server == nil) { return 0; }
+    Stream.Close(server.Stdin);
+    let w = await Os.WaitAsync(server.Pid, 5000);
+    if (w == nil || w.Alive) {
+        Os.KillChild(server.Pid, 9);
+        await Os.WaitAsync(server.Pid);
+    }
+    Stream.Close(server.Stdout);
+    Stream.Close(server.Stderr);
+    server = nil;
+    return 0;
+}
+
+fn runChecks(base: string) {
+    Console.WriteLine("--- Public Routes ---");
+    let health = Http.Get(base + "/health");
+    checkStatus("GET /health", 200, health);
+    checkBody("GET /health body", "ok", health);
+
+    let asy = Http.Get(base + "/async");
+    checkStatus("GET /async (async handler)", 200, asy);
+    checkBody("GET /async body", "async-hello", asy);
+
+    Console.WriteLine("--- CORS ---");
+    let pre = Http.Request("OPTIONS", base + "/api/users", nil, nil,
+                           { "Origin": "https://example.com", "Access-Control-Request-Method": "GET" });
+    checkStatus("OPTIONS /api/users (preflight)", 204, pre);
+
+    Console.WriteLine("--- Auth ---");
+    let login = Http.Post(base + "/auth/login", "{\"username\":\"alice\"}");
+    checkStatus("POST /auth/login", 200, login);
+    checkBody("POST /auth/login has token", "token", login);
+    var token = "";
+    if (statusOf(login) == 200) { token = Json.Parse(login.body).token ?? ""; }
+
+    checkStatus("POST /auth/login invalid JSON", 400, Http.Post(base + "/auth/login", "not-json"));
+    checkStatus("POST /auth/login missing username", 400, Http.Post(base + "/auth/login", "{}"));
+
+    Console.WriteLine("--- JWT Protected Routes ---");
+    checkStatus("GET /api/users no token", 401, Http.Get(base + "/api/users"));
+    checkStatus("GET /api/users bad token", 401,
+                Http.Get(base + "/api/users", { "Authorization": "Bearer invalid.token.here" }));
+    checkStatus("GET /api/users malformed auth header", 401,
+                Http.Get(base + "/api/users", { "Authorization": "NotBearer xyz" }));
+
+    let auth = { "Authorization": "Bearer " + token };
+
+    let users = Http.Get(base + "/api/users", auth);
+    checkStatus("GET /api/users with token", 200, users);
+    checkBody("GET /api/users body has Alice", "Alice", users);
+
+    let one = Http.Get(base + "/api/users/42", auth);
+    checkStatus("GET /api/users/42", 200, one);
+    checkBody("GET /api/users/42 has id", "42", one);
+
+    let me = Http.Get(base + "/api/me", auth);
+    checkStatus("GET /api/me", 200, me);
+    checkBody("GET /api/me has user alice", "alice", me);
+
+    let created = Http.Post(base + "/api/users", "{\"name\":\"Charlie\"}", auth);
+    checkStatus("POST /api/users", 201, created);
+    checkBody("POST /api/users has Charlie", "Charlie", created);
+
+    checkStatus("POST /api/users invalid JSON", 400, Http.Post(base + "/api/users", "bad json", auth));
+
+    let updated = Http.Put(base + "/api/users/5", "{\"name\":\"Updated\"}", auth);
+    checkStatus("PUT /api/users/5", 200, updated);
+    checkBody("PUT /api/users/5 updated", "true", updated);
+
+    let deleted = Http.Delete(base + "/api/users/7", auth);
+    checkStatus("DELETE /api/users/7", 200, deleted);
+    checkBody("DELETE /api/users/7 deleted", "true", deleted);
+
+    let missing = Http.Get(base + "/api/unknown", auth);
+    checkStatus("GET /api/unknown 404", 404, missing);
+    checkBody("404 body has error", "not found", missing);
+    return 0;
+}
 
 // ============================================================
 // Benchmarks - network-free: route registration + direct
@@ -55,106 +307,28 @@ fn benchRouter() {
     Console.WriteLine("=== benchmarks done ===");
 }
 
-fn Main() {
-    app = new Router();
-    global logMw  = new LoggerMiddleware();
-    global corsMw = new CorsMiddleware("*");
-    global jwtMw  = new JwtMiddleware(secret, ["/auth/login", "/health", "/async"]);
+fn async Main() {
+    let args = Os.Args();
+    if (len(args) > 0 && args[0] == "serve") { return serve(); }
 
-    app.Use(fn(req, next) { return logMw.Handle(req, next); });
-    app.Use(fn(req, next) { return corsMw.Handle(req, next); });
-    app.Use(fn(req, next) { return jwtMw.Handle(req, next); });
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Router Full Test Suite");
+    Console.WriteLine("================================================");
 
-    // --- Public routes ---
-
-    app.Get("/health", fn(_req) {
-        return Response.Json({status: "ok"}, nil);
-    });
-
-    app.Post("/auth/login", fn(req) {
-        let body  = nil;
-        let error = false;
-        try {
-            body = Json.Parse(req.body);
-        } catch(e) {
-            error = true;
-        }
-
-        if (error)
-            return Response.Error(400, "Invalid JSON");
-
-        if (body == nil || body.username == nil)
-            return Response.Error(400, "Missing username");
-
-        let token = JwtSign({sub: body.username, role: "user"}, secret, 3600);
-        return Response.Json({token: token}, nil);
-    });
-
-    app.Get("/async", asyncHello);
-
-    // --- Protected routes via route group ---
-
-    let api = app.Group("/api");
-
-    api.Get("/me", fn(req) {
-        return Response.Json({user: req.jwt.sub, role: req.jwt.role}, nil);
-    });
-
-    api.Get("/users", fn(req) {
-        return Response.Json([
-            {id: 1, name: "Alice"},
-            {id: 2, name: "Bob"}
-        ], nil);
-    });
-
-    api.Get("/users/:id", fn(req) {
-        return Response.Json({id: req.params.id, name: "Alice"}, nil);
-    });
-
-    api.Post("/users", fn(req) {
-        let body  = nil;
-        let error = false;
-        try {
-            body = Json.Parse(req.body);
-        } catch(e) {
-            error = true;
-        }
-        if (body == nil || body.name == nil)
-            return Response.Error(400, "Missing name field");
-        if (error)
-            return Response.Error(400, "Invalid JSON body");
-        return Response.Json({id: 3, name: body.name, created: true}, 201);
-    });
-
-    api.Put("/users/:id", fn(req) {
-        let body  = nil;
-        let error = false;
-        try {
-            body = Json.Parse(req.body);
-        } catch(e) {
-            error = true;
-        }
-        if (error)
-            return Response.Error(400, "Invalid JSON body");
-        return Response.Json({id: req.params.id, updated: true}, nil);
-    });
-
-    api.Delete("/users/:id", fn(req) {
-        return Response.Json({id: req.params.id, deleted: true}, nil);
-    });
-
-    app.NotFound(fn(req) {
-        return Response.Error(404, "Route not found: " + req.path);
-    });
+    let port = await startServer();
+    if (port > 0) {
+        runChecks("http://127.0.0.1:" + str(port));
+    } else {
+        fail("server did not report a port");
+    }
+    await stopServer();
 
     benchRouter();
 
-    VM.OnSignal(2, fn(a) {
-        Console.WriteLine("Stopping server...");
-        app.Stop();
-        return 0;
-    });
-
-    Console.WriteLine("Server starting on http://localhost:8087");
-    app.Listen(8087);
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Results: " + str(testsRun - testsFailed) + " passed, " + str(testsFailed) + " failed");
+    Console.WriteLine("================================================");
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine(" All tests passed.");
+    return 0;
 }

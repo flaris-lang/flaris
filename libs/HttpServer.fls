@@ -62,6 +62,8 @@
 // HttpServer:
 //   new HttpServer(opts?)
 //       port                 listen port; 0 binds an ephemeral port (see Port())
+//       host                 listen address; "127.0.0.1" or    (default nil:
+//                            "::1" serves this machine only     every interface)
 //       backlog              listen backlog                    (default 128)
 //       keepAlive            allow connection reuse            (default true)
 //       idleTimeoutMs        keep-alive idle wait              (default 5000)
@@ -79,6 +81,8 @@
 //                            the handler to pull - see Uploads
 //       maxUploadBytes       ceiling for a streamed body        (default 0 = none)
 //       serverName           Server: header                    (default "Flaris")
+//       timing               per-request phase times           (default false)
+//                            see Timing below
 //       tls                  AcceptTls options -> serve HTTPS  (default nil)
 //                            { pkcs12File, password } on any platform, or
 //                            { certFile, keyFile } (PEM, OpenSSL only);
@@ -92,7 +96,9 @@
 //   .OnError(handler)          - fn(req, res, err); default sends a 500
 //   .OnTlsError(handler)       - fn(peer, message); default drops silently
 //   .OnAccess(handler)         - fn(entry) once per completed request; pair
-//                                with HttpStatus.CombinedLogLine(entry)
+//                                with HttpStatus.CombinedLogLine(entry).
+//                                With { timing: true } the entry also carries
+//                                `timing` - see Timing below
 //                                OnError, OnTlsError and OnAccess may be
 //                                `fn async` (they are awaited). One that throws
 //                                is contained: the exception is dropped and
@@ -153,10 +159,30 @@
 //       produce repeated Set-Cookie lines.
 //   .Redirect(url, status?)  .NoContent()   .Error(status, message)
 //   .StartChunked(contentType?)  .WriteChunk(data)  .EndChunked()
-//                            - stream a response of unknown length
+//                            - stream a response of unknown length; WriteChunk
+//                              returns false once the client has gone
 //   .Sent()                  - true once the response has been written
 //   .Hijack()                - take the raw socket; the server stops managing
 //                              the connection entirely (protocol upgrades)
+//   .Mark(name)              - close a timing phase under name (see Timing);
+//                              a no-op unless the server times requests
+//   .Timing()                - the phases so far, or nil when not timing
+//
+// Timing:
+//   { timing: true } measures every request in phases: `read` (request line,
+//   headers and body off the socket), `route` (matching, up to the moment a
+//   handler runs), then `handler` (until the response head is written). A
+//   handler may split its own time with res.Mark("db") - each mark closes a
+//   phase of that name, and whatever follows still ends as `handler`. The
+//   phases go out as a Server-Timing header, which browser dev tools show
+//   next to the request:
+//
+//       Server-Timing: read;dur=0.31, route;dur=0.05, db;dur=4.20, handler;dur=0.62
+//
+//   and the OnAccess entry carries the same figures plus `total` (through the
+//   last byte written) as `timing`, an object of milliseconds. Router marks
+//   `route` itself, so a routed app sees its middleware and handler under
+//   `handler`. Off, the option costs one nil test per response.
 //
 // Files:
 //   .File() and the static mounts answer with the validators a browser needs:
@@ -268,34 +294,30 @@ fn _fileExists(path:string): bool { return File.Exists(path); }
 fn _fileBytes(path:string)        { return File.ReadAllBytes(path); }
 fn _fileStat(path:string)         { return File.Stat(path); }
 
-fn _isTokenByte(v:int): bool {
-    if ((v >= 97 && v <= 122) || (v >= 65 && v <= 90) || (v >= 48 && v <= 57)) {
-        return true;
-    }
-    if (v == 33 || v == 35 || v == 36 || v == 37 || v == 38) { return true; }
-    if (v == 39 || v == 42 || v == 43 || v == 45 || v == 46) { return true; }
-    if (v == 94 || v == 95 || v == 96) { return true; }
-    if (v == 124 || v == 126) { return true; }
-    return false;
-}
-
 // RFC 9110 token characters - the only ones allowed in a header name (or a
 // method). Anything else and this server and a proxy in front may disagree
 // about what the header is even called, which is how a smuggled request hides.
-// Compared as bytes: String.CharAt yields a char, which will not index into a
-// string of allowed characters, and comparing one against a one-character
-// *string* silently never matches.
-fn _isToken(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (!_isTokenByte(v)) { return false; }
-        i += 1;
+// A leading '-' is the one spelling of a literal hyphen this regex engine
+// accepts inside a class.
+const _TOKEN_RE = "^[-A-Za-z0-9!#$%&'*+.^_`|~]+$";
+
+// Every byte a request line or header must not carry: 1-31 and DEL. NUL cannot
+// occur, a string ends there. Built on first use: a module global cannot call a
+// function of its own module in its initialiser.
+global _CTL_BYTES = nil;
+
+fn _ctlBytes(): string {
+    if (_CTL_BYTES == nil) {
+        let s = "";
+        let i = 1;
+        while (i < 32) { s = s + Char.FromInt(i); i += 1; }
+        _CTL_BYTES = s + Char.FromInt(127);
     }
-    return true;
+    return _CTL_BYTES;
+}
+
+fn _isToken(s:string): bool {
+    return String.Length(s) > 0 && Regex.IsMatch(s, _TOKEN_RE);
 }
 
 // Content-Length is DIGIT only. Convert.ParseInt would otherwise accept "+5"
@@ -333,64 +355,25 @@ fn _isValidHost(v:string): bool {
 // Validate one header line and return the index of its colon, or a negative
 // code: -1 malformed / bad name, -2 obsolete line folding, -3 a bare CR.
 //
-// One allocation and one pass. Done separately this was a String.Contains for
-// the CR, two String.StartsWith for the fold, a String.IndexOf, a String.Left
-// to cut the name out, and then a second buffer inside _isToken - per header,
-// on every request. Real requests carry ten or more headers, so this is the
-// hot loop of the whole parser.
+// Real requests carry ten or more headers, so this is the hot loop of the
+// whole parser: every check is one builtin scan of the line, never a byte
+// loop in script (that cost 2 ms per request on a 650 MHz router).
 fn _validateHeaderLine(hl:string): int {
-    let n:int = String.Length(hl);
-    if (n == 0) { return -1; }
-    let b = Buffer.FromString(hl);
-
-    let f:int = Buffer.ReadU8At(b, 0);
-    if (f == 32 || f == 9) { return -2; }        // SP or HTAB: obs-fold
-
-    let colon:int = -1;
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (v == 13) { return -3; }              // a bare CR anywhere in the line
-        if (colon < 0) {
-            if (v == 58) {                       // ':'
-                if (i == 0) { return -1; }
-                colon = i;
-            } else if (!_isTokenByte(v)) {
-                return -1;                        // not a token character
-            }
-        }
-        i += 1;
-    }
-    if (colon < 0) { return -1; }
+    if (String.Length(hl) == 0) { return -1; }
+    if (String.StartsWith(hl, " ") || String.StartsWith(hl, "\t")) { return -2; }  // obs-fold
+    if (String.IndexOf(hl, "\r") >= 0) { return -3; }         // a bare CR anywhere in the line
+    let colon:int = String.IndexOf(hl, ":");
+    if (colon <= 0) { return -1; }
+    if (!Regex.IsMatch(String.Left(hl, colon), _TOKEN_RE)) { return -1; }
     return colon;
 }
 
 fn _isHex(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (!((v >= 48 && v <= 57) || (v >= 97 && v <= 102) || (v >= 65 && v <= 70))) {
-            return false;
-        }
-        i += 1;
-    }
-    return true;
+    return String.Length(s) > 0 && Regex.IsMatch(s, "^[0-9A-Fa-f]+$");
 }
 
 fn _isDigits(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (v < 48 || v > 57) { return false; }
-        i += 1;
-    }
-    return true;
+    return String.Length(s) > 0 && Regex.IsMatch(s, "^[0-9]+$");
 }
 
 // Bodies at or below this size are written together with the header block in a
@@ -474,17 +457,10 @@ fn _sendFileAll(conn, path:string, offset:int, count:int): bool {
 // Any control byte in a decoded path. A "%00" would otherwise reach the
 // filesystem layer and truncate the name there, so a check on the extension
 // (".js", ".txt") can be walked straight past.
+// The charset scan cannot name NUL, so that byte is looked for on the bytes.
 fn _hasCtlBytes(s:string): bool {
-    let n:int = String.Length(s);
-    if (n == 0) { return false; }
-    let b = Buffer.FromString(s);
-    let i:int = 0;
-    while (i < n) {
-        let v:int = Buffer.ReadU8At(b, i);
-        if (v < 32 || v == 127) { return true; }
-        i += 1;
-    }
-    return false;
+    if (String.IndexOfAnyFrom(s, _ctlBytes(), 0) >= 0) { return true; }
+    return Buffer.IndexOf(Buffer.FromString(s), 0) >= 0;
 }
 
 // A path segment beginning with "." marks a file that is conventionally
@@ -527,12 +503,11 @@ fn _crossesSymlink(root:string, rel:string): bool {
 
 // Read exactly `count` bytes, or nil if the peer stops first.
 //
-// Stream.ReadBytes returns whatever has already arrived and does not wait, so
-// on a body larger than the socket buffer it runs dry and returns nil long
-// before the body is complete - and after a 100-continue it returns nil
-// immediately, because the client has not started sending. Parking on
-// WaitReadable first is what turns that into a real read; it also suspends only
-// this fiber, so a slow upload does not hold up anything else.
+// Stream.ReadBytes hands over what has arrived, so a body larger than the
+// socket buffer takes several reads, and with nothing there it waits as long
+// as the socket allows. Parking on WaitReadable first gives every read this
+// request's own deadline - after a 100-continue the client may never start -
+// and suspends only this fiber, so a slow upload holds up nothing else.
 fn _readChunk(conn, want:int, timeoutMs:int) {
     let ms = (timeoutMs > 0) ? timeoutMs : 10000;
     if (Stream.WaitReadable(conn, ms) == nil) { return nil; }
@@ -561,7 +536,7 @@ fn _streamChunked(conn, maxBytes:int, sink, timeoutMs:int) {
     let done:bool = false;
     while (!done) {
         let line = Stream.ReadLine(conn);
-        // nil is a stalled peer, "" is EOF; neither is a chunk header.
+        // nil is EOF or a stalled peer, "" a blank line; neither is a chunk header.
         if (line == nil || line == "") { return { ok: false, status: 400, total: total }; }
 
         let semi = String.IndexOf(line, ";");     // drop any chunk extension
@@ -581,7 +556,9 @@ fn _streamChunked(conn, maxBytes:int, sink, timeoutMs:int) {
             let part = _readExact(conn, n, timeoutMs);
             if (part == nil || len(part) != n) { return { ok: false, status: 400, total: total }; }
             if (!sink(part)) { return { ok: false, status: 0, total: total }; }
-            Stream.ReadLine(conn);                // CRLF after the chunk
+            // Only the CRLF may follow the chunk data: anything else would let
+            // a front end and this server disagree on where the body ends.
+            if (Stream.ReadLine(conn) != "") { return { ok: false, status: 400, total: total }; }
         }
     }
     return { ok: true, status: 0, total: total };
@@ -654,9 +631,9 @@ fn _isUnder(child:string, root:string): bool {
         || String.StartsWith(child, root + "\\");
 }
 
-// Stream.WriteBytes may come up short on a slow socket, and unlike WriteAll it
-// has no offset argument to resume from. Re-slice only when a write is actually
-// partial, so the common case allocates nothing.
+// Stream.WriteBytes comes up short when the socket's write timeout cuts it
+// off, and it has no offset argument to resume from. Re-slice only when a
+// write is actually partial, so the common case allocates nothing.
 fn _writeBlock(conn, buf, count:int): bool {
     let off:int = 0;
     while (off < count) {
@@ -1304,6 +1281,10 @@ class HttpResponse
     let _hijacked:bool   = false;  // the caller took the socket
     let _bodyBytes:int   = 0;      // payload written, for the access log
     let _req             = nil;    // the request being answered, for If-* / Range
+    let _tmStart:int     = 0;      // timing: request start; phases below are nil when off
+    let _tmNames         = nil;
+    let _tmTicks         = nil;
+    let _tmHead:int      = 0;      // when the response head was built
 
     fn Constructor(conn, headOnly:bool, keepAlive:bool, serverName:string, req?) {
         _conn       = conn;
@@ -1324,6 +1305,45 @@ class HttpResponse
     fn Hijacked(): bool    { return _hijacked; }
     fn StatusCode(): int   { return _status; }
     fn BodyBytes(): int    { return _bodyBytes; }
+
+    fn _timeFrom(start:int, read:int) {
+        _tmStart = start;
+        _tmNames = ["read"];
+        _tmTicks = [read];
+    }
+
+    // Repeating the last name moves that phase's end instead of adding a
+    // phase, so a router that marks "route" after the server did replaces it.
+    fn Mark(name:string) {
+        if (_tmTicks == nil) { return this; }
+        let n:int = len(_tmNames);
+        if (n > 0 && _tmNames[n - 1] == name) {
+            _tmTicks[n - 1] = Time.Ticks();
+        } else {
+            Array.Append(_tmNames, name);
+            Array.Append(_tmTicks, Time.Ticks());
+        }
+        return this;
+    }
+
+    fn _phases(end:int) {
+        let out  = {};
+        let prev:int = _tmStart;
+        iter (i from 0 to len(_tmNames)) {
+            out[_tmNames[i]] = Time.TicksToMs(_tmTicks[i] - prev);
+            prev = _tmTicks[i];
+        }
+        out["handler"] = Time.TicksToMs(end - prev);
+        return out;
+    }
+
+    fn Timing() {
+        if (_tmTicks == nil) { return nil; }
+        let now:int = Time.Ticks();
+        let out = this._phases((_tmHead > 0) ? _tmHead : now);
+        out["total"] = Time.TicksToMs(now - _tmStart);
+        return out;
+    }
 
     // Hand the raw connection to the caller and step out of its way: the server
     // writes nothing further, does not close it, and does not reuse it for
@@ -1439,6 +1459,15 @@ class HttpResponse
             }
         }
         foreach (c in _setCookies) { Array.Append(sb, "Set-Cookie: " + c); }
+        if (_tmTicks != nil && _tmHead == 0) {
+            _tmHead = Time.Ticks();
+            let ph    = this._phases(_tmHead);
+            let parts = [];
+            foreach (k in Object.Keys(ph)) {
+                Array.Append(parts, k + ";dur=" + String.FormatArray("{0:.2f}", [ph[k]]));
+            }
+            Array.Append(sb, "Server-Timing: " + String.Join(parts, ", "));
+        }
         if (bodyLen >= 0) {
             Array.Append(sb, "Content-Length: " + str(bodyLen));
         } else {
@@ -1693,17 +1722,16 @@ class HttpResponse
 
         // Size line, payload and terminator in one write when the chunk is
         // small - three syscalls per chunk is the dominant cost of streaming.
+        // false once the client is gone, so a streaming handler can stop.
         if (!isBlock && n <= _COALESCE_MAX) {
-            Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n" + data + "\r\n");
             _bodyBytes = _bodyBytes + n;
-            return true;
+            return Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n" + data + "\r\n");
         }
-        Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n");
-        if (isBlock) { _writeBlock(_conn, data, n); }
-        else         { Stream.WriteAll(_conn, data); }
-        Stream.WriteAll(_conn, "\r\n");
+        let ok = Stream.WriteAll(_conn, Convert.ToRadixString(n, 16) + "\r\n");
+        if (ok) { ok = isBlock ? _writeBlock(_conn, data, n) : Stream.WriteAll(_conn, data); }
+        if (ok) { ok = Stream.WriteAll(_conn, "\r\n"); }
         _bodyBytes = _bodyBytes + n;
-        return true;
+        return ok;
     }
 
     fn EndChunked(): bool {
@@ -1777,6 +1805,7 @@ fn _splitPath(path:string): array {
 class HttpServer
 {
     let _port:int              = 8080;
+    let _host                   = nil;   // nil = every interface
     let _backlog:int           = 128;
     let _keepAlive:bool        = true;
     let _idleTimeoutMs:int     = 5000;
@@ -1809,12 +1838,14 @@ class HttpServer
     let _hookErrors:int        = 0;    // exceptions dropped from OnAccess/OnError/OnTlsError
     let _inFlight:int          = 0;    // requests being handled right now
     let _statics:array         = [];   // { prefix, root, index, cacheControl }
+    let _timing:bool           = false;
 
     fn Constructor(opts?) {
         _routes  = [];
         _statics = [];
         if (opts != nil) {
             _port               = Object.TryGet(opts, "port",               8080);
+            _host               = Object.TryGet(opts, "host",               nil);
             _backlog            = Object.TryGet(opts, "backlog",            128);
             _keepAlive          = Object.TryGet(opts, "keepAlive",          true);
             _idleTimeoutMs      = Object.TryGet(opts, "idleTimeoutMs",      5000);
@@ -1828,6 +1859,7 @@ class HttpServer
             _maxUploadBytes     = Object.TryGet(opts, "maxUploadBytes",     0);
             _serverName         = Object.TryGet(opts, "serverName",         "Flaris");
             _tls                = Object.TryGet(opts, "tls",                nil);
+            _timing             = Object.TryGet(opts, "timing",             false);
         }
     }
 
@@ -1916,9 +1948,9 @@ class HttpServer
             throw(1, "HttpServer: this build cannot terminate TLS "
                      + "(no server-capable TLS backend for Stream.AcceptTls)");
         }
-        let s = Stream.Listen("tcp", _port, _backlog);
+        let s = Stream.Listen("tcp", _port, _backlog, _host);
         if (s == nil) {
-            throw(1, "HttpServer: could not bind port " + str(_port));
+            throw(1, "HttpServer: could not bind port " + str(_port) + (_host == nil ? "" : " on " + _host));
         }
         _sock      = s;
         _boundPort = _port;
@@ -2020,8 +2052,8 @@ class HttpServer
 
     // Serve requests on one connection until it closes or the limits run out.
     fn _serveConnection(conn) {
-        // Read the peer from the raw socket first: AcceptTls detaches it, so
-        // this is the last point where the address is available.
+        // Read the peer first: a failed TLS handshake closes the socket, and
+        // the address with it.
         let peer = Stream.PeerAddr(conn) ?? "";
         let c    = conn;
 
@@ -2032,8 +2064,8 @@ class HttpServer
 
         // TLS terminates here, inside the connection fiber - never in the accept
         // loop, where one slow handshake would hold up every other client.
-        // AcceptTls takes ownership of the raw socket and detaches it either
-        // way, so the failure path must not close it.
+        // AcceptTls upgrades the socket in place, or closes it when the
+        // handshake fails.
         if (_tls != nil) {
             c = Stream.AcceptTls(c, _tls);
             if (c == nil) {
@@ -2086,6 +2118,7 @@ class HttpServer
     // Returns 1 to keep the connection, 0 to close it, 2 when a handler took it
     // over and this server must neither close nor touch it again.
     fn _serveOne(conn, peer:string, served:int): int {
+        let tStart:int = _timing ? Time.Ticks() : 0;
         let parsed = this._readRequest(conn, peer);
         let req    = parsed.req;
 
@@ -2102,6 +2135,7 @@ class HttpServer
         let keep = _keepAlive && req.keepAlive && _running
                    && (served + 1) < _maxRequestsPerConn;
         let res  = new HttpResponse(conn, req.method == "HEAD", keep, _serverName, req);
+        if (_timing) { res._timeFrom(tStart, Time.Ticks()); }
 
         let t0:int = Time.Millis();
         _inFlight = _inFlight + 1;
@@ -2121,7 +2155,8 @@ class HttpServer
                     bytes:      res.BodyBytes(),
                     durationMs: Time.Millis() - t0,
                     referer:    req.Header("Referer",    "") ?? "",
-                    userAgent:  req.Header("User-Agent", "") ?? ""
+                    userAgent:  req.Header("User-Agent", "") ?? "",
+                    timing:     res.Timing()
                 }));
             } catch (_e) {
                 _hookErrors = _hookErrors + 1;
@@ -2157,6 +2192,7 @@ class HttpServer
                         if (m == req.method || (req.method == "HEAD" && m == "GET")) {
                             req.params = p;
                             matched = true;
+                            res.Mark("route");
                             _settled(r.handler(req, res));
                         } else {
                             methodMismatch = true;
@@ -2167,17 +2203,20 @@ class HttpServer
 
             // 2. Static mounts.
             if (!matched) {
+                res.Mark("route");
                 matched = this._serveStatic(req, res);
             }
 
             // 3. Catch-all handler.
             if (!matched && _onRequest != nil) {
                 matched = true;
+                res.Mark("route");
                 _settled(_onRequest(req, res));
             }
 
             // 4. Nothing claimed it.
             if (!matched && !res.Sent()) {
+                res.Mark("route");
                 if (methodMismatch) {
                     res.Error(405, "method not allowed");
                 } else if (_notFound != nil) {
@@ -2300,6 +2339,9 @@ class HttpServer
     // code to report, -1 means the peer closed and nothing should be sent.
     fn _readRequest(conn, peer:string) {
         let line = Stream.ReadLine(conn);
+        // RFC 9112 asks a server to ignore an empty line before the request
+        // line; a client may send one after the previous request's body.
+        if (line == "") { line = Stream.ReadLine(conn); }
         if (line == nil || line == "") {
             return { req: nil, status: -1, message: "closed" };
         }
@@ -2355,11 +2397,11 @@ class HttpServer
             Array.Append(raw, h);
             h = Stream.ReadLine(conn);
         }
-        // ReadLine returns "" for a genuine blank line (and at EOF) but nil
-        // when the peer went silent for readTimeoutMs or closed mid-line.
-        // Treating the two alike answers a
-        // request the client never finished sending - and leaves whatever it
-        // sends next to be read as a second request.
+        // ReadLine returns "" for the blank line that ends the headers, and nil
+        // when the peer closed or went silent for readTimeoutMs before it.
+        // Treating the two alike answers a request the client never finished
+        // sending - and leaves whatever it sends next to be read as a second
+        // request.
         if (h == nil) {
             return { req: nil, status: 400, message: "incomplete request headers" };
         }

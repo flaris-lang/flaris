@@ -1,0 +1,239 @@
+// test_spi.fls - Tests for Spi.fls against simulated chips
+// Run: flarisvm tests/test_spi.fls --libs=./libs
+//
+// No hardware: every Spi here is given a SimSpi through opts.backend, with an
+// MCP3008 ADC on /dev/spidev0.0 and a loopback (MOSI wired to MISO) on
+// /dev/spidev0.1. What is tested is everything above the bus - settings,
+// full-duplex framing, argument checks and error reporting. The spi-tools
+// backend needs hardware.
+
+import { Spi } from library("Spi", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, "  expected=", expected, "  got=", actual);
+    }
+    return 0;
+}
+
+fn sameBytes(a, b): bool {
+    if (a == nil || b == nil || len(a) != len(b)) { return false; }
+    iter (i from 0 to len(a)) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+// The MCP3008 single-ended read: send 0x01 (start bit), then 0x80 | ch << 4,
+// then a filler byte. The 10-bit result comes back in the low two bits of the
+// second byte and all of the third.
+fn mcpFrame(ch: int) { return [0x01, 0x80 | (ch << 4), 0x00]; }
+fn mcpValue(rx) { return ((rx[1] & 0x03) << 8) | rx[2]; }
+
+class SimSpi {
+    let adc      = nil;     // the MCP3008's eight channel values
+    let configs  = nil;     // every Configure call, in order
+    let calls    = 0;
+    let last     = nil;     // the last Transfer call
+
+    fn Constructor() {
+        this.adc     = [0, 1, 512, 1023, 300, 700, 5, 1000];
+        this.configs = [];
+        this.calls   = 0;
+        this.last    = nil;
+    }
+
+    // A controller that cannot do 12-bit words, to exercise "config".
+    fn Configure(device: string, mode: int, bits: int, lsbFirst: bool) {
+        Array.Append(this.configs, { device: device, mode: mode, bits: bits, lsbFirst: lsbFirst });
+        if (bits == 12) { return { ok: false, errorKind: "config", error: "controller refused 12-bit words" }; }
+        return { ok: true };
+    }
+
+    fn Transfer(device: string, speedHz: int, tx) {
+        this.calls += 1;
+        this.last = { device: device, speedHz: speedHz, tx: tx };
+        if (device == "/dev/spidev0.1") { return { ok: true, data: tx }; }
+        if (device != "/dev/spidev0.0") { return { ok: false, errorKind: "bus", error: device + " not found" }; }
+        let rx: [int] = [];
+        iter (i from 0 to len(tx)) { Array.Append(rx, 0); }
+        if (len(tx) == 3 && tx[0] == 0x01 && (tx[1] & 0x80) != 0) {
+            let v = this.adc[(tx[1] >> 4) & 0x07];
+            rx[1] = (v >> 8) & 0x03;
+            rx[2] = v & 0xFF;
+        }
+        return { ok: true, data: rx };
+    }
+}
+
+class RaisingSpi {
+    fn Configure(_device: string, _mode: int, _bits: int, _lsbFirst: bool) { return { ok: true }; }
+    fn Transfer(_device: string, _speedHz: int, _tx) { throw(1, "clock stuck"); }
+}
+
+class ShortSpi {
+    fn Configure(_device: string, _mode: int, _bits: int, _lsbFirst: bool) { return { ok: true }; }
+    fn Transfer(_device: string, _speedHz: int, _tx) { return { ok: true, data: [1] }; }
+}
+
+fn Main() {
+    let sim = new SimSpi();
+    let adc = new Spi(0, 0, { backend: sim });
+
+    Console.WriteLine("[ settings ]");
+    checkEq(adc.Device(), "/dev/spidev0.0", "Device() names the spidev node");
+    checkEq(adc.Mode(), 0, "mode defaults to 0");
+    checkEq(adc.SpeedHz(), 1000000, "speedHz defaults to 1 MHz");
+    checkEq(adc.Bits(), 8, "bits defaults to 8");
+    checkEq(adc.LsbFirst(), false, "lsbFirst defaults to false");
+    check(adc.Error() == nil, "a good device starts with no error");
+    checkEq(len(sim.configs), 0, "nothing is configured before the first transfer");
+
+    Console.WriteLine("[ full-duplex exchange with an MCP3008 ]");
+    iter (ch from 0 to 8) {
+        let rx = adc.Transfer(mcpFrame(ch));
+        check(rx != nil && len(rx) == 3, "channel " + str(ch) + " returns three bytes");
+        checkEq(mcpValue(rx), sim.adc[ch], "channel " + str(ch) + " value");
+    }
+    checkEq(len(sim.configs), 1, "the device is configured once");
+    let cfg = sim.configs[0];
+    check(cfg["device"] == "/dev/spidev0.0" && cfg["mode"] == 0 && cfg["bits"] == 8 && cfg["lsbFirst"] == false,
+          "  with the object's settings");
+    checkEq(sim.last["speedHz"], 1000000, "every transfer carries the clock rate");
+
+    let fast = new Spi(0, 0, { backend: sim, mode: 3, speedHz: 8000000, lsbFirst: true });
+    fast.Transfer(mcpFrame(0));
+    let c2 = sim.configs[len(sim.configs) - 1];
+    check(c2["mode"] == 3 && c2["lsbFirst"] == true, "mode and bit order reach Configure");
+    checkEq(sim.last["speedHz"], 8000000, "speedHz reaches Transfer");
+
+    Console.WriteLine("[ loopback: Transfer, Write, Read ]");
+    let loop = new Spi(0, 1, { backend: sim });
+    check(sameBytes(loop.Transfer([1, 2, 254, 255]), [1, 2, 254, 255]), "loopback returns what was sent");
+    check(loop.Write([7, 8]), "Write succeeds");
+    check(sameBytes(sim.last["tx"], [7, 8]), "  and sends its bytes");
+    check(sameBytes(loop.Read(3), [0, 0, 0]), "Read sends zeros by default");
+    check(sameBytes(loop.Read(2, 0xFF), [0xFF, 0xFF]), "Read sends the fill byte given");
+    let blk = Buffer.Create(2, 1);
+    Buffer.FromArray(blk, [0xA5, 0x5A]);
+    check(sameBytes(loop.Transfer(blk), [0xA5, 0x5A]), "Transfer accepts a block");
+
+    Console.WriteLine("[ bad settings never reach the bus ]");
+    let bads = [[{ mode: 4 }, "mode 4"], [{ mode: "1" }, "mode as a string"],
+                [{ speedHz: 0 }, "speedHz 0"], [{ speedHz: 1.5 }, "fractional speedHz"],
+                [{ bits: 0 }, "bits 0"], [{ bits: 33 }, "bits 33"],
+                [{ lsbFirst: "yes" }, "lsbFirst as a string"]];
+    let before = sim.calls;
+    let configsBefore = len(sim.configs);
+    foreach (b in bads) {
+        let opts = b[0];
+        opts["backend"] = sim;
+        let s = new Spi(0, 0, opts);
+        checkEq(s.ErrorKind(), "usage", "constructor reports " + b[1]);
+        check(s.Transfer([1]) == nil && s.ErrorKind() == "usage", "  and a transfer fails: " + b[1]);
+    }
+    let negative = new Spi(-1, 0, { backend: sim });
+    check(new Spi(nil, 0, { backend: sim }).ErrorKind() == "usage", "a nil bus is refused");
+    check(negative.Transfer([1]) == nil && negative.ErrorKind() == "usage", "a negative bus is refused");
+    checkEq(sim.calls, before, "no bad setting reached Transfer");
+    checkEq(len(sim.configs), configsBefore, "no bad setting reached Configure");
+
+    Console.WriteLine("[ bad arguments never reach the bus ]");
+    before = sim.calls;
+    check(loop.Transfer([]) == nil, "Transfer refuses nothing to send");
+    check(loop.Transfer([256]) == nil, "Transfer refuses a byte above 255");
+    check(loop.Transfer([1.0]) == nil, "Transfer refuses a float");
+    check(loop.Transfer("abc") == nil, "Transfer refuses a string");
+    check(loop.Transfer(nil) == nil, "Transfer refuses nil");
+    let big: [int] = [];
+    iter (i from 0 to 4097) { Array.Append(big, 0); }
+    check(loop.Transfer(big) == nil, "Transfer refuses more than 4096 bytes");
+    check(!loop.Write([]), "Write refuses nothing to send");
+    check(loop.Read(0) == nil, "Read refuses a count of 0");
+    check(loop.Read(4097) == nil, "Read refuses a count above 4096");
+    check(loop.Read(2, 300) == nil, "Read refuses a fill above 255");
+    checkEq(loop.ErrorKind(), "usage", "the failures are usage errors");
+    checkEq(sim.calls, before, "none of them reached the bus");
+
+    Console.WriteLine("[ word sizes ]");
+    let wide = new Spi(0, 1, { backend: sim, bits: 16 });
+    check(wide.Transfer([1, 2, 3]) == nil && wide.ErrorKind() == "usage", "16-bit words refuse an odd length");
+    check(sameBytes(wide.Transfer([1, 2, 3, 4]), [1, 2, 3, 4]), "16-bit words take whole words");
+    let wider = new Spi(0, 1, { backend: sim, bits: 24 });
+    check(wider.Transfer([1, 2]) == nil, "24-bit words need multiples of four bytes");
+    check(wider.Transfer([1, 2, 3, 4]) != nil, "  and accept them");
+
+    Console.WriteLine("[ bus errors ]");
+    let twelve = new Spi(0, 1, { backend: sim, bits: 12 });
+    let n0 = len(sim.configs);
+    check(twelve.Transfer([1, 2]) == nil, "a refused configuration fails the transfer");
+    checkEq(twelve.ErrorKind(), "config", "  with errorKind config");
+    twelve.Transfer([1, 2]);
+    checkEq(len(sim.configs), n0 + 2, "  and is tried again on the next call");
+
+    let missing = new Spi(1, 0, { backend: sim });
+    check(missing.Transfer([1]) == nil && missing.ErrorKind() == "bus", "a missing device is errorKind bus");
+    check(missing.Error() != nil, "  with a message");
+
+    let raising = new Spi(0, 0, { backend: new RaisingSpi() });
+    check(raising.Transfer([1]) == nil, "a backend that raises does not raise through Spi");
+    checkEq(raising.ErrorKind(), "io", "  it is reported as io");
+    check(String.Contains(raising.Error(), "clock stuck"), "  with the backend's message");
+
+    let short = new Spi(0, 0, { backend: new ShortSpi() });
+    check(short.Transfer([1, 2, 3]) == nil && short.ErrorKind() == "io", "too few bytes back is an io error");
+
+    check(loop.Transfer([9]) != nil && loop.Error() == nil && loop.ErrorKind() == nil,
+          "a successful call clears the error");
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + str(testsRun - testsFailed) + "/" + str(testsRun) + " passed");
+
+    // ===================================================================
+    // Benchmarks - library overhead over a simulated bus (no process spawn)
+    // ===================================================================
+    Console.WriteLine("");
+    benchSep();
+    Console.WriteLine("Benchmarks");
+    benchSep();
+    let frame = mcpFrame(2);
+    let block64: [int] = [];
+    iter (i from 0 to 64) { Array.Append(block64, i); }
+    bench("MCP3008 read (3-byte Transfer + decode)", fn() { _sink = _sink + mcpValue(adc.Transfer(frame)); }, 20000);
+    bench("Transfer 64 bytes", fn() { _sink = _sink + len(loop.Transfer(block64)); }, 20000);
+    bench("Read 32 bytes", fn() { _sink = _sink + len(loop.Read(32)); }, 20000);
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

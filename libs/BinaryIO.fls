@@ -40,6 +40,11 @@
 //   or call SetBigEndian(true), to switch.  Individual multi-byte methods obey
 //   the current setting.
 //
+// End of data: a BinaryReader past its block returns 0 (strings and blocks come
+// back short), so check BytesLeft() or IsEOF(). A BinaryStreamReader returns nil
+// at the end of the stream instead, and reads strings and byte runs exactly -
+// several reads when a socket or pipe delivers them in parts.
+//
 // Float methods (WriteF32 / WriteF64 / ReadF32 / ReadF64) work in safe mode -
 // they use Buffer.*FloatAt directly on the backing block (no --unsafe needed).
 //
@@ -799,75 +804,108 @@ class BinaryStreamReader
         _be = (bigEndian == true);
     }
 
-    fn ReadU8():int    { return Stream.ReadU8(_s); }
-    fn ReadI8():int    { let v:int = Stream.ReadU8(_s); return v >= 128 ? v - 256 : v; }
-    fn ReadBool():bool { return Stream.ReadU8(_s) != 0; }
-    fn ReadU16():int   { return Stream.ReadU16(_s, _be); }
-    fn ReadI16():int   { let v:int = Stream.ReadU16(_s, _be); return v >= 32768 ? v - 65536 : v; }
-    fn ReadU32():int   { return Stream.ReadU32(_s, _be); }
-    fn ReadI32():int   { let v:int = Stream.ReadU32(_s, _be); return v >= 2147483648 ? v - 4294967296 : v; }
-    fn ReadU64():int   { return Stream.ReadU64(_s, _be); }
-    fn ReadI64():int   { return Stream.ReadU64(_s, _be); }
+    fn ReadU8():int  { return Stream.ReadU8(_s); }
+    fn ReadU16():int { return Stream.ReadU16(_s, _be); }
+    fn ReadU32():int { return Stream.ReadU32(_s, _be); }
+    fn ReadU64():int { return Stream.ReadU64(_s, _be); }
+    fn ReadI64():int { return Stream.ReadU64(_s, _be); }
 
-    fn ReadU24():int {
-        let a:int = Stream.ReadU8(_s);
-        let b:int = Stream.ReadU8(_s);
-        let c:int = Stream.ReadU8(_s);
-        if (_be) { return (a << 16) | (b << 8) | c; }
-        return a | (b << 8) | (c << 16);
+    // The signed and derived reads pass nil through at the end of the stream.
+    fn ReadI8():int|nil {
+        let v = Stream.ReadU8(_s);
+        return v == nil ? nil : (v >= 128 ? v - 256 : v);
     }
-    fn ReadI24():int {
-        let v:int = ReadU24();
-        return v >= 8388608 ? v - 16777216 : v;
+    fn ReadBool():bool|nil {
+        let v = Stream.ReadU8(_s);
+        return v == nil ? nil : v != 0;
     }
-
-    fn ReadString():string {
-        let n:int = Stream.ReadU16(_s, _be);
-        if (n == 0) return "";
-        let buf:block = Stream.ReadBytes(_s, n);
-        return Buffer.ToString(buf);
+    fn ReadI16():int|nil {
+        let v = Stream.ReadU16(_s, _be);
+        return v == nil ? nil : (v >= 32768 ? v - 65536 : v);
+    }
+    fn ReadI32():int|nil {
+        let v = Stream.ReadU32(_s, _be);
+        return v == nil ? nil : (v >= 2147483648 ? v - 4294967296 : v);
     }
 
-    fn ReadCString():string {
+    fn ReadU24():int|nil {
+        let b = _readExact(3);
+        if (b == nil || len(b) < 3) { return nil; }
+        if (_be) { return (b[0] << 16) | (b[1] << 8) | b[2]; }
+        return b[0] | (b[1] << 8) | (b[2] << 16);
+    }
+    fn ReadI24():int|nil {
+        let v = ReadU24();
+        return v == nil ? nil : (v >= 8388608 ? v - 16777216 : v);
+    }
+
+    // Exactly n bytes, or fewer when the stream ends first; nil when it had
+    // already ended. Stream.ReadBytes hands over what has arrived, so a socket
+    // or pipe can take several reads to fill one run.
+    fn _readExact(n:int) {
+        let out = Stream.ReadBytes(_s, n);
+        if (out == nil) { return nil; }
+        while (len(out) < n) {
+            let more = Stream.ReadBytes(_s, n - len(out));
+            if (more == nil) { break; }
+            Buffer.Append(out, more);
+        }
+        return out;
+    }
+
+    fn ReadString():string|nil {
+        let n = Stream.ReadU16(_s, _be);
+        if (n == nil) { return nil; }
+        return ReadStringFixed(n);
+    }
+
+    fn ReadCString():string|nil {
+        let first = Stream.ReadU8(_s);
+        if (first == nil) { return nil; }
         let bytes:array = [];
-        let b:int = Stream.ReadU8(_s);
-        while (b != 0) {
+        let b = first;
+        while (b != nil && b != 0) { // an unterminated string runs to the end of the stream
             Array.Append(bytes, b);
             b = Stream.ReadU8(_s);
         }
+        if (len(bytes) == 0) { return ""; }
         let buf:block = Buffer.Create(len(bytes), 1);
         Buffer.FromArray(buf, bytes);
         return Buffer.ToString(buf);
     }
 
-    fn ReadStringFixed(n:int):string {
+    fn ReadStringFixed(n:int):string|nil {
         if (n == 0) return "";
-        let buf:block = Stream.ReadBytes(_s, n);
-        return Buffer.ToString(buf);
+        let buf = _readExact(n);
+        return buf == nil ? nil : Buffer.ToString(buf);
     }
 
-    fn ReadBytes(n:int):block { return Stream.ReadBytes(_s, n); }
+    fn ReadBytes(n:int):block|nil { return _readExact(n); }
 
-    fn Skip(n:int)    { Stream.Seek(_s, Stream.Tell(_s) + n); }
+    // Seeks where the stream can; a socket or pipe reads the bytes and drops them.
+    fn Skip(n:int) {
+        if (n <= 0 || Stream.Seek(_s, n, 1)) { return; }
+        var left:int = n;
+        while (left > 0) {
+            let b = Stream.ReadBytes(_s, left < 65536 ? left : 65536);
+            if (b == nil) { return; }
+            left -= len(b);
+        }
+    }
     fn Seek(pos:int)  { Stream.Seek(_s, pos); }
     fn Position():int { return Stream.Tell(_s); }
 
-    // Stream size is not known without seeking to end; IsEOF is conservative.
-    // For file-backed streams, use BinaryFileReader which knows total size.
-    fn IsEOF() : bool {
-        // Best-effort: attempt to peek; stream readers don't expose total size.
-        return false;  // conservative default; use BytesLeft() for file readers
+    // True once the stream has ended. On a socket or pipe this waits for the
+    // next byte, or for the peer to close.
+    fn IsEOF():bool { return Stream.Peek(_s) == nil; }
+
+    // Bytes left in a file; -1 for a stream with no known size.
+    fn BytesLeft():int {
+        let size = Stream.Size(_s);
+        return size == nil ? -1 : size - Stream.Tell(_s);
     }
 
-    // Stream total size is not available without seeking; returns -1 (unknown).
-    fn BytesLeft() : int { return -1; }
-
-    fn PeekU8() : int {
-        let pos:int = Stream.Tell(_s);
-        let v:int   = Stream.ReadU8(_s);
-        Stream.Seek(_s, pos);
-        return v;
-    }
+    fn PeekU8():int|nil { return Stream.Peek(_s); }
 
     fn Close() { Stream.Close(_s); }
 }

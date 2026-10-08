@@ -515,6 +515,56 @@ fn test_endian_omitted() {
     File.Delete(path);
 }
 
+global _bioPeer = nil;
+
+// A BinaryStreamReader returns nil once the stream has ended, and reads byte
+// runs exactly even when a socket delivers them in parts.
+fn test_stream_reader_end_and_parts() {
+    let path = Path.Combine(Os.TempDir(), "flaris_bio_stream_end.bin");
+    let w = new BinaryFileWriter(path);
+    w.WriteU16(5);
+    w.WriteBytes(Buffer.FromString("hello"));
+    w.WriteU8(7);
+    w.WriteU8(0x41);
+    w.WriteU8(0x42); // "AB" with no terminator
+    w.Close();
+    let r = new BinaryFileReader(path);
+    check("stream BytesLeft on a file", r.BytesLeft(), 10);
+    check("stream ReadString", r.ReadString(), "hello");
+    check("stream PeekU8 leaves the byte", r.PeekU8(), 7);
+    r.Skip(1);
+    check("stream ReadCString runs to the end", r.ReadCString(), "AB");
+    check("stream IsEOF at the end", r.IsEOF(), true);
+    check("stream ReadU8 at the end", r.ReadU8(), nil);
+    check("stream ReadBool at the end", r.ReadBool(), nil);
+    check("stream ReadI16 at the end", r.ReadI16(), nil);
+    check("stream ReadString at the end", r.ReadString(), nil);
+    check("stream ReadCString at the end", r.ReadCString(), nil);
+    r.Close();
+    File.Delete(path);
+
+    // Where the client connects: a dual-stack port 0 can be one held on 127.0.0.1 alone.
+    let srv = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(srv);
+    let port = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10));
+    let cli = Stream.Connect("tcp", "127.0.0.1", port);
+    Stream.WaitReadable(srv, 2000);
+    let acc = Stream.Accept(srv);
+    Stream.WaitReadable(acc, 1); // non-blocking from here: a read takes what has arrived
+    _bioPeer = cli;
+    Stream.WriteString(cli, "abc");
+    Fiber.Run(fn () { Fiber.Sleep(50); Stream.WriteString(_bioPeer, "defXYZ"); });
+    let sr = new BinaryStreamReader(acc);
+    let got = sr.ReadBytes(6);
+    check("stream ReadBytes across two parts", got == nil ? "nil" : Buffer.ToString(got), "abcdef");
+    check("stream PeekU8 on a socket", sr.PeekU8(), 88);
+    sr.Skip(2);
+    check("stream Skip on a socket", sr.ReadU8(), 90);
+    Stream.Close(cli);
+    Stream.Close(acc);
+    Stream.Close(srv);
+}
+
 // =============================================================================
 // 2.0 additional coverage
 // =============================================================================
@@ -962,6 +1012,7 @@ fn Main() {
     test_readstring_fixed_and_cstring();
     test_buffer_primitives();
     test_binary_float_io();
+    test_stream_reader_end_and_parts();
 
     test_benchmark();
 

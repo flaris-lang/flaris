@@ -104,12 +104,61 @@ fn test_routes() {
     pkEq("wildcard captures rest", r5.params["*"], "css/site.css");
 }
 
+global streamPeer = nil;
+
+// [client, accepted] over loopback; the accepted end reads non-blocking, so a
+// read takes what has arrived and the rest can come later.
+fn tcpPair() {
+    // Where the client connects: a dual-stack port 0 can be one held on 127.0.0.1 alone.
+    let srv = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(srv);
+    let port = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10));
+    let cli = Stream.Connect("tcp", "127.0.0.1", port);
+    Stream.WaitReadable(srv, 2000);
+    let acc = Stream.Accept(srv);
+    Stream.Close(srv);
+    Stream.WaitReadable(acc, 1);
+    return [cli, acc];
+}
+
+fn sendLater(text: string) {
+    Fiber.Run(fn () { Fiber.Sleep(50); Stream.WriteString(streamPeer, text); });
+}
+
+fn test_stream_reads() {
+    let p = tcpPair();
+    streamPeer = p[0];
+
+    Stream.WriteString(p[0], "abc");
+    sendLater("def");
+    let ex = HttpUtil.ReadExact(p[1], 6);
+    pkEq("ReadExact waits for the rest", ex == nil ? "nil" : Buffer.ToString(ex), "abcdef");
+
+    // A trailer after the last chunk is read too, so the next line is in step.
+    Stream.WriteString(p[0], "5\r\nhello\r\n6\r\n world\r\n0\r\nX-Sum: 1\r\n\r\nNEXT\n");
+    let body = HttpUtil.DecodeChunked(p[1]);
+    pkEq("DecodeChunked", body == nil ? "nil" : Buffer.ToString(body), "hello world");
+    pkEq("... reads the trailer", Stream.ReadLine(p[1]), "NEXT");
+
+    Stream.WriteString(p[0], "8\r\nchun");
+    sendLater("ked!\r\n0\r\n\r\n");
+    let split = HttpUtil.DecodeChunked(p[1]);
+    pkEq("a chunk that arrives in two parts", split == nil ? "nil" : Buffer.ToString(split), "chunked!");
+
+    Stream.WriteString(p[0], "3\r\nabcXX\r\n0\r\n\r\n");
+    pk("anything but CRLF after the chunk data is malformed", HttpUtil.DecodeChunked(p[1]) == nil);
+
+    Stream.Close(p[0]);
+    Stream.Close(p[1]);
+}
+
 fn Main() {
     test_url();
     test_codecs();
     test_query();
     test_headers();
     test_routes();
+    test_stream_reads();
     Console.WriteLine("Results: ", passed, " passed, ", failed, " failed");
     if (failed > 0) { return 1; }
     return 0;

@@ -5,12 +5,10 @@ Stream.OpenSerial cannot tell this from a real modem, so tests/test_modem.fls
 drives the whole library - including the parts that only misbehave against a
 device - without hardware and without --unsafe.
 
-Prints the slave tty path on stdout as its first line, then serves until it is
-killed. A test harness reads that line and hands the path to the VM:
-
-    python3 tests/fake_modem.py &
-    PORT=$(head -1 ...)
-    VM tests/test_modem.fls --libs=./libs -- "$PORT"
+Prints the slave tty path on stdout as its first line, then serves until its
+stdin closes (or until it is killed, when stdin is a terminal). test_modem.fls
+starts it with a pipe for stdin and reads that first line, so the fake never
+outlives the test.
 
 Answers are deliberately awkward where a real modem is awkward: +CSQ arrives
 split across two writes (a line routinely lands in two reads on a real port),
@@ -20,6 +18,7 @@ is injected mid-command so URC handling is exercised against a reply in flight.
 
 import os
 import pty
+import select
 import sys
 import termios
 import time
@@ -50,8 +49,7 @@ def respond(fd, cmd):
         return                                    # silent: the caller must time out
     if cmd == "AT+SLOW":
         # answers late, so a cancel reliably lands while the reply is still
-        # owed. Cancelling here used to desynchronise the stream for good:
-        # every later command read the previous one's answer.
+        # owed and the next command has to read past it.
         time.sleep(0.4)
         os.write(fd, b"\r\n+SLOW: 1\r\n\r\nOK\r\n")
         return
@@ -96,12 +94,17 @@ def main():
     os.set_blocking(master, False)
     print(os.ttyname(slave), flush=True)
 
+    watch = [master] if os.isatty(0) else [master, 0]
     buf = b""
     while True:
+        ready, _, _ = select.select(watch, [], [])
+        if 0 in ready and not os.read(0, 4096):
+            break
+        if master not in ready:
+            continue
         try:
             chunk = os.read(master, 4096)
         except BlockingIOError:
-            time.sleep(0.005)
             continue
         except OSError:
             break

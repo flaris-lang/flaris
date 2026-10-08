@@ -1,0 +1,930 @@
+// test_smtp.fls - Tests for Smtp.fls
+// Run: flarisvm tests/test_smtp.fls --libs='./libs'
+//
+// The message builder, the authentication tokens and the failure paths need
+// nothing installed: they run against fake servers on loopback. The live part
+// is skipped unless you point it at a mail server of your own, through these
+// environment variables:
+//
+//   SMTP_TEST_HOST      the server's name or address              (required)
+//   SMTP_TEST_PORT      its port                                  (default 1025)
+//   SMTP_TEST_USER      login name                                (default alice)
+//   SMTP_TEST_PASSWORD  password                                  (default secret)
+//   SMTP_TEST_TLS       "auto", "none", "starttls" or "implicit"  (default auto)
+//   SMTP_TEST_API       a Mailpit API base URL, e.g. http://127.0.0.1:8025;
+//                       when set, every sent message is read back and checked
+//
+// The easiest server is Mailpit in Docker, which stores what it receives and
+// serves it over HTTP:
+//
+//   docker run -d --name flaris-mail -p 1025:1025 -p 8025:8025 axllent/mailpit \
+//       --smtp-auth-accept-any --smtp-auth-allow-insecure --smtp-disable-rdns
+//   SMTP_TEST_HOST=127.0.0.1 SMTP_TEST_API=http://127.0.0.1:8025 \
+//       flarisvm tests/test_smtp.fls --libs='./libs'
+//
+// Use a server you own: the test deliberately sends test mail to addresses
+// under .test and logs in with the credentials you give it.
+
+import { SmtpClient, SmtpMessage, SmtpAuth, Dkim } from library("Smtp", "1.0");
+import { Http } from library("Http", "1.0");
+import { Util } from library("Util", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+// ---- addresses --------------------------------------------------------------
+
+fn test_addresses() {
+    Console.WriteLine("== addresses ==");
+    let a = SmtpMessage.Address("bob@x.test");
+    checkEq(a.address, "bob@x.test", "bare address");
+    checkEq(a.name, nil, "bare address has no name");
+
+    let b = SmtpMessage.Address("Bob Smith <bob@x.test>");
+    checkEq(b.address, "bob@x.test", "display-name form: address");
+    checkEq(b.name, "Bob Smith", "display-name form: name");
+
+    let c = SmtpMessage.Address("\"Smith, Bob\" <bob@x.test>");
+    checkEq(c.name, "Smith, Bob", "quoted display name is unquoted");
+
+    let d = SmtpMessage.Address({ address: " carol@x.test ", name: "Carol" });
+    checkEq(d.address, "carol@x.test", "object form is trimmed");
+    checkEq(d.name, "Carol", "object form keeps the name");
+
+    checkEq(SmtpMessage.Address("no-at-sign"), nil, "missing @ is rejected");
+    checkEq(SmtpMessage.Address("@x.test"), nil, "empty local part is rejected");
+    checkEq(SmtpMessage.Address("bob@"), nil, "empty domain is rejected");
+    checkEq(SmtpMessage.Address("bob@x.test\r\nRCPT TO:<evil@x.test>"), nil, "CRLF injection is rejected");
+    checkEq(SmtpMessage.Address({ name: "Nobody" }), nil, "object without address is rejected");
+    checkEq(SmtpMessage.Address(42), nil, "a number is not an address");
+    checkEq(SmtpMessage.Address(nil), nil, "nil is not an address");
+
+    checkEq(SmtpMessage.Recipients({ to: "a@x.test", cc: ["b@x.test", "c@x.test"], bcc: "d@x.test" }),
+            ["a@x.test", "b@x.test", "c@x.test", "d@x.test"], "recipients in to, cc, bcc order");
+    checkEq(SmtpMessage.Recipients({ to: "a@x.test", cc: "broken" }), nil, "one bad recipient fails the list");
+}
+
+// ---- the builder ------------------------------------------------------------
+
+const FIXED = { date: "Tue, 30 Sep 2026 10:00:00 +0000", messageId: "<fixed@x.test>" };
+
+fn build(fields) {
+    let m = { date: FIXED.date, messageId: FIXED.messageId };
+    foreach (k in Object.Keys(fields)) { m[k] = fields[k]; }
+    return SmtpMessage.Build(m);
+}
+
+fn headerOf(rendered: string, name: string) {
+    let head = String.Substr(rendered, 0, String.IndexOf(rendered, "\r\n\r\n"));
+    foreach (l in String.Split(head, "\r\n")) {
+        if (String.StartsWith(l, name + ": ")) { return String.Substr(l, String.Length(name) + 2); }
+    }
+    return nil;
+}
+
+fn test_builder() {
+    Console.WriteLine("== builder ==");
+    let m = build({ from: "Alice <alice@x.test>", to: "bob@x.test", subject: "Hello", text: "Body line" });
+    check(m != nil, "text message builds");
+    checkEq(headerOf(m, "From"), "Alice <alice@x.test>", "From header");
+    checkEq(headerOf(m, "To"), "bob@x.test", "To header");
+    checkEq(headerOf(m, "Subject"), "Hello", "ASCII subject as is");
+    checkEq(headerOf(m, "Date"), FIXED.date, "Date override");
+    checkEq(headerOf(m, "Message-ID"), FIXED.messageId, "Message-ID override");
+    checkEq(headerOf(m, "MIME-Version"), "1.0", "MIME-Version");
+    checkEq(headerOf(m, "Content-Type"), "text/plain; charset=utf-8", "single text part");
+    checkEq(headerOf(m, "Content-Transfer-Encoding"), "7bit", "ASCII body stays 7bit");
+    check(String.EndsWith(m, "\r\nBody line\r\n"), "body ends the message with CRLF");
+    check(!String.Contains(m, "Bcc"), "no Bcc header");
+
+    // Generated values when not overridden.
+    let g = SmtpMessage.Build({ from: "a@x.test", to: "b@x.test", text: "x" });
+    let id = headerOf(g, "Message-ID");
+    check(id != nil && String.StartsWith(id, "<") && String.EndsWith(id, "@x.test>"), "generated Message-ID uses the sender's domain");
+    let g2 = SmtpMessage.Build({ from: "a@x.test", to: "b@x.test", text: "x" });
+    check(headerOf(g2, "Message-ID") != id, "Message-IDs are unique");
+    check(Time.Parse(headerOf(g, "Date"), "%a, %d %b %Y %H:%M:%S %z") != nil, "generated Date parses as RFC 5322");
+
+    // Non-ASCII goes through RFC 2047 in headers and base64 in bodies.
+    let u = build({ from: { address: "a@x.test", name: "Åsa" }, to: "b@x.test", subject: "Hej världen", text: "räksmörgås" });
+    checkEq(headerOf(u, "Subject"), "=?UTF-8?B?" + Util.Base64Encode("Hej världen") + "?=", "UTF-8 subject is an encoded word");
+    checkEq(headerOf(u, "From"), "=?UTF-8?B?" + Util.Base64Encode("Åsa") + "?= <a@x.test>", "UTF-8 display name is encoded");
+    checkEq(headerOf(u, "Content-Transfer-Encoding"), "base64", "UTF-8 body goes base64");
+    check(String.Contains(u, "\r\n\r\n" + Util.Base64Encode("räksmörgås") + "\r\n"), "base64 body content");
+
+    // Display names that need quoting.
+    let q = build({ from: "a@x.test", to: { address: "b@x.test", name: "Smith, Bob" }, text: "x" });
+    checkEq(headerOf(q, "To"), "\"Smith, Bob\" <b@x.test>", "a comma in the name is quoted");
+
+    // Several recipients, cc, reply-to, extra headers.
+    let r = build({ from: "a@x.test", to: ["b@x.test", "Carol <c@x.test>"], cc: "d@x.test", replyTo: "e@x.test",
+                    headers: { "X-Priority": "1", "X-Mailer": "Flaris" }, text: "x" });
+    checkEq(headerOf(r, "To"), "b@x.test, Carol <c@x.test>", "several To addresses");
+    checkEq(headerOf(r, "Cc"), "d@x.test", "Cc header");
+    checkEq(headerOf(r, "Reply-To"), "e@x.test", "Reply-To header");
+    checkEq(headerOf(r, "X-Priority"), "1", "extra header");
+    checkEq(headerOf(r, "X-Mailer"), "Flaris", "second extra header");
+    checkEq(build({ from: "a@x.test", to: "b@x.test", headers: { "X-Bad": "a\r\nInjected: yes" }, text: "x" }), nil, "header injection is refused");
+
+    // Required fields.
+    checkEq(SmtpMessage.Build({ to: "b@x.test", text: "x" }), nil, "no from -> nil");
+    checkEq(SmtpMessage.Build({ from: "a@x.test", text: "x" }), nil, "no recipient -> nil");
+    checkEq(SmtpMessage.Build({ from: "bad", to: "b@x.test", text: "x" }), nil, "bad from -> nil");
+    checkEq(SmtpMessage.Build(nil), nil, "nil message -> nil");
+    check(SmtpMessage.Build({ from: "a@x.test", bcc: "b@x.test" }) != nil, "bcc alone is a recipient");
+    let empty = SmtpMessage.Build({ from: "a@x.test", to: "b@x.test" });
+    check(empty != nil && String.EndsWith(empty, "7bit\r\n\r\n\r\n"), "no body at all is an empty text part");
+
+    // Long lines are made safe.
+    let long = build({ from: "a@x.test", to: "b@x.test", text: String.Repeat("y", 1200) });
+    checkEq(headerOf(long, "Content-Transfer-Encoding"), "quoted-printable", "a line over the limit goes quoted-printable");
+    let wrapped = String.Substr(long, String.IndexOf(long, "\r\n\r\n") + 4);
+    let maxLen = 0;
+    foreach (l in String.Split(wrapped, "\r\n")) { if (String.Length(l) > maxLen) { maxLen = String.Length(l); } }
+    checkEq(maxLen, 76, "soft breaks keep lines at 76 columns");
+    checkEq(String.Replace(String.Replace(wrapped, "=\r\n", ""), "\r\n", ""), String.Repeat("y", 1200), "soft breaks undo to the original");
+    let b64 = build({ from: "a@x.test", to: "b@x.test", text: String.Repeat("日本語テキスト", 20) });
+    checkEq(headerOf(b64, "Content-Transfer-Encoding"), "base64", "mostly non-ASCII text goes base64");
+
+    // Line endings are normalized.
+    let lf = build({ from: "a@x.test", to: "b@x.test", text: "one\ntwo\r\nthree" });
+    check(String.Contains(lf, "\r\none\r\ntwo\r\nthree\r\n"), "LF and CRLF both become CRLF");
+}
+
+fn test_multipart() {
+    Console.WriteLine("== multipart ==");
+    let alt = build({ from: "a@x.test", to: "b@x.test", text: "plain", html: "<b>rich</b>" });
+    let ct = headerOf(alt, "Content-Type");
+    check(String.StartsWith(ct, "multipart/alternative; boundary=\""), "text+html is multipart/alternative");
+    let b = String.Substr(ct, String.IndexOf(ct, "\"") + 1);
+    b = String.Substr(b, 0, String.Length(b) - 1);
+    checkEq(String.Count(alt, "--" + b), 3, "two parts and a closing boundary");
+    check(String.IndexOf(alt, "text/plain") < String.IndexOf(alt, "text/html"), "plain part comes first");
+    check(String.EndsWith(alt, "--" + b + "--\r\n"), "closing boundary ends the message");
+
+    let att = build({ from: "a@x.test", to: "b@x.test", text: "see attached",
+                      attachments: [{ name: "data.csv", content: "a,b\n1,2\n" },
+                                    { name: "blob.bin", content: _bytes([0, 1, 2]), type: "application/x-test" },
+                                    { name: "logo.png", content: "png", inline: "logo1" }] });
+    check(String.StartsWith(headerOf(att, "Content-Type"), "multipart/mixed; boundary=\""), "attachments make multipart/mixed");
+    check(String.Contains(att, "Content-Type: text/csv; name=\"data.csv\""), "type guessed from the extension");
+    check(String.Contains(att, "Content-Disposition: attachment; filename=\"data.csv\""), "attachment disposition");
+    check(String.Contains(att, "\r\n\r\n" + Util.Base64Encode("a,b\n1,2\n") + "\r\n"), "attachment content is base64");
+    check(String.Contains(att, "Content-Type: application/x-test; name=\"blob.bin\""), "explicit type wins");
+    check(String.Contains(att, "\r\n\r\nAAEC\r\n"), "block content is base64");
+    check(String.Contains(att, "Content-Disposition: inline; filename=\"logo.png\""), "inline disposition");
+    check(String.Contains(att, "Content-ID: <logo1>"), "inline part carries a Content-ID");
+    check(String.Contains(att, "Content-Type: text/plain; charset=utf-8"), "the text body is the first part");
+
+    let both = build({ from: "a@x.test", to: "b@x.test", text: "t", html: "<i>h</i>", attachments: [{ name: "n.txt", content: "n" }] });
+    check(String.Contains(both, "multipart/mixed") && String.Contains(both, "multipart/alternative"), "alternative nested inside mixed");
+    check(String.IndexOf(both, "multipart/mixed") < String.IndexOf(both, "multipart/alternative"), "mixed is the outer wrapper");
+
+    checkEq(build({ from: "a@x.test", to: "b@x.test", attachments: [{ content: "x" }] }), nil, "attachment without a name -> nil");
+    checkEq(build({ from: "a@x.test", to: "b@x.test", attachments: [{ name: "x", content: 7 }] }), nil, "attachment with a number as content -> nil");
+}
+
+fn test_fordata() {
+    Console.WriteLine("== DATA form ==");
+    let d = SmtpMessage.ForData("Subject: s\r\n\r\n.starts with dot\r\nplain\r\n..two dots\r\n");
+    check(String.Contains(d, "\r\n..starts with dot\r\n"), "leading dot is doubled");
+    check(String.Contains(d, "\r\n...two dots\r\n"), "two leading dots become three");
+    check(String.Contains(d, "\r\nplain\r\n"), "ordinary lines untouched");
+    check(String.EndsWith(d, "\r\n.\r\n"), "terminated by CRLF.CRLF");
+    checkEq(SmtpMessage.ForData("no trailing newline"), "no trailing newline\r\n.\r\n", "a missing final CRLF is added");
+}
+
+// ---- authentication tokens --------------------------------------------------
+
+fn test_auth_tokens() {
+    Console.WriteLine("== auth tokens ==");
+    checkEq(SmtpAuth.Plain("alice", "secret"), "AGFsaWNlAHNlY3JldA==", "AUTH PLAIN token");
+    checkEq(SmtpAuth.Plain("", ""), "AAA=", "empty PLAIN token is two NULs");
+
+    // RFC 2195 section 2: the published CRAM-MD5 example.
+    let challenge = Util.Base64Encode("<1896.697170952@postoffice.reston.mci.net>");
+    checkEq(Util.Base64DecodeString(SmtpAuth.CramMd5("tim", "tanstaaftanstaaf", challenge)),
+            "tim b913a602c7eda7a495b4e6e7334d3890", "CRAM-MD5 matches RFC 2195");
+    checkEq(SmtpAuth.CramMd5("tim", "x", "not base64!!"), nil, "bad challenge -> nil");
+    // RFC 2202 test case 2 for HMAC-MD5.
+    checkEq(SmtpAuth.HmacMd5("Jefe", Buffer.FromString("what do ya want for nothing?")), "750c783e6ab0b503eaa86e310a5db738", "HMAC-MD5 RFC 2202 vector");
+    // A key longer than the block is hashed first (RFC 2202 test case 6).
+    checkEq(SmtpAuth.HmacMd5(String.Repeat("\xaa", 80), Buffer.FromString("Test Using Larger Than Block-Size Key - Hash Key First")),
+            "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd", "HMAC-MD5 with an 80-byte key");
+
+    checkEq(Util.Base64DecodeString(SmtpAuth.XOAuth2("user@x.test", "ya29.token")),
+            "user=user@x.test\x01auth=Bearer ya29.token\x01\x01", "XOAUTH2 initial response");
+}
+
+// ---- encoders and folding ---------------------------------------------------
+
+fn test_encoders() {
+    Console.WriteLine("== encoders ==");
+    checkEq(SmtpMessage.QuotedPrintable("r\u00e4k"), "r=C3=A4k", "QP escapes UTF-8 bytes");
+    checkEq(SmtpMessage.QuotedPrintable("a=b"), "a=3Db", "QP escapes the equals sign");
+    checkEq(SmtpMessage.QuotedPrintable("end "), "end=20", "QP escapes a trailing space");
+    checkEq(SmtpMessage.QuotedPrintable("tab\t\nx"), "tab=09\r\nx", "QP escapes a trailing tab and keeps line breaks");
+    checkEq(SmtpMessage.QuotedPrintable("a \nb"), "a=20\r\nb", "trailing blank before a newline");
+    checkEq(SmtpMessage.QuotedPrintable("one\r\ntwo"), "one\r\ntwo", "CRLF is kept as one break");
+    checkEq(SmtpMessage.QuotedPrintable(""), "", "empty input");
+    let hundred = SmtpMessage.QuotedPrintable(String.Repeat("a", 100));
+    let qlines = String.Split(hundred, "\r\n");
+    checkEq(len(qlines), 2, "a 100-char line gets one soft break");
+    checkEq(String.Length(qlines[0]), 76, "soft-broken line is 76 wide including the =");
+    check(String.EndsWith(qlines[0], "="), "soft break marker");
+    let esc = SmtpMessage.QuotedPrintable(String.Repeat("=", 40));
+    foreach (l in String.Split(esc, "\r\n")) { check(String.Length(l) <= 76, "escaped sequences never straddle a break"); }
+
+    let short = SmtpMessage.EncodedWords("Hej v\u00e4rlden");
+    checkEq(short, "=?UTF-8?B?" + Util.Base64Encode("Hej v\u00e4rlden") + "?=", "one encoded word when it fits");
+    checkEq(SmtpMessage.EncodedWords("plain ascii"), "plain ascii", "ASCII is left alone");
+    let longSubject = String.Repeat("r\u00e4ksm\u00f6rg\u00e5s ", 12);   // 168 bytes, 3-byte boundaries everywhere
+    let ew = SmtpMessage.EncodedWords(longSubject);
+    let words = String.Split(ew, " ");
+    check(len(words) >= 4, "a long subject becomes several encoded words");
+    let joined = "";
+    let allShort = true;
+    foreach (w in words) {
+        if (String.Length(w) > 75) { allShort = false; }
+        check(String.StartsWith(w, "=?UTF-8?B?") && String.EndsWith(w, "?="), "encoded word shape");
+        let inner = String.Substr(w, 10, String.Length(w) - 12);
+        let dec = Util.Base64DecodeString(inner);
+        check(dec != nil, "every word decodes on its own");
+        joined = joined + (dec ?? "");
+    }
+    check(allShort, "no encoded word passes 75 characters");
+    checkEq(joined, longSubject, "the words concatenate back to the subject");
+
+    let many = [];
+    iter (i from 0 to 9) { Array.Append(many, "Recipient Number " + str(i) + " <recipient" + str(i) + "@example.test>"); }
+    let f = build({ from: "a@x.test", to: many, subject: String.Repeat("word ", 30), text: "x" });
+    let head = String.Substr(f, 0, String.IndexOf(f, "\r\n\r\n"));
+    let over = 0;
+    let continuation = 0;
+    foreach (l in String.Split(head, "\r\n")) {
+        if (String.Length(l) > 78) { over += 1; }
+        if (String.StartsWith(l, " ")) { continuation += 1; }
+    }
+    checkEq(over, 0, "no header line passes 78 columns");
+    check(continuation >= 3, "long headers were folded onto continuation lines");
+    let unfolded = String.Replace(head, "\r\n ", " ");
+    check(String.Contains(unfolded, "To: Recipient Number 0 <recipient0@example.test>, Recipient Number 1"), "unfolding restores the address list");
+    checkEq(SmtpMessage.FoldHeader("X-A", "short"), "X-A: short", "short header untouched");
+    let tok = SmtpMessage.FoldHeader("X-A", String.Repeat("z", 120) + " tail");
+    checkEq(tok, "X-A: " + String.Repeat("z", 120) + "\r\n tail", "an unbreakable token stays whole, the rest folds");
+}
+
+fn test_utf8_addresses() {
+    Console.WriteLine("== SMTPUTF8 ==");
+    checkEq(SmtpMessage.Address("\u00e5sa@x.test"), nil, "non-ASCII address refused by default");
+    let u = SmtpMessage.Address("\u00c5sa <\u00e5sa@x.test>", true);
+    check(u != nil && u.address == "\u00e5sa@x.test" && u.name == "\u00c5sa", "non-ASCII address accepted with utf8");
+    checkEq(SmtpMessage.NeedsUtf8({ from: "a@x.test", to: "\u00e5sa@x.test" }), true, "NeedsUtf8 sees a UTF-8 recipient");
+    checkEq(SmtpMessage.NeedsUtf8({ from: "a@x.test", to: "b@x.test", subject: "r\u00e4k" }), false, "a UTF-8 subject alone is not SMTPUTF8");
+    checkEq(SmtpMessage.Build({ from: "a@x.test", to: "\u00e5sa@x.test", text: "x" }), nil, "Build without smtputf8 refuses it");
+    let m = SmtpMessage.Build({ from: "a@x.test", to: "\u00e5sa@x.test", text: "x", date: FIXED.date, messageId: FIXED.messageId }, { smtputf8: true });
+    check(m != nil, "Build with smtputf8 accepts it");
+    checkEq(headerOf(m, "To"), "\u00e5sa@x.test", "the address goes into the header as raw UTF-8");
+    checkEq(SmtpMessage.Recipients({ to: "\u00e5sa@x.test" }, { smtputf8: true }), ["\u00e5sa@x.test"], "Recipients with smtputf8");
+}
+
+// ---- fake servers -----------------------------------------------------------
+
+// Every command line the fake servers read, in order, for assertions on the
+// exact wire form.
+global _received = [];
+
+fn lastReceived(prefix: string) {
+    let found = nil;
+    foreach (l in _received) { if (String.StartsWith(l, prefix)) { found = l; } }
+    return found;
+}
+
+fn countReceived(prefix: string): int {
+    let n = 0;
+    foreach (l in _received) { if (String.StartsWith(l, prefix)) { n += 1; } }
+    return n;
+}
+
+// A scripted server: every entry in `script` is one reply the server sends,
+// in order, after reading one line from the client (the first is sent as the
+// greeting without waiting). "close" hangs up, "silence" waits.
+global _nextPort = 0;
+
+fn fakeServer(script): int {
+    if (_nextPort == 0) { _nextPort = 45000 + Math.RandomInt(0, 2000); }
+    let ls = nil;
+    let port = 0;
+    let tries = 0;
+    while (ls == nil && tries < 20) {
+        port = _nextPort;
+        _nextPort += 1;
+        ls = Stream.Listen("tcp", port);
+        tries += 1;
+    }
+    if (ls == nil) { return 0; }
+    Fiber.Run(fn() {
+        if (Stream.WaitReadable(ls, 5000) != nil) {
+            let c = Stream.Accept(ls);
+            if (c != nil) {
+                let first = true;
+                let open = true;
+                let prev = "";
+                foreach (step in script) {
+                    if (!open) { break; }
+                    if (!first) {
+                        if (Stream.WaitReadable(c, 3000) == nil) { break; }
+                        let line = Stream.ReadLine(c);
+                        if (line == nil) { break; }
+                        Array.Append(_received, line);
+                        // After a 354 the body runs until the lone dot; swallow it.
+                        if (String.StartsWith(prev, "354")) {
+                            while (line != nil && line != ".") {
+                                if (Stream.WaitReadable(c, 3000) == nil) { break; }
+                                line = Stream.ReadLine(c);
+                                if (line != nil) { Array.Append(_received, line); }
+                            }
+                        }
+                    }
+                    first = false;
+                    prev = step;
+                    if (step == "next") {
+                        // Drop this client and serve the next connection.
+                        Stream.Close(c);
+                        c = nil;
+                        if (Stream.WaitReadable(ls, 5000) == nil) { open = false; break; }
+                        c = Stream.Accept(ls);
+                        if (c == nil) { open = false; break; }
+                        first = true;
+                        continue;
+                    }
+                    if (step == "close") { open = false; }
+                    else if (step == "silence") { Fiber.Sleep(1500); }
+                    else { Stream.WriteAll(c, step + "\r\n"); }
+                }
+                if (open) { Fiber.Sleep(100); }
+                if (c != nil) { Stream.Close(c); }
+            }
+        }
+        Stream.Close(ls);
+    });
+    Fiber.Sleep(20);
+    return port;
+}
+
+const EHLO_OK = "250-fake.test\r\n250-AUTH PLAIN LOGIN CRAM-MD5\r\n250 8BITMIME";
+const MSG = { from: "a@x.test", to: "b@x.test", subject: "t", text: "t" };
+
+fn test_fake_servers() {
+    Console.WriteLine("== fake servers ==");
+
+    let p1 = fakeServer(["HTTP/1.0 200 OK", "close"]);
+    let r1 = new SmtpClient("127.0.0.1", p1, { tls: "none", timeoutMs: 1000 }).Connect();
+    checkEq(r1.ok, false, "an HTTP server is not SMTP");
+    checkEq(r1.errorKind, "protocol", "HTTP server: protocol");
+
+    let p2 = fakeServer(["421 fake.test too busy", "close"]);
+    let r2 = new SmtpClient("127.0.0.1", p2, { tls: "none", timeoutMs: 1000 }).Connect();
+    checkEq(r2.errorKind, "protocol", "421 greeting: protocol");
+    check(String.Contains(r2.error, "too busy"), "421 greeting: server text is reported");
+
+    let p3 = fakeServer(["220 fake.test", EHLO_OK, "535 5.7.8 bad credentials", "535 5.7.8 bad credentials", "535 nope"]);
+    let r3 = new SmtpClient("127.0.0.1", p3, { tls: "none", user: "u", password: "p", timeoutMs: 1000 }).Connect();
+    checkEq(r3.errorKind, "auth", "rejected credentials: auth");
+    check(String.Contains(r3.error, "CRAM-MD5") && String.Contains(r3.error, "PLAIN"), "every offered mechanism was tried: " + str(r3.error));
+
+    let p4 = fakeServer(["220 fake.test", "silence"]);
+    let r4 = new SmtpClient("127.0.0.1", p4, { tls: "none", timeoutMs: 400 }).Connect();
+    checkEq(r4.errorKind, "timeout", "silent server: timeout");
+
+    let p5 = fakeServer(["220 fake.test", "close"]);
+    let r5 = new SmtpClient("127.0.0.1", p5, { tls: "none", timeoutMs: 1000 }).Connect();
+    checkEq(r5.errorKind, "closed", "hang-up after the greeting: closed");
+
+    let p6 = fakeServer(["220 fake.test", EHLO_OK, "close"]);
+    let r6 = new SmtpClient("127.0.0.1", p6, { tls: "starttls", timeoutMs: 1000 }).Connect();
+    checkEq(r6.errorKind, "tls", "STARTTLS required but not offered: tls");
+
+    let p7 = fakeServer(["220 fake.test", "250-fake.test\r\n250 STARTTLS", "454 4.7.0 TLS not available", "close"]);
+    let r7 = new SmtpClient("127.0.0.1", p7, { tls: "auto", timeoutMs: 1000 }).Connect();
+    checkEq(r7.errorKind, "tls", "STARTTLS refused by the server: tls");
+
+    let r8 = new SmtpClient("127.0.0.1", 1, { tls: "none", timeoutMs: 500 }).Connect();
+    checkEq(r8.errorKind, "connect", "nothing listening: connect");
+
+    // 192.0.2.1 (TEST-NET-1) is never routed: the connect stalls, or fails at once offline.
+    let t9 = Time.Millis();
+    let r8b = new SmtpClient("192.0.2.1", 25, { tls: "none", timeoutMs: 300 }).Connect();
+    checkEq(r8b.errorKind, "connect", "unreachable host: connect");
+    check(Time.Millis() - t9 < 3000, "... within timeoutMs");
+
+    // A complete session without AUTH, one recipient refused, one accepted.
+    let p9 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "550 5.1.1 no such user", "250 ok", "354 go", "250 queued as ABC123", "221 bye"]);
+    let c9 = new SmtpClient("127.0.0.1", p9, { tls: "none", timeoutMs: 1000 });
+    let r9 = c9.Send({ from: "a@x.test", to: ["nobody@x.test", "b@x.test"], subject: "t", text: "t" });
+    checkEq(r9.ok, true, "partial delivery still sends: " + str(r9.error));
+    checkEq(r9.id, "ABC123", "queue id parsed");
+    checkEq(r9.rejected, ["nobody@x.test"], "the refused recipient is listed");
+    checkEq(c9.Capabilities()["8BITMIME"], true, "capability without a value is true");
+    checkEq(c9.Capabilities()["AUTH"], "PLAIN LOGIN CRAM-MD5", "capability with a value keeps it");
+    c9.Close();
+
+    let p10 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "550 no", "250 reset"]);
+    let r10 = new SmtpClient("127.0.0.1", p10, { tls: "none", timeoutMs: 1000 }).Send(MSG);
+    checkEq(r10.errorKind, "rejected", "every recipient refused: rejected");
+    checkEq(r10.rejected, ["b@x.test"], "refused list");
+
+    let p11 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "552 5.3.4 message too big"]);
+    let r11 = new SmtpClient("127.0.0.1", p11, { tls: "none", timeoutMs: 1000 }).Send(MSG);
+    checkEq(r11.errorKind, "rejected", "message refused after DATA: rejected");
+    check(String.Contains(r11.error, "too big"), "refusal text is reported");
+
+    let bad = new SmtpClient("127.0.0.1", p11, { tls: "none" }).Send({ from: "a@x.test", text: "no recipient" });
+    checkEq(bad.errorKind, "rejected", "an unbuildable message never touches the network");
+
+    // CRAM-MD5 is chosen over PLAIN on a plain link, and the exchange is right.
+    let ch = Util.Base64Encode("<123@fake.test>");
+    let p12 = fakeServer(["220 fake.test", EHLO_OK, "334 " + ch, "235 ok", "221 bye"]);
+    let c12 = new SmtpClient("127.0.0.1", p12, { tls: "none", user: "tim", password: "tanstaaftanstaaf", timeoutMs: 1000 });
+    let r12 = c12.Connect();
+    checkEq(r12.ok, true, "CRAM-MD5 session authenticates");
+    checkEq(r12.encrypted, false, "plain link reported");
+    c12.Close();
+
+    let p13 = fakeServer(["220 fake.test", "250-fake.test\r\n250 AUTH LOGIN", "334 VXNlcm5hbWU6", "334 UGFzc3dvcmQ6", "235 ok", "221 bye"]);
+    let c13 = new SmtpClient("127.0.0.1", p13, { tls: "none", user: "u", password: "p", timeoutMs: 1000 });
+    checkEq(c13.Connect().ok, true, "AUTH LOGIN exchange");
+    c13.Close();
+
+    let p14 = fakeServer(["220 fake.test", "250 fake.test", "221 bye"]);
+    let r14 = new SmtpClient("127.0.0.1", p14, { tls: "none", user: "u", password: "p", timeoutMs: 1000 }).Connect();
+    checkEq(r14.errorKind, "auth", "credentials given but no AUTH offered: auth");
+
+    let p15 = fakeServer(["220 fake.test", "250 fake.test", "221 bye"]);
+    let c15 = new SmtpClient("127.0.0.1", p15, { tls: "none", timeoutMs: 1000 });
+    checkEq(c15.Connect().ok, true, "no credentials, no AUTH: fine");
+    checkEq(c15.IsConnected(), true, "IsConnected after Connect");
+    checkEq(c15.HasCapability("size"), false, "HasCapability is false for an unannounced extension");
+    c15.Close();
+    checkEq(c15.IsConnected(), false, "IsConnected after Close");
+}
+
+const EHLO_FULL = "250-fake.test\r\n250-SIZE 1000\r\n250-PIPELINING\r\n250-DSN\r\n250-SMTPUTF8\r\n250 8BITMIME";
+
+fn test_extensions() {
+    Console.WriteLine("== extensions ==");
+    _received = [];
+
+    // SMTPUTF8: refused up front when the server lacks it, sent as a MAIL
+    // parameter when it has it.
+    let p1 = fakeServer(["220 fake.test", EHLO_OK, "221 bye"]);
+    let r1 = new SmtpClient("127.0.0.1", p1, { tls: "none", timeoutMs: 1000 }).Send({ from: "a@x.test", to: "\u00e5sa@x.test", text: "x" });
+    checkEq(r1.errorKind, "rejected", "UTF-8 address without SMTPUTF8: rejected");
+    check(String.Contains(r1.error, "SMTPUTF8"), "the refusal names SMTPUTF8");
+    checkEq(lastReceived("MAIL"), nil, "nothing was sent for it");
+
+    _received = [];
+    let p2 = fakeServer(["220 fake.test", EHLO_FULL, "250 ok", "250 ok", "354 go", "250 queued as U1", "221 bye"]);
+    let c2 = new SmtpClient("127.0.0.1", p2, { tls: "none", timeoutMs: 1000 });
+    let r2 = c2.Send({ from: "a@x.test", to: "\u00e5sa@x.test", subject: "t", text: "t" });
+    checkEq(r2.ok, true, "UTF-8 address with SMTPUTF8 sends: " + str(r2.error));
+    let mail2 = lastReceived("MAIL FROM");
+    check(mail2 != nil && String.Contains(mail2, " SMTPUTF8"), "MAIL FROM carries SMTPUTF8: " + str(mail2));
+    check(mail2 != nil && String.Contains(mail2, " BODY=8BITMIME"), "MAIL FROM carries BODY=8BITMIME");
+    check(mail2 != nil && String.Contains(mail2, " SIZE="), "MAIL FROM carries SIZE when announced");
+    checkEq(lastReceived("RCPT TO"), "RCPT TO:<\u00e5sa@x.test>", "RCPT TO with the raw UTF-8 address");
+    checkEq(c2.HasCapability("pipelining"), true, "HasCapability is case-insensitive");
+    c2.Close();
+
+    // SIZE: too big is refused before MAIL FROM.
+    _received = [];
+    let p3 = fakeServer(["220 fake.test", EHLO_FULL, "221 bye"]);
+    let r3 = new SmtpClient("127.0.0.1", p3, { tls: "none", timeoutMs: 1000 }).Send({ from: "a@x.test", to: "b@x.test", text: String.Repeat("x", 2000) });
+    checkEq(r3.errorKind, "rejected", "over the SIZE limit: rejected");
+    check(String.Contains(r3.error, "exceeds the server limit of 1000"), "SIZE refusal names the limit");
+    checkEq(lastReceived("MAIL"), nil, "an oversized message is not offered");
+
+    // DSN parameters on MAIL FROM and RCPT TO, only when announced.
+    _received = [];
+    let p4 = fakeServer(["220 fake.test", EHLO_FULL, "250 ok", "250 ok", "250 ok", "354 go", "250 queued as D1", "221 bye"]);
+    let c4 = new SmtpClient("127.0.0.1", p4, { tls: "none", timeoutMs: 1000 });
+    let r4 = c4.Send({ from: "a@x.test", to: ["b@x.test", "c@x.test"], text: "t", dsn: { notify: ["success", "failure"], ret: "hdrs", envid: "job-42" } });
+    checkEq(r4.ok, true, "DSN send: " + str(r4.error));
+    let mail4 = lastReceived("MAIL FROM");
+    check(mail4 != nil && String.Contains(mail4, " RET=HDRS") && String.Contains(mail4, " ENVID=job-42"), "MAIL FROM carries RET and ENVID: " + str(mail4));
+    checkEq(lastReceived("RCPT TO:<c@"), "RCPT TO:<c@x.test> NOTIFY=SUCCESS,FAILURE", "RCPT TO carries NOTIFY");
+    checkEq(countReceived("RCPT TO"), 2, "one RCPT per recipient");
+    c4.Close();
+
+    _received = [];
+    let p5 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as D2", "221 bye"]);
+    let r5 = new SmtpClient("127.0.0.1", p5, { tls: "none", timeoutMs: 1000 }).Send({ from: "a@x.test", to: "b@x.test", text: "t", dsn: { notify: "never" } });
+    checkEq(r5.ok, true, "dsn field is ignored without the extension");
+    checkEq(lastReceived("RCPT TO"), "RCPT TO:<b@x.test>", "no NOTIFY when DSN is not announced");
+    check(!String.Contains(lastReceived("MAIL FROM"), "SIZE="), "no SIZE parameter when not announced");
+
+    // PIPELINING: the whole envelope in one write, replies read in order.
+    _received = [];
+    let p6 = fakeServer(["220 fake.test", EHLO_FULL, "250 ok", "550 nobody", "250 ok", "354 go", "250 queued as P1", "221 bye"]);
+    let c6 = new SmtpClient("127.0.0.1", p6, { tls: "none", timeoutMs: 1000 });
+    let r6 = c6.Send({ from: "a@x.test", to: ["nobody@x.test", "b@x.test"], text: "t" });
+    checkEq(r6.ok, true, "pipelined send: " + str(r6.error));
+    checkEq(r6.id, "P1", "pipelined queue id");
+    checkEq(r6.rejected, ["nobody@x.test"], "pipelined refused recipient");
+    c6.Close();
+
+    let p7 = fakeServer(["220 fake.test", EHLO_FULL, "550 bad sender", "503 no sender", "503 no sender", "250 reset"]);
+    let r7 = new SmtpClient("127.0.0.1", p7, { tls: "none", timeoutMs: 1000 }).Send(MSG);
+    checkEq(r7.errorKind, "rejected", "pipelined sender refusal: rejected");
+    check(String.Contains(r7.error, "bad sender"), "pipelined sender refusal text");
+    checkEq(lastReceived("RSET"), "RSET", "RSET after a pipelined refusal");
+
+    let p8 = fakeServer(["220 fake.test", EHLO_FULL, "250 ok", "550 no", "354 go", "554 no valid recipients", "250 reset"]);
+    let r8 = new SmtpClient("127.0.0.1", p8, { tls: "none", timeoutMs: 1000 }).Send(MSG);
+    checkEq(r8.errorKind, "rejected", "pipelined: every recipient refused");
+    checkEq(r8.rejected, ["b@x.test"], "pipelined refused list");
+
+    // Certificate pinning needs an encrypted link.
+    let r9 = new SmtpClient("127.0.0.1", p8, { tls: "none", serverCert: "ab" }).Connect();
+    checkEq(r9.errorKind, "tls", "serverCert with tls none: tls");
+    let p10 = fakeServer(["220 fake.test", EHLO_OK, "221 bye"]);
+    let r10 = new SmtpClient("127.0.0.1", p10, { tls: "auto", serverCert: "ab", timeoutMs: 1000 }).Connect();
+    checkEq(r10.errorKind, "tls", "serverCert on a server without STARTTLS: tls");
+    check(String.Contains(r10.error, "serverCert"), "the pin error names the option");
+}
+
+// ---- DKIM -------------------------------------------------------------------
+
+// RFC 8463 Appendix A: the Ed25519 key from RFC 8032 test 1 and the signed message.
+const RFC8463_SEED   = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
+const RFC8463_PUBLIC = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+const RFC8463_MESSAGE =
+    "DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed;\r\n" +
+    " d=football.example.com; i=@football.example.com;\r\n" +
+    " q=dns/txt; s=brisbane; t=1528637909; h=from : to :\r\n" +
+    " subject : date : message-id : from : subject : date;\r\n" +
+    " bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;\r\n" +
+    " b=/gCrinpcQOoIfuHNQIbq4pgh9kyIK3AQUdt9OdqQehSwhEIug4D11Bus\r\n" +
+    " Fa3bT3FY5OsU7ZbnKELq+eXdp1Q1Dw==\r\n" +
+    "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n" +
+    " d=football.example.com; i=@football.example.com;\r\n" +
+    " q=dns/txt; s=test; t=1528637909; h=from : to : subject :\r\n" +
+    " date : message-id : from : subject : date;\r\n" +
+    " bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;\r\n" +
+    " b=F45dVWDfMbQDGHJFlXUNB2HKfbCeLRyhDXgFpEL8GwpsRe0IeIixNTe3\r\n" +
+    " DhCVlUrSjV4BwcVcOF6+FF3Zo9Rpo1tFOeS9mPYQTnGdaSGsgeefOsk2Jz\r\n" +
+    " dA+L10TeYt9BgDfQNZtKdN1WO//KgIqXP7OdEFE4LjFYNcUxZQ4FADY+8=\r\n" +
+    "From: Joe SixPack <joe@football.example.com>\r\n" +
+    "To: Suzie Q <suzie@shopping.example.net>\r\n" +
+    "Subject: Is dinner ready?\r\n" +
+    "Date: Fri, 11 Jul 2003 21:00:37 -0700 (PDT)\r\n" +
+    "Message-ID: <20030712040037.46341.5F8J@football.example.com>\r\n" +
+    "\r\n" +
+    "Hi.\r\n" +
+    "\r\n" +
+    "We lost the game.  Are you hungry yet?\r\n" +
+    "\r\n" +
+    "Joe.\r\n";
+
+fn test_dkim() {
+    Console.WriteLine("== DKIM ==");
+    // Canonicalization on its own.
+    checkEq(Dkim.CanonicalHeader("Subject", "  Is   dinner\r\n ready?  ", "relaxed"), "subject:Is dinner ready?", "relaxed header canonicalization");
+    checkEq(Dkim.CanonicalHeader("Subject", " x", "simple"), "Subject: x", "simple header canonicalization keeps the value");
+    checkEq(Dkim.CanonicalBody("Hi.\r\n\r\nWe lost the game.  Are you hungry yet?  \r\n\r\nJoe.\r\n\r\n\r\n", "relaxed"),
+            "Hi.\r\n\r\nWe lost the game. Are you hungry yet?\r\n\r\nJoe.\r\n", "relaxed body canonicalization");
+    checkEq(Dkim.CanonicalBody("\r\n\r\n", "relaxed"), "", "an empty body canonicalizes to nothing");
+    checkEq(Dkim.CanonicalBody("x", "simple"), "x\r\n", "simple body gets its final CRLF");
+    let bodyStart = String.IndexOf(RFC8463_MESSAGE, "\r\n\r\n") + 4;
+    let bh = Util.Base64Encode(_sha256Block(Dkim.CanonicalBody(String.Substr(RFC8463_MESSAGE, bodyStart), "relaxed")));
+    checkEq(bh, "2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=", "body hash matches RFC 8463");
+
+    // The RFC's own signature verifies with the RFC's public key.
+    let v = Dkim.Verify(RFC8463_MESSAGE, RFC8463_PUBLIC);
+    checkEq(v.ok, true, "RFC 8463 Ed25519 signature verifies: " + str(v.error));
+    checkEq(v.domain, "football.example.com", "verified domain");
+    checkEq(v.selector, "brisbane", "verified selector");
+    checkEq(Dkim.Verify(RFC8463_MESSAGE, String.Repeat("00", 32)).ok, false, "a different key fails");
+    let tampered = String.Replace(RFC8463_MESSAGE, "Are you hungry yet?", "Are you hungry now?");
+    let tv = Dkim.Verify(tampered, RFC8463_PUBLIC);
+    checkEq(tv.ok, false, "a changed body fails");
+    checkEq(tv.error, "body hash mismatch", "and says why");
+    let tsub = String.Replace(RFC8463_MESSAGE, "Is dinner ready?", "Is dinner ready!");
+    checkEq(Dkim.Verify(tsub, RFC8463_PUBLIC).ok, false, "a changed signed header fails");
+    let lf = String.Replace(RFC8463_MESSAGE, "\r\n", "\n");
+    checkEq(Dkim.Verify(lf, RFC8463_PUBLIC).ok, true, "LF line ends are normalized before verifying");
+    checkEq(Dkim.Verify("no headers here", RFC8463_PUBLIC).ok, false, "no header block");
+    let unsigned = Dkim.Verify(build({ from: "a@x.test", to: "b@x.test", text: "x" }), RFC8463_PUBLIC);
+    checkEq(unsigned.error, "no DKIM-Signature header", "unsigned message is reported as such");
+
+    // Signing with the seed + public key, then with the 64-byte secret.
+    let signer = new Dkim({ domain: "football.example.com", selector: "brisbane", key: RFC8463_SEED, publicKey: RFC8463_PUBLIC });
+    checkEq(signer.PublicKey(), RFC8463_PUBLIC, "public key round-trips to base64");
+    checkEq(signer.DnsRecord(), "v=DKIM1; k=ed25519; p=" + RFC8463_PUBLIC, "DNS record text");
+    checkEq(signer.DnsName(), "brisbane._domainkey.football.example.com", "DNS record name");
+    let msg = build({ from: "Joe SixPack <joe@football.example.com>", to: "Suzie Q <suzie@shopping.example.net>",
+                      subject: "Is dinner ready?", text: "Hi.\n\nWe lost the game.  Are you hungry yet?\n\nJoe." });
+    let signed = signer.Sign(msg, 1528637909);
+    let sigHead = String.Substr(signed, 0, String.IndexOf(signed, "\r\nDate:"));
+    check(String.StartsWith(String.Replace(sigHead, "\r\n ", " "), "DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed; d=football.example.com; s=brisbane; t=1528637909;"), "signature header shape");
+    foreach (l in String.Split(sigHead, "\r\n")) { check(String.Length(l) <= 78, "signature header lines are folded: " + str(String.Length(l))); }
+    check(String.Contains(String.Replace(sigHead, "\r\n ", " "), " h=from:to:subject:date:message-id:mime-version:content-type:from;"), "signed header list with From oversigned");
+    check(String.Contains(sigHead, " bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;"), "same body hash as the RFC for the same body");
+    let sv = Dkim.Verify(signed, RFC8463_PUBLIC);
+    checkEq(sv.ok, true, "our signature verifies: " + str(sv.error));
+    checkEq(Dkim.Verify(String.Replace(signed, "Joe.", "Jim."), RFC8463_PUBLIC).ok, false, "our signature catches a body change");
+    checkEq(Dkim.Verify(String.Replace(signed, "Subject: Is", "Subject: is"), RFC8463_PUBLIC).ok, false, "our signature catches a header change");
+    checkEq(Dkim.Verify(signed + "extra\r\n", RFC8463_PUBLIC).ok, false, "appended body text is caught");
+    let unfolded = String.Replace(signed, "\r\n ", " ");
+    checkEq(Dkim.Verify(unfolded, RFC8463_PUBLIC).ok, true, "a relay that unfolds the headers keeps it valid");
+
+    let kp = Crypto.Ed25519KeyPair();
+    let s2 = new Dkim({ domain: "X.test", selector: "s1", key: kp.SecretKey, expireSeconds: 3600 });
+    let signed2 = s2.Sign(msg);
+    check(String.Contains(signed2, "; d=x.test; s=s1;"), "domain is lowercased");
+    check(String.Contains(String.Replace(signed2, "\r\n ", " "), "; x="), "expiry tag present");
+    checkEq(Dkim.Verify(signed2, kp.PublicKey).ok, true, "signing with a generated 64-byte key verifies");
+    checkEq(Dkim.Verify(signed2, RFC8463_PUBLIC).ok, false, "and not with another key");
+    check(Dkim.Verify(signed2, "short").error != nil, "a bad public key is an error, not a crash");
+
+    let bad = 0;
+    try { new Dkim({ domain: "x.test", selector: "s", key: "nope" }); } catch (e) { bad += 1; }
+    try { new Dkim({ selector: "s", key: kp.SecretKey }); } catch (e) { bad += 1; }
+    checkEq(bad, 2, "unusable key or missing domain raise at construction");
+}
+
+fn _sha256Block(s: string) {
+    let hex = Hash.Sha256(s);
+    let b = Buffer.Create(32, 1);
+    iter (i from 0 to 32) { Buffer.WriteU8At(b, i, Convert.ParseRadix(String.Substr(hex, i * 2, 2), 16)); }
+    return b;
+}
+
+// ---- shortcuts, async, one-shot, reconnect ----------------------------------
+
+fn test_shortcuts() {
+    Console.WriteLine("== shortcuts ==");
+    let m = build({ from: "a@x.test", to: "b@x.test", text: "x", inReplyTo: "abc@x.test", references: ["<r1@x.test>", "r2@x.test"],
+                    priority: "high", listUnsubscribe: ["https://x.test/unsub?u=1", "mailto:unsub@x.test"] });
+    checkEq(headerOf(m, "In-Reply-To"), "<abc@x.test>", "In-Reply-To gets its brackets");
+    checkEq(headerOf(m, "References"), "<r1@x.test> <r2@x.test>", "References list");
+    checkEq(headerOf(m, "X-Priority"), "1", "high priority");
+    checkEq(headerOf(m, "Importance"), "high", "Importance header");
+    checkEq(headerOf(m, "List-Unsubscribe"), "<https://x.test/unsub?u=1>, <mailto:unsub@x.test>", "List-Unsubscribe");
+    checkEq(headerOf(m, "List-Unsubscribe-Post"), "List-Unsubscribe=One-Click", "one-click marker for an https link");
+    let low = build({ from: "a@x.test", to: "b@x.test", text: "x", priority: "low", listUnsubscribe: "mailto:u@x.test" });
+    checkEq(headerOf(low, "X-Priority"), "5", "low priority");
+    checkEq(headerOf(low, "List-Unsubscribe-Post"), nil, "no one-click marker for mailto only");
+    let none = build({ from: "a@x.test", to: "b@x.test", text: "x" });
+    checkEq(headerOf(none, "X-Priority"), nil, "no priority header by default");
+}
+
+fn async test_session_features() {
+    Console.WriteLine("== session features ==");
+    _received = [];
+    let p1 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as A1", "221 bye"]);
+    let c1 = new SmtpClient("127.0.0.1", p1, { tls: "none", timeoutMs: 1000 });
+    let f = c1.SendAsync(MSG);
+    let r1 = await f;
+    checkEq(r1.ok, true, "SendAsync resolves to the Send result: " + str(r1.error));
+    checkEq(r1.id, "A1", "SendAsync queue id");
+    c1.Close();
+
+    let p2 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as O1", "221 bye"]);
+    let r2 = SmtpClient.SendOne("127.0.0.1", p2, { tls: "none", timeoutMs: 1000 }, MSG);
+    checkEq(r2.ok, true, "SendOne: " + str(r2.error));
+    checkEq(lastReceived("QUIT"), "QUIT", "SendOne quits afterwards");
+
+    // The server drops the session after the first message; the second
+    // reconnects once and goes through.
+    _received = [];
+    let p3 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as R1", "next",
+                         "220 fake.test again", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as R2", "221 bye"]);
+    let c3 = new SmtpClient("127.0.0.1", p3, { tls: "none", timeoutMs: 1000 });
+    checkEq(c3.Send(MSG).id, "R1", "first message on the session");
+    let r3 = c3.Send(MSG);
+    checkEq(r3.ok, true, "second message after the server hung up: " + str(r3.error));
+    checkEq(r3.id, "R2", "delivered on the reopened session");
+    checkEq(countReceived("EHLO"), 2, "exactly one reconnect");
+    c3.Close();
+
+    // A server that keeps hanging up is reported, not retried forever.
+    let p4 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as R1", "next", "220 again", EHLO_OK, "close"]);
+    let c4 = new SmtpClient("127.0.0.1", p4, { tls: "none", timeoutMs: 1000 });
+    c4.Send(MSG);
+    let r4 = c4.Send(MSG);
+    checkEq(r4.errorKind, "closed", "a second hang-up is reported as closed");
+
+    // DKIM through the client: the signature header travels in DATA.
+    _received = [];
+    let signer = new Dkim({ domain: "x.test", selector: "s1", key: RFC8463_SEED, publicKey: RFC8463_PUBLIC });
+    let p5 = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as K1", "221 bye"]);
+    let r5 = SmtpClient.SendOne("127.0.0.1", p5, { tls: "none", timeoutMs: 1000, dkim: signer }, MSG);
+    checkEq(r5.ok, true, "send with dkim: " + str(r5.error));
+    let sigLine = lastReceived("DKIM-Signature:");
+    check(sigLine != nil && String.Contains(sigLine, "d=x.test"), "DKIM-Signature header was sent: " + str(sigLine));
+}
+
+// ---- live -------------------------------------------------------------------
+
+fn apiMessages(api: string) {
+    let r = Http.Get(api + "/api/v1/messages");
+    if (r == nil || r.status != 200) { return nil; }
+    return Json.Parse(r.body);
+}
+
+fn apiRaw(api: string, id: string): string {
+    let r = Http.Get(api + "/api/v1/message/" + id + "/raw");
+    return (r == nil) ? "" : r.body;
+}
+
+fn test_live() {
+    let host = Os.Getenv("SMTP_TEST_HOST");
+    if (host == nil || host == "") {
+        Console.WriteLine("== live: skipped (SMTP_TEST_HOST not set) ==");
+        return;
+    }
+    Console.WriteLine("== live ==");
+    let port = int(Os.Getenv("SMTP_TEST_PORT") ?? "1025");
+    let user = Os.Getenv("SMTP_TEST_USER") ?? "alice";
+    let password = Os.Getenv("SMTP_TEST_PASSWORD") ?? "secret";
+    let tls = Os.Getenv("SMTP_TEST_TLS") ?? "auto";
+    let api = Os.Getenv("SMTP_TEST_API");
+    if (api != nil && api == "") { api = nil; }
+    if (api != nil) { Http.Delete(api + "/api/v1/messages"); }
+
+    let c = new SmtpClient(host, port, { user: user, password: password, tls: tls, insecure: true, timeoutMs: 10000 });
+    let r = c.Connect();
+    checkEq(r.ok, true, "live connect: " + str(r.error));
+    if (!r.ok) { return; }
+    if (r.encrypted) {
+        let pc = c.PeerCert();
+        check(pc != nil && pc.sha256 != nil && String.Length(pc.sha256) == 64, "PeerCert reports a SHA-256 fingerprint");
+        if (pc != nil) {
+            let pinned = new SmtpClient(host, port, { user: user, password: password, tls: tls, serverCert: pc.sha256, timeoutMs: 10000 });
+            checkEq(pinned.Connect().ok, true, "connect with the right serverCert pin");
+            pinned.Close();
+            let wrong = new SmtpClient(host, port, { user: user, password: password, tls: tls, serverCert: String.Repeat("0", 64), timeoutMs: 10000 });
+            let rw = wrong.Connect();
+            checkEq(rw.errorKind, "tls", "connect with a wrong serverCert pin: tls");
+            check(String.Contains(rw.error, "mismatch"), "pin mismatch is named");
+        }
+    }
+    Console.WriteLine("  encrypted=", r.encrypted, " capabilities=", Object.Keys(r.capabilities));
+    checkEq(c.IsEncrypted(), r.encrypted, "IsEncrypted agrees with the Connect result");
+    if (tls == "none")                          { checkEq(r.encrypted, false, "tls none: plain link"); }
+    if (tls == "starttls" || tls == "implicit") { checkEq(r.encrypted, true, "tls " + tls + ": encrypted link"); }
+    if (tls == "auto" && port == 465)           { checkEq(r.encrypted, true, "tls auto on 465: implicit TLS"); }
+
+    let tag = _hex8();
+    let s1 = c.Send({ from: "Flaris Test <flaris@x.test>", to: ["one@x.test", "Two <two@x.test>"], cc: "three@x.test", bcc: "four@x.test",
+                      subject: "Live " + tag + " räksmörgås", text: "Plain text " + tag, html: "<p>HTML <b>" + tag + "</b></p>",
+                      attachments: [{ name: "notes.txt", content: "attached " + tag }] });
+    checkEq(s1.ok, true, "live send 1: " + str(s1.error));
+    check(s1.ok && s1.id != nil && s1.id != "", "live send 1 returns a queue id");
+
+    let s2 = c.Send({ from: "flaris@x.test", to: "five@x.test", subject: "Second " + tag, text: ".leading dot\nsecond " + tag });
+    checkEq(s2.ok, true, "live send 2 over the same session: " + str(s2.error));
+    c.Close();
+
+    let kp = Crypto.Ed25519KeyPair();
+    let signer = new Dkim({ domain: "x.test", selector: "live", key: kp.SecretKey });
+    let s3 = SmtpClient.SendOne(host, port, { user: user, password: password, tls: tls, insecure: true, timeoutMs: 10000, dkim: signer },
+                                { from: "flaris@x.test", to: "six@x.test", subject: "Signed " + tag, text: "signed body\r\nwith two lines", html: "<p>signed</p>" });
+    checkEq(s3.ok, true, "live signed send: " + str(s3.error));
+
+    if (api == nil) { return; }
+    Fiber.Sleep(300);
+    let list = apiMessages(api);
+    check(list != nil, "API reachable");
+    if (list == nil) { return; }
+    checkEq(list.total, 3, "all three messages stored");
+    let first = nil;
+    let second = nil;
+    let third = nil;
+    foreach (m in list.messages) {
+        if (String.StartsWith(m.Subject, "Live ")) { first = m; }
+        if (String.StartsWith(m.Subject, "Second ")) { second = m; }
+        if (String.StartsWith(m.Subject, "Signed ")) { third = m; }
+    }
+    check(first != nil && second != nil, "both messages found by subject");
+    if (first != nil) {
+        checkEq(first.Subject, "Live " + tag + " räksmörgås", "UTF-8 subject decoded by the server");
+        checkEq(first.From.Address, "flaris@x.test", "From address");
+        checkEq(first.From.Name, "Flaris Test", "From name");
+        checkEq(len(first.To), 2, "two To addresses");
+        checkEq(first.To[1].Name, "Two", "To display name");
+        checkEq(len(first.Cc), 1, "one Cc");
+        checkEq(len(first.Bcc), 1, "Bcc recipient delivered");
+        checkEq(first.Attachments, 1, "one attachment");
+        // Mailpit prepends its own Bcc header from the envelope, so the raw
+        // text is only checked for what the builder wrote.
+        let raw = apiRaw(api, first.ID);
+        check(String.Contains(raw, "multipart/mixed") && String.Contains(raw, "multipart/alternative"), "MIME structure kept");
+        check(String.Contains(raw, "filename=\"notes.txt\""), "attachment name kept");
+    }
+    if (second != nil) {
+        let raw2 = apiRaw(api, second.ID);
+        check(String.Contains(raw2, "\r\n.leading dot\r\n") || String.Contains(raw2, "\n.leading dot\n"), "dot-stuffing undone by the server");
+    }
+    if (third != nil) {
+        // Mailpit stores the message as received, so the signature must still
+        // verify against what it kept, apart from the headers it adds on top.
+        let raw3 = apiRaw(api, third.ID);
+        let dv = Dkim.Verify(raw3, kp.PublicKey);
+        checkEq(dv.ok, true, "DKIM signature verifies on the stored message: " + str(dv.error));
+    }
+    Http.Delete(api + "/api/v1/messages");
+}
+
+fn _bytes(arr) {
+    let b = Buffer.Create(len(arr), 1);
+    Buffer.FromArray(b, arr);
+    return b;
+}
+
+fn _hex8(): string {
+    let b = Crypto.RandomBytes(4);
+    let out = "";
+    iter (i from 0 to 4) {
+        let h = Convert.ToRadixString(Buffer.ReadU8At(b, i), 16);
+        out = out + ((String.Length(h) < 2) ? "0" + h : h);
+    }
+    return out;
+}
+
+// ---- benchmarks -------------------------------------------------------------
+
+fn run_benchmarks() {
+    Console.WriteLine("");
+    Console.WriteLine("== benchmarks ==");
+    benchSep();
+    let small = { from: "a@x.test", to: "b@x.test", subject: "Hello", text: "A short body." };
+    bench("Build: small text message", fn() { _sink += String.Length(SmtpMessage.Build(small)); }, 2000);
+    let rich = { from: "Alice <a@x.test>", to: ["b@x.test", "Carol <c@x.test>"], subject: "Report räksmörgås",
+                 text: String.Repeat("line of text\n", 50), html: "<p>" + String.Repeat("html ", 200) + "</p>",
+                 attachments: [{ name: "data.bin", content: Crypto.RandomBytes(4096) }] };
+    bench("Build: html + 4 KB attachment", fn() { _sink += String.Length(SmtpMessage.Build(rich)); }, 300);
+    let rendered = SmtpMessage.Build(rich);
+    bench("ForData: dot-stuff " + str(String.Length(rendered)) + " bytes", fn() { _sink += String.Length(SmtpMessage.ForData(rendered)); }, 300);
+    bench("Address: parse display-name form", fn() { _sink += len(SmtpMessage.Address("Bob Smith <bob@x.test>").address); }, 20000);
+    bench("Auth: PLAIN token", fn() { _sink += String.Length(SmtpAuth.Plain("alice", "secret")); }, 20000);
+    let ch = Util.Base64Encode("<1896.697170952@postoffice.reston.mci.net>");
+    bench("Auth: CRAM-MD5 answer", fn() { _sink += String.Length(SmtpAuth.CramMd5("tim", "tanstaaftanstaaf", ch)); }, 2000);
+    benchSep();
+}
+
+fn async Main() {
+    Console.WriteLine("=== Smtp tests ===");
+    test_addresses();
+    test_builder();
+    test_multipart();
+    test_fordata();
+    test_auth_tokens();
+    test_encoders();
+    test_utf8_addresses();
+    test_fake_servers();
+    test_extensions();
+    test_dkim();
+    test_shortcuts();
+    await test_session_features();
+    test_live();
+    run_benchmarks();
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: ", testsRun, "  failed: ", testsFailed);
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

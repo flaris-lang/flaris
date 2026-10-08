@@ -61,6 +61,8 @@
 //                                 HttpStatus.CombinedLogLine(entry)
 //   .Stop(timeoutMs?)           - stop accepting, then wait for in-flight
 //                                 requests to finish (default 5000 ms)
+//   .Port()                     - the port Listen bound, the real one when it
+//                                 was given 0; 0 until it has bound
 //
 //   Dispatch: patterns are split once at registration, not per request. A
 //   pattern with no ":param" and no "*" is answered from a map, so the route
@@ -698,7 +700,14 @@ class Router
         return route.chain;
     }
 
-    fn _dispatch(req) {
+    // Runs the matched pipeline. `res`, when the server passed one, gets the
+    // route phase closed here for its Server-Timing header.
+    fn _run(pipeline, req, res) {
+        if (res != nil) { res.Mark("route"); }
+        return pipeline.Run(req);
+    }
+
+    fn _dispatch(req, res?) {
         if (req == nil || req.method == nil || req.path == nil) {
             return Response.Error(400, "Bad Request");
         }
@@ -729,7 +738,7 @@ class Router
         if (hit != nil) {
             req.params = {};
             let pipeline = new _Pipeline(this._chainFor(hit), hit.handler);
-            return pipeline.Run(req);
+            return this._run(pipeline, req, res);
         }
 
         // Two passes for the same reason: host-scoped routes first, then the
@@ -742,7 +751,7 @@ class Router
                 if (hr.host != nil && hr.method == req.method
                     && _hostMatches(hr.host, host) && this._matchRoute(hr, segs, req)) {
                     let pipeline = new _Pipeline(this._chainFor(hr), hr.handler);
-                    return pipeline.Run(req);
+                    return this._run(pipeline, req, res);
                 }
                 hi += 1;
             }
@@ -756,7 +765,7 @@ class Router
                     let route = _routes[ri];
                     this._matchRoute(route, this._pathSegs(req.path), req);
                     let pipeline = new _Pipeline(this._chainFor(route), route.handler);
-                    return pipeline.Run(req);
+                    return this._run(pipeline, req, res);
                 }
             }
         } else {
@@ -766,7 +775,7 @@ class Router
                 if (route.host == nil && route.method == req.method
                     && this._matchRoute(route, segs, req)) {
                     let pipeline = new _Pipeline(this._chainFor(route), route.handler);
-                    return pipeline.Run(req);
+                    return this._run(pipeline, req, res);
                 }
                 i += 1;
             }
@@ -781,7 +790,7 @@ class Router
             ? _notFound
             : fn(_r) { return Response.Error(404, "Not Found"); };
         let pipeline = new _Pipeline(_middleware, terminal);
-        return pipeline.Run(req);
+        return this._run(pipeline, req, res);
     }
 
     // ---- server loop ----
@@ -789,8 +798,10 @@ class Router
     // Serves on HttpServer. Every request arrives through OnRequest, so Router
     // owns dispatch, middleware and 404 handling.
     // opts are passed straight through to HttpServer, so everything it offers -
-    // tls, streamBodies, maxConnections, the timeouts - is reachable from here:
+    // tls, streamBodies, maxConnections, the timeouts, timing - is reachable
+    // from here:
     //   app.Listen(8443, { tls: { pkcs12File: "s.p12", password: "..." } });
+    //   app.Listen(8080, { timing: true });   // Server-Timing: read, route, handler
     fn Listen(port:int, opts?) {
         Console.WriteLine("Router listening on port ", port);
         let o = opts ?? {};
@@ -822,9 +833,13 @@ class Router
                 // something the client controls.
                 peer:    req.peer,
                 secure:  req.secure,
-                body:    req.Text()
+                body:    req.Text(),
+                // The HttpRequest itself, for a handler that needs the body as
+                // bytes (`native.body` is a block; a string stops at NUL) or
+                // its streaming reads.
+                native:  req
             };
-            let r = this._dispatch(plain);
+            let r = this._dispatch(plain, res);
             if (r == nil) {
                 res.Status(500).Text("Internal Server Error");
                 return;
@@ -873,6 +888,10 @@ class Router
         });
 
         srv.Listen();
+    }
+
+    fn Port(): int {
+        return (this._server == nil) ? 0 : this._server.Port();
     }
 
     // Stop accepting and wait for the requests in flight to finish.
@@ -1342,13 +1361,24 @@ class JwtMiddleware
     let _secret:string   = "";
     let _skipPaths:array = [];
     let _claimOpts        = nil;
+    let _cache            = nil;   // token -> { payload, exp }; nil when cacheSize is 0
+    let _cacheSize:int    = 0;
+    let _cacheCount:int   = 0;
 
-    // options: { leeway:int, requireExp:bool }
+    // options: { leeway:int, requireExp:bool, cacheSize:int }
+    //
+    // cacheSize keeps that many verified tokens so a repeat request skips the
+    // base64 and JSON work of a verify (about 6 ms on a 650 MHz router). A hit
+    // still enforces the token's expiry; only the signature check is reused,
+    // which is sound because the same bytes and secret verify the same way
+    // every time. Default 0: verify every request.
     fn Constructor(secret:string, skipPaths, options?) {
         _secret    = secret;
         _skipPaths = (skipPaths == nil) ? [] : skipPaths;
 
         let o = options ?? nil;
+        _cacheSize = (o != nil && Object.HasKey(o, "cacheSize")) ? o.cacheSize : 0;
+        if (_cacheSize > 0) { _cache = {}; }
         // exp and nbf are always enforced when the token carries them - that is
         // the entire point of giving a bearer token a lifetime. requireExp goes
         // further and refuses a token with no expiry at all.
@@ -1375,6 +1405,18 @@ class JwtMiddleware
 
         let token = String.Substr(auth, len(prefix), len(auth) - len(prefix));
 
+        if (_cache != nil) {
+            let hit = Object.TryGet(_cache, token, nil);
+            if (hit != nil) {
+                if (hit.exp == nil || Time.Now() < hit.exp + _claimOpts.leeway) {
+                    req.jwt = hit.payload;
+                    return next(req);
+                }
+                Object.Delete(_cache, token);
+                _cacheCount = _cacheCount - 1;
+            }
+        }
+
         // Decode ONCE. Decoding is the expensive half of a verify (base64 plus
         // two JSON parses), and this used to pay it twice: once inside
         // VerifyHS256WithClaims and again to read the payload for req.jwt.
@@ -1385,6 +1427,14 @@ class JwtMiddleware
         // token a credential that never expires, including any that have leaked.
         if (!Jwt.VerifyDecodedHS256(decoded, _secret, _claimOpts)) {
             return Response.Error(401, "Invalid or expired token");
+        }
+
+        if (_cache != nil) {
+            // Full, so drop everything: tokens are few and long-lived, and a
+            // refill costs one verify each.
+            if (_cacheCount >= _cacheSize) { _cache = {}; _cacheCount = 0; }
+            _cache[token] = { payload: decoded.payload, exp: Object.TryGet(decoded.payload, "exp", nil) };
+            _cacheCount = _cacheCount + 1;
         }
 
         req.jwt = decoded.payload;

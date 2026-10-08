@@ -44,8 +44,8 @@ optional JIT IR side-channel (a conforming VM may ignore it; see §3.7).
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `SYS_VERSION` / `CHUNK_VERSION` | `0x01000400` (1.0.4.0) | version written into produced chunks |
-| `MIN_SUPPORTED_BYTECODE_VERSION` | `0x01000300` (1.0.3.0) | oldest chunk version a loader MUST accept |
+| `SYS_VERSION` / `CHUNK_VERSION` | `0x01000500` (1.0.5.0) | version written into produced chunks |
+| `MIN_SUPPORTED_BYTECODE_VERSION` | `0x01000500` (1.0.5.0) | oldest chunk version a loader MUST accept |
 | `DEFAULT_LIB_VERSION` | `0x01000000` | default module version when unspecified |
 
 Version words pack four bytes `major.minor.patch.revision`, most-significant byte
@@ -58,8 +58,10 @@ numbers stable and only bump `SYS_VERSION` (older VMs reject the newer files via
 the version ceiling; 1.0.0.9 appended `OP_CONCAT_N` and `OP_NIL_LOCAL`, 1.0.2.0
 appended `OP_CALL_WITH_THIS` and `OP_OBJ_ARITH_L`, all this way; 1.0.3.0 inserted
 `OP_USHR` after `OP_SHR` and raised the floor to 1.0.3.0; 1.0.4.0 added the
-optional import-table chunk section, §5.5, bumping only `SYS_VERSION`). A loader MUST
-reject a chunk whose version is below the floor or above its own `SYS_VERSION`.
+optional import-table chunk section, §5.5, and removed `OP_DBG_FUNC_NAME`, raising
+the floor to 1.0.4.0; 1.0.5.0 made the `OP_ITER_NEXT` and `OP_JUMP_TABLE` targets
+relative, §6.6, raising the floor to 1.0.5.0). A loader MUST reject a chunk whose
+version is below the floor or above its own `SYS_VERSION`.
 
 ---
 
@@ -433,7 +435,7 @@ Magic is the four ASCII bytes `FLS2`. Total header size: 192 bytes
 | 72 | 4 | `codeEnd` | u32 | = `mainSectionEnd` in the current writer |
 | 76 | 4 | `mainSectionEnd` | u32 | |
 | 80 | 2 | — | | reserved; MUST be zero, a reader MUST reject nonzero |
-| 82 | 1 | `sigAlg` | u8 | 0 = unsigned, 1 = retired legacy Ed25519 (MUST be rejected), 2 = Ed25519 (§5.3). Any other value MUST be rejected |
+| 82 | 1 | `sigAlg` | u8 | 0 = unsigned, 1 and 2 = retired schemes (MUST be rejected), 3 = Ed25519 (§5.3). Any other value MUST be rejected |
 | 83 | 1 | — | | reserved; MUST be zero, a reader MUST reject nonzero |
 | 84 | 32 | `pubkey` | raw | Ed25519 public key; all-zero when unsigned |
 | 116 | 64 | `signature` | raw | Ed25519 signature; all-zero when unsigned |
@@ -447,8 +449,10 @@ extensibility only.
 
 ### 5.3 Signature and trust
 
-**Algorithm.** Ed25519 (as in RFC 8032; the reference implementation uses
-Monocypher). The 64-byte secret key is `seed ‖ pubkey`.
+**Algorithm.** Ed25519 as in RFC 8032, with SHA-512. The 64-byte secret key
+is `seed ‖ pubkey`; a signer derives the public half from the seed, so the
+header always carries the key this scheme gives that seed. Scheme 2 used the
+same curve arithmetic with BLAKE2b in place of SHA-512 and is retired.
 
 **Signed content.** `digest = SHA-256( file[0..116) ‖ 64 zero bytes ‖
 file[180..EOF) )` — the entire file with the 64-byte signature field masked to
@@ -472,11 +476,11 @@ the **complete final file including the signature** — identical to
 one of: `UNSIGNED` (sigAlg 0, key/sig fields zero), `VALID` (cryptographically
 valid, signer not trusted), `TRUSTED` (valid and signer key in the trust set),
 `BAD` (signature check failed), `STRIPPED` (sigAlg 0 but key/signature bytes
-nonzero — tamper evidence), `UNSUPPORTED` (sigAlg 1 or any unknown value).
+nonzero — tamper evidence), `UNSUPPORTED` (sigAlg 1, 2 or any unknown value).
 `BAD`, `STRIPPED` and `UNSUPPORTED` MUST always be rejected. `UNSIGNED` and
 `VALID` are rejected only under `--require-signed`. All rejects exit with code
 4. The reference trust set is one built-in anchor (`flaris-lang.org`,
-`b6e2237413be79854985a1d4650ddefca8bc9c517964e6b9814b887bc6b779be`) plus
+`d43ec4260fe82ee101a939caabff95358b0698718d7b8c38652b5457bdf59621`) plus
 `~/.flaris/trusted_keys` (path override `$FLARIS_TRUSTED_KEYS`; one
 `hex64 [label]` per line, `#` comments, ≤ 256 keys, unreadable file = fail
 closed).
@@ -718,7 +722,7 @@ Every opcode appears in exactly one row, in opcode-number order within the row.
 | 9 | `EXPORT` (aliasIdx:u16 nameIdx:u16 type:u32), `CMP_JUMP_LC32`, `PUSH_HOST`, `CALL0_HOST`, `CALL1_HOST`, `CALL2_HOST`, `CALL3_HOST`, `CALL4_HOST`, `CALL5_HOST` (host forms: modHash:u32 fnHash:u32, rewritten in place to one member pointer at load) |
 | 11 | `INVOKE_MEMBER` (key:u16 argc:u8 mode:u8 classIdGuard:u32 idx:u16 — the last three fields are runtime-managed cache, emitted as zero) |
 | 13 | `INVOKE_GLOBAL_CACHED` (globalKey:u16 methodKey:u16 argc:u8 mode:u8 classIdGuard:u32 idx:u16 — cache fields as in INVOKE_MEMBER) |
-| var | `JUMP_TABLE` = 12 + 2·size: `min:i32 max:i32 size:u8`, then size × `caseAddr:u16`, then `defaultAddr:u16` (all addresses absolute). `FN_CAPTURE` = 4 + 3·count: `fnIdx:u16 count:u8`, then count × (`nameConstIdx:u16 parentSlot:u8`) |
+| var | `JUMP_TABLE` = 12 + 2·size: `min:i32 max:i32 size:u8`, then size × `caseOff:u16`, then `defaultOff:u16` (each a distance forward from the first table entry). `FN_CAPTURE` = 4 + 3·count: `fnIdx:u16 count:u8`, then count × (`nameConstIdx:u16 parentSlot:u8`) |
 
 ### 6.6 Branch-target computation
 
@@ -727,10 +731,11 @@ operand byte.
 
 - `OP_JUMP`, `OP_JUMP_IF_FALSE`, `OP_JUMP_IF_TRUE`,
   `OP_CMP_JUMP_LL/LC/LC32`: `target = base + off` (forward).
-- `OP_LOOP`: `target = base − off` (backward).
-- `OP_ITER_BEGIN`, `OP_ITER_NEXT`, `OP_FOREACH`, `OP_TRY_BEGIN`
-  (`catchIp`/`finallyIp`), `OP_TRY_LEAVE`, `OP_JUMP_TABLE`: operands are
-  **absolute** code offsets within the chunk.
+- `OP_LOOP`, `OP_ITER_NEXT`: `target = base − off` (backward).
+- `OP_JUMP_TABLE`: every table entry is `target − tableStart`, where
+  `tableStart` is the offset of the first entry (forward).
+- `OP_ITER_BEGIN`, `OP_FOREACH`, `OP_TRY_BEGIN` (`catchIp`/`finallyIp`),
+  `OP_TRY_LEAVE`: operands are **absolute** code offsets within the chunk.
 
 ---
 
@@ -866,10 +871,11 @@ type (functions, classes, instances, fibers, …) → true. Traps: —
 **`OP_LOOP`** `<off:u16>` — 3 bytes. Unconditional **backward** branch; the
 mandatory loop back-edge checkpoint (quantum, §3.3). Traps: —
 
-**`OP_JUMP_TABLE`** `<min:i32> <max:i32> <size:u8> size×<case:addr:u16>
-<default:addr:u16>` — 12 + 2·size bytes. Stack `v →`. Coerces `v` to int;
+**`OP_JUMP_TABLE`** `<min:i32> <max:i32> <size:u8> size×<case:off:u16>
+<default:off:u16>` — 12 + 2·size bytes. Stack `v →`. Coerces `v` to int;
 if `min ≤ v ≤ max` and `v − min < size` jumps to `case[v − min]`, else to
-`default`. All targets absolute. A label repeated in the switch occupies its
+`default`. Every entry is the target's distance forward from the first
+table entry (§6.6). A label repeated in the switch occupies its
 table slot once, holding the FIRST body that declared it - the same case the
 comparison-chain lowering would run. Traps: —
 
@@ -1435,12 +1441,13 @@ nothing (the compiler accounts for this statically). Equivalent to
 
 ### 7.14a Host call shortcuts
 
-A host embedding the VM can publish native modules of its own
-(`FlarisRegisterModule`). Those modules are not in the builtin registry and
-have no index a chunk could carry — the registry is per process, and its
-ordering depends on the host, not on the program. A host call therefore
-carries the two 32-bit name hashes instead: `xxHash64(moduleName)` and
-`xxHash64(functionName)`, each truncated to its low 32 bits.
+A host embedding the VM can publish native modules of its own (in its host
+options, or with `FlarisRegisterModule` afterwards). Those modules are not in
+the builtin registry and have no index a chunk could carry — each host keeps
+its own registry, and its ordering depends on the host, not on the program. A
+host call therefore carries the two 32-bit name hashes instead:
+`xxHash64(moduleName)` and `xxHash64(functionName)`, each truncated to its low
+32 bits.
 
 **`OP_PUSH_HOST`** `<modHash:u32> <fnHash:u32>` — 9 bytes. Stack `→ f`.
 Pushes the host function the two hashes name. Traps: —
@@ -1543,9 +1550,10 @@ span wider than
 `MAX_ITER_SPAN` (2⁶⁰ steps) raises `InvalidArgs` — the *width* is refused,
 never the magnitude, so a short range at any magnitude is legal.
 
-**`OP_ITER_NEXT`** `<slot:u8> <endSlot:u8> <body:addr:u16>` — 5 bytes.
+**`OP_ITER_NEXT`** `<slot:u8> <endSlot:u8> <off:u16>` — 5 bytes.
 Stack `→`. If `local[slot] < local[endSlot]`: increments the slot and
-jumps to the absolute `body` address (quantum-checked back-edge);
+branches back `off` bytes to the body, like `OP_LOOP` (quantum-checked
+back-edge);
 otherwise falls through. The test is inclusive against the STORED bound,
 which is one less than the source range's upper bound — a counted loop
 decrements it once at entry (§ `OP_DEC_LOCAL`), so the language's
@@ -2249,8 +2257,8 @@ chunk, not inferred from the prose alone.
 
 ### D.14a Host call shortcuts (§7.14a)
 
-Only reachable in an embedding that registers its own native modules
-(`FlarisRegisterModule`) — not exercised by any `.fls` in this repo.
+Only reachable in an embedding that registers its own native modules (host
+options or `FlarisRegisterModule`) — not exercised by any `.fls` in this repo.
 
 | Code | Opcode(s) | Comment |
 | --- | --- | --- |

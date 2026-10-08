@@ -1,13 +1,30 @@
 // test_http.fls - Test suite for Http.fls stdlib
 //
-// Uses httpbin.org as the test server (plain HTTP on port 80).
-// Run: flarisvm test_http.fls
+// The network checks run against a local server, not the internet: the test
+// starts this same file a second time with "serve" (the Http client blocks the
+// scheduler, so client and server need two processes). The server answers the
+// httpbin.org endpoints the checks use - /get, /headers, /post, /put, /patch,
+// /delete, /anything, /status/<code>, /redirect/<n> and /json, plus
+// /delay/<ms> - on an ephemeral port. When openssl can make a self-signed
+// certificate it serves the same endpoints over https on a second port. It
+// prints "PORT=<n>" (and "TLSPORT=<n>") and stops when the test closes its
+// stdin.
+//
+// Run: flarisvm tests/test_http.fls --libs=./libs
 
+import { HttpServer } from library("HttpServer", "1.0");
 import { Http, Status, ContentType } from library("Http", "1.0");
 import { HttpUtil } from library("HttpUtil", "1.0");
 
+const TLS_PASSWORD = "testpass";
+
 global testsRun    = 0;
 global testsFailed = 0;
+
+global base    = "";    // http://127.0.0.1:<port>
+global tlsBase = nil;   // https://127.0.0.1:<port>, nil without a certificate
+global tmpDir  = "";    // certificate, wgetrc and wget downloads
+global server  = nil;   // the server child: { Pid, Stdin, Stdout, Stderr }
 
 fn check(cond, msg) {
     testsRun = testsRun + 1;
@@ -30,6 +47,158 @@ fn checkEq(actual, expected, msg) {
 fn statusOf(res)  { if (res == nil) { return -1; } return res.status; }
 fn bodyOf(res)    { if (res == nil) { return ""; } return res.body;   }
 fn headersOf(res) { if (res == nil) { return {}; } return res.headers; }
+
+// --------------------------------------------------------
+//  Server half: the httpbin endpoints the checks use
+// --------------------------------------------------------
+
+// "x-test-header" -> "X-Test-Header", the spelling httpbin reports.
+fn canonName(k: string): string {
+    let parts = String.Split(k, "-");
+    var out = "";
+    iter (i from 0 to len(parts)) {
+        let p = parts[i];
+        if (i > 0) { out += "-"; }
+        if (len(p) > 0) { out += String.ToUpper(String.Left(p, 1)) + String.Substr(p, 1); }
+    }
+    return out;
+}
+
+// What httpbin echoes back: the request as the server saw it.
+fn echo(req) {
+    let hdrs = {};
+    foreach (v, k in req.headers) { hdrs[canonName(k)] = v; }
+    return {
+        method:  req.method,
+        url:     (req.secure ? "https://" : "http://") + req.Header("host", "") + req.rawPath,
+        args:    req.query,
+        headers: hdrs,
+        json:    req.Json()
+    };
+}
+
+fn sendEcho(req, res)    { res.Json(echo(req)); }
+fn sendHeaders(req, res) { res.Json({ headers: echo(req).headers }); }
+fn sendStatus(req, res)  { res.Text("", Convert.ParseInt(req.Param("code")) ?? 400); }
+fn sendJson(_req, res)   { res.Json({ slideshow: { title: "Sample Slide Show", slides: 2 } }); }
+
+// /redirect/<n>: n hops of 302, the last one landing on /get.
+fn sendRedirect(req, res) {
+    let n = Convert.ParseInt(req.Param("n")) ?? 1;
+    res.Redirect(n > 1 ? "/redirect/" + str(n - 1) : "/get");
+}
+
+// /delay/<ms>: answer after ms milliseconds; only this connection waits.
+fn sendDelayed(req, res) {
+    Fiber.Sleep(Convert.ParseInt(req.Param("ms")) ?? 0);
+    res.Json(echo(req));
+}
+
+fn addRoutes(srv) {
+    srv.Get("/get", sendEcho);              // HEAD /get is answered by the same route
+    srv.Get("/headers", sendHeaders);
+    srv.Post("/post", sendEcho);
+    srv.Put("/put", sendEcho);
+    srv.Patch("/patch", sendEcho);
+    srv.Delete("/delete", sendEcho);
+    foreach (m in ["GET", "POST", "PUT", "PATCH", "DELETE", "QUERY"]) {
+        srv.Route(m, "/anything", sendEcho);
+    }
+    srv.Get("/status/:code", sendStatus);
+    srv.Post("/status/:code", sendStatus);
+    srv.Get("/redirect/:n", sendRedirect);
+    srv.Get("/json", sendJson);
+    srv.Get("/delay/:ms", sendDelayed);
+    return srv;
+}
+
+fn async serve(p12) {
+    let plain = addRoutes(new HttpServer({ port: 0, host: "127.0.0.1" }));
+    Console.WriteLine("PORT=" + str(plain.ListenAsync()));
+
+    let secure = nil;
+    if (p12 != nil) {
+        var tlsPort = 0;
+        try {
+            secure = addRoutes(new HttpServer({ port: 0, host: "127.0.0.1",
+                                                tls: { pkcs12File: p12, password: TLS_PASSWORD } }));
+            tlsPort = secure.ListenAsync();
+        } catch (e) {
+            secure = nil;   // this build cannot terminate TLS
+        }
+        Console.WriteLine("TLSPORT=" + str(tlsPort));
+    }
+
+    let stdin = Stream.Stdin();
+    var line = await Stream.ReadLineAsync(stdin);
+    while (line != nil) { line = await Stream.ReadLineAsync(stdin); }
+    plain.Stop(1000);
+    if (secure != nil) { secure.Stop(1000); }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Test half: start and stop the server child
+// --------------------------------------------------------
+
+fn vmPath(): string {
+    let vm = Os.GetEnv("FLARISVM");
+    return (vm == nil || vm == "") ? "flarisvm" : vm;
+}
+
+// A self-signed certificate for the https server. Returns the PKCS#12 path,
+// or nil when openssl is not available.
+fn makeCertificate(): string {
+    if (Os.Which("openssl") == nil) { return nil; }
+    let key  = Path.Combine(tmpDir, "key.pem");
+    let cert = Path.Combine(tmpDir, "cert.pem");
+    let p12  = Path.Combine(tmpDir, "server.p12");
+    Os.RunEx("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", key, "-out", cert,
+                         "-days", "2", "-nodes", "-subj", "/CN=localhost",
+                         "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], { Stdin: "" });
+    Os.RunEx("openssl", ["pkcs12", "-export", "-out", p12, "-inkey", key, "-in", cert,
+                         "-passout", "pass:" + TLS_PASSWORD], { Stdin: "" });
+    return File.Exists(p12) ? p12 : nil;
+}
+
+// Start the server child and set base (and tlsBase). Returns false if it never
+// reported its port.
+fn async startServer(): bool {
+    let p12 = makeCertificate();
+    let args = ["--libs=./libs", "tests/test_http.fls", "serve"];
+    if (p12 != nil) { Array.Append(args, p12); }
+    server = Os.Spawn(vmPath(), args);
+    if (server == nil) { return false; }
+
+    var port = 0;
+    var tlsPort = (p12 == nil) ? 0 : -1;
+    let deadline = Time.Millis() + 10000;
+    while ((port == 0 || tlsPort < 0) && Time.Millis() < deadline) {
+        let line = await Stream.ReadLineAsync(server.Stdout, deadline - Time.Millis());
+        if (line == nil) { break; }
+        if (String.StartsWith(line, "PORT="))    { port    = Convert.ParseInt(String.Substr(line, 5)) ?? 0; }
+        if (String.StartsWith(line, "TLSPORT=")) { tlsPort = Convert.ParseInt(String.Substr(line, 8)) ?? 0; }
+    }
+    if (port <= 0) { return false; }
+    base = "http://127.0.0.1:" + str(port);
+    if (tlsPort > 0) { tlsBase = "https://127.0.0.1:" + str(tlsPort); }
+    return true;
+}
+
+// Closing its stdin stops the server; reap it either way.
+fn async stopServer() {
+    if (server == nil) { return 0; }
+    Stream.Close(server.Stdin);
+    let w = await Os.WaitAsync(server.Pid, 5000);
+    if (w == nil || w.Alive) {
+        Os.KillChild(server.Pid, 9);
+        await Os.WaitAsync(server.Pid);
+    }
+    Stream.Close(server.Stdout);
+    Stream.Close(server.Stderr);
+    server = nil;
+    return 0;
+}
 
 // --------------------------------------------------------
 //  Constants (no network)
@@ -105,7 +274,7 @@ fn test_parse_url() {
 fn test_get() {
     Console.WriteLine("== GET ==");
 
-    let res = Http.Get("http://httpbin.org/get", nil);
+    let res = Http.Get(base + "/get", nil);
     check(res != nil,                 "get: response not nil");
     checkEq(statusOf(res), Status.OK, "get: status 200");
     check(headersOf(res) != nil,      "get: headers present");
@@ -114,11 +283,11 @@ fn test_get() {
     if (res != nil) {
         let json = Json.Parse(res.body);
         check(json != nil,                        "get: body is valid JSON");
-        checkEq(json.url, "http://httpbin.org/get", "get: url echoed");
+        checkEq(json.url, base + "/get", "get: url echoed");
     }
 
     // Optional headers - omit second arg entirely
-    let res2 = Http.Get("http://httpbin.org/get");
+    let res2 = Http.Get(base + "/get");
     check(res2 != nil,                  "get: omitted headers not nil");
     checkEq(statusOf(res2), Status.OK,  "get: omitted headers status 200");
     return 0;
@@ -132,7 +301,7 @@ fn test_get_headers() {
     Console.WriteLine("== GET custom headers ==");
 
     let hdrs = { "X-Test-Header": "flaris123", "Accept": "application/json" };
-    let res  = Http.Get("http://httpbin.org/headers", hdrs);
+    let res  = Http.Get(base + "/headers", hdrs);
     check(res != nil,                 "get headers: response not nil");
     checkEq(statusOf(res), Status.OK, "get headers: status 200");
 
@@ -154,7 +323,7 @@ fn test_post() {
     Console.WriteLine("== POST ==");
 
     let payload = Json.Stringify({ name: "flaris", value: 42 });
-    let res     = Http.Post("http://httpbin.org/post", payload, nil);
+    let res     = Http.Post(base + "/post", payload, nil);
     check(res != nil,                 "post: response not nil");
     checkEq(statusOf(res), Status.OK, "post: status 200");
 
@@ -177,7 +346,7 @@ fn test_put() {
     Console.WriteLine("== PUT ==");
 
     let payload = Json.Stringify({ id: 1, updated: true });
-    let res     = Http.Put("http://httpbin.org/put", payload, nil);
+    let res     = Http.Put(base + "/put", payload, nil);
     check(res != nil,                 "put: response not nil");
     checkEq(statusOf(res), Status.OK, "put: status 200");
 
@@ -198,7 +367,7 @@ fn test_patch() {
     Console.WriteLine("== PATCH ==");
 
     let payload = Json.Stringify({ field: "value", partial: true });
-    let res     = Http.Patch("http://httpbin.org/patch", payload, nil);
+    let res     = Http.Patch(base + "/patch", payload, nil);
     check(res != nil,                 "patch: response not nil");
     checkEq(statusOf(res), Status.OK, "patch: status 200");
 
@@ -211,7 +380,7 @@ fn test_patch() {
     }
 
     // Omit headers
-    let res2 = Http.Patch("http://httpbin.org/patch", payload);
+    let res2 = Http.Patch(base + "/patch", payload);
     check(res2 != nil,                  "patch: omitted headers not nil");
     checkEq(statusOf(res2), Status.OK,  "patch: omitted headers status 200");
     return 0;
@@ -224,26 +393,24 @@ fn test_patch() {
 fn test_query_method() {
     Console.WriteLine("== QUERY ==");
 
-    // QUERY is a new method; most servers (httpbin included) reject it with 405.
-    // The point of this test is that the client TRANSMITS a QUERY request with a
-    // body and gets a real HTTP response back. If a server ever echoes it (200),
-    // we additionally verify the method + body round-trip.
+    // QUERY is a newer method that many servers still reject with 405. The
+    // client must TRANSMIT a QUERY request with a body and get a real HTTP
+    // response back; the local server echoes it, so the method and body
+    // round-trip is verified as well.
     let payload = Json.Stringify({ filter: "status:open", limit: 10 });
-    let res     = Http.Query("http://httpbin.org/anything", payload, nil);
+    let res     = Http.Query(base + "/anything", payload, nil);
     check(res != nil,          "query: response not nil");
     check(statusOf(res) > 0,   "query: got a real HTTP status");
 
-    if (res != nil && statusOf(res) == Status.OK) {
-        let json = Json.Parse(res.body);
-        check(json != nil, "query: valid JSON response");
-        if (json != nil) {
-            checkEq(json.method, "QUERY", "query: method echoed as QUERY");
-            check(json.json.limit == 10, "query: body echoed");
-        }
+    let json = (statusOf(res) == Status.OK) ? Json.Parse(res.body) : nil;
+    check(json != nil, "query: valid JSON response");
+    if (json != nil) {
+        checkEq(json.method, "QUERY", "query: method echoed as QUERY");
+        check(json.json.limit == 10, "query: body echoed");
     }
 
     // Omit headers - still completes end-to-end.
-    let res2 = Http.Query("http://httpbin.org/anything", payload);
+    let res2 = Http.Query(base + "/anything", payload);
     check(res2 != nil,        "query: omitted headers not nil");
     check(statusOf(res2) > 0, "query: omitted headers got a status");
     return 0;
@@ -256,7 +423,7 @@ fn test_query_method() {
 fn test_head() {
     Console.WriteLine("== HEAD ==");
 
-    let res = Http.Head("http://httpbin.org/get");
+    let res = Http.Head(base + "/get");
     check(res != nil,                 "head: response not nil");
     checkEq(statusOf(res), Status.OK, "head: status 200");
 
@@ -268,7 +435,7 @@ fn test_head() {
     }
 
     // 404 via HEAD
-    let r404 = Http.Head("http://httpbin.org/status/404");
+    let r404 = Http.Head(base + "/status/404");
     checkEq(statusOf(r404), Status.NotFound, "head: 404 status");
     return 0;
 }
@@ -280,7 +447,7 @@ fn test_head() {
 fn test_delete() {
     Console.WriteLine("== DELETE ==");
 
-    let res = Http.Delete("http://httpbin.org/delete", nil);
+    let res = Http.Delete(base + "/delete", nil);
     check(res != nil,                 "delete: response not nil");
     checkEq(statusOf(res), Status.OK, "delete: status 200");
     return 0;
@@ -293,15 +460,15 @@ fn test_delete() {
 fn test_status_codes() {
     Console.WriteLine("== Status codes ==");
 
-    let r404 = Http.Get("http://httpbin.org/status/404", nil);
+    let r404 = Http.Get(base + "/status/404", nil);
     check(r404 != nil,                            "404: response not nil");
     checkEq(statusOf(r404), Status.NotFound,      "404: status returned");
 
-    let r500 = Http.Get("http://httpbin.org/status/500", nil);
+    let r500 = Http.Get(base + "/status/500", nil);
     check(r500 != nil,                            "500: response not nil");
     checkEq(statusOf(r500), Status.InternalError, "500: status returned");
 
-    let r401 = Http.Get("http://httpbin.org/status/401", nil);
+    let r401 = Http.Get(base + "/status/401", nil);
     check(r401 != nil,                            "401: response not nil");
     checkEq(statusOf(r401), Status.Unauthorized,  "401: status returned");
     return 0;
@@ -314,7 +481,7 @@ fn test_status_codes() {
 fn test_redirect() {
     Console.WriteLine("== Redirect ==");
 
-    let res = Http.Get("http://httpbin.org/redirect/1", nil);
+    let res = Http.Get(base + "/redirect/1", nil);
     check(res != nil,                 "redirect: response not nil");
     checkEq(statusOf(res), Status.OK, "redirect: followed to 200");
 
@@ -324,12 +491,12 @@ fn test_redirect() {
     }
 
     // Multi-hop: 3 hops, still within the 5-hop limit
-    let r3 = Http.Get("http://httpbin.org/redirect/3", nil);
+    let r3 = Http.Get(base + "/redirect/3", nil);
     check(r3 != nil,                   "redirect 3-hop: response not nil");
     checkEq(statusOf(r3), Status.OK,   "redirect 3-hop: followed to 200");
 
     // Exceeds limit (> 5 hops) - should return nil
-    let r6 = Http.Get("http://httpbin.org/redirect/6", nil);
+    let r6 = Http.Get(base + "/redirect/6", nil);
     check(r6 == nil, "redirect 6-hop: exceeds limit returns nil");
 
     return 0;
@@ -342,7 +509,7 @@ fn test_redirect() {
 fn test_query_string() {
     Console.WriteLine("== Query string ==");
 
-    let res = Http.Get("http://httpbin.org/get?foo=bar&n=42", nil);
+    let res = Http.Get(base + "/get?foo=bar&n=42", nil);
     check(res != nil,                 "query: response not nil");
     checkEq(statusOf(res), Status.OK, "query: status 200");
 
@@ -369,9 +536,10 @@ fn test_error_paths() {
     let empty = Http.Get("", nil);
     check(empty == nil, "empty url returns nil");
 
+    // Nothing listens on port 1: the https request fails, but must not throw.
     let httpsThrew = false;
     try {
-        Http.Get("https://example.com/", nil);
+        Http.Get("https://127.0.0.1:1/", nil);
     } catch (e) {
         httpsThrew = true;
     }
@@ -386,7 +554,7 @@ fn test_error_paths() {
 fn test_curl() {
     Console.WriteLine("== Curl ==");
 
-    let res = Http.Curl("http://httpbin.org/get", nil);
+    let res = Http.Curl(base + "/get", nil);
     if (res == nil) {
         Console.WriteLine("  SKIP: curl not available");
         return 0;
@@ -394,12 +562,17 @@ fn test_curl() {
     checkEq(statusOf(res), Status.OK, "curl get: status 200");
     check(len(res.body) > 0,          "curl get: body not empty");
 
-    let https = Http.Curl("https://httpbin.org/get", nil);
-    check(https != nil,               "curl https: response not nil");
-    checkEq(statusOf(https), Status.OK, "curl https: status 200");
+    // The local certificate is self-signed, so curl is told to accept it.
+    if (tlsBase != nil) {
+        let https = Http.Curl(tlsBase + "/get", { insecure: true });
+        check(https != nil,               "curl https: response not nil");
+        checkEq(statusOf(https), Status.OK, "curl https: status 200");
+    } else {
+        Console.WriteLine("  SKIP: curl https - no local https server (openssl not available)");
+    }
 
     let payload = Json.Stringify({ From: "flaris" });
-    let post = Http.Curl("http://httpbin.org/post", {
+    let post = Http.Curl(base + "/post", {
         method:  "POST",
         body:    payload,
         headers: { "Content-Type": ContentType.JSON }
@@ -409,7 +582,7 @@ fn test_curl() {
 
     // PATCH via curl
     let patchPayload = Json.Stringify({ x: 1 });
-    let patch = Http.Curl("http://httpbin.org/patch", {
+    let patch = Http.Curl(base + "/patch", {
         method: "PATCH",
         body:   patchPayload,
         headers: { "Content-Type": ContentType.JSON }
@@ -417,15 +590,15 @@ fn test_curl() {
     check(patch != nil,               "curl patch: not nil");
     checkEq(statusOf(patch), Status.OK, "curl patch: status 200");
 
-    let slow = Http.Curl("http://httpbin.org/delay/1", { timeout: 5 });
+    let slow = Http.Curl(base + "/delay/300", { timeout: 5 });
     check(slow != nil,                "curl timeout: not nil");
     checkEq(statusOf(slow), Status.OK, "curl timeout: completes");
 
-    let r404 = Http.Curl("http://httpbin.org/status/404", nil);
+    let r404 = Http.Curl(base + "/status/404", nil);
     checkEq(statusOf(r404), Status.NotFound, "curl 404 returned");
 
     // Omit options
-    let res2 = Http.Curl("http://httpbin.org/get");
+    let res2 = Http.Curl(base + "/get");
     check(res2 != nil,                "curl: omitted options not nil");
     checkEq(statusOf(res2), Status.OK, "curl: omitted options status 200");
 
@@ -439,21 +612,32 @@ fn test_curl() {
 fn test_wget() {
     Console.WriteLine("== WGet ==");
 
-    let res = Http.WGet("http://httpbin.org/get", "/tmp/flaris_wget_test.json");
+    let dest = Path.Combine(tmpDir, "flaris_wget_test.json");
+    let res = Http.WGet(base + "/get", dest);
     if (res == nil) {
         Console.WriteLine("  SKIP: wget not available");
         return 0;
     }
-    checkEq(res.path, "/tmp/flaris_wget_test.json", "wget: path matches dest");
+    checkEq(res.path, dest, "wget: path matches dest");
     checkEq(statusOf(res), Status.OK, "wget: status 200");
 
-    let https = Http.WGet("https://httpbin.org/get", "/tmp/flaris_wget_https.json");
-    check(https != nil,               "wget https: not nil");
-    checkEq(statusOf(https), Status.OK, "wget https: status 200");
+    // WGet has no option to accept a self-signed certificate; a wgetrc that
+    // names the local certificate as the CA lets wget verify it.
+    if (tlsBase != nil) {
+        let rc = Path.Combine(tmpDir, "wgetrc");
+        File.WriteText(rc, "ca_certificate = " + Path.Combine(tmpDir, "cert.pem") + "\n");
+        Os.SetEnv("WGETRC", rc);
+        let https = Http.WGet(tlsBase + "/get", Path.Combine(tmpDir, "flaris_wget_https.json"));
+        Os.UnsetEnv("WGETRC");
+        check(https != nil,               "wget https: not nil");
+        checkEq(statusOf(https), Status.OK, "wget https: status 200");
+    } else {
+        Console.WriteLine("  SKIP: wget https - no local https server (openssl not available)");
+    }
 
-    let autoPath = Path.Combine(Os.TempDir(), "flaris_wget_auto.json");
+    let autoPath = Path.Combine(tmpDir, "flaris_wget_auto.json");
     if (File.Exists(autoPath)) { File.Delete(autoPath); }
-    let auto = Http.WGet("http://httpbin.org/json", autoPath);
+    let auto = Http.WGet(base + "/json", autoPath);
     check(auto != nil, "wget auto-name: not nil");
     if (auto != nil) {
         checkEq(auto.path, autoPath, "wget auto-name: temp path used");
@@ -470,7 +654,7 @@ fn test_wget() {
 
 fn async test_async() {
     Console.WriteLine("== Async GET ==");
-    let res = await Http.GetAsync("http://httpbin.org/get", nil);
+    let res = await Http.GetAsync(base + "/get", nil);
     check(res != nil,                 "async get: not nil");
     checkEq(statusOf(res), Status.OK, "async get: status 200");
     if (res != nil) {
@@ -480,7 +664,7 @@ fn async test_async() {
 
     Console.WriteLine("== Async POST ==");
     let payload = Json.Stringify({ lang: "flaris", isAsync: true });
-    let res2 = await Http.PostAsync("http://httpbin.org/post", payload, nil);
+    let res2 = await Http.PostAsync(base + "/post", payload, nil);
     check(res2 != nil,                 "async post: not nil");
     checkEq(statusOf(res2), Status.OK, "async post: status 200");
     if (res2 != nil) {
@@ -490,7 +674,7 @@ fn async test_async() {
 
     Console.WriteLine("== Async PUT ==");
     let putPayload = Json.Stringify({ id: 99, isAsync: true });
-    let res3 = await Http.PutAsync("http://httpbin.org/put", putPayload, nil);
+    let res3 = await Http.PutAsync(base + "/put", putPayload, nil);
     check(res3 != nil,                 "async put: not nil");
     checkEq(statusOf(res3), Status.OK, "async put: status 200");
     if (res3 != nil) {
@@ -500,7 +684,7 @@ fn async test_async() {
 
     Console.WriteLine("== Async PATCH ==");
     let patchPayload = Json.Stringify({ delta: 5, isAsync: true });
-    let res4 = await Http.PatchAsync("http://httpbin.org/patch", patchPayload, nil);
+    let res4 = await Http.PatchAsync(base + "/patch", patchPayload, nil);
     check(res4 != nil,                 "async patch: not nil");
     checkEq(statusOf(res4), Status.OK, "async patch: status 200");
     if (res4 != nil) {
@@ -509,19 +693,19 @@ fn async test_async() {
     }
 
     Console.WriteLine("== Async DELETE ==");
-    let res5 = await Http.DeleteAsync("http://httpbin.org/delete", nil);
+    let res5 = await Http.DeleteAsync(base + "/delete", nil);
     check(res5 != nil,                 "async delete: not nil");
     checkEq(statusOf(res5), Status.OK, "async delete: status 200");
 
     Console.WriteLine("== Async HEAD ==");
-    let res6 = await Http.HeadAsync("http://httpbin.org/get");
+    let res6 = await Http.HeadAsync(base + "/get");
     check(res6 != nil,                 "async head: not nil");
     checkEq(statusOf(res6), Status.OK, "async head: status 200");
     if (res6 != nil) { check(res6.headers != nil, "async head: headers present"); }
 
     Console.WriteLine("== Async status codes ==");
-    checkEq(statusOf(await Http.GetAsync("http://httpbin.org/status/404", nil)), Status.NotFound, "async 404");
-    checkEq(statusOf(await Http.PostAsync("http://httpbin.org/status/201", "", nil)), Status.Created, "async 201");
+    checkEq(statusOf(await Http.GetAsync(base + "/status/404", nil)), Status.NotFound, "async 404");
+    checkEq(statusOf(await Http.PostAsync(base + "/status/201", "", nil)), Status.Created, "async 201");
 
     Console.WriteLine("== Async error path ==");
     let bad = await Http.GetAsync("http://this-host-does-not-exist.invalid/", nil);
@@ -537,9 +721,9 @@ fn async test_async() {
 fn async test_async_concurrent() {
     Console.WriteLine("== Async concurrent ==");
 
-    let f1 = Http.GetAsync("http://httpbin.org/get",     nil);
-    let f2 = Http.GetAsync("http://httpbin.org/get?n=2", nil);
-    let f3 = Http.GetAsync("http://httpbin.org/get?n=3", nil);
+    let f1 = Http.GetAsync(base + "/get",     nil);
+    let f2 = Http.GetAsync(base + "/get?n=2", nil);
+    let f3 = Http.GetAsync(base + "/get?n=3", nil);
 
     let r1 = await f1;
     let r2 = await f2;
@@ -569,29 +753,42 @@ fn async test_async_concurrent() {
 // --------------------------------------------------------
 
 fn async Main() {
+    let args = Os.Args();
+    if (len(args) > 0 && args[0] == "serve") {
+        return await serve(len(args) > 1 ? args[1] : nil);
+    }
+
     Console.WriteLine("=== Http.fls test suite ===");
 
     test_constants();
     test_parse_url();
-    test_get();
-    test_get_headers();
-    test_post();
-    test_put();
-    test_patch();
-    test_query_method();
-    test_head();
-    test_delete();
-    test_status_codes();
-    test_redirect();
-    test_query_string();
-    test_error_paths();
-    test_curl();
-    test_wget();
-    await test_async();
-    await test_async_concurrent();
+
+    tmpDir = Directory.CreateTemp("flaris_http");
+    if (await startServer()) {
+        test_get();
+        test_get_headers();
+        test_post();
+        test_put();
+        test_patch();
+        test_query_method();
+        test_head();
+        test_delete();
+        test_status_codes();
+        test_redirect();
+        test_query_string();
+        test_error_paths();
+        test_curl();
+        test_wget();
+        await test_async();
+        await test_async_concurrent();
+    } else {
+        check(false, "local server did not report its port");
+    }
+    await stopServer();
+    Directory.DeleteAll(tmpDir);
 
     Console.WriteLine("");
     Console.WriteLine("Results: " + Convert.ToString(testsRun) + " run, " + Convert.ToString(testsFailed) + " failed.");
     if (testsFailed == 0) { Console.WriteLine("All tests passed."); }
-    return testsFailed;
+    return testsFailed > 0 ? 1 : 0;
 }

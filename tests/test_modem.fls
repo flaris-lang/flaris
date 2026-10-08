@@ -1,12 +1,16 @@
 // test_modem.fls
 // Tests for Modem.fls against tests/fake_modem.py on a pseudo-terminal.
 //
-// Started by tests/test_modem.sh, which brings the fake modem up and passes
-// its tty path as the first argument. The focus is the parts that only go
-// wrong against a device: port ownership between two instances, the state a
-// failed open leaves behind, line framing, URCs, and the async entry points.
+//   flarisvm tests/test_modem.fls --libs=./libs
 //
-//   bash tests/test_modem.sh
+// Starts the fake modem with python3 (Stream.OpenSerial needs a tty, and
+// python's pty module makes one), reads the tty path from its first output
+// line, and stops it at the end. Skips (exit 0) without python3.
+//
+// The focus is the parts that only go wrong against a device: port ownership
+// between two instances, the state a failed open leaves behind, line framing,
+// URCs, and the async entry points. No --unsafe: a serial port is ordinary
+// sandboxed I/O.
 
 import { AT, Modem } from library("libs/Modem", "1.0");
 
@@ -29,13 +33,54 @@ fn section(name: string) {
     Console.WriteLine("--- " + name + " ---");
 }
 
-fn Main() {
-    let argv = Os.Args();
-    if (len(argv) < 1) {
-        Console.WriteLine("usage: test_modem.fls <tty>   (run tests/test_modem.sh instead)");
-        return 2;
+fn bench(name: string, f: fn, n: int) {
+    f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    Console.WriteLine(
+        String.PadRight(name, 40),
+        String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.1f}", [Time.TicksToUs(dt) / float(n)]), 9), " µs/call"
+    );
+}
+
+fn async Main() {
+    if (Os.Which("python3") == nil) {
+        Console.WriteLine("SKIP: python3 not available to run tests/fake_modem.py");
+        return 0;
     }
-    let port = argv[0];
+    let fake = Os.Spawn("python3", ["tests/fake_modem.py"]);
+    if (fake == nil) {
+        Console.WriteLine("could not start python3 tests/fake_modem.py");
+        return 1;
+    }
+    let port = await Stream.ReadLineAsync(fake.Stdout, 5000);
+    var rc = 1;
+    if (port == nil || File.Stat(port) == nil) {
+        Console.WriteLine("fake_modem.py did not come up (got " + str(port) + ")");
+    } else {
+        rc = runChecks(port);
+    }
+
+    // The fake serves until its stdin closes.
+    Stream.Close(fake.Stdin);
+    let done = await Os.WaitAsync(fake.Pid, 3000);
+    if (done == nil || done.Alive) {
+        Os.KillChild(fake.Pid, 9);
+        await Os.WaitAsync(fake.Pid, 3000);
+    }
+    let errText = Stream.ReadAll(fake.Stderr);
+    if (rc != 0 && errText != nil && len(errText) > 0) {
+        Console.WriteLine("fake_modem.py stderr:");
+        Console.WriteLine(Buffer.ToString(errText));
+    }
+    Stream.Close(fake.Stdout);
+    Stream.Close(fake.Stderr);
+    return rc;
+}
+
+fn runChecks(port: string): int {
     Console.WriteLine("================================================");
     Console.WriteLine(" Modem test suite - " + port);
     Console.WriteLine("================================================");
@@ -207,6 +252,16 @@ fn Main() {
     Console.WriteLine("================================================");
     Console.WriteLine(" Results: " + passed + " passed, " + failed + " failed");
     Console.WriteLine("================================================");
-    if (failed == 0) { return 0; }
-    return 1;
+    if (failed > 0) { return 1; }
+
+    Console.WriteLine("");
+    Console.WriteLine("=== Modem benchmarks ===");
+    let bm = new Modem(port);
+    if (bm.IsOpen()) {
+        let bat = bm.At();
+        bench("AT round trip (At().Send)", fn() { bat.Send("AT", 1000); }, 50);
+        bench("Info() (four commands)", fn() { bm.Info(); }, 20);
+    }
+    bm.Close();
+    return 0;
 }

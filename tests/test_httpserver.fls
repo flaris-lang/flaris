@@ -350,6 +350,15 @@ fn test_chunked() {
     let raw2 = "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
              + "3;ext=1\r\nabc\r\n" + "0\r\n\r\n";
     checkEq(request(gPort, raw2, false).body, "abc", "chunk extension ignored");
+
+    // Only the CRLF may follow a chunk's data.
+    let raw3 = "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+             + "3\r\nabcXX\r\n" + "0\r\n\r\n";
+    checkEq(request(gPort, raw3, false).code, 400, "bytes after a chunk's data are refused");
+
+    // RFC 9112: an empty line before the request line is ignored.
+    checkEq(request(gPort, "\r\nGET /stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false).code,
+            200, "an empty line before the request line is ignored");
     return 0;
 }
 
@@ -862,6 +871,60 @@ fn waitHookErrors(srv, n: int) {
     return srv.HookErrors();
 }
 
+// The access hook runs on the connection fiber after the reply is written, so
+// the client can be back before the entry exists.
+fn waitSeen(arr, n: int) {
+    let tries = 0;
+    while (len(arr) < n && tries < 500) { Fiber.Sleep(1); tries += 1; }
+    return len(arr);
+}
+
+fn test_timing() {
+    Console.WriteLine("== timing ==");
+
+    let seen = [];
+    let srv  = new HttpServer({ port: 0, timing: true });
+    srv.Get("/plain", fn(_req, res) { res.Text("ok"); });
+    srv.Get("/marked", fn(_req, res) { Fiber.Sleep(5); res.Mark("db"); res.Text("ok"); });
+    srv.OnAccess(fn(e) { Array.Append(seen, e); });
+    let port = srv.ListenAsync();
+
+    let r  = req1(port, "GET", "/plain");
+    let st = Object.TryGet(r.headers, "server-timing", "") ?? "";
+    check(String.StartsWith(st, "read;dur="), "Server-Timing opens with the read phase");
+    check(String.Contains(st, ", route;dur="), "then the route phase");
+    let phases = String.Split(st, ", ");
+    checkEq(len(phases), 3, "three phases for a plain handler");
+    check(String.StartsWith(phases[2], "handler;dur="), "and ends with the handler phase");
+
+    checkEq(waitSeen(seen, 1), 1, "the access hook fired");
+    let e = seen[len(seen) - 1];
+    check(e.timing != nil, "the access entry carries timing");
+    check(e.timing.total >= e.timing.handler, "total covers the handler");
+    check(e.timing.read >= 0.0 && e.timing.route >= 0.0, "read and route are ms figures");
+
+    let m   = req1(port, "GET", "/marked");
+    let stm = Object.TryGet(m.headers, "server-timing", "") ?? "";
+    check(String.Contains(stm, ", db;dur="), "a handler mark adds its own phase");
+    check(String.Contains(stm, ", handler;dur="), "the tail after the mark is still the handler phase");
+    checkEq(waitSeen(seen, 2), 2, "the access hook fired for the marked route");
+    let em = seen[len(seen) - 1];
+    check(em.timing.db >= 4.0, "the marked phase measured the sleep before it");
+    check(em.timing.handler < em.timing.db, "the handler phase excludes the marked one");
+
+    let r4  = req1(port, "GET", "/nope");
+    let st4 = Object.TryGet(r4.headers, "server-timing", "") ?? "";
+    check(String.Contains(st4, "handler;dur="), "a 404 is timed too");
+    srv.Stop();
+
+    // Off by default: no header, no timing on the entry.
+    gAccess = [];
+    let r0 = req1(gPort, "GET", "/");
+    checkEq(Object.HasKey(r0.headers, "server-timing"), false, "no Server-Timing unless asked for");
+    waitSeen(gAccess, 1);
+    checkEq(gAccess[len(gAccess) - 1].timing, nil, "entry.timing is nil when off");
+}
+
 fn test_hook_failures() {
     Console.WriteLine("== throwing hooks ==");
 
@@ -949,6 +1012,9 @@ fn test_graceful_shutdown() {
 
     let drained = srv.Stop(3000);
     check(drained, "Stop waited for the request in flight");
+    // The client fiber reads the response after the server has finished it.
+    let bodyUntil = Time.Millis() + 1000;
+    while (gSlowBody == "" && Time.Millis() < bodyUntil) { Fiber.Sleep(10); }
     checkEq(gSlowBody, "finished", "the in-flight request completed rather than being cut");
     checkEq(srv.InFlight(), 0, "nothing left in flight");
     check(!srv.IsRunning(), "server reports stopped");
@@ -1365,6 +1431,29 @@ fn test_status_helpers() {
 }
 
 // ---------------------------------------------------------------------------
+// Listen address
+// ---------------------------------------------------------------------------
+fn test_bind_address() {
+    Console.WriteLine("== listen address ==");
+
+    let srv = new HttpServer({ port: 0, host: "127.0.0.1", idleTimeoutMs: 400 });
+    srv.Get("/", fn(_req, res) { res.Text("local"); });
+    let port = srv.ListenAsync();
+    let r = req1(port, "GET", "/");
+    checkEq(r == nil ? nil : r.body, "local", "host 127.0.0.1 serves over IPv4 loopback");
+    let v6 = Stream.Connect("tcp", "::1", port, 1000);
+    check(v6 == nil, "... and over nothing else");
+    if (v6 != nil) { Stream.Close(v6); }
+    srv.Stop(500);
+
+    let bad = new HttpServer({ port: 0, host: "no.such.host.invalid" });
+    let msg = "";
+    try { bad.ListenAsync(); bad.Stop(100); } catch (e) { msg = e.Error; }
+    check(String.Contains(msg, "no.such.host.invalid"), "a host that cannot be bound fails, naming it");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Server setup
 // ---------------------------------------------------------------------------
 
@@ -1647,6 +1736,7 @@ fn async Main() {
     test_streaming_bodies();
     test_multipart();
     test_access_log();
+    test_timing();
     test_hook_failures();
     test_graceful_shutdown();
     test_file_semantics();
@@ -1654,6 +1744,7 @@ fn async Main() {
     test_static_exposure();
     test_request_object();
     test_status_helpers();
+    test_bind_address();
 
     Console.WriteLine("===========================");
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

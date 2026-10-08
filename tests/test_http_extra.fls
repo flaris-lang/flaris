@@ -1,7 +1,7 @@
 // test_http_extra.fls
 // Offline tests for the Http helpers that do NOT need a network: CookieJar,
-// Multipart form builder, and Http.Retry. (test_http.fls covers the live
-// request path against httpbin and is excluded from the automated suite.)
+// Multipart form builder, and Http.Retry. (test_http.fls covers the request
+// path against a local server.)
 //
 //   flarisvm ./tests/test_http_extra.fls --libs='./libs'
 
@@ -255,6 +255,29 @@ fn test_shell_quoting() {
     return 0;
 }
 
+global ndjsonLines = [];
+
+// A chunked NDJSON body where one JSON line spans two chunks: the line arrives
+// whole, and the blank and non-JSON lines are skipped.
+fn test_ndjson_chunked() {
+    // Where the client connects: a dual-stack port 0 can be one held on 127.0.0.1 alone.
+    let srv = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(srv);
+    let port = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10));
+    let cli = Stream.Connect("tcp", "127.0.0.1", port);
+    Stream.WaitReadable(srv, 2000);
+    let acc = Stream.Accept(srv);
+    Stream.WriteString(acc, "9\r\n{\"a\":1}\r\n\r\n5\r\n{\"b\":\r\n3\r\n22}\r\n3\r\n\nx\n\r\n0\r\n\r\n");
+    Stream.Close(acc);
+    ndjsonLines = [];
+    Http._ndjsonChunked(cli, fn (line) { Array.Append(ndjsonLines, line); });
+    checkEq(len(ndjsonLines), 2, "NDJSON lines from a chunked body");
+    checkEq(ndjsonLines[0], "{\"a\":1}", "... the first line");
+    checkEq(ndjsonLines[1], "{\"b\":22}", "... a line split across two chunks");
+    Stream.Close(cli);
+    Stream.Close(srv);
+}
+
 fn Main() {
     test_shell_quoting();
     Console.WriteLine("=== Http extra (offline) test suite ===");
@@ -262,6 +285,7 @@ fn Main() {
     test_cookiejar();
     test_multipart();
     test_retry();
+    test_ndjson_chunked();
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

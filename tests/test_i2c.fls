@@ -1,0 +1,295 @@
+// test_i2c.fls - Tests for I2c.fls against simulated chips
+// Run: flarisvm tests/test_i2c.fls --libs=./libs
+//
+// No hardware: every I2c here is given a SimBus through opts.backend, so what
+// is tested is everything above the bus - register framing, byte order,
+// argument checks and error reporting. The i2c-tools backend needs hardware.
+
+import { I2c } from library("I2c", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, "  expected=", expected, "  got=", actual);
+    }
+    return 0;
+}
+
+fn sameBytes(a, b): bool {
+    if (a == nil || b == nil || len(a) != len(b)) { return false; }
+    iter (i from 0 to len(a)) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+// A chip with 256 byte registers. The first byte of a write sets the register
+// pointer and the rest is stored from there on; a read returns bytes from the
+// pointer on. Both advance the pointer, as real register chips do.
+class SimChip {
+    let regs = nil;
+    let ptr  = 0;
+
+    fn Constructor() {
+        this.regs = Array.Create(256, Type.Int);
+        this.ptr  = 0;
+    }
+
+    fn Write(tx) {
+        if (len(tx) == 0) { return 0; }
+        this.ptr = tx[0];
+        iter (i from 1 to len(tx)) {
+            this.regs[this.ptr] = tx[i];
+            this.ptr = (this.ptr + 1) & 0xFF;
+        }
+        return 0;
+    }
+
+    fn Read(n: int) {
+        let out: [int] = [];
+        iter (i from 0 to n) {
+            Array.Append(out, this.regs[this.ptr]);
+            this.ptr = (this.ptr + 1) & 0xFF;
+        }
+        return out;
+    }
+}
+
+// Bus 1 with whatever chips were added; every other bus does not exist. It
+// records the last transfer so tests can see exactly what went on the wire.
+class SimBus {
+    let chips = nil;
+    let addrs = nil;
+    let calls = 0;
+    let last  = nil;
+
+    fn Constructor() {
+        this.chips = {};
+        this.addrs = [];
+        this.calls = 0;
+        this.last  = nil;
+    }
+
+    fn Add(addr: int, chip) {
+        this.chips[str(addr)] = chip;
+        Array.Append(this.addrs, addr);
+        return chip;
+    }
+
+    fn Transfer(bus: int, addr: int, tx, rxLen: int) {
+        this.calls += 1;
+        this.last = { bus: bus, addr: addr, tx: tx, rxLen: rxLen };
+        if (bus != 1) { return { ok: false, errorKind: "bus", error: "I2C bus " + str(bus) + " not found" }; }
+        let key = str(addr);
+        if (!(key in this.chips)) { return { ok: false, errorKind: "nack", error: "no chip answered" }; }
+        let chip = this.chips[key];
+        chip.Write(tx);
+        if (rxLen == 0) { return { ok: true, data: [] }; }
+        return { ok: true, data: chip.Read(rxLen) };
+    }
+
+    fn Scan(bus: int) {
+        if (bus != 1) { return { ok: false, errorKind: "bus", error: "I2C bus " + str(bus) + " not found" }; }
+        return { ok: true, addresses: this.addrs };
+    }
+}
+
+class RaisingBus {
+    fn Transfer(_bus: int, _addr: int, _tx, _rxLen: int) { throw(1, "wire fell off"); }
+    fn Scan(_bus: int) { throw(1, "wire fell off"); }
+}
+
+class ShortBus {
+    fn Transfer(_bus: int, _addr: int, _tx, _rxLen: int) { return { ok: true, data: [1] }; }
+    fn Scan(_bus: int) { return { ok: true, addresses: [] }; }
+}
+
+fn Main() {
+    let sim  = new SimBus();
+    let chip = sim.Add(0x76, new SimChip());
+    chip.regs[0xD0] = 0x60;
+    let dev  = new I2c(1, 0x76, { backend: sim });
+
+    Console.WriteLine("[ construction ]");
+    checkEq(dev.Bus(), 1, "Bus()");
+    checkEq(dev.Address(), 0x76, "Address()");
+    check(dev.Error() == nil, "a good device starts with no error");
+
+    let bads = [[1, 0x03, "address below 0x08"], [1, 0x78, "address above 0x77"],
+                [1, "x", "address that is not an int"], [-1, 0x76, "negative bus"],
+                [nil, 0x76, "nil bus"]];
+    foreach (b in bads) {
+        let d = new I2c(b[0], b[1], { backend: sim });
+        checkEq(d.ErrorKind(), "usage", "constructor reports " + b[2]);
+        let before = sim.calls;
+        check(d.ReadReg8(0) == nil, "a call on it fails: " + b[2]);
+        checkEq(d.ErrorKind(), "usage", "  with the usage error: " + b[2]);
+        checkEq(sim.calls, before, "  and never reaches the bus: " + b[2]);
+    }
+
+    Console.WriteLine("[ 8-bit registers ]");
+    checkEq(dev.ReadReg8(0xD0), 0x60, "ReadReg8 reads the chip id");
+    check(sameBytes(sim.last["tx"], [0xD0]) && sim.last["rxLen"] == 1,
+          "  as one transaction: write the register, read one byte");
+    check(dev.WriteReg8(0xF4, 0x27), "WriteReg8 succeeds");
+    checkEq(chip.regs[0xF4], 0x27, "  and stores the value");
+    check(sameBytes(sim.last["tx"], [0xF4, 0x27]) && sim.last["rxLen"] == 0,
+          "  as one write: register, then value");
+
+    Console.WriteLine("[ register blocks ]");
+    iter (i from 0 to 6) { chip.regs[0x88 + i] = 0x10 + i; }
+    check(sameBytes(dev.ReadRegs(0x88, 6), [0x10, 0x11, 0x12, 0x13, 0x14, 0x15]),
+          "ReadRegs reads consecutive registers");
+    check(dev.WriteRegs(0x40, [1, 2, 3]), "WriteRegs succeeds");
+    check(chip.regs[0x40] == 1 && chip.regs[0x41] == 2 && chip.regs[0x42] == 3,
+          "  and fills consecutive registers");
+    let blk = Buffer.Create(2, 1);
+    Buffer.FromArray(blk, [9, 8]);
+    check(dev.WriteRegs(0x50, blk), "WriteRegs accepts a block");
+    check(chip.regs[0x50] == 9 && chip.regs[0x51] == 8, "  and writes its bytes");
+
+    Console.WriteLine("[ 16-bit registers and byte order ]");
+    chip.regs[0x20] = 0x12;
+    chip.regs[0x21] = 0x34;
+    checkEq(dev.ReadReg16(0x20, "be"), 0x1234, "ReadReg16 big-endian");
+    checkEq(dev.ReadReg16(0x20, "le"), 0x3412, "ReadReg16 little-endian");
+    check(dev.WriteReg16(0x30, 0xABCD, "be"), "WriteReg16 big-endian succeeds");
+    check(chip.regs[0x30] == 0xAB && chip.regs[0x31] == 0xCD, "  high byte first");
+    check(dev.WriteReg16(0x30, 0xABCD, "le"), "WriteReg16 little-endian succeeds");
+    check(chip.regs[0x30] == 0xCD && chip.regs[0x31] == 0xAB, "  low byte first");
+    check(dev.WriteReg16(0x30, -2, "be"), "WriteReg16 takes a negative value");
+    check(chip.regs[0x30] == 0xFF && chip.regs[0x31] == 0xFE, "  as two's complement");
+    foreach (o in ["BE", "big", nil]) {
+        check(dev.ReadReg16(0x20, o) == nil && dev.ErrorKind() == "usage",
+              "ReadReg16 refuses byte order " + str(o));
+    }
+    check(!dev.WriteReg16(0x30, 0x10000, "be") && dev.ErrorKind() == "usage",
+          "WriteReg16 refuses a value above 65535");
+
+    Console.WriteLine("[ raw transfers ]");
+    check(dev.Write([0x60, 0xAA, 0xBB]), "Write sends raw bytes");
+    check(chip.regs[0x60] == 0xAA && chip.regs[0x61] == 0xBB, "  which the chip stores");
+    check(dev.Write([0x60]), "Write sets the pointer alone");
+    check(sameBytes(dev.Read(2), [0xAA, 0xBB]), "Read continues from the pointer");
+    check(sameBytes(dev.WriteRead([0x61], 1), [0xBB]), "WriteRead is a write then a read");
+    check(sameBytes(sim.last["tx"], [0x61]) && sim.last["rxLen"] == 1, "  in one transaction");
+
+    Console.WriteLine("[ bad arguments never reach the bus ]");
+    let calls = sim.calls;
+    check(!dev.Write([]), "Write refuses nothing to write");
+    check(!dev.Write([256]), "Write refuses a byte above 255");
+    check(!dev.Write([-1]), "Write refuses a negative byte");
+    check(!dev.Write([1.5]), "Write refuses a float");
+    check(!dev.Write("abc"), "Write refuses a string");
+    check(!dev.Write(nil), "Write refuses nil");
+    check(dev.ReadRegs(0x10, 0) == nil, "ReadRegs refuses a count of 0");
+    check(dev.ReadRegs(0x10, 8193) == nil, "ReadRegs refuses a count above 8192");
+    check(dev.ReadReg8(256) == nil, "ReadReg8 refuses register 256");
+    check(dev.ReadReg8(-1) == nil, "ReadReg8 refuses register -1");
+    check(dev.ReadReg8(nil) == nil, "ReadReg8 refuses a nil register");
+    check(dev.Read(nil) == nil, "Read refuses a nil count");
+    checkEq(dev.ErrorKind(), "usage", "the failures are usage errors");
+    checkEq(sim.calls, calls, "none of them reached the bus");
+
+    Console.WriteLine("[ bus errors ]");
+    let ghost = new I2c(1, 0x50, { backend: sim });
+    check(ghost.ReadReg8(0) == nil, "a missing chip reads as nil");
+    checkEq(ghost.ErrorKind(), "nack", "  with errorKind nack");
+    check(ghost.Error() != nil, "  and a message");
+    check(!ghost.WriteReg8(0, 1), "a write to a missing chip is false");
+    let late = sim.Add(0x50, new SimChip());
+    late.regs[0] = 7;
+    checkEq(ghost.ReadReg8(0), 7, "once the chip is there, reads work");
+    check(ghost.Error() == nil && ghost.ErrorKind() == nil, "  and the error is cleared");
+
+    let otherBus = new I2c(2, 0x76, { backend: sim });
+    check(otherBus.ReadReg8(0) == nil && otherBus.ErrorKind() == "bus", "a missing bus is errorKind bus");
+
+    let raising = new I2c(1, 0x76, { backend: new RaisingBus() });
+    check(raising.ReadReg8(0) == nil, "a backend that raises does not raise through I2c");
+    checkEq(raising.ErrorKind(), "io", "  it is reported as io");
+    check(String.Contains(raising.Error(), "wire fell off"), "  with the backend's message");
+    check(raising.Scan() == nil && raising.ErrorKind() == "io", "  and the same for Scan");
+
+    let short = new I2c(1, 0x76, { backend: new ShortBus() });
+    check(short.ReadRegs(0, 4) == nil && short.ErrorKind() == "io", "too few bytes back is an io error");
+
+    Console.WriteLine("[ scan ]");
+    let bus = new I2c(1, nil, { backend: sim });
+    let found = bus.Scan();
+    check(found != nil && Array.Contains(found, 0x76) && Array.Contains(found, 0x50),
+          "Scan lists the chips on the bus");
+    check(bus.ReadReg8(0) == nil && bus.ErrorKind() == "usage", "an I2c without an address cannot transfer");
+    check(String.Contains(bus.Error(), "no address"), "  and says so");
+    check(new I2c(1, 0x03, { backend: sim }).Scan() != nil, "Scan needs a bus, not a good address");
+    let noBus = new I2c(3, nil, { backend: sim });
+    check(noBus.Scan() == nil && noBus.ErrorKind() == "bus", "Scan on a missing bus fails with errorKind bus");
+
+    Console.WriteLine("[ Word and ToSigned ]");
+    checkEq(I2c.Word([0x12, 0x34], 0, "be"), 0x1234, "Word be");
+    checkEq(I2c.Word([0x12, 0x34], 0, "le"), 0x3412, "Word le");
+    checkEq(I2c.Word([0, 0x12, 0x34], 1, "be"), 0x1234, "Word at an offset");
+    check(I2c.Word([0x12, 0x34], 1, "be") == nil, "Word past the end is nil");
+    check(I2c.Word([0x12, 0x34], -1, "be") == nil, "Word at a negative index is nil");
+    check(I2c.Word([0x12, 0x34], 0, "x") == nil, "Word with a bad order is nil");
+    checkEq(I2c.ToSigned(0xFFFE, 16), -2, "ToSigned 16-bit negative");
+    checkEq(I2c.ToSigned(0x7FFF, 16), 32767, "ToSigned 16-bit positive");
+    checkEq(I2c.ToSigned(0x80, 8), -128, "ToSigned 8-bit");
+    checkEq(I2c.ToSigned(0x1FFFE, 16), -2, "ToSigned ignores bits above the width");
+    checkEq(I2c.ToSigned(0x80000, 20), -524288, "ToSigned 20-bit, as BME280 readings are");
+    check(I2c.ToSigned(5, 0) == nil, "ToSigned refuses 0 bits");
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + str(testsRun - testsFailed) + "/" + str(testsRun) + " passed");
+
+    // ===================================================================
+    // Benchmarks - library overhead over a simulated bus (no process spawn)
+    // ===================================================================
+    Console.WriteLine("");
+    benchSep();
+    Console.WriteLine("Benchmarks");
+    benchSep();
+    let raw = [0x7A, 0x1C, 0x00, 0x82, 0x3E, 0x00];
+    bench("ReadReg8", fn() { _sink = _sink + dev.ReadReg8(0xD0); }, 20000);
+    bench("ReadReg16 be", fn() { _sink = _sink + dev.ReadReg16(0x20, "be"); }, 20000);
+    bench("ReadRegs 6 bytes", fn() { _sink = _sink + len(dev.ReadRegs(0x88, 6)); }, 20000);
+    bench("WriteRegs 16 bytes", fn() {
+        if (dev.WriteRegs(0x00, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])) { _sink = _sink + 1; }
+    }, 20000);
+    bench("Word + ToSigned (decode one reading)", fn() {
+        _sink = _sink + I2c.ToSigned(I2c.Word(raw, 0, "be"), 16);
+    }, 100000);
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

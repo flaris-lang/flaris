@@ -105,10 +105,11 @@ flarisvm --format-write src/app.fls   # rewrite in place
 
 | Flag | Effect |
 |------|--------|
-| `--unsafe` | Enable unsafe code and FFI (raw memory, `Os.Kill`, plain-http imports, FFI) |
+| `--unsafe` | Enable unsafe code and FFI (raw memory, plain-http imports, FFI) |
 | `--allow-ffi` | Enable `Ffi.*` only, leaving the rest of `--unsafe` refused |
 | `--mem` | Memory report at shutdown: peak RSS, slab footprint, peak/total object counts, heap bytes, block regions, and leak count. Exits non-zero if leaks are detected. |
 | `--stats` | Print VM statistics after execution (implies `--time`) |
+| `--prof[=hz]` | Sample the running script `hz` times a second (1-10000, default 1000) from a CPU timer and print a per-function table at exit. A sample is charged to the script function running, builtin time included, and to every caller on its stack (`self` / `total`); objects allocated are charged the same way; native (JIT) kernels are charged to their interpreted caller, and with the JIT on each row ends with the reason that function ran interpreted (its `--check` verdict, or a native-entry fallback). Lines with `-g`; a per-fiber table when several fibers ran. `flarisvm` only; Windows caps the rate at 1000 |
 | `--time` | Print timing report |
 | `--verbose` | Verbose output (also enables the timing report) |
 | `--list-keys` | Print the built-in and trusted signing keys, then exit |
@@ -267,7 +268,7 @@ a security sandbox for *malicious* input.
   but that check does not type-verify it. **Run untrusted bytecode with
   `--jit-disable`**, which ignores the embedded JIT code entirely.
 - `--unsafe` grants FFI and raw-memory access; never combine it with untrusted code.
-- `--allow-ffi` grants FFI alone, so a script that only needs a plugin does not also get raw memory, `Os.Kill` and plain-http imports. `--unsafe` implies it.
+- `--allow-ffi` grants FFI alone, so a script that only needs a plugin does not also get raw memory and plain-http imports. `--unsafe` implies it.
 
 #### Bytecode verification
 
@@ -589,7 +590,7 @@ compile errors.
 
 **Keywords.** `fn` `async` `static` `inline` `let` `var` `const` `global`
 `if` `else` `for` `foreach` `iter` `from` `to` `while` `do` `switch` `case`
-`default` `break` `continue` `return` `yield` `await` `guard` `nil` `true`
+`default` `break` `continue` `return` `yield` `await` `guard` `weak` `nil` `true`
 `false` `class` `this` `super` `new` `enum` `import` `export` `library` `as`
 `try` `catch` `finally` `throw` `breakpoint`. The words `and` `or` `in` `is`
 are operators. (`var` is an alias for `let`.) Every keyword, plus the operator
@@ -744,7 +745,7 @@ Use `String.*` UTF-8 helpers for correct Unicode handling. Standard string index
 
 #### Char
 
-`char` is an unsigned 32-bit Unicode codepoint value. The `char()` built-in creates one from an integer codepoint.
+`char` holds one Unicode code point, 0–0x10FFFF. `char(x)` and `Char.FromInt(x)` create one from an integer; a value outside that range gives U+FFFD, the replacement character, on every platform.
 
 Character escapes in a `'...'` literal denote **one code point**: `'\n'`, `'\t'`, `'\0'`, `'\xHH'` (U+00HH), `'\uXXXX'`, and `'\u{H..H}'` (up to U+10FFFF). `'\xHH'` is a code point, not a raw byte - `'\xE0'` is U+00E0 (`'à'`), not a lone byte.
 
@@ -1296,8 +1297,9 @@ Console.WriteLine(Color.Cyan);        // 11
   error - member names are not checked against the declaration.
 - A duplicate member name is a compile error.
 - There is no reverse mapping - `str(Color.Red)` is `"0"`, not `"Red"`.
-- `switch` over an enum is not checked for exhaustiveness (see
-  [R12 - Static Analyzer](#r12---static-analyzer)).
+- A `switch` whose labels are all members of one enum and that has no
+  `default` must handle every member, or the analyzer warns (code 2021,
+  `switch-not-exhaustive` - see [R12 - Static Analyzer](#r12---static-analyzer)).
 
 ### Labeled loops
 
@@ -1417,7 +1419,7 @@ These functions are VM instructions - available everywhere, no namespace require
 | `int(x)` | Integer | Truncates floats toward zero; `NaN` gives `0` and a value beyond the `int` range saturates to `Math.Int64Max`/`Math.Int64Min`. A numeric string is parsed the same way (optional sign, decimal digits, saturating on overflow) |
 | `float(x)` | Float | Widens int to double |
 | `str(x)` | String | Converts any value to string. An array gives `<array[n]>`, an object `<object>`, a class instance `<ClassName>` (a collection `<Stack[n]>`), a class `<class ClassName>`. |
-| `char(x)` | Char | 32-bit Unicode codepoint |
+| `char(x)` | Char | Unicode code point; outside 0–0x10FFFF gives U+FFFD |
 
 ### Bitcast / Narrowing
 
@@ -1448,6 +1450,18 @@ len({ a: 1, b: 2 });   // 2 (property count)
 ```js
 guard(expr)   // Raises Exception.GuardCheck if expr evaluates to nil
 ```
+
+---
+
+### Weak handle
+
+```js
+this.parent = weak(expr);   // a handle on expr that does not keep it alive
+```
+
+`weak(expr)` is `Weak.Create(expr)` in expression form: the same prefix
+position and precedence as `guard`. Read the value back with `Weak.Get`, which
+yields `nil` once the target is gone - see the `Weak` module.
 
 ---
 
@@ -1545,7 +1559,7 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | 1 | Primary | literals, identifiers, `(...)` | N/A |
 | 2 | Postfix | `obj.prop` `obj?.prop` `arr[i]` `arr?.[i]` `fn(...)` `x++` `x--` | Left |
 | 3 | Power | `^^` | Right |
-| 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` | Right |
+| 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` `weak()` | Right |
 | 5 | Multiplicative & Bitwise | `*` `/` `%` `<<` `>>` `>>>` `&` `\|` `^` | Left |
 | 6 | Additive | `+` `-` | Left |
 | 7 | Comparison | `<` `<=` `>` `>=` | Left |
@@ -1644,8 +1658,9 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | Limit | Default | Maximum | Description |
 | ------- | --------- | --------- | ------------- |
 | Fibers | 256 | 1024 | Concurrent fibers tracked by the scheduler; override with `--fibers=` (a power of two) |
-| Events | 64 | 64 | Event slots (I/O, async, etc.) |
-| Timers | 64 | 64 | Active timers |
+| Events | 256 | 256 | Event slots (I/O, async, etc.) |
+| Timers | 256 | 256 | Active timers |
+| Async I/O operations | 512 | 512 | Stream operations in flight at once: async calls plus synchronous calls parked on a socket or serial port. One more raises `Exception.OutOfMemory` on the fiber that asked; whatever it had taken from the stream's read-ahead stays there |
 | Per-fiber scheduling quantum | 10,000 | 100,000 | Scheduling checkpoints (loop back-edges + call/return boundaries) per slice before auto-yield; tune with `Fiber.SetQuantum` |
 
 **At the fiber limit.** A fiber counts against the limit from the moment it is
@@ -1668,7 +1683,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | ------- | ------- | ------- | ------------- |
 | Call frames | 64 | 1,024 | Call stack depth; override with `--frames=` |
 | Nested try/catch handlers | 24 | 24 | Maximum nested try/catch handlers |
-| Evaluation stack | 4,096 | 65,535 | VM evaluation stack size; override with `--stack=` |
+| Evaluation stack | 1,024 | 65,535 | VM evaluation stack size per fiber; override with `--stack=` |
 
 ### Locals and Arguments
 
@@ -1689,7 +1704,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | String literal content | 64 KB | `"..."` and `"""..."""` alike |
 | Interpolation holes per `$"..."` | 15 | One `String.Format` argument each, one fewer than the call-argument limit |
 | Literal nesting depth | 64 | Max container nesting when building array/object literals (raises `Exception.NestingError`) |
-| Elements per array / object literal | stack size | A literal is built on the evaluation stack: one slot per array element, two per object property, on top of any operands pending around it in the same function, such as earlier call arguments. A function whose peak stack use exceeds the stack size (default 4,096 slots) loads with a warning naming it and the `--stack=` size that fits, and calling it raises `Exception.StackError`. Over 65,535 elements or 32,767 properties is a compile error. Build larger containers in a loop |
+| Elements per array / object literal | stack size | A literal is built on the evaluation stack: one slot per array element, two per object property, on top of any operands pending around it in the same function, such as earlier call arguments. A function whose peak stack use exceeds the stack size (default 1,024 slots) loads with a warning naming it and the `--stack=` size that fits, and calling it raises `Exception.StackError`. Over 65,535 elements or 32,767 properties is a compile error. Build larger containers in a loop |
 | Line numbers in stack traces | 65,535 | With `-g`, every line past 65,535 reports 65,535 (the compiler warns once). Without `-g` every frame reports line 0 |
 | Comparison depth | 1,024 | Max nesting for structural `==`/ordering of containers (raises `Exception.NestingError`; above the JSON depth cap, so parsed documents always compare) |
 | Clone depth | 512 | Max nesting for `Object.Clone`/`Array.Clone`; a deeper or **cyclic** value raises `Exception.NestingError` instead of overflowing the stack (above the JSON depth cap, so parsed documents always clone) |
@@ -1865,7 +1880,12 @@ class Node {
 // ...while the parent holds the child. Neither is ever freed.
 ```
 
-Flaris has no `weak` reference, so the fix is structural. In order of preference:
+The fix is a weak handle for the back-reference, or a structural change. In
+order of preference:
+
+0. **Observe the parent through a handle.** `Weak.Create(parent)` does not
+   keep the parent alive and `Weak.Get` yields `nil` once it is gone - see the
+   `Weak` module.
 
 1. **Do not store the parent.** Most back-references exist to read one or two
    values. Copy those values into the child at construction instead of the object.
@@ -2021,7 +2041,7 @@ let digest = Hash.Sha256("hello");
 let root = Math.Sqrt(2.0);
 ```
 
-No import statement is needed - all modules are always available. Two modules (`Ffi`, `Memory`) additionally require the `--unsafe` flag at runtime.
+No import statement is needed - all modules are always available. Two modules additionally need a runtime flag: `Memory` needs `--unsafe`, and `Ffi` needs `--allow-ffi` (or `--unsafe`, which implies it).
 
 Each function table has a `JIT` column stating whether the function can be called directly from JIT-compiled code (see R11 for the legend and the surrounding rules).
 
@@ -2052,9 +2072,9 @@ Each function table has a `JIT` column stating whether the function can be calle
 | | `FileWatch` | Watch file-states on files and callbacks |
 | **Networking** | `Net` | DNS, IP conversion, and interface inspection |
 | **Concurrency** | `Fiber` | Green-thread creation, messaging, and lifecycle |
-| | `Event` | One-shot fiber synchronization (max 64 events) |
+| | `Event` | One-shot fiber synchronization (max 256 events) |
 | | `Scheduler` | Low-level fiber scheduling primitives |
-| | `Timers` | Fiber-based timer scheduling (max 64 timers) |
+| | `Timers` | Fiber-based timer scheduling (max 256 timers) |
 | **System** | `OS` | Process, environment, and system interface |
 | | `VM` | VM introspection and control |
 | | `Ffi` | Dynamic native library loading ⚠️ |
@@ -2062,7 +2082,7 @@ Each function table has a `JIT` column stating whether the function can be calle
 | **Time** | `Time` | Unix timestamp manipulation |
 | **Debug** | `Debug` | Assertions, introspection, and runtime checks |
 
-⚠️ = requires `--unsafe` flag (`flarisvm --unsafe <file>`)
+⚠️ = requires a runtime flag: `--unsafe` for `Memory`, `--allow-ffi` or `--unsafe` for `Ffi`
 
 ### Type Annotation Shorthands
 
@@ -2198,7 +2218,7 @@ out-of-range subscript raises `Exception.OutOfBounds` instead of returning `0`.
 | **CopyStringAt** | `CopyStringAt(buf:block, offset:int, s:string, n:int) - bool` | Copies `n` bytes of `s` into `buf` at byte `offset`. `n` defaults to `len(s)`. Bounds-checked against the full byte extent (`count × size`); returns `false` if `offset + n` exceeds it, or on a non-block/non-string. | ✓ |
 | **WriteVarintAt** | `WriteVarintAt(buf:block, offset:int, value:int) - int` | Writes `value` as an unsigned LEB128 varint (protobuf-style: 7 bits/byte, high bit = continuation, max 10 bytes). Returns the byte count written, or 0 if it would not fit. Zigzag-encode signed values first: `(n << 1) ^ (n >> 63)`. | ✓ |
 | **ReadVarintAt** | `ReadVarintAt(buf:block, offset:int) - array` | Reads an unsigned LEB128 varint at `offset`. Returns `[value, bytesRead]`; `bytesRead` is 0 on out-of-range or malformed/truncated input (never reads past the block). | — |
-| **Create** | `Create(count:int, size:int) - block` | Allocates new buffer: `count` elements, `size` bytes each (`size` in 1–255). `nil` if `count <= 0`, `count` is above 2^32-1, or `size` is outside 1–255; raises when the allocation exceeds the 2 GiB cap or fails. | ✓ owned¹ |
+| **Create** | `Create(count:int, size:int) - block` | Allocates new buffer: `count` elements, `size` bytes each (`size` in 1–255). `count` 0 gives an empty block, which a memory stream (`Stream.Open`) can grow. `nil` if `count` is negative or above 2^32-1, or `size` is outside 1–255; raises when the allocation exceeds the 2 GiB cap or fails. | ✓ owned¹ |
 | **Fill** | `Fill(buf:block, value:int) - bool` | Fills entire buffer with byte `value` (0–255). Mutates. | ✓ |
 | **ProcessCallback** | `ProcessCallback(fn:function, buf:block, len:int, blocksize:int, cb:function) - nil` | Processes `buf` with your worker function `fn(buf, len, blocksize)`, then calls `cb(buf, result)` when finished. Returns immediately. Runs on another CPU core when `fn` is simple enough (see the note below), otherwise runs normally — same result either way. | ✓ |
 | **ProcessEvent** | `ProcessEvent(fn:function, buf:block, len:int, blocksize:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Start several and wait for them all with `Event.WaitFor([ids])`. See the note below. | ✓ |
@@ -2546,37 +2566,37 @@ fn touch(key, value) {
 
 Namespace: **`Console`**
 
-Terminal I/O, color, and cursor control.
+Terminal I/O, color, and cursor control. Every read of stdin - these functions and `Stream.Stdin()` alike - goes through one buffer, so bytes one of them reads ahead are never lost to the other.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Clear** | `Clear() - nil` | Clear the entire terminal screen and move cursor to home (1,1). | — |
 | **ClearLine** | `ClearLine() - nil` | Erase the current line and move cursor to column 1. | — |
-| **Error** | `Error(...args:any) - nil` | Print to stderr in red. | — |
-| **GetCursor** | `GetCursor() - object` | Returns `{x, y}` cursor position object. | — |
+| **Error** | `Error(...args:any) - nil` | Print the arguments, space-separated, to stdout after a `❌ ` marker, with a newline. | — |
+| **GetCursor** | `GetCursor() - object` | The cursor position as `{Cols, Rows}`, counted from 0. `nil` when stdin or stdout is not a terminal, or the terminal does not answer. | — |
 | **IsTTY** | `IsTTY() - bool` | `true` if stdout is a real terminal (not piped). | — |
-| **KeyPressed** | `KeyPressed() - bool` | `true` if a key is waiting in the input buffer (non-blocking). | — |
-| **Ok** | `Ok(...args:any) - nil` | Print to stdout in green. | — |
-| **ReadChar** | `ReadChar() - char` | Read a single character from stdin (blocking). | — |
-| **ReadFloat** | `ReadFloat() - float` | Read a float from stdin. | — |
-| **ReadInt** | `ReadInt() - int` | Read an integer from stdin. | — |
-| **ReadKey** | `ReadKey() - object` | Blocking read of one keypress. Returns `{Key:string, Char:char, IsSpecial:bool}`. `Key` is `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"Insert"`, `"Delete"`, `"Enter"`, `"Escape"`, `"Backspace"`, `"Tab"`, `"F1"`–`"F12"`, or a single printable character. `IsSpecial` is `true` for arrows, function keys, and the navigation cluster. | — |
-| **ReadLine** | `ReadLine() - string` | Read a line from stdin (blocking, strips newline). | — |
-| **ReadPassword** | `ReadPassword() - string` | Read without echo. | — |
+| **KeyPressed** | `KeyPressed() - bool` | `true` if a key is waiting (non-blocking), a byte stdin has already read ahead included. | — |
+| **Ok** | `Ok(...args:any) - nil` | Print the arguments, space-separated, to stdout after a `✅ ` marker, with a newline. | — |
+| **ReadChar** | `ReadChar() - char` | Read a single character from stdin (blocking); `nil` at end of input. | — |
+| **ReadFloat** | `ReadFloat() - float` | Read one line from stdin as a float; `nil` at end of input, or when the line is not one clean number (surrounding spaces allowed). The whole line is consumed. | — |
+| **ReadInt** | `ReadInt() - int` | Read one line from stdin as an integer; `nil` at end of input, or when the line is not one clean integer (surrounding spaces allowed) or overflows. The whole line is consumed. | — |
+| **ReadKey** | `ReadKey() - object` | Blocking read of one keypress. Returns `{Key:string, Char:char, IsSpecial:bool}`. `Key` is `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"Insert"`, `"Delete"`, `"Enter"`, `"Escape"`, `"Backspace"`, `"Tab"`, `"F1"`–`"F12"`, or a single printable character, and `""` at end of input. `IsSpecial` is `true` for arrows, function keys, and the navigation cluster. | — |
+| **ReadLine** | `ReadLine() - string` | Read a line from stdin (blocking). The line ends at `\n`, and a `\r` right before it is dropped - the rule `Stream.ReadLine` uses, so any other `\r` stays in the line. `nil` at end of input. | — |
+| **ReadPassword** | `ReadPassword() - string` | Read a line without echo, by the same rule as `ReadLine`; `""` at end of input. | — |
 | **RestoreCursor** | `RestoreCursor() - nil` | Restore previously saved cursor position. | — |
 | **SaveCursor** | `SaveCursor() - nil` | Save current cursor position. | — |
-| **SetBackground** | `SetBackground(color:int) - nil` | Set background color. Use `ConsoleColor.*` constants. | — |
-| **SetColor** | `SetColor(color:int) - nil` | Set foreground color. Use `ConsoleColor.*` constants. | — |
-| **SetCursor** | `SetCursor(x:int, y:int) - nil` | Move cursor to column `x`, row `y`. | — |
+| **SetBackground** | `SetBackground(color:int) - nil` | Set background color. Use the `Console.ConsoleColor.*` constants. | — |
+| **SetColor** | `SetColor(color:int) - nil` | Set foreground color. Use the `Console.ConsoleColor.*` constants. | — |
+| **SetCursor** | `SetCursor(row:int, col:int) - nil` | Move the cursor to `row`, `col`, both counted from 1 (a value below 1 counts as 1). | — |
 | **SetRaw** | `SetRaw(enable:bool) - nil` | Enable or disable terminal raw mode. When `true`: disables line buffering and echo so individual keypresses are available immediately without pressing Enter. Restore with `SetRaw(false)` before exit. Has no effect if not running on a TTY. | — |
-| **Size** | `Size() - object` | Returns `{width, height}` of terminal. | — |
-| **TryReadChar** | `TryReadChar() - char` | Non-blocking: returns `char` if key pressed, else `\0`. | — |
-| **Warn** | `Warn(...args:any) - nil` | Print to stderr in yellow. | — |
+| **Size** | `Size() - array` | The terminal's size as `[cols, rows]`; `nil` when stdout is not a terminal. | — |
+| **TryReadChar** | `TryReadChar() - char` | Non-blocking: the waiting character, or `nil` when there is none. | — |
+| **Warn** | `Warn(...args:any) - nil` | Print the arguments, space-separated, to stdout after a `⚠️ ` marker, with a newline. | — |
 | **Write** | `Write(...args:any) - nil` | Print to stdout without trailing newline. | — |
 | **WriteLines** | `WriteLines(...args:any) - nil` | Print multiple values each on its own line. | — |
-| **WriteLine** | `WriteLine(...args:any) - nil` | Print to stdout with trailing newline. | — |
+| **WriteLine** | `WriteLine(...args:any) - nil` | Print to stdout with trailing newline. A built-in class's instance (a collection, `Random`, a `Weak` handle) prints as `str()` shows it, e.g. `<Stack[2]>`. | — |
 
-**ConsoleColor constants:** `Default`, `Red`, `Green`, `Blue`, `Yellow`, `Cyan`
+**ConsoleColor constants** (`Console.ConsoleColor.Red`, ...): `Default`, `Red`, `Green`, `Blue`, `Yellow`, `Cyan`
 
 ---
 
@@ -2662,7 +2682,7 @@ Character classification and conversion. All functions operate on the full 32-bi
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
 | **Code** | `Code(c:char) - int` | Raw Unicode codepoint as an integer (`'A'` - 65, `'中'` - 0x4E2D). | ✓ |
-| **FromInt** | `FromInt(n:int) - char` | Wrap an integer codepoint as a `char`. No range check performed. | ✓ |
+| **FromInt** | `FromInt(n:int) - char` | An integer code point as a `char`. Outside 0–0x10FFFF it gives U+FFFD, the replacement character; `Convert.ToChar` returns `nil` there instead. | ✓ |
 
 ```flaris
 // Unicode-aware classification
@@ -2718,15 +2738,17 @@ Authenticated encryption (XChaCha20-Poly1305), Ed25519 signatures, X25519 key ex
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Argon2** | `Argon2(password:string\|block, salt:string\|block, iterations?:int, memKiB?:int) - string` | Argon2id password hash (64-hex). `salt` >= 8 bytes (16 recommended); `iterations` 1-1024, default 3; `memKiB` memory cost in KiB, 8-1048576 (1 GiB), default 65536 (64 MiB). A value outside those ranges raises `InvalidArgs`. | — |
+| **ChaCha20** | `ChaCha20(key:string\|block, nonce:string\|block, counter:int, data:string\|block) - block` | The raw ChaCha20 stream cipher: XOR `data` with the keystream under the 32-byte `key`, starting at block `counter`, and return the result as a block; the same call encrypts and decrypts. An 8-byte `nonce` selects the original variant with a 64-bit counter, a 12-byte `nonce` the IETF (RFC 8439) one with a 32-bit counter. No authentication - pair it with `Poly1305`. For ordinary encryption use `Encrypt`, which does both and picks the nonce. Raises on any other key or nonce length, a negative counter, or more than 256 MB. | ✓ owned¹ |
 | **ConstantTimeEquals** | `ConstantTimeEquals(a:string\|block, b:string\|block) - bool` | Compare two byte sequences in constant time (no early exit). Use instead of `==` when verifying MACs, signatures, or tokens so equality checks don't leak timing. Only length inequality returns early. | ✓ |
 | **Decrypt** | `Decrypt(cipher:string\|block, cipherLen:int, key:string\|block, nonce:string\|block, tag:string) - object` | Decrypt `cipherLen` bytes of XChaCha20-Poly1305 `cipher` with the 32-byte `key`, 24-byte `nonce`, and hex `tag` returned by `Encrypt`. Returns `{Ok:bool, Plain:block}`. On authentication failure `Ok` is `false` and `Plain` is zeroed - always check `Ok` before using `Plain`. | — |
-| **Ed25519KeyPair** | `Ed25519KeyPair() - object` | Generate an Ed25519 signing key pair. Returns `{PublicKey:string(64 hex), SecretKey:string(128 hex)}`. | — |
+| **Ed25519KeyPair** | `Ed25519KeyPair() - object` | Generate an Ed25519 (RFC 8032, SHA-512) signing key pair, interoperable with OpenSSH, libsodium and JWT `EdDSA`. The secret key is the 32-byte seed followed by the public key. Keys and signatures made before 1.0.5 used a different hash and do not verify against these. Returns `{PublicKey:string(64 hex), SecretKey:string(128 hex)}`. | — |
 | **Ed25519Sign** | `Ed25519Sign(secretKey:string, message:string\|block) - string` | Sign `message` with a hex secret key; returns a 128-hex signature. | ✓ owned¹ |
 | **Ed25519Verify** | `Ed25519Verify(signature:string, publicKey:string, message:string\|block) - bool` | Verify a hex signature against a hex public key and message. | ✓ |
 | **Encrypt** | `Encrypt(data:string\|block, dataLen:int, key:string\|block) - object` | Encrypt `dataLen` bytes of `data` with XChaCha20-Poly1305 under a 32-byte `key`. A fresh 24-byte nonce is generated per call (never supply your own). Returns `{Ok:bool, Cipher:block, Nonce:block, Tag:string(32 hex)}`. Max 256 MB. | — |
 | **HmacSha1** | `HmacSha1(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA1 (40-hex). Legacy/interop: TOTP/HOTP 2FA, OAuth1, AWS SigV2. | ✓ owned¹ |
 | **HmacSha256** | `HmacSha256(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA256 (64-hex). | ✓ owned¹ |
 | **HmacSha512** | `HmacSha512(key:string\|block, data:string\|block) - string` | Compute HMAC-SHA512 (128-hex). E.g. JWT HS512. | ✓ owned¹ |
+| **Poly1305** | `Poly1305(key:string\|block, data:string\|block) - block` | The Poly1305 one-time authenticator (RFC 8439): a 16-byte tag over `data` under the 32-byte `key`. The key must never authenticate two messages - protocols derive it per message from `ChaCha20`. Compare tags with `ConstantTimeEquals`. | ✓ owned¹ |
 | **RandomBytes** | `RandomBytes(count:int) - block` | Generate `count` cryptographically random bytes (CSPRNG). Raises if `count` is not in `1..67108864`. | ✓ owned¹ |
 | **X25519KeyPair** | `X25519KeyPair() - object` | Generate an X25519 key-exchange key pair. Returns `{PublicKey:string(64 hex), SecretKey:string(64 hex)}`. | — |
 | **X25519Shared** | `X25519Shared(secretKey:string, peerPublicKey:string) - string` | X25519 ECDH; returns the 64-hex raw shared secret. Hash it (e.g. `Hash.Blake2b`) before using it as a key. | ✓ owned¹ |
@@ -2747,7 +2769,7 @@ Runtime introspection and assertion tools. Available in all builds; overhead is 
 | **Here** | `Here(?label:string)` | Prints the current file, line, and function name to stdout (with an optional `label`). | — |
 | **Pool** | `Pool()` | Prints allocator statistics and a per-slab dump. Requires `--unsafe` (the dump shows heap addresses). | — |
 | **Refs** | `Refs(value:any) - int` | Returns `value`'s external reference count (`-1` for tagged immediates, which have none). | — |
-| **Stack** | `Stack()` | Prints the current operand stack to stdout. | — |
+| **Stack** | `Stack()` | Prints the values on the current operand stack to stdout, top first. | — |
 | **StackPtr** | `StackPtr() - int` | Returns the current operand-stack depth. | — |
 | **Value** | `Value(v:any)` | Prints a detailed internal representation of a value. Requires `--unsafe` (the dump shows heap addresses). | — |
 
@@ -2781,12 +2803,12 @@ Filesystem directory operations.
 
 Namespace: **`Event`**
 
-Signals fibers can wait on. Max 64 events (a shared, fixed pool).
+Signals fibers can wait on. Max 256 events per VM (a shared, fixed pool).
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **Create** | `Create() - int` | Claims a new event id (`0..63`), or **`-1`** if the 64-id pool is exhausted. Always check for `-1`. | ✓ |
-| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..63`, or `InvalidArgs` for an id that was never created. | ✓ |
+| **Create** | `Create() - int` | Claims a new event id (`0..255`), or **`-1`** if the 256-id pool is exhausted. Always check for `-1`. | ✓ |
+| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..255`, or `InvalidArgs` for an id that was never created. | ✓ |
 | **WaitOne** | `WaitOne(id:int, timeoutMs?:int) - any` | Parks the caller until `Set` is called on this event, then returns the value it was set with. With a positive `timeoutMs` it resumes with **`nil`** once the deadline passes; `0`/omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id. | — |
 | **WaitFor** | `WaitFor(ids:array, timeoutMs?:int) - array` | Waits until **all** of the events in `ids` have been set, then returns their values as an array. Use it to start several `ProcessEvent`/`Set` jobs and continue once they've all finished. (An empty list returns `[]` right away.) With a positive `timeoutMs`, if the deadline passes before every event fires it returns **`nil`** and stops waiting; `0` or omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id or `InvalidArgs` for a non-int element. | — |
 | **Free** | `Free(id:int)` | Releases an id back to the pool. Use to reclaim an event you created but never delivered (a dropped job) so the fixed pool is not exhausted. Raises `IndexOutOfBounds` for an out-of-range id. | ✓ |
@@ -2802,7 +2824,7 @@ Note: `WaitFor` returns the values sorted by event id, which may differ from the
 
 Namespace: **`Ffi`**
 
-Dynamic loading of native shared libraries (`.so`, `.dylib`). Requires `--unsafe` flag. FFI calls cross a clean isolation boundary - arguments and return values are marshalled through a structured type system; no VM internals are exposed to native code.
+Dynamic loading of native shared libraries (`.so`, `.dylib`). Requires `--allow-ffi` (or `--unsafe`, which implies it). FFI calls cross a clean isolation boundary - arguments and return values are marshalled through a structured type system; no VM internals are exposed to native code.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
@@ -2899,7 +2921,7 @@ Cooperative green-thread creation, communication, and lifecycle management.
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Cancel** | `Cancel(f:fiber) - bool` | Cancel a fiber: `Exception.Cancelled` is raised at the point it is parked, so every `finally` it is inside runs on the way out. No `catch` can see it - a cancelled fiber cannot talk itself out of stopping - and any I/O it was parked on is cancelled. Asynchronous: the fiber does its unwinding on a later scheduler pass, so it is not finished the moment `Cancel` returns, and a `finally` that awaits keeps it alive until that await resolves. Whoever is waiting on `await f` receives `Exception.Cancelled`; with nobody waiting it is discarded, because cancelling is not an error. `true` if the fiber was still live, `false` if it had already finished or was already being cancelled. Raises `OutOfFibers`, leaving `f` untouched, when `f` is parked in an unawaited `yield` and the [fiber limit](#fibers-and-scheduling) is reached - it needs a turn to unwind. | — |
-| **CancelIo** | `CancelIo(f:fiber) - bool` | Abandon `f`'s pending async I/O **without** killing the fiber: it wakes from its `await` with `nil` and `Stream.LastError()` reporting `7` (cancelled), then carries on running. Use it to drop a stalled read while still answering the client — `Cancel` by contrast stops the fiber for good. `false` if `f` was not waiting on I/O. | — |
+| **CancelIo** | `CancelIo(f:fiber) - bool` | Abandon `f`'s pending async I/O **without** killing the fiber: it wakes from its `await` with `nil` and `Stream.LastError()` reporting `7` (cancelled), then carries on running. Bytes a cancelled `Stream.ReadAsync` or `Stream.ReadLineAsync` had already received go back to the stream, so the next read sees them. `Stream.ConnectAsync` and `Stream.ConnectTlsAsync` cannot be cancelled; they end at their own `timeoutMs`. Use it to drop a stalled read while still answering the client — `Cancel` by contrast stops the fiber for good. `false` if `f` was not waiting on I/O. | — |
 | **FromId** | `FromId(id:int) - fiber` | Returns the live fiber with that integer ID, or `nil` when none matches (it finished, or the ID was never used). Inside a host application a script only finds fibers of its own context. | — |
 | **GetMessage** | `GetMessage(f:fiber) - any` | Consume and return the oldest queued message (FIFO), or `nil` if the mailbox is empty. | — |
 | **HasMessage** | `HasMessage(f:fiber) - bool` | `true` if at least one message is queued for `f`. | — |
@@ -2944,24 +2966,26 @@ Factory functions (`New`, `Run`, `Id`, `Sleep`), `AwaitAll` and `Park` are not a
 
 Namespace: **`File`**
 
-File read, write, and metadata operations.
+File read, write, and metadata operations. A path that is not a string - `nil` included - names no file: every call fails on it as on a missing file, and nothing on disk is touched. `nil` data writes nothing.
+
+A call that fails - `nil` or `false` where it would return a value or `true` - sets `Stream.LastError()` the way a stream call does: `6` the operating system refused (a missing path, a directory, no permission, a full disk), `4` the file is past the call's size limit or memory ran out, `5` the call refuses the request (a file copied onto itself, a typed number array for `WriteLines`, a negative `Truncate` size). An async call resolves it, to `0` when it succeeds; a synchronous call that succeeds leaves it as it was.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **AppendLines** | `AppendLines(path:string, lines:array) - bool` | As `WriteLines`, appending (the file is created if missing). | — |
 | **AppendText** | `AppendText(path:string, text:string) - bool` | Append text to the file (created if missing), bytes written verbatim. `false` if it can't be opened or written. | — |
-| **Copy** | `Copy(src:string, dst:string) - bool` | Copy file from `src` to `dst` (binary, overwriting `dst`). `false` on any open/read/write error, or when `src` and `dst` are the same file (including through a hard or symbolic link) - the file is left untouched. | — |
+| **Copy** | `Copy(src:string, dst:string) - bool` | Copy file from `src` to `dst` (binary, overwriting `dst`). `false` on any open/read/write error, or when `src` and `dst` are the same file (including through a hard or symbolic link) - the file is left untouched. A source that cannot be read as a file (missing, a directory) leaves `dst` untouched. | — |
 | **CopyAsync** | `CopyAsync(src:string, dst:string) - fiber` | Non-blocking `Copy`. Use with `await`; resolves to `true` on success, `false` on error or when `src` and `dst` are the same file. Other fibers run while the file is copied. | — |
 | **CreateHardLink** | `CreateHardLink(target:string, linkPath:string) - bool` | Create a hard link at `linkPath` sharing `target`'s inode. `target` must exist and be on the same filesystem. | — |
 | **CreateSymlink** | `CreateSymlink(target:string, linkPath:string) - bool` | Create a symbolic link at `linkPath` pointing to `target` (need not exist). On Windows requires Developer Mode / admin. | — |
 | **Delete** | `Delete(path:string) - bool` | Delete the file (or symbolic link) at `path`. `false` if it can't be removed - including for a directory, which takes `Directory.Delete`. | — |
 | **Exists** | `Exists(path:string) - bool` | `true` if path exists and is a regular file (symlinks followed). Directories report `false` - use `Directory.Exists`. | — |
 | **GetModifiedTime** | `GetModifiedTime(path:string) - int` | Returns Unix timestamp of last modification. | — |
-| **Lines** | `Lines(path:string, callback:fn) - int` | Stream the file line by line, calling `callback(line)` for each (terminators stripped as `ReadLines` does) without building an array - the memory-cheap alternative to `ReadLines` for large files. The callback may return `false` to stop early. Returns the number of lines processed, or `nil` if the file can't be opened, a line passes 256 MB, or the callback raises. | — |
-| **Move** | `Move(src:string, dst:string) - bool` | Move/rename file. | — |
+| **Lines** | `Lines(path:string, callback:fn) - int` | Stream the file line by line, calling `callback(line)` for each (terminators stripped as `ReadLines` does) without building an array - the memory-cheap alternative to `ReadLines` for large files. The callback may return `false` to stop early. Returns the number of lines processed, or `nil` if the file can't be opened or read (a directory), or a line passes 256 MB. An exception the callback raises propagates. | — |
+| **Move** | `Move(src:string, dst:string) - bool` | Move/rename a file. An existing file at `dst` is replaced. Atomic within one filesystem; fails across filesystems, with no copy+delete fallback. | — |
 | **ReadAllBytes** | `ReadAllBytes(path:string) - block` | Read the entire file as a byte block, to end of file - pipes and `/proc` files, whose reported size is 0, read in full. `nil` if it can't be opened or read, or passes 2 GiB. | — |
 | **ReadAllBytesAsync** | `ReadAllBytesAsync(path:string) - fiber` | Non-blocking `ReadAllBytes`. Use with `await`; resolves as `ReadAllBytes` returns. Other fibers run while the file is read. | — |
-| **ReadLines** | `ReadLines(path:string) - array` | Read file into array of strings (one per line). Lines end at `\n`; a `\r` right before it is stripped too, a lone `\r` is data - the rule `Stream.ReadLine` uses. Lines of any length stay whole. `nil` if the file can't be opened or a line passes 256 MB. | — |
+| **ReadLines** | `ReadLines(path:string) - array` | Read file into array of strings (one per line). Lines end at `\n`; a `\r` right before it is stripped too, a lone `\r` is data - the rule `Stream.ReadLine` uses. Lines of any length stay whole. `nil` if the file can't be opened or read (a directory), or a line passes 256 MB. | — |
 | **ReadLink** | `ReadLink(path:string) - string` | The target a symbolic link points to (the raw stored target, not a resolved path), or `nil` if not a symlink / unreadable. POSIX only - `nil` on Windows. | — |
 | **ReadText** | `ReadText(path:string) - string` | Read the entire file as a string, to end of file (pipes and `/proc` files included). Bytes are taken as they are - no encoding check or conversion. `nil` if it can't be opened or read, or passes 256 MB. | — |
 | **ReadTextAsync** | `ReadTextAsync(path:string) - fiber` | Non-blocking `ReadText`. Use with `await`; resolves as `ReadText` returns. Other fibers run while the file is read. | — |
@@ -2985,7 +3009,7 @@ File read, write, and metadata operations.
 
 Namespace: **`FileWatch`**
 
-File and directory event monitoring. Up to 64 concurrent watchers per VM. Uses `inotify` on Linux, `kqueue` on macOS/BSD, and `ReadDirectoryChangesW` on Windows. The callback fires on every scheduler tick where an event is pending - no fiber is blocked. It runs as its own call with the permissions of the fiber that opened the watch and must run to completion: to wait on something (`await`, `Fiber.Sleep`), start a fiber from the callback.
+File and directory event monitoring. Up to 64 concurrent watchers per VM. Uses `inotify` on Linux, `kqueue` on macOS/BSD, and `ReadDirectoryChangesW` on Windows. The callback runs once per event, between fibers' turns - no fiber is blocked, and a sleeping fiber does not delay it. It runs as its own call with the permissions of the fiber that opened the watch and must run to completion: to wait on something (`await`, `Fiber.Sleep`), start a fiber from the callback. A callback that raises is reported on stderr and the watch carries on. An open watch alone does not keep the program running.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
@@ -3273,6 +3297,45 @@ r.NextFloat();       // deterministic [0,1)
 
 ---
 
+### Weak
+
+Namespace: **`Weak`**
+
+Non-owning handles. `Weak.Create(v)` returns a handle that does not keep `v`
+alive; `Weak.Get(h)` returns `v` while something else still owns it and `nil`
+afterwards. Every handle on a value is nilled the moment the value's last owner
+lets go - before its `Destructor` runs - so a `Destructor` can never hand a
+dying object back out through a handle. Use a handle for the back-reference in
+a pair (a child's link to its parent, an observer's link to its subject) so the
+pair forms no reference cycle - see *Reference cycles are never collected*.
+
+| Function | Signature | Description | JIT |
+| -------- | --------- | ----------- | --- |
+| **Alive** | `Alive(h:instance) - bool` | `true` while the handle's target lives. | — |
+| **Create** | `Create(v:any) - instance` | A handle on `v`. Raises `Exception.InvalidArguments` for `nil`, a number, a bool or a char - values with no lifetime to observe. | — |
+| **Get** | `Get(h:instance) - any` | The target while it lives, `nil` afterwards. The result is an ordinary owning reference: keep it only as long as needed. Raises `Exception.InvalidArguments` for an instance that is not a handle. | — |
+
+- Handles never extend a lifetime: a value reached only through handles is
+  freed as soon as its last owner lets go.
+- `Object.Clone(h)` is a second, independent handle on the same target.
+- A value owned by a structure that was just dropped dies when the deferred-free
+  queue next drains, not on the same instruction as its owner; a handle on it
+  resolves until then.
+- A handle on a static value (a class, a module) always resolves.
+
+`weak(v)` is the keyword form of `Create`.
+
+```flaris
+class Node {
+    let child = nil;    // owned
+    let parent = nil;   // observed
+    fn Adopt(c) { this.child = c; c.parent = weak(this); }
+    fn Up() { return Weak.Get(this.parent); }   // nil once the parent is gone
+}
+```
+
+---
+
 ### Memory
 
 Namespace: **`Memory`**
@@ -3539,7 +3602,7 @@ These are bitmask unions - use `&` not `==`.
 
 Namespace: **`Os`**
 
-Process, environment, and system interface. Functions marked **unsafe** require the `--unsafe` flag.
+Process, environment, and system interface. None of it needs `--unsafe`: an embedding host that must not let a script start or signal processes withholds the whole module.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
@@ -3555,7 +3618,7 @@ Process, environment, and system interface. Functions marked **unsafe** require 
 | **GetArgValue** | `GetArgValue(name:string, default?:string) - string` | Value of the first script argument of the form `name=value`. Leading dashes are ignored on both sides and a trailing `=` on `name` is optional, so `"port"`, `"--port"` and `"--port="` all find `--port=8080` — but none of them matches `--report=1`. Returns `default` (or `nil`) if not found. | — |
 | **Gid** | `Gid() - int` | Returns the real group ID of the process; `0` on Windows. | — |
 | **IsRoot** | `IsRoot() - bool` | `true` if the process is running as root (UID 0); on Windows, if it runs elevated (as administrator). | — |
-| **Kill** | `Kill(pid:int, signal:int) - bool` | Send a signal to a process. Use standard signal numbers (e.g. `15` for SIGTERM, `9` for SIGKILL). Requires `--unsafe`. | — |
+| **Kill** | `Kill(pid:int, signal:int) - bool` | Send a signal to any process. Use standard signal numbers (e.g. `15` for SIGTERM, `9` for SIGKILL); `0` only tests that the process exists. On Linux and macOS a `pid` of `0` or below addresses a process group, as `kill(2)` does. To signal only processes this VM started, use `KillChild`. | — |
 | **Name** | `Name() - string` | Returns OS name: `"Windows"`, `"Linux"` or `"macOS"`. | — |
 | **Pid** | `Pid() - int` | Returns the current process ID. | — |
 | **Ppid** | `Ppid() - int` | Returns the parent process ID; `0` on Windows. | — |
@@ -3567,15 +3630,15 @@ Process, environment, and system interface. Functions marked **unsafe** require 
 | **TempDir** | `TempDir() - string` | Returns path to system temp directory. | — |
 | **Uid** | `Uid() - int` | Returns the real user ID of the process; `0` on Windows. | — |
 | **Wait** | `Wait(pid:int) - int` | Wait (blocking) for child process to exit. Returns its exit code, the negative signal number if killed by a signal, or `nil` when `pid` is not an unreaped child of this process (`0` and negative values included - they never select a process group). | — |
-| **WaitTimeout** | `WaitTimeout(pid:int, timeoutMs:int) - object` | Wait (blocking) up to `timeoutMs` milliseconds for a child process to exit. Returns `{Alive:bool, Exit:int, TimedOut:bool}`; when the deadline expires first, `Alive` stays `true` and `TimedOut` is `true`. `timeoutMs <= 0` checks once. `Exit` is `nil` when `pid` is not an unreaped child of this process. | — |
+| **WaitTimeout** | `WaitTimeout(pid:int, timeoutMs:int) - object` | Wait (blocking) up to `timeoutMs` milliseconds for a child process to exit. Returns `{Alive:bool, Exit:int, TimedOut:bool}`; when the deadline expires first, `Alive` stays `true`, `Exit` is `nil` and `TimedOut` is `true`. `timeoutMs <= 0` checks once. `Exit` is `nil` when `pid` is not an unreaped child of this process. | — |
 | **WaitAsync** | `WaitAsync(pid:int, timeoutMs?:int) - fiber` | Wait for a child to exit without blocking other fibers: `await` resolves to `{Alive:bool, Exit:int, TimedOut:bool}`, as `WaitTimeout` returns, and reaps the child once it has exited. Without `timeoutMs` it waits for the exit; `timeoutMs <= 0` checks once. On Linux and macOS the wait costs no thread and `Fiber.CancelIo` abandons it (`nil`, `Stream.LastError()` 7); on Windows it runs on the I/O pool in short slices, where `Fiber.CancelIo` cannot interrupt it - pass a timeout there. | — |
-| **Spawn** | `Spawn(cmd:string, args?:array, options?:object) - object` | Start `cmd` (searched on `PATH`, no shell) with separate stdin/stdout/stderr pipes. Returns `{Pid:int, Stdin:int, Stdout:int, Stderr:int}`; the three descriptors are the only ones `ReadPipe`/`WritePipe`/`ClosePipe` accept. Accepts `Cwd`, `Env`, `MergeStderr` (then `Stderr` is `nil`) and `Streams`: with `Streams: true` the three pipes are `Stream` objects instead - use `Stream.ReadLine`, `Stream.ReadLineAsync`, `Stream.WriteString` and friends, and `Stream.Close` them yourself. Stdout and stderr are non-blocking. Returns `nil` when the program cannot be started, or while 256 spawned children are still unreaped. The child is never reaped for you - `TryWait`/`Wait` it, or it stays a zombie. | — |
-| **ReadPipe** | `ReadPipe(fd:int) - string` | Non-blocking read of up to 4 KB from a pipe returned by `Spawn`. Binary-safe. Returns `nil` when no data is available, the pipe is at end of file, or `fd` did not come from `Spawn` - use `TryWait` to tell "not yet" from "finished". | — |
-| **WritePipe** | `WritePipe(fd:int, data:string) - int` | Write `data` to the `Stdin` pipe of a spawned process. Returns bytes written (possibly fewer than `len(data)`), or `-1` on error or when `fd` did not come from `Spawn`. Blocks every fiber while the pipe is full. | — |
-| **ClosePipe** | `ClosePipe(fd:int) - bool` | Close a pipe returned by `Spawn`. Call on `Stdin` to signal EOF to the child process. `false` for a descriptor that did not come from `Spawn` or is already closed. | — |
+| **Spawn** | `Spawn(cmd:string, args?:array, options?:object) - object` | Start `cmd` (searched on `PATH`, no shell) with separate stdin/stdout/stderr pipes. Returns `{Pid:int, Stdin:stream, Stdout:stream, Stderr:stream}`: read and write them with `Stream.ReadLine`, `Stream.ReadLineAsync`, `Stream.WriteString` and friends, and `Stream.Close` them yourself. They are ordinary pipes, so a synchronous read waits for the child and holds up every fiber meanwhile - use the `*Async` calls to wait on the child alone. Accepts `Cwd`, `Env`, `MergeStderr` (then `Stderr` is `nil`) and `Streams`, which is still accepted and changes nothing. Returns `nil` when the program cannot be started, or while 256 spawned children are still unreaped. The child is never reaped for you - `TryWait`/`Wait` it, or it stays a zombie. | — |
+| **ReadPipe** | `ReadPipe(pipe:stream) - string` | Deprecated, kept for this release: use `Stream.ReadBytes` or `Stream.ReadLine`. Reads up to 4 KB of what has arrived on a pipe from `Spawn`, without waiting. Binary-safe. Returns `nil` when nothing has arrived yet, at end of file, or for a closed stream - use `TryWait` to tell "not yet" from "finished". | — |
+| **WritePipe** | `WritePipe(pipe:stream, data:string) - int` | Deprecated, kept for this release: use `Stream.WriteString`. Writes all of `data` to a spawned process's `Stdin` and returns the byte count, or `-1` on an error (the child has gone) or for a closed stream. Blocks every fiber while the pipe is full. | — |
+| **ClosePipe** | `ClosePipe(pipe:stream) - bool` | Deprecated, kept for this release: use `Stream.Close`. Closes a pipe from `Spawn`; on `Stdin` the child sees end of file. `false` for a stream that is already closed. | — |
 | **IsAlive** | `IsAlive(pid:int) - bool` | Returns `true` if the process with `pid` is still running. Non-blocking. Does not reap the child: a child that has exited reports `false` while its exit code stays available to `TryWait`/`Wait`. | — |
-| **TryWait** | `TryWait(pid:int) - object` | Non-blocking wait. Returns `{Alive:bool, Exit:int}`. When `Alive` is `false` the child has been reaped and `Exit` holds the exit code - or `nil` when `pid` is not an unreaped child of this process (never spawned, or already reaped). | — |
-| **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance or has already been reaped. For sending signals to arbitrary PIDs use `Os.Kill` (requires `--unsafe`). | — |
+| **TryWait** | `TryWait(pid:int) - object` | Non-blocking wait. Returns `{Alive:bool, Exit:int}`. While `Alive` is `true`, `Exit` is `nil`. When `Alive` is `false` the child has been reaped and `Exit` holds the exit code - or `nil` when `pid` is not an unreaped child of this process (never spawned, or already reaped). | — |
+| **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance or has already been reaped. For sending signals to arbitrary PIDs use `Os.Kill`. | — |
 | **RunEx** | `RunEx(cmd:string, args?:array, options?:object) - object` | Run `cmd` (searched on `PATH`, no shell) and wait for it to finish. Returns `{Exit:int, Stdout:string, Stderr:string}` with stdout and stderr captured separately; stdin is inherited unless `Stdin` is given. Accepts `Cwd`, `Env`, `Stdin`, `MergeStderr` and `Timeout` (see [Launch options](#launch-options)); with `Timeout` the result also carries `TimedOut`. Returns `nil` when the program cannot be started (not found, not executable). Each stream keeps its first 16 MB; after that the pipe is closed, so a child that keeps writing receives `SIGPIPE`. | — |
 | **RunExTimeout** | `RunExTimeout(cmd:string, timeoutMs:int, args?:array, options?:object) - object` | Takes the same options as `RunEx` except `Timeout`. Run `cmd` with separate stdout/stderr capture and wait up to `timeoutMs` milliseconds. Returns `{Exit:int, Stdout:string, Stderr:string, TimedOut:bool}`. If the timeout expires first, the child is terminated and `TimedOut` is `true` with `Exit` set to `124`. The child runs in its own process group (a Job Object on Windows) and the whole group is killed, so a grandchild cannot outlive the deadline or stretch the call past it. `timeoutMs <= 0` means no limit. | — |
 | **GetEnvAll** | `GetEnvAll() - object` | Returns all environment variables as an object `{NAME: "value", ...}`; `Object.Keys` lists the names. | — |
@@ -3593,7 +3656,7 @@ ignored.
 | `Stdin` | string | Text written to the child's stdin, which is then closed. `""` gives the child an empty stdin instead of this process's. Written while the output is read, so a child that writes before it reads cannot deadlock. | `RunEx`, `RunExTimeout` |
 | `MergeStderr` | bool | Send stderr to the same pipe as stdout, interleaved as written. | all three |
 | `Timeout` | int | Milliseconds before the child and its process group are killed; `Exit` is then `124` and `TimedOut` is `true`. | `RunEx` |
-| `Streams` | bool | Return the pipes as `Stream` objects. | `Spawn` |
+| `Streams` | bool | Accepted and ignored: the pipes are always streams. | `Spawn` |
 
 ```flaris
 let r = Os.RunEx("git", ["log", "--oneline", "-5"], {
@@ -3602,7 +3665,7 @@ let r = Os.RunEx("git", ["log", "--oneline", "-5"], {
     Timeout: 5000
 });
 
-let p = Os.Spawn("sort", [], {Streams: true});
+let p = Os.Spawn("sort");
 Stream.WriteString(p.Stdin, "b\na\n");
 Stream.Close(p.Stdin);
 var line = Stream.ReadLine(p.Stdout);
@@ -3934,7 +3997,7 @@ Namespace: **`Stream`**
 
 Unified I/O for files, network sockets, pipes, and serial ports. All functions operate on a `stream` value backed by a file descriptor. A `nil` stream argument behaves exactly like a closed stream (`IsOpen` is `false`, reads return `nil`), so closing the result of a failed `Open` is harmless.
 
-**TLS streams.** `ConnectTls` and `AcceptTls` return an ordinary `stream` whose bytes happen to be encrypted, so every function below works over TLS and any Stream-based library runs unchanged — there is no separate TLS API to port to. TLS comes from the OS stack (macOS Secure Transport, Linux OpenSSL via `dlopen`, Windows SChannel) and the system trust store; certificates and hostnames are verified by default (TLS >= 1.2).
+**TLS streams.** `ConnectTls`, `StartTls` and `AcceptTls` return an ordinary `stream` whose bytes happen to be encrypted, so every function below works over TLS and any Stream-based library runs unchanged — there is no separate TLS API to port to. TLS comes from the OS stack (macOS Secure Transport, Linux OpenSSL via `dlopen`, Windows SChannel) and the system trust store; certificates and hostnames are verified by default (TLS >= 1.2).
 
 Four operations behave differently on a TLS stream, because a TLS session is a byte conversation with no file offset:
 
@@ -4008,75 +4071,126 @@ socket - the operation runs on an I/O worker instead, and **each outstanding
 read or write holds one worker for its whole duration**. The worker count is set
 with `--io-threads`; a Windows program that keeps many pipe or file operations in
 flight at once needs it raised to match, or the extra operations queue behind the
-ones already running. Sockets never pay this on any platform.
+ones already running. Sockets never pay this on any platform. `Close` and
+`Fiber.CancelIo` stop such an operation as they stop any other, with one
+exception: a read from the Windows console sits in the operating system until
+input arrives, so its timeout and a cancel take effect only then.
+
+**Synchronous calls wait without blocking.** A socket that has been used with
+`WaitReadable` or an `*Async` call stays non-blocking, and a serial port is
+opened that way on Linux and macOS. A synchronous call that has to wait on one -
+a read with nothing there yet, a write to a full socket, `SendFile` with no room
+- parks only the calling fiber until it can go on, for as long as `SetTimeout`
+allows; other fibers keep running. `ReadBytes` and `ReadString` then return what
+has arrived; `ReadLine` waits for its line, the fixed-width readers (`ReadU32`
+and the rest) and `ReadVarint` for exactly the bytes they decode, and a write
+returns once every byte is out. A read that the timeout cuts short gives back
+what it had read, so the next read starts there. Inside a completion callback or
+a host call, where a fiber cannot be parked, the same calls wait in place and
+the other fibers wait with them.
+
+**End of stream and closed streams.** A fixed-width reader (`ReadU16` and the
+rest) that reaches the end of the stream part-way through a value returns `nil`
+and consumes the bytes it had read, since no more can follow; only a timeout
+gives them back. Every read on a closed or `nil` stream returns `nil` with
+`LastError()` `2`, and the `*Async` calls resolve to that instead of raising.
+Writes answer the same way: `false` (`WriteBytes` `-1`, `SendFile` `nil`) with
+`LastError()` `2`, and `WriteAsync` resolves to `nil`; only `Close` returns
+`true` on a stream that is already closed.
+
+**Operations a stream does not support.** A call that has no meaning for
+the kind of stream it is given answers the same way on every operating system:
+`false` (`Tell` `-1`, `Size`, `PeerAddr` and `Accept` `nil`) with `LastError()`
+`5`. `Seek`, `Tell`, `Size` and `Truncate` apply to a file stream (or a
+standard stream redirected from a file); `SetTimeout` and `LocalAddr` to a
+socket; `Shutdown` and `PeerAddr` to a connected TCP socket; `SetNoDelay` and
+`SetKeepAlive` to a TCP socket; `Accept` to a listening TCP socket. A failure
+of a call that does apply reports `6`, and every one of them reports `2` on a
+closed or `nil` stream.
+
+**Write failures.** A write that fails sets `LastError()`: `1` when the write
+timeout set with `SetTimeout` passed, `2` for a closed stream, `3` when the
+reader is gone (a pipe with no reader, a reset connection), `6` for another OS
+error. A socket whose peer has closed may still accept one write - the loss is
+only reported once the peer answers - so it is the next write that fails. The
+fixed-width writers and `WriteByte` keep the low bits of the value
+(`WriteByte(s, 256)` writes `0`), a `nil` value writes `0`, and `nil` data
+writes nothing.
+
+**Out of memory.** A synchronous read that cannot allocate what it needs raises
+`Exception.OutOfMemory`; an async read resolves to `nil` with `LastError()` `4`,
+also when it would have completed at once. Either way the bytes it had taken
+from the stream stay there, so a later read still gets them.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **Accept** | `Accept(s:stream) - stream` | Accept an incoming connection on a listening socket. Returns `nil` if no connection is pending. | — |
-| **Close** | `Close(s:stream) - bool` | Close the stream. Pending output is delivered first, as `Flush` would; it does not wait for storage (see `Sync`). A stream that is dropped without being closed is flushed and closed when it is collected, so nothing written is lost either way. | — |
-| **Connect** | `Connect(proto:string, host:string, port:int) - stream` | Open socket. `proto`: `"tcp"` or `"udp"`. `host`: hostname or IP (v4/v6). Returns `nil` on failure. | — |
-| **ConnectAsync** | `ConnectAsync(proto:string, host:string, port:int) - fiber` | Non-blocking `Connect`: the DNS lookup and TCP handshake are offloaded to the io pool, so the fiber suspends instead of stalling the VM. Use with `await`; resolves to a socket stream, or `nil` on failure. Raises on a bad `proto`/`port`. | — |
-| **AcceptTls** | `AcceptTls(s:stream, options:object) - stream` | Terminate TLS on a socket `Accept` already returned; the result is an ordinary stream. **Takes ownership of `s`** - it is detached either way, so never `Close` it afterwards. `options`: `pkcs12File` + `password` (all platforms) or `certFile` + `keyFile` (PEM, OpenSSL only); `handshakeTimeoutMs` (default 10000) bounds the handshake *and* every later read/write; `requireClientCert` demands a client certificate, validated against the system trust store. `nil` on failure - reason via `TlsLastError()`. | — |
-| **ConnectTlsAsync** | `ConnectTlsAsync(host:string, port:int, options?:object) - fiber` | Async `ConnectTls`: DNS, the TCP handshake **and** the TLS handshake run on the I/O pool, so only the calling fiber suspends. `await` resolves to a stream, or `nil` on failure. Same `options` as `ConnectTls`. Prefer this in any client that must stay responsive - a TLS handshake is far more expensive than a plain connect. | — |
-| **ConnectTls** | `ConnectTls(host:string, port:int, options?:object) - stream` | Open a TLS connection as an ordinary stream. `options`: `insecure` skips certificate/hostname verification (trusted hosts only), `timeoutMs` (default 30000) bounds the connect and each later read/write, `sni` overrides the name sent and verified against the certificate. `nil` on failure - reason via `TlsLastError()`. | — |
-| **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy data from `src` to `dst`. Optional byte limit. | — |
-| **Flush** | `Flush(s:stream) - bool` | Deliver pending output to the operating system, so another handle, another process or a reader that outlives a crash of this one sees it. Cheap - one write of whatever has accumulated - so it is fine after every record where visibility matters, as a logger does. Only a file stream holds output back at all; sockets, pipes, serial ports and the console write through, and `Flush` on them is a no-op. Does not wait for the device: that is `Sync`. | — |
-| **Sync** | `Sync(s:stream) - bool` | `Flush`, then wait until the bytes are on the device - `fsync` for a file, `tcdrain` for a serial port, nothing for a socket or pipe. Milliseconds, a storage barrier: use it at a checkpoint, not after every write. | — |
-| **IsOpen** | `IsOpen(s:stream) - bool` | `true` if stream is still open. | — |
-| **LastError** | `LastError() - int` | Why the calling fiber's most recent async operation (`ReadAsync`, `ReadLineAsync`, `WriteAsync`, `WaitReadable`) - or a synchronous `ReadLine` - resolved to `nil` — or, where the call reports partial progress, why it stopped short. `0` = it succeeded, so a `nil` with `LastError() == 0` means a clean end-of-file, not a failure. Per-fiber, so concurrent fibers never overwrite each other's reason. Codes: `1` timeout, `2` stream closed/invalid, `3` connection reset, `4` the read hit a size limit - its own (2 GiB for a byte read, 256 MB for a line) or the 1 GiB shared between all in-flight async reads, `6` other OS error, `7` cancelled by `Fiber.CancelIo`. Code `5` is reserved and no longer produced; the numbering is stable, so handle codes you do not know by falling through rather than by position. | — |
-| **Listen** | `Listen(proto:string, port:int, backlog?:int) - stream` | Create a listening socket. `proto`: `"tcp"` or `"udp"`. Binds a dual-stack IPv6 socket (`IPV6_V6ONLY=0`, so IPv4 clients connect too) and falls back to IPv4-only if v6 is unavailable. Sets `SO_REUSEADDR` and `SO_REUSEPORT`. `backlog` defaults to `128`. | — |
-| **LocalAddr** | `LocalAddr(s:stream) - string` | Local endpoint of a socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
-| **TlsLastError** | `TlsLastError() - string\|nil` | Why the last `ConnectTls`/`AcceptTls` failed (bad certificate, wrong password, handshake refused). Distinct from `LastError()`, which reports an integer io-error code: a TLS setup failure is a message with no errno. `nil` if none. | — |
+| **Accept** | `Accept(s:stream) - stream` | Accept an incoming connection on a listening socket. Returns `nil` if no connection is pending (`LastError()` `0`), or for anything but a listening TCP socket (`5`). The new socket is blocking on every platform, like one from `Connect`, so `SetTimeout` applies to it. | — |
+| **Close** | `Close(s:stream) - bool` | Close the stream. Pending output is delivered first, as `Flush` would; it does not wait for storage (see `Sync`). `false` when that output could not be delivered or the operating system reported an error closing - the stream is closed either way, and closing it again returns `true`. An async operation still pending on the stream - in this fiber's `await` or another's - resolves to `nil` with `LastError()` `2`. A stream that is dropped without being closed is flushed and closed when it is collected, so nothing written is lost either way; a pending async operation keeps its stream alive until it finishes. | ✓ |
+| **Connect** | `Connect(proto:string, host:string, port:int, timeoutMs?:int) - stream` | Open socket. `proto`: `"tcp"` or `"udp"`. `host`: hostname or IP (v4/v6); every address it resolves to is tried in turn. Returns `nil` on failure, with `LastError()` `1` when `timeoutMs` passed and `6` otherwise (refused, unreachable, a name that does not resolve). `timeoutMs` bounds the connect - all the addresses together, not the name lookup - and then each later read and write, as `SetTimeout` would (call `SetTimeout` afterwards to change or remove that part). Omitted, `nil` or `<= 0`, the connect waits as long as the operating system lets it, which can be over a minute for a host that does not answer. Synchronous - like every blocking call it parks all fibers until it returns; `ConnectAsync` waits on the calling fiber alone. | — |
+| **ConnectAsync** | `ConnectAsync(proto:string, host:string, port:int, timeoutMs?:int) - fiber` | Non-blocking `Connect`: the DNS lookup and TCP handshake are offloaded to the io pool, so the fiber suspends instead of stalling the VM. Use with `await`; resolves to a socket stream, or `nil` on failure with `LastError()` as for `Connect`. `timeoutMs` means what it does for `Connect`. Raises on a bad `proto`/`port`. | — |
+| **AcceptTls** | `AcceptTls(s:stream, options:object) - stream` | Terminate TLS on a socket `Accept` already returned. Upgrades `s` in place and returns it: on success `s` is a TLS stream over the same socket, on failure it is closed. A memory stream is refused (`5`). `options`: `pkcs12File` + `password` (all platforms) or `certFile` + `keyFile` (PEM, OpenSSL only); `handshakeTimeoutMs` (default 10000) bounds the handshake *and* every later read/write; `requireClientCert` demands a client certificate, validated against the system trust store. `nil` on failure, with `LastError()` `1` when the handshake timed out, `6` for any other failure, `2` for a closed stream and `5` for one that is already TLS; the reason as text via `TlsLastError()`. | — |
+| **StartTls** | `StartTls(s:stream, options:object) - stream` | Switch a plain socket the program is already talking over to client TLS - the STARTTLS step of SMTP, IMAP or LDAP: negotiate the switch in the protocol, then call this once the server has said go ahead. Upgrades `s` in place and returns it: on success `s` is a TLS stream over the same socket, on failure it is closed. `options`: `sni` (the host name verified against the certificate, required unless `insecure`), `insecure`, `timeoutMs` (default 30000) bounds the handshake and each later read/write. Refused (`nil`, `LastError()` `5`) without `sni` or `insecure`, for anything but an open plain socket (`2` when closed), and when the stream still holds unread buffered input, i.e. the protocol exchange was not finished. `nil` on a failed handshake, with `LastError()` `1` when it timed out and `6` otherwise; the reason as text via `TlsLastError()`. | — |
+| **ConnectTlsAsync** | `ConnectTlsAsync(host:string, port:int, options?:object) - fiber` | Async `ConnectTls`: DNS, the TCP handshake **and** the TLS handshake run on the I/O pool, so only the calling fiber suspends. `await` resolves to a stream, or `nil` on failure with `LastError()` and `TlsLastError()` as for `ConnectTls`. Same `options` as `ConnectTls`. Prefer this in any client that must stay responsive - a TLS handshake is far more expensive than a plain connect. | — |
+| **ConnectTls** | `ConnectTls(host:string, port:int, options?:object) - stream` | Open a TLS connection as an ordinary stream. `options`: `insecure` skips certificate/hostname verification (trusted hosts only), `timeoutMs` (default 30000) bounds the connect - every address the host resolves to, together - the handshake and each later read/write, `sni` overrides the name sent and verified against the certificate. `nil` on failure, with `LastError()` `1` when the connect or the handshake ran out of time and `6` for any other failure; the reason as text via `TlsLastError()`. | — |
+| **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy from `src` to `dst` until `src` ends, or at most `limit` bytes when `limit` is given (`0` copies nothing; omitted, `nil` or negative means no limit). Nothing past the limit is taken from `src`, so the next read starts right after the copied bytes. There is no size cap: a copy of any length works, since only one 64 KB chunk is held at a time. `false` if either stream is closed (`LastError()` `2`) or a read or write fails (`LastError()` says why). Synchronous - like every blocking call it parks all fibers until it finishes. | — |
+| **Flush** | `Flush(s:stream) - bool` | Deliver pending output to the operating system, so another handle, another process or a reader that outlives a crash of this one sees it. Cheap - one write of whatever has accumulated - so it is fine after every record where visibility matters, as a logger does. Only a file stream holds output back at all; sockets, pipes, serial ports and the console write through, and `Flush` on them is a no-op. Does not wait for the device: that is `Sync`. `false` when the output could not be delivered, or on a closed stream (`LastError()` `2`). | ✓ |
+| **Sync** | `Sync(s:stream) - bool` | `Flush`, then wait until the bytes are on the device - `fsync` for a file, `tcdrain` for a serial port, nothing for a socket or pipe. Milliseconds, a storage barrier: use it at a checkpoint, not after every write. `false` when either step fails, or on a closed stream (`LastError()` `2`). | ✓ |
+| **IsOpen** | `IsOpen(s:stream) - bool` | `true` if stream is still open. | ✓ |
+| **LastError** | `LastError() - int` | Why the calling fiber's most recent async operation (`ReadAsync`, `ReadLineAsync`, `WriteAsync`, `WaitReadable`) - or a synchronous `ReadLine` - resolved to `nil` — or, where the call reports partial progress, why it stopped short. A `nil` with `LastError() == 0` means a clean end-of-file, not a failure. Read it right after the call that returned `nil` or a short result: after a call that succeeded it may still hold an earlier reason. Per-fiber, so concurrent fibers never overwrite each other's reason. A failed synchronous write sets it too (see **Write failures**), and so does a failed `File.*` call (see **File**). Codes: `1` timeout, `2` stream closed/invalid, `3` connection reset or a reader that is gone, `4` the read hit its size limit (2 GiB for a byte read, 256 MB for a line), or an async call found no memory, `6` other OS error, `7` cancelled by `Fiber.CancelIo`. `5` the operation does not apply to this kind of stream (see **Operations a stream does not support**). The numbering is stable, so handle codes you do not know by falling through rather than by position. | — |
+| **Listen** | `Listen(proto:string, port:int, backlog?:int, host?:string) - stream` | Create a listening socket. `proto`: `"tcp"` or `"udp"`. Without `host` it binds every interface: a dual-stack IPv6 socket (`IPV6_V6ONLY=0`, so IPv4 clients connect too), falling back to IPv4-only if v6 is unavailable. `host` binds one address instead - `"127.0.0.1"` or `"::1"` for a server only this machine can reach, or the address of one interface; a name binds the first address it resolves to, so give an IP to choose between IPv4 and IPv6 (`"localhost"` is often `::1` alone). `nil` or `""` is every interface. `nil` with `LastError()` `6` when `host` does not resolve or is not an address of this machine, or when another socket already listens on that TCP port - a restarted server can still bind a port its old connections leave in `TIME_WAIT`. UDP ports are shared, so several receivers can bind one multicast port. `port` `0` picks a free port (read it back with `LocalAddr`); one outside `0`-`65535` raises. `backlog` defaults to `128`. | — |
+| **LocalAddr** | `LocalAddr(s:stream) - string` | Local endpoint of a socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket (`LastError()` `5`) or on error. | — |
+| **TlsLastError** | `TlsLastError() - string\|nil` | Why the last `ConnectTls`/`StartTls`/`AcceptTls` failed (bad certificate, wrong password, handshake refused), as text. `LastError()` gives the same failure as a code. `nil` if none. | — |
 | **TlsPeerCert** | `TlsPeerCert(s:stream) - object\|nil` | The peer's leaf certificate as `{ sha256, subject }` (`sha256` = lowercase hex fingerprint of the DER cert). Use for pinning / trust-on-first-use. `nil` for a non-TLS stream or when unavailable. | — |
 | **TlsServerAvailable** | `TlsServerAvailable() - bool` | `true` if this build can terminate TLS (`AcceptTls`). Narrower than having TLS at all: an old or stripped `libssl` may support clients but not servers. | — |
-| **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), `"a"` (append/create) or `"rw"` (read-write/create). Returns `nil` on failure. Reads are buffered ahead and writes are held back, 4 KB each way, so reading or writing a byte at a time costs no more than reading or writing a chunk; see `Flush` for when held-back output becomes visible to others. | — |
+| **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), `"a"` (append/create) or `"rw"` (read-write/create). Returns `nil` with `LastError()` `6` on failure, for a directory, or for a `nil` path; a mode other than these four raises. Reads are buffered ahead and writes are held back, 4 KB each way, so reading or writing a byte at a time costs no more than reading or writing a chunk; see `Flush` for when held-back output becomes visible to others. | — |
+| **Open** | `Open(data:block, mode:string) - stream` | A memory stream over a byte block (element size 1): every stream call works on the block's own bytes, at a position of the stream's own. The modes are as for a file - `"r"` reads only, `"w"` empties the block first, `"a"` writes at its end wherever the position points, `"rw"` reads and writes - and writes grow the block at once, so it holds them without a `Flush`. `Seek`, `Tell`, `Size` and `Truncate` work; a write past the end fills the gap with zeros. A memory stream never waits, and `Close` releases the block. Returns `nil` with `LastError()` `5` for a block of wider elements, or for a write mode on a constant block. | — |
 | **OpenSerial** | `OpenSerial(port:string, baud:int, format?:string, flow?:string) - stream` | Open serial port in raw mode. Returns `nil` if the port cannot be opened. `format` is `[7\|8][N\|E\|O][1\|2]`, default `"8N1"` (databits, parity, stopbits). `flow` is `"none"` (default), `"rtscts"` (hardware RTS/CTS) or `"xonxoff"` (software). Flow control is always applied explicitly, so a port left in RTS/CTS by a previous opener is reset by `"none"`. **Baud:** on Linux any rate the C library names, `50`–`4000000` – including `230400`, `460800` and `921600` for LTE/PPP; on macOS/BSD any rate the driver accepts; on Windows any rate the driver accepts. An unsupported rate raises rather than silently running at the wrong speed. | — |
-| **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it, on any kind of stream. Waits for a byte exactly as a read would, and returns `nil` at EOF or on error. | — |
-| **PeerAddr** | `PeerAddr(s:stream) - string` | Remote endpoint of a connected socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for a non-socket or on error. | — |
+| **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it, on any kind of stream. Waits for a byte exactly as a read would, and returns `nil` at EOF or on error - `LastError()` tells them apart. | — |
+| **PeerAddr** | `PeerAddr(s:stream) - string` | Remote endpoint of a connected socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for anything but a connected socket (`LastError()` `5`) or on error. | — |
 | **Pipe** | `Pipe() - array` | Create a pipe. Returns `[readStream, writeStream]`. | — |
-| **ReadAll** | `ReadAll(s:stream, limit?:int, timeout?:int) - block` | Read until EOF or `limit` bytes and return a `block`. On a file a short read ends the read; on a socket/pipe it reads until the peer closes (EOF) or, for a socket, the `timeout` fires (seconds, default 3) — bytes already read are returned, not discarded. Returns `nil` only on a hard I/O error. | — |
-| **ReadAsync** | `ReadAsync(s:stream, count?:int, timeout?:int, cb?:fn) - fiber` | Async read. `count > 0` completes once exactly `count` bytes have arrived; `count` omitted or `0` reads until EOF. `await` resolves to a `block`, or `nil`. A block can be shorter than `count` when EOF arrives first **or when the deadline fires after some bytes have arrived** — a timeout hands over what it already has rather than discarding it, so always check `len()`, and call `Stream.LastError()` (`1` = timed out) to tell a short block from a complete one. `nil` means nothing was received at all, or a hard error. A read that is not bounded by `count` stops at 2 GiB and reports `Stream.LastError() == 4`, so a peer that never closes cannot grow it without limit. Those caps are per operation; a further 1 GiB ceiling applies to everything in flight at once, so opening more connections does not buy more buffer - a read that would cross it also reports `4`. `timeout` in ms; `<= 0` (default) = no deadline. With `cb`, `cb(block)` is invoked on completion and the awaited result is `nil`. | — |
-| **ReadByte** | `ReadByte(s:stream) - int` | Read one byte as integer. | — |
-| **ReadBytes** | `ReadBytes(s:stream, count:int) - block` | Read up to `count` bytes into a block. A short block is not an error: a peer close or a `SetTimeout` firing part-way keeps the bytes already read, so check `len()` and loop until you have `count`. `nil` only when nothing at all was read. | — |
-| **ReadLine** | `ReadLine(s:stream) - string` | Read until `\n`, stripping a preceding `\r` (so `\r\n` and `\n` both work). A lone `\r` and an embedded NUL are data, not terminators. Nothing past the terminator is consumed, so a byte-oriented read may follow one directly. A blank line is `""`; end of file is `nil`, as it is for `ReadLineAsync`, so `while (line != nil)` terminates and a blank line inside the file does not end the loop. `nil` also comes back on error and if the line passes 256 MB - `Stream.LastError()` tells them apart (`0` = clean end of file, `4` = over the line cap, `6` = an OS error). On a socket that has been used with `WaitReadable` or an `*Async` call, a line that has not fully arrived parks the calling fiber - other fibers run - until it does, or until the read timeout set with `SetTimeout` passes (`nil`). | — |
-| **ReadLineAsync** | `ReadLineAsync(s:stream, timeout?:int, cb?:fn) - fiber` | Async counterpart of `ReadLine`. `await` resolves to one line with the terminator (and a preceding `\r`) stripped, or `nil` at EOF, on timeout, or on error. Like the synchronous call it consumes nothing past the terminator, so consecutive calls stay in step on a line protocol and a byte-oriented read may follow one directly. `timeout` in ms; `<= 0` (default) = no deadline. A stream that ends mid-line hands over the unterminated remainder, and the call after that is the `nil` for EOF - check `Stream.LastError()` (`0` = clean EOF, `1` = timed out, `4` = the line exceeded 256 MB). With `cb`, `cb(line)` is invoked on completion and the awaited result is `nil`. | — |
-| **ReadString** | `ReadString(s:stream, count:int) - string` | Read `count` bytes as string. Binary-safe: an embedded NUL is data, so the result is as long as what was read. `nil` at EOF with nothing read. | — |
-| **Seek** | `Seek(s:stream, pos:int, whence?:int) - bool` | Seek a file stream. `whence`: `0` from start (default), `1` from the current position, `2` from the end (`pos` may be negative). Returns `true` on success. | — |
-| **SendFile** | `SendFile(s:stream, path:string, offset?:int, count?:int) - int` | Zero-copy file-to-socket transfer. Uses `sendfile` on Linux and macOS/BSD; falls back to read/write loop on other targets (e.g. OpenWrt). Returns bytes sent. | — |
-| **SetKeepAlive** | `SetKeepAlive(s:stream, on:bool) - bool` | Enable/disable TCP keep-alive probes (`SO_KEEPALIVE`) on a socket. Returns `true` if set. | — |
-| **SetNoDelay** | `SetNoDelay(s:stream, on:bool) - bool` | Enable/disable `TCP_NODELAY` (disable Nagle) so small writes go out immediately. Returns `true` if set. | — |
-| **SetTimeout** | `SetTimeout(s:stream, readMs:int, writeMs?:int) - bool` | Set read and write timeouts in milliseconds on a socket stream. If `writeMs` is omitted, both directions use `readMs`. | — |
-| **Shutdown** | `Shutdown(s:stream, how:string) - bool` | Half-close a socket. `how`: `"r"` stops reads, `"w"` stops writes (sends EOF to the peer while the read side stays open), anything else shuts both. Returns `true` on success. | — |
-| **Size** | `Size(s:stream) - int` | Byte length of the underlying file (`fstat`). `nil` for a socket/pipe or on error. | — |
+| **ReadAll** | `ReadAll(s:stream, limit?:int, timeout?:int) - block` | Read until EOF or `limit` bytes and return a `block`. A file is read to its end; a socket or pipe until the peer closes (EOF) or, for a socket, the `timeout` fires (seconds of silence, default 3; `0` waits without one) — bytes already read are returned, not discarded. The timeout applies to this call only: a timeout set with `SetTimeout` is back in force afterwards. `nil` for `limit` or `timeout` means the default; a negative `limit` means no limit, as for `Copy`, and `0` reads nothing. On a socket left non-blocking by `WaitReadable` or an `*Async` call it returns at once with what has already arrived, and `timeout` does not apply. Returns `nil` on a hard I/O error, and for a closed stream (`LastError()` `2`). | — |
+| **ReadAsync** | `ReadAsync(s:stream, count?:int, timeout?:int, cb?:fn) - fiber` | Async read. `count > 0` completes once exactly `count` bytes have arrived; `count` omitted, `0` or negative reads until EOF. A closed stream resolves to `nil` with `LastError()` `2`. `await` resolves to a `block`, or `nil`. A block can be shorter than `count` - empty when the stream had already ended - when EOF arrives first **or when the deadline fires after some bytes have arrived** — a timeout hands over what it already has rather than discarding it, so always check `len()`, and call `Stream.LastError()` (`1` = timed out) to tell a short block from a complete one. `nil` means a timeout with nothing received, or a hard error. A read that is not bounded by `count` stops at 2 GiB and reports `Stream.LastError() == 4`, so a peer that never closes cannot grow it without limit. `timeout` in ms; `<= 0` (default) = no deadline. With `cb`, `cb(block)` is invoked on completion and the awaited result is `nil`; a `cb` that raises is reported on stderr and the exception dropped. | — |
+| **ReadByte** | `ReadByte(s:stream) - int` | Read one byte as integer (0–255). `nil` on EOF. | — |
+| **ReadBytes** | `ReadBytes(s:stream, count:int) - block` | Read up to `count` bytes into a block. A short block is not an error: a peer close or a `SetTimeout` firing part-way keeps the bytes already read, and on a non-blocking socket it returns what has arrived, so check `len()` and loop until you have `count`. `nil` only when nothing at all was read: `LastError()` is `0` at end of file, `1` on a timeout - and for a `count` of `0` or less. | — |
+| **ReadLine** | `ReadLine(s:stream, delim?:string\|int) - string` | Read until `\n`, stripping a preceding `\r` (so `\r\n` and `\n` both work). A lone `\r` - also one right before the end of the stream - and an embedded NUL are data, not terminators. `delim` ends the line at another byte instead - a one-character string such as `"\r"` (a device that ends lines with CR alone) or `";"`, or a byte value `0`-`255` (`0` for NUL-separated records, which a string literal cannot hold); with it nothing else is stripped, so a CR before it stays part of the line. Anything else as `delim` raises. Nothing past the terminator is consumed, so a byte-oriented read may follow one directly. A blank line is `""`; end of file is `nil`, as it is for `ReadLineAsync`, so `while (line != nil)` terminates and a blank line inside the file does not end the loop. `nil` also comes back on error, on a read timeout and if the line passes 256 MB - `Stream.LastError()` tells them apart (`0` = clean end of file, `1` = the timeout set with `SetTimeout` or `Connect` passed, `4` = over the line cap, `6` = an OS error). A line cut off by a timeout stays buffered, so the next read starts at the beginning of it. On a serial port (Linux and macOS), and on a socket that has been used with `WaitReadable` or an `*Async` call, a line that has not fully arrived parks the calling fiber - other fibers run - until it does or, on a socket, until the read timeout passes. | — |
+| **ReadLineAsync** | `ReadLineAsync(s:stream, timeout?:int, cb?:fn, delim?:string\|int) - fiber` | Async counterpart of `ReadLine`, with the same `delim` (pass `nil` for `timeout` and `cb` to give only a terminator). `await` resolves to one line with the terminator (and a preceding `\r`) stripped, or `nil` at EOF, on timeout, or on error. Like the synchronous call it consumes nothing past the terminator, so consecutive calls stay in step on a line protocol and a byte-oriented read may follow one directly. `timeout` in ms; `<= 0` (default) = no deadline. A stream that ends mid-line hands over the unterminated remainder (a trailing `\r` included), and the call after that is the `nil` for EOF - check `Stream.LastError()` (`0` = clean EOF, `1` = timed out, `4` = the line exceeded 256 MB). A line that times out, or is abandoned with `Fiber.CancelIo`, gives back what it had read, so the next read starts at the beginning of that line. With `cb`, `cb(line)` is invoked on completion and the awaited result is `nil`; a `cb` that raises is reported on stderr and the exception dropped. A closed stream resolves to `nil` with `LastError()` `2`. | — |
+| **ReadString** | `ReadString(s:stream, count:int) - string` | Read `count` bytes as string - fewer, like `ReadBytes`, at end of file, on a timeout or from a non-blocking socket that has not received them all yet. Binary-safe: an embedded NUL is data, so the result is as long as what was read. `nil` with nothing read, with `LastError()` saying why, and for a `count` of `0` or less, as for `ReadBytes`. | — |
+| **Seek** | `Seek(s:stream, pos:int, whence?:int) - bool` | Seek a file stream. `whence`: `0` from start (default), `1` from the current position, `2` from the end (`pos` may be negative); any other `whence` raises. Returns `true` on success, `false` for a position before the start (`LastError()` `6`) or a stream that cannot seek (`5`). | ✓ |
+| **SendFile** | `SendFile(s:stream, path:string, offset?:int, count?:int) - int` | Zero-copy file-to-socket transfer (`sendfile` on Linux and macOS/BSD); what the kernel path cannot take - a TLS stream, a file or pipe on macOS, targets without it such as OpenWrt - is copied instead. Returns the bytes sent: all of them on a blocking socket; on a non-blocking one that fills, what fit, so call again from `offset` plus that count (with nothing sent yet it waits for room, like a write). `count` defaults to the rest of the file, as does a negative `count`; `0` - or an `offset` at or past the end - sends nothing and returns `0`. `nil` when nothing could be sent: a missing file or a negative `offset` (`LastError()` `6`), a closed stream (`2`), a reader that is gone (`3`), a write timeout with nothing sent (`1`). | — |
+| **SetKeepAlive** | `SetKeepAlive(s:stream, on:bool) - bool` | Enable/disable TCP keep-alive probes (`SO_KEEPALIVE`) on a TCP socket. Returns `true` if set; `false` for anything but a TCP socket (`LastError()` `5`). | — |
+| **SetNoDelay** | `SetNoDelay(s:stream, on:bool) - bool` | Enable/disable `TCP_NODELAY` (disable Nagle) so small writes go out immediately. Returns `true` if set; `false` for anything but a TCP socket (`LastError()` `5`). | — |
+| **SetTimeout** | `SetTimeout(s:stream, readMs:int, writeMs?:int) - bool` | Set read and write timeouts in milliseconds on a socket stream. If `writeMs` is omitted, both directions use `readMs`; `0` removes a timeout. `false` for anything but a socket (`LastError()` `5`), or a negative time (`6`). | — |
+| **Shutdown** | `Shutdown(s:stream, how:string) - bool` | Half-close a socket. `how`: `"r"` stops reads, `"w"` stops writes (sends EOF to the peer while the read side stays open), anything else shuts both. Returns `true` on success; `false` for anything but a connected TCP socket - a listener or a UDP socket included (`LastError()` `5`). | — |
+| **Size** | `Size(s:stream) - int` | Byte length of the underlying file, including output the stream still holds back (it is delivered first). `nil` for anything but a regular file - a socket, pipe or terminal (`LastError()` `5`) - or on error (`6`). | — |
 | **Stderr** | `Stderr() - stream` | A `dup()` of the process stderr as a writable stream. Closing it (or its GC) leaves the real stderr open. | — |
-| **Stdin** | `Stdin() - stream` | A `dup()` of the process stdin as a readable stream. Closing it leaves the real stdin open. | — |
+| **Stdin** | `Stdin() - stream` | The process stdin as a readable stream: the same stream on every call, shared with `Console`'s reads, so neither loses what the other read ahead. Closing it leaves the real stdin open; the next call opens a fresh one, and what the closed one had read ahead is gone. | — |
 | **Stdout** | `Stdout() - stream` | A `dup()` of the process stdout as a writable stream. Closing it leaves the real stdout open. | — |
-| **Tell** | `Tell(s:stream) - int` | Current byte offset, or `-1` when the stream cannot seek (pipe, socket, TLS). | — |
-| **Truncate** | `Truncate(s:stream, size:int) - bool` | Grow or shrink the file to exactly `size` bytes (`ftruncate`). Returns `true` on success. | — |
-| **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. | — | **On a socket this leaves the descriptor non-blocking for good** (deliberately — async slots re-arm it, and a socket may have read and write armed at once). A later *synchronous* `ReadBytes`/`ReadString` on that socket therefore ignores `SetTimeout` and comes up short the moment the next byte is still in flight, so loop until you have what you need rather than treating one short read as a dead peer. `ReadLine` is the exception: it parks until the rest of the line arrives.
-| **WriteAll** | `WriteAll(s:stream, data:string\|block) - bool` | Write all bytes, retrying on partial writes. A block writes all of its bytes: element count × element size. | ✓ |
-| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int). **A deadline that fires part-way still resolves to a count** - the bytes already delivered - so compare it with the size of `data` in bytes (`len(data)` for a string or a buffer of 1-byte elements) rather than treating any int as success, and resume from that offset if you need the rest; `Stream.LastError()` reports `1` for the short case and `0` for a complete one. `nil` means nothing was delivered at all, or a hard I/O error, where no resume is possible. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. | — |
-| **WriteByte** | `WriteByte(s:stream, value:int) - bool` | Write single byte. Returns `true` on success, `false` on a write error. | — |
-| **WriteBytes** | `WriteBytes(s:stream, buf:block, count:int) - int` | Write `count` bytes from block, at most its size in bytes (element count × element size); returns bytes written, or `-1` on failure. | ✓ |
-| **WriteString** | `WriteString(s:stream, s:string) - bool` | Write the string's bytes — all of them, including any embedded NUL. | — |
+| **Tell** | `Tell(s:stream) - int` | Current byte offset, or `-1` when the stream cannot seek - a pipe, socket or TLS session (`LastError()` `5`). | ✓ |
+| **Truncate** | `Truncate(s:stream, size:int) - bool` | Grow or shrink the file to exactly `size` bytes. Returns `true` on success, `false` for a negative `size` (`LastError()` `6`) or a stream that is not a file (`5`). | ✓ |
+| **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. On a socket this leaves the descriptor non-blocking for good (async slots re-arm it, and a socket may have read and write armed at once); synchronous calls on it then wait by parking the fiber - see above. On Windows only a socket can be waited on: a pipe or a file raises. A closed stream gives `nil` with `LastError()` `2`. | — |
+| **WriteAll** | `WriteAll(s:stream, data:string\|block) - bool` | Write all bytes, retrying on partial writes. A block writes all of its bytes: element count × element size. `false` on a write error, a write timeout or a closed stream; `LastError()` says which. | ✓ |
+| **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int). **A deadline that fires part-way still resolves to a count** - the bytes already delivered - so compare it with the size of `data` in bytes (`len(data)` for a string or a buffer of 1-byte elements) rather than treating any int as success, and resume from that offset if you need the rest; `Stream.LastError()` reports `1` for the short case and `0` for a complete one. `nil` means nothing was delivered at all, or a hard I/O error, where no resume is possible; a closed stream resolves to `nil` with `LastError()` `2`. The write is tried at once and waits only for what does not fit. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. | — |
+| **WriteByte** | `WriteByte(s:stream, value:int) - bool` | Write single byte: the low 8 bits of `value`. Returns `true` on success, `false` on a write error (`LastError()` says why). | ✓ |
+| **WriteBytes** | `WriteBytes(s:stream, buf:block, count:int) - int` | Write `count` bytes from block, at most its size in bytes (element count × element size); returns bytes written - fewer only when a `SetTimeout` write timeout cut it off - or `-1` on failure (`LastError()` says why). A `count` of `0` or less writes nothing and returns `0`. | ✓ |
+| **WriteString** | `WriteString(s:stream, s:string) - bool` | Write the string's bytes — all of them, including any embedded NUL. `false` on a write error, a write timeout or a closed stream; `LastError()` says which. A file holds output back, so an error delivering it can also surface later, at `Flush` or `Close`. | ✓ |
 | **ReadU8** | `ReadU8(s:stream) - int` | Read one unsigned byte (0–255). Returns `nil` on EOF. | — |
-| **ReadU16** | `ReadU16(s:stream, bigEndian?:bool) - int` | Read 2 bytes as unsigned 16-bit integer. Default little-endian. | — |
-| **ReadU32** | `ReadU32(s:stream, bigEndian?:bool) - int` | Read 4 bytes as unsigned 32-bit integer. Default little-endian. | — |
-| **ReadU64** | `ReadU64(s:stream, bigEndian?:bool) - int` | Read 8 bytes as 64-bit integer. Default little-endian. | — |
-| **WriteU8** | `WriteU8(s:stream, value:int) - bool` | Write one byte. Returns `true` on success. | — |
-| **WriteU16** | `WriteU16(s:stream, value:int, bigEndian?:bool) - bool` | Write 2 bytes. Default little-endian. Returns `true` on success. | — |
-| **WriteU32** | `WriteU32(s:stream, value:int, bigEndian?:bool) - bool` | Write 4 bytes. Default little-endian. Returns `true` on success. | — |
-| **WriteU64** | `WriteU64(s:stream, value:int, bigEndian?:bool) - bool` | Write 8 bytes. Default little-endian. Returns `true` on success. | — |
+| **ReadU16** | `ReadU16(s:stream, bigEndian?:bool) - int` | Read 2 bytes as unsigned 16-bit integer. Default little-endian. `nil` on EOF. | — |
+| **ReadU32** | `ReadU32(s:stream, bigEndian?:bool) - int` | Read 4 bytes as unsigned 32-bit integer. Default little-endian. `nil` on EOF. | — |
+| **ReadU64** | `ReadU64(s:stream, bigEndian?:bool) - int` | Read 8 bytes as 64-bit integer (all bits set reads as `-1`). Default little-endian. `nil` on EOF. | — |
+| **WriteU8** | `WriteU8(s:stream, value:int) - bool` | Write one byte. Returns `true` on success. | ✓ |
+| **WriteU16** | `WriteU16(s:stream, value:int, bigEndian?:bool) - bool` | Write 2 bytes. Default little-endian. Returns `true` on success. | ✓ |
+| **WriteU32** | `WriteU32(s:stream, value:int, bigEndian?:bool) - bool` | Write 4 bytes. Default little-endian. Returns `true` on success. | ✓ |
+| **WriteU64** | `WriteU64(s:stream, value:int, bigEndian?:bool) - bool` | Write 8 bytes. Default little-endian. Returns `true` on success. | ✓ |
 | **ReadI8** | `ReadI8(s:stream) - int` | Read one signed byte (−128…127). `nil` on EOF. | — |
 | **ReadI16** | `ReadI16(s:stream, bigEndian?:bool) - int` | Read a signed 16-bit integer. Default little-endian. `nil` on EOF. | — |
 | **ReadI32** | `ReadI32(s:stream, bigEndian?:bool) - int` | Read a signed 32-bit integer. Default little-endian. `nil` on EOF. | — |
 | **ReadI64** | `ReadI64(s:stream, bigEndian?:bool) - int` | Read a signed 64-bit integer. Default little-endian. `nil` on EOF. | — |
 | **ReadF32** | `ReadF32(s:stream, bigEndian?:bool) - float` | Read a 32-bit IEEE-754 float. Default little-endian. `nil` on EOF. | — |
 | **ReadF64** | `ReadF64(s:stream, bigEndian?:bool) - float` | Read a 64-bit IEEE-754 double. Default little-endian. `nil` on EOF. | — |
-| **WriteF32** | `WriteF32(s:stream, value:float, bigEndian?:bool) - bool` | Write a 32-bit IEEE-754 float. Default little-endian. | — |
-| **WriteF64** | `WriteF64(s:stream, value:float, bigEndian?:bool) - bool` | Write a 64-bit IEEE-754 double. Default little-endian. | — |
+| **WriteF32** | `WriteF32(s:stream, value:float, bigEndian?:bool) - bool` | Write a 32-bit IEEE-754 float. Default little-endian. | ✓ |
+| **WriteF64** | `WriteF64(s:stream, value:float, bigEndian?:bool) - bool` | Write a 64-bit IEEE-754 double. Default little-endian. | ✓ |
 | **ReadVarint** | `ReadVarint(s:stream) - int` | Decode an unsigned LEB128 varint (1–10 bytes). `nil` on EOF/truncation or an over-long encoding. | — |
-| **WriteVarint** | `WriteVarint(s:stream, value:int) - bool` | Encode `value` as an unsigned LEB128 varint. Returns `true` on success. | — |
+| **WriteVarint** | `WriteVarint(s:stream, value:int) - bool` | Encode `value` as an unsigned LEB128 varint. Returns `true` on success. | ✓ |
 
 #### Stream instance method syntax
 
@@ -4218,6 +4332,11 @@ broken-down fields and formatting are UTC. The richer calendar/timezone API
 (local zones, leap years, durations, relative "ago") lives in the `Datetime`
 library.
 
+The UTC functions (`Format`, `Parse`, `Year` ... `Weekday`, the `Add*` family)
+work for any `int` timestamp on every platform. Local time comes from the
+operating system, so `TimeZoneOffsetMins` answers `0` (UTC) for an instant the
+system cannot place.
+
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **AddDays** | `AddDays(t:int, n:number) - int` | Add `n` days to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
@@ -4240,7 +4359,7 @@ library.
 | **Ticks** | `Ticks() - int` | Monotonic nanosecond counter. The epoch is undefined; use only for deltas with `TicksToMs`/`TicksToUs`. | ✓ |
 | **TicksToMs** | `TicksToMs(ticks:int) - float` | Convert a nanosecond tick delta to milliseconds. Example: `Time.TicksToMs(Time.Ticks() - t0)` - `1.234` | ✓ |
 | **TicksToUs** | `TicksToUs(ticks:int) - float` | Convert a nanosecond tick delta to microseconds. Example: `Time.TicksToUs(Time.Ticks() - t0)` - `1234.5` | ✓ |
-| **TimeZoneOffsetMins** | `TimeZoneOffsetMins(t?:int) - int` | Local timezone offset in minutes from UTC, DST-aware. Uses the current time, or the given timestamp. | ✓ |
+| **TimeZoneOffsetMins** | `TimeZoneOffsetMins(t?:int) - int` | Local timezone offset in minutes from UTC, DST-aware. Uses the current time, or the given timestamp. `0` (UTC) when the system cannot place the instant. | ✓ |
 | **ToMillis** | `ToMillis(seconds:int) - int` | Convert whole seconds to milliseconds. Inverse of `FromMillis`. | ✓ |
 | **Weekday** | `Weekday(t:int) - int` | Day of week: 0=Sunday … 6=Saturday. | ✓ |
 | **Year** | `Year(t:int) - int` | The year, e.g. 2026. Every timestamp has one: far past and future years are returned in full. | ✓ |
@@ -4252,7 +4371,7 @@ library.
 Namespace: **`Timers`**
 
 Fiber-based timer scheduling.
-Max 64 simultaneous timers.
+Max 256 simultaneous timers.
 Timer resolution is approx 1-3ms.
 Every `Set*` function raises `InvalidArguments` when `func` is `nil`.
 
@@ -4260,7 +4379,7 @@ Every `Set*` function raises `InvalidArguments` when `func` is `nil`.
 | ---------- | ----------- | ------------- | --- |
 | **Cancel** | `Cancel(id:int\|float) - bool` | Cancel a timer by its handle; `false` for a handle that is not live (a fired one-shot, an already-cancelled timer, or a number that never was one). Handles are never reused, so a stale handle can never hit a newer timer. | — |
 | **IsActive** | `IsActive(id:int\|float) - bool` | `true` if `id` refers to a live timer (a scheduled one-shot not yet fired, or a still-repeating interval). | — |
-| **SetAtTime** | `SetAtTime(timestamp:int\|float, func:fn ) - int\|nil` | Fire `fn` once at the given **Unix timestamp** (seconds since epoch); a time already in the past fires as soon as possible. Returns a handle, or `nil` on a NaN timestamp or when the timer table (max 64) is full. | — |
+| **SetAtTime** | `SetAtTime(timestamp:int\|float, func:fn ) - int\|nil` | Fire `fn` once at the given **Unix timestamp** (seconds since epoch); a time already in the past fires as soon as possible. Returns a handle, or `nil` on a NaN timestamp or when the timer table (max 256) is full. | — |
 | **SetImmediate** | `SetImmediate(func:fn ) - int\|nil` | Fire `fn` on the next scheduler pump (a zero-delay one-shot), akin to Node's `setImmediate`. Returns a handle, or `nil` when the timer table is full. | — |
 | **SetInterval** | `SetInterval(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` every `ms` milliseconds; ticks missed while the VM was busy are dropped, not replayed as a burst. Returns a handle, or `nil` if `ms` is NaN or `<= 0`, or the timer table is full. | — |
 | **SetTimeout** | `SetTimeout(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` once after `ms` milliseconds (a negative delay fires as soon as possible). Returns a handle, or `nil` on a NaN delay or when the timer table is full. | — |
@@ -4286,10 +4405,10 @@ Virtual machine introspection and control.
 | **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the VM halts regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
 | **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache), `StringPoolChunks`/`StringPoolBytes` (chunks the string pool currently holds and their size) and `StringPoolFree` (string bodies parked in the pool for reuse - what `CompactMemory` can give back once whole chunks are free). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
 | **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a non-function handler returns `false`. | — |
-| **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §10a. | — |
+| **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §11. | — |
 | **PatchFunction** | `PatchFunction(original:fn, replacement:fn) - bool` | Replace function at runtime. Requires running unsafe-mode `--unsafe`. The replacement may be a Flaris-function, a builtin-function or a FFI-function. Pass `nil` as replacement to remove the patch. Caveats: call sites the compiler inlined (trivial single-`return` functions) and calls made from inside JIT-compiled functions bypass the patch; self-recursive calls inside the original body also keep calling the original. | — |
 | **PeakAllocations** | `PeakAllocations() - int` | Peak allocation count since VM start. | — |
-| **RaiseSignal** | `RaiseSignal(signum:int) - bool` | Send signal `signum` to the current process (`raise`). A handler registered via `OnSignal` runs on the next signal pump; an uncatchable signal takes the OS default effect. Returns `false` on an out-of-range number. | — |
+| **RaiseSignal** | `RaiseSignal(signum:int) - bool` | Raise signal `signum` for the handler registered with `OnSignal`, which runs on the next signal pump. Returns `false` and sends nothing when no handler is registered for `signum` (so always for an uncatchable signal or an out-of-range number) or when the embedding host turned the VM's signal handling off: the OS default would end the process. | — |
 | **SignalName** | `SignalName(signum:int) - string\|nil` | Canonical name (e.g. `"SIGINT"`) for a signal number, or `nil` if unknown on this platform. | — |
 | **SignalNumber** | `SignalNumber(name:string) - int\|nil` | Platform signal number for a name like `"SIGINT"` (the `"SIG"` prefix is optional), or `nil` if unknown. Use this instead of hardcoding numbers, which are platform-specific (`SIGUSR1` is 10 on Linux, 30 on macOS). | — |
 | **Version** | `Version() - int` | The running runtime's version, packed as `0xMMmmppbb` (major, minor, patch, build) - the same encoding a `.flx` file's header stores and `Ffi.GetVersion` reads from a plugin. `let v = VM.Version(); let patch = (v >> 8) & 0xFF;`. | — |
@@ -5020,7 +5139,7 @@ The JIT is **on by default** and gates the pipeline at both ends. `--jit-disable
 
 With `--jit-disable` at compile time, no JIT IR is written - the `.flx` is standard bytecode only. With `--jit-disable` at run time, any JIT IR in the file is loaded but not compiled; functions run on the bytecode interpreter.
 
-The JIT backend is automatically selected at run time based on the CPU: ARM64 on Apple Silicon / Raspberry Pi / etc., and x86-64 on Linux/macOS/Windows PCs. On other platforms the bytecode interpreter is the only execution tier.
+The JIT backend is automatically selected at run time based on the CPU: ARM64 on Apple Silicon / Raspberry Pi with a 64-bit OS / etc., and x86-64 on Linux/macOS/Windows PCs. On other platforms the bytecode interpreter is the only execution tier.
 
 ### The JIT boundary - why it exists
 
@@ -5050,6 +5169,13 @@ What runs natively inside a JIT function:
 | String literals | Read-only uses share the literal: comparisons, concatenation, arguments to a builtin that neither keeps nor returns them, and a local that is only read. A literal passed to a script function, stored in a field, returned, or given to a builtin that may keep or return it is a fresh copy, as in interpreted code. A local holding a literal must not be written through (`s[i] = c`), returned, stored or passed to a script function |
 | A builtin with an `any` result, stored into an annotated local (`let n: int = Json.FastSelect(p, j);`) or returned from a typed function | The value gets the same run-time check as in interpreted code - error code 22 with the same message, `int` converted for a `float` target, `nil` refused for a scalar - and the function stops at a mismatch. Targets: `int`, `float`, `bool`, `char`, `string`, `block` |
 
+A lambda is judged like a named function. A typed lambda that captures nothing -
+`fn (x: int): int { return x * x + 1; }` - gets native code, so `Array.Select`,
+`Reduce` and the other callback builtins call it natively, and as a
+`ProcessCallback`/`ProcessEvent` kernel it runs on another core exactly as a
+named kernel does. The function that creates a lambda stays interpreted
+itself, and `--check` lists each lambda as `<lambda>` with its line.
+
 What still requires the interpreter:
 
 | Not allowed in a JIT function | Why |
@@ -5057,7 +5183,8 @@ What still requires the interpreter:
 | Object literals `{a: 1}`; `[char]`/`[bool]` or heterogeneous array literals | Untracked heap allocation (homogeneous `[int]`/`[float]` literals in a declaration are lowered) |
 | `new Foo(...)` with a constructor, or with arguments | Constructor dispatch — only argument-less `let p = new C()` on a constructor-less class is lowered |
 | `obj.field` on an object of unknown class | Dynamic property lookup — resolved only for `this`, a class-typed parameter, or a `new`-pinned local |
-| `try`/`catch`, `yield`, `await`, closures | Interpreter machinery |
+| `try`/`catch`, `yield`, `await` | Interpreter machinery |
+| A lambda that captures a variable of the enclosing function, or uses its `this` | The captured values live in the lambda's own environment, which native code cannot see |
 | Global variable reads/writes | Globals live in the interpreter environment |
 | A string, array, block, instance or `nil` value tested for truth (`if (s)`, `!s`, `s && t`) | `nil` and empty values are false in the interpreter; compare explicitly (`s != nil`, `len(s) > 0`) to stay native |
 
@@ -5255,8 +5382,9 @@ JIT eligibility  (✓ native   · interpreted):
   · scale_all                    (line 28) - expression has no JIT lowering
   · label                        (line 34) - a parameter is untyped, or not a JIT type (int/float/bool/char/string/block, or a typed array)
   · Point.dist                   (line 51) - member access (only this.<field> is JIT-lowered)
+  · <lambda>                     (line 60) - captures a variable of the enclosing function (closures are not JIT-compiled)
 
-  2 of 5 functions are JIT-eligible.
+  2 of 6 functions are JIT-eligible.
 ```
 
 The reason on each `·` line names the first disqualifier and its line, so you can fix or restructure without guessing. It also works on library files, e.g. `flarisvm --check libs/Signals.fls --libs='./libs'`, to see which functions of a module are numeric kernels.
@@ -5274,14 +5402,13 @@ modes agree below that depth.
 
 ### Denied modules and native code
 
-An embedding host can deny whole built-in modules to a context (see the
+An embedding host can deny whole built-in modules to its scripts (see the
 Embedding guide §10). JIT-compiled code honours that exactly as the interpreter
 does. Every compiled function knows which built-in modules its native code can
-reach, counting every compiled function it calls; in a fiber whose context
-denies one of them, the function runs interpreted, and the call raises
-`Exception.ModuleDenied` at the same place it would with the JIT off. Fibers a
-sandboxed context spawns and callbacks a builtin runs for it inherit the same
-authority. A function that reaches no built-in module - and every function when
+reach, counting every compiled function it calls; in a host that denies one of
+them, the function runs interpreted, and the call raises
+`Exception.ModuleDenied` at the same place it would with the JIT off. Fibers the
+script spawns and callbacks a builtin runs for it are held to the same mask. A function that reaches no built-in module - and every function when
 nothing is denied - enters native code as usual. Modules registered by the host
 application are not built-in modules and are not affected.
 
@@ -5673,6 +5800,7 @@ differ - so copy it from this column rather than deriving it.
 | 2018 | `mismatched-compare` | `MISMATCHED_COMPARE` | `==`, `!=` or an ordering between values that can never be equal: the numeric types (int, float, char, bool) compare with each other by value, `nil` with `nil`, and every other type only with its own kind - so `"5" == 5` is always false and `"5" != 5` always true. Only reported when both operand types are known; a comparison with `nil` is left to the nil rules |
 | 2019 | `self-assign` | `SELF_ASSIGN` | `x = x`, or the same member chain on both sides (`this.a = this.a`); compound stores (`x += x`) are not reported |
 | 2020 | `self-compare` | `SELF_COMPARE` | A name compared with itself (`x == x`, `x < x`) - the result is fixed. A float operand is not reported, because `f != f` is the NaN test |
+| 2021 | `switch-not-exhaustive` | `SWITCH_NOT_EXHAUSTIVE` | A `switch` with no `default` whose every `case` label is a member of one enum, and some member is not handled - a value of that member matches nothing. Members sharing a value are covered together. A switch with a `default` (even an empty one) or with any label that is not a member of that enum is not reported, and neither is an enum imported from a library |
 
 Every warning above (the *Reserved* codes excepted) is suppressible; **no error
 is**. A raw number works anywhere a name does, e.g. `-Wno-2000`.
@@ -5909,7 +6037,10 @@ runtime guard applies instead.
   (`if (x != nil && x.Length() > 0)`), the branches of a `?:`, or a `while`
   condition, and `break` / `continue` do not count as an early exit the way
   `return` and `throw` do.
-- **No exhaustiveness checking for `switch`** over an enum.
+- **Enum exhaustiveness is judged from the labels.** A `switch` is treated as
+  an enum switch (code 2021) only when every label is a member of the same
+  local enum; the type of the subject is not consulted, so a switch with one
+  literal label, or over an imported enum, is never reported.
 
 Definite-assignment analysis is not needed: `let x;` without an initializer is
 a syntax error, so every variable is assigned where it is declared.

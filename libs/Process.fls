@@ -53,16 +53,16 @@
 //   p.Wait()              → int - exit code; blocks fiber until child exits
 //   p.Kill(signal?)       - send signal (default SIGTERM = 15)
 //   p.IsAlive()           → bool
-//   p.Close()             - close all pipe fds
+//   p.Close()             - close the child's pipes
 
 class Process {
 
     let _pid:int     = 0;
-    let _stdin:int   = -1;
-    let _stdout:int  = -1;
-    let _stderr:int  = -1;
-    let _outBuf      = "";
-    let _errBuf      = "";
+    // The child's pipes as streams. Every wait on them goes through an *Async
+    // call, so it parks only the fiber that asked - the rest keep running.
+    let _stdin       = nil;
+    let _stdout      = nil;
+    let _stderr      = nil;
     let _exited      = false;
     let _exitCode: int|nil = 0;
 
@@ -70,17 +70,11 @@ class Process {
         this.Write(data + "\n");
     }
 
+    // Everything the child writes to stdout until it closes it, byte for byte.
     fn ReadAll() {
-        let out = "";
-        while (true) {
-            let line = this.ReadLine();
-            if (line == nil) break;
-            out = out + line;
-            if (String.Length(line) == 0 || String.IndexOf(line, "\n") < 0) {
-                out = out + "\n";
-            }
-        }
-        return out;
+        if (this._stdout == nil) return "";
+        let b = Fiber.Await(Stream.ReadAsync(this._stdout, 0));
+        return b == nil ? "" : Buffer.ToString(b);
     }
 
     fn _init(handle) {
@@ -113,113 +107,62 @@ class Process {
     }
 
     fn Wait() {
-        while (true) {
-            this._poll();
-            if (this._exited) return this._exitCode;
-            Fiber.Sleep(1);
+        while (!this._exited) {
+            let r = Fiber.Await(Os.WaitAsync(this._pid));
+            if (r != nil && !r.Alive) {
+                this._exited   = true;
+                this._exitCode = r.Exit;
+            } else {
+                this._poll(); // the wait was cancelled: look once, then wait again
+            }
         }
+        return this._exitCode;
     }
 
     fn WaitTimeout(timeoutMs:int) {
         return Os.WaitTimeout(this._pid, timeoutMs);
     }
 
+    // Returns once all of `data` is in the pipe, however slowly the child reads.
     fn Write(data) {
-        Os.WritePipe(this._stdin, data);
+        if (this._stdin != nil) { Fiber.Await(Stream.WriteAsync(this._stdin, data)); }
     }
 
     fn CloseStdin() {
-        Os.ClosePipe(this._stdin);
-        this._stdin = -1;
+        if (this._stdin != nil) { Stream.Close(this._stdin); this._stdin = nil; }
     }
 
+    // The next stdout line without its line ending, or nil once the child has
+    // closed stdout; an unterminated last line is handed over as it is.
     fn ReadLine() {
-        while (true) {
-            let nl = String.IndexOf(this._outBuf, "\n");
-            if (nl >= 0) {
-                let line = String.Substr(this._outBuf, 0, nl);
-                this._outBuf = String.Substr(this._outBuf, nl + 1);
-                return line;
-            }
-            var chunk = Os.ReadPipe(this._stdout);
-            if (chunk == nil && !this._exited) {
-                this._poll();
-                // Exit detected right after a nil read: the child may have
-                // written its output and exited inside that window, so drain
-                // once more before treating nil as EOF (data written before
-                // exit stays readable in the pipe buffer).
-                if (this._exited) {
-                    chunk = Os.ReadPipe(this._stdout);
-                }
-            }
-            if (chunk != nil) {
-                this._outBuf = this._outBuf + chunk;
-            } else if (this._exited) {
-                if (String.Length(this._outBuf) > 0) {
-                    let line = this._outBuf;
-                    this._outBuf = "";
-                    return line;
-                }
-                return nil;
-            } else {
-                Fiber.Sleep(1);
-            }
-        }
+        return this._stdout == nil ? nil : Fiber.Await(Stream.ReadLineAsync(this._stdout));
     }
 
     fn ReadLineErr() {
-        while (true) {
-            let nl = String.IndexOf(this._errBuf, "\n");
-            if (nl >= 0) {
-                let line = String.Substr(this._errBuf, 0, nl);
-                this._errBuf = String.Substr(this._errBuf, nl + 1);
-                return line;
-            }
-            var chunk = Os.ReadPipe(this._stderr);
-            if (chunk == nil && !this._exited) {
-                this._poll();
-                // Same drain-on-fresh-exit as ReadLine: never declare EOF on a
-                // nil read that raced with the child's exit.
-                if (this._exited) {
-                    chunk = Os.ReadPipe(this._stderr);
-                }
-            }
-            if (chunk != nil) {
-                this._errBuf = this._errBuf + chunk;
-            } else if (this._exited) {
-                if (String.Length(this._errBuf) > 0) {
-                    let line = this._errBuf;
-                    this._errBuf = "";
-                    return line;
-                }
-                return nil;
-            } else {
-                Fiber.Sleep(1);
-            }
-        }
+        return this._stderr == nil ? nil : Fiber.Await(Stream.ReadLineAsync(this._stderr));
     }
 
     fn Close() {
-        if (this._stdin  >= 0) { Os.ClosePipe(this._stdin);  this._stdin  = -1; }
-        if (this._stdout >= 0) { Os.ClosePipe(this._stdout); this._stdout = -1; }
-        if (this._stderr >= 0) { Os.ClosePipe(this._stderr); this._stderr = -1; }
+        if (this._stdin  != nil) { Stream.Close(this._stdin);  this._stdin  = nil; }
+        if (this._stdout != nil) { Stream.Close(this._stdout); this._stdout = nil; }
+        if (this._stderr != nil) { Stream.Close(this._stderr); this._stderr = nil; }
     }
 }
 
-fn Spawn(cmd, args?) {
-    let handle = Os.Spawn(cmd, args ?? []);
+fn _start(cmd, args) {
+    let handle = Os.Spawn(cmd, args ?? [], { Streams: true });
     if (handle == nil) return nil;
     let p = new Process();
     p._init(handle);
     return p;
 }
 
+fn Spawn(cmd, args?) {
+    return _start(cmd, args);
+}
+
 fn Start(cmd, args?, _opts?) {
-    let handle = Os.Spawn(cmd, args ?? []);
-    if (handle == nil) return nil;
-    let p = new Process();
-    p._init(handle);
-    return p;
+    return _start(cmd, args);
 }
 
 fn _withProcessResult(raw) {

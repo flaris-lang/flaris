@@ -62,15 +62,17 @@ flarisvm --unsafe    script.fls    # Ffi.* and everything else below
 ```
 
 Without either, every `Ffi.*` call raises `Exception.UnsafeOperation` at runtime.
+The same holds for calling a function `Ffi.GetFunction` returned: it runs only
+where FFI is allowed, so handing one to an embedded context or fiber without it
+raises `UnsafeOperation` there (`ModuleDenied` when the host withholds `Ffi`).
 
-**Prefer `--allow-ffi`.** `--unsafe` is a single switch over five separate
-capabilities, so granting FFI with it also grants the other four:
+**Prefer `--allow-ffi`.** `--unsafe` is a single switch over four separate
+capabilities, so granting FFI with it also grants the other three:
 
 | capability | granted by `--allow-ffi` | granted by `--unsafe` |
 |---|---|---|
 | `Ffi.*` - load and call native code | yes | yes |
 | `Memory.*`, `Buffer.GetAddress` - read/write any address | no | yes |
-| `Os.Kill` - signal any process | no | yes |
 | `import` over plain `http://` | no | yes |
 | raw JIT entry points | no | yes |
 
@@ -97,7 +99,7 @@ Signature checks can be disabled with `--no-verify`, but this is not recommended
 
 ## 3. The Ffi Module
 
-Namespace: **`Ffi`** - requires `--unsafe` flag.
+Namespace: **`Ffi`** - requires `--allow-ffi` (or `--unsafe`, which implies it).
 
 | Function | Signature | Description |
 | ---------- | ----------- | ------------- |

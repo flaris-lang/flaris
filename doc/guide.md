@@ -37,7 +37,7 @@ Flaris is:
 - **Deterministic** - execution order is always clear and reproducible.
 - **Fast** - written in C with a compact bytecode interpreter.
 - **Embeddable** - ideal for applications, tools, servers, and games.
-- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`). Static analysis runs on every compile and catches mistakes before the program starts. A runtime-only binary (`flaris`) ships without the compiler, `VM.Eval` or `VM.Compile`.
+- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`, or `--allow-ffi` for FFI alone). Static analysis runs on every compile and catches mistakes before the program starts. A runtime-only binary (`flaris`) ships without the compiler, `VM.Eval` or `VM.Compile`.
 - **Concurrent** - fibers and async functions allow concurrency without threads.
 
 **Three core principles:**
@@ -248,6 +248,7 @@ flarisvm --require-signed --exec app.flx
 | `--jit-disable` | Turn off the JIT. It is on by default and auto-compiles every eligible function to native code (use `--check` to see which) |
 | `--mem` | Memory report at shutdown (peak RSS, slab footprint, leak detection) |
 | `--stats` | Statistics (allocations, counters) |
+| `--prof[=hz]` | Sample the running script `hz` times a second (default 1000) and print where the time went at exit; `flarisvm` only |
 | `--unsafe` | Enable FFI / unsafe code |
 | `--small` | Enable strip of symbols |
 | `-g` / `--no-strip` | Keep debug info - line numbers in stack traces (off by default) |
@@ -304,6 +305,7 @@ Flaris source files are UTF-8 encoded and must not contain NUL bytes. Identifier
 | `import` / `export` / `as` | Modules |
 | `try` / `catch` / `finally` / `throw` | Exceptions |
 | `guard` | Assert non-nil (throws if nil) |
+| `weak` | Handle that does not keep its target alive |
 | `enum` | Define enumeration |
 | `breakpoint` | Debug pause |
 | `in` | Membership test / foreach iterator |
@@ -579,6 +581,10 @@ fn label(l) {
     }
 }
 ```
+
+A `switch` that labels only members of one enum and has no `default` must
+handle every member; the analyzer warns about the ones it misses (warning
+2021).
 
 Values must be integer literals, optionally negative - `A = 1 + 2` and `B = A`
 `A = -1` are all rejected. Declare an enum at the top level or inside a
@@ -896,6 +902,19 @@ let addr = guard(user.address);  // throws if nil
 ```
 
 Use `guard` when a nil value means something has gone wrong. For optional values, just use `??` or check directly.
+
+### `weak`
+
+`weak(expr)` returns a handle on `expr` that does not keep it alive. Read it back with `Weak.Get`, which yields `nil` once the target is gone. It is the way to hold a back-reference without forming a reference cycle:
+
+```js
+class Node {
+    let child = nil;                 // owned
+    let parent = nil;                // observed
+    fn Adopt(c) { this.child = c; c.parent = weak(this); }
+    fn Up() { return Weak.Get(this.parent); }
+}
+```
 
 ### Function Calls
 
@@ -2247,6 +2266,16 @@ fn async loadFiles(a, b) {
 
 The calling fiber suspends at each `await` and is resumed automatically when the operation completes. Other fibers continue to run in the meantime.
 
+An `*Async` call has to be awaited right where it is made - `await File.ReadTextAsync(p)` or `Fiber.Await(File.ReadTextAsync(p))` - to get its result. Called on its own, as a statement, it starts the operation and carries on at once: the work still happens (`Os.ExecuteAsync("cmd")` runs the command in the background) and its result is discarded. Keeping the call and awaiting it later does not work, because the call itself returns `nil`. To start work now and collect it later, put it in an async function - calling one returns its fiber:
+
+```js
+fn async readLater(path) { return await File.ReadTextAsync(path); }
+
+let job = readLater(path);   // starts now
+// ... other work ...
+let text = await job;
+```
+
 ### Sleep
 
 ```js
@@ -2939,9 +2968,58 @@ if (after > before + 10) {
 **Performance profiling:**
 
 ```bash
-flarisvm script.fls --verbose --time
-# Output: [Time] Execution took 34.943 ms. Idle time 0ms
+flarisvm script.fls --time            # [Time] Execution took 34.943 ms. Idle time 0ms
+flarisvm script.fls --prof            # where the time went, by function
+flarisvm script.fls -g --prof=500     # by source line, 500 samples a second
 ```
+
+`--prof` samples the running script from a CPU timer and prints a table at
+exit:
+
+```
+[Profile] 1000 Hz: 812 samples on script code (812.0 ms), 2 in the VM, 40.0 ms waiting, 855.0 ms wall
+[Profile] objects: 12034 allocated, 61 live at peak, 12 live at start
+     %      self     total   objects  function                          location                interpreted because
+  91.3%       741       741     12000  hot                               script.fls:4            a parameter is untyped, or not a JIT type (...)
+   8.7%        71       812        20  Main                              script.fls:11           reads a global variable
+```
+
+`self` is the samples taken while the function was running, including the
+time it spent inside a builtin or a library call, so the column answers "which
+of my functions pays" rather than "which native routine ran". `total` adds the
+samples taken while the function was anywhere on the call stack, so a caller
+is charged for what it calls; a recursive function counts once per sample.
+`objects` is the number of objects allocated while the function was on top,
+charged the same way as the samples. The milliseconds come from the clock, so
+they stay right when the OS delivers fewer ticks than asked for (the header
+then says how many it delivered). Samples "in the VM" are ticks with no fiber
+running: loading and the scheduler. "waiting" is wall time with no CPU use:
+I/O waits and sleeps. When more than one fiber took samples, a second table
+lists the fibers by their entry function.
+
+A function the JIT has compiled to native code has no sampling points of its
+own, so its time is charged to the interpreted function that called it; run
+with `--jit-disable` when you want exact attribution.
+
+Every row is therefore a function that ran in the interpreter, and the last
+column says why - the same reason `--check` gives, without a second run:
+
+| Column says | Meaning |
+|-------------|---------|
+| a `--check` reason | The function is not JIT-eligible; fix what it names to make it native |
+| `compiled, but these calls failed the native entry check` | Native code exists, but the arguments these calls passed did not match it - most often a `[int]`/`[float]` parameter given an array that is not internally typed - so they ran interpreted |
+| `eligible, but the backend did not compile it` | The analyzer accepted the function and the native compiler declined it, for example because its body is too large |
+| `top-level code is never compiled` | Statements outside any function |
+| `not JIT-eligible; --check on the source says why` | The code was loaded from a `.flx`, which does not keep the reason |
+
+With `--jit-disable` the column is left out, since everything is interpreted
+by request. Lines need debug info
+(`-g`); without it the table shows files only. The profiler is part of
+`flarisvm`, not of the runtime-only `flaris`. macOS and Linux sample from the
+process CPU timer; Windows ticks a sampler thread at up to 1000 Hz and counts a
+tick only when the script thread used CPU since the last one, so blocked time
+reads as waiting on every platform. The browser build has no profiler. Off, it
+costs nothing; on, a sample is one flag test at the next loop or call.
 
 ## Development vs Production
 

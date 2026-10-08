@@ -1,0 +1,1271 @@
+// Smtp.fls - SMTP client for Flaris: send mail through a submission server.
+// Version: 1.0
+//
+// A client written on Stream sockets: ESMTP (EHLO), implicit TLS on port 465,
+// STARTTLS on any other port, PLAIN, LOGIN, CRAM-MD5 and XOAUTH2
+// authentication, PIPELINING, SIZE, DSN and SMTPUTF8 where the server offers
+// them, a MIME builder for text, HTML and attachments, and DKIM signing with
+// Ed25519 (RFC 8463). That is what Gmail, Outlook, Fastmail, Postfix, Exim and
+// every hosted relay speak.
+//
+// Usage:
+//   import { SmtpClient, SmtpMessage, Dkim } from library("Smtp", "1.0");
+//
+//   let smtp = new SmtpClient("smtp.example.com", 587, { user: "alice", password: "secret" });
+//   let r = smtp.Send({
+//       from: "alice@example.com",
+//       to: ["bob@example.com", { address: "carol@example.com", name: "Carol" }],
+//       subject: "Report",
+//       text: "Plain-text body",
+//       html: "<p>HTML body</p>",                    // optional alternative
+//       attachments: [{ name: "report.csv", content: csvText, type: "text/csv" }]
+//   });
+//   if (!r.ok) { Console.WriteLine(r.errorKind, ": ", r.error); }
+//   smtp.Close();
+//
+//   SmtpClient.SendOne(host, port, opts, msg)   // one message, one session
+//   let f = smtp.SendAsync(msg); ... let r = await f;   // on its own fiber
+//
+// Options:
+//   user, password  credentials; without them no AUTH is attempted
+//   token           an OAuth2 access token: XOAUTH2 with `user` as the account
+//   tls             "auto" (default): implicit TLS on port 465, STARTTLS when the
+//                   server offers it, otherwise plain
+//                   "starttls": STARTTLS is required, a server without it fails
+//                   "implicit": TLS from the first byte, any port
+//                   "none": never encrypt (test servers on loopback)
+//   insecure        accept any certificate (self-signed test servers)
+//   serverCert      pin the server: the SHA-256 fingerprint of its certificate
+//                   as hex, as Stream.TlsPeerCert / PeerCert() report it. A
+//                   different certificate fails with errorKind "tls".
+//   auth            "auto" (default), "plain", "login", "cram-md5" or "xoauth2".
+//                   auto prefers PLAIN over an encrypted link and CRAM-MD5 over a
+//                   plain one, and never sends a password in the clear unless
+//                   the server offers nothing better.
+//   helo            the name sent in EHLO                       (default "localhost")
+//   timeoutMs       how long each socket wait may take           (default 30000)
+//   dkim            a Dkim signer; every message goes out with a DKIM-Signature
+//
+// Every call returns a result object with ok; on failure error tells what
+// happened and errorKind which side it was on: "connect", "tls", "auth",
+// "protocol", "rejected", "timeout" or "closed". Nothing raises.
+//
+// Send connects and authenticates on first use, so Connect() is optional; call
+// it to inspect the server (capabilities, whether the link is encrypted)
+// before sending. One client can Send many messages over one session; a
+// session the server dropped in between is reopened once.
+// Send returns { ok, id, rejected } where id is the queue id the server
+// reported and rejected lists recipients the server refused (a message is
+// still sent when at least one was accepted), or { ok:false, error,
+// errorKind, rejected } when nothing was delivered.
+//
+// Message fields:
+//   from                 "a@x" | "Name <a@x>" | { address, name }   (required)
+//   to, cc, bcc          one address or an array of them; bcc is sent but
+//                        never written into the headers
+//   replyTo              one address
+//   subject              any UTF-8; encoded per RFC 2047 when needed
+//   text                 the plain-text body
+//   html                 an HTML body; with text it becomes multipart/alternative
+//   attachments          [{ name, content: string|block, type?, inline?:cid }]
+//   headers              extra headers as { "X-Name": "value" }
+//   date, messageId      override the generated values
+//   inReplyTo            the id of the message this answers
+//   references           one id or an array, the thread this belongs to
+//   priority             "high" | "low" (X-Priority and Importance headers)
+//   listUnsubscribe      one URL or an array; an https URL adds the one-click
+//                        marker (RFC 8058)
+//   dsn                  delivery status notification, when the server offers
+//                        DSN: { notify: "never" | ["success","failure","delay"],
+//                        ret: "full" | "hdrs", envid: string }
+//
+// Bodies go out as 7bit when they are plain ASCII, quoted-printable when they
+// are mostly ASCII, and base64 otherwise; attachments are always base64.
+// Header lines are folded at 78 columns. Non-ASCII addresses (SMTPUTF8) are
+// accepted when the server announces SMTPUTF8 and refused with a clear error
+// otherwise.
+//
+// SmtpMessage.Build(msg, opts?) -> string | nil renders the RFC 5322 text
+// without a server, which is how the test suite checks it and how a program
+// can hand a message to another transport; opts: { smtputf8: bool }.
+// SmtpMessage.Address(a, utf8?) -> { address, name } | nil parses one address
+// in any of the accepted forms. SmtpMessage.QuotedPrintable(s),
+// SmtpMessage.EncodedWords(s) and SmtpMessage.FoldHeader(name, value) expose
+// the encoders.
+//
+// DKIM:
+//   let kp = Crypto.Ed25519KeyPair();
+//   let signer = new Dkim({ domain: "example.com", selector: "s1", key: kp.SecretKey });
+//   Console.WriteLine(signer.DnsName(), " TXT ", signer.DnsRecord());   // publish this
+//   let smtp = new SmtpClient(host, 587, { user, password, dkim: signer });
+//
+//   Dkim signs with ed25519-sha256 and relaxed/relaxed canonicalization, the
+//   From header oversigned. Dkim.Verify(text, publicKey) checks a received
+//   message's Ed25519 signature: { ok, domain, selector } or { ok:false,
+//   error }. Keys: the 64-byte secret Crypto.Ed25519KeyPair gives (hex, base64
+//   or block), or a 32-byte seed with publicKey beside it; the public key as
+//   the DNS record carries it (base64) or hex. RSA signatures are neither made
+//   nor checked.
+//
+// Socket waits park only the calling fiber, so other fibers keep running.
+
+import { Util } from library("Util", "1.0");
+import { Digest } from library("CryptoKit", "1.0");
+
+const _CRLF = "\r\n";
+const _FOLD_AT = 78;          // preferred line length (RFC 5322 2.1.1)
+const _EW_BYTES = 45;         // raw bytes per encoded word: 60 base64 + 12 wrapper = 72 <= 75
+const _HEXU = "0123456789ABCDEF";
+
+// ---- helpers ----------------------------------------------------------------
+
+fn _hex(b): string {
+    let out = "";
+    iter (i from 0 to len(b)) {
+        let h = Convert.ToRadixString(Buffer.ReadU8At(b, i), 16);
+        out = out + ((String.Length(h) < 2) ? "0" + h : h);
+    }
+    return out;
+}
+
+fn _isAscii(s: string): bool {
+    let b = Buffer.FromString(s);
+    iter (i from 0 to len(b)) {
+        if (Buffer.ReadU8At(b, i) > 127) { return false; }
+    }
+    return true;
+}
+
+// Bytes of s that quoted-printable would have to escape.
+fn _unsafeBytes(s: string): int {
+    let b = Buffer.FromString(s);
+    let n = 0;
+    iter (i from 0 to len(b)) {
+        let c = Buffer.ReadU8At(b, i);
+        if (c > 126 || (c < 32 && c != 9 && c != 10 && c != 13) || c == 61) { n += 1; }
+    }
+    return n;
+}
+
+// Base64 in 76-column lines, as MIME bodies want it.
+fn _b64Lines(data): string {
+    let all = Util.Base64Encode(data) ?? "";
+    let n = String.Length(all);
+    if (n <= 76) { return all; }
+    let parts = [];
+    let pos = 0;
+    while (pos < n) {
+        Array.Append(parts, String.Substr(all, pos, 76));
+        pos += 76;
+    }
+    return String.Join(parts, _CRLF);
+}
+
+// Cut a block at a UTF-8 character boundary at or before `at`.
+fn _utf8Cut(b, at: int): int {
+    let i = at;
+    while (i > 0 && (Buffer.ReadU8At(b, i) & 0xC0) == 0x80) { i -= 1; }
+    return (i == 0) ? at : i;
+}
+
+// RFC 2047 encoded words, each at most 75 characters, split between
+// characters so every word decodes on its own; joined by a space, which
+// decoders drop between adjacent encoded words.
+fn _encodedWords(s: string): string {
+    let b = Buffer.FromString(s);
+    let n = len(b);
+    let words = [];
+    let pos = 0;
+    while (pos < n) {
+        let take = n - pos;
+        if (take > _EW_BYTES) { take = _utf8Cut(b, pos + _EW_BYTES) - pos; }
+        if (take <= 0) { take = 1; }
+        Array.Append(words, "=?UTF-8?B?" + (Util.Base64Encode(Buffer.Slice(b, pos, take)) ?? "") + "?=");
+        pos += take;
+    }
+    return String.Join(words, " ");
+}
+
+// Header text: ASCII as is, anything else as encoded words.
+fn _headerText(s: string): string {
+    if (_isAscii(s)) { return s; }
+    return _encodedWords(s);
+}
+
+// Fold "Name: value" at spaces so no line passes _FOLD_AT where a space
+// allows it; a continuation line starts with a space.
+fn _fold(name: string, value: string): string {
+    let head = name + ": ";
+    if (String.Length(head) + String.Length(value) <= _FOLD_AT) { return head + value; }
+    let lines = [];
+    let cur = head;
+    let curLen = String.Length(head);
+    let first = true;
+    foreach (tok in String.Split(value, " ")) {
+        if (tok == "") { continue; }
+        let tl = String.Length(tok);
+        if (!first && curLen + 1 + tl > _FOLD_AT) {
+            Array.Append(lines, cur);
+            cur = " " + tok;
+            curLen = 1 + tl;
+        } else {
+            cur = first ? cur + tok : cur + " " + tok;
+            curLen = first ? curLen + tl : curLen + 1 + tl;
+        }
+        first = false;
+    }
+    Array.Append(lines, cur);
+    return String.Join(lines, _CRLF);
+}
+
+// Every line ends in CRLF, whatever the caller wrote.
+fn _crlf(s: string): string {
+    let lines = String.Split(String.Replace(s, "\r\n", "\n"), "\n");
+    return String.Join(lines, _CRLF);
+}
+
+fn _maxLine(s: string): int {
+    let m = 0;
+    foreach (l in String.Split(s, "\n")) {
+        let n = String.Length(l);
+        if (n > m) { m = n; }
+    }
+    return m;
+}
+
+// A trailing blank on a line must be escaped or the decoder drops it.
+fn _qpEndLine(line: string): string {
+    let n = String.Length(line);
+    if (n == 0) { return line; }
+    let last = String.Substr(line, n - 1, 1);
+    if (last == " ") { return String.Substr(line, 0, n - 1) + "=20"; }
+    if (last == "\t") { return String.Substr(line, 0, n - 1) + "=09"; }
+    return line;
+}
+
+// Quoted-printable (RFC 2045 6.7): printable ASCII as is, everything else
+// =XX, soft breaks so no line passes 76 characters.
+fn _qp(s: string): string {
+    let b = Buffer.FromString(String.Replace(s, "\r\n", "\n"));
+    let n = len(b);
+    let out = [];
+    let line = "";
+    let lineLen = 0;
+    iter (i from 0 to n) {
+        let c = Buffer.ReadU8At(b, i);
+        if (c == 10) {
+            Array.Append(out, _qpEndLine(line));
+            line = ""; lineLen = 0;
+            continue;
+        }
+        let piece = "";
+        if ((c >= 33 && c <= 126 && c != 61) || c == 32 || c == 9) {
+            piece = String.Create(1, char(c));
+        } else {
+            piece = "=" + String.Substr(_HEXU, c / 16, 1) + String.Substr(_HEXU, c % 16, 1);
+        }
+        let pl = String.Length(piece);
+        if (lineLen + pl > 75) {
+            Array.Append(out, line + "=");
+            line = ""; lineLen = 0;
+        }
+        line = line + piece;
+        lineLen += pl;
+    }
+    Array.Append(out, _qpEndLine(line));
+    return String.Join(out, _CRLF);
+}
+
+// Pick the transfer encoding a text part needs and render it.
+fn _bodyPart(type: string, body: string): string {
+    let head = "Content-Type: " + type + "; charset=utf-8" + _CRLF + "Content-Transfer-Encoding: ";
+    if (_isAscii(body) && _maxLine(body) <= 900) {
+        return head + "7bit" + _CRLF + _CRLF + _crlf(body);
+    }
+    let unsafe = _unsafeBytes(body);
+    let total = len(Buffer.FromString(body));
+    if (unsafe * 3 <= total) {
+        return head + "quoted-printable" + _CRLF + _CRLF + _qp(body);
+    }
+    return head + "base64" + _CRLF + _CRLF + _b64Lines(body);
+}
+
+// A boundary no body can contain by accident.
+fn _boundary(): string {
+    return "=_flaris_" + _hex(Crypto.RandomBytes(12));
+}
+
+fn _listOf(v) {
+    if (v == nil) { return []; }
+    if (Type.IsArray(v)) { return v; }
+    return [v];
+}
+
+// The MIME type an attachment gets when the caller gave none.
+fn _guessType(name: string): string {
+    let dot = String.LastIndexOf(name, ".");
+    let ext = (dot < 0) ? "" : String.ToLower(String.Substr(name, dot + 1));
+    if (ext == "txt" || ext == "log" || ext == "md") { return "text/plain"; }
+    if (ext == "csv")  { return "text/csv"; }
+    if (ext == "html" || ext == "htm") { return "text/html"; }
+    if (ext == "json") { return "application/json"; }
+    if (ext == "xml")  { return "application/xml"; }
+    if (ext == "pdf")  { return "application/pdf"; }
+    if (ext == "zip")  { return "application/zip"; }
+    if (ext == "png")  { return "image/png"; }
+    if (ext == "jpg" || ext == "jpeg") { return "image/jpeg"; }
+    if (ext == "gif")  { return "image/gif"; }
+    if (ext == "svg")  { return "image/svg+xml"; }
+    return "application/octet-stream";
+}
+
+// ---- the message ------------------------------------------------------------
+
+class SmtpMessage
+{
+    // One address in any accepted form -> { address, name } | nil. utf8 allows
+    // non-ASCII local parts and domains (SMTPUTF8, RFC 6531).
+    fn static Address(a, utf8?) {
+        if (a == nil) { return nil; }
+        let u = utf8 == true;
+        if (Type.IsObject(a)) {
+            let addr = Object.TryGet(a, "address", nil);
+            if (addr == nil || !SmtpMessage._validAddress(addr, u)) { return nil; }
+            let name = Object.TryGet(a, "name", nil);
+            if (name != nil && (!Type.IsString(name) || String.Contains(name, "\r") || String.Contains(name, "\n"))) { return nil; }
+            return { address: String.Trim(addr), name: name };
+        }
+        if (!Type.IsString(a)) { return nil; }
+        if (String.Contains(a, "\r") || String.Contains(a, "\n")) { return nil; }
+        let s = String.Trim(a);
+        let lt = String.LastIndexOf(s, "<");
+        if (lt >= 0 && String.EndsWith(s, ">")) {
+            let addr = String.Substr(s, lt + 1, String.Length(s) - lt - 2);
+            let name = String.Trim(String.Substr(s, 0, lt));
+            if (String.StartsWith(name, "\"") && String.EndsWith(name, "\"") && String.Length(name) >= 2) {
+                name = String.Substr(name, 1, String.Length(name) - 2);
+            }
+            if (!SmtpMessage._validAddress(addr, u)) { return nil; }
+            return { address: String.Trim(addr), name: (name == "") ? nil : name };
+        }
+        if (!SmtpMessage._validAddress(s, u)) { return nil; }
+        return { address: s, name: nil };
+    }
+
+    fn static _validAddress(a, utf8: bool): bool {
+        if (!Type.IsString(a)) { return false; }
+        let s = String.Trim(a);
+        let at = String.LastIndexOf(s, "@");
+        if (at < 1 || at == String.Length(s) - 1) { return false; }
+        if (String.Contains(s, " ") || String.Contains(s, "\r") || String.Contains(s, "\n") ||
+            String.Contains(s, "<") || String.Contains(s, ">") || String.Contains(s, ",")) { return false; }
+        if (!utf8 && !_isAscii(s)) { return false; }
+        return true;
+    }
+
+    // True when any address of the message needs SMTPUTF8.
+    fn static NeedsUtf8(msg): bool {
+        if (msg == nil || !Type.IsObject(msg)) { return false; }
+        foreach (f in ["from", "to", "cc", "bcc", "replyTo"]) {
+            foreach (a in _listOf(Object.TryGet(msg, f, nil))) {
+                let p = SmtpMessage.Address(a, true);
+                if (p != nil && !_isAscii(p.address)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    // The header form: `Name <a@x>`, with the name encoded when needed and
+    // quoted when it holds a special.
+    fn static _headerAddress(p): string {
+        if (p.name == nil || p.name == "") { return p.address; }
+        let n = _headerText(p.name);
+        if (n == p.name && (String.Contains(n, ",") || String.Contains(n, ".") || String.Contains(n, "\"") ||
+                             String.Contains(n, "@") || String.Contains(n, ":") || String.Contains(n, ";"))) {
+            n = "\"" + String.Replace(n, "\"", "\\\"") + "\"";
+        }
+        return n + " <" + p.address + ">";
+    }
+
+    // All addresses of a field -> array of { address, name }; nil when one is bad.
+    fn static _addresses(v, utf8: bool) {
+        let out = [];
+        foreach (a in _listOf(v)) {
+            let p = SmtpMessage.Address(a, utf8);
+            if (p == nil) { return nil; }
+            Array.Append(out, p);
+        }
+        return out;
+    }
+
+    // Everything RCPT TO needs: to + cc + bcc, in order, or nil when one is bad.
+    fn static Recipients(msg, opts?) {
+        let utf8 = Object.TryGet(opts ?? {}, "smtputf8", false) == true;
+        let all = [];
+        foreach (f in ["to", "cc", "bcc"]) {
+            let ps = SmtpMessage._addresses(Object.TryGet(msg, f, nil), utf8);
+            if (ps == nil) { return nil; }
+            foreach (p in ps) { Array.Append(all, p.address); }
+        }
+        return all;
+    }
+
+    // The encoders, for callers that build headers or bodies themselves.
+    fn static QuotedPrintable(s: string): string { return _qp(s); }
+    fn static EncodedWords(s: string): string { return _headerText(s); }
+    fn static FoldHeader(name: string, value: string): string { return _fold(name, value); }
+
+    // The RFC 5322 text of msg, CRLF line ends, no trailing dot; nil when a
+    // required field is missing or an address is malformed.
+    fn static Build(msg, opts?) {
+        if (msg == nil || !Type.IsObject(msg)) { return nil; }
+        let utf8 = Object.TryGet(opts ?? {}, "smtputf8", false) == true;
+        let from = SmtpMessage.Address(Object.TryGet(msg, "from", nil), utf8);
+        if (from == nil) { return nil; }
+        let to = SmtpMessage._addresses(Object.TryGet(msg, "to", nil), utf8);
+        let cc = SmtpMessage._addresses(Object.TryGet(msg, "cc", nil), utf8);
+        if (to == nil || cc == nil) { return nil; }
+        if (SmtpMessage._addresses(Object.TryGet(msg, "bcc", nil), utf8) == nil) { return nil; }
+        if (len(to) + len(cc) + len(_listOf(Object.TryGet(msg, "bcc", nil))) == 0) { return nil; }
+
+        let h = [];
+        let date = Object.TryGet(msg, "date", nil) ?? Time.Format(Time.Now(), "%a, %d %b %Y %H:%M:%S %z");
+        Array.Append(h, _fold("Date", date));
+        Array.Append(h, _fold("From", SmtpMessage._headerAddress(from)));
+        if (len(to) > 0) { Array.Append(h, _fold("To", SmtpMessage._joinAddresses(to))); }
+        if (len(cc) > 0) { Array.Append(h, _fold("Cc", SmtpMessage._joinAddresses(cc))); }
+        let replyTo = SmtpMessage.Address(Object.TryGet(msg, "replyTo", nil), utf8);
+        if (replyTo != nil) { Array.Append(h, _fold("Reply-To", SmtpMessage._headerAddress(replyTo))); }
+        Array.Append(h, _fold("Subject", _headerText(Object.TryGet(msg, "subject", "") ?? "")));
+        let at = String.LastIndexOf(from.address, "@");
+        let id = Object.TryGet(msg, "messageId", nil) ??
+                 "<" + _hex(Crypto.RandomBytes(16)) + "@" + String.Substr(from.address, at + 1) + ">";
+        Array.Append(h, _fold("Message-ID", id));
+        let irt = Object.TryGet(msg, "inReplyTo", nil);
+        if (irt != nil) { Array.Append(h, _fold("In-Reply-To", SmtpMessage._msgId(irt))); }
+        let refs = _listOf(Object.TryGet(msg, "references", nil));
+        if (len(refs) > 0) {
+            let ids = [];
+            foreach (r in refs) { Array.Append(ids, SmtpMessage._msgId(r)); }
+            Array.Append(h, _fold("References", String.Join(ids, " ")));
+        }
+        let prio = Object.TryGet(msg, "priority", nil);
+        if (prio == "high")     { Array.Append(h, "X-Priority: 1"); Array.Append(h, "Importance: high"); }
+        else if (prio == "low") { Array.Append(h, "X-Priority: 5"); Array.Append(h, "Importance: low"); }
+        let unsub = Object.TryGet(msg, "listUnsubscribe", nil);
+        if (unsub != nil) {
+            let urls = [];
+            foreach (u in _listOf(unsub)) { Array.Append(urls, "<" + str(u) + ">"); }
+            Array.Append(h, _fold("List-Unsubscribe", String.Join(urls, ", ")));
+            foreach (u in _listOf(unsub)) {
+                if (String.StartsWith(str(u), "http")) { Array.Append(h, "List-Unsubscribe-Post: List-Unsubscribe=One-Click"); break; }
+            }
+        }
+        Array.Append(h, "MIME-Version: 1.0");
+        let extra = Object.TryGet(msg, "headers", nil);
+        if (extra != nil && Type.IsObject(extra)) {
+            foreach (k in Object.Keys(extra)) {
+                let v = str(extra[k]);
+                if (String.Contains(k, ":") || String.Contains(k, " ") || String.Contains(k, "\n") ||
+                    String.Contains(v, "\n") || String.Contains(v, "\r") || !_isAscii(k)) { return nil; }
+                Array.Append(h, _fold(k, _headerText(v)));
+            }
+        }
+
+        let text = Object.TryGet(msg, "text", nil);
+        let html = Object.TryGet(msg, "html", nil);
+        let atts = _listOf(Object.TryGet(msg, "attachments", nil));
+        if (text == nil && html == nil && len(atts) == 0) { text = ""; }
+
+        // Body: a single part, text+html as alternative, and attachments as
+        // a mixed wrapper around whichever of those applies.
+        let body = "";
+        if (text != nil && html != nil) {
+            let b = _boundary();
+            body = "Content-Type: multipart/alternative; boundary=\"" + b + "\"" + _CRLF + _CRLF +
+                   "--" + b + _CRLF + _bodyPart("text/plain", text) + _CRLF +
+                   "--" + b + _CRLF + _bodyPart("text/html", html) + _CRLF +
+                   "--" + b + "--";
+        } else if (html != nil) {
+            body = _bodyPart("text/html", html);
+        } else if (text != nil) {
+            body = _bodyPart("text/plain", text);
+        }
+
+        if (len(atts) > 0) {
+            let b = _boundary();
+            let parts = [];
+            if (body != "") { Array.Append(parts, "--" + b + _CRLF + body); }
+            foreach (a in atts) {
+                let part = SmtpMessage._attachment(a);
+                if (part == nil) { return nil; }
+                Array.Append(parts, "--" + b + _CRLF + part);
+            }
+            body = "Content-Type: multipart/mixed; boundary=\"" + b + "\"" + _CRLF + _CRLF +
+                   String.Join(parts, _CRLF) + _CRLF + "--" + b + "--";
+        }
+
+        return String.Join(h, _CRLF) + _CRLF + body + _CRLF;
+    }
+
+    // A message id with its angle brackets, whether or not the caller gave them.
+    fn static _msgId(v): string {
+        let t = String.Trim(str(v));
+        return (String.StartsWith(t, "<")) ? t : "<" + t + ">";
+    }
+
+    fn static _joinAddresses(ps): string {
+        let out = [];
+        foreach (p in ps) { Array.Append(out, SmtpMessage._headerAddress(p)); }
+        return String.Join(out, ", ");
+    }
+
+    fn static _attachment(a) {
+        if (a == nil || !Type.IsObject(a)) { return nil; }
+        let name = Object.TryGet(a, "name", nil);
+        let content = Object.TryGet(a, "content", nil);
+        if (name == nil || content == nil || !Type.IsString(name)) { return nil; }
+        if (!Type.IsString(content) && !Type.IsBlock(content)) { return nil; }
+        if (String.Contains(name, "\r") || String.Contains(name, "\n")) { return nil; }
+        let type = Object.TryGet(a, "type", nil) ?? _guessType(name);
+        let cid = Object.TryGet(a, "inline", nil);
+        let disp = (cid != nil) ? "inline" : "attachment";
+        let fname = "\"" + String.Replace(_headerText(name), "\"", "") + "\"";
+        let head = _fold("Content-Type", type + "; name=" + fname) + _CRLF +
+                   "Content-Transfer-Encoding: base64" + _CRLF +
+                   _fold("Content-Disposition", disp + "; filename=" + fname) + _CRLF;
+        if (cid != nil) { head = head + "Content-ID: <" + str(cid) + ">" + _CRLF; }
+        return head + _CRLF + _b64Lines(content);
+    }
+
+    // DATA form: dot-stuffed (RFC 5321 4.5.2), ending in CRLF.CRLF.
+    fn static ForData(rendered: string): string {
+        let lines = String.Split(rendered, _CRLF);
+        let out = [];
+        foreach (l in lines) {
+            Array.Append(out, String.StartsWith(l, ".") ? "." + l : l);
+        }
+        let joined = String.Join(out, _CRLF);
+        if (!String.EndsWith(joined, _CRLF)) { joined = joined + _CRLF; }
+        return joined + "." + _CRLF;
+    }
+}
+
+// ---- authentication tokens (also used by the tests) -------------------------
+
+class SmtpAuth
+{
+    // AUTH PLAIN: base64 of NUL user NUL password.
+    fn static Plain(user: string, password: string): string {
+        let ub = Buffer.FromString(user);
+        let pb = Buffer.FromString(password);
+        let b = Buffer.Create(2 + len(ub) + len(pb), 1);
+        Buffer.WriteU8At(b, 0, 0);
+        Buffer.Copy(ub, 0, b, 1, len(ub));
+        Buffer.WriteU8At(b, 1 + len(ub), 0);
+        Buffer.Copy(pb, 0, b, 2 + len(ub), len(pb));
+        return Util.Base64Encode(b);
+    }
+
+    // AUTH CRAM-MD5 (RFC 2195): "user hex(HMAC-MD5(password, challenge))", base64.
+    fn static CramMd5(user: string, password: string, challengeB64: string): string {
+        let challenge = Util.Base64DecodeBlock(challengeB64);
+        if (challenge == nil) { return nil; }
+        return Util.Base64Encode(user + " " + SmtpAuth.HmacMd5(password, challenge));
+    }
+
+    // Hex HMAC-MD5 over a block, key as a string (RFC 2104 with a 64-byte block).
+    fn static HmacMd5(key: string, data): string {
+        let k = Buffer.FromString(key);
+        if (len(k) > 64) { k = Digest.Md5(k, true); }
+        let ipad = Buffer.Create(64 + len(data), 1);
+        let opad = Buffer.Create(64 + 16, 1);
+        iter (i from 0 to 64) {
+            let kb = (i < len(k)) ? Buffer.ReadU8At(k, i) : 0;
+            Buffer.WriteU8At(ipad, i, kb ^ 0x36);
+            Buffer.WriteU8At(opad, i, kb ^ 0x5c);
+        }
+        Buffer.Copy(data, 0, ipad, 64, len(data));
+        let inner = Digest.Md5(ipad, true);
+        Buffer.Copy(inner, 0, opad, 64, 16);
+        return Digest.Md5(opad);
+    }
+
+    // AUTH XOAUTH2: base64 of "user=<user>\x01auth=Bearer <token>\x01\x01".
+    fn static XOAuth2(user: string, token: string): string {
+        return Util.Base64Encode("user=" + user + "\x01auth=Bearer " + token + "\x01\x01");
+    }
+}
+
+// ---- DKIM (RFC 6376 with the Ed25519 algorithm of RFC 8463) ----------------
+
+fn _hexToBlock(hex: string) {
+    let n = String.Length(hex) / 2;
+    let b = Buffer.Create(n, 1);
+    iter (i from 0 to n) {
+        Buffer.WriteU8At(b, i, Convert.ParseRadix(String.Substr(hex, i * 2, 2), 16));
+    }
+    return b;
+}
+
+// Collapse runs of space/tab to one space and drop the ones at the end.
+fn _collapseWsp(v: string): string {
+    let out = [];
+    foreach (tok in String.Split(String.Replace(v, "\t", " "), " ")) {
+        if (tok != "") { Array.Append(out, tok); }
+    }
+    return String.Join(out, " ");
+}
+
+fn _isHex(s: string): bool {
+    let b = Buffer.FromString(s);
+    if (len(b) == 0) { return false; }
+    iter (i from 0 to len(b)) {
+        let c = Buffer.ReadU8At(b, i);
+        if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) { return false; }
+    }
+    return true;
+}
+
+// Key material in hex, base64 or a block -> hex; nil when it is none of them.
+fn _keyHex(k, bytes: int) {
+    if (k == nil) { return nil; }
+    if (Type.IsBlock(k)) { return (len(k) == bytes) ? _hex(k) : nil; }
+    if (!Type.IsString(k)) { return nil; }
+    let t = String.Trim(k);
+    if (String.Length(t) == bytes * 2 && _isHex(t)) { return String.ToLower(t); }
+    let b = Util.Base64DecodeBlock(t);
+    if (b != nil && len(b) == bytes) { return _hex(b); }
+    return nil;
+}
+
+class Dkim
+{
+    let _domain: string = "";
+    let _selector: string = "";
+    let _secretHex: string = "";
+    let _publicHex: string = "";
+    let _headers = nil;
+    let _expire: int = 0;
+
+    // opts: { domain, selector, key, publicKey?, headers?, expireSeconds? }
+    // key is the secret key as Crypto.Ed25519KeyPair gives it (64 bytes: seed
+    // then public key) in hex, base64 or a block, or the 32-byte seed alone
+    // with publicKey beside it. Raises on a key it cannot read.
+    fn Constructor(opts) {
+        _domain = String.ToLower(Object.TryGet(opts, "domain", "") ?? "");
+        _selector = Object.TryGet(opts, "selector", "") ?? "";
+        _headers = Object.TryGet(opts, "headers", nil);
+        _expire = Object.TryGet(opts, "expireSeconds", 0);
+        let key = Object.TryGet(opts, "key", nil);
+        let full = _keyHex(key, 64);
+        if (full != nil) {
+            _secretHex = full;
+            _publicHex = String.Substr(full, 64, 64);
+        } else {
+            let seed = _keyHex(key, 32);
+            let pub = _keyHex(Object.TryGet(opts, "publicKey", nil), 32);
+            if (seed == nil || pub == nil) { throw new Exception(1, "Dkim: key must be a 64-byte secret key, or a 32-byte seed with publicKey"); }
+            _secretHex = seed + pub;
+            _publicHex = pub;
+        }
+        if (_domain == "" || _selector == "") { throw new Exception(1, "Dkim: domain and selector are required"); }
+    }
+
+    fn Domain(): string { return _domain; }
+    fn Selector(): string { return _selector; }
+    // The public key in the base64 form the DNS record carries.
+    fn PublicKey(): string { return Util.Base64Encode(_hexToBlock(_publicHex)); }
+    // The TXT record to publish at <selector>._domainkey.<domain>.
+    fn DnsRecord(): string { return "v=DKIM1; k=ed25519; p=" + this.PublicKey(); }
+    fn DnsName(): string { return _selector + "._domainkey." + _domain; }
+
+    // The signed message: the DKIM-Signature header prepended to `rendered`
+    // (CRLF text as SmtpMessage.Build makes it). nil when the text has no
+    // header block.
+    fn Sign(rendered: string, timestamp?) {
+        let hdr = this.SignatureHeader(rendered, timestamp);
+        if (hdr == nil) { return nil; }
+        return hdr + _CRLF + rendered;
+    }
+
+    // Just the "DKIM-Signature: ..." header, folded.
+    fn SignatureHeader(rendered: string, timestamp?) {
+        let parsed = Dkim._split(rendered);
+        if (parsed == nil) { return nil; }
+        let names = _headers ?? ["from", "to", "cc", "subject", "date", "message-id", "reply-to", "in-reply-to",
+                                 "references", "mime-version", "content-type", "list-unsubscribe"];
+        let present = [];
+        foreach (n in names) {
+            let ln = String.ToLower(n);
+            foreach (hd in parsed.headers) { if (hd.name == ln) { Array.Append(present, ln); break; } }
+        }
+        Array.Append(present, "from");   // oversign: no further From may be added
+        let t = timestamp ?? Time.Now();
+        let bh = Util.Base64Encode(_hexToBlock(Hash.Sha256(Dkim.CanonicalBody(parsed.body, "relaxed"))));
+        let tags = "v=1; a=ed25519-sha256; c=relaxed/relaxed; d=" + _domain + "; s=" + _selector +
+                   "; t=" + str(t) + (_expire > 0 ? "; x=" + str(t + _expire) : "") +
+                   "; h=" + String.Join(present, ":") + "; bh=" + bh + "; b=";
+        let digest = Dkim._headerDigest(parsed.headers, present, "relaxed", tags);
+        let sigHex = Crypto.Ed25519Sign(_secretHex, digest);
+        let sig = Util.Base64Encode(_hexToBlock(sigHex));
+        // The signature is split so the folded header stays under 78 columns;
+        // verifiers ignore whitespace inside b=.
+        let value = tags + String.Substr(sig, 0, 44) + " " + String.Substr(sig, 44);
+        return _fold("DKIM-Signature", value);
+    }
+
+    // Verify the Ed25519 DKIM signature(s) of a message against a public key
+    // (base64 as in DNS, hex, or a block). { ok, domain, selector, error }.
+    fn static Verify(rendered: string, publicKey) {
+        let pubHex = _keyHex(publicKey, 32);
+        if (pubHex == nil) { return { ok: false, error: "public key must be 32 bytes" }; }
+        let parsed = Dkim._split(rendered);
+        if (parsed == nil) { return { ok: false, error: "no header block" }; }
+        let seen = 0;
+        let edSeen = 0;
+        let lastError = "no DKIM-Signature header";
+        foreach (hd in parsed.headers) {
+            if (hd.name != "dkim-signature") { continue; }
+            seen += 1;
+            let tags = Dkim._tags(hd.value);
+            let alg = Object.TryGet(tags, "a", "");
+            // An Ed25519 signature's verdict outranks a foreign algorithm's.
+            if (alg != "ed25519-sha256") { if (edSeen == 0) { lastError = "unsupported algorithm " + alg; } continue; }
+            edSeen += 1;
+            let c = String.Split(Object.TryGet(tags, "c", "simple/simple"), "/");
+            let hc = c[0];
+            let bc = (len(c) > 1) ? c[1] : "simple";
+            let body = parsed.body;
+            let l = Object.TryGet(tags, "l", nil);
+            let canon = Dkim.CanonicalBody(body, bc);
+            if (l != nil && int(l) < String.Length(canon)) { canon = String.Substr(canon, 0, int(l)); }
+            let bh = Util.Base64Encode(_hexToBlock(Hash.Sha256(canon)));
+            if (bh != Object.TryGet(tags, "bh", "")) { lastError = "body hash mismatch"; continue; }
+            let names = [];
+            foreach (n in String.Split(Object.TryGet(tags, "h", ""), ":")) {
+                let nn = String.ToLower(String.Trim(n));
+                if (nn != "") { Array.Append(names, nn); }
+            }
+            if (!Array.Contains(names, "from")) { lastError = "From is not signed"; continue; }
+            let digest = Dkim._headerDigest(parsed.headers, names, hc, Dkim._stripB(hd));
+            let sigB = Util.Base64DecodeBlock(Object.TryGet(tags, "b", ""));
+            if (sigB == nil || len(sigB) != 64) { lastError = "malformed b= tag"; continue; }
+            if (Crypto.Ed25519Verify(_hex(sigB), pubHex, digest)) {
+                return { ok: true, domain: Object.TryGet(tags, "d", nil), selector: Object.TryGet(tags, "s", nil) };
+            }
+            lastError = "signature does not verify";
+        }
+        return { ok: false, error: lastError, signatures: seen };
+    }
+
+    // Body hash input for the given canonicalization ("relaxed" | "simple").
+    fn static CanonicalBody(body: string, canon: string): string {
+        let text = String.Replace(body, "\r\n", "\n");
+        let lines = String.Split(text, "\n");
+        if (canon == "relaxed") {
+            let out = [];
+            foreach (l in lines) { Array.Append(out, _collapseWsp(l)); }
+            lines = out;
+        }
+        // Drop the empty lines at the end; a non-empty body ends in CRLF.
+        let n = len(lines);
+        while (n > 0 && lines[n - 1] == "") { n -= 1; }
+        if (n == 0) { return ""; }
+        let kept = [];
+        iter (i from 0 to n) { Array.Append(kept, lines[i]); }
+        return String.Join(kept, _CRLF) + _CRLF;
+    }
+
+    // One header in canonical form, without the trailing CRLF.
+    fn static CanonicalHeader(name: string, rawValue: string, canon: string): string {
+        if (canon == "relaxed") {
+            return String.ToLower(name) + ":" + _collapseWsp(String.Replace(rawValue, _CRLF, ""));
+        }
+        return name + ":" + rawValue;
+    }
+
+    // ---- internals ----
+
+    // Headers as [{ name (lowercase), rawName, value (folded as sent) }] and the body.
+    fn static _split(rendered: string) {
+        let text = String.Replace(String.Replace(rendered, "\r\n", "\n"), "\n", _CRLF);
+        let cut = String.IndexOf(text, _CRLF + _CRLF);
+        let head = (cut < 0) ? text : String.Substr(text, 0, cut);
+        let body = (cut < 0) ? "" : String.Substr(text, cut + 4);
+        let headers = [];
+        foreach (line in String.Split(head, _CRLF)) {
+            if (line == "") { continue; }
+            if ((String.StartsWith(line, " ") || String.StartsWith(line, "\t")) && len(headers) > 0) {
+                let last = headers[len(headers) - 1];
+                last.value = last.value + _CRLF + line;
+                continue;
+            }
+            let colon = String.IndexOf(line, ":");
+            if (colon < 1) { return nil; }
+            Array.Append(headers, { name: String.ToLower(String.Substr(line, 0, colon)),
+                                    rawName: String.Substr(line, 0, colon),
+                                    value: String.Substr(line, colon + 1) });
+        }
+        if (len(headers) == 0) { return nil; }
+        return { headers: headers, body: body };
+    }
+
+    // The DKIM-Signature tags as an object; whitespace inside b= and bh= dropped.
+    fn static _tags(value: string) {
+        let out = {};
+        foreach (part in String.Split(String.Replace(value, _CRLF, ""), ";")) {
+            let eq = String.IndexOf(part, "=");
+            if (eq < 0) { continue; }
+            let k = String.Trim(String.Substr(part, 0, eq));
+            let v = String.Trim(String.Substr(part, eq + 1));
+            if (k == "b" || k == "bh") { v = String.Replace(String.Replace(v, " ", ""), "\t", ""); }
+            out[k] = v;
+        }
+        return out;
+    }
+
+    // The signature header's raw value with the b= value emptied, as the
+    // hash input wants it.
+    fn static _stripB(hd): string {
+        let v = hd.value;
+        let parts = String.Split(v, ";");
+        let out = [];
+        foreach (part in parts) {
+            let t = String.Replace(String.Trim(String.Replace(part, _CRLF, "")), "\t", " ");
+            if (String.StartsWith(t, "b=")) { Array.Append(out, " b="); }
+            else { Array.Append(out, part); }
+        }
+        return String.Join(out, ";");
+    }
+
+    // SHA-256 over the selected headers (bottom-up per name, RFC 6376 5.4.2)
+    // followed by the signature header without CRLF.
+    fn static _headerDigest(headers, names, canon: string, sigValue: string) {
+        let used = {};
+        let input = "";
+        foreach (n in names) {
+            let skip = Object.TryGet(used, n, 0);
+            let found = nil;
+            let seen = 0;
+            let i = len(headers) - 1;
+            while (i >= 0) {
+                if (headers[i].name == n) {
+                    if (seen == skip) { found = headers[i]; break; }
+                    seen += 1;
+                }
+                i -= 1;
+            }
+            used[n] = skip + 1;
+            if (found == nil) { continue; }
+            input = input + Dkim.CanonicalHeader(found.rawName, found.value, canon) + _CRLF;
+        }
+        input = input + Dkim.CanonicalHeader("DKIM-Signature", sigValue, canon);
+        return _hexToBlock(Hash.Sha256(input));
+    }
+}
+
+// ---- the client -------------------------------------------------------------
+
+class SmtpClient
+{
+    let _host: string = "";
+    let _port: int = 587;
+    let _opts = nil;
+    let _timeoutMs: int = 30000;
+    let _sock = nil;
+    let _connected: bool = false;
+    let _encrypted: bool = false;
+    let _authenticated: bool = false;
+    let _caps = nil;          // { STARTTLS: true, AUTH: "PLAIN LOGIN", SIZE: "..." }
+    let _greeting: string = "";
+    let _lastReply: string = "";
+    let _peerCert = nil;
+    let _dkim = nil;
+
+    fn Constructor(host: string, port: int, opts?) {
+        _host = host;
+        _port = port;
+        _opts = opts ?? {};
+        _timeoutMs = Object.TryGet(_opts, "timeoutMs", 30000);
+        _dkim = Object.TryGet(_opts, "dkim", nil);
+    }
+
+    // One message through a fresh session: connect, send, quit.
+    fn static SendOne(host: string, port: int, opts, msg) {
+        let c = new SmtpClient(host, port, opts);
+        let r = c.Send(msg);
+        c.Close();
+        return r;
+    }
+
+    // Send on its own fiber: `await smtp.SendAsync(msg)` or Fiber.Await(...).
+    fn async SendAsync(msg) {
+        return this.Send(msg);
+    }
+
+    fn IsConnected(): bool { return _connected; }
+    fn IsEncrypted(): bool { return _encrypted; }
+    // The EHLO extensions the server announced, once connected.
+    fn Capabilities() { return _caps; }
+    fn HasCapability(name: string): bool { return _caps != nil && Object.TryGet(_caps, String.ToUpper(name), nil) != nil; }
+    // The server's certificate as { sha256, subject }, once TLS is up.
+    fn PeerCert() { return _peerCert; }
+    // The last reply line the server sent, for diagnostics.
+    fn LastReply(): string { return _lastReply; }
+
+    // Open the session: greeting, EHLO, TLS as configured, AUTH when
+    // credentials were given. Returns { ok, encrypted, capabilities } or a failure.
+    fn Connect() {
+        if (_connected) { return { ok: true, encrypted: _encrypted, capabilities: _caps }; }
+        let tls = Object.TryGet(_opts, "tls", "auto");
+        let implicit = (tls == "implicit") || (tls == "auto" && _port == 465);
+        let insecure = Object.TryGet(_opts, "insecure", false) == true;
+        let pin = Object.TryGet(_opts, "serverCert", nil);
+        if (pin != nil && tls == "none") {
+            return { ok: false, error: "serverCert needs an encrypted link, but tls is \"none\"", errorKind: "tls" };
+        }
+        _peerCert = nil;
+
+        // DNS, the TCP handshake and an implicit TLS handshake run on the I/O
+        // pool, so only this fiber waits for them.
+        if (implicit) {
+            _sock = Fiber.Await(Stream.ConnectTlsAsync(_host, _port, { insecure: insecure || pin != nil, timeoutMs: _timeoutMs }));
+            if (_sock == nil) {
+                return { ok: false, error: "TLS connect to " + _host + ":" + str(_port) + " failed: " + (Stream.TlsLastError() ?? "unknown"), errorKind: "tls" };
+            }
+            _encrypted = true;
+            let p = this._checkPin(pin);
+            if (!p.ok) { return p; }
+        } else {
+            _sock = Fiber.Await(Stream.ConnectAsync("tcp", _host, _port, _timeoutMs));
+            if (_sock == nil) { return { ok: false, error: "cannot connect to " + _host + ":" + str(_port), errorKind: "connect" }; }
+            _encrypted = false;
+        }
+        Stream.SetTimeout(_sock, _timeoutMs);
+        _authenticated = false;
+
+        let greet = this._reply();
+        if (greet == nil) { return this._fail(this._kindOfNil(), "no greeting from the server"); }
+        if (greet.code != 220) { return this._fail("protocol", "server refused the session: " + greet.text); }
+        _greeting = greet.text;
+
+        let e = this._ehlo();
+        if (!e.ok) { return e; }
+
+        if (!_encrypted && tls != "none") {
+            let offered = Object.TryGet(_caps, "STARTTLS", false) == true;
+            if (offered) {
+                let r = this._starttls(insecure || pin != nil);
+                if (!r.ok) { return r; }
+                let p = this._checkPin(pin);
+                if (!p.ok) { return p; }
+                e = this._ehlo();
+                if (!e.ok) { return e; }
+            } else if (tls == "starttls") {
+                return this._fail("tls", "server does not offer STARTTLS");
+            } else if (pin != nil) {
+                return this._fail("tls", "serverCert given but the server does not offer STARTTLS");
+            }
+        }
+
+        let a = this._authenticate();
+        if (!a.ok) { return a; }
+        _connected = true;
+        return { ok: true, encrypted: _encrypted, capabilities: _caps };
+    }
+
+    // Send one message; connects first when needed. { ok, id, rejected } or a
+    // failure. A session the server dropped since the last Send is reopened
+    // once.
+    fn Send(msg) {
+        // The message is checked before any network work, so a bad one costs
+        // no connection.
+        let rendered = SmtpMessage.Build(msg, { smtputf8: true });
+        if (rendered == nil) { return this._rejected("message is missing from/to or has a malformed address", []); }
+        if (_dkim != nil) {
+            rendered = _dkim.Sign(rendered);
+            if (rendered == nil) { return this._rejected("DKIM signing failed", []); }
+        }
+        let wasConnected = _connected;
+        if (!_connected) {
+            let c = this.Connect();
+            if (!c.ok) { return c; }
+        }
+        let r = this._deliver(msg, rendered);
+        if (!r.ok && r.errorKind == "closed" && wasConnected) {
+            let c = this.Connect();
+            if (!c.ok) { return c; }
+            r = this._deliver(msg, rendered);
+        }
+        return r;
+    }
+
+    fn _deliver(msg, rendered: string) {
+        let utf8 = Object.TryGet(_caps, "SMTPUTF8", false) == true;
+        let needsUtf8 = SmtpMessage.NeedsUtf8(msg);
+        if (needsUtf8 && !utf8) {
+            return this._rejected("a non-ASCII address needs SMTPUTF8, which this server does not offer", []);
+        }
+        let rcpts = SmtpMessage.Recipients(msg, { smtputf8: true });
+        let from = SmtpMessage.Address(msg.from, true);
+        let size = String.Length(rendered);
+
+        let limit = int(str(Object.TryGet(_caps, "SIZE", "0")));
+        if (limit > 0 && size > limit) {
+            return this._rejected("message of " + str(size) + " bytes exceeds the server limit of " + str(limit), []);
+        }
+
+        // MAIL FROM with the parameters the server understands.
+        let mail = "MAIL FROM:<" + from.address + ">";
+        if (Object.TryGet(_caps, "8BITMIME", false) == true) { mail = mail + " BODY=8BITMIME"; }
+        if (needsUtf8) { mail = mail + " SMTPUTF8"; }
+        if (Object.TryGet(_caps, "SIZE", nil) != nil) { mail = mail + " SIZE=" + str(size); }
+        let dsn = Object.TryGet(msg, "dsn", nil);
+        let hasDsn = dsn != nil && Type.IsObject(dsn) && Object.TryGet(_caps, "DSN", false) == true;
+        let rcptSuffix = "";
+        if (hasDsn) {
+            let ret = Object.TryGet(dsn, "ret", nil);
+            if (ret != nil) { mail = mail + " RET=" + String.ToUpper(str(ret)); }
+            let envid = Object.TryGet(dsn, "envid", nil);
+            if (envid != nil) { mail = mail + " ENVID=" + str(envid); }
+            let notify = Object.TryGet(dsn, "notify", nil);
+            if (notify != nil) {
+                rcptSuffix = " NOTIFY=" + String.ToUpper(Type.IsArray(notify) ? String.Join(notify, ",") : str(notify));
+            }
+        }
+
+        let cmds = [mail];
+        foreach (a in rcpts) { Array.Append(cmds, "RCPT TO:<" + a + ">" + rcptSuffix); }
+        Array.Append(cmds, "DATA");
+
+        // With PIPELINING every command goes out at once and the replies are
+        // read back in order; otherwise one at a time, stopping at a refused
+        // sender.
+        let replies = [];
+        if (Object.TryGet(_caps, "PIPELINING", false) == true) {
+            if (!this._write(String.Join(cmds, _CRLF) + _CRLF)) { return this._fail("closed", "write failed"); }
+            foreach (c in cmds) {
+                let r = this._reply();
+                if (r == nil) { return this._fail(this._kindOfNil(), "no reply to " + String.Substr(c, 0, 4)); }
+                Array.Append(replies, r);
+            }
+        } else {
+            let stop = false;
+            foreach (c in cmds) {
+                if (stop) { break; }
+                let r = this._cmd(c);
+                if (r == nil) { return this._fail(this._kindOfNil(), "no reply to " + String.Substr(c, 0, 4)); }
+                Array.Append(replies, r);
+                if (len(replies) == 1 && r.code != 250) { stop = true; }
+            }
+        }
+
+        if (replies[0].code != 250) {
+            if (len(replies) == len(cmds)) { this._cmd("RSET"); }
+            return this._rejected("sender refused: " + replies[0].text, []);
+        }
+        let refused = [];
+        let accepted = 0;
+        iter (i from 0 to len(rcpts)) {
+            let rr = replies[1 + i];
+            if (rr.code == 250 || rr.code == 251) { accepted += 1; }
+            else { Array.Append(refused, rcpts[i]); }
+        }
+        let d = replies[len(cmds) - 1];
+        if (accepted == 0) {
+            if (d.code == 354) { this._write("." + _CRLF); this._reply(); }
+            this._cmd("RSET");
+            return this._rejected("every recipient was refused: " + replies[1].text, refused);
+        }
+        if (d.code != 354) { this._cmd("RSET"); return this._rejected("DATA refused: " + d.text, refused); }
+        if (!this._write(SmtpMessage.ForData(rendered))) { return this._fail("closed", "write failed during DATA"); }
+        let q = this._reply();
+        if (q == nil) { return this._fail(this._kindOfNil(), "no reply after the message"); }
+        if (q.code != 250) { return this._rejected("message refused: " + q.text, refused); }
+
+        let id = q.text;
+        let qi = String.IndexOf(q.text, "queued as ");
+        if (qi >= 0) { id = String.Trim(String.Substr(q.text, qi + 10)); }
+        return { ok: true, id: id, rejected: refused };
+    }
+
+    fn Close() {
+        if (_sock != nil) {
+            if (_connected) { this._write("QUIT" + _CRLF); this._reply(); }
+            Stream.Close(_sock);
+            _sock = nil;
+        }
+        _connected = false;
+        _encrypted = false;
+        _authenticated = false;
+        return nil;
+    }
+
+    // ---- session steps ----
+
+    fn _checkPin(pin) {
+        _peerCert = Stream.TlsPeerCert(_sock);
+        if (pin == nil) { return { ok: true }; }
+        let want = String.ToLower(String.Replace(String.Replace(str(pin), ":", ""), "sha256", ""));
+        let got = (_peerCert == nil) ? nil : Object.TryGet(_peerCert, "sha256", nil);
+        if (got == nil) { return this._fail("tls", "the server's certificate could not be read for pinning"); }
+        if (String.ToLower(got) != want) { return this._fail("tls", "server certificate mismatch: got sha256 " + got); }
+        return { ok: true };
+    }
+
+    fn _ehlo() {
+        let helo = Object.TryGet(_opts, "helo", "localhost");
+        let r = this._cmd("EHLO " + helo);
+        if (r == nil) { return this._fail(this._kindOfNil(), "no reply to EHLO"); }
+        if (r.code != 250) {
+            r = this._cmd("HELO " + helo);
+            if (r == nil) { return this._fail(this._kindOfNil(), "no reply to HELO"); }
+            if (r.code != 250) { return this._fail("protocol", "EHLO/HELO refused: " + r.text); }
+            _caps = {};
+            return { ok: true };
+        }
+        _caps = {};
+        let first = true;
+        foreach (line in r.lines) {
+            if (first) { first = false; continue; }   // the server's own name
+            let sp = String.IndexOf(line, " ");
+            let key = String.ToUpper((sp < 0) ? line : String.Substr(line, 0, sp));
+            let val = (sp < 0) ? true : String.Substr(line, sp + 1);
+            _caps[key] = val;
+        }
+        return { ok: true };
+    }
+
+    fn _starttls(insecure: bool) {
+        let r = this._cmd("STARTTLS");
+        if (r == nil) { return this._fail(this._kindOfNil(), "no reply to STARTTLS"); }
+        if (r.code != 220) { return this._fail("tls", "STARTTLS refused: " + r.text); }
+        let up = Stream.StartTls(_sock, { sni: _host, insecure: insecure, timeoutMs: _timeoutMs });
+        if (up == nil) {
+            _sock = nil;    // StartTls owns and closed the socket
+            _connected = false;
+            return { ok: false, error: "TLS handshake failed: " + (Stream.TlsLastError() ?? "unknown"), errorKind: "tls" };
+        }
+        _sock = up;
+        Stream.SetTimeout(_sock, _timeoutMs);
+        _encrypted = true;
+        return { ok: true };
+    }
+
+    fn _authenticate() {
+        let user = Object.TryGet(_opts, "user", nil);
+        let password = Object.TryGet(_opts, "password", nil);
+        let token = Object.TryGet(_opts, "token", nil);
+        if (user == nil || (password == nil && token == nil)) { return { ok: true }; }
+
+        let offered = String.ToUpper(str(Object.TryGet(_caps, "AUTH", "")));
+        let mechs = String.Split(String.Trim(offered), " ");
+        let want = String.ToLower(Object.TryGet(_opts, "auth", "auto"));
+        let order = [];
+        if (want == "auto") {
+            if (token != nil) { order = ["xoauth2"]; }
+            else if (_encrypted) { order = ["plain", "login", "cram-md5"]; }
+            else { order = ["cram-md5", "plain", "login"]; }
+        } else {
+            order = [want];
+        }
+
+        let tried = [];
+        foreach (m in order) {
+            let name = String.ToUpper(m);
+            if (want == "auto" && !Array.Contains(mechs, name)) { continue; }
+            Array.Append(tried, name);
+            let r = nil;
+            if (m == "plain")         { r = this._cmd("AUTH PLAIN " + SmtpAuth.Plain(user, password ?? "")); }
+            else if (m == "login")    { r = this._authLogin(user, password ?? ""); }
+            else if (m == "cram-md5") { r = this._authCram(user, password ?? ""); }
+            else if (m == "xoauth2")  { r = this._authXOAuth2(user, token ?? ""); }
+            else { return this._fail("auth", "unknown auth mechanism: " + m); }
+            if (r == nil) { return this._fail(this._kindOfNil(), "no reply during AUTH"); }
+            if (r.code == 235) { _authenticated = true; return { ok: true }; }
+            if (r.code == 534 || r.code == 535 || r.code == 454 || r.code == 501) { continue; }
+            return this._fail("auth", "AUTH " + name + " failed: " + r.text);
+        }
+        if (len(tried) == 0) {
+            return this._fail("auth", (offered == "") ? "server offers no authentication" : "no usable mechanism among: " + offered);
+        }
+        return this._fail("auth", "authentication failed (" + String.Join(tried, ", ") + "): " + _lastReply);
+    }
+
+    fn _authLogin(user: string, password: string) {
+        let r = this._cmd("AUTH LOGIN");
+        if (r == nil || r.code != 334) { return r; }
+        r = this._cmd(Util.Base64Encode(user));
+        if (r == nil || r.code != 334) { return r; }
+        return this._cmd(Util.Base64Encode(password));
+    }
+
+    fn _authCram(user: string, password: string) {
+        let r = this._cmd("AUTH CRAM-MD5");
+        if (r == nil || r.code != 334) { return r; }
+        let answer = SmtpAuth.CramMd5(user, password, String.Trim(r.text));
+        if (answer == nil) { return { code: 501, text: "bad challenge", lines: [] }; }
+        return this._cmd(answer);
+    }
+
+    fn _authXOAuth2(user: string, token: string) {
+        let r = this._cmd("AUTH XOAUTH2 " + SmtpAuth.XOAuth2(user, token));
+        // A 334 carries a JSON error; an empty line ends the exchange.
+        if (r != nil && r.code == 334) { r = this._cmd(""); }
+        return r;
+    }
+
+    // ---- wire ----
+
+    fn _write(s: string): bool {
+        if (_sock == nil) { return false; }
+        return Stream.WriteAll(_sock, s) == true;
+    }
+
+    // One command, one reply: { code, text, lines } | nil (timeout or closed).
+    fn _cmd(line: string) {
+        if (!this._write(line + _CRLF)) { _lastReply = ""; return nil; }
+        return this._reply();
+    }
+
+    // Read one reply, multi-line (250-...) included. nil on timeout/close.
+    fn _reply() {
+        let lines = [];
+        let code = 0;
+        while (true) {
+            if (_sock == nil) { return nil; }
+            if (Stream.WaitReadable(_sock, _timeoutMs) == nil) { _lastReply = ""; return nil; }
+            let l = Stream.ReadLine(_sock);
+            if (l == nil) { _lastReply = nil; return nil; }
+            _lastReply = l;
+            if (String.Length(l) < 3 || !String.IsNumeric(String.Substr(l, 0, 3))) {
+                return { code: 0, text: l, lines: [l] };
+            }
+            code = int(String.Substr(l, 0, 3));
+            let rest = (String.Length(l) > 4) ? String.Substr(l, 4) : "";
+            Array.Append(lines, rest);
+            if (String.Length(l) < 4 || String.Substr(l, 3, 1) != "-") { break; }
+        }
+        return { code: code, text: lines[len(lines) - 1], lines: lines };
+    }
+
+    // Which failure a nil reply means: nil _lastReply = the peer closed.
+    fn _kindOfNil(): string {
+        return (_lastReply == nil) ? "closed" : "timeout";
+    }
+
+    fn _fail(kind: string, msg: string) {
+        if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+        _connected = false;
+        _encrypted = false;
+        return { ok: false, error: msg, errorKind: kind };
+    }
+
+    // A refusal keeps the session usable for the next message.
+    fn _rejected(msg: string, refused) {
+        return { ok: false, error: msg, errorKind: "rejected", rejected: refused };
+    }
+}
+
+export { SmtpClient, SmtpMessage, SmtpAuth, Dkim };

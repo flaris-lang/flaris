@@ -1,17 +1,38 @@
-// test_http_redirect.fls - server half of the redirect credential test.
+// test_http_redirect.fls - credential headers must not follow a cross-origin
+// redirect, while a same-origin redirect keeps them.
 //
-// Started by tests/test_http_redirect.sh, which then runs
-// test_http_redirect_client.fls against it in a separate process. Two
-// processes are needed because the Http client blocks the scheduler: a
-// client and a server fiber in one VM deadlock.
+// The test starts this same file a second time with "serve" as the server: the
+// Http client blocks the scheduler, so client and server need two processes.
+// The server runs two origins on two ephemeral ports, both reporting which
+// credential headers actually reached them. It prints the home port as
+// "PORT=<n>" and stops when the test closes its stdin.
 //
-// Two origins on two ports. Both report back which credential headers
-// actually reached them, which is the whole question under test.
+//   flarisvm tests/test_http_redirect.fls --libs=./libs
 
+import { Http } from library("Http", "1.0");
 import { HttpServer } from library("HttpServer", "1.0");
 
-const FOREIGN_PORT = 18092;
-const HOME_PORT    = 18091;
+global server = nil;
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (cond) { Console.WriteLine("[PASS] " + msg); }
+    else      { testsFailed = testsFailed + 1; Console.WriteLine("[FAIL] " + msg); }
+}
+
+fn field(resp, key: string): string {
+    if (resp == nil) return "<no response>";
+    let o = Json.Parse(resp.body);
+    if (o == nil) return "<unparseable>";
+    return str(o[key]);
+}
+
+// ============================================================
+// Server half
+// ============================================================
 
 fn report(req, res) {
     res.Json({
@@ -22,18 +43,114 @@ fn report(req, res) {
     });
 }
 
-fn Main() {
-    let foreign = new HttpServer({ port: FOREIGN_PORT, idleTimeoutMs: 2000 });
+fn async serve() {
+    let foreign = new HttpServer({ port: 0, host: "127.0.0.1", idleTimeoutMs: 2000 });
     foreign.Get("/land", fn(req, res) { report(req, res); });
-    foreign.ListenAsync();
+    let foreignPort = foreign.ListenAsync();
 
-    let home = new HttpServer({ port: HOME_PORT, idleTimeoutMs: 2000 });
+    let home = new HttpServer({ port: 0, host: "127.0.0.1", idleTimeoutMs: 2000 });
     home.Get("/cross", fn(_req, res) {
-        res.Redirect("http://127.0.0.1:" + str(FOREIGN_PORT) + "/land");
+        res.Redirect("http://127.0.0.1:" + str(foreignPort) + "/land");
     });
     // Same host and port, so the caller never leaves the origin it trusted.
     home.Get("/same",   fn(_req, res) { res.Redirect("/landed"); });
     home.Get("/landed", fn(req, res) { report(req, res); });
-    home.Listen();
+    Console.WriteLine("PORT=" + str(home.ListenAsync()));
+
+    let stdin = Stream.Stdin();
+    var line = await Stream.ReadLineAsync(stdin);
+    while (line != nil) { line = await Stream.ReadLineAsync(stdin); }
+    home.Stop(1000);
+    foreign.Stop(1000);
+    return 0;
+}
+
+// ============================================================
+// Test half
+// ============================================================
+
+fn vmPath(): string {
+    let vm = Os.GetEnv("FLARISVM");
+    return (vm == nil || vm == "") ? "flarisvm" : vm;
+}
+
+// Start the server child and return the port it reports, or 0.
+fn async startServer(): int {
+    server = Os.Spawn(vmPath(), ["--libs=./libs", "tests/test_http_redirect.fls", "serve"]);
+    if (server == nil) { return 0; }
+    let deadline = Time.Millis() + 10000;
+    while (Time.Millis() < deadline) {
+        let line = await Stream.ReadLineAsync(server.Stdout, deadline - Time.Millis());
+        if (line == nil) { return 0; }
+        if (String.StartsWith(line, "PORT=")) { return Convert.ParseInt(String.Substr(line, 5)) ?? 0; }
+    }
+    return 0;
+}
+
+// Closing its stdin stops the server; reap it either way.
+fn async stopServer() {
+    if (server == nil) { return 0; }
+    Stream.Close(server.Stdin);
+    let w = await Os.WaitAsync(server.Pid, 5000);
+    if (w == nil || w.Alive) {
+        Os.KillChild(server.Pid, 9);
+        await Os.WaitAsync(server.Pid);
+    }
+    Stream.Close(server.Stdout);
+    Stream.Close(server.Stderr);
+    server = nil;
+    return 0;
+}
+
+fn runChecks(base: string) {
+    let creds = { "Authorization":       "Bearer SECRET-TOKEN",
+                  "Cookie":              "sid=SECRET-SESSION",
+                  "Proxy-Authorization": "Basic SECRET-PROXY",
+                  "X-Trace":             "keep-me" };
+
+    // No redirect: everything the caller sent arrives.
+    let direct = Http.Get(base + "/landed", creds);
+    check(direct != nil, "direct request succeeds");
+    check(field(direct, "auth")   == "Bearer SECRET-TOKEN",  "direct: Authorization delivered");
+    check(field(direct, "cookie") == "sid=SECRET-SESSION",   "direct: Cookie delivered");
+
+    // Same-origin redirect: still the caller's own origin, so nothing is lost.
+    let same = Http.Get(base + "/same", creds);
+    check(same != nil, "same-origin redirect succeeds");
+    check(field(same, "auth")   == "Bearer SECRET-TOKEN", "same-origin: Authorization kept");
+    check(field(same, "cookie") == "sid=SECRET-SESSION",  "same-origin: Cookie kept");
+    check(field(same, "trace")  == "keep-me",             "same-origin: ordinary header kept");
+
+    // Cross-origin redirect: the credential headers must not follow.
+    let cross = Http.Get(base + "/cross", creds);
+    check(cross != nil, "cross-origin redirect succeeds");
+    check(field(cross, "auth")   == "-", "cross-origin: Authorization dropped");
+    check(field(cross, "cookie") == "-", "cross-origin: Cookie dropped");
+    check(field(cross, "proxy")  == "-", "cross-origin: Proxy-Authorization dropped");
+    check(field(cross, "trace")  == "keep-me",
+          "cross-origin: ordinary header still sent - only credentials are dropped");
+    return 0;
+}
+
+fn async Main() {
+    let args = Os.Args();
+    if (len(args) > 0 && args[0] == "serve") { return await serve(); }
+
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Http redirect credential test");
+    Console.WriteLine("================================================");
+
+    let port = await startServer();
+    if (port > 0) {
+        runChecks("http://127.0.0.1:" + str(port));
+    } else {
+        check(false, "server did not report a port");
+    }
+    await stopServer();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("All redirect credential tests passed!");
     return 0;
 }

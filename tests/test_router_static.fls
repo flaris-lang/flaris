@@ -1,20 +1,69 @@
-// test_router_static.fls
-// Static file serving + CORS. Run via tests/test_router_static.sh, which sets
-// up the web root, starts this server, then drives it with curl.
+// test_router_static.fls - Router static file serving and CORS end to end:
+// path safety, MIME types, the index fallback, byte-exact binary bodies, the
+// files that must never be served, and the CORS headers the server emits.
 //
-//   flarisvm --unsafe ./tests/test_router_static.fls --libs='./libs'
+// The test builds a web root in a temp directory and starts this same file a
+// second time with "serve <root>" as the server: the Http client blocks the
+// scheduler, so client and server need two processes. The server binds an
+// ephemeral port, prints it as "PORT=<n>", and stops when the test closes its
+// stdin.
+//
+//   flarisvm tests/test_router_static.fls --libs=./libs
 
 import { Router, Response, CorsMiddleware }
     from library("Router", "1.0");
+import { Http } from library("Http", "1.0");
 
-global app = nil;
+global app    = nil;
+global server = nil;
 
-fn Main() {
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn pass(msg) {
+    testsRun += 1;
+    Console.WriteLine("[PASS] " + msg);
+}
+
+fn fail(msg) {
+    testsRun += 1;
+    testsFailed += 1;
+    Console.WriteLine("[FAIL] " + msg);
+}
+
+fn statusOf(res): int { return res == nil ? -1 : res.status; }
+fn bodyOf(res): string { return res == nil ? "" : str(res.body); }
+fn headerOf(res, name: string): string {
+    if (res == nil || res.headers == nil) { return ""; }
+    return Object.TryGet(res.headers, name, "");
+}
+
+fn checkStatus(label, expected: int, res) {
+    let got = statusOf(res);
+    if (got == expected) { pass(label + " (HTTP " + str(got) + ")"); }
+    else { fail(label + " - expected " + str(expected) + ", got " + str(got)); }
+}
+
+// Header names arrive lowercased; values compare without regard to case.
+fn checkHeader(label, res, name: string, needle: string) {
+    if (String.Contains(String.ToLower(headerOf(res, name)), String.ToLower(needle))) { pass(label); }
+    else { fail(label + " - " + name + " is '" + headerOf(res, name) + "', missing '" + needle + "'"); }
+}
+
+fn checkBody(label, res, needle: string) {
+    if (String.Contains(bodyOf(res), needle)) { pass(label); }
+    else { fail(label + " - missing '" + needle + "'"); }
+}
+
+// ============================================================
+// Server half
+// ============================================================
+
+fn serve(root: string) {
     app = new Router();
 
-    // CORS with a specific origin + credentials + an exposed header. Every
-    // response must carry these headers - which only works because the builtin
-    // HTTP server now emits all of resp.headers, not just Content-Type.
+    // A specific origin with credentials and an exposed header: every response
+    // must carry all three headers.
     global corsMw = new CorsMiddleware("https://app.example.com", {
         credentials:   true,
         exposeHeaders: "X-Total-Count"
@@ -25,16 +74,167 @@ fn Main() {
         return Response.Json({ pong: true }, nil);
     });
 
-    // Mount the web root prepared by the .sh harness at /static.
-    app.Static("/static", "/tmp/flaris_static_test", {
+    app.Static("/static", root, {
         cacheControl: "public, max-age=60"
     });
 
-    VM.OnSignal(2, fn(a) {
-        app.Stop();
-        return 0;
+    // Report the port once Listen has bound it, then serve until stdin closes.
+    Fiber.Run(fn() {
+        let t0 = Time.Millis();
+        while (app.Port() == 0 && Time.Millis() - t0 < 5000) { Fiber.Sleep(5); }
+        Console.WriteLine("PORT=" + str(app.Port()));
+        let stdin = Stream.Stdin();
+        var line = Fiber.Await(Stream.ReadLineAsync(stdin));
+        while (line != nil) { line = Fiber.Await(Stream.ReadLineAsync(stdin)); }
+        app.Stop(1000);
     });
+    app.Listen(0, { host: "127.0.0.1" });
+    return 0;
+}
 
-    Console.WriteLine("Static server on http://localhost:8091");
-    app.Listen(8091);
+// ============================================================
+// Test half
+// ============================================================
+
+// The file whose bytes must come back unchanged: NULs and high bytes included.
+fn binaryFixture() {
+    let bytes = [0, 1, 2, 0, 255, 254, 0, 80, 78, 71, 68, 65, 84, 65, 0];   // ...PNGDATA\0
+    let b = Buffer.Create(len(bytes), 1);
+    Buffer.FromArray(b, bytes);
+    return b;
+}
+
+// <tmp>/www is the web root; <tmp>/outside.txt lies beyond it and is reached
+// only through the two symlinks, which the server must refuse to follow.
+fn buildWebRoot(tmp: string): string {
+    let root = Path.Combine(tmp, "www");
+    Directory.Ensure(Path.Combine(root, "sub"));
+    Directory.Ensure(Path.Combine(root, ".git"));
+    Directory.Ensure(Path.Combine(root, ".well-known"));
+    File.WriteText(Path.Combine(root, "index.html"), "<!doctype html><h1>INDEX_ROOT</h1>");
+    File.WriteText(Path.Combine(root, "app.css"), "body{color:CSS_MARKER}");
+    File.WriteText(Path.Combine(root, "data.json"), "{\"data\":\"JSON_MARKER\"}");
+    File.WriteText(Path.Combine(root, "sub/page.html"), "<!doctype html><h1>SUB_PAGE</h1>");
+    File.WriteAllBytes(Path.Combine(root, "bin.dat"), binaryFixture());
+    File.WriteText(Path.Combine(root, ".env"), "SECRET_TOKEN=hunter2");
+    File.WriteText(Path.Combine(root, ".git/config"), "GIT_SECRET");
+    File.WriteText(Path.Combine(root, ".well-known/probe.txt"), "WELLKNOWN_OK");
+    File.WriteText(Path.Combine(tmp, "outside.txt"), "OUTSIDE_THE_ROOT");
+    File.CreateSymlink(Path.Combine(tmp, "outside.txt"), Path.Combine(root, "escape.txt"));
+    File.CreateSymlink(tmp, Path.Combine(root, "escapedir"));
+    return root;
+}
+
+fn vmPath(): string {
+    let vm = Os.GetEnv("FLARISVM");
+    return (vm == nil || vm == "") ? "flarisvm" : vm;
+}
+
+// Start the server child and return the port it reports, or 0.
+fn async startServer(root: string): int {
+    server = Os.Spawn(vmPath(), ["--libs=./libs", "tests/test_router_static.fls", "serve", root]);
+    if (server == nil) { return 0; }
+    let deadline = Time.Millis() + 10000;
+    while (Time.Millis() < deadline) {
+        let line = await Stream.ReadLineAsync(server.Stdout, deadline - Time.Millis());
+        if (line == nil) { return 0; }
+        if (String.StartsWith(line, "PORT=")) { return Convert.ParseInt(String.Substr(line, 5)) ?? 0; }
+    }
+    return 0;
+}
+
+// Closing its stdin stops the server; reap it either way.
+fn async stopServer() {
+    if (server == nil) { return 0; }
+    Stream.Close(server.Stdin);
+    let w = await Os.WaitAsync(server.Pid, 5000);
+    if (w == nil || w.Alive) {
+        Os.KillChild(server.Pid, 9);
+        await Os.WaitAsync(server.Pid);
+    }
+    Stream.Close(server.Stdout);
+    Stream.Close(server.Stderr);
+    server = nil;
+    return 0;
+}
+
+fn runChecks(base: string) {
+    let css = Http.Get(base + "/static/app.css");
+    checkStatus("GET /static/app.css", 200, css);
+    checkHeader("  content-type css", css, "content-type", "text/css");
+    checkHeader("  cache-control set", css, "cache-control", "public, max-age=60");
+    checkBody("  css body", css, "CSS_MARKER");
+
+    checkBody("GET /static/ -> index.html", Http.Get(base + "/static/"), "INDEX_ROOT");
+    checkStatus("GET /static (no slash) -> index", 200, Http.Get(base + "/static"));
+
+    checkBody("GET /static/sub/page.html", Http.Get(base + "/static/sub/page.html"), "SUB_PAGE");
+
+    checkHeader("GET /static/data.json content-type", Http.Get(base + "/static/data.json"),
+                "content-type", "application/json");
+
+    checkStatus("GET /static/nope.js", 404, Http.Get(base + "/static/nope.js"));
+
+    // The client sends the path as written, so ".." reaches the server literally.
+    checkStatus("GET /static/../ traversal blocked", 403,
+                Http.Get(base + "/static/../test_router_static.fls"));
+    checkStatus("GET /static/../../etc/passwd blocked", 403,
+                Http.Get(base + "/static/../../etc/passwd"));
+
+    let bin = Http.Get(base + "/static/bin.dat");
+    let want = binaryFixture();
+    let got = Buffer.FromString(bodyOf(bin));
+    if (statusOf(bin) == 200 && Buffer.Equals(got, want)) {
+        pass("GET /static/bin.dat byte-exact (" + str(len(want)) + " bytes)");
+    } else {
+        fail("GET /static/bin.dat corrupted - HTTP " + str(statusOf(bin)) + ", "
+             + str(len(got)) + " bytes, expected " + str(len(want)));
+    }
+
+    checkStatus("GET /static/.env blocked", 404, Http.Get(base + "/static/.env"));
+    checkStatus("GET /static/.git/config blocked", 404, Http.Get(base + "/static/.git/config"));
+    checkBody(".well-known still reachable", Http.Get(base + "/static/.well-known/probe.txt"), "WELLKNOWN_OK");
+
+    let esc = Http.Get(base + "/static/escape.txt");
+    checkStatus("symlink out of the root blocked", 404, esc);
+    if (String.Contains(bodyOf(esc), "OUTSIDE_THE_ROOT")) { fail("symlink target was disclosed"); }
+    else { pass("symlink target not disclosed"); }
+    checkStatus("symlinked directory not traversed", 404,
+                Http.Get(base + "/static/escapedir/outside.txt"));
+
+    let ping = Http.Get(base + "/api/ping", { "Origin": "https://app.example.com" });
+    checkHeader("CORS Allow-Origin on GET", ping, "access-control-allow-origin", "https://app.example.com");
+    checkHeader("CORS Allow-Credentials", ping, "access-control-allow-credentials", "true");
+    checkHeader("CORS Expose-Headers", ping, "access-control-expose-headers", "X-Total-Count");
+
+    let pre = Http.Request("OPTIONS", base + "/api/ping", nil, nil,
+                           { "Origin": "https://app.example.com", "Access-Control-Request-Method": "GET" });
+    checkStatus("OPTIONS /api/ping preflight", 204, pre);
+    if (headerOf(pre, "access-control-allow-methods") != "") { pass("  preflight Allow-Methods"); }
+    else { fail("  preflight Allow-Methods - missing"); }
+    return 0;
+}
+
+fn async Main() {
+    let args = Os.Args();
+    if (len(args) > 1 && args[0] == "serve") { return serve(args[1]); }
+
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Router Static + CORS Test Suite");
+    Console.WriteLine("================================================");
+
+    let tmp = Directory.CreateTemp("flaris_static");
+    let port = await startServer(buildWebRoot(tmp));
+    if (port > 0) {
+        runChecks("http://127.0.0.1:" + str(port));
+    } else {
+        fail("server did not report a port");
+    }
+    await stopServer();
+    Directory.DeleteAll(tmp);
+
+    Console.WriteLine("================================================");
+    Console.WriteLine(" Results: " + str(testsRun - testsFailed) + " passed, " + str(testsFailed) + " failed");
+    Console.WriteLine("================================================");
+    return testsFailed > 0 ? 1 : 0;
 }

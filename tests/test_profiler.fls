@@ -1,0 +1,199 @@
+// test_profiler.fls - Tests for Profiler.fls
+// Run: flarisvm tests/test_profiler.fls --libs='./libs'
+
+import { Profiler } from library("Profiler", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (actual != expected) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL:", msg, " expected=", expected, " got=", actual);
+    }
+}
+
+fn spin(n: int): int {
+    let s = 0;
+    iter (i from 0 to n) { s += i; }
+    return s;
+}
+
+fn test_section() {
+    Console.WriteLine("== Section ==");
+    Profiler.Reset();
+    let v = Profiler.Section("spin", fn() { return spin(1000); });
+    checkEq(v, 499500, "Section returns the body's value");
+    Profiler.Section("spin", fn() { return spin(1000); });
+
+    let s = Profiler.Stats();
+    checkEq(s.spin.calls, 2, "two calls recorded");
+    check(s.spin.totalMs >= 0.0, "total is a non-negative ms figure");
+    check(s.spin.minUs <= s.spin.maxUs, "min never exceeds max");
+    check(s.spin.avgUs >= s.spin.minUs && s.spin.avgUs <= s.spin.maxUs, "avg lies between min and max");
+}
+
+fn test_section_throws() {
+    Console.WriteLine("== Section records a throwing body ==");
+    Profiler.Reset();
+    let caught = false;
+    try {
+        Profiler.Section("boom", fn() { throw(7, "boom"); });
+    } catch (e) {
+        caught = true;
+    }
+    check(caught, "the exception still reaches the caller");
+    checkEq(Profiler.Stats().boom.calls, 1, "the failed call is counted");
+}
+
+fn test_begin_end() {
+    Console.WriteLine("== Begin / End ==");
+    Profiler.Reset();
+    let t = Profiler.Begin();
+    spin(2000);
+    let ms = Profiler.End("manual", t);
+    check(ms >= 0.0, "End returns the elapsed ms");
+    checkEq(Profiler.Stats().manual.calls, 1, "one span recorded");
+
+    // Two spans open at once close independently - Begin hands back the
+    // start, so nothing is shared between them.
+    let a = Profiler.Begin();
+    let b = Profiler.Begin();
+    Profiler.End("outer", a);
+    Profiler.End("inner", b);
+    checkEq(Profiler.Stats().outer.calls, 1, "outer span recorded");
+    checkEq(Profiler.Stats().inner.calls, 1, "inner span recorded");
+}
+
+fn test_nested() {
+    Console.WriteLine("== nested sections are inclusive ==");
+    Profiler.Reset();
+    Profiler.Section("outer", fn() {
+        Profiler.Section("inner", fn() { spin(5000); });
+        spin(10);
+    });
+    let s = Profiler.Stats();
+    check(s.outer.totalMs >= s.inner.totalMs, "outer includes inner");
+}
+
+fn test_count() {
+    Console.WriteLine("== Count ==");
+    Profiler.Reset();
+    Profiler.Count("hit");
+    Profiler.Count("hit");
+    Profiler.Count("hit", 3);
+    let s = Profiler.Stats();
+    checkEq(s.hit.calls, 5, "counter sums its increments");
+    checkEq(s.hit.totalMs, nil, "a counter has no time");
+    check(String.Contains(Profiler.Report(), "hit"), "counters appear in the report");
+}
+
+fn test_disable() {
+    Console.WriteLine("== Disable ==");
+    Profiler.Reset();
+    Profiler.Disable();
+    checkEq(Profiler.IsEnabled(), false, "IsEnabled reports the switch");
+    let v = Profiler.Section("off", fn() { return 42; });
+    checkEq(v, 42, "a disabled Section still runs the body");
+    let t = Profiler.Begin();
+    let ms = Profiler.End("off", t);
+    check(ms >= 0.0, "a disabled End still returns the elapsed ms");
+    Profiler.Count("off");
+    checkEq(Object.HasKey(Profiler.Stats(), "off"), false, "nothing was recorded");
+    Profiler.Enable();
+    checkEq(Profiler.IsEnabled(), true, "enabled again");
+}
+
+fn test_report() {
+    Console.WriteLine("== Report ==");
+    Profiler.Reset();
+    Profiler.Section("slow", fn() { spin(20000); });
+    Profiler.Section("fast", fn() { spin(10); });
+    Profiler.Section("fast", fn() { spin(10); });
+    Profiler.Count("events", 9);
+
+    let rep = Profiler.Report();
+    let lines = String.Split(rep, "\n");
+    checkEq(len(lines), 5, "header, rule and one row per name");
+    check(String.StartsWith(lines[2], "slow"), "sorted by total time, largest first");
+    check(String.StartsWith(lines[3], "fast"), "then the smaller section");
+    check(String.StartsWith(lines[4], "events"), "counters, having no time, sort last");
+    check(String.Contains(lines[4], "-"), "a counter shows - for its times");
+
+    let byCalls = String.Split(Profiler.Report({ sort: "calls" }), "\n");
+    check(String.StartsWith(byCalls[2], "events"), "sort: calls puts the counter first");
+
+    let top1 = String.Split(Profiler.Report({ top: 1 }), "\n");
+    checkEq(len(top1), 3, "top limits the rows");
+
+    Profiler.Reset();
+    checkEq(len(String.Split(Profiler.Report(), "\n")), 2, "an empty profiler reports only the header");
+}
+
+fn Main() {
+    test_section();
+    test_section_throws();
+    test_begin_end();
+    test_nested();
+    test_count();
+    test_disable();
+    test_report();
+
+    Console.WriteLine("\nTests run: " + str(testsRun) + ", failed: " + str(testsFailed));
+
+    Console.WriteLine("\n\n=== Profiler Benchmarks ===");
+    Console.WriteLine(String.PadRight("benchmark", 48), String.PadLeft("total", 9), "      ", String.PadLeft("µs/call", 11));
+    benchSep();
+
+    Profiler.Reset();
+    bench("Section  empty body", fn() {
+        Profiler.Section("b", fn() { return 1; }); _sink += 1;
+    }, 20000);
+    bench("Begin + End", fn() {
+        let t = Profiler.Begin(); Profiler.End("m", t); _sink += 1;
+    }, 20000);
+    bench("Count", fn() {
+        Profiler.Count("c"); _sink += 1;
+    }, 20000);
+    Profiler.Disable();
+    bench("Section  disabled", fn() {
+        Profiler.Section("b", fn() { return 1; }); _sink += 1;
+    }, 20000);
+    Profiler.Enable();
+    bench("Stats()  3 names", fn() {
+        _sink += len(Object.Keys(Profiler.Stats()));
+    }, 5000);
+    bench("Report() 3 names", fn() {
+        _sink += String.Length(Profiler.Report());
+    }, 2000);
+
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

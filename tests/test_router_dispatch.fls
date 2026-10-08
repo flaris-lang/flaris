@@ -309,6 +309,26 @@ fn test_jwt_auth() {
     app2.Use(fn(r, next) { return mw2.Handle(r, next); });
     app2.Get("/admin", fn(r) { return Response.Text(r.jwt.sub, nil); });
     checkEq(app2._dispatch(authReq(good)).body, "alice", "verified claims reach the handler");
+
+    // cacheSize: a repeat of the same token skips the verify but keeps every
+    // decision - a cached token still expires, a forgery is still refused,
+    // and the claims still reach the handler.
+    let cached = authApp(new JwtMiddleware(secret, [], { cacheSize: 2 }));
+    let short  = jwt.EncodeHS256({ sub: "brief" }, secret, { exp: now + 1 });
+    checkEq(cached._dispatch(authReq(short)).status, 200, "cache: first request verifies");
+    checkEq(cached._dispatch(authReq(short)).status, 200, "cache: repeat request served from cache");
+    checkEq(cached._dispatch(authReq(tampered)).status, 401, "cache: forgery still rejected");
+    Fiber.Sleep(2200);
+    checkEq(cached._dispatch(authReq(short)).status, 401, "cache: expiry enforced on a cached token");
+    checkEq(cached._dispatch(authReq(good)).status, 200, "cache: second token cached");
+    checkEq(cached._dispatch(authReq(noExp)).status, 200, "cache: overflow resets and still verifies");
+    checkEq(cached._dispatch(authReq(good)).status, 200, "cache: unexpired token still fine after reset");
+    let app3 = new Router();
+    let mw3  = new JwtMiddleware(secret, [], { cacheSize: 8 });
+    app3.Use(fn(r, next) { return mw3.Handle(r, next); });
+    app3.Get("/admin", fn(r) { return Response.Text(r.jwt.sub, nil); });
+    app3._dispatch(authReq(good));
+    checkEq(app3._dispatch(authReq(good)).body, "alice", "cache: claims reach the handler on a hit");
     return 0;
 }
 
@@ -685,6 +705,26 @@ fn test_async_stages() {
     return 0;
 }
 
+// The server's response, when handed to _dispatch, gets the route phase
+// closed just before the pipeline runs - once per request, matched or not.
+fn test_route_mark() {
+    Console.WriteLine("== route mark ==");
+    let marks = [];
+    let res   = { Mark: fn(name) { Array.Append(marks, name); } };
+    let app   = new Router();
+    app.Get("/", fn(_req) { return Response.Text("root"); });
+    app.Get("/u/:id", fn(req) { return Response.Text(req.params.id); });
+
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/"), res)), "root", "fixed route still answers");
+    checkEq(len(marks), 1, "one mark for a fixed route");
+    checkEq(marks[0], "route", "named route");
+    app._dispatch(mkReq("GET", "/u/7"), res);
+    app._dispatch(mkReq("GET", "/missing"), res);
+    checkEq(len(marks), 3, "dynamic and unmatched requests mark too");
+    checkEq(bodyOf(app._dispatch(mkReq("GET", "/"))), "root", "no response object, no mark");
+    checkEq(len(marks), 3, "nothing marked without one");
+}
+
 fn Main() {
     Console.WriteLine("=== Router dispatch tests ===");
     test_matching();
@@ -695,6 +735,7 @@ fn Main() {
     test_rate_limit();
     test_virtual_hosts();
     test_router_cookies();
+    test_route_mark();
     test_cors();
     test_security_headers();
 

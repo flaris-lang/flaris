@@ -76,7 +76,7 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 
 ## The libraries
 
-43 libraries, all pure Flaris unless noted:
+53 libraries, all pure Flaris unless noted:
 
 **Data & formats** — `CSV`, `XML`, `BinaryIO`, `BitConverter`, `Config`,
 `Template`, `Lexer`
@@ -89,21 +89,24 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 `StringBuilder`
 
 **Web & network** — `Http`, `Https`, `HttpServer`, `HttpUtil`, `Router`,
-`OpenApi`, `WebSocket`, `Jwt`
+`OpenApi`, `WebSocket`, `Jwt`, `Ssh`
 
 **Security** — `CryptoKit` (HKDF, PBKDF2, TOTP/HOTP, Argon2id password hashing,
 sealed blobs, streaming MD5/SHA-1/SHA-256/SHA-384/SHA-512/SHA-3/Keccak-256/SHAKE)
 
 **Data stores** — `SQLite`, `Postgres`, `Redis`
 
-**System & tooling** — `Argparse`, `Process`, `Logger`, `Datetime`, `Promise`,
-`Signals`, `ConsoleMenu`, `Test`, `Util`
+**System & tooling** — `Argparse`, `Process`, `Logger`, `Profiler`, `Datetime`,
+`Promise`, `Signals`, `ConsoleMenu`, `Test`, `Util`
 
 **Serial & cellular** — `Modem` (AT transport plus 3GPP 27.007/27.005: SIM and
 PIN, signal, registration, operator scan, SMS in PDU mode, data contexts, USSD
 and call control)
 
-**Media** — `Graphics`, `Audio`, `QRCode`, `Png`
+**Hardware** — `I2c`, `Spi` (chips on Linux I2C and SPI buses, through i2c-tools
+and spi-tools)
+
+**Media** — `Graphics`, `Audio`, `QRCode`, `Png`, `Pdf`
 
 **AI** — `AI` (Ollama client)
 

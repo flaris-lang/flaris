@@ -573,6 +573,33 @@ fn test_delimited() {
     check("delimited: length past the reader raises", String.Contains(caught, "runs past"), true);
 }
 
+global pbPeer = nil;
+global pbRest = nil;
+
+// Pb.ReadDelimited off a socket that delivers the message in two parts.
+fn test_delimited_stream() {
+    // Where the client connects: a dual-stack port 0 can be one held on 127.0.0.1 alone.
+    let srv = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(srv);
+    let port = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10));
+    let cli = Stream.Connect("tcp", "127.0.0.1", port);
+    Stream.WaitReadable(srv, 2000);
+    let acc = Stream.Accept(srv);
+    Stream.WaitReadable(acc, 1); // non-blocking from here: a read takes what has arrived
+    let inner = new Inner();
+    inner.note = String.Repeat("x", 200);
+    let bytes = Pb.EncodeDelimited(inner);
+    Stream.WriteBytes(cli, Buffer.Slice(bytes, 0, 100), 100);
+    pbPeer = cli;
+    pbRest = Buffer.Slice(bytes, 100, len(bytes) - 100);
+    Fiber.Run(fn () { Fiber.Sleep(50); Stream.WriteBytes(pbPeer, pbRest, len(pbRest)); });
+    let back = Pb.ReadDelimited(acc, Inner);
+    check("delimited stream: a message in two parts", back == nil ? 0 : len(back.note), 200);
+    Stream.Close(cli);
+    Stream.Close(acc);
+    Stream.Close(srv);
+}
+
 // Lengths of 128 bytes and more take a two-byte varint, at every nesting level.
 fn test_long_lengths() {
     let inner = new Inner();
@@ -1428,6 +1455,7 @@ fn Main() {
     test_merge();
     test_equals_clone();
     test_delimited();
+    test_delimited_stream();
     test_long_lengths();
     test_reader_after_error();
 
