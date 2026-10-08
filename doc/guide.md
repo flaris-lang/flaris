@@ -37,7 +37,7 @@ Flaris is:
 - **Deterministic** - execution order is always clear and reproducible.
 - **Fast** - written in C with a compact bytecode interpreter.
 - **Embeddable** - ideal for applications, tools, servers, and games.
-- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`). Static analysis runs on every compile and catches mistakes before the program starts. A runtime-only binary (`flaris`) ships without the compiler, `VM.Eval` or `VM.Compile`.
+- **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`, or `--allow-ffi` for FFI alone). Static analysis runs on every compile and catches mistakes before the program starts. A runtime-only binary (`flaris`) ships without the compiler, `VM.Eval` or `VM.Compile`.
 - **Concurrent** - fibers and async functions allow concurrency without threads.
 
 **Three core principles:**
@@ -2265,6 +2265,16 @@ fn async loadFiles(a, b) {
 ```
 
 The calling fiber suspends at each `await` and is resumed automatically when the operation completes. Other fibers continue to run in the meantime.
+
+An `*Async` call has to be awaited right where it is made - `await File.ReadTextAsync(p)` or `Fiber.Await(File.ReadTextAsync(p))` - to get its result. Called on its own, as a statement, it starts the operation and carries on at once: the work still happens (`Os.ExecuteAsync("cmd")` runs the command in the background) and its result is discarded. Keeping the call and awaiting it later does not work, because the call itself returns `nil`. To start work now and collect it later, put it in an async function - calling one returns its fiber:
+
+```js
+fn async readLater(path) { return await File.ReadTextAsync(path); }
+
+let job = readLater(path);   // starts now
+// ... other work ...
+let text = await job;
+```
 
 ### Sleep
 

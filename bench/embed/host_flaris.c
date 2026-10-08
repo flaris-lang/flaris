@@ -14,12 +14,12 @@ static char *SlurpScript(const char *path)
     return buf;
 }
 
-static FlarisConfig BenchConfig(void)
+static FlarisHostOptions BenchOptions(void)
 {
-    FlarisConfig cfg = flarisConfigDefaults;
-    cfg.installSignals = FLARIS_OFF; /* a host keeps its own handlers */
-    cfg.startIoPool    = FLARIS_OFF; /* no worker threads for a pure-compute script */
-    return cfg;
+    FlarisHostOptions opt = flarisHostOptionsDefaults;
+    opt.installSignals = FLARIS_OFF; /* a host keeps its own handlers */
+    opt.startIoPool    = FLARIS_OFF; /* no worker threads for a pure-compute script */
+    return opt;
 }
 
 int main(int argc, char **argv)
@@ -34,44 +34,44 @@ int main(int argc, char **argv)
         double t0 = NowMs();
         for (int i = 0; i < LOAD_CYCLES; i++)
         {
-            FlarisConfig cfg = BenchConfig();
-            if (FlarisInitVM(&cfg) != FLARIS_OK) { fprintf(stderr, "init failed\n"); return 1; }
-            FlarisContext *ctx = NULL;
-            if (FlarisCreateContext(NULL, &ctx) != FLARIS_OK) { fprintf(stderr, "ctx failed\n"); return 1; }
-            if (FlarisLoadSourceText(ctx, src, "script.fls") != FLARIS_OK) { fprintf(stderr, "load failed\n"); return 1; }
-            FlarisRunToCompletion();
+            FlarisHostOptions opt = BenchOptions();
+            FlarisHost *host = NULL;
+            if (FlarisHostCreate(&opt, &host) != FLARIS_OK) { fprintf(stderr, "create failed\n"); return 1; }
+            if (FlarisHostLoadScript(host, src, "script.fls") != FLARIS_OK) { fprintf(stderr, "load failed\n"); return 1; }
 
             FlarisValue out = 0;
-            if (FlarisCall(ctx, "Total", NULL, 0, &out, err, sizeof err) != FLARIS_OK)
+            FlarisFunction *total = FlarisHostGetFunction(host, "Total");
+            if (!total || FlarisFunctionCall(total, NULL, 0, &out, err, sizeof err) != FLARIS_OK)
             { fprintf(stderr, "Total failed: %s\n", err); return 1; }
             acc += FlarisAsInt(out);
             FlarisReleaseValue(out);
 
-            FlarisShutdownVM(0);
+            FlarisHostDestroy(host);
         }
         Report(acc, NowMs() - t0);
         return 0;
     }
 
-    FlarisConfig cfg = BenchConfig();
-    if (FlarisInitVM(&cfg) != FLARIS_OK) { fprintf(stderr, "init failed\n"); return 1; }
-    FlarisContext *ctx = NULL;
-    FlarisCreateContext(NULL, &ctx);
-    if (FlarisLoadSourceText(ctx, src, "script.fls") != FLARIS_OK) { fprintf(stderr, "load failed\n"); return 1; }
+    FlarisHostOptions opt = BenchOptions();
+    FlarisHost *host = NULL;
+    if (FlarisHostCreate(&opt, &host) != FLARIS_OK) { fprintf(stderr, "create failed\n"); return 1; }
+    if (FlarisHostLoadScript(host, src, "script.fls") != FLARIS_OK) { fprintf(stderr, "load failed\n"); return 1; }
+    FlarisFunction *update = FlarisHostGetFunction(host, "Update");
+    if (!update) { fprintf(stderr, "no Update\n"); return 1; }
 
     double t0 = NowMs();
     for (int i = 0; i < CALLS; i++)
     {
         FlarisValue args[1] = { FlarisInt(i) };
         FlarisValue out = 0;
-        if (FlarisCall(ctx, "Update", args, 1, &out, err, sizeof err) != FLARIS_OK)
+        if (FlarisFunctionCall(update, args, 1, &out, err, sizeof err) != FLARIS_OK)
         { fprintf(stderr, "Update failed: %s\n", err); return 1; }
         acc += FlarisAsInt(out);
         FlarisReleaseValue(out);
         FlarisReleaseValue(args[0]);
     }
     double el = NowMs() - t0;
-    FlarisShutdownVM(0);
+    FlarisHostDestroy(host);
     Report(acc, el);
     return 0;
 }

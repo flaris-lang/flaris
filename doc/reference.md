@@ -105,7 +105,7 @@ flarisvm --format-write src/app.fls   # rewrite in place
 
 | Flag | Effect |
 |------|--------|
-| `--unsafe` | Enable unsafe code and FFI (raw memory, `Os.Kill`, plain-http imports, FFI) |
+| `--unsafe` | Enable unsafe code and FFI (raw memory, plain-http imports, FFI) |
 | `--allow-ffi` | Enable `Ffi.*` only, leaving the rest of `--unsafe` refused |
 | `--mem` | Memory report at shutdown: peak RSS, slab footprint, peak/total object counts, heap bytes, block regions, and leak count. Exits non-zero if leaks are detected. |
 | `--stats` | Print VM statistics after execution (implies `--time`) |
@@ -268,7 +268,7 @@ a security sandbox for *malicious* input.
   but that check does not type-verify it. **Run untrusted bytecode with
   `--jit-disable`**, which ignores the embedded JIT code entirely.
 - `--unsafe` grants FFI and raw-memory access; never combine it with untrusted code.
-- `--allow-ffi` grants FFI alone, so a script that only needs a plugin does not also get raw memory, `Os.Kill` and plain-http imports. `--unsafe` implies it.
+- `--allow-ffi` grants FFI alone, so a script that only needs a plugin does not also get raw memory and plain-http imports. `--unsafe` implies it.
 
 #### Bytecode verification
 
@@ -1658,8 +1658,8 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | Limit | Default | Maximum | Description |
 | ------- | --------- | --------- | ------------- |
 | Fibers | 256 | 1024 | Concurrent fibers tracked by the scheduler; override with `--fibers=` (a power of two) |
-| Events | 64 | 64 | Event slots (I/O, async, etc.) |
-| Timers | 64 | 64 | Active timers |
+| Events | 256 | 256 | Event slots (I/O, async, etc.) |
+| Timers | 256 | 256 | Active timers |
 | Async I/O operations | 512 | 512 | Stream operations in flight at once: async calls plus synchronous calls parked on a socket or serial port. One more raises `Exception.OutOfMemory` on the fiber that asked; whatever it had taken from the stream's read-ahead stays there |
 | Per-fiber scheduling quantum | 10,000 | 100,000 | Scheduling checkpoints (loop back-edges + call/return boundaries) per slice before auto-yield; tune with `Fiber.SetQuantum` |
 
@@ -1683,7 +1683,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | ------- | ------- | ------- | ------------- |
 | Call frames | 64 | 1,024 | Call stack depth; override with `--frames=` |
 | Nested try/catch handlers | 24 | 24 | Maximum nested try/catch handlers |
-| Evaluation stack | 4,096 | 65,535 | VM evaluation stack size; override with `--stack=` |
+| Evaluation stack | 1,024 | 65,535 | VM evaluation stack size per fiber; override with `--stack=` |
 
 ### Locals and Arguments
 
@@ -1704,7 +1704,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | String literal content | 64 KB | `"..."` and `"""..."""` alike |
 | Interpolation holes per `$"..."` | 15 | One `String.Format` argument each, one fewer than the call-argument limit |
 | Literal nesting depth | 64 | Max container nesting when building array/object literals (raises `Exception.NestingError`) |
-| Elements per array / object literal | stack size | A literal is built on the evaluation stack: one slot per array element, two per object property, on top of any operands pending around it in the same function, such as earlier call arguments. A function whose peak stack use exceeds the stack size (default 4,096 slots) loads with a warning naming it and the `--stack=` size that fits, and calling it raises `Exception.StackError`. Over 65,535 elements or 32,767 properties is a compile error. Build larger containers in a loop |
+| Elements per array / object literal | stack size | A literal is built on the evaluation stack: one slot per array element, two per object property, on top of any operands pending around it in the same function, such as earlier call arguments. A function whose peak stack use exceeds the stack size (default 1,024 slots) loads with a warning naming it and the `--stack=` size that fits, and calling it raises `Exception.StackError`. Over 65,535 elements or 32,767 properties is a compile error. Build larger containers in a loop |
 | Line numbers in stack traces | 65,535 | With `-g`, every line past 65,535 reports 65,535 (the compiler warns once). Without `-g` every frame reports line 0 |
 | Comparison depth | 1,024 | Max nesting for structural `==`/ordering of containers (raises `Exception.NestingError`; above the JSON depth cap, so parsed documents always compare) |
 | Clone depth | 512 | Max nesting for `Object.Clone`/`Array.Clone`; a deeper or **cyclic** value raises `Exception.NestingError` instead of overflowing the stack (above the JSON depth cap, so parsed documents always clone) |
@@ -2041,7 +2041,7 @@ let digest = Hash.Sha256("hello");
 let root = Math.Sqrt(2.0);
 ```
 
-No import statement is needed - all modules are always available. Two modules (`Ffi`, `Memory`) additionally require the `--unsafe` flag at runtime.
+No import statement is needed - all modules are always available. Two modules additionally need a runtime flag: `Memory` needs `--unsafe`, and `Ffi` needs `--allow-ffi` (or `--unsafe`, which implies it).
 
 Each function table has a `JIT` column stating whether the function can be called directly from JIT-compiled code (see R11 for the legend and the surrounding rules).
 
@@ -2072,9 +2072,9 @@ Each function table has a `JIT` column stating whether the function can be calle
 | | `FileWatch` | Watch file-states on files and callbacks |
 | **Networking** | `Net` | DNS, IP conversion, and interface inspection |
 | **Concurrency** | `Fiber` | Green-thread creation, messaging, and lifecycle |
-| | `Event` | One-shot fiber synchronization (max 64 events) |
+| | `Event` | One-shot fiber synchronization (max 256 events) |
 | | `Scheduler` | Low-level fiber scheduling primitives |
-| | `Timers` | Fiber-based timer scheduling (max 64 timers) |
+| | `Timers` | Fiber-based timer scheduling (max 256 timers) |
 | **System** | `OS` | Process, environment, and system interface |
 | | `VM` | VM introspection and control |
 | | `Ffi` | Dynamic native library loading ⚠️ |
@@ -2082,7 +2082,7 @@ Each function table has a `JIT` column stating whether the function can be calle
 | **Time** | `Time` | Unix timestamp manipulation |
 | **Debug** | `Debug` | Assertions, introspection, and runtime checks |
 
-⚠️ = requires `--unsafe` flag (`flarisvm --unsafe <file>`)
+⚠️ = requires a runtime flag: `--unsafe` for `Memory`, `--allow-ffi` or `--unsafe` for `Ffi`
 
 ### Type Annotation Shorthands
 
@@ -2594,7 +2594,7 @@ Terminal I/O, color, and cursor control. Every read of stdin - these functions a
 | **Warn** | `Warn(...args:any) - nil` | Print the arguments, space-separated, to stdout after a `⚠️ ` marker, with a newline. | — |
 | **Write** | `Write(...args:any) - nil` | Print to stdout without trailing newline. | — |
 | **WriteLines** | `WriteLines(...args:any) - nil` | Print multiple values each on its own line. | — |
-| **WriteLine** | `WriteLine(...args:any) - nil` | Print to stdout with trailing newline. | — |
+| **WriteLine** | `WriteLine(...args:any) - nil` | Print to stdout with trailing newline. A built-in class's instance (a collection, `Random`, a `Weak` handle) prints as `str()` shows it, e.g. `<Stack[2]>`. | — |
 
 **ConsoleColor constants** (`Console.ConsoleColor.Red`, ...): `Default`, `Red`, `Green`, `Blue`, `Yellow`, `Cyan`
 
@@ -2769,7 +2769,7 @@ Runtime introspection and assertion tools. Available in all builds; overhead is 
 | **Here** | `Here(?label:string)` | Prints the current file, line, and function name to stdout (with an optional `label`). | — |
 | **Pool** | `Pool()` | Prints allocator statistics and a per-slab dump. Requires `--unsafe` (the dump shows heap addresses). | — |
 | **Refs** | `Refs(value:any) - int` | Returns `value`'s external reference count (`-1` for tagged immediates, which have none). | — |
-| **Stack** | `Stack()` | Prints the current operand stack to stdout. | — |
+| **Stack** | `Stack()` | Prints the values on the current operand stack to stdout, top first. | — |
 | **StackPtr** | `StackPtr() - int` | Returns the current operand-stack depth. | — |
 | **Value** | `Value(v:any)` | Prints a detailed internal representation of a value. Requires `--unsafe` (the dump shows heap addresses). | — |
 
@@ -2803,12 +2803,12 @@ Filesystem directory operations.
 
 Namespace: **`Event`**
 
-Signals fibers can wait on. Max 64 events (a shared, fixed pool).
+Signals fibers can wait on. Max 256 events per VM (a shared, fixed pool).
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **Create** | `Create() - int` | Claims a new event id (`0..63`), or **`-1`** if the 64-id pool is exhausted. Always check for `-1`. | ✓ |
-| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..63`, or `InvalidArgs` for an id that was never created. | ✓ |
+| **Create** | `Create() - int` | Claims a new event id (`0..255`), or **`-1`** if the 256-id pool is exhausted. Always check for `-1`. | ✓ |
+| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..255`, or `InvalidArgs` for an id that was never created. | ✓ |
 | **WaitOne** | `WaitOne(id:int, timeoutMs?:int) - any` | Parks the caller until `Set` is called on this event, then returns the value it was set with. With a positive `timeoutMs` it resumes with **`nil`** once the deadline passes; `0`/omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id. | — |
 | **WaitFor** | `WaitFor(ids:array, timeoutMs?:int) - array` | Waits until **all** of the events in `ids` have been set, then returns their values as an array. Use it to start several `ProcessEvent`/`Set` jobs and continue once they've all finished. (An empty list returns `[]` right away.) With a positive `timeoutMs`, if the deadline passes before every event fires it returns **`nil`** and stops waiting; `0` or omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id or `InvalidArgs` for a non-int element. | — |
 | **Free** | `Free(id:int)` | Releases an id back to the pool. Use to reclaim an event you created but never delivered (a dropped job) so the fixed pool is not exhausted. Raises `IndexOutOfBounds` for an out-of-range id. | ✓ |
@@ -2824,7 +2824,7 @@ Note: `WaitFor` returns the values sorted by event id, which may differ from the
 
 Namespace: **`Ffi`**
 
-Dynamic loading of native shared libraries (`.so`, `.dylib`). Requires `--unsafe` flag. FFI calls cross a clean isolation boundary - arguments and return values are marshalled through a structured type system; no VM internals are exposed to native code.
+Dynamic loading of native shared libraries (`.so`, `.dylib`). Requires `--allow-ffi` (or `--unsafe`, which implies it). FFI calls cross a clean isolation boundary - arguments and return values are marshalled through a structured type system; no VM internals are exposed to native code.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
@@ -3602,7 +3602,7 @@ These are bitmask unions - use `&` not `==`.
 
 Namespace: **`Os`**
 
-Process, environment, and system interface. Functions marked **unsafe** require the `--unsafe` flag.
+Process, environment, and system interface. None of it needs `--unsafe`: an embedding host that must not let a script start or signal processes withholds the whole module.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
@@ -3618,7 +3618,7 @@ Process, environment, and system interface. Functions marked **unsafe** require 
 | **GetArgValue** | `GetArgValue(name:string, default?:string) - string` | Value of the first script argument of the form `name=value`. Leading dashes are ignored on both sides and a trailing `=` on `name` is optional, so `"port"`, `"--port"` and `"--port="` all find `--port=8080` — but none of them matches `--report=1`. Returns `default` (or `nil`) if not found. | — |
 | **Gid** | `Gid() - int` | Returns the real group ID of the process; `0` on Windows. | — |
 | **IsRoot** | `IsRoot() - bool` | `true` if the process is running as root (UID 0); on Windows, if it runs elevated (as administrator). | — |
-| **Kill** | `Kill(pid:int, signal:int) - bool` | Send a signal to a process. Use standard signal numbers (e.g. `15` for SIGTERM, `9` for SIGKILL). Requires `--unsafe`. | — |
+| **Kill** | `Kill(pid:int, signal:int) - bool` | Send a signal to any process. Use standard signal numbers (e.g. `15` for SIGTERM, `9` for SIGKILL); `0` only tests that the process exists. On Linux and macOS a `pid` of `0` or below addresses a process group, as `kill(2)` does. To signal only processes this VM started, use `KillChild`. | — |
 | **Name** | `Name() - string` | Returns OS name: `"Windows"`, `"Linux"` or `"macOS"`. | — |
 | **Pid** | `Pid() - int` | Returns the current process ID. | — |
 | **Ppid** | `Ppid() - int` | Returns the parent process ID; `0` on Windows. | — |
@@ -3638,7 +3638,7 @@ Process, environment, and system interface. Functions marked **unsafe** require 
 | **ClosePipe** | `ClosePipe(pipe:stream) - bool` | Deprecated, kept for this release: use `Stream.Close`. Closes a pipe from `Spawn`; on `Stdin` the child sees end of file. `false` for a stream that is already closed. | — |
 | **IsAlive** | `IsAlive(pid:int) - bool` | Returns `true` if the process with `pid` is still running. Non-blocking. Does not reap the child: a child that has exited reports `false` while its exit code stays available to `TryWait`/`Wait`. | — |
 | **TryWait** | `TryWait(pid:int) - object` | Non-blocking wait. Returns `{Alive:bool, Exit:int}`. While `Alive` is `true`, `Exit` is `nil`. When `Alive` is `false` the child has been reaped and `Exit` holds the exit code - or `nil` when `pid` is not an unreaped child of this process (never spawned, or already reaped). | — |
-| **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance or has already been reaped. For sending signals to arbitrary PIDs use `Os.Kill` (requires `--unsafe`). | — |
+| **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance or has already been reaped. For sending signals to arbitrary PIDs use `Os.Kill`. | — |
 | **RunEx** | `RunEx(cmd:string, args?:array, options?:object) - object` | Run `cmd` (searched on `PATH`, no shell) and wait for it to finish. Returns `{Exit:int, Stdout:string, Stderr:string}` with stdout and stderr captured separately; stdin is inherited unless `Stdin` is given. Accepts `Cwd`, `Env`, `Stdin`, `MergeStderr` and `Timeout` (see [Launch options](#launch-options)); with `Timeout` the result also carries `TimedOut`. Returns `nil` when the program cannot be started (not found, not executable). Each stream keeps its first 16 MB; after that the pipe is closed, so a child that keeps writing receives `SIGPIPE`. | — |
 | **RunExTimeout** | `RunExTimeout(cmd:string, timeoutMs:int, args?:array, options?:object) - object` | Takes the same options as `RunEx` except `Timeout`. Run `cmd` with separate stdout/stderr capture and wait up to `timeoutMs` milliseconds. Returns `{Exit:int, Stdout:string, Stderr:string, TimedOut:bool}`. If the timeout expires first, the child is terminated and `TimedOut` is `true` with `Exit` set to `124`. The child runs in its own process group (a Job Object on Windows) and the whole group is killed, so a grandchild cannot outlive the deadline or stretch the call past it. `timeoutMs <= 0` means no limit. | — |
 | **GetEnvAll** | `GetEnvAll() - object` | Returns all environment variables as an object `{NAME: "value", ...}`; `Object.Keys` lists the names. | — |
@@ -4371,7 +4371,7 @@ system cannot place.
 Namespace: **`Timers`**
 
 Fiber-based timer scheduling.
-Max 64 simultaneous timers.
+Max 256 simultaneous timers.
 Timer resolution is approx 1-3ms.
 Every `Set*` function raises `InvalidArguments` when `func` is `nil`.
 
@@ -4379,7 +4379,7 @@ Every `Set*` function raises `InvalidArguments` when `func` is `nil`.
 | ---------- | ----------- | ------------- | --- |
 | **Cancel** | `Cancel(id:int\|float) - bool` | Cancel a timer by its handle; `false` for a handle that is not live (a fired one-shot, an already-cancelled timer, or a number that never was one). Handles are never reused, so a stale handle can never hit a newer timer. | — |
 | **IsActive** | `IsActive(id:int\|float) - bool` | `true` if `id` refers to a live timer (a scheduled one-shot not yet fired, or a still-repeating interval). | — |
-| **SetAtTime** | `SetAtTime(timestamp:int\|float, func:fn ) - int\|nil` | Fire `fn` once at the given **Unix timestamp** (seconds since epoch); a time already in the past fires as soon as possible. Returns a handle, or `nil` on a NaN timestamp or when the timer table (max 64) is full. | — |
+| **SetAtTime** | `SetAtTime(timestamp:int\|float, func:fn ) - int\|nil` | Fire `fn` once at the given **Unix timestamp** (seconds since epoch); a time already in the past fires as soon as possible. Returns a handle, or `nil` on a NaN timestamp or when the timer table (max 256) is full. | — |
 | **SetImmediate** | `SetImmediate(func:fn ) - int\|nil` | Fire `fn` on the next scheduler pump (a zero-delay one-shot), akin to Node's `setImmediate`. Returns a handle, or `nil` when the timer table is full. | — |
 | **SetInterval** | `SetInterval(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` every `ms` milliseconds; ticks missed while the VM was busy are dropped, not replayed as a burst. Returns a handle, or `nil` if `ms` is NaN or `<= 0`, or the timer table is full. | — |
 | **SetTimeout** | `SetTimeout(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` once after `ms` milliseconds (a negative delay fires as soon as possible). Returns a handle, or `nil` on a NaN delay or when the timer table is full. | — |
@@ -4405,10 +4405,10 @@ Virtual machine introspection and control.
 | **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the VM halts regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
 | **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache), `StringPoolChunks`/`StringPoolBytes` (chunks the string pool currently holds and their size) and `StringPoolFree` (string bodies parked in the pool for reuse - what `CompactMemory` can give back once whole chunks are free). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
 | **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a non-function handler returns `false`. | — |
-| **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §10a. | — |
+| **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §11. | — |
 | **PatchFunction** | `PatchFunction(original:fn, replacement:fn) - bool` | Replace function at runtime. Requires running unsafe-mode `--unsafe`. The replacement may be a Flaris-function, a builtin-function or a FFI-function. Pass `nil` as replacement to remove the patch. Caveats: call sites the compiler inlined (trivial single-`return` functions) and calls made from inside JIT-compiled functions bypass the patch; self-recursive calls inside the original body also keep calling the original. | — |
 | **PeakAllocations** | `PeakAllocations() - int` | Peak allocation count since VM start. | — |
-| **RaiseSignal** | `RaiseSignal(signum:int) - bool` | Send signal `signum` to the current process (`raise`). A handler registered via `OnSignal` runs on the next signal pump; an uncatchable signal takes the OS default effect. Returns `false` on an out-of-range number. | — |
+| **RaiseSignal** | `RaiseSignal(signum:int) - bool` | Raise signal `signum` for the handler registered with `OnSignal`, which runs on the next signal pump. Returns `false` and sends nothing when no handler is registered for `signum` (so always for an uncatchable signal or an out-of-range number) or when the embedding host turned the VM's signal handling off: the OS default would end the process. | — |
 | **SignalName** | `SignalName(signum:int) - string\|nil` | Canonical name (e.g. `"SIGINT"`) for a signal number, or `nil` if unknown on this platform. | — |
 | **SignalNumber** | `SignalNumber(name:string) - int\|nil` | Platform signal number for a name like `"SIGINT"` (the `"SIG"` prefix is optional), or `nil` if unknown. Use this instead of hardcoding numbers, which are platform-specific (`SIGUSR1` is 10 on Linux, 30 on macOS). | — |
 | **Version** | `Version() - int` | The running runtime's version, packed as `0xMMmmppbb` (major, minor, patch, build) - the same encoding a `.flx` file's header stores and `Ffi.GetVersion` reads from a plugin. `let v = VM.Version(); let patch = (v >> 8) & 0xFF;`. | — |
@@ -5402,14 +5402,13 @@ modes agree below that depth.
 
 ### Denied modules and native code
 
-An embedding host can deny whole built-in modules to a context (see the
+An embedding host can deny whole built-in modules to its scripts (see the
 Embedding guide §10). JIT-compiled code honours that exactly as the interpreter
 does. Every compiled function knows which built-in modules its native code can
-reach, counting every compiled function it calls; in a fiber whose context
-denies one of them, the function runs interpreted, and the call raises
-`Exception.ModuleDenied` at the same place it would with the JIT off. Fibers a
-sandboxed context spawns and callbacks a builtin runs for it inherit the same
-authority. A function that reaches no built-in module - and every function when
+reach, counting every compiled function it calls; in a host that denies one of
+them, the function runs interpreted, and the call raises
+`Exception.ModuleDenied` at the same place it would with the JIT off. Fibers the
+script spawns and callbacks a builtin runs for it are held to the same mask. A function that reaches no built-in module - and every function when
 nothing is denied - enters native code as usual. Modules registered by the host
 application are not built-in modules and are not affected.
 
