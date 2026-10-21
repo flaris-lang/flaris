@@ -37,10 +37,7 @@
 // Scope
 // -----------------------------------------------------------------------------
 // Unary calls only, both directions - one request message, one response
-// message. Calls are synchronous: an async client exists in outline (the
-// request/response split below is what it needs) but is not shipped, because a
-// call nested inside async methods does not yet complete - see the async-method
-// receiver fix in vm/vm.c for the first half of that story. That is the whole of what Connect does over HTTP/1.1 without an
+// message. That is the whole of what Connect does over HTTP/1.1 without an
 // envelope reader; a call whose descriptor says clientStream or serverStream is
 // rejected up front rather than silently mis-framed.
 //
@@ -51,7 +48,8 @@
 //       srv    anything with Post(path, fn(req, res)) - HttpServer, say. It is
 //              a parameter rather than an import so a program that only makes
 //              calls never loads an HTTP server.
-//       impls  { MethodName: fn(msg, call) -> reply }
+//       impls  { MethodName: fn(msg, call) -> reply }, plain or `fn async`
+//              (its fiber is awaited for the reply)
 //       opts   { requireVersion: bool }  demand Connect-Protocol-Version: 1
 //
 // `call` carries { method, codec, headers, header(name, value) }. A handler
@@ -75,6 +73,10 @@
 //   Call(method, msg)            -> instance   the response message
 //   CallFull(method, msg)        -> { message, status, headers }
 //   Invoke(service, name, msg)   -> instance   same, looked up by method name
+//   CallAsync / CallFullAsync / InvokeAsync    the same, as a fiber to await;
+//                                              only the calling fiber waits,
+//                                              so a server in the same VM can
+//                                              answer
 //   Url(method)                  -> string     the absolute URL a call posts to
 //   With(headers)                -> Connect    a copy carrying extra headers
 //
@@ -84,8 +86,9 @@
 // nil. A response that arrives but cannot be decoded raises too - a call either
 // returns a message or raises.
 //
-// There is no client-side socket timeout: the underlying Http client does not
-// expose one. `timeoutMs` bounds the server's work, not the wait.
+// The wait on the socket is the Http client's: the connect and every read give
+// up after 30 s, and the call then raises Code.Unavailable with Status 0.
+// `timeoutMs` bounds the server's work, not that wait.
 //
 // Every call is its own connection - the Http client sends `Connection: close`
 // and does not pool - so a call costs a TCP handshake on top of the round trip.
@@ -160,6 +163,10 @@ global _connectCodeNames:array = [
 
 global CONNECT_CONTENT_TYPE:string = "application/proto";
 global CONNECT_CONTENT_TYPE_JSON:string = "application/json";
+
+// An `fn async` implementation returns its fiber; wait for it so the reply -
+// or what it threw - is in hand before the response is written.
+fn _settled(v) { return Type.IsFiber(v) ? Fiber.Await(v) : v; }
 
 // Every failure of a Connect call, whether the peer reported it or the request
 // never arrived. `.Code` is a Connect code, not a VM error code.
@@ -463,12 +470,12 @@ class Connect {
                                : Pb.Decode(req.body ?? "", m.input);
                 // `header` lets a handler add response metadata without handing
                 // it the response object, which it must not write to itself.
-                let reply = impl(msg, {
+                let reply = _settled(impl(msg, {
                     method:  m,
                     codec:   (json ? "json" : "proto"),
                     headers: req.headers,
                     header:  fn(name, value) { res.Header(name, value); }
-                });
+                }));
                 if (is_nil(reply)) {
                     Connect._writeError(res, Code.Internal,
                         "Connect: " + m.fqName + " returned no message");

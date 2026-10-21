@@ -159,6 +159,31 @@ fn test_builder() {
     checkEq(headerOf(r, "X-Mailer"), "Flaris", "second extra header");
     checkEq(build({ from: "a@x.test", to: "b@x.test", headers: { "X-Bad": "a\r\nInjected: yes" }, text: "x" }), nil, "header injection is refused");
 
+    // A CR or LF in any value that becomes a header line refuses the message.
+    let base = { from: "a@x.test", to: "b@x.test", text: "x" };
+    let injected = [
+        ["subject",         "Hi\r\nBcc: evil@z.test",                          "subject (CRLF)"],
+        ["subject",         "Hi\nBcc: evil@z.test",                             "subject (bare LF)"],
+        ["date",            "Tue, 30 Sep 2026 10:00:00 +0000\r\nX-Inj: 1",     "date"],
+        ["messageId",       "<a@x.test>\r\nX-Inj: 1",                          "messageId"],
+        ["inReplyTo",       "<a@x.test>\rX-Inj: 1",                             "inReplyTo (bare CR)"],
+        ["references",      ["<a@x.test>", "<b@x.test>\r\nX-Inj: 1"],          "references"],
+        ["listUnsubscribe", "https://x.test/u\r\nX-Inj: 1",                    "listUnsubscribe"],
+        ["attachments",     [{ name: "a.txt", content: "x", type: "text/plain\r\nX-Inj: 1" }], "attachment type"],
+        ["attachments",     [{ name: "a.png", content: "x", inline: "cid1\r\nX-Inj: 1" }],     "attachment cid"],
+        ["dsn",             { envid: "id\r\nRCPT TO:<evil@z.test>" },          "dsn envid"],
+        ["dsn",             { notify: ["success", "failure\r\nRSET"] },        "dsn notify"],
+        ["to",              { address: "b@x.test", name: "Bob\r\nBcc: evil@z.test" }, "display name"],
+        ["from",            "Alice\r\nBcc: evil@z.test <a@x.test>",            "address string"],
+        ["headers",         { "X-Bad\r": "v" },                                 "extra header name"]
+    ];
+    foreach (c in injected) {
+        let m = {};
+        foreach (k in Object.Keys(base)) { m[k] = base[k]; }
+        m[c[0]] = c[1];
+        checkEq(SmtpMessage.Build(m), nil, "a line break in the " + c[2] + " is refused");
+    }
+
     // Required fields.
     checkEq(SmtpMessage.Build({ to: "b@x.test", text: "x" }), nil, "no from -> nil");
     checkEq(SmtpMessage.Build({ from: "a@x.test", text: "x" }), nil, "no recipient -> nil");
@@ -474,6 +499,9 @@ fn test_fake_servers() {
 
     let bad = new SmtpClient("127.0.0.1", p11, { tls: "none" }).Send({ from: "a@x.test", text: "no recipient" });
     checkEq(bad.errorKind, "rejected", "an unbuildable message never touches the network");
+    let crlf = new SmtpClient("127.0.0.1", p11, { tls: "none" })
+        .Send({ from: "a@x.test", to: "b@x.test", subject: "Hi\r\nBcc: evil@z.test", text: "x" });
+    checkEq(crlf.errorKind, "rejected", "a line break in the subject never touches the network");
 
     // CRAM-MD5 is chosen over PLAIN on a plain link, and the exchange is right.
     let ch = Util.Base64Encode("<123@fake.test>");

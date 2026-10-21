@@ -46,7 +46,10 @@
 //
 // Configuration - all methods return this for chaining:
 //   Word(start, cont)             - identifier chars; "a-z" ranges are expanded
-//   Number()                      - integer and float literals (val is int or float)
+//   Number()                      - integer and float literals (val is int or float):
+//                                   42, 3.14, 1e-5, 1.5E+3, 0x1F, 0b101, 0o17. A "."
+//                                   belongs to a number only when a digit follows it,
+//                                   so "0..10" is 0, "..", 10 and "1." is 1, "."
 //   Quote(ch, type)               - quoted string; backslash escapes honoured
 //   LineComment(prefix)           - skip from prefix to end of line
 //   BlockComment(open, close)     - skip enclosed block
@@ -59,7 +62,9 @@
 //
 // Static:
 //   Lexer.Quick(src, opts)        - one-shot; opts keys: word, number, string,
-//                                   lineComment, blockComment, ops, keywords, skip
+//                                   lineComment, blockComment, ops, keywords, skip;
+//                                   keywords is an array (type "keyword") or an
+//                                   object mapping each word to its type
 //
 // Token types (default names):
 //   "word"    - identifier
@@ -124,7 +129,8 @@ class Lexer {
         return this;
     }
 
-    // Integer and float literals.  val will be int or float.
+    // Integer and float literals.  val will be int or float; an integer too
+    // large for an int has val nil.
     fn Number() : instance {
         this._numOn    = true;
         this._ready    = false;
@@ -289,7 +295,7 @@ class Lexer {
             }
         }
         if (this._numOn) {
-            this._numStop = Lexer._buildStop("0123456789.");
+            this._numStop = Lexer._buildStop("0123456789");
             // Same: add skip chars so numbers stop at \n, \t, etc.
             iter (si from 0 to String.Length(this._skipChars)) {
                 let sc: string = String.Substr(this._skipChars, si, 1);
@@ -470,12 +476,57 @@ class Lexer {
         return 0;
     }
 
+    fn static _isHex(c: char) : bool {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    }
+
+    // End of the number literal starting at the digit s[pos], shifted left
+    // one bit with bit 0 set for a float: 0x/0b/0o integers, else digits, a
+    // fraction when "." is followed by a digit, and an exponent when e/E (and
+    // a sign) is followed by a digit. numStop ends a run of digits.
+    fn static _numEnd(s: string, pos: int, n: int, numStop: string) : int {
+        if (s[pos] == '0' && pos + 2 < n) {
+            let x = s[pos + 1];
+            let d = s[pos + 2];
+            var r = -1;
+            if ((x == 'x' || x == 'X') && Lexer._isHex(d)) {
+                r = pos + 2;
+                while (r < n && Lexer._isHex(s[r])) { r += 1; }
+            } else if ((x == 'b' || x == 'B') && (d == '0' || d == '1')) {
+                r = pos + 2;
+                while (r < n && (s[r] == '0' || s[r] == '1')) { r += 1; }
+            } else if ((x == 'o' || x == 'O') && d >= '0' && d <= '7') {
+                r = pos + 2;
+                while (r < n && s[r] >= '0' && s[r] <= '7') { r += 1; }
+            }
+            if (r >= 0) { return r << 1; }
+        }
+        var e = String.IndexOfAnyFrom(s, numStop, pos);
+        var p = (e < 0) ? n : e;
+        var fl = 0;
+        if (p + 1 < n && s[p] == '.' && s[p + 1] >= '0' && s[p + 1] <= '9') {
+            e = String.IndexOfAnyFrom(s, numStop, p + 1);
+            p = (e < 0) ? n : e;
+            fl = 1;
+        }
+        if (p < n && (s[p] == 'e' || s[p] == 'E')) {
+            var q = p + 1;
+            if (q < n && (s[q] == '+' || s[q] == '-')) { q += 1; }
+            if (q < n && s[q] >= '0' && s[q] <= '9') {
+                e = String.IndexOfAnyFrom(s, numStop, q);
+                p = (e < 0) ? n : e;
+                fl = 1;
+            }
+        }
+        return (p << 1) | fl;
+    }
+
     // Scans s into token records of five ints, [kind | flag | index << 8,
     // start, length, line, col]:
     //   1 whitespace run, when whitespace is emitted
     //   2 quoted string: index = quote, range = content between the quotes;
     //     flag 16 = holds a backslash escape
-    //   3 number; flag 16 = holds "."
+    //   3 number; flag 16 = float
     //   4 word
     //   5 operator: index = position in _ops
     //   6 unrecognised byte
@@ -604,13 +655,12 @@ class Lexer {
             let d = s[pos];
             if (cfg[3] != 0 && d >= '0' && d <= '9') {
                 let e    = String.IndexOfAnyFrom(s, numStop, pos);
-                let stop = (e < 0) ? n : e;
+                var stop = (e < 0) ? n : e;
                 var fl   = 0;
-                iter (k from pos to stop) {
-                    if (s[k] == '.') {
-                        fl = 16;
-                        break;
-                    }
+                if (stop < n && (d == '0' || s[stop] == '.' || s[stop] == 'e' || s[stop] == 'E')) {
+                    let r = Lexer._numEnd(s, pos, n, numStop);
+                    stop = r >> 1;
+                    fl   = (r & 1) << 4;
                 }
                 Lexer._rec(out, 3 | fl, pos, stop - pos, tl, tc);
                 col += stop - pos;
@@ -698,7 +748,7 @@ class Lexer {
     //   lineComment : string or array - line comment prefix(es)
     //   blockComment: array [open, close]
     //   ops         : string - single-char operators
-    //   keywords    : array or object - if array, type = "keyword"
+    //   keywords    : array (type "keyword") or object { word: type }
     //   skip        : string - characters to skip
     fn static Quick(src: string, opts: object) : array {
         let lex = new Lexer();
@@ -743,9 +793,7 @@ class Lexer {
             if (Type.Is(opts.keywords, Type.Array)) {
                 lex.Keywords(opts.keywords, "keyword");
             } else {
-                // object: {word: type}
-                let _ktype = opts.keywords;
-                // iterate keys not directly supported - use Keywords with array if object
+                foreach (ktype, word in opts.keywords) { lex.Keyword(word, ktype); }
             }
         }
 

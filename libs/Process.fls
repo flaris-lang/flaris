@@ -4,18 +4,21 @@
 // ============================================================
 //
 // Runs external programs, captures their output, and streams
-// data to/from them. Built on top of Os.Spawn / Os.RunEx,
+// data to/from them. Built on top of Os.Spawn / Os.RunEx.
 //
 // QUICK START
 // -----------
-//   import { Process, Run, Shell, Spawn } from library("Process", "1.0");
+//   import { Process, Run, RunAsync, Shell, Spawn } from library("Process", "1.0");
 //
 //   // Blocking run - capture exit code + stdout + stderr
-//   let r = Run("git", ["log", "--oneline", "-5"]);
+//   let r = Run("git", ["log", "--oneline", "-5"], { cwd: "/src/project" });
 //   Console.WriteLine(r.Exit, r.Stdout);
 //
 //   // Shell string (sh -c on Unix, cmd /c on Windows)
 //   let r = Shell("ls -la | grep .fls");
+//
+//   // The same run without holding up other fibers; both children run at once
+//   let both = Fiber.AwaitAll([RunAsync("make", ["a"]), RunAsync("make", ["b"])]);
 //
 //   // Spawned process - interact while running
 //   let p = Spawn("tail", ["-f", "/var/log/system.log"]);
@@ -40,17 +43,39 @@
 //
 // API
 // ---
-//   Run(cmd, args?, opts?) → {Exit:int, Stdout:string, Stderr:string, TimedOut:bool} | nil
-//   Shell(cmd, opts?)      → {Exit:int, Stdout:string, Stderr:string, TimedOut:bool} | nil
+//   Run(cmd, args?, opts?)      → Result - runs the child; every fiber waits
+//   Shell(cmd, opts?)           → Result - sh -c / cmd /c, as Run
+//   RunAsync(cmd, args?, opts?) → fiber resolving to a Result. Only the fiber that
+//                                 awaits it waits; the others run meanwhile
+//   Spawn(cmd, args?)           → Process | nil
+//   Start(cmd, args?, opts?)    → Process | nil - Spawn with opts (cwd, env, mergeStderr)
+//   StartAsync(cmd, args?, opts?) → fiber resolving to Start's Process | nil
 //   WaitTimeout(pid, timeoutMs) → {Alive:bool, Exit:int, TimedOut:bool}
-//   Spawn(cmd, args?)     → Process | nil
 //
-//   p.Pid                 int - process id
+//   Result: {Exit:int, Stdout:string, Stderr:string, Success:bool, TimedOut:bool};
+//   a program that cannot be started gives Exit 127.
+//
+//   opts (every key optional):
+//     timeout      int     ms before the child is killed: Exit 124, TimedOut true.
+//                          Run and Shell kill the child's whole process group;
+//                          RunAsync kills the child itself
+//     cwd          string  working directory of the child
+//     env          object  variables merged over this process's environment
+//                          (a nil value removes one)
+//     stdin        string  text fed to the child's stdin, which is then closed.
+//                          Without it Run and Shell share this process's stdin
+//                          and RunAsync gives the child an empty one
+//     mergeStderr  bool    stderr goes to Stdout, interleaved as written
+//
+//   p.Pid()               → int - process id
 //   p.ReadLine()          → string | nil - next stdout line (blocks fiber, not VM)
 //   p.ReadLineErr()       → string | nil - next stderr line
+//   p.ReadAll()           → string - the rest of stdout, until the child closes it
 //   p.Write(data)         - write string to stdin
+//   p.WriteLine(data)     - write data and "\n"
 //   p.CloseStdin()        - signal EOF to child's stdin
 //   p.Wait()              → int - exit code; blocks fiber until child exits
+//   p.WaitTimeout(ms)     → {Alive, Exit, TimedOut} - as WaitTimeout above
 //   p.Kill(signal?)       - send signal (default SIGTERM = 15)
 //   p.IsAlive()           → bool
 //   p.Close()             - close the child's pipes
@@ -149,8 +174,23 @@ class Process {
     }
 }
 
-fn _start(cmd, args) {
-    let handle = Os.Spawn(cmd, args ?? [], { Streams: true });
+// opts (see the header) as Os.Spawn / Os.RunEx launch options.
+fn _launchOptions(opts, withStdin:bool) {
+    let o = {};
+    if (opts == nil) return o;
+    if (opts.cwd != nil)         o.Cwd = opts.cwd;
+    if (opts.env != nil)         o.Env = opts.env;
+    if (opts.mergeStderr != nil) o.MergeStderr = opts.mergeStderr;
+    if (withStdin && opts.stdin != nil) o.Stdin = opts.stdin;
+    return o;
+}
+
+fn _timeoutOf(opts): int {
+    return (opts != nil && opts.timeout != nil) ? opts.timeout : 0;
+}
+
+fn _start(cmd, args, opts) {
+    let handle = Os.Spawn(cmd, args ?? [], _launchOptions(opts, false));
     if (handle == nil) return nil;
     let p = new Process();
     p._init(handle);
@@ -158,11 +198,15 @@ fn _start(cmd, args) {
 }
 
 fn Spawn(cmd, args?) {
-    return _start(cmd, args);
+    return _start(cmd, args, nil);
 }
 
-fn Start(cmd, args?, _opts?) {
-    return _start(cmd, args);
+fn Start(cmd, args?, opts?) {
+    return _start(cmd, args, opts);
+}
+
+fn async StartAsync(cmd, args?, opts?) {
+    return _start(cmd, args, opts);
 }
 
 fn _withProcessResult(raw) {
@@ -181,35 +225,76 @@ fn _withProcessResult(raw) {
     return r;
 }
 
-fn Run(cmd, args?, _opts?) {
-    let timeout = (_opts != nil && _opts.timeout != nil) ? _opts.timeout : 0;
+fn Run(cmd, args?, opts?) {
+    let timeout = _timeoutOf(opts);
+    let o = _launchOptions(opts, true);
     let raw = (timeout > 0)
-        ? Os.RunExTimeout(cmd, timeout, args ?? [])
-        : Os.RunEx(cmd, args ?? []);
+        ? Os.RunExTimeout(cmd, timeout, args ?? [], o)
+        : Os.RunEx(cmd, args ?? [], o);
     return _withProcessResult(raw);
 }
 
-fn RunAsync(cmd, args?, _opts?) {
-    return Run(cmd, args ?? [], _opts ?? {});
+// The child's output as a string, read until it closes the pipe or the
+// deadline passes (then what had arrived).
+fn async _drain(s, timeout:int) {
+    if (s == nil) return "";
+    let b = await Stream.ReadAsync(s, 0, timeout);
+    Stream.Close(s);
+    return b == nil ? "" : Buffer.ToString(b);
 }
 
-fn Shell(cmd, _opts?) {
+fn async _feed(s, input) {
+    if (input != nil && input != "") await Stream.WriteAsync(s, input);
+    Stream.Close(s);
+    return nil;
+}
+
+// Waits for the exit; past the deadline kills the child and reaps it.
+fn async _reap(pid:int, timeout:int) {
+    let r = timeout > 0 ? await Os.WaitAsync(pid, timeout) : await Os.WaitAsync(pid);
+    if (r != nil && r.TimedOut) {
+        Os.KillChild(pid, 9);
+        await Os.WaitAsync(pid);
+        return { Exit: 124, TimedOut: true };
+    }
+    return { Exit: r == nil ? nil : r.Exit, TimedOut: false };
+}
+
+// Run on pipes from Os.Spawn: stdout, stderr, stdin and the exit are each
+// waited on by their own fiber, so a child that fills one pipe while another
+// is unread cannot stall, and nothing waits outside the calling fiber.
+fn _runSpawned(cmd, args, opts) {
+    let h = Os.Spawn(cmd, args, _launchOptions(opts, false));
+    if (h == nil) return _withProcessResult(nil);
+    let timeout = _timeoutOf(opts);
+    let done = Fiber.AwaitAll([
+        _drain(h.Stdout, timeout),
+        _drain(h.Stderr, timeout),
+        _feed(h.Stdin, opts == nil ? nil : opts.stdin),
+        _reap(h.Pid, timeout)
+    ]);
+    let exit = done[3];
+    return _withProcessResult({
+        Exit: exit.Exit,
+        Stdout: done[0],
+        Stderr: done[1],
+        TimedOut: exit.TimedOut
+    });
+}
+
+fn async RunAsync(cmd, args?, opts?) {
+    return _runSpawned(cmd, args ?? [], opts);
+}
+
+fn Shell(cmd, opts?) {
     let isWin = Os.Name() == "Windows";
     let shell = isWin ? "cmd" : "sh";
     let flag  = isWin ? "/c"  : "-c";
-    let timeout = (_opts != nil && _opts.timeout != nil) ? _opts.timeout : 0;
-    let raw = (timeout > 0)
-        ? Os.RunExTimeout(shell, timeout, [flag, cmd])
-        : Os.RunEx(shell, [flag, cmd]);
-    return _withProcessResult(raw);
+    return Run(shell, [flag, cmd], opts);
 }
 
 fn WaitTimeout(pid:int, timeoutMs:int) {
     return Os.WaitTimeout(pid, timeoutMs);
-}
-
-fn StartAsync(cmd, args?, _opts?) {
-    return Start(cmd, args ?? [], _opts ?? {});
 }
 
 export { Process, Spawn, Start, Run, RunAsync, Shell, StartAsync, WaitTimeout };

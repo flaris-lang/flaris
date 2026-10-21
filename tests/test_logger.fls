@@ -606,6 +606,59 @@ fn test_child() {
     check(String.Contains(grandchild._prefix, "Task"),   "grandchild prefix contains Task");
 
     File.Delete(path);
+
+    // A child writes through the parent's sink: whichever of them rotates the
+    // file, the other follows to the new one and no line is lost.
+    let rpath = Path.Combine(Os.TempDir(), "_test_logger_child_rot.log");
+    let files = [rpath, rpath + ".1", rpath + ".2", rpath + ".3", rpath + ".4"];
+    foreach (f in files) { if (File.Exists(f)) { File.Delete(f); } }
+    let rp = new Logger();
+    rp.SetOutput("file", rpath);
+    rp.SetRotation(200, 4);
+    let rc = rp.Child("[db]");
+    iter (i from 0 to 10) {
+        rp.Info("parent line " + str(i));
+        rc.Info("child line " + str(i));
+    }
+    rc.Close();
+    rp.Info("parent after the child closed");
+    rp.Close();
+    var all = "";
+    foreach (f in files) { if (File.Exists(f)) { all = all + File.ReadText(f); } }
+    checkEq(len(String.Split(all, "parent line ")) - 1, 10, "rotation keeps every parent line");
+    checkEq(len(String.Split(all, "child line ")) - 1, 10, "rotation keeps every child line");
+    check(String.Contains(all, "parent after the child closed"), "a child's Close leaves the shared sink open");
+    foreach (f in files) { if (File.Exists(f)) { File.Delete(f); } }
+
+    // SetOutput on a child gives it a destination of its own.
+    let opath = Path.Combine(Os.TempDir(), "_test_logger_child_own.log");
+    let cpath = Path.Combine(Os.TempDir(), "_test_logger_child_own2.log");
+    foreach (f in [opath, cpath]) { if (File.Exists(f)) { File.Delete(f); } }
+    let op = new Logger();
+    op.SetOutput("file", opath);
+    let oc = op.Child("own");
+    oc.SetOutput("file", cpath);
+    oc.Info("to the child's file");
+    op.Info("to the parent's file");
+    oc.Close();
+    op.Close();
+    check(String.Contains(File.ReadText(cpath), "to the child's file"), "a child's SetOutput redirects the child");
+    check(!String.Contains(File.ReadText(opath), "to the child's file"), "  and not the parent");
+    check(String.Contains(File.ReadText(opath), "to the parent's file"), "  which keeps its own file");
+    foreach (f in [opath, cpath]) { if (File.Exists(f)) { File.Delete(f); } }
+
+    // A child sends to the parent's syslog too.
+    let udp = Stream.Listen("udp", 0, nil, "127.0.0.1");
+    let addr = Stream.LocalAddr(udp);
+    let sp = new Logger();
+    sp.SetOutput("file", Path.Combine(Os.TempDir(), "_test_logger_child_sys.log"));
+    sp.SetSyslog("127.0.0.1", Convert.ParseInt(String.Substr(addr, String.LastIndexOf(addr, ":") + 1)));
+    sp.Child("sub").Warn("from the child");
+    let dg = (Stream.WaitReadable(udp, 2000) == true) ? Stream.ReadBytes(udp, 2048) : nil;
+    check(dg != nil && String.Contains(Buffer.ToString(dg), "from the child"), "a child keeps the parent's syslog");
+    sp.Close();
+    Stream.Close(udp);
+    File.Delete(Path.Combine(Os.TempDir(), "_test_logger_child_sys.log"));
 }
 
 // ============================================================
@@ -813,6 +866,197 @@ fn test_json_mode_still_structured() {
     File.Delete(path);
 }
 
+// ============================================================
+// With: context fields
+// ============================================================
+
+fn test_with_context() {
+    Console.WriteLine("== With (context fields) ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_ctx.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetOutput("file", path);
+    log.SetJson(true);
+    let ctx = { request: "a1", user: 42 };
+    let req = log.With(ctx);
+    req.Info("served", { status: 200 });
+    req.Info("override", { user: 7 });
+    log.Info("plain");
+    let deeper = req.With({ step: "db" }).Child("repo");
+    deeper.Warn("slow");
+    ctx.user = 99;
+    req.Info("after the caller changed its object");
+
+    let lines = File.ReadLines(path);
+    checkEq(len(lines), 5, "With: one record per call");
+    let e0 = Json.Parse(lines[0]);
+    checkEq(e0.request, "a1", "With: context field in the record");
+    checkEq(e0.user, 42, "With: second context field");
+    checkEq(e0.status, 200, "With: the record's own field too");
+    checkEq(Json.Parse(lines[1]).user, 7, "With: a record's field wins over the context");
+    check(!Object.HasKey(Json.Parse(lines[2]), "request"), "With: the parent's records carry no context");
+    let e3 = Json.Parse(lines[3]);
+    check(e3.request == "a1" && e3.step == "db", "With: nested With keeps both sets of fields");
+    checkEq(e3.logger, "repo", "With: a Child of a With logger keeps the fields");
+    checkEq(Json.Parse(lines[4]).user, 42, "With: the fields are copied");
+
+    // Text mode appends the fields as JSON; ...With methods still work.
+    let tpath = Path.Combine(Os.TempDir(), "_test_logger_ctx_text.log");
+    if (File.Exists(tpath)) { File.Delete(tpath); }
+    let tl = new Logger();
+    tl.SetOutput("file", tpath);
+    let tr = tl.With({ job: 5 });
+    tr.Info("start");
+    tr.InfoWith("step", { n: 1 });
+    checkEq(tr.GetLevel(), tl.GetLevel(), "With: inherits the level");
+    let tlines = File.ReadLines(tpath);
+    checkEq(tlines[0], "[INF] start {\"job\":5}", "With: text record ends in the context as JSON");
+    check(String.Contains(tlines[1], "[INF] step n=1 {\"job\":5}"), "With: InfoWith pairs, then the context");
+
+    log.Close();
+    tl.Close();
+    File.Delete(path);
+    File.Delete(tpath);
+}
+
+// ============================================================
+// AddSink: several destinations
+// ============================================================
+
+fn test_add_sink() {
+    Console.WriteLine("== AddSink ==");
+    let main  = Path.Combine(Os.TempDir(), "_test_logger_main.log");
+    let debug = Path.Combine(Os.TempDir(), "_test_logger_debug.json");
+    let fmt   = Path.Combine(Os.TempDir(), "_test_logger_fmt.log");
+    foreach (f in [main, debug, fmt]) { if (File.Exists(f)) { File.Delete(f); } }
+
+    let udp = Stream.Listen("udp", 0, nil, "127.0.0.1");
+    let addr = Stream.LocalAddr(udp);
+    let port = Convert.ParseInt(String.Substr(addr, String.LastIndexOf(addr, ":") + 1));
+
+    let log = new Logger();
+    log.SetOutput("file", main);
+    log.SetLevel("warn");
+    log.AddSink("file", { path: debug, level: "debug", format: "json" });
+    log.AddSink("syslog", { host: "127.0.0.1", port: port, level: "error" });
+    log.AddSink("file", { path: fmt, level: Logger.INFO, format: fn(r) { return r.levelName + "|" + r.msg; } });
+
+    log.Debug("d1");
+    log.Info("i1");
+    log.Warn("w1", { k: 1 });
+    let child = log.Child("kid");
+    child.Debug("from the child");
+    log.Error("e1");
+
+    let dg = (Stream.WaitReadable(udp, 2000) == true) ? Stream.ReadBytes(udp, 2048) : nil;
+    let dgText = (dg == nil) ? "" : Buffer.ToString(dg);
+    check(String.StartsWith(dgText, "<11>flaris: [ERR] e1"), "AddSink: syslog sink gets the error record");
+    check(Stream.WaitReadable(udp, 50) != true, "AddSink: syslog sink below its level gets nothing");
+
+    let mainText = File.ReadText(main);
+    check(String.Contains(mainText, "[WRN] w1 {\"k\":1}") && String.Contains(mainText, "[ERR] e1"), "AddSink: the logger's own sink keeps its level");
+    check(!String.Contains(mainText, "i1") && !String.Contains(mainText, "d1"), "AddSink: the logger's own sink filters below warn");
+
+    let dl = File.ReadLines(debug);
+    checkEq(len(dl), 5, "AddSink: the debug sink gets every record");
+    checkEq(Json.Parse(dl[0]).msg, "d1", "AddSink: a json sink writes JSON");
+    checkEq(Json.Parse(dl[2]).k, 1, "AddSink: a json sink carries the fields");
+    checkEq(Json.Parse(dl[3]).logger, "kid", "AddSink: children write to the added sinks");
+
+    checkEq(File.ReadLines(fmt), ["INFO|i1", "WARN|w1", "ERROR|e1"], "AddSink: a sink with its own formatter and level");
+
+    // RemoveSinks leaves the logger's own sink.
+    log.RemoveSinks();
+    log.Debug("gone");
+    log.Error("still here");
+    check(!String.Contains(File.ReadText(debug), "gone"), "RemoveSinks: the added sinks stop");
+    check(String.Contains(File.ReadText(main), "still here"), "RemoveSinks: the logger's sink stays");
+
+    // A child's SetOutput leaves the parent's added sinks behind.
+    let own = Path.Combine(Os.TempDir(), "_test_logger_own.log");
+    if (File.Exists(own)) { File.Delete(own); }
+    log.AddSink("file", { path: debug, level: "debug" });
+    let c2 = log.Child("own");
+    c2.SetOutput("file", own);
+    c2.Error("child only");
+    log.Error("parent and sink");
+    check(!String.Contains(File.ReadText(debug), "child only"), "AddSink: a child with its own output skips the parent's sinks");
+    check(String.Contains(File.ReadText(debug), "parent and sink"), "AddSink: the parent still writes to them");
+    check(String.Contains(File.ReadText(debug), "[ERR] parent and sink"), "AddSink: a sink without a format follows the logger (text)");
+    c2.Close();
+
+    var threw = 0;
+    try { log.AddSink("pigeon"); } catch (e) { threw += 1; }
+    try { log.AddSink("file"); } catch (e) { threw += 1; }
+    try { log.AddSink("stdout", { format: "xml" }); } catch (e) { threw += 1; }
+    try { log.AddSink("stdout", { level: "loud" }); } catch (e) { threw += 1; }
+    try { log.AddSink("syslog", { }); } catch (e) { threw += 1; }
+    checkEq(threw, 5, "AddSink: bad kind, path, format, level and host raise");
+
+    log.Close();
+    log.Error("after Close");
+    check(!String.Contains(File.ReadText(debug), "after Close"), "Close: the added file sinks are closed too");
+    Stream.Close(udp);
+    foreach (f in [main, debug, fmt, own]) { if (File.Exists(f)) { File.Delete(f); } }
+
+    // An added file sink rotates on its own.
+    let rot = Path.Combine(Os.TempDir(), "_test_logger_sink_rot.log");
+    foreach (f in [rot, rot + ".1", rot + ".2", rot + ".3"]) { if (File.Exists(f)) { File.Delete(f); } }
+    let rl = new Logger();
+    rl.Disable();
+    rl.Enable();
+    rl.SetOutput("file", Path.Combine(Os.TempDir(), "_test_logger_sink_rot_main.log"));
+    rl.AddSink("file", { path: rot, maxBytes: 200, maxFiles: 2, timestamp: true });
+    iter (i from 0 to 30) { rl.Info("rotating sink line " + str(i)); }
+    rl.Close();
+    check(File.Exists(rot + ".1") && File.Exists(rot + ".2") && !File.Exists(rot + ".3"), "AddSink: file sink rotation, maxFiles respected");
+    check(Regex.IsMatch(File.ReadLines(rot + ".1")[0], "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2} \\[INF\\] rotating"), "AddSink: timestamp option");
+    foreach (f in [rot, rot + ".1", rot + ".2", Path.Combine(Os.TempDir(), "_test_logger_sink_rot_main.log")]) { if (File.Exists(f)) { File.Delete(f); } }
+}
+
+// ============================================================
+// SetFormatter
+// ============================================================
+
+fn test_formatter() {
+    Console.WriteLine("== SetFormatter ==");
+    let path = Path.Combine(Os.TempDir(), "_test_logger_formatter.log");
+    if (File.Exists(path)) { File.Delete(path); }
+
+    let log = new Logger();
+    log.SetOutput("file", path);
+    log.SetPrefix("api");
+    let seen = { time: 0, level: -1 };
+    log.SetFormatter(fn(r) {
+        seen.time = r.time;
+        seen.level = r.level;
+        if (r.msg == "drop") { return nil; }
+        if (r.msg == "own newline") { return "kept\n"; }
+        let f = (r.fields == nil) ? "-" : Json.Stringify(r.fields);
+        return r.levelName + "|" + r.logger + "|" + r.msg + "|" + f;
+    });
+    log.Info("one", { a: 1 });
+    log.Info("drop");
+    log.With({ ctx: true }).Warn("two");
+    log.Child("sub").Error("three");
+    log.Info("own newline");
+    let lines = File.ReadLines(path);
+    checkEq(lines, ["INFO|api|one|{\"a\":1}", "WARN|api|two|{\"ctx\":true}", "ERROR|api.sub|three|-", "kept"],
+            "SetFormatter: renders, drops on nil, reaches children, adds a missing newline only");
+    check(seen.time >= Time.Now() - 5 && seen.time <= Time.Now(), "SetFormatter: record time is Unix seconds");
+    checkEq(seen.level, 1, "SetFormatter: record level is the number");
+
+    log.SetFormatter(nil);
+    log.Info("back to text");
+    check(String.Contains(File.ReadText(path), "api [INF] back to text"), "SetFormatter(nil) restores the text format");
+    var threw = false;
+    try { log.SetFormatter("not a function"); } catch (e) { threw = true; }
+    check(threw, "SetFormatter refuses a non-function");
+    log.Close();
+    File.Delete(path);
+}
+
 fn async Main() {
     Console.WriteLine("=== Logger test suite ===");
 
@@ -845,6 +1089,9 @@ fn async Main() {
     test_forgery_via_prefix();
     test_ordinary_text_untouched();
     test_json_mode_still_structured();
+    test_with_context();
+    test_add_sink();
+    test_formatter();
 
     Console.WriteLine("=== Done ===");
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);
@@ -894,8 +1141,38 @@ fn async Main() {
         log_file.Error("error message"); _sink = _sink + 1;
     }, 2000);
 
+    Console.WriteLine("\n[ Context, several sinks, formatter ]");
+    let bench_json = Path.Combine(Os.TempDir(), "_bench_logger.json");
+    if (File.Exists(bench_json)) { File.Delete(bench_json); }
+    let log_ctx = log_file.With({ request: "a1f3", user: 42 });
+    bench("Info()  to file  through With() context", fn() {
+        log_ctx.Info("benchmark message"); _sink = _sink + 1;
+    }, 2000);
+    let log_two = new Logger();
+    log_two.SetOutput("file", bench_path);
+    log_two.AddSink("file", { path: bench_json, format: "json" });
+    bench("Info()  to file + a JSON file sink", fn() {
+        log_two.Info("benchmark message"); _sink = _sink + 1;
+    }, 1000);
+    let log_dbg = new Logger();
+    log_dbg.SetLevel("warn");
+    log_dbg.AddSink("file", { path: bench_json, level: "error" });
+    bench("Debug() filtered, an added sink at error", fn() {
+        log_dbg.Debug("msg"); _sink = _sink + 1;
+    }, 20000);
+    let log_fmt = new Logger();
+    log_fmt.SetOutput("file", bench_path);
+    log_fmt.SetFormatter(fn(r) { return r.levelName + " " + r.msg; });
+    bench("Info()  to file  custom formatter", fn() {
+        log_fmt.Info("benchmark message"); _sink = _sink + 1;
+    }, 2000);
+    log_two.Close();
+    log_dbg.Close();
+    log_fmt.Close();
+
     benchSep();
     Console.WriteLine("_sink=" + str(_sink));
     if (File.Exists(bench_path)) { File.Delete(bench_path); }
+    if (File.Exists(bench_json)) { File.Delete(bench_json); }
     return testsFailed;
 }

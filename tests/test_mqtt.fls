@@ -1,0 +1,815 @@
+// test_mqtt.fls - Tests for Mqtt.fls, the pure-Flaris MQTT client.
+// Run: flarisvm tests/test_mqtt.fls --libs='./libs'
+//
+// The codec, the topic rules and every packet flow - QoS 1 and 2 both ways,
+// keep-alive, reconnect, malformed packets, MQTT 5 reason codes - run against
+// fake brokers on loopback and need nothing installed. The live part runs
+// when a broker answers on 127.0.0.1:1883 (MQTT_TEST_HOST / MQTT_TEST_PORT
+// pick another) and is skipped otherwise. Mosquitto in Docker, without
+// authentication:
+//
+//   docker run -d --name flaris-mqtt -p 1883:1883 eclipse-mosquitto:2 \
+//       mosquitto -c /mosquitto-no-auth.conf
+//
+// The live part uses topics under "flaris/mqtt/test/<random>/" and clears the
+// retained messages it sets.
+
+import { Mqtt, MqttClient, MqttError } from library("Mqtt", "1.0");
+import { Test } from library("Test", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn same(a, b): bool {
+    if ((Type.IsObject(a) || Type.IsArray(a)) && (Type.IsObject(b) || Type.IsArray(b))) {
+        return Json.Stringify(a, { sortKeys: true }) == Json.Stringify(b, { sortKeys: true });
+    }
+    return a == b;
+}
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (!same(actual, expected)) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", Json.Stringify(expected), " got=", Json.Stringify(actual));
+    }
+}
+
+fn raised(f) {
+    try { f(); } catch (e) { return e; }
+    return nil;
+}
+
+fn kindOf(e) {
+    if (e == nil) { return "none"; }
+    if (e is MqttError) { return e.Kind; }
+    return "other: " + e.Error;
+}
+
+// A block from ints, strings, blocks and arrays of them, nested any depth.
+fn bytes(parts) {
+    let out = Buffer.Create(0, 1);
+    appendBytes(out, parts);
+    return out;
+}
+
+fn appendBytes(out, p) {
+    if (Type.IsString(p) || Type.IsBlock(p)) { Buffer.Append(out, p); return; }
+    if (Type.IsArray(p)) {
+        foreach (x in p) { appendBytes(out, x); }
+        return;
+    }
+    let one = Buffer.Create(1, 1);
+    one[0] = p;
+    Buffer.Append(out, one);
+}
+
+fn be16(n) { return [(n >> 8) & 255, n & 255]; }
+fn str16(s) { return [be16(String.Length(s)), s]; }
+fn arr(b) { return (len(b) == 0) ? [] : Buffer.ToArray(b); }
+
+// ---- codec ------------------------------------------------------------------
+
+fn test_codec() {
+    Console.WriteLine("== codec ==");
+    let table = [[0, [0x00]], [127, [0x7F]], [128, [0x80, 0x01]], [16383, [0xFF, 0x7F]],
+                 [16384, [0x80, 0x80, 0x01]], [2097151, [0xFF, 0xFF, 0x7F]],
+                 [2097152, [0x80, 0x80, 0x80, 0x01]], [268435455, [0xFF, 0xFF, 0xFF, 0x7F]]];
+    foreach (row in table) {
+        checkEq(arr(Mqtt.EncodeLength(row[0])), row[1], "remaining length " + str(row[0]));
+        checkEq(Mqtt.DecodeLength(bytes(row[1])), [row[0], len(row[1])], "decode " + str(row[0]));
+    }
+    checkEq(Mqtt.DecodeLength(bytes([9, 9, 0xC1, 0x02]), 2), [321, 2], "decode at an offset");
+    checkEq(Mqtt.DecodeLength(bytes([0xFF, 0xFF, 0xFF, 0xFF, 0x01])), nil, "a fifth byte is malformed");
+    checkEq(Mqtt.DecodeLength(bytes([0x80])), nil, "a truncated length");
+    check(raised(fn() { Mqtt.EncodeLength(268435456); }) != nil, "a length past the maximum raises");
+
+    checkEq(arr(Mqtt.EncodePublish("a/b", "hi", { qos: 1, packetId: 10, retain: true })),
+            arr(bytes([0x33, 0x09, str16("a/b"), be16(10), "hi"])), "PUBLISH QoS 1 retained");
+    checkEq(arr(Mqtt.EncodePublish("t", "", nil)), arr(bytes([0x30, 0x03, str16("t")])), "PUBLISH QoS 0, empty payload");
+    checkEq(arr(Mqtt.EncodePublish("t", "x", { qos: 2, packetId: 0x1234, dup: true })),
+            arr(bytes([0x3C, 0x06, str16("t"), 0x12, 0x34, "x"])), "PUBLISH QoS 2 DUP");
+    checkEq(arr(Mqtt.EncodePublish("t", "x", { protocolVersion: 5 })), arr(bytes([0x30, 0x05, str16("t"), 0x00, "x"])), "MQTT 5 PUBLISH has a property length");
+    let big = Mqtt.EncodePublish("t", String.Repeat("z", 200), nil);
+    checkEq([big[1], big[2]], [0xCB, 0x01], "a 203-byte body takes a two-byte length");
+    let bin = bytes([0, 255, 13, 10]);
+    let pb = Mqtt.EncodePublish("t", bin, nil);
+    checkEq(arr(Buffer.Slice(pb, 5, 4)), [0, 255, 13, 10], "a block payload byte for byte");
+}
+
+fn test_topics() {
+    Console.WriteLine("== topics ==");
+    let yes = [["sport/tennis/player1/#", "sport/tennis/player1"], ["sport/tennis/player1/#", "sport/tennis/player1/ranking"],
+               ["sport/tennis/player1/#", "sport/tennis/player1/score/wimbledon"], ["sport/#", "sport"], ["#", "a/b/c"],
+               ["sport/tennis/+", "sport/tennis/player1"], ["sport/+", "sport/"], ["+/+", "/finance"], ["/+", "/finance"],
+               ["+", "finance"], ["$SYS/#", "$SYS/broker/load"], ["$SYS/+/load", "$SYS/broker/load"], ["a/b", "a/b"],
+               ["+/b/#", "x/b"], ["a//c", "a//c"]];
+    let no = [["sport/tennis/+", "sport/tennis/player1/ranking"], ["sport/+", "sport"], ["+", "/finance"],
+              ["#", "$SYS/broker"], ["+/monitor/Clients", "$SYS/monitor/Clients"], ["a/b", "a/bc"], ["a/bc", "a/b"],
+              ["sport/tennis/#", "sport/tennis2"], ["a/b", "A/b"], ["a/+/c", "a/b/c/d"]];
+    foreach (p in yes) { check(Mqtt.TopicMatches(p[0], p[1]), "'" + p[0] + "' matches '" + p[1] + "'"); }
+    foreach (p in no) { check(!Mqtt.TopicMatches(p[0], p[1]), "'" + p[0] + "' does not match '" + p[1] + "'"); }
+
+    foreach (f in ["#", "+", "a/#", "+/b/+", "/", "a/+/c/#", "$SYS/#"]) { check(Mqtt.ValidFilter(f), "valid filter '" + f + "'"); }
+    foreach (f in ["", "a#", "a/#/b", "a+", "a/b+/c", "#/a", "++"]) { check(!Mqtt.ValidFilter(f), "invalid filter '" + f + "'"); }
+    foreach (t in ["a", "a/b", "/", "$SYS/x"]) { check(Mqtt.ValidTopic(t), "valid topic '" + t + "'"); }
+    foreach (t in ["", "a/+", "a/#", "#"]) { check(!Mqtt.ValidTopic(t), "invalid topic '" + t + "'"); }
+}
+
+// ---- fake brokers -----------------------------------------------------------
+
+// Every packet the fake brokers read: { type, flags, body }.
+global _pkts = [];
+
+fn listenLoopback() {
+    let ls = Stream.Listen("tcp", 0, 16, "127.0.0.1");
+    let addr = Stream.LocalAddr(ls);
+    return [ls, int(String.Substr(addr, String.LastIndexOf(addr, ":") + 1))];
+}
+
+fn readPacket(c, waitMs) {
+    if (Stream.WaitReadable(c, waitMs) == nil) { return nil; }
+    let b1 = Stream.ReadU8(c);
+    if (b1 == nil) { return nil; }
+    var rem = 0;
+    var mult = 1;
+    var more = true;
+    while (more) {
+        let d = Stream.ReadU8(c);
+        if (d == nil) { return nil; }
+        rem += (d & 127) * mult;
+        mult *= 128;
+        more = (d & 128) != 0;
+    }
+    var body = Buffer.Create(0, 1);
+    while (len(body) < rem) {
+        let part = Stream.ReadBytes(c, rem - len(body));
+        if (part == nil) { return nil; }
+        Buffer.Append(body, part);
+    }
+    return { type: b1 >> 4, flags: b1 & 15, body: body };
+}
+
+// A scripted broker. Each entry reads one packet (kept in _pkts) and then
+// sends: a block, or an array of blocks written 20 ms apart (a packet split
+// across TCP segments). { send, pause, read } waits pause ms first and with
+// read: false sends without reading; send "close" hangs up; "next" drops the
+// client and serves the next connection; "drain" reads until the client
+// closes.
+fn fakeBroker(script): int {
+    let lp = listenLoopback();
+    let ls = lp[0];
+    Fiber.Run(fn() {
+        if (Stream.WaitReadable(ls, 3000) != nil) {
+            let c = Stream.Accept(ls);
+            Stream.WaitReadable(c, 1);
+            foreach (step in script) {
+                if (c == nil && step != "next") { break; }
+                if (step == "next") {
+                    if (c != nil) { Stream.Close(c); }
+                    c = nil;
+                    if (Stream.WaitReadable(ls, 3000) == nil) { break; }
+                    c = Stream.Accept(ls);
+                    Stream.WaitReadable(c, 1);
+                    continue;
+                }
+                if (step == "drain") {
+                    while (true) {
+                        let p = readPacket(c, 3000);
+                        if (p == nil) { break; }
+                        Array.Append(_pkts, p);
+                    }
+                    break;
+                }
+                var out = step;
+                var read = true;
+                var pause = 0;
+                if (Type.IsObject(step)) {
+                    out = step.send;
+                    read = step.read ?? true;
+                    pause = step.pause ?? 0;
+                }
+                if (read) {
+                    let p = readPacket(c, 3000);
+                    if (p == nil) { break; }
+                    Array.Append(_pkts, p);
+                }
+                if (pause > 0) { Fiber.Sleep(pause); }
+                if (out == "close") { Stream.Close(c); c = nil; continue; }
+                if (Type.IsArray(out)) {
+                    foreach (piece in out) { Stream.WriteAll(c, piece); Fiber.Sleep(20); }
+                } else if (out != nil) {
+                    Stream.WriteAll(c, out);
+                }
+            }
+            if (c != nil) { Fiber.Sleep(30); Stream.Close(c); }
+        }
+        Stream.Close(ls);
+    });
+    return lp[1];
+}
+
+const CONNACK_OK = [0x20, 0x02, 0x00, 0x00];
+
+fn connack(flags, code) { return bytes([0x20, 0x02, flags, code]); }
+fn ack(type, pid) { return bytes([(type << 4) | ((type == 6) ? 2 : 0), 0x02, be16(pid)]); }
+fn publish(topic, payload, qos, pid, flags) {
+    let rest = bytes([str16(topic), (qos > 0) ? be16(pid) : [], payload]);
+    return bytes([0x30 | (qos << 1) | flags, Mqtt.EncodeLength(len(rest)), rest]);
+}
+fn pktOf(type) {
+    foreach (p in _pkts) { if (p.type == type) { return p; } }
+    return nil;
+}
+fn countOf(type) { return Array.Count(_pkts, fn(p) => p.type == type); }
+
+const FAST = { timeoutMs: 500, keepAlive: 0 };
+
+fn test_connect() {
+    Console.WriteLine("== fake broker: connect ==");
+    _pkts = [];
+    let p = fakeBroker([connack(1, 0), "drain"]);
+    let c = new MqttClient("127.0.0.1", p, { clientId: "c1", keepAlive: 30, username: "u", password: "pw", timeoutMs: 500,
+                                             will: { topic: "w", payload: "bye", qos: 1, retain: true } });
+    checkEq(c.Connect(), { sessionPresent: true }, "Connect reports the session flag");
+    checkEq(c.IsConnected(), true, "connected");
+    checkEq(c.SessionPresent(), true, "SessionPresent");
+    c.Disconnect();
+    Fiber.Sleep(30);
+    let cp = pktOf(1);
+    checkEq(cp?.flags, 0, "CONNECT fixed-header flags");
+    checkEq(arr(cp?.body ?? bytes([])), arr(bytes([str16("MQTT"), 4, 0xEE, be16(30), str16("c1"), str16("w"), str16("bye"), str16("u"), str16("pw")])),
+            "CONNECT: level 4, every flag, keep-alive, id, will, user, password");
+    checkEq(countOf(14), 1, "Disconnect sends DISCONNECT");
+    checkEq(c.IsConnected(), false, "not connected after Disconnect");
+    checkEq(kindOf(raised(fn() { c.Publish("t", "x"); })), "closed", "Publish after Disconnect raises");
+
+    let p2 = fakeBroker([connack(0, 5)]);
+    let e2 = raised(fn() { Mqtt.Connect("127.0.0.1", p2, FAST); });
+    checkEq(kindOf(e2), "refused", "CONNACK 5: refused");
+    checkEq(e2?.Reason, 5, "the return code");
+    check(e2 != nil && String.Contains(e2.Error, "not authorized"), "the code is named");
+
+    let p3 = fakeBroker([{ pause: 700, send: nil }]);
+    let t0 = Time.Millis();
+    checkEq(kindOf(raised(fn() { Mqtt.Connect("127.0.0.1", p3, { timeoutMs: 200 }); })), "timeout", "no CONNACK: timeout");
+    check(Time.Millis() - t0 < 600, "after timeoutMs");
+
+    let p4 = fakeBroker([publish("x", "y", 0, 0, 0)]);
+    checkEq(kindOf(raised(fn() { Mqtt.Connect("127.0.0.1", p4, FAST); })), "protocol", "a PUBLISH instead of CONNACK: protocol");
+
+    let p5 = fakeBroker(["close"]);
+    checkEq(kindOf(raised(fn() { Mqtt.Connect("127.0.0.1", p5, FAST); })), "closed", "a broker that hangs up: closed");
+
+    let lp = listenLoopback();
+    Stream.Close(lp[0]);
+    checkEq(kindOf(raised(fn() { Mqtt.Connect("127.0.0.1", lp[1], FAST); })), "connect", "nobody listening: connect");
+
+    let generated = new MqttClient("127.0.0.1", 1, nil).ClientId();
+    check(String.StartsWith(generated, "flaris-") && String.Length(generated) == 23, "a generated client id: " + generated);
+}
+
+fn test_publish_flows() {
+    Console.WriteLine("== fake broker: publish flows ==");
+    _pkts = [];
+    let p = fakeBroker([bytes(CONNACK_OK), nil, [bytes([0x40]), bytes([0x02, 0x00, 0x01])], ack(5, 2), ack(7, 2), { pause: 400, send: nil }, "drain"]);
+    let c = Mqtt.Connect("127.0.0.1", p, { timeoutMs: 250, keepAlive: 0 });
+    checkEq(c.Publish("q/0", "zero"), true, "QoS 0");
+    checkEq(c.Publish("q/1", "one", { qos: 1, retain: true }), true, "QoS 1 waits for a PUBACK split in two");
+    checkEq(c.Publish("q/2", bytes([0, 1, 2]), { qos: 2 }), true, "QoS 2: PUBREC, PUBREL, PUBCOMP");
+    let t0 = Time.Millis();
+    checkEq(kindOf(raised(fn() { c.Publish("q/1", "lost", { qos: 1 }); })), "timeout", "no PUBACK: timeout");
+    let waited = Time.Millis() - t0;
+    check(waited >= 200 && waited < 600, "after timeoutMs: " + str(waited));
+    c.Disconnect();
+    Fiber.Sleep(30);
+    let pubs = Array.Where(_pkts, fn(x) => x.type == 3);
+    checkEq(len(pubs), 4, "four PUBLISH packets");
+    checkEq(pubs[0].flags, 0, "QoS 0 flags");
+    checkEq(arr(pubs[0].body), arr(bytes([str16("q/0"), "zero"])), "QoS 0 has no packet id");
+    checkEq(pubs[1].flags, 0x3, "QoS 1 + retain flags");
+    checkEq(arr(pubs[1].body), arr(bytes([str16("q/1"), be16(1), "one"])), "QoS 1 with packet id 1");
+    checkEq(pubs[2].flags, 0x4, "QoS 2 flags");
+    checkEq(arr(pubs[2].body), arr(bytes([str16("q/2"), be16(2), 0, 1, 2])), "QoS 2 with packet id 2 and a block payload");
+    let rel = pktOf(6);
+    checkEq([rel?.flags, arr(rel?.body ?? bytes([]))], [2, [0, 2]], "PUBREL with flags 0010 and the packet id");
+}
+
+fn test_inbound() {
+    Console.WriteLine("== fake broker: incoming messages ==");
+    _pkts = [];
+    let q1 = publish("in/one", "first", 1, 7, 0);
+    let p = fakeBroker([bytes(CONNACK_OK),
+                        bytes([0x90, 0x04, be16(1), 0x01, 0x80]),
+                        { read: false, send: [Buffer.Slice(q1, 0, 3), Buffer.Slice(q1, 3, 5), Buffer.Slice(q1, 8, len(q1) - 8)] },
+                        { send: publish("in/two", "second", 2, 9, 0) },
+                        { send: publish("in/two", "second", 2, 9, 8) },
+                        { send: ack(6, 9) },
+                        { send: publish("in/kept", "retained", 0, 0, 1) },
+                        { read: false, send: publish("in/zero", "", 0, 0, 0) },
+                        "drain"]);
+    let c = Mqtt.Connect("127.0.0.1", p, FAST);
+    checkEq(c.Subscribe(["in/#", "denied/#"], 1), [1, 128], "SUBACK codes, 128 for a refused filter");
+    let sub = pktOf(8);
+    checkEq(sub?.flags, 2, "SUBSCRIBE flags 0010");
+    checkEq(arr(sub?.body ?? bytes([])), arr(bytes([be16(1), str16("in/#"), 1, str16("denied/#"), 1])), "SUBSCRIBE body");
+    let m1 = c.Receive(1000);
+    checkEq([m1?.topic, m1?.payload, m1?.qos, m1?.retain, m1?.dup], ["in/one", "first", 1, false, false], "a QoS 1 message split in three");
+    let m2 = c.Receive(1000);
+    checkEq([m2?.topic, m2?.payload, m2?.qos], ["in/two", "second", 2], "a QoS 2 message");
+    let m3 = c.Receive(1000);
+    checkEq([m3?.topic, m3?.payload, m3?.retain], ["in/kept", "retained", true], "the redelivered QoS 2 message was not handed over twice; retain flag");
+    let m4 = c.Receive(1000);
+    checkEq([m4?.topic, m4?.payload], ["in/zero", ""], "an empty payload");
+    checkEq(c.Receive(50), nil, "nothing more");
+    c.Disconnect();
+    Fiber.Sleep(30);
+    let acks = Array.Select(Array.Where(_pkts, fn(x) => x.type >= 4 && x.type <= 7), fn(x) => [x.type, arr(x.body)]);
+    checkEq(acks, [[4, [0, 7]], [5, [0, 9]], [5, [0, 9]], [7, [0, 9]]], "PUBACK 7, PUBREC 9 twice, PUBCOMP 9");
+}
+
+fn test_handlers() {
+    Console.WriteLine("== fake broker: handlers ==");
+    _pkts = [];
+    let p = fakeBroker([bytes(CONNACK_OK),
+                        bytes([0x90, 0x03, be16(1), 0x01]),
+                        bytes([0x90, 0x03, be16(2), 0x00]),
+                        { read: false, send: [publish("h/a/x", "for handler", 1, 3, 0), publish("other", "for receive", 0, 0, 0)] },
+                        nil,                     // PUBACK 3 from the client
+                        ack(4, 3),               // the handler's own QoS 1 publish
+                        { read: false, send: publish("h/a/y", "raise", 0, 0, 0) },
+                        { read: false, send: publish("h/a/z", "after", 0, 0, 0) },
+                        "drain"]);
+    let c = Mqtt.Connect("127.0.0.1", p, FAST);
+    let seen = [];
+    c.Subscribe("h/+/#", 1, fn(m) {
+        Array.Append(seen, m.payload);
+        if (m.payload == "for handler") { c.Publish("reply", "ok", { qos: 1 }); Array.Append(seen, "published"); }
+        if (m.payload == "raise") { throw(Exception.RuntimeError, "handler failure"); }
+    });
+    c.Subscribe("other", 0);
+    let r = c.Receive(1000);
+    checkEq(r?.payload, "for receive", "a topic without a handler goes to Receive");
+    let deadline = Time.Millis() + 1500;
+    while (len(seen) < 4 && Time.Millis() < deadline) { Fiber.Sleep(10); }
+    checkEq(seen, ["for handler", "published", "raise", "after"], "the handler ran, published at QoS 1 from inside, survived a throw");
+    c.Disconnect();
+    check(true, "Disconnect releases the handler that holds the client");
+}
+
+fn test_keepalive() {
+    Console.WriteLine("== fake broker: keep-alive ==");
+    _pkts = [];
+    let p = fakeBroker([bytes(CONNACK_OK), bytes([0xD0, 0x00]), "drain"]);
+    let lost = [];
+    let p2 = fakeBroker([bytes(CONNACK_OK), { pause: 900, send: nil }]);
+    let c = Mqtt.Connect("127.0.0.1", p, { timeoutMs: 300, keepAlive: 1 });
+    let c2 = Mqtt.Connect("127.0.0.1", p2, { timeoutMs: 300, keepAlive: 1, onConnectionLost: fn(why) { Array.Append(lost, why); } });
+    let t0 = Time.Millis();
+    while ((c2.IsConnected() || Time.Millis() - t0 < 1250) && Time.Millis() - t0 < 2500) { Fiber.Sleep(20); }
+    checkEq(countOf(12), 2, "PINGREQ after a second of silence, from both clients");
+    checkEq(c.IsConnected(), true, "PINGRESP keeps the link");
+    checkEq(c2.IsConnected(), false, "no PINGRESP: the link is given up");
+    check(len(lost) == 1 && String.Contains(lost[0], "PINGRESP"), "onConnectionLost names why: " + Json.Stringify(lost));
+    checkEq(c2.Receive(10), nil, "Receive on a lost client returns nil");
+    c.Disconnect();
+    c2.Disconnect();
+}
+
+fn test_malformed() {
+    Console.WriteLine("== fake broker: malformed packets ==");
+    let cases = [[bytes([0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]), "malformed remaining length"],
+                 [bytes([0x36, 0x05, str16("t"), 0, 1]), "QoS 3"],
+                 [bytes([0x32, 0x03, str16("t")]), "short PUBLISH"],
+                 [bytes([0x40, 0x01, 0x00]), "short acknowledgement"],
+                 [bytes([0xF0, 0x00]), "unexpected packet type 15"],
+                 [bytes([0x20, 0x02, 0, 0]), "unexpected packet type 2"],
+                 [bytes([0x30, 0x7F, 0x00]), "the broker closed the connection"]];
+    foreach (cs in cases) {
+        let reasons = [];
+        let p = fakeBroker([bytes(CONNACK_OK), { read: false, send: cs[0] }, { read: false, pause: 50, send: "close" }]);
+        let c = Mqtt.Connect("127.0.0.1", p, { timeoutMs: 300, keepAlive: 0, onConnectionLost: fn(why) { Array.Append(reasons, why); } });
+        let t0 = Time.Millis();
+        while (c.IsConnected() && Time.Millis() - t0 < 1500) { Fiber.Sleep(10); }
+        checkEq(c.IsConnected(), false, cs[1] + ": the link is closed");
+        check(len(reasons) == 1 && String.Contains(reasons[0], cs[1]), cs[1] + ": reason " + Json.Stringify(reasons));
+        c.Disconnect();
+    }
+    let p2 = fakeBroker([bytes(CONNACK_OK), { read: false, send: bytes([0x30, 0x84, 0x80, 0x80, 0x08]) }]);
+    let lost = [];
+    let c2 = Mqtt.Connect("127.0.0.1", p2, { timeoutMs: 300, keepAlive: 0, maxPacketBytes: 1000, onConnectionLost: fn(why) { Array.Append(lost, why); } });
+    let t1 = Time.Millis();
+    while (c2.IsConnected() && Time.Millis() - t1 < 1000) { Fiber.Sleep(10); }
+    check(len(lost) == 1 && String.Contains(lost[0], "maxPacketBytes"), "a 16 MB packet over maxPacketBytes is refused unread: " + Json.Stringify(lost));
+    c2.Disconnect();
+}
+
+fn test_unsubscribe_and_errors() {
+    Console.WriteLine("== fake broker: unsubscribe, bad arguments ==");
+    _pkts = [];
+    let p = fakeBroker([bytes(CONNACK_OK), bytes([0x90, 0x04, be16(1), 0x00, 0x02]), bytes([0xB0, 0x02, be16(2)]), "drain"]);
+    let c = Mqtt.Connect("127.0.0.1", p, FAST);
+    checkEq(c.Subscribe({ "a/b": 0, "c/#": 2 }), [0, 2], "Subscribe with an object of filter: qos");
+    checkEq(c.Unsubscribe(["a/b", "c/#"]), nil, "Unsubscribe waits for UNSUBACK");
+    let un = pktOf(10);
+    checkEq([un?.flags, arr(un?.body ?? bytes([]))], [2, arr(bytes([be16(2), str16("a/b"), str16("c/#")]))], "UNSUBSCRIBE body");
+    check(raised(fn() { c.Publish("a/+", "x"); }) != nil, "publishing to a wildcard raises");
+    check(raised(fn() { c.Publish("", "x"); }) != nil, "publishing to an empty topic raises");
+    check(raised(fn() { c.Subscribe("a/#/b"); }) != nil, "a misplaced # raises");
+    check(raised(fn() { c.Publish("t", "x", { qos: 3 }); }) != nil, "QoS 3 raises");
+    c.Disconnect();
+}
+
+fn test_reconnect() {
+    Console.WriteLine("== fake broker: reconnect ==");
+    _pkts = [];
+    let p = fakeBroker([bytes(CONNACK_OK),
+                        bytes([0x90, 0x03, be16(1), 0x01]),
+                        { send: "close" },                    // takes the QoS 1 PUBLISH, hangs up
+                        "next",
+                        bytes(CONNACK_OK),                    // the second CONNECT
+                        bytes([0x90, 0x03, be16(3), 0x01]),    // SUBSCRIBE again
+                        ack(4, 2),                            // the resent PUBLISH (DUP)
+                        { read: false, send: publish("re/x", "back", 0, 0, 0) },
+                        "drain"]);
+    let lost = [];
+    let c = Mqtt.Connect("127.0.0.1", p, { timeoutMs: 1500, keepAlive: 0, reconnect: true, reconnectMinMs: 50,
+                                           onConnectionLost: fn(why) { Array.Append(lost, why); } });
+    c.Subscribe("re/#", 1);
+    checkEq(c.Publish("re/q", "survives", { qos: 1 }), true, "a QoS 1 publish completes across a reconnect");
+    checkEq(c.Receive(1000)?.payload, "back", "messages flow on the new connection");
+    checkEq(len(lost), 1, "onConnectionLost once");
+    c.Disconnect();
+    Fiber.Sleep(30);
+    checkEq(countOf(1), 2, "two CONNECTs");
+    checkEq(countOf(8), 2, "the subscription was sent again");
+    let pubs = Array.Where(_pkts, fn(x) => x.type == 3);
+    checkEq(Array.Select(pubs, fn(x) => x.flags), [0x2, 0xA], "the resent PUBLISH carries DUP");
+
+    _pkts = [];
+    let p2 = fakeBroker([bytes(CONNACK_OK), { read: false, send: "close" }, "next", bytes(CONNACK_OK), "drain"]);
+    let m = Mqtt.Connect("127.0.0.1", p2, FAST);
+    let t0 = Time.Millis();
+    while (m.IsConnected() && Time.Millis() - t0 < 1000) { Fiber.Sleep(10); }
+    checkEq(m.IsConnected(), false, "without reconnect a dropped link stays down");
+    checkEq(kindOf(raised(fn() { m.Publish("t", "x"); })), "closed", "and Publish says so");
+    checkEq(m.Connect().sessionPresent, false, "Connect again by hand");
+    checkEq(m.Publish("t", "again"), true, "and publish on the new link");
+    m.Disconnect();
+    Fiber.Sleep(30);
+    checkEq(Array.Select(_pkts, fn(x) => x.type), [1, 1, 3, 14], "two CONNECTs, the PUBLISH, DISCONNECT");
+}
+
+fn test_v5() {
+    Console.WriteLine("== fake broker: MQTT 5 ==");
+    _pkts = [];
+    let p = fakeBroker([bytes([0x20, 0x03, 0x00, 0x00, 0x00]), "drain"]);
+    let c = Mqtt.Connect("127.0.0.1", p, { timeoutMs: 400, keepAlive: 0, protocolVersion: 5, clientId: "v5" });
+    let cp = pktOf(1);
+    checkEq(arr(cp?.body ?? bytes([])), arr(bytes([str16("MQTT"), 5, 0x02, be16(0), 0x00, str16("v5")])), "CONNECT level 5 with empty properties");
+    c.Disconnect();
+
+    _pkts = [];
+    let p2 = fakeBroker([bytes([0x20, 0x03, 0x00, 0x00, 0x00]),
+                         bytes([0x90, 0x04, be16(1), 0x00, 0x01]),
+                         bytes([0x40, 0x04, be16(2), 0x87, 0x00]),
+                         bytes([0x40, 0x03, be16(3), 0x10]),
+                         { read: false, send: bytes([0x30, 0x0A, str16("t"), 0x05, 0x02, 0, 0, 0, 0x3C, "x"]) },
+                         "drain"]);
+    let c2 = Mqtt.Connect("127.0.0.1", p2, { timeoutMs: 400, keepAlive: 0, protocolVersion: 5 });
+    checkEq(c2.Subscribe("t", 1), [1], "MQTT 5 SUBACK after its property length");
+    let e = raised(fn() { c2.Publish("t", "x", { qos: 1 }); });
+    checkEq([kindOf(e), e?.Reason], ["refused", 0x87], "PUBACK reason 0x87: refused");
+    checkEq(c2.Publish("t", "y", { qos: 1 }), true, "PUBACK reason 0x10 (no subscribers) is success");
+    let m = c2.Receive(1000);
+    checkEq(m?.payload, "x", "an incoming PUBLISH with properties (message expiry) skips them");
+    let sub = pktOf(8);
+    checkEq(arr(sub?.body ?? bytes([])), arr(bytes([be16(1), 0x00, str16("t"), 1])), "MQTT 5 SUBSCRIBE: property length and options byte");
+    c2.Disconnect();
+
+    let p3 = fakeBroker([bytes([0x20, 0x03, 0x00, 0x86, 0x00])]);
+    let e3 = raised(fn() { Mqtt.Connect("127.0.0.1", p3, { timeoutMs: 400, protocolVersion: 5 }); });
+    checkEq([kindOf(e3), e3?.Reason], ["refused", 0x86], "CONNACK reason 0x86");
+    check(e3 != nil && String.Contains(e3.Error, "bad user name or password"), "named");
+}
+
+fn test_dropped_client() {
+    Console.WriteLine("== fake broker: a dropped client ==");
+    _pkts = [];
+    let p = fakeBroker([bytes(CONNACK_OK), "drain"]);
+    var c = Mqtt.Connect("127.0.0.1", p, FAST);
+    c = nil;
+    Fiber.Sleep(50);
+    checkEq(countOf(14), 1, "a client dropped without Disconnect disconnects itself");
+}
+
+// ---- TLS ----------------------------------------------------------------------
+
+// A self-signed certificate for localhost as a PKCS#12 bundle (password
+// "pw"), or nil when openssl is missing or this build cannot serve TLS.
+fn tlsFixture() {
+    if (!Stream.TlsServerAvailable() || Os.Which("openssl") == nil) { return nil; }
+    let dir = Path.Combine(Os.TempDir(), "flaris-mqtt-tls-" + str(Os.Pid()));
+    Directory.Create(dir);
+    let f = { dir: dir, key: Path.Combine(dir, "key.pem"), cert: Path.Combine(dir, "cert.pem"), p12: Path.Combine(dir, "server.p12") };
+    let req = Os.RunEx("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", f.key, "-out", f.cert, "-days", "2", "-nodes",
+                                   "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"]);
+    let p12 = (req != nil && req.Exit == 0) ? Os.RunEx("openssl", ["pkcs12", "-export", "-out", f.p12, "-inkey", f.key, "-in", f.cert, "-passout", "pass:pw"]) : nil;
+    if (p12 == nil || p12.Exit != 0) { tlsCleanup(f); return nil; }
+    return f;
+}
+
+fn tlsCleanup(f) {
+    foreach (p in [f.key, f.cert, f.p12]) { if (File.Exists(p)) { File.Delete(p); } }
+    Directory.Delete(f.dir);
+}
+
+fn test_tls() {
+    Console.WriteLine("== fake broker: TLS ==");
+    let f = tlsFixture();
+    if (f == nil) { Console.WriteLine("  skipped: no openssl, or no TLS server in this build"); return; }
+    _pkts = [];
+    let lp = listenLoopback();
+    let ls = lp[0];
+    Fiber.Run(fn() {
+        iter (k from 0 to 2) {
+            if (Stream.WaitReadable(ls, 3000) == nil) { break; }
+            let c = Stream.Accept(ls);
+            let t = Stream.AcceptTls(c, { pkcs12File: f.p12, password: "pw", handshakeTimeoutMs: 2000 });
+            if (t == nil) { continue; }
+            let p = readPacket(t, 2000);
+            if (p != nil) {
+                Array.Append(_pkts, p);
+                Stream.WriteAll(t, bytes(CONNACK_OK));
+                let q = readPacket(t, 2000);
+                if (q != nil) { Array.Append(_pkts, q); Stream.WriteAll(t, bytes([0x40, 0x02, q.body[5], q.body[6]])); }
+                let d = readPacket(t, 2000);
+                if (d != nil) { Array.Append(_pkts, d); }
+            }
+            Stream.Close(t);
+        }
+        Stream.Close(ls);
+    });
+    checkEq(kindOf(raised(fn() { Mqtt.Connect("127.0.0.1", lp[1], { tls: true, timeoutMs: 2000 }); })), "tls", "a self-signed certificate is refused by default");
+    let c = Mqtt.Connect("127.0.0.1", lp[1], { tls: true, insecure: true, timeoutMs: 2000, keepAlive: 0 });
+    checkEq(c.IsConnected(), true, "CONNECT over TLS");
+    checkEq(c.Publish("t/x", "secret", { qos: 1 }), true, "a QoS 1 publish acknowledged over TLS");
+    c.Disconnect();
+    Fiber.Sleep(30);
+    checkEq(Array.Select(_pkts, fn(x) => x.type), [1, 3, 14], "CONNECT, PUBLISH and DISCONNECT went through TLS");
+    tlsCleanup(f);
+}
+
+// ---- echo broker for the benchmarks -------------------------------------------
+
+// Answers CONNECT, SUBSCRIBE and PINGREQ, acknowledges QoS 1, and sends every
+// PUBLISH back at QoS 0 once anything is subscribed.
+fn echoBroker(): int {
+    let lp = listenLoopback();
+    let ls = lp[0];
+    Fiber.Run(fn() {
+        if (Stream.WaitReadable(ls, 3000) == nil) { Stream.Close(ls); return; }
+        let c = Stream.Accept(ls);
+        Stream.WaitReadable(c, 1);
+        var subscribed = false;
+        while (true) {
+            let p = readPacket(c, 5000);
+            if (p == nil) { break; }
+            if (p.type == 1) { Stream.WriteAll(c, bytes(CONNACK_OK)); }
+            else if (p.type == 8) { subscribed = true; Stream.WriteAll(c, bytes([0x90, 0x03, p.body[0], p.body[1], 0x01])); }
+            else if (p.type == 12) { Stream.WriteAll(c, bytes([0xD0, 0x00])); }
+            else if (p.type == 14) { break; }
+            else if (p.type == 3) {
+                let qos = (p.flags >> 1) & 3;
+                let tl = (p.body[0] << 8) | p.body[1];
+                if (qos == 1) { Stream.WriteAll(c, bytes([0x40, 0x02, p.body[2 + tl], p.body[3 + tl]])); }
+                if (subscribed) {
+                    let off = 2 + tl + ((qos > 0) ? 2 : 0);
+                    let rest = bytes([Buffer.Slice(p.body, 0, 2 + tl), Buffer.Slice(p.body, off, len(p.body) - off)]);
+                    Stream.WriteAll(c, bytes([0x30, Mqtt.EncodeLength(len(rest)), rest]));
+                }
+            }
+        }
+        Stream.Close(c);
+        Stream.Close(ls);
+    });
+    return lp[1];
+}
+
+// ---- live -------------------------------------------------------------------
+
+fn liveTarget() {
+    let host = Os.Getenv("MQTT_TEST_HOST") ?? "127.0.0.1";
+    let port = int(Os.Getenv("MQTT_TEST_PORT") ?? "1883");
+    if (!Net.IsReachable(host, port, 300)) {
+        Console.WriteLine("== live: skipped (no MQTT broker on " + host + ":" + str(port) + ") ==");
+        return nil;
+    }
+    return { host: host, port: port };
+}
+
+fn randomBase(): string {
+    let b = Crypto.RandomBytes(4);
+    var out = "flaris/mqtt/test/";
+    iter (i from 0 to 4) { out += Convert.ToRadixString(b[i] + 256, 16); }
+    return out + "/";
+}
+
+fn test_live(t) {
+    if (t == nil) { return; }
+    Console.WriteLine("== live ==");
+    let base = randomBase();
+    let sub = Mqtt.Connect(t.host, t.port, { keepAlive: 10 });
+    let pub = Mqtt.Connect(t.host, t.port, { keepAlive: 10 });
+    checkEq(sub.Subscribe(base + "q/#", 2), [2], "SUBSCRIBE granted QoS 2");
+    pub.Publish(base + "q/0", "zero");
+    pub.Publish(base + "q/1", "one", { qos: 1 });
+    pub.Publish(base + "q/2", "two", { qos: 2 });
+    let got = [];
+    iter (i from 0 to 3) { let m = sub.Receive(2000); Array.Append(got, [m?.topic, m?.payload, m?.qos]); }
+    checkEq(got, [[base + "q/0", "zero", 0], [base + "q/1", "one", 1], [base + "q/2", "two", 2]], "QoS 0, 1 and 2 in order");
+
+    let order = [];
+    iter (i from 0 to 200) { pub.Publish(base + "q/seq", str(i), { qos: 1 }); }
+    iter (i from 0 to 200) { Array.Append(order, int(sub.Receive(2000)?.payload ?? "-1")); }
+    let expected = [];
+    iter (i from 0 to 200) { Array.Append(expected, i); }
+    checkEq(order, expected, "200 QoS 1 messages in order");
+
+    // Binary payloads.
+    let bsub = Mqtt.Connect(t.host, t.port, { binary: true });
+    bsub.Subscribe(base + "bin", 1);
+    let all = Buffer.Create(256, 1);
+    iter (i from 0 to 256) { all[i] = i; }
+    pub.Publish(base + "bin", all, { qos: 1 });
+    let bm = bsub.Receive(2000);
+    check(bm != nil && Type.IsBlock(bm.payload) && Buffer.Equals(bm.payload, all), "all 256 byte values arrive as a block");
+    let big = String.Repeat("0123456789abcdef", 65536);
+    pub.Publish(base + "bin", big, { qos: 1 });
+    checkEq(len(bsub.Receive(3000)?.payload ?? Buffer.Create(0, 1)), 1048576, "a 1 MB payload");
+    bsub.Disconnect();
+
+    // Retained messages.
+    pub.Publish(base + "retained", "kept", { qos: 1, retain: true });
+    let late = Mqtt.Connect(t.host, t.port);
+    late.Subscribe(base + "retained", 1);
+    let rm = late.Receive(2000);
+    checkEq([rm?.payload, rm?.retain], ["kept", true], "a new subscriber gets the retained message");
+    pub.Publish(base + "retained", "", { qos: 1, retain: true });
+    checkEq(late.Receive(2000)?.payload, "", "the delete reaches current subscribers as an empty message");
+    late.Unsubscribe(base + "retained");
+    late.Subscribe(base + "retained", 1);
+    checkEq(late.Receive(300), nil, "an empty retained payload deleted it");
+    late.Disconnect();
+
+    // Wildcards and handlers.
+    let w = Mqtt.Connect(t.host, t.port);
+    let viaHandler = [];
+    w.Subscribe(base + "home/+/temp", 1, fn(m) { Array.Append(viaHandler, m.topic); });
+    w.Subscribe(base + "home/+/light", 0);
+    pub.Publish(base + "home/kitchen/temp", "21", { qos: 1 });
+    pub.Publish(base + "home/kitchen/light", "on", { qos: 1 });
+    let wm = w.Receive(2000);
+    checkEq(wm?.topic, base + "home/kitchen/light", "a topic without a handler goes to Receive");
+    let deadline = Time.Millis() + 2000;
+    while (len(viaHandler) == 0 && Time.Millis() < deadline) { Fiber.Sleep(10); }
+    checkEq(viaHandler, [base + "home/kitchen/temp"], "the + handler took its topic");
+    w.Unsubscribe([base + "home/+/temp", base + "home/+/light"]);
+    pub.Publish(base + "home/kitchen/temp", "22", { qos: 1 });
+    checkEq(w.Receive(300), nil, "nothing after Unsubscribe");
+    w.Disconnect();
+
+    // The last will: published when a client vanishes, not after Disconnect.
+    let watcher = Mqtt.Connect(t.host, t.port);
+    watcher.Subscribe(base + "will/#", 1);
+    let polite = Mqtt.Connect(t.host, t.port, { will: { topic: base + "will/polite", payload: "gone", qos: 1 } });
+    polite.Disconnect();
+    let crash = Mqtt.Connect(t.host, t.port, { will: { topic: base + "will/crash", payload: "crashed", qos: 1 } });
+    crash.Abort();
+    let wl = watcher.Receive(3000);
+    checkEq([wl?.topic, wl?.payload], [base + "will/crash", "crashed"], "the will of the client that vanished, and only that one");
+    checkEq(watcher.Receive(300), nil, "no will after a clean Disconnect");
+    watcher.Disconnect();
+
+    // MQTT 5.
+    let v5 = Mqtt.Connect(t.host, t.port, { protocolVersion: 5 });
+    checkEq(v5.Subscribe(base + "v5/#", 2), [2], "MQTT 5 SUBSCRIBE");
+    v5.Publish(base + "v5/a", "five", { qos: 2 });
+    v5.Publish(base + "v5/b", "four", { qos: 1 });
+    pub.Publish(base + "v5/c", "from 3.1.1", { qos: 1 });
+    let v5got = [];
+    iter (i from 0 to 3) { Array.Append(v5got, v5.Receive(2000)?.payload); }
+    checkEq(v5got, ["five", "four", "from 3.1.1"], "MQTT 5 round trips, QoS 2 and 1, and a 3.1.1 sender");
+    v5.Disconnect();
+
+    // Persistent session: QoS 1 messages queued while away.
+    let id = "flaris-test-" + String.Substr(base, 17, 8);
+    let ps = Mqtt.Connect(t.host, t.port, { clientId: id, cleanSession: false });
+    ps.Subscribe(base + "persist", 1);
+    ps.Disconnect();
+    pub.Publish(base + "persist", "while away", { qos: 1 });
+    let back = new MqttClient(t.host, t.port, { clientId: id, cleanSession: false });
+    checkEq(back.Connect().sessionPresent, true, "the broker kept the session");
+    checkEq(back.Receive(2000)?.payload, "while away", "and the message queued for it");
+    back.Disconnect();
+    let wipe = Mqtt.Connect(t.host, t.port, { clientId: id, cleanSession: true });
+    wipe.Disconnect();
+
+    sub.Disconnect();
+    pub.Disconnect();
+}
+
+// ---- benchmarks -------------------------------------------------------------
+
+fn throughput(label: string, host: string, port: int, topic: string, n: int, qos: int) {
+    let s = Mqtt.Connect(host, port, { keepAlive: 0 });
+    let p = Mqtt.Connect(host, port, { keepAlive: 0 });
+    s.Subscribe(topic, qos);
+    let t0 = Time.Ticks();
+    var received = 0;
+    let reader = Fiber.New(fn() {
+        while (received < n) {
+            if (s.Receive(3000) == nil) { break; }
+            received += 1;
+        }
+        return received;
+    });
+    Fiber.Resume(reader, true);
+    iter (i from 0 to n) { p.Publish(topic, "payload-0123456789", { qos: qos }); }
+    let got = Fiber.Await(reader);
+    let ms = Time.TicksToMs(Time.Ticks() - t0);
+    Console.WriteLine(String.PadRight(label, 48), String.PadLeft(str(int(float(got) * 1000.0 / ms)), 9), " msg/s  (",
+                      got, " of ", n, " in ", String.FormatArray("{0:.1f}", [ms]), " ms)");
+    s.Disconnect();
+    p.Disconnect();
+}
+
+fn run_benchmarks(t) {
+    Console.WriteLine("");
+    Console.WriteLine("== benchmarks ==");
+    Test.Bench("EncodePublish: 20-byte payload", fn() { _sink += len(Mqtt.EncodePublish("sensors/kitchen/temp", "21.5 degrees celsius", { qos: 1, packetId: 7 })); }, 20000);
+    Test.Bench("TopicMatches: home/+/temp/#", fn() { if (Mqtt.TopicMatches("home/+/temp/#", "home/kitchen/temp/now")) { _sink += 1; } }, 50000);
+    let lenBlock = Mqtt.EncodeLength(2097152);
+    Test.Bench("DecodeLength: 4 bytes", fn() { _sink += Mqtt.DecodeLength(lenBlock)[0]; }, 50000);
+
+    let p = echoBroker();
+    let c = Mqtt.Connect("127.0.0.1", p, { keepAlive: 0 });
+    Test.Bench("fake broker: QoS 1 publish round trip", fn() { c.Publish("bench/q1", "payload", { qos: 1 }); }, 2000);
+    c.Disconnect();
+    let p2 = echoBroker();
+    let e = Mqtt.Connect("127.0.0.1", p2, { keepAlive: 0 });
+    e.Subscribe("bench/#", 0);
+    let t0 = Time.Ticks();
+    let n = 5000;
+    iter (i from 0 to n) { e.Publish("bench/q0", "payload-0123456789"); }
+    var got = 0;
+    while (got < n) {
+        if (e.Receive(2000) == nil) { break; }
+        got += 1;
+    }
+    let ms = Time.TicksToMs(Time.Ticks() - t0);
+    Console.WriteLine(String.PadRight("fake broker: QoS 0 publish + echo", 48), String.PadLeft(str(int(float(got) * 1000.0 / ms)), 9), " msg/s");
+    e.Disconnect();
+
+    if (t == nil) { return; }
+    let base = randomBase();
+    throughput("mosquitto: QoS 0 publisher -> subscriber", t.host, t.port, base + "bench0", 10000, 0);
+    throughput("mosquitto: QoS 1 publisher -> subscriber", t.host, t.port, base + "bench1", 2000, 1);
+    let q = Mqtt.Connect(t.host, t.port, { keepAlive: 0 });
+    Test.Bench("mosquitto: QoS 1 publish round trip", fn() { q.Publish(base + "rt", "payload", { qos: 1 }); }, 1000);
+    Test.Bench("mosquitto: QoS 2 publish round trip", fn() { q.Publish(base + "rt", "payload", { qos: 2 }); }, 500);
+    q.Disconnect();
+}
+
+fn async Main() {
+    Console.WriteLine("=== Mqtt tests ===");
+    test_codec();
+    test_topics();
+    test_connect();
+    test_publish_flows();
+    test_inbound();
+    test_handlers();
+    test_keepalive();
+    test_malformed();
+    test_unsubscribe_and_errors();
+    test_reconnect();
+    test_v5();
+    test_dropped_client();
+    test_tls();
+    let live = liveTarget();
+    test_live(live);
+    run_benchmarks(live);
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: ", testsRun, "  failed: ", testsFailed);
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

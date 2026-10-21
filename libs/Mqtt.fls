@@ -1,0 +1,1013 @@
+// Mqtt.fls - MQTT client in pure Flaris: MQTT 3.1.1, and 5.0 on request.
+// Version: 1.0
+//
+// Connects to any MQTT broker (Mosquitto, EMQX, HiveMQ, AWS IoT, ...) over a
+// Stream socket, plain or TLS, with no plugin and no --unsafe. Publish at QoS
+// 0, 1 and 2 with the full acknowledgement flows, retained messages, the last
+// will, subscriptions with + and # wildcards, keep-alive pings, and an
+// automatic reconnect that restores the subscriptions and resends what was
+// not acknowledged. A reader fiber per connection takes packets off the
+// socket, so every wait parks only the fiber that waits.
+//
+// MQTT 5 (protocolVersion: 5) speaks the 5.0 packet layout with empty
+// property sets: reason codes are checked, properties the broker sends are
+// skipped. Not covered: MQTT 5 properties (user properties, topic aliases,
+// message expiry, enhanced AUTH), MQTT over WebSockets, and a session that
+// outlives the process (unacknowledged QoS 1/2 messages live in memory only).
+//
+// Usage:
+//   import { Mqtt, MqttClient, MqttError } from library("Mqtt", "1.0");
+//
+//   let c = Mqtt.Connect("127.0.0.1", 1883, { clientId: "sensor-7", keepAlive: 30 });
+//   c.Subscribe("home/+/temp", 1, fn(m) { Console.WriteLine(m.topic, " = ", m.payload); });
+//   c.Publish("home/kitchen/temp", "21.5", { qos: 1, retain: true });
+//   c.Subscribe("alerts/#", 2);                    // no handler: read with Receive
+//   let m = c.Receive(5000);                       // { topic, payload, qos, retain, dup } | nil
+//   c.Disconnect();
+//
+// Connecting:
+//   Mqtt.Connect(host, port?, opts?) -> MqttClient    connected; raises MqttError
+//   new MqttClient(host, port?, opts?), then Connect() -> { sessionPresent }
+//   port defaults to 1883, or 8883 with tls.
+//   opts:
+//     clientId          default "flaris-" and 16 random hex digits
+//     cleanSession      default true (cleanStart in MQTT 5)
+//     keepAlive         seconds between pings when idle, default 60; 0 = none
+//     username, password   password may be a string or a block
+//     will              { topic, payload, qos?, retain? } published by the
+//                       broker when this client vanishes without Disconnect
+//     protocolVersion   4 (MQTT 3.1.1, default) or 5
+//     tls               true: TLS from the first byte
+//     insecure          accept any certificate (self-signed test brokers)
+//     sni               the name to verify the certificate against (default host)
+//     timeoutMs         how long connecting and each acknowledgement may take,
+//                       default 10000
+//     binary            payloads arrive as blocks instead of strings
+//     reconnect         true: reconnect after a lost connection, with a delay
+//                       from reconnectMinMs (500) doubling to reconnectMaxMs (30000)
+//     onMessage         fn(msg) for messages no subscription handler took
+//     onConnectionLost  fn(reason) when the link drops (before any reconnect)
+//     maxPacketBytes    larger incoming packets close the link, default 16 MB
+//
+// Publishing:
+//   Publish(topic, payload, opts?) -> true     opts: { qos: 0|1|2, retain: bool }
+//   payload is a string or a block. QoS 0 returns once written; QoS 1 waits
+//   for PUBACK, QoS 2 for PUBREC and PUBCOMP (sending PUBREL in between).
+//   A missing acknowledgement raises MqttError "timeout" after timeoutMs.
+//   An empty retained payload deletes the retained message of that topic.
+//
+// Subscribing:
+//   Subscribe(filters, qos?, handler?) -> granted QoS per filter (128 = refused)
+//     filters is one filter, an array of them, or { filter: qos, ... }.
+//     handler(msg) gets every message matching these filters; without one
+//     they go to onMessage, or wait for Receive.
+//   Unsubscribe(filters)
+//   Receive(timeoutMs?) -> msg | nil    the next message for nobody's handler;
+//                                       nil after timeoutMs (omitted: no limit)
+//                                       or once the client is closed
+//   msg: { topic, payload, qos, retain, dup }
+//   Handlers run one at a time on a fiber of their own, so a handler may
+//   publish and wait for its acknowledgement; one that raises is reported on
+//   stderr. A retained message arrives with retain set.
+//
+// State:
+//   IsConnected()  SessionPresent()  ClientId()  Pending() -> messages waiting
+//   for Receive  OnMessage(fn) sets the handler for messages no other takes.
+//   Connect() again after a lost link (without reconnect) opens a new one.
+//
+// Closing:
+//   Disconnect()   sends DISCONNECT: the broker discards the will
+//   Abort()        drops the socket without DISCONNECT: the broker publishes the will
+//   Handlers are released on either, which ends any reference cycle a handler
+//   that uses the client would form.
+//
+// Errors raise MqttError: Kind "connect", "tls", "refused" (the CONNACK
+// return code, or MQTT 5 reason code, in Reason), "timeout", "closed" or
+// "protocol".
+//
+// Helpers:
+//   Mqtt.TopicMatches(filter, topic) -> bool    the broker's matching rules,
+//                                               $-topics excluded from wildcards
+//   Mqtt.ValidTopic(topic) / Mqtt.ValidFilter(filter) -> bool
+//   Mqtt.EncodeLength(n) -> block / Mqtt.DecodeLength(block, offset?) -> [value, bytes] | nil
+//   Mqtt.EncodePublish(topic, payload, opts?) -> block    one PUBLISH packet;
+//     opts: { qos, retain, dup, packetId, protocolVersion }
+
+const _DEFAULT_PORT = 1883;
+const _DEFAULT_TLS_PORT = 8883;
+const _DEFAULT_TIMEOUT_MS = 10000;
+const _MAX_REMAINING = 268435455;
+
+const _T_CONNECT = 1;
+const _T_CONNACK = 2;
+const _T_PUBLISH = 3;
+const _T_PUBACK = 4;
+const _T_PUBREC = 5;
+const _T_PUBREL = 6;
+const _T_PUBCOMP = 7;
+const _T_SUBSCRIBE = 8;
+const _T_SUBACK = 9;
+const _T_UNSUBSCRIBE = 10;
+const _T_UNSUBACK = 11;
+const _T_PINGREQ = 12;
+const _T_PINGRESP = 13;
+const _T_DISCONNECT = 14;
+
+class MqttError : Exception {
+    let Kind: string = "";   // connect | tls | refused | timeout | closed | protocol
+    let Reason: int = 0;     // CONNACK return code or MQTT 5 reason code
+}
+
+fn _mqttErr(kind: string, msg: string, reason: int) {
+    let e = new MqttError(Exception.IOError, msg);
+    e.Kind = kind;
+    e.Reason = reason;
+    return e;
+}
+
+// ---- codec --------------------------------------------------------------------
+
+fn _varintSize(n: int): int {
+    if (n < 128) { return 1; }
+    if (n < 16384) { return 2; }
+    if (n < 2097152) { return 3; }
+    return 4;
+}
+
+// n as a variable byte integer at off; returns the offset after it.
+fn _putVarint(b: block, off: int, n: int): int {
+    var v: int = n;
+    var o: int = off;
+    var more: bool = true;
+    while (more) {
+        var d: int = v & 127;
+        v = v >> 7;
+        more = v > 0;
+        if (more) { d = d | 128; }
+        b[o] = d;
+        o += 1;
+    }
+    return o;
+}
+
+// The variable byte integer at off as value * 8 + its length (1-4); -1 when
+// the block ends inside it, -2 when it runs past four bytes.
+fn _getVarint(b: block, off: int, end: int): int {
+    var v: int = 0;
+    var mult: int = 1;
+    var i: int = 0;
+    while (i < 4) {
+        if (off + i >= end) { return -1; }
+        let d: int = b[off + i];
+        v += (d & 127) * mult;
+        i += 1;
+        if ((d & 128) == 0) { return v * 8 + i; }
+        mult *= 128;
+    }
+    return -2;
+}
+
+fn _putU16(b: block, off: int, v: int): int {
+    b[off] = (v >> 8) & 255;
+    b[off + 1] = v & 255;
+    return off + 2;
+}
+
+fn _getU16(b: block, off: int): int {
+    return (b[off] << 8) | b[off + 1];
+}
+
+// A length-prefixed string (or binary field) at off; returns the offset after it.
+fn _putStr(b: block, off: int, s: string): int {
+    let n: int = String.Length(s);
+    let o: int = _putU16(b, off, n);
+    if (n > 0) { Buffer.CopyStringAt(b, o, s, n); }
+    return o + n;
+}
+
+fn _putBin(b: block, off: int, data: block): int {
+    let n: int = len(data);
+    let o: int = _putU16(b, off, n);
+    if (n > 0) { Buffer.Copy(data, 0, b, o, n); }
+    return o + n;
+}
+
+// One PUBLISH packet. v5 adds the (empty) property length.
+fn _publishPacket(topic: string, payload: block, qos: int, retain: bool, dup: bool, pid: int, v5: bool): block {
+    let tl: int = String.Length(topic);
+    let pl: int = len(payload);
+    var rem: int = 2 + tl + pl;
+    if (qos > 0) { rem += 2; }
+    if (v5) { rem += 1; }
+    let b: block = Buffer.Create(1 + _varintSize(rem) + rem, 1);
+    var h: int = 48 | (qos << 1);
+    if (retain) { h = h | 1; }
+    if (dup) { h = h | 8; }
+    b[0] = h;
+    var o: int = _putVarint(b, 1, rem);
+    o = _putStr(b, o, topic);
+    if (qos > 0) { o = _putU16(b, o, pid); }
+    if (v5) { b[o] = 0; o += 1; }
+    if (pl > 0) { Buffer.Copy(payload, 0, b, o, pl); }
+    return b;
+}
+
+// PUBACK, PUBREC, PUBREL or PUBCOMP for pid.
+fn _ackPacket(type: int, pid: int): block {
+    let b: block = Buffer.Create(4, 1);
+    b[0] = (type << 4) | ((type == _T_PUBREL) ? 2 : 0);
+    b[1] = 2;
+    _putU16(b, 2, pid);
+    return b;
+}
+
+fn _bytes(v): block {
+    if (v == nil) { return Buffer.Create(0, 1); }
+    if (Type.IsBlock(v)) { return v; }
+    return Buffer.FromString(Type.IsString(v) ? v : str(v));
+}
+
+fn _connectPacket(clientId: string, clean: bool, keepAlive: int, user, password, will, v5: bool): block {
+    var rem = 10 + 2 + String.Length(clientId);
+    if (v5) { rem += 1; }
+    var flags = 0;
+    if (clean) { flags = flags | 2; }
+    var willTopic = "";
+    var willPayload = nil;
+    if (will != nil) {
+        willTopic = will.topic;
+        willPayload = _bytes(Object.TryGet(will, "payload", nil));
+        let wq = Object.TryGet(will, "qos", 0) ?? 0;
+        flags = flags | 4 | (wq << 3);
+        if (Object.TryGet(will, "retain", false) == true) { flags = flags | 32; }
+        rem += 2 + String.Length(willTopic) + 2 + len(willPayload);
+        if (v5) { rem += 1; }
+    }
+    var pw = nil;
+    if (user != nil) { flags = flags | 128; rem += 2 + String.Length(user); }
+    if (password != nil) { pw = _bytes(password); flags = flags | 64; rem += 2 + len(pw); }
+    let b = Buffer.Create(1 + _varintSize(rem) + rem, 1);
+    b[0] = _T_CONNECT << 4;
+    var o = _putVarint(b, 1, rem);
+    o = _putStr(b, o, "MQTT");
+    b[o] = v5 ? 5 : 4;
+    b[o + 1] = flags;
+    o = _putU16(b, o + 2, keepAlive);
+    if (v5) { b[o] = 0; o += 1; }
+    o = _putStr(b, o, clientId);
+    if (will != nil) {
+        if (v5) { b[o] = 0; o += 1; }
+        o = _putStr(b, o, willTopic);
+        o = _putBin(b, o, willPayload);
+    }
+    if (user != nil) { o = _putStr(b, o, user); }
+    if (pw != nil) { o = _putBin(b, o, pw); }
+    return b;
+}
+
+// SUBSCRIBE (qos per filter) or, with qos nil, UNSUBSCRIBE.
+fn _subPacket(pid: int, filters, qos, v5: bool): block {
+    var rem = 2;
+    if (v5) { rem += 1; }
+    foreach (f in filters) { rem += 2 + String.Length(f) + ((qos != nil) ? 1 : 0); }
+    let b = Buffer.Create(1 + _varintSize(rem) + rem, 1);
+    b[0] = (qos != nil) ? 0x82 : 0xA2;
+    var o = _putVarint(b, 1, rem);
+    o = _putU16(b, o, pid);
+    if (v5) { b[o] = 0; o += 1; }
+    iter (i from 0 to len(filters)) {
+        o = _putStr(b, o, filters[i]);
+        if (qos != nil) { b[o] = qos[i]; o += 1; }
+    }
+    return b;
+}
+
+// ---- topics -------------------------------------------------------------------
+
+// The broker's matching: + is one level, # the rest (the parent level
+// included), and a wildcard at the start never matches a $ topic.
+fn _matches(filter: string, topic: string): bool {
+    let fl: int = String.Length(filter);
+    let tl: int = String.Length(topic);
+    if (tl > 0 && fl > 0 && String.CharAt(topic, 0) == '$') {
+        let f0: char = String.CharAt(filter, 0);
+        if (f0 == '+' || f0 == '#') { return false; }
+    }
+    var fi: int = 0;
+    var ti: int = 0;
+    while (fi < fl) {
+        let c: char = String.CharAt(filter, fi);
+        if (c == '#') { return true; }
+        if (c == '+') {
+            while (ti < tl && String.CharAt(topic, ti) != '/') { ti += 1; }
+            fi += 1;
+            continue;
+        }
+        if (ti >= tl) {
+            return c == '/' && fi + 2 == fl && String.CharAt(filter, fi + 1) == '#';
+        }
+        if (c != String.CharAt(topic, ti)) { return false; }
+        fi += 1;
+        ti += 1;
+    }
+    return ti == tl;
+}
+
+fn _validFilter(f: string): bool {
+    let n: int = String.Length(f);
+    if (n == 0 || n > 65535) { return false; }
+    iter (i from 0 to n) {
+        let c: char = String.CharAt(f, i);
+        if (c == '\0') { return false; }
+        if (c == '#') {
+            if (i != n - 1) { return false; }
+            if (i > 0 && String.CharAt(f, i - 1) != '/') { return false; }
+        }
+        if (c == '+') {
+            if (i > 0 && String.CharAt(f, i - 1) != '/') { return false; }
+            if (i < n - 1 && String.CharAt(f, i + 1) != '/') { return false; }
+        }
+    }
+    return true;
+}
+
+fn _validTopic(t: string): bool {
+    let n: int = String.Length(t);
+    if (n == 0 || n > 65535) { return false; }
+    return String.IndexOfAnyFrom(t, "+#", 0) < 0 && !String.Contains(t, '\0');
+}
+
+fn _hex(b): string {
+    var out = "";
+    iter (i from 0 to len(b)) {
+        let h = Convert.ToRadixString(b[i], 16);
+        out += (String.Length(h) < 2) ? "0" + h : h;
+    }
+    return out;
+}
+
+fn _wake(id: int) {
+    if (id == 0) { return; }
+    let f = Fiber.FromId(id);
+    if (f != nil) { Fiber.Unpark(f); }
+}
+
+fn _connackText(code: int): string {
+    if (code == 1) { return "unacceptable protocol version"; }
+    if (code == 2) { return "client identifier rejected"; }
+    if (code == 3) { return "server unavailable"; }
+    if (code == 4) { return "bad user name or password"; }
+    if (code == 5) { return "not authorized"; }
+    if (code == 0x86) { return "bad user name or password"; }
+    if (code == 0x87) { return "not authorized"; }
+    if (code == 0x84) { return "unsupported protocol version"; }
+    if (code == 0x85) { return "client identifier not valid"; }
+    return "refused with code " + str(code);
+}
+
+// ---- the connection -----------------------------------------------------------
+
+// Everything one connection needs. The reader and dispatcher fibers hold this,
+// never the MqttClient, so dropping the client can close it.
+class MqttSession {
+    let host: string = "";
+    let port: int = _DEFAULT_PORT;
+    let opts = nil;
+    let clientId: string = "";
+    let v5: bool = false;
+    let clean: bool = true;
+    let keepAlive: int = 60;
+    let timeoutMs: int = _DEFAULT_TIMEOUT_MS;
+    let binary: bool = false;
+    let reconnect: bool = false;
+    let maxPacket: int = 16777216;
+
+    let sock = nil;
+    let connected: bool = false;
+    let closing: bool = false;
+    let running: bool = false;     // a reader fiber is in ReadLoop
+    let sessionPresent: bool = false;
+    let lastError: string = "";
+    let lastSend: int = 0;
+    let pingSent: int = 0;
+
+    let writing: bool = false;
+    let writeWaiters = [];
+
+    let nextPid: int = 0;
+    let pending = {};          // str(pid) -> { kind, qos, stage, done, error, reason, codes, fiber, packet, sent }
+    let qos2In = {};           // str(pid) of received QoS 2 messages until their PUBREL
+
+    let subs = [];             // { filter, qos, handler }
+    let inbox = [];
+    let receiver: int = 0;
+    let onMessage = nil;
+    let onLost = nil;
+    let jobs = [];             // [handler, msg] for the dispatcher
+    let dispatcher: int = 0;
+
+    let ptype: int = 0;        // the packet _readPacket just read
+    let pflags: int = 0;
+    let pbody = nil;
+
+    fn Constructor(host: string, port: int, opts) {
+        this.host = host;
+        this.port = port;
+        this.opts = opts;
+        let id = Object.TryGet(opts, "clientId", nil);
+        this.clientId = (id != nil) ? id : "flaris-" + _hex(Crypto.RandomBytes(8));
+        this.v5 = Object.TryGet(opts, "protocolVersion", 4) == 5;
+        this.clean = Object.TryGet(opts, "cleanSession", true) != false;
+        this.keepAlive = Object.TryGet(opts, "keepAlive", 60) ?? 60;
+        this.timeoutMs = Object.TryGet(opts, "timeoutMs", _DEFAULT_TIMEOUT_MS) ?? _DEFAULT_TIMEOUT_MS;
+        this.binary = Object.TryGet(opts, "binary", false) == true;
+        this.reconnect = Object.TryGet(opts, "reconnect", false) == true;
+        this.maxPacket = Object.TryGet(opts, "maxPacketBytes", 16777216) ?? 16777216;
+        this.onMessage = Object.TryGet(opts, "onMessage", nil);
+        this.onLost = Object.TryGet(opts, "onConnectionLost", nil);
+    }
+
+    // Socket, CONNECT and CONNACK; raises MqttError.
+    fn Open() {
+        let tls = Object.TryGet(opts, "tls", false) == true;
+        var s = nil;
+        if (tls) {
+            let to = { insecure: Object.TryGet(opts, "insecure", false) == true, timeoutMs: timeoutMs };
+            let sni = Object.TryGet(opts, "sni", nil);
+            if (sni != nil) { to.sni = sni; }
+            s = Fiber.Await(Stream.ConnectTlsAsync(host, port, to));
+            if (s == nil) { throw _mqttErr("tls", "Mqtt: TLS connect to " + host + ":" + str(port) + " failed: " + (Stream.TlsLastError() ?? "unknown"), 0); }
+        } else {
+            s = Fiber.Await(Stream.ConnectAsync("tcp", host, port, timeoutMs));
+            if (s == nil) {
+                let why = (Stream.LastError() == 1) ? "timed out" : "refused or unreachable";
+                throw _mqttErr("connect", "Mqtt: cannot connect to " + host + ":" + str(port) + " (" + why + ")", 0);
+            }
+            Stream.SetNoDelay(s, true);
+        }
+        Stream.SetTimeout(s, timeoutMs);
+        sock = s;
+        pingSent = 0;
+        let user = Object.TryGet(opts, "username", nil);
+        let password = Object.TryGet(opts, "password", nil);
+        let will = Object.TryGet(opts, "will", nil);
+        if (!this.Send(_connectPacket(clientId, clean, keepAlive, user, password, will, v5))) {
+            this.Drop();
+            throw _mqttErr("closed", "Mqtt: the broker closed the connection before CONNECT", 0);
+        }
+        if (Stream.WaitReadable(sock, timeoutMs) == nil) {
+            this.Drop();
+            throw _mqttErr("timeout", "Mqtt: no CONNACK within " + str(timeoutMs) + " ms", 0);
+        }
+        let t = this.ReadPacket();
+        if (t < 0) {
+            let msg = lastError;
+            this.Drop();
+            throw _mqttErr((t == -1) ? "closed" : "protocol", "Mqtt: " + msg, 0);
+        }
+        if (t != _T_CONNACK || len(pbody) < 2) {
+            this.Drop();
+            throw _mqttErr("protocol", "Mqtt: expected CONNACK, got packet type " + str(t), 0);
+        }
+        let code = pbody[1];
+        if (code != 0) {
+            this.Drop();
+            throw _mqttErr("refused", "Mqtt: connection refused: " + _connackText(code), code);
+        }
+        sessionPresent = (pbody[0] & 1) == 1;
+        connected = true;
+    }
+
+    fn Drop() {
+        connected = false;
+        if (sock != nil) { Stream.Close(sock); sock = nil; }
+    }
+
+    // Write a whole packet; packets from several fibers never interleave.
+    fn Send(packet: block): bool {
+        if (writing) {
+            let deadline = Time.Millis() + timeoutMs;
+            let me = Fiber.Id();
+            while (writing) {
+                let left = deadline - Time.Millis();
+                if (left <= 0) { return false; }
+                Array.Append(writeWaiters, me);
+                Fiber.Park(left);
+            }
+        }
+        if (sock == nil) { return false; }
+        writing = true;
+        let ok = Stream.WriteAll(sock, packet) == true;
+        writing = false;
+        lastSend = Time.Millis();
+        while (len(writeWaiters) > 0) {
+            let f = Fiber.FromId(writeWaiters[0]);
+            Array.RemoveAt(writeWaiters, 0);
+            if (f != nil && Fiber.Unpark(f)) { break; }
+        }
+        return ok;
+    }
+
+    // Read one packet into ptype, pflags and pbody: its type, -1 when the link
+    // failed or closed, -2 when the packet is malformed (lastError says why).
+    fn ReadPacket(): int {
+        let b1 = Stream.ReadU8(sock);
+        if (b1 == nil) { return this._linkFailed(); }
+        var rem = 0;
+        var mult = 1;
+        var i = 0;
+        var more = true;
+        while (more) {
+            let d = Stream.ReadU8(sock);
+            if (d == nil) { return this._linkFailed(); }
+            rem += (d & 127) * mult;
+            i += 1;
+            more = (d & 128) != 0;
+            if (more && i == 4) { lastError = "malformed remaining length"; return -2; }
+            mult *= 128;
+        }
+        if (rem > maxPacket) { lastError = "a packet of " + str(rem) + " bytes is over maxPacketBytes"; return -2; }
+        ptype = b1 >> 4;
+        pflags = b1 & 15;
+        if (rem == 0) {
+            pbody = Buffer.Create(0, 1);
+            return ptype;
+        }
+        var body = Stream.ReadBytes(sock, rem);
+        if (body == nil) { return this._linkFailed(); }
+        while (len(body) < rem) {
+            let more2 = Stream.ReadBytes(sock, rem - len(body));
+            if (more2 == nil) { return this._linkFailed(); }
+            Buffer.Append(body, more2);
+        }
+        pbody = body;
+        return ptype;
+    }
+
+    fn _linkFailed(): int {
+        let code = Stream.LastError();
+        lastError = (code == 1) ? "timed out inside a packet" : "the broker closed the connection";
+        return -1;
+    }
+
+    // Take packets until the link ends; reconnect when asked to.
+    fn ReadLoop() {
+        running = true;
+        while (true) {
+            let reason = this._readUntilLost();
+            let wasConnected = connected;
+            this.Drop();
+            if (closing) { break; }
+            if (wasConnected && onLost != nil) {
+                try { onLost(reason); } catch (e) { Console.Error("Mqtt: onConnectionLost raised: " + e.Error); }
+            }
+            if (!reconnect || closing || !this._reconnect()) { break; }
+        }
+        connected = false;
+        foreach (e, _k in pending) {
+            e.done = true;
+            e.error = "closed";
+            _wake(e.fiber);
+        }
+        pending = {};
+        running = false;
+        _wake(receiver);
+        _wake(dispatcher);
+    }
+
+    fn _readUntilLost(): string {
+        let kaMs = keepAlive * 1000;
+        while (sock != nil && !closing) {
+            var wait = -1;
+            let now = Time.Millis();
+            if (kaMs > 0) {
+                if (pingSent > 0) {
+                    wait = pingSent + timeoutMs - now;
+                    if (wait <= 0) { return "no PINGRESP within " + str(timeoutMs) + " ms"; }
+                } else {
+                    wait = lastSend + kaMs - now;
+                    if (wait <= 0) {
+                        pingSent = now;
+                        if (!this.Send(this._ping())) { return "the broker closed the connection"; }
+                        continue;
+                    }
+                }
+            }
+            if (Stream.WaitReadable(sock, wait) == nil) {
+                if (Stream.LastError() == 1) { continue; }
+                return "the broker closed the connection";
+            }
+            let t = this.ReadPacket();
+            if (t < 0) { return lastError; }
+            let err = this._handle(t);
+            if (err != "") {
+                lastError = err;
+                return err;
+            }
+        }
+        return "closed";
+    }
+
+    fn _ping(): block {
+        let b = Buffer.Create(2, 1);
+        b[0] = 0xC0;
+        return b;
+    }
+
+    // One incoming packet; "" when fine, otherwise why the link must end.
+    fn _handle(t: int): string {
+        let b = pbody;
+        let n = len(b);
+        if (t == _T_PUBLISH) { return this._publish(b, n); }
+        if (t == _T_PINGRESP) { pingSent = 0; return ""; }
+        if (t == _T_PUBACK || t == _T_PUBREC || t == _T_PUBCOMP || t == _T_PUBREL) {
+            if (n < 2) { return "short acknowledgement"; }
+            let pid = _getU16(b, 0);
+            let reason = (n > 2) ? b[2] : 0;
+            if (t == _T_PUBREL) {
+                Object.Delete(qos2In, str(pid));
+                this.Send(_ackPacket(_T_PUBCOMP, pid));
+                return "";
+            }
+            let e = Object.TryGet(pending, str(pid), nil);
+            if (t == _T_PUBREC) {
+                if (reason >= 0x80) { this._finish(pid, e, "refused", reason); return ""; }
+                if (e != nil) { e.stage = 1; e.packet = _ackPacket(_T_PUBREL, pid); }
+                this.Send(_ackPacket(_T_PUBREL, pid));
+                return "";
+            }
+            if (e != nil && ((t == _T_PUBACK && e.qos == 1) || (t == _T_PUBCOMP && e.qos == 2))) {
+                this._finish(pid, e, (reason >= 0x80) ? "refused" : "", reason);
+            }
+            return "";
+        }
+        if (t == _T_SUBACK || t == _T_UNSUBACK) {
+            if (n < 2) { return "short SUBACK"; }
+            let pid = _getU16(b, 0);
+            var off = 2;
+            if (v5) {
+                let pv = _getVarint(b, 2, n);
+                if (pv < 0) { return "malformed properties"; }
+                off = 2 + (pv & 7) + (pv >> 3);
+            }
+            let codes = [];
+            iter (i from off to n) { Array.Append(codes, b[i]); }
+            let e = Object.TryGet(pending, str(pid), nil);
+            if (e != nil) {
+                e.codes = codes;
+                this._finish(pid, e, "", 0);
+            }
+            return "";
+        }
+        if (t == _T_DISCONNECT) {
+            return "the broker disconnected" + ((n > 0) ? " (reason " + str(b[0]) + ")" : "");
+        }
+        return "unexpected packet type " + str(t);
+    }
+
+    fn _finish(pid: int, e, error: string, reason: int) {
+        Object.Delete(pending, str(pid));
+        if (e == nil) { return; }
+        e.done = true;
+        e.error = error;
+        e.reason = reason;
+        _wake(e.fiber);
+    }
+
+    // An incoming PUBLISH: deliver, then acknowledge.
+    fn _publish(b, n: int): string {
+        let qos = (pflags >> 1) & 3;
+        if (qos == 3) { return "PUBLISH with QoS 3"; }
+        if (n < 2) { return "short PUBLISH"; }
+        let tl = _getU16(b, 0);
+        var off = 2 + tl;
+        var pid = 0;
+        if (qos > 0) {
+            if (off + 2 > n) { return "short PUBLISH"; }
+            pid = _getU16(b, off);
+            off += 2;
+        }
+        if (v5) {
+            let pv = _getVarint(b, off, n);
+            if (pv < 0) { return "malformed PUBLISH properties"; }
+            off += (pv & 7) + (pv >> 3);
+        }
+        if (off > n) { return "short PUBLISH"; }
+        let topic = Buffer.ToString(b, 2, tl);
+        let rest = n - off;
+        var payload = nil;
+        if (binary) { payload = Buffer.Slice(b, off, rest); }
+        else { payload = (rest == 0) ? "" : Buffer.ToString(b, off, rest); }
+        let msg = { topic: topic, payload: payload, qos: qos, retain: (pflags & 1) == 1, dup: (pflags & 8) == 8 };
+        if (qos == 2) {
+            let key = str(pid);
+            if (Object.TryGet(qos2In, key, false) == true) {
+                this.Send(_ackPacket(_T_PUBREC, pid));
+                return "";
+            }
+            qos2In[key] = true;
+        }
+        this.Deliver(msg);
+        if (qos == 1) { this.Send(_ackPacket(_T_PUBACK, pid)); }
+        if (qos == 2) { this.Send(_ackPacket(_T_PUBREC, pid)); }
+        return "";
+    }
+
+    // To every matching handler; else to onMessage; else to Receive.
+    fn Deliver(msg) {
+        var handled = false;
+        foreach (s in subs) {
+            if (s.handler != nil && _matches(s.filter, msg.topic)) {
+                Array.Append(jobs, [s.handler, msg]);
+                handled = true;
+            }
+        }
+        if (!handled && onMessage != nil) {
+            Array.Append(jobs, [onMessage, msg]);
+            handled = true;
+        }
+        if (handled) {
+            this._startDispatcher();
+            _wake(dispatcher);
+            return;
+        }
+        Array.Append(inbox, msg);
+        _wake(receiver);
+    }
+
+    fn _startDispatcher() {
+        if (dispatcher != 0) { return; }
+        let st = this;
+        dispatcher = Fiber.Run(fn() { st.DispatchLoop(); });
+    }
+
+    // Run handlers one at a time, off the reader fiber.
+    fn DispatchLoop() {
+        while (true) {
+            if (len(jobs) == 0) {
+                if (closing || (!connected && !reconnect)) { break; }
+                Fiber.Park(1000);
+                continue;
+            }
+            let job = jobs[0];
+            Array.RemoveAt(jobs, 0);
+            try {
+                let h = job[0];
+                h(job[1]);
+            } catch (e) {
+                Console.Error("Mqtt: a message handler raised: " + e.Error);
+            }
+        }
+        dispatcher = 0;
+    }
+
+    fn NextPid(): int {
+        var tries = 0;
+        while (tries < 65536) {
+            nextPid = (nextPid % 65535) + 1;
+            if (Object.TryGet(pending, str(nextPid), nil) == nil) { return nextPid; }
+            tries += 1;
+        }
+        throw _mqttErr("protocol", "Mqtt: all 65535 packet identifiers are in use", 0);
+    }
+
+    // Send a packet that the broker acknowledges and wait for the flow to end.
+    fn Flow(kind: string, qos: int, pid: int, packet: block) {
+        let e = { kind: kind, qos: qos, stage: 0, done: false, error: "", reason: 0, codes: nil, fiber: 0, packet: packet, sent: false };
+        pending[str(pid)] = e;
+        e.sent = this.Send(packet);
+        if (!e.sent && !reconnect) {
+            Object.Delete(pending, str(pid));
+            throw _mqttErr("closed", "Mqtt: the connection is closed", 0);
+        }
+        let deadline = Time.Millis() + timeoutMs;
+        while (!e.done) {
+            let left = deadline - Time.Millis();
+            if (left <= 0) {
+                Object.Delete(pending, str(pid));
+                throw _mqttErr("timeout", "Mqtt: no acknowledgement for " + kind + " within " + str(timeoutMs) + " ms", 0);
+            }
+            e.fiber = Fiber.Id();
+            Fiber.Park(left);
+        }
+        if (e.error == "closed") { throw _mqttErr("closed", "Mqtt: the connection closed before the " + kind + " was acknowledged", 0); }
+        if (e.error == "refused") { throw _mqttErr("refused", "Mqtt: the broker refused the " + kind + " (reason " + str(e.reason) + ")", e.reason); }
+        return e;
+    }
+
+    // After a reconnect: subscriptions back (unless the broker kept the
+    // session) and every unacknowledged flow sent again.
+    fn _reconnect(): bool {
+        let minMs = Object.TryGet(opts, "reconnectMinMs", 500) ?? 500;
+        let maxMs = Object.TryGet(opts, "reconnectMaxMs", 30000) ?? 30000;
+        var delay = minMs;
+        while (!closing) {
+            Fiber.Sleep(delay);
+            if (closing) { return false; }
+            try {
+                this.Open();
+            } catch (e) {
+                delay = Math.Min(delay * 2, maxMs);
+                continue;
+            }
+            if (!sessionPresent && len(subs) > 0) {
+                let filters = [];
+                let qos = [];
+                foreach (s in subs) { Array.Append(filters, s.filter); Array.Append(qos, s.qos); }
+                this.Send(_subPacket(this.NextPid(), filters, qos, v5));
+            }
+            foreach (e, _k in pending) {
+                if (e.kind == "publish" && e.stage == 0 && e.sent) {
+                    let p = Buffer.Slice(e.packet, 0, len(e.packet));
+                    p[0] = p[0] | 8;
+                    this.Send(p);
+                } else {
+                    e.sent = this.Send(e.packet);
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn Close(polite: bool) {
+        closing = true;
+        if (sock != nil && connected && polite) {
+            let b = Buffer.Create(2, 1);
+            b[0] = _T_DISCONNECT << 4;
+            this.Send(b);
+        }
+        this.Drop();
+        subs = [];
+        onMessage = nil;
+        onLost = nil;
+        jobs = [];
+        _wake(receiver);
+        _wake(dispatcher);
+    }
+}
+
+class MqttClient {
+    let _s = nil;
+
+    fn Constructor(host: string, port?: int, opts?) {
+        let o = opts ?? {};
+        let tls = Object.TryGet(o, "tls", false) == true;
+        _s = new MqttSession(host, port ?? (tls ? _DEFAULT_TLS_PORT : _DEFAULT_PORT), o);
+    }
+
+    // Connect and start the reader: { sessionPresent }. Raises MqttError.
+    // After a lost connection (without reconnect) it connects again.
+    fn Connect() {
+        if (_s.connected) { return { sessionPresent: _s.sessionPresent }; }
+        if (_s.closing) { throw _mqttErr("closed", "Mqtt: the client was disconnected", 0); }
+        if (_s.running) { throw _mqttErr("connect", "Mqtt: the client is reconnecting already", 0); }
+        _s.Open();
+        let st = _s;
+        Fiber.Run(fn() { st.ReadLoop(); });
+        return { sessionPresent: _s.sessionPresent };
+    }
+
+    fn IsConnected(): bool { return _s.connected; }
+    fn SessionPresent(): bool { return _s.sessionPresent; }
+    fn ClientId(): string { return _s.clientId; }
+    // Messages waiting for Receive.
+    fn Pending(): int { return len(_s.inbox); }
+
+    fn Publish(topic: string, payload, opts?) {
+        if (!_validTopic(topic)) { throw(Exception.InvalidArguments, "Mqtt: not a valid topic to publish to: '" + topic + "'"); }
+        let qos = (opts == nil) ? 0 : (Object.TryGet(opts, "qos", 0) ?? 0);
+        let retain = opts != nil && Object.TryGet(opts, "retain", false) == true;
+        if (qos < 0 || qos > 2) { throw(Exception.InvalidArguments, "Mqtt: qos must be 0, 1 or 2"); }
+        this._ready();
+        if (qos == 0) {
+            if (!_s.Send(_publishPacket(topic, _bytes(payload), 0, retain, false, 0, _s.v5))) {
+                throw _mqttErr("closed", "Mqtt: the connection is closed", 0);
+            }
+            return true;
+        }
+        let pid = _s.NextPid();
+        _s.Flow("publish", qos, pid, _publishPacket(topic, _bytes(payload), qos, retain, false, pid, _s.v5));
+        return true;
+    }
+
+    fn Subscribe(filters, qos?, handler?) {
+        let list = [];
+        let qs = [];
+        let q = qos ?? 0;
+        if (Type.IsObject(filters)) {
+            foreach (v, k in filters) { Array.Append(list, k); Array.Append(qs, v ?? 0); }
+        } else if (Type.IsArray(filters)) {
+            foreach (f in filters) { Array.Append(list, f); Array.Append(qs, q); }
+        } else {
+            Array.Append(list, filters);
+            Array.Append(qs, q);
+        }
+        if (len(list) == 0) { throw(Exception.InvalidArguments, "Mqtt: nothing to subscribe to"); }
+        iter (i from 0 to len(list)) {
+            if (!Type.IsString(list[i]) || !_validFilter(list[i])) { throw(Exception.InvalidArguments, "Mqtt: not a valid topic filter: '" + str(list[i]) + "'"); }
+            if (qs[i] < 0 || qs[i] > 2) { throw(Exception.InvalidArguments, "Mqtt: qos must be 0, 1 or 2"); }
+        }
+        this._ready();
+        let pid = _s.NextPid();
+        let e = _s.Flow("subscribe", 1, pid, _subPacket(pid, list, qs, _s.v5));
+        iter (i from 0 to len(list)) {
+            this._forget(list[i]);
+            if (i < len(e.codes) && e.codes[i] < 0x80) {
+                Array.Append(_s.subs, { filter: list[i], qos: qs[i], handler: handler });
+            }
+        }
+        return e.codes;
+    }
+
+    fn Unsubscribe(filters) {
+        let list = Type.IsArray(filters) ? filters : [filters];
+        this._ready();
+        let pid = _s.NextPid();
+        _s.Flow("unsubscribe", 1, pid, _subPacket(pid, list, nil, _s.v5));
+        foreach (f in list) { this._forget(f); }
+        return nil;
+    }
+
+    fn OnMessage(handler) { _s.onMessage = handler; return nil; }
+
+    fn Receive(timeoutMs?) {
+        let limit = timeoutMs ?? -1;
+        let deadline = Time.Millis() + limit;
+        while (len(_s.inbox) == 0) {
+            if (_s.closing || (!_s.connected && !_s.reconnect)) { return nil; }
+            let left = (limit < 0) ? 3600000 : deadline - Time.Millis();
+            if (left <= 0) { return nil; }
+            _s.receiver = Fiber.Id();
+            Fiber.Park(left);
+            _s.receiver = 0;
+        }
+        let m = _s.inbox[0];
+        Array.RemoveAt(_s.inbox, 0);
+        return m;
+    }
+
+    fn Disconnect() {
+        _s.Close(true);
+        return nil;
+    }
+
+    fn Abort() {
+        _s.Close(false);
+        return nil;
+    }
+
+    fn Destructor() {
+        if (_s != nil && !_s.closing) { _s.Close(true); }
+    }
+
+    fn _ready() {
+        if (_s.closing) { throw _mqttErr("closed", "Mqtt: the client was disconnected", 0); }
+        if (!_s.connected && !_s.reconnect) { throw _mqttErr("closed", "Mqtt: not connected", 0); }
+    }
+
+    fn _forget(filter: string) {
+        var i = 0;
+        while (i < len(_s.subs)) {
+            if (_s.subs[i].filter == filter) { Array.RemoveAt(_s.subs, i); }
+            else { i += 1; }
+        }
+    }
+}
+
+class Mqtt {
+    fn static Connect(host: string, port?: int, opts?) {
+        let c = new MqttClient(host, port, opts);
+        c.Connect();
+        return c;
+    }
+
+    fn static TopicMatches(filter: string, topic: string): bool { return _matches(filter, topic); }
+    fn static ValidTopic(topic: string): bool { return _validTopic(topic); }
+    fn static ValidFilter(filter: string): bool { return _validFilter(filter); }
+
+    fn static EncodeLength(n: int): block {
+        if (n < 0 || n > _MAX_REMAINING) { throw(Exception.InvalidArguments, "Mqtt: a length must be 0..268435455"); }
+        let b = Buffer.Create(_varintSize(n), 1);
+        _putVarint(b, 0, n);
+        return b;
+    }
+
+    // [value, bytes used], or nil when b ends inside it or it is malformed.
+    fn static DecodeLength(b: block, offset?: int) {
+        let v = _getVarint(b, offset ?? 0, len(b));
+        if (v < 0) { return nil; }
+        return [v >> 3, v & 7];
+    }
+
+    fn static EncodePublish(topic: string, payload, opts?) {
+        let qos = (opts == nil) ? 0 : (Object.TryGet(opts, "qos", 0) ?? 0);
+        let pid = (opts == nil) ? 0 : (Object.TryGet(opts, "packetId", 0) ?? 0);
+        let retain = opts != nil && Object.TryGet(opts, "retain", false) == true;
+        let dup = opts != nil && Object.TryGet(opts, "dup", false) == true;
+        let v5 = opts != nil && Object.TryGet(opts, "protocolVersion", 4) == 5;
+        return _publishPacket(topic, _bytes(payload), qos, retain, dup, pid, v5);
+    }
+}
+
+export { Mqtt, MqttClient, MqttError };

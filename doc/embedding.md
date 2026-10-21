@@ -337,7 +337,6 @@ born with its creator's capabilities and may only narrow from there.
 | Limit | Default | Range |
 |-------|---------|-------|
 | `stackSize` | 1024 | 64–65535 value-stack slots |
-| `fifoSizeCfg` | 1024 | power of two, 8–1024 |
 | `maxSlabs` | 1024 | object-pool ceiling |
 | `maxFibers` | 256 | power of two, 2–1024 |
 | `maxFrames` | 64 | 8–1024 call frames per fiber |

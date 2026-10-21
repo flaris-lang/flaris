@@ -1,0 +1,446 @@
+// Test suite for Tar.fls
+//
+// Run: flarisvm tests/test_tar.fls --libs=./libs
+//
+// Every archive is built here: by TarWriter, or byte by byte with rawHeader()
+// for the GNU and v7 forms the writer never produces.
+
+import { Tar } from library("Tar", "1.0");
+import { Deflate } from library("Deflate", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+// Symlinks need privileges on Windows and NTFS keeps no POSIX modes.
+global isWindows   = Os.Name() == "Windows";
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + "  expected=" + str(expected) + " got=" + str(actual));
+    }
+}
+
+fn find(entries, name: string) {
+    foreach (e in entries) { if (e.name == name) return e; }
+    return nil;
+}
+
+// The text in a header field, up to its first NUL.
+fn field(b: block, off: int, width: int): string {
+    var n = 0;
+    while (n < width && b[off + n] != 0) { n += 1; }
+    return n == 0 ? "" : Buffer.ToString(Buffer.Slice(b, off, n));
+}
+
+// The unsigned byte sum POSIX defines, the checksum field counted as spaces.
+fn headerSum(b: block, off: int): int {
+    var s = 0;
+    iter (i from 0 to 512) {
+        s += (i >= 148 && i < 156) ? 32 : b[off + i];
+    }
+    return s;
+}
+
+// A 512-byte header with the given name, type and size, magic `magic` ("" for
+// v7), and its checksum filled in. `set` patches raw bytes: [[offset, [byte, ...]], ...].
+fn rawHeader(name: string, flag: string, size: int, magic: string, set: array): block {
+    let b = Buffer.Create(512, 1);
+    Buffer.CopyStringAt(b, 0, name, len(name));
+    Buffer.CopyStringAt(b, 100, "0000644", 7);
+    Buffer.CopyStringAt(b, 108, "0000000", 7);
+    Buffer.CopyStringAt(b, 116, "0000000", 7);
+    let sz = String.PadLeft(Convert.ToRadixString(size, 8), 11, '0');
+    Buffer.CopyStringAt(b, 124, sz, 11);
+    Buffer.CopyStringAt(b, 136, "14500000000", 11);
+    if (len(flag) > 0) { Buffer.CopyStringAt(b, 156, flag, 1); }
+    if (len(magic) > 0) { Buffer.CopyStringAt(b, 257, magic, len(magic)); }
+    foreach (p in set) {
+        iter (k from 0 to len(p[1])) { b[p[0] + k] = p[1][k]; }
+    }
+    let cs = String.PadLeft(Convert.ToRadixString(headerSum(b, 0), 8), 6, '0');
+    Buffer.CopyStringAt(b, 148, cs, 6);
+    b[155] = 32;
+    return b;
+}
+
+// `data` padded out to whole 512-byte blocks.
+fn padded(data: string): block {
+    let n = ((len(data) + 511) / 512) * 512;
+    let b = Buffer.Create(n, 1);
+    if (len(data) > 0) { Buffer.CopyStringAt(b, 0, data, len(data)); }
+    return b;
+}
+
+fn concat(parts: array): block {
+    var out = Buffer.Create(0, 1);
+    foreach (p in parts) { Buffer.Append(out, p); }
+    Buffer.Append(out, Buffer.Create(1024, 1));
+    return out;
+}
+
+// ============================================================
+//  Round trip and the ustar header
+// ============================================================
+
+fn test_roundtrip() {
+    let w = Tar.Create();
+    checkEq(w.AddFile("hello.txt", "hello world\n",
+        { mode: 420, mtime: 1700000000, uid: 501, gid: 20, uname: "alice", gname: "staff" }), 1, "AddFile counts one entry");
+    w.AddDirectory("docs", { mtime: 1700000001 });
+    w.AddFile("docs/readme.md", "# readme", { mtime: 1700000002, mode: 493 });
+    w.AddSymlink("latest", "hello.txt", { mtime: 1700000003 });
+    w.AddHardLink("again.txt", "hello.txt", { mtime: 1700000004 });
+    let bin = Buffer.Create(1000, 1);
+    iter (i from 0 to 1000) { bin[i] = i * 7; }
+    w.AddFile("bin/data.bin", bin);
+    w.AddFile("empty.txt", "");
+    checkEq(w.Count(), 7, "Count");
+
+    let t = w.ToBlock();
+    checkEq(len(t) % 10240, 0, "the archive ends on a 10240-byte record");
+    checkEq(field(t, 257, 6), "ustar", "magic ustar");
+    checkEq(t[262], 0, "POSIX magic ends in NUL");
+    checkEq(field(t, 263, 2), "00", "version 00");
+    checkEq(field(t, 100, 8), "0000644", "mode as seven octal digits");
+    checkEq(field(t, 124, 12), "00000000014", "size as eleven octal digits");
+    checkEq(field(t, 136, 12), "14524770400", "mtime in octal");
+    checkEq(field(t, 265, 32), "alice", "uname");
+    checkEq(Convert.ParseInt("0o" + field(t, 148, 7)), headerSum(t, 0), "checksum is the unsigned header sum");
+    checkEq(t[155], 32, "checksum field ends with NUL then space");
+    checkEq(field(t, 512, 12), "hello world\n", "data follows the header");
+
+    let es = Tar.Read(t);
+    checkEq(len(es), 7, "Read returns every entry");
+    let h = es[0];
+    checkEq(h.name, "hello.txt", "name");
+    checkEq(h.type, "file", "type file");
+    checkEq(h.size, 12, "size");
+    checkEq(h.mode, 420, "mode");
+    checkEq(h.mtime, 1700000000, "mtime");
+    checkEq(h.uid, 501, "uid");
+    checkEq(h.gid, 20, "gid");
+    checkEq(h.uname + ":" + h.gname, "alice:staff", "uname and gname");
+    checkEq(Buffer.ToString(h.data), "hello world\n", "data");
+    checkEq(es[1].name, "docs/", "a directory name ends in /");
+    checkEq(es[1].type, "dir", "type dir");
+    checkEq(es[1].mode, 493, "directory mode defaults to 0755");
+    checkEq(es[2].mode, 493, "explicit mode");
+    checkEq(es[3].type, "symlink", "type symlink");
+    checkEq(es[3].linkname, "hello.txt", "symlink target");
+    checkEq(es[3].mode, 511, "link mode defaults to 0777");
+    checkEq(es[4].type, "hardlink", "type hardlink");
+    checkEq(es[4].linkname, "hello.txt", "hard link target");
+    check(Buffer.Equals(es[5].data, bin), "binary data round-trips");
+    checkEq(len(es[6].data), 0, "an empty file has empty data");
+    checkEq(len(es[3].data), 0, "a link has empty data");
+
+    let ls = Tar.List(t);
+    checkEq(len(ls), 7, "List returns every entry");
+    check(ls[0].data == nil, "List leaves the data out");
+    checkEq(ls[5].size, 1000, "List keeps the size");
+}
+
+// ============================================================
+//  Names and values ustar cannot hold
+// ============================================================
+
+fn test_long_names() {
+    let split = String.Repeat("d", 120) + "/" + String.Repeat("f", 90);           // 211, splits
+    let tooLong = String.Repeat("seg/", 70) + "file.txt";                           // 288, needs pax
+    let noSlash = String.Repeat("x", 130) + ".txt";                                 // no split point
+    let utf8 = "räksmörgås/日本.txt";
+    let longTarget = String.Repeat("t/", 70) + "target";
+    let w = Tar.Create();
+    w.AddFile(split, "split");
+    w.AddFile(tooLong, "pax");
+    w.AddFile(noSlash, "noslash");
+    w.AddFile(utf8, "utf8");
+    w.AddSymlink("ll", longTarget);
+    w.AddFile("ids", "i", { uid: 3000000, gid: 4000000 });
+    w.AddFile("old", "o", { mtime: -86400 });
+    w.AddFile("late", "l", { mtime: 9000000000 });
+    w.AddFile("who", "w", { uname: "jöns", gname: String.Repeat("g", 40) });
+    let t = w.ToBlock();
+
+    checkEq(field(t, 345, 155), String.Repeat("d", 120), "a 211-byte ASCII name splits into prefix");
+    checkEq(field(t, 0, 100), String.Repeat("f", 90), "... and name");
+    checkEq(t[1024 + 156], 120, "a 288-byte name gets a pax 'x' header");
+    let rec = "298 path=" + tooLong + "\n";
+    checkEq(field(t, 1536, 512), rec, "the pax record counts its own length");
+
+    let es = Tar.Read(t);
+    checkEq(len(es), 9, "pax headers are not entries");
+    checkEq(es[0].name, split, "split name reads back");
+    checkEq(es[1].name, tooLong, "pax path reads back");
+    checkEq(es[2].name, noSlash, "unsplittable name reads back");
+    checkEq(es[3].name, utf8, "UTF-8 name reads back");
+    checkEq(es[4].linkname, longTarget, "long link target reads back");
+    checkEq(es[5].uid, 3000000, "uid past the octal field");
+    checkEq(es[5].gid, 4000000, "gid past the octal field");
+    checkEq(es[6].mtime, -86400, "mtime before 1970");
+    checkEq(es[7].mtime, 9000000000, "mtime past the octal field");
+    checkEq(es[8].uname, "jöns", "non-ASCII uname");
+    checkEq(es[8].gname, String.Repeat("g", 40), "gname past its field");
+    checkEq(Buffer.ToString(es[1].data), "pax", "data after a pax header");
+}
+
+// ============================================================
+//  Headers other tools write
+// ============================================================
+
+fn test_foreign_headers() {
+    let gnuMagic = "ustar  ";      // GNU: "ustar" two spaces, then the NUL Create left
+    let longName = String.Repeat("n", 150) + ".txt";
+    let longLink = String.Repeat("l", 120);
+    let t = concat([
+        rawHeader("././@LongLink", "L", len(longName) + 1, gnuMagic, []), padded(longName),
+        rawHeader(String.Left(longName, 100), "0", 3, gnuMagic, []), padded("gnu"),
+        rawHeader("././@LongLink", "K", len(longLink), gnuMagic, []), padded(longLink),
+        rawHeader("lnk", "2", 0, gnuMagic, []),
+        // base-256 uid: 0x80 then the value big-endian
+        rawHeader("big", "0", 1, gnuMagic, [[108, [0x80, 1, 2, 3, 4, 5, 6, 7]]]), padded("b"),
+        // v7: no magic; a trailing slash is all that marks a directory
+        rawHeader("v7dir/", "0", 0, "", []),
+        rawHeader("v7file", "", 2, "", []), padded("v7"),
+        // GNU prefix area is not a prefix
+        rawHeader("plain", "0", 1, gnuMagic, [[345, [110, 111, 112, 114, 101]]]), padded("p"),
+        // pax global header applies to everything after it
+        rawHeader("pax_global_header", "g", 20, "ustar", []), padded("20 uname=globaluser\n"),
+        rawHeader("g1", "0", 1, "ustar", []), padded("1"),
+        rawHeader("x", "x", 9, "ustar", []), padded("9 size=4\n"),
+        rawHeader("sized", "0", 0, "ustar", []), padded("four")
+    ]);
+    let es = Tar.Read(t);
+    check(es != nil, "foreign headers parse: " + str(Tar.LastError()));
+    if (es == nil) return;
+    checkEq(es[0].name, longName, "GNU 'L' long name");
+    checkEq(Buffer.ToString(es[0].data), "gnu", "... with its data");
+    checkEq(es[1].linkname, longLink, "GNU 'K' long link name");
+    checkEq(es[2].uid, 0x01020304050607, "GNU base-256 number");
+    checkEq(es[3].name + " " + es[3].type, "v7dir/ dir", "v7 directory by its slash");
+    checkEq(es[4].type, "file", "v7 NUL type flag is a file");
+    checkEq(Buffer.ToString(es[4].data), "v7", "v7 data");
+    checkEq(es[5].name, "plain", "the GNU prefix area is ignored");
+    checkEq(es[6].uname, "globaluser", "pax 'g' applies to the next entry");
+    checkEq(es[7].uname, "globaluser", "... and the ones after it");
+    checkEq(es[7].size, 4, "pax size overrides the header");
+    checkEq(Buffer.ToString(es[7].data), "four", "... and the data is read to it");
+}
+
+fn test_damaged() {
+    let w = Tar.Create();
+    w.AddFile("a.txt", String.Repeat("a", 600));
+    w.AddFile("b.txt", "b");
+    let t = w.ToBlock();
+
+    check(Tar.Read(Buffer.FromString(String.Repeat("z", 1024))) == nil, "garbage is not an archive");
+    check(String.Contains(Tar.LastError(), "checksum"), "LastError names the checksum");
+
+    let bad = Buffer.Slice(t, 0, len(t));
+    bad[5] = 33;
+    check(Tar.Read(bad) == nil, "a changed header byte fails its checksum");
+
+    check(Tar.Read(Buffer.Slice(t, 0, 800)) == nil, "an entry cut off by the end is an error");
+    check(String.Contains(Tar.LastError(), "past the end"), "... saying so");
+    check(Tar.Read(Buffer.Slice(t, 0, 1536 + 100)) == nil, "a header cut off by the end is an error");
+
+    let noEnd = Tar.Read(Buffer.Slice(t, 0, 2560));
+    checkEq(noEnd == nil ? -1 : len(noEnd), 2, "an archive without its end marker reads to its last entry");
+    checkEq(len(Tar.Read(Buffer.Create(1024, 1))), 0, "two zero blocks are an empty archive");
+    checkEq(len(Tar.Read(Tar.Create().ToBlock())), 0, "an empty writer makes an empty archive");
+    check(Tar.Read(nil) == nil, "nil is not an archive");
+    check(Tar.LastError() != nil, "LastError after nil");
+    Tar.Read(t);
+    checkEq(Tar.LastError(), nil, "LastError is cleared by a good read");
+}
+
+// ============================================================
+//  gzip
+// ============================================================
+
+fn test_gzip() {
+    let w = Tar.Create();
+    w.AddFile("a.txt", String.Repeat("compress me ", 500));
+    w.AddFile("b.txt", "b");
+    let gz = w.ToGzip();
+    checkEq(gz[0] * 256 + gz[1], 0x1F8B, "ToGzip writes a gzip stream");
+    check(len(gz) < 1000, "and compresses (" + str(len(gz)) + " bytes)");
+    let es = Tar.Read(gz);
+    checkEq(len(es), 2, "Read sniffs gzip");
+    checkEq(Buffer.ToString(es[0].data), String.Repeat("compress me ", 500), "data through gzip");
+    checkEq(len(Tar.Read(Deflate.Gzip(w.ToBlock()))), 2, "a tar.gz from Deflate.Gzip reads too");
+    let broken = Buffer.FromString("..garbage that is no gzip at all");
+    broken[0] = 0x1F; broken[1] = 0x8B;
+    check(Tar.Read(broken) == nil, "broken gzip is an error");
+
+    let dir = Directory.CreateTemp("flaris_tar_gz");
+    check(w.Save(dir + "/out/a.tgz"), "Save creates the directory and writes .tgz");
+    let saved = File.ReadAllBytes(dir + "/out/a.tgz");
+    checkEq(saved[0], 0x1F, "Save gzips a .tgz path");
+    check(w.Save(dir + "/a.tar"), "Save a plain .tar");
+    checkEq(field(File.ReadAllBytes(dir + "/a.tar"), 257, 6), "ustar", "Save writes a plain tar for .tar");
+    checkEq(len(Tar.Read(saved)), 2, "the saved file reads back");
+    Directory.DeleteAll(dir);
+}
+
+// ============================================================
+//  From disk and back to disk
+// ============================================================
+
+fn test_tree_and_extract() {
+    let base = Directory.CreateTemp("flaris_tar_tree");
+    let src = base + "/src";
+    Directory.Ensure(src + "/bin");
+    Directory.Ensure(src + "/docs/deep");
+    File.WriteText(src + "/top.txt", "top");
+    File.WriteText(src + "/bin/run.sh", "#!/bin/sh\n");
+    File.WriteText(src + "/docs/deep/note.txt", "note");
+    File.SetMode(src + "/bin/run.sh", 493);
+    File.SetMode(src + "/top.txt", 384);
+    File.SetModifiedTime(src + "/top.txt", 1600000000);
+    if (!isWindows) { File.CreateSymlink("top.txt", src + "/link"); }
+
+    let w = Tar.Create();
+    let added = w.AddTree(src, "app");
+    checkEq(added, isWindows ? 6 : 7, "AddTree adds files, directories and links");
+    let es = Tar.Read(w.ToBlock());
+    check(find(es, "app/docs/") != nil, "directory entry with the prefix");
+    checkEq(find(es, "app/top.txt").mtime, 1600000000, "file time carried");
+    if (!isWindows) {
+        checkEq(find(es, "app/bin/run.sh").mode, 493, "executable mode carried");
+        checkEq(find(es, "app/top.txt").mode, 384, "private mode carried");
+        checkEq(find(es, "app/link").type, "symlink", "a symlink is stored as a link");
+        checkEq(find(es, "app/link").linkname, "top.txt", "... with its target");
+    }
+
+    let out = base + "/out/nested";
+    let r = Tar.ExtractTo(w.ToBlock(), out);
+    checkEq(r.written, added, "ExtractTo writes every entry");
+    checkEq(len(r.skipped), 0, "nothing skipped");
+    checkEq(File.ReadText(out + "/app/docs/deep/note.txt"), "note", "deep file extracted");
+    checkEq(File.GetModifiedTime(out + "/app/top.txt"), 1600000000, "file time restored");
+    if (!isWindows) {
+        checkEq(File.Stat(out + "/app/bin/run.sh").Mode & 511, 493, "executable bit restored");
+        checkEq(File.Stat(out + "/app/top.txt").Mode & 511, 384, "0600 restored as 0600");
+        checkEq(File.ReadLink(out + "/app/link"), "top.txt", "link restored");
+    }
+    Directory.DeleteAll(base);
+}
+
+fn test_extract_hostile() {
+    let base = Directory.CreateTemp("flaris_tar_hostile");
+    let out = base + "/out";
+    Directory.Ensure(base + "/outside");
+    Directory.Ensure(out);
+    if (!isWindows) {
+        File.CreateSymlink(base + "/outside", out + "/planted");
+        File.CreateSymlink(base + "/outside/victim.txt", out + "/victim.txt");
+    }
+
+    let w = Tar.Create();
+    w.AddFile("ok.txt", "fine");
+    w.AddFile("../escape.txt", "x");
+    w.AddFile("/abs.txt", "x");
+    w.AddFile("C:/drive.txt", "x");
+    w.AddFile("a/../../up.txt", "x");
+    w.AddFile("setuid", "x", { mode: 3583 });          // 06777
+    if (!isWindows) {
+        w.AddSymlink("esc", "../outside");
+        w.AddSymlink("abs", "/etc/passwd");
+        w.AddSymlink("good", "ok.txt");
+        w.AddFile("planted/through.txt", "x");
+        w.AddFile("victim.txt", "replaced");
+        w.AddHardLink("hard", "ok.txt");
+        w.AddHardLink("hardout", "../outside/x");
+    }
+    let r = Tar.ExtractTo(w.ToBlock(), out);
+    let skipped = String.Join(r.skipped, ",");
+    foreach (n in ["../escape.txt", "/abs.txt", "C:/drive.txt", "a/../../up.txt"]) {
+        check(String.Contains(skipped, n), "skipped " + n);
+    }
+    check(!File.Exists(base + "/escape.txt") && !File.Exists(base + "/up.txt"), "nothing written above the root");
+    checkEq(File.ReadText(out + "/ok.txt"), "fine", "a plain entry is written");
+    if (!isWindows) {
+        checkEq(File.Stat(out + "/setuid").Mode & 4095, 493, "setuid, setgid and group/other write are masked");
+        check(String.Contains(skipped, "esc"), "a link out of the root is skipped");
+        check(String.Contains(skipped, "abs"), "an absolute link is skipped");
+        check(String.Contains(skipped, "planted/through.txt"), "a path through a symlink on disk is skipped");
+        check(String.Contains(skipped, "hardout"), "a hard link out of the root is skipped");
+        checkEq(len(Directory.List(base + "/outside")), 0, "nothing landed outside");
+        checkEq(File.ReadLink(out + "/good"), "ok.txt", "a link inside the root is made");
+        checkEq(File.ReadText(out + "/hard"), "fine", "a hard link inside the root is made");
+        check(!File.Stat(out + "/victim.txt").IsSymlink, "a link on disk at the entry's path is replaced");
+        checkEq(File.ReadText(out + "/victim.txt"), "replaced", "... not written through");
+    }
+    checkEq(Tar.SafeName("./a//b/"), "a/b", "SafeName normalises");
+    check(Tar.SafeName("../x") == nil && Tar.SafeName("/x") == nil && Tar.SafeName("..\\x") == nil,
+          "SafeName refuses what escapes");
+    check(Tar.ExtractTo(Buffer.FromString(String.Repeat("q", 600)), out) == nil, "ExtractTo of garbage is nil");
+    let devices = Tar.ExtractTo(concat([rawHeader("tty", "3", 0, "ustar", []), rawHeader("pipe", "6", 0, "ustar", [])]), out);
+    checkEq(String.Join(devices.skipped, ","), "tty,pipe", "device and fifo entries are skipped");
+    check(!File.Exists(out + "/tty") && !File.Exists(out + "/pipe"), "... and nothing is made for them");
+    Directory.DeleteAll(base);
+}
+
+// ============================================================
+//  Benchmarks
+// ============================================================
+
+fn bench(name: string, n: int, f) {
+    f();
+    let t0 = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let ms = Time.TicksToMs(Time.Ticks() - t0) / float(n);
+    Console.WriteLine(String.PadRight(name, 44), String.PadLeft(String.FormatArray("{0:.2f}", [ms]), 9), " ms");
+    return ms;
+}
+
+fn test_benchmarks() {
+    Console.WriteLine("");
+    Console.WriteLine("=== Tar benchmarks ===");
+
+    let small = Tar.Create();
+    iter (i from 0 to 1000) { small.AddFile("files/f" + str(i) + ".txt", "content of file " + str(i), { mtime: 1700000000 }); }
+    let smallTar = small.ToBlock();
+    bench("write 1,000 small files (ToBlock)", 5, fn() { small.ToBlock(); });
+    bench("read 1,000 small files (Read)", 5, fn() { Tar.Read(smallTar); });
+    bench("list 1,000 small files (List)", 5, fn() { Tar.List(smallTar); });
+
+    let big = Buffer.Create(8388608, 1);
+    Buffer.FillPattern(big, "0123456789abcdef");
+    let one = Tar.Create();
+    one.AddFile("big.bin", big);
+    let bigTar = one.ToBlock();
+    let wms = bench("write one 8 MB file (ToBlock)", 5, fn() { one.ToBlock(); });
+    let rms = bench("read one 8 MB file (Read)", 5, fn() { Tar.Read(bigTar); });
+    Console.WriteLine("  ", String.FormatArray("{0:.0f}", [8.0 / (wms / 1000.0)]), " MB/s write, ",
+                      String.FormatArray("{0:.0f}", [8.0 / (rms / 1000.0)]), " MB/s read");
+    check(Buffer.Equals(Tar.Read(bigTar)[0].data, big), "the 8 MB file round-trips");
+
+    let gzSmall = small.ToGzip();
+    bench("read 1,000 small files from tar.gz", 3, fn() { Tar.Read(gzSmall); });
+}
+
+fn Main() {
+    Console.WriteLine("=== Tar tests ===");
+    test_roundtrip();
+    test_long_names();
+    test_foreign_headers();
+    test_damaged();
+    test_gzip();
+    test_tree_and_extract();
+    test_extract_hostile();
+    test_benchmarks();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All Tar tests passed!");
+    return 0;
+}

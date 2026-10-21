@@ -84,8 +84,13 @@
 import { BigInt }  from library("BigInt",  "1.0");
 import { Decimal } from library("Decimal", "1.0");
 
+// Degree from which a node's edges also get a lookup map; below it a scan of
+// the edge array is cheaper than building one.
+const _EDGE_MAP_MIN = 32;
+
 class Graph {
     let _adj = nil; 
+    let _edgeMaps = nil;
     let _directed = false;
     let _edgeCount = 0;
     let _wNative = nil; 
@@ -95,6 +100,7 @@ class Graph {
         this._weightType = "native";
         this._wNative    = true;
         this._adj        = Collections.HashMap();  // node -> [{To, Weight}]
+        this._edgeMaps   = Collections.HashMap();  // node -> { Map, Covered } (see _edgeMap)
         this._edgeCount  = 0;
     }
 
@@ -161,6 +167,7 @@ class Graph {
         let degree: int = len(this._adj.Get(id));
         this._edgeCount = this._edgeCount - degree;
         this._adj.Delete(id);
+        this._edgeMaps.Delete(id);
 
         let remaining: array = this._adj.Keys();
         foreach (n in remaining) {
@@ -176,6 +183,7 @@ class Graph {
             }
             if (removed > 0) {
                 this._adj.Set(n, trimmed);
+                this._edgeMaps.Delete(n);
                 if (this._directed) {
                     this._edgeCount = this._edgeCount - removed;
                 }
@@ -208,8 +216,12 @@ class Graph {
             adj.Set(dst, dstEdges);
         }
 
-        foreach (e in srcEdges) {
-            if (e.To == dst) return this;
+        if (len(srcEdges) < _EDGE_MAP_MIN) {
+            foreach (e in srcEdges) {
+                if (e.To == dst) return this;
+            }
+        } else if (this._edgeMap(src, srcEdges).Has(dst)) {
+            return this;
         }
 
         Array.Append(srcEdges, { To: dst, Weight: weight });
@@ -220,6 +232,26 @@ class Graph {
         }
 
         return this;
+    }
+
+    // Lookup map To -> first edge with that To over a node's edge array, for
+    // nodes with at least _EDGE_MAP_MIN edges. Kept as { Map, Covered }: Map
+    // holds edges[0 .. Covered) and takes in the edges appended since on each
+    // use. Whatever removes edges from an array deletes the node's entry.
+    fn _edgeMap(id, edges) {
+        var m = this._edgeMaps.Get(id);
+        if (m == nil) {
+            m = { Map: Collections.HashMap(), Covered: 0 };
+            this._edgeMaps.Set(id, m);
+        }
+        let map = m.Map;
+        let n = len(edges);
+        iter (i from m.Covered to n) {
+            let e = edges[i];
+            if (!map.Has(e.To)) map.Set(e.To, e);
+        }
+        m.Covered = n;
+        return map;
     }
 
     fn RemoveEdge(src, dst): instance {
@@ -239,6 +271,7 @@ class Graph {
         if (!removed) return this;
 
         this._adj.Set(src, newEdges);
+        this._edgeMaps.Delete(src);
         this._edgeCount = this._edgeCount - 1;
 
         if (!this._directed) {
@@ -253,22 +286,30 @@ class Graph {
                 }
             }
             this._adj.Set(dst, newRev);
+            this._edgeMaps.Delete(dst);
         }
 
         return this;
     }
 
     fn HasEdge(src, dst): bool {
-        if (!this._adj.Has(src)) return false;
-        foreach (e in this._adj.Get(src)) {
+        let edges = this._adj.Get(src);
+        if (edges == nil) return false;
+        if (len(edges) >= _EDGE_MAP_MIN) return this._edgeMap(src, edges).Has(dst);
+        foreach (e in edges) {
             if (e.To == dst) return true;
         }
         return false;
     }
 
     fn GetEdgeWeight(src, dst) {
-        if (!this._adj.Has(src)) return nil;
-        foreach (e in this._adj.Get(src)) {
+        let edges = this._adj.Get(src);
+        if (edges == nil) return nil;
+        if (len(edges) >= _EDGE_MAP_MIN) {
+            let e = this._edgeMap(src, edges).Get(dst);
+            return e == nil ? nil : e.Weight;
+        }
+        foreach (e in edges) {
             if (e.To == dst) return e.Weight;
         }
         return nil;
@@ -1236,6 +1277,7 @@ class Graph {
 
     fn Clear(): instance {
         this._adj       = Collections.HashMap();
+        this._edgeMaps  = Collections.HashMap();
         this._edgeCount = 0;
         return this;
     }

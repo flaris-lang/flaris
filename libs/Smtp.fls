@@ -85,6 +85,11 @@
 // accepted when the server announces SMTPUTF8 and refused with a clear error
 // otherwise.
 //
+// A CR or LF in any value written into a header or the envelope (subject,
+// date, ids, names, attachment type and cid, dsn, extra headers) refuses the
+// whole message, since it would start a line of the sender's choosing: Build
+// returns nil and Send fails with errorKind "rejected" before connecting.
+//
 // SmtpMessage.Build(msg, opts?) -> string | nil renders the RFC 5322 text
 // without a server, which is how the test suite checks it and how a program
 // can hand a message to another transport; opts: { smtputf8: bool }.
@@ -233,14 +238,17 @@ fn _maxLine(s: string): int {
     return m;
 }
 
-// A trailing blank on a line must be escaped or the decoder drops it.
-fn _qpEndLine(line: string): string {
-    let n = String.Length(line);
-    if (n == 0) { return line; }
-    let last = String.Substr(line, n - 1, 1);
-    if (last == " ") { return String.Substr(line, 0, n - 1) + "=20"; }
-    if (last == "\t") { return String.Substr(line, 0, n - 1) + "=09"; }
-    return line;
+// A trailing blank on a line must be escaped or the decoder drops it: the
+// line out[ls, o) ending in a space or a tab gets =20 / =09 instead. Returns
+// the new end.
+fn _qpEndLine(out: block, ls: int, o: int): int {
+    if (o == ls) { return o; }
+    let last = out[o - 1];
+    if (last != 32 && last != 9) { return o; }
+    out[o - 1] = 61;                                        // '='
+    if (last == 32) { out[o] = 50; out[o + 1] = 48; }       // "20"
+    else            { out[o] = 48; out[o + 1] = 57; }       // "09"
+    return o + 2;
 }
 
 // Quoted-printable (RFC 2045 6.7): printable ASCII as is, everything else
@@ -248,32 +256,51 @@ fn _qpEndLine(line: string): string {
 fn _qp(s: string): string {
     let b = Buffer.FromString(String.Replace(s, "\r\n", "\n"));
     let n = len(b);
-    let out = [];
-    let line = "";
-    let lineLen = 0;
+    // At most 4 bytes out per byte in (a line break can also escape the blank
+    // before it), plus a 3-byte soft break per 73.
+    let out = Buffer.Create(n * 5 + 16, 1);
+    let m = _qpInto(b, n, out, Buffer.FromString(_HEXU));
+    return Buffer.ToString(out, 0, m);
+}
+
+// The quoted-printable form of b[0, n) written to `out`, lines joined with
+// CRLF; returns its length. `hex` is the upper-case hex alphabet.
+fn _qpInto(b: block, n: int, out: block, hex: block): int {
+    var o = 0;
+    var ls = 0;             // start of the current line in out
+    var lineLen = 0;
     iter (i from 0 to n) {
-        let c = Buffer.ReadU8At(b, i);
+        let c = b[i];
         if (c == 10) {
-            Array.Append(out, _qpEndLine(line));
-            line = ""; lineLen = 0;
+            o = _qpEndLine(out, ls, o);
+            out[o] = 13;
+            out[o + 1] = 10;
+            o += 2;
+            ls = o;
+            lineLen = 0;
             continue;
         }
-        let piece = "";
-        if ((c >= 33 && c <= 126 && c != 61) || c == 32 || c == 9) {
-            piece = String.Create(1, char(c));
-        } else {
-            piece = "=" + String.Substr(_HEXU, c / 16, 1) + String.Substr(_HEXU, c % 16, 1);
-        }
-        let pl = String.Length(piece);
+        var pl = 3;
+        if ((c >= 33 && c <= 126 && c != 61) || c == 32 || c == 9) { pl = 1; }
         if (lineLen + pl > 75) {
-            Array.Append(out, line + "=");
-            line = ""; lineLen = 0;
+            out[o] = 61;
+            out[o + 1] = 13;
+            out[o + 2] = 10;
+            o += 3;
+            ls = o;
+            lineLen = 0;
         }
-        line = line + piece;
+        if (pl == 1) {
+            out[o] = c;
+        } else {
+            out[o] = 61;
+            out[o + 1] = hex[c >> 4];
+            out[o + 2] = hex[c & 15];
+        }
+        o += pl;
         lineLen += pl;
     }
-    Array.Append(out, _qpEndLine(line));
-    return String.Join(out, _CRLF);
+    return _qpEndLine(out, ls, o);
 }
 
 // Pick the transfer encoding a text part needs and render it.
@@ -293,6 +320,12 @@ fn _bodyPart(type: string, body: string): string {
 // A boundary no body can contain by accident.
 fn _boundary(): string {
     return "=_flaris_" + _hex(Crypto.RandomBytes(12));
+}
+
+fn _hasLineBreak(v): bool {
+    if (v == nil) { return false; }
+    let s = str(v);
+    return String.Contains(s, "\r") || String.Contains(s, "\n");
 }
 
 fn _listOf(v) {
@@ -415,10 +448,40 @@ class SmtpMessage
     fn static EncodedWords(s: string): string { return _headerText(s); }
     fn static FoldHeader(name: string, value: string): string { return _fold(name, value); }
 
+    // A CR or LF in a value that is written into a header line, or into an
+    // envelope parameter, would end that line and start one of the sender's
+    // choosing: another header, another recipient, another SMTP command.
+    fn static _hasLineBreaks(msg): bool {
+        foreach (f in ["subject", "date", "messageId", "inReplyTo"]) {
+            if (_hasLineBreak(Object.TryGet(msg, f, nil))) { return true; }
+        }
+        foreach (f in ["references", "listUnsubscribe"]) {
+            foreach (v in _listOf(Object.TryGet(msg, f, nil))) {
+                if (_hasLineBreak(v)) { return true; }
+            }
+        }
+        foreach (a in _listOf(Object.TryGet(msg, "attachments", nil))) {
+            if (Type.IsObject(a) && (_hasLineBreak(Object.TryGet(a, "type", nil)) ||
+                                     _hasLineBreak(Object.TryGet(a, "inline", nil)))) { return true; }
+        }
+        let dsn = Object.TryGet(msg, "dsn", nil);
+        if (dsn != nil && Type.IsObject(dsn)) {
+            if (_hasLineBreak(Object.TryGet(dsn, "ret", nil)) || _hasLineBreak(Object.TryGet(dsn, "envid", nil))) {
+                return true;
+            }
+            foreach (v in _listOf(Object.TryGet(dsn, "notify", nil))) {
+                if (_hasLineBreak(v)) { return true; }
+            }
+        }
+        return false;
+    }
+
     // The RFC 5322 text of msg, CRLF line ends, no trailing dot; nil when a
-    // required field is missing or an address is malformed.
+    // required field is missing, an address is malformed or a header value
+    // holds a CR or LF.
     fn static Build(msg, opts?) {
         if (msg == nil || !Type.IsObject(msg)) { return nil; }
+        if (SmtpMessage._hasLineBreaks(msg)) { return nil; }
         let utf8 = Object.TryGet(opts ?? {}, "smtputf8", false) == true;
         let from = SmtpMessage.Address(Object.TryGet(msg, "from", nil), utf8);
         if (from == nil) { return nil; }
@@ -466,7 +529,7 @@ class SmtpMessage
         if (extra != nil && Type.IsObject(extra)) {
             foreach (k in Object.Keys(extra)) {
                 let v = str(extra[k]);
-                if (String.Contains(k, ":") || String.Contains(k, " ") || String.Contains(k, "\n") ||
+                if (String.Contains(k, ":") || String.Contains(k, " ") || _hasLineBreak(k) ||
                     String.Contains(v, "\n") || String.Contains(v, "\r") || !_isAscii(k)) { return nil; }
                 Array.Append(h, _fold(k, _headerText(v)));
             }
@@ -580,15 +643,22 @@ class SmtpAuth
         if (len(k) > 64) { k = Digest.Md5(k, true); }
         let ipad = Buffer.Create(64 + len(data), 1);
         let opad = Buffer.Create(64 + 16, 1);
+        SmtpAuth._pads(k, ipad, opad);
+        Buffer.Copy(data, 0, ipad, 64, len(data));
+        let inner = Digest.Md5(ipad, true);
+        Buffer.Copy(inner, 0, opad, 64, 16);
+        return Digest.Md5(opad);
+    }
+
+    // The first 64 bytes of ipad and opad: the key, zero-padded to 64 bytes,
+    // XOR 0x36 and XOR 0x5c.
+    fn static _pads(k: block, ipad: block, opad: block): int {
         iter (i from 0 to 64) {
             let kb = (i < len(k)) ? Buffer.ReadU8At(k, i) : 0;
             Buffer.WriteU8At(ipad, i, kb ^ 0x36);
             Buffer.WriteU8At(opad, i, kb ^ 0x5c);
         }
-        Buffer.Copy(data, 0, ipad, 64, len(data));
-        let inner = Digest.Md5(ipad, true);
-        Buffer.Copy(inner, 0, opad, 64, 16);
-        return Digest.Md5(opad);
+        return 64;
     }
 
     // AUTH XOAUTH2: base64 of "user=<user>\x01auth=Bearer <token>\x01\x01".
@@ -982,7 +1052,7 @@ class SmtpClient
         // The message is checked before any network work, so a bad one costs
         // no connection.
         let rendered = SmtpMessage.Build(msg, { smtputf8: true });
-        if (rendered == nil) { return this._rejected("message is missing from/to or has a malformed address", []); }
+        if (rendered == nil) { return this._rejected("message is missing from/to, or has a malformed address or header value", []); }
         if (_dkim != nil) {
             rendered = _dkim.Sign(rendered);
             if (rendered == nil) { return this._rejected("DKIM signing failed", []); }

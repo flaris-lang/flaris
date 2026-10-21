@@ -496,6 +496,177 @@ fn test_dotenv() {
     File.Delete(p);
 }
 
+fn test_unicode_escapes() {
+    Console.WriteLine("\n[33] Unicode escapes");
+    let c = new Config();
+    c.Load("a = \"caf\\u00e9\"\nb = \"\\U0001F600!\"\nc = \"\"\"x\\u00e9y\"\"\"\nbad = \"\\u00zz\"\n");
+    check("\\uXXXX decodes to UTF-8",     c.GetString("a", nil),   "café");
+    check("\\UXXXXXXXX decodes to UTF-8", c.GetString("b", nil),   "😀!");
+    check("\\u in multi-line string",     c.GetString("c", nil),   "xéy");
+    check("invalid \\u keeps the letter", c.GetString("bad", nil), "u00zz");
+}
+
+fn test_float_round_trip() {
+    Console.WriteLine("\n[34] Float round-trip");
+    let c = new Config();
+    c.Load("whole = 1.0\nthird = 0.30000000000000004\nbig = 1e300\nlist = [1.0, 2.5]\npos = inf\n");
+    let c2 = new Config();
+    c2.Load(c.ToString());
+    checkTrue("1.0 reloads as float",       type(c2.Get("whole")) == Type.Float);
+    check("full precision kept",            c2.GetFloat("third", nil), 0.30000000000000004);
+    check("1e300 kept",                     c2.GetFloat("big", nil),   1e300);
+    checkTrue("float in array stays float", type(c2.GetArray("list")[0]) == Type.Float);
+    check("inf kept",                       c2.GetFloat("pos", nil),   Math.Infinity);
+}
+
+fn test_dates_and_times() {
+    Console.WriteLine("\n[35] Dates and times stay as text");
+    let c = new Config();
+    c.Load("odt = 1979-05-27T07:32:00Z\nsp = 1979-05-27 07:32:00-07:00\nfrac = 1979-05-27T00:32:00.999999+01:00\nld = 1979-05-27\nlt = 07:32:00\nafter = 3\n");
+    check("offset date-time",       c.Get("odt"),  "1979-05-27T07:32:00Z");
+    check("space delimiter",        c.Get("sp"),   "1979-05-27 07:32:00-07:00");
+    check("fractional seconds",     c.Get("frac"), "1979-05-27T00:32:00.999999+01:00");
+    check("local date",             c.Get("ld"),   "1979-05-27");
+    check("local time",             c.Get("lt"),   "07:32:00");
+    check("next key still parsed",  c.Get("after"), 3);
+    let c2 = new Config();
+    c2.Load(c.ToString());
+    check("date-time saves and reloads", c2.Get("odt"), "1979-05-27T07:32:00Z");
+}
+
+fn test_array_of_tables_subtables() {
+    Console.WriteLine("\n[36] Sub-tables of an array of tables");
+    let c = new Config();
+    c.Load("[[srv]]\nname = \"a\"\n[[srv]]\nname = \"x\"\n[srv.tls]\non = true\n[[srv.port]]\nn = 1\n");
+    let srv = c.GetArray("srv");
+    check("array kept",               len(srv), 2);
+    check("first item untouched",     Json.Stringify(srv[0]), "{\"name\":\"a\"}");
+    check("[srv.tls] joins last item", srv[1].tls.on, true);
+    check("[[srv.port]] joins last item", srv[1].port[0].n, 1);
+
+    let out = c.ToString();
+    checkTrue("sub-table saved under [srv.tls]", String.Contains(out, "[srv.tls]"));
+    let c2 = new Config();
+    c2.Load(out);
+    check("round-trip keeps nesting", Json.Stringify(c2.Get("srv")), Json.Stringify(c.Get("srv")));
+
+    let c3 = Config.FromObject({ a: [ { x: 1, b: { y: 2 } } ] });
+    let c4 = new Config();
+    c4.Load(c3.ToString());
+    check("FromObject nesting round-trips", Json.Stringify(c4.Get("a")), "[{\"x\":1,\"b\":{\"y\":2}}]");
+    check("no stray top-level table",       c4.Get("b"), nil);
+}
+
+fn test_quoted_keys() {
+    Console.WriteLine("\n[37] Keys that are not bare keys");
+    let c = new Config();
+    c.Set("plain", 1);
+    let o = {};
+    o["my key"] = 2;
+    o["a.b"] = 3;
+    c.Set("sec", o);
+    let out = c.ToString();
+    checkTrue("space key quoted", String.Contains(out, "\"my key\" = 2"));
+    let c2 = new Config();
+    c2.Load(out);
+    check("bare key round-trips",   c2.GetInt("plain", nil), 1);
+    check("quoted key round-trips", c2.GetSection("sec")["my key"], 2);
+    check("dotted key round-trips", c2.GetSection("sec")["a.b"], 3);
+    let c3 = new Config();
+    c3.Load("[\"my sec\".inner]\nv = 1\n");
+    check("quoted table header", c3.GetSection("my sec").inner.v, 1);
+}
+
+fn test_yaml_compact_sequences() {
+    Console.WriteLine("\n[38] YAML - sequence at the key's indent");
+    let c = new Config();
+    c.LoadYaml("key:\n- a\n- b\nnext: 1\nsteps:\n- name: x\n  run: y\n- name: z\njob:\n  needs:\n  - one\n  - two\n  env: e\n");
+    check("compact list",            Json.Stringify(c.Get("key")),   "[\"a\",\"b\"]");
+    check("key after list",          c.GetInt("next", nil),          1);
+    check("compact list of maps",    Json.Stringify(c.Get("steps")), "[{\"name\":\"x\",\"run\":\"y\"},{\"name\":\"z\"}]");
+    check("nested compact list",     Json.Stringify(c.Get("job.needs")), "[\"one\",\"two\"]");
+    check("key after nested list",   c.GetString("job.env", nil),    "e");
+}
+
+fn test_yaml_block_chomping() {
+    Console.WriteLine("\n[39] YAML - block scalar chomping");
+    let c = new Config();
+    c.LoadYaml("clip: |\n  a\n  b\n\nstrip: |-\n  a\n  b\n\nkeep: |+\n  a\n\n\nfclip: >\n  a\n  b\nfstrip: >-\n  a\n  b\nfkeep: >+\n  a\n\nlast: 1\n");
+    check("| clips to one newline", c.Get("clip"),   "a\nb\n");
+    check("|- strips newlines",     c.Get("strip"),  "a\nb");
+    check("|+ keeps newlines",      c.Get("keep"),   "a\n\n\n");
+    check("> folds and clips",      c.Get("fclip"),  "a b\n");
+    check(">- folds and strips",    c.Get("fstrip"), "a b");
+    check(">+ folds and keeps",     c.Get("fkeep"),  "a\n\n");
+    check("key after blocks",       c.GetInt("last", nil), 1);
+    let c2 = new Config();
+    c2.LoadYaml("steps:\n  - run: |\n      echo hi\n      echo there\n  - run: ls\n");
+    check("block scalar in a list item", Json.Stringify(c2.Get("steps")), "[{\"run\":\"echo hi\\necho there\\n\"},{\"run\":\"ls\"}]");
+}
+
+fn test_yaml_quoted_escapes() {
+    Console.WriteLine("\n[40] YAML - quoted string escapes");
+    let c = new Config();
+    c.LoadYaml("tab: \"a\\tb\"\nnl: \"x\\ny\"\nuni: \"caf\\u00e9\"\nq: \"say \\\"hi\\\" # not a comment\"\nsingle: 'it''s \\n'\n");
+    check("\\t decoded",            c.Get("tab"),    "a\tb");
+    check("\\n decoded",            c.Get("nl"),     "x\ny");
+    check("\\u decoded",            c.Get("uni"),    "café");
+    check("escaped quote and #",     c.Get("q"),      "say \"hi\" # not a comment");
+    check("single quotes literal",   c.Get("single"), "it's \\n");
+}
+
+fn test_invalid_values() {
+    Console.WriteLine("\n[41] TOML - values that do not parse load as nil");
+    let t0 = Time.Ticks();
+    let c = new Config();
+    c.Load("k = [a]\nx = 1\n");
+    check("bare word in an array",       c.Get("k"),          nil);
+    check("key after it",                c.GetInt("x", nil),  1);
+    c.Load("k = [1, [2, b]]\nx = 2\n");
+    check("bare word in a nested array", c.Get("k"),          nil);
+    check("key after nested",            c.GetInt("x", nil),  2);
+    c.Load("k = { a = 1, b = c }\nx = 3\n");
+    check("bare word in an inline table", c.Get("k"),         nil);
+    check("key after table",             c.GetInt("x", nil),  3);
+    c.Load("k = { @ = 1 }\nx = 4\n");
+    check("bad key in an inline table",  c.Get("k"),          nil);
+    c.Load("k = [\n  a,\n  2,\n]\nx = 5\n");
+    check("bad element of a multi-line array", c.Get("k"),    nil);
+    check("key after the array",         c.GetInt("x", nil),  5);
+    c.Load("k = [1, 2");
+    check("unclosed array",              c.Get("k"),          nil);
+    c.Load("k = [1, 2,\n  3, # three\n]\n");
+    check("multi-line array with comment", Json.Stringify(c.Get("k")), "[1,2,3]");
+    check("parse errors return at once", Time.TicksToMs(Time.Ticks() - t0) < 1000.0, true);
+}
+
+fn test_nested_array_round_trip() {
+    Console.WriteLine("\n[42] TOML - nested arrays and inline tables round-trip");
+    let src = "k = [[1, 2], [3]]\nm = [[1, [2, \"s\"]], [{ a = 1, b = [true] }], []]\n";
+    let c1 = new Config();
+    c1.Load(src);
+    check("nested array loads",  Json.Stringify(c1.Get("k")), "[[1,2],[3]]");
+    let text = c1.ToString();
+    check("nested array saves",  String.Contains(text, "k = [[1, 2], [3]]"), true);
+    let c2 = new Config();
+    c2.Load(text);
+    check("nested array reloads", Json.Stringify(c2.Get("k")), "[[1,2],[3]]");
+    check("mixed nesting reloads", Json.Stringify(c2.Get("m")), "[[1,[2,\"s\"]],[{\"a\":1,\"b\":[true]}],[]]");
+}
+
+fn test_yaml_hash_in_values() {
+    Console.WriteLine("\n[43] YAML - '#' starts a comment only after whitespace");
+    let c = new Config();
+    c.LoadYaml("url: http://x/#frag\ncolor: \"#fff\"\nplain: a#b\nnote: it's a #1 # c\nlist: [a#b, c] # x\ntab: v\t# c\n# full line\n  # indented\n");
+    check("# inside a URL",          c.Get("url"),   "http://x/#frag");
+    check("quoted #",                c.Get("color"), "#fff");
+    check("# inside a plain word",   c.Get("plain"), "a#b");
+    check("apostrophe is not a quote", c.Get("note"), "it's a");
+    check("# in a flow sequence",    Json.Stringify(c.Get("list")), "[\"a#b\",\"c\"]");
+    check("comment after a tab",     c.Get("tab"),   "v");
+    check("comment lines skipped",   len(c.Keys()),  6);
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -533,6 +704,17 @@ fn Main() {
     test_yaml_load_file();
     test_yaml_multiline_blocks();
     test_dotenv();
+    test_unicode_escapes();
+    test_float_round_trip();
+    test_dates_and_times();
+    test_array_of_tables_subtables();
+    test_quoted_keys();
+    test_yaml_compact_sequences();
+    test_yaml_block_chomping();
+    test_yaml_quoted_escapes();
+    test_invalid_values();
+    test_nested_array_round_trip();
+    test_yaml_hash_in_values();
 
     Console.WriteLine("\n" + String.Repeat("=", 40));
     Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed");

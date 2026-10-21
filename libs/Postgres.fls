@@ -12,12 +12,13 @@
 //      Ubuntu:  apt install libpq-dev
 //      Fedora:  dnf install libpq-devel
 //
-// 2. Compile the FFI plugin (run from the repo root):
+// 2. Compile the FFI plugin from ffi/pg_ffi.c (run from the repo root) into
+//    ~/.flaris/ffi ($FLARIS_FFI), where Ffi.Load finds it by name:
 //
-//      macOS:  gcc -shared -fPIC -O2 -o libs/pg_ffi.dylib libs/pg_ffi.c \
-//                  $(pg_config --cflags) -lpq $(pg_config --ldflags)
-//      Linux:  gcc -shared -fPIC -O2 -o libs/pg_ffi.so   libs/pg_ffi.c \
-//                  $(pg_config --cflags) -lpq $(pg_config --ldflags)
+//      macOS:  gcc -shared -fPIC -O2 -I ffi -o ~/.flaris/ffi/pg_ffi.dylib ffi/pg_ffi.c \
+//                  -I"$(pg_config --includedir)" -L"$(pg_config --libdir)" -lpq
+//      Linux:  gcc -shared -fPIC -O2 -I ffi -o ~/.flaris/ffi/pg_ffi.so    ffi/pg_ffi.c \
+//                  -I"$(pg_config --includedir)" -L"$(pg_config --libdir)" -lpq
 //
 // 3. Run your script with the --unsafe (unsafe/FFI) flag:
 //
@@ -103,15 +104,16 @@
 // -------------
 // FFI libraries are loaded without a SHA-256 fingerprint check here, which
 // means you are trusting the library at the path you compiled.  If you need
-// tamper detection, pass the SHA-256 of your compiled pg_ffi as the second
-// argument to Ffi.Load and run flarisvm --no-verify to enforce it.
+// tamper detection, pass the SHA-256 of your compiled pg_ffi
+// (flarisvm --sha256 <file>) as the second argument to Ffi.Load; the check is
+// on unless flarisvm runs with --no-verify.
 //
 // TROUBLESHOOTING
 // ---------------
 //   Connect returns nil        - check server is running; libpq error is on stderr
 //   Exception.UnsafeOperation  - add --unsafe flag: flarisvm --unsafe script.fls
 //   "symbol not found"         - wrong or stale pg_ffi binary; recompile
-//   "dylib not found"          - run from repo root, or set --libs= to the right path
+//   "dylib not found"          - the plugin is not in ~/.flaris/ffi (or $FLARIS_FFI)
 //
 // API REFERENCE
 // -------------
@@ -135,7 +137,8 @@
 //   ExecParams(sql, params:array)
 //
 // Transactions:
-//   Transaction(fn)   - calls fn(db); auto-COMMIT on success, ROLLBACK on throw
+//   Transaction(fn)   - calls fn(); auto-COMMIT on success, ROLLBACK on a false
+//                       return or a throw (the exception is rethrown unchanged)
 //
 // Misc:
 //   Close()
@@ -296,7 +299,8 @@ class Postgres {
     }
 
     // db.Transaction(f) - bool
-    // Wraps f() in BEGIN/COMMIT. If f() returns false, rolls back and returns false.
+    // Wraps f() in BEGIN/COMMIT. If f() returns false, rolls back and returns
+    // false; if it throws, rolls back and rethrows the same exception.
     // Example: db.Transaction(fn() { return db.ExecParams("...", [...]) == 1; });
     fn Transaction(f: fn): bool {
         this.Exec("BEGIN");
@@ -310,7 +314,7 @@ class Postgres {
             return true;
         } catch (e) {
             this.Exec("ROLLBACK");
-            throw(e.Code, e.Message);
+            throw e;
         }
     }
 

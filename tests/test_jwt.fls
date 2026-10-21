@@ -1,7 +1,9 @@
 // test_jwt.fls
-// Tests for Jwt.fls - HS256 encode, decode, verify, and claims validation.
+// Tests for Jwt.fls - encode, decode, verify (HMAC, EdDSA, RSA, ECDSA), JWK
+// and JWK Set keys, and claims validation.
 
 import { Jwt } from library("libs/Jwt", "1.0");
+import { Util } from library("libs/Util", "1.0");
 
 global passed = 0;
 global failed = 0;
@@ -32,6 +34,56 @@ fn assert(name:string, cond:bool) {
         failed += 1;
     }
 }
+
+// A token with header JSON headerJson over payload part payloadB64, MAC'ed
+// with HS256 under secret.
+fn macToken(headerJson: string, payloadB64: string, secret: string): string {
+    let si = Jwt.Base64UrlEncodeString(headerJson) + "." + payloadB64;
+    return si + "." + Util.Base64UrlEncode(Util.HexToBin(Crypto.HmacSha256(secret, si)));
+}
+
+// Token t with its header replaced by one naming alg.
+fn withAlgHeader(t: string, alg: string): string {
+    let p = String.Split(t, ".");
+    return Jwt.Base64UrlEncodeString("{\"alg\":\"" + alg + "\",\"typ\":\"JWT\"}") + "." + p[1] + "." + p[2];
+}
+
+// s with the base64url character at i changed.
+fn flipChar(s: string, i: int): string {
+    let c = (s[i] == 'A' ? "B" : "A");
+    return String.Substr(s, 0, i) + c + String.Substr(s, i + 1);
+}
+
+// Token t with the character n places from its end changed.
+fn flipLast(t: string, n: int): string {
+    return flipChar(t, len(t) - n);
+}
+
+// RFC 7515 Appendix A.2 (RS256) and A.3 (ES256): the RFC's keys and tokens.
+global RFC_RSA_N = "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ";
+global RFC_RS256 = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
+global RFC_EC_X  = "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU";
+global RFC_EC_Y  = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
+global RFC_ES256 = "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q";
+
+// Keys and tokens made with the openssl command line: payload
+// {sub:"user-42", iat:1700000000, exp:1700003600, aud:"api", iss:"auth.example"}.
+global RSA_JWK = { kty: "RSA", kid: "rsa-1", n: "3mZ0iOF--V7j7l9iHmcSPcFJkbiGWgGvzli0cEOeCPALec6HO9QNuNifHswCDi9uyHH1_VQ2FFnTdAAnLbyNKa0gbXDL1YH8isgCUTlFvGZyJCRcaVGxVkOdW2WudvJ88VdbnvVMvLXAyta7T4uh8sZL4WFO2vPB4RMgIWZZr3FLwIDD404ygxLDdoe3_DOeO5VkUA89jhu7JRwrqWix2zCKuYeOH4rs_hKk96hjd4xEcdzpn-CkowtKMZaESzXQTMA_ChL07z8zvKOlfA7ix9b_zrG8tB1NdVbvOGdI55TgrQpsbZdaONr1X_ovigWuNrAPcsUy6FaF21TcKsmC8Q", e: "AQAB" };
+global RSA2_JWK = { kty: "RSA", kid: "rsa-2", n: "x3pzdWMURFoKzyiJKoTjXU2qM6MxB6EDyqID1yc4Hw4lkl7__H7OK2UEQLTTWDCZaWGYDDCNpETq72DBg-5VAi3aL_W_BsGhWf2xIFyoEdElZcHZciWuLWUggDCw5Oqf9PdxkiJs8P7uJsnWvIbsrYMqUkTFPmR0anwAcOnCmCL2cMu7S_I0c3AjYwmfhKOx9dGJ7moNAefNLv38Js9qedCscgrw8ykWMH5FHphEXU1L2HNWEFJDGCi48H7uoNOG-PNkqPmiQpFfjhdOkhCS7HJhsR73SNBRo8mOWOFrOoF4kpLAzP512F3mnXAQ3z0IiC0fmQfV8jgg6R0apfXSCQ", e: "AQAB" };
+global RSA1024_JWK = { kty: "RSA", kid: "rsa-small", n: "vmsaz0KV3gD1rsScJBCqUHp-r0cKzHfndKuO7VhfZo9cfwA0Lwb5eeabV4jgprIbsZoT4LQ1W4x9aOFI72unt3LgiAuC5qHEGt1Bu7GOZ2IVGEBlKgMwZ9Lqh-v9qWyGjV1zbB4Eq4EqgdE8oKik86MTvfmbXdhAemTgVKJAuAs", e: "AQAB" };
+global RSA4096_JWK = { kty: "RSA", kid: "rsa-big", n: "qwTAWzjE6Y3_izcWDPkrjpSLzR0MFjQtXlxrU3rMogHWmDfHzREWX4CNzdZHXWbxtk3mu8TOdj9YjtWecA7EXwK-Juo5xoco-QPxB8WZGUxm2kmpnIjWpFVhdOj_xLcX7vI7O8VuIu133gSeWTxG4bHc1fEyrJy8xzaHu6-fmDsnnZrmdJ9d5IGtBRDzjoC0me3qpaSHsOmb_Q705a7GzNxoUF7OeeNyLh4KxC3UYbBnExc1HyQZInennIGZdlEMrZxDKHLTMmgMrbwPs2AWF4sudHuwZlB9-bFuCtv294NAArbQteRIfZWOyzGKjjzjjwx_E-n40MgA9-bJerqW_sH4kLkzAXusZajhoA-jWF42sY848v05s5yom8L6DXEWPCsJPNJA36Srzz3spXKL_1yUNwX0aKMYGw26IPTrFJw0feXPjhzZLbqKVqAGi9RVpLCUEBY0VCJQdv_XaGXsu2b6WxlgBer2D-KZzi_voJ56VuFDkG-TLCXXHcSHEnHWglw0n4WlzbvuwNnjQpyeH2Pl105-ifysHBr5hg09CazaCgmWBxxZV2sdApRgMwpgcQ6fdYJsmqlblt0sKteBCHTuq7ufG5v0lc9Ix9y-rBgx-jcLvYM4MH0udgD6Cbcu336P_P1D6q2Cg-IuKVL11b5kjdLec_qvDbfZxP13P50", e: "AQAB" };
+global EC_JWK = { kty: "EC", crv: "P-256", kid: "ec-1", x: "ogBN_sVaOUt0Oc3kRoF1U0remgDfjE1UVJopMcSVKDo", y: "_QZ9Idr4B5ooxQGjvwaPG5cweWJc4RRpTEwoaNl2Sh0" };
+global RSA_PEM = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3mZ0iOF++V7j7l9iHmcS\nPcFJkbiGWgGvzli0cEOeCPALec6HO9QNuNifHswCDi9uyHH1/VQ2FFnTdAAnLbyN\nKa0gbXDL1YH8isgCUTlFvGZyJCRcaVGxVkOdW2WudvJ88VdbnvVMvLXAyta7T4uh\n8sZL4WFO2vPB4RMgIWZZr3FLwIDD404ygxLDdoe3/DOeO5VkUA89jhu7JRwrqWix\n2zCKuYeOH4rs/hKk96hjd4xEcdzpn+CkowtKMZaESzXQTMA/ChL07z8zvKOlfA7i\nx9b/zrG8tB1NdVbvOGdI55TgrQpsbZdaONr1X/ovigWuNrAPcsUy6FaF21TcKsmC\n8QIDAQAB\n-----END PUBLIC KEY-----\n";
+global RSA_PKCS1_PEM = "-----BEGIN RSA PUBLIC KEY-----\nMIIBCgKCAQEA3mZ0iOF++V7j7l9iHmcSPcFJkbiGWgGvzli0cEOeCPALec6HO9QN\nuNifHswCDi9uyHH1/VQ2FFnTdAAnLbyNKa0gbXDL1YH8isgCUTlFvGZyJCRcaVGx\nVkOdW2WudvJ88VdbnvVMvLXAyta7T4uh8sZL4WFO2vPB4RMgIWZZr3FLwIDD404y\ngxLDdoe3/DOeO5VkUA89jhu7JRwrqWix2zCKuYeOH4rs/hKk96hjd4xEcdzpn+Ck\nowtKMZaESzXQTMA/ChL07z8zvKOlfA7ix9b/zrG8tB1NdVbvOGdI55TgrQpsbZda\nONr1X/ovigWuNrAPcsUy6FaF21TcKsmC8QIDAQAB\n-----END RSA PUBLIC KEY-----\n";
+global EC_PEM = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEogBN/sVaOUt0Oc3kRoF1U0remgDf\njE1UVJopMcSVKDr9Bn0h2vgHmijFAaO/Bo8blzB5YlzhFGlMTCho2XZKHQ==\n-----END PUBLIC KEY-----\n";
+global T_RS256 = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYS0xIn0.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.tfPlPvIaLKII3JSQsgHALy-B56tJMhs6160sM9hYDPdP52hDXh633vMMrt7_N-bgs8-ZziT40L-ZmYJNGBO7u_BNP7jUJ94fALEKsNeu62FlcsBTvo5IkZtQoGF_I4SE1eqhwlmhgN3bvpEI14hfHm3_aktMvDovcF7OnaNn0ZYnOqvLHV5xUwfxKBxNvCBpFqoElMx2dDc9LEQzMkx9NzArjakM0_272G4EePl3YkC70DZpM0UjLoYr8bFbgj7wWSyv2XUY-tN45ef5sAW-r-LU17uf3QSzgE4Dm9jHDq9y00oOrgR2Z245KIBpg4s79kkdaxyaRQnK-wRFZGmxMw";
+global T_RS384 = "eyJhbGciOiJSUzM4NCIsInR5cCI6IkpXVCIsImtpZCI6InJzYS0xIn0.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.Ueb2omyjZE6Fwbg5FJ5GTTiJXM32xz1J2_cTsdrVEaiMamq0vEL8xKJdFU0Kt_S_-YdbBIGkdXoIa6rLtQSinQRGz87gTvFPUNR9RbPgz7WT-XBSdfHUa9DJ5ZiU7EFfshdb-dnhqBecTRbm-xZesQgpl1ZnOY7lsf1ljNg5a7vjLVUq_pnR-eYa7j-1F4eHyvqbHU0QTJmzJM58DwENtkrX7gE8VKNmokazGE5kand8I41FKBMFq5TnJsTrdJiKMaP9ecJB5N_zbIK1CWmN1aqPvO2bNakz6KgmI3t9CMnxRIYZ9HmF80hV_iUagrH8REGvZDwfPDiqEE3VK8Xsng";
+global T_RS512 = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCIsImtpZCI6InJzYS0xIn0.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.ZdxGz4OGXBfiX3E6D7FYUrQjtCbYXmQ9-DntxmnZ51YqhG8ANRyXdRpOdUIJZxgQZvE0t8R0Aib7VuXikOz6C-Pk8bmIr5r36uaOqoXMEdPBl6LebjtRjb6HPFsb3Ca-sB2tuEYQDPHxSSTiSViQZpHXwzpF83Io4fr2SEEX9Fm5DPsV17Q5-HtynZteJYZVMwpts8OKaK1JpxZA--wotwq15e3L6-cw6x2uTx_YBW7GMdJdO_FGhCav0_CjXf3TVqe9RLfWFB2VZjOyrUSJUbxwxMTlwKVHY29pa6amlRmiTcdAHPjBB8A8pYpv1uH_12RcA-m5YmFFobTOEt9EYw";
+global T_PS256 = "eyJhbGciOiJQUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYS0xIn0.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.o7OTbypOPIfhk1RgZP6ZIXthON0ykexNIvKilwvD-gJ86aSuLxMu8jNn2aBV8GbR9Enx7K1HtTx5boUm5QPRhlxTFgaaw17B6emKOJ6PPX-Pg3nfm6KEuawkQlJP6yy0JWmMA6K3Kvmz8HzGZhzyZheucFy8lYcgNQr19aFWvNP3T9Lt0rskiq7dgINZnHoe5sIUBNeY2Ob_kXP1fq7RlRPQ-136Z-pOFRHrzQOfwisrxZI4KyKEfLLNcJ7ZcrAePbsDukn2snO0ZtGjT1qgemM65Y_Gaa2B_DM1GCBj6u84ajOAmRjC49UXUJlo2Zq_SMx_KDeQuH6Z6eN3Ki2vQA";
+global T_ES256 = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImVjLTEifQ.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.Jj-R2B6IprOwwkELhetDhjn3QTiDyHhq70nDbq92Cytr36oe-N5pgNIZ9F1qRGTZUoKtrHY3QehWh-mMfKQTwg";
+global T_RS256_KEY2 = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InJzYS0yIn0.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.t0zW2VRj0TiRbLZMBFYhvk6k-cV475X7tpVFlQyb8cqSMOYstmTCnT63OsIJUE7xCL7UyhH8JZPej4NPYf9Qd6PFHW4W2QGV-0qbVpOrJYXdCsKtRjSwoaT9Tu5eKwTouHpThtJIe5Z48pPu2vhaP6_fz4aDZ_AY3ZKHdGXUPjGZnbiKytK1cUH_xaail0I0k1ebyRK_3j-3Lz4eRHyUTRslzZ56URUpknnaTOWScYbtakKc_HidxFkyeJkLoVXFNg14IYzNz0Hfn4uSoSJy_ArvYLzMIIEN6Mat0RCAVT0RDQTu1wFlgiSEBllGPhZcZ1DkP8PFebZKAHeTM8W-4A";
+global T_RS256_4096 = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.g1T_v07RBONTMJ7emby2SmDIC7mzV3su9Jy_T9mVBui-994v1mb_ItxdeLQWLQPEPSzSteekj84CqUUOlKRCRFmWmJCWF20DJfHKFe-aZoZUFjqwhxwUJBTEbAB0vWN5HlLcm7DwhYCF95PRgnXpH1YNKnb03JttvK8pyS6zonwdJD9nMpgBQ_8EV4c_L9RURLMC1diHvLp9RI99F85leNTn8EyG1-wfdICVYQLgoiFGHZTH2j-NofT1kQJuXQO89UJuntQNBWG9dUpNy4SuILI2yrpXw_iQYk4IBJ7S9uHWxy42XxcrKEgSpnxoWH-WbLCl1g9Az6oIeJxeCMY0gpFpmcdzxRuxZUn4Iu_4mKcNwsCd690v-VKxwDE6b8BtMV2d5GZW3YSI6s69T6_hLh1bXJzMxSPZTIpSVs4bkOej-7bEpfNfuqHGdmZ3a5oVaCUfIz9Oa00FyGu0ishL-ZnA2IQYp222DHSYzFbh-Q4vVxc5ZMWscg8ZH4jVH0j_-wydZ_eD1RDEQzviX1OeuCtBkGeWMfADPdmEa4qIWi6bCUR8FHuM8HklfwMaDCsBqHhH6_YqGJXOzuweT1ecV14fj2ayEvBYW6EcnqtGGylp8l849-mgyvTAeAtrjx8xPaujMCkuarIPbKBLQnf1nATC7lUaaNnZVgwX3yaQVmo";
+global T_RS256_NOKID = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDAsImF1ZCI6ImFwaSIsImlzcyI6ImF1dGguZXhhbXBsZSJ9.n93OVew-6P9lNf8PCqfQbfxgRMgBqUxgfvAYbXZ5r4cp9Q4sTrO2AAMhGlmECfqfBTcsFXMlflfk0BtlTtrTJUxybp5PmnPpz35iTzA_ZZXK1AvLCfx2Pz4B6CaM7MFu6PP_FMCJ7KbjSMeBMd-ZJ1AqwsDfb6K6t3W3DezlbTVeZjBFpoBvaduBhXUQfIOZlJuQqjthNLJTrXQPI3OEaPMbW3vFVtpOgMUb5vmF-lQPrYaYxWqNPFl7DUQbGHf0_G1cVA3i1ORsj582Q1tAbwljRZM-rHwhsyaR42U0PP8zs028i3ulQQ4-74Yq81TjALuW2ZTNEmez4Q3j6eC1JQ";
 
 fn Main() {
     let jwt    = new Jwt();
@@ -389,6 +441,158 @@ fn Main() {
     assert("EdDSA WithClaims iss mismatch",    !Jwt.VerifyEdDSAWithClaims(tEdAud, kp.PublicKey, { iss: "you" }));
 
     // ============================================================
+    //  Algorithm pinning on the HMAC verifiers
+    // ============================================================
+
+    // A token with its own header but an HS256 MAC over it.
+    let hsPayload = Jwt.Base64UrlEncodeString("{\"sub\":\"pin\"}");
+    let as512  = macToken("{\"alg\":\"HS512\",\"typ\":\"JWT\"}", hsPayload, secret);
+    let asNone = macToken("{\"alg\":\"none\",\"typ\":\"JWT\"}", hsPayload, secret);
+    let asCrit = macToken("{\"alg\":\"HS256\",\"crit\":[\"exp\"]}", hsPayload, secret);
+    let asOk   = macToken("{\"alg\":\"HS256\",\"typ\":\"JWT\"}", hsPayload, secret);
+    assert("HS256 MAC under a hand-made header verifies", Jwt.VerifyHS256(asOk, secret));
+    assert("HS256 verifier rejects a header naming HS512", !Jwt.VerifyHS256(as512, secret));
+    assert("HS256 verifier rejects alg none",              !Jwt.VerifyHS256(asNone, secret));
+    assert("HS256 verifier rejects a crit header",         !Jwt.VerifyHS256(asCrit, secret));
+    assert("VerifyDecodedHS256 rejects alg none",          !Jwt.VerifyDecodedHS256(Jwt.Decode(asNone), secret));
+    assert("HS512 verifier rejects an HS256 header",       !Jwt.VerifyHS512(withAlgHeader(t512, "HS256"), secret));
+    assert("EdDSA verifier rejects an HS256 token",        !Jwt.VerifyEdDSA(token, kp.PublicKey));
+    assert("HS256 verifier refuses a non-string secret",   !Jwt.VerifyHS256(token, 42));
+    let pemSigned = Jwt.EncodeHS256({ sub: "admin" }, RSA_PEM);
+    assert("HS256 verifier refuses a PEM key as secret",   !Jwt.VerifyHS256(pemSigned, RSA_PEM));
+
+    // ============================================================
+    //  RS256 / ES256 test vectors of RFC 7515
+    // ============================================================
+
+    let rfcRsa = Jwt.KeyFromJwk({ kty: "RSA", n: RFC_RSA_N, e: "AQAB" });
+    let rfcEc  = Jwt.KeyFromJwk({ kty: "EC", crv: "P-256", x: RFC_EC_X, y: RFC_EC_Y });
+    assert("RFC 7515 A.2 RSA key reads",          rfcRsa != nil);
+    assert("RFC 7515 A.3 EC key reads",           rfcEc != nil);
+    assert("RFC 7515 A.2 RS256 token verifies",   Jwt.VerifyRS256(RFC_RS256, rfcRsa));
+    assert("RFC 7515 A.3 ES256 token verifies",   Jwt.VerifyES256(RFC_ES256, rfcEc));
+    assert("RFC 7515 A.2 claims before exp",      Jwt.VerifyRS256WithClaims(RFC_RS256, rfcRsa, { now: 1300819000, iss: "joe" }));
+    assert("RFC 7515 A.2 claims after exp",       !Jwt.VerifyRS256WithClaims(RFC_RS256, rfcRsa, { now: 1300819400 }));
+    assert("RFC 7515 A.3 claims before exp",      Jwt.VerifyES256WithClaims(RFC_ES256, rfcEc, { now: 1300819000 }));
+    assert("RFC 7515 A.3 claims after exp",       !Jwt.VerifyES256WithClaims(RFC_ES256, rfcEc, { now: 1300819400 }));
+    assert("RFC 7515 A.2 with the A.3 key fails", !Jwt.VerifyRS256(RFC_RS256, rfcEc));
+    assert("RFC 7515 A.3 with the A.2 key fails", !Jwt.VerifyES256(RFC_ES256, rfcRsa));
+    assert("RFC 7515 A.2 key as a plain JWK",     Jwt.VerifyRS256(RFC_RS256, { kty: "RSA", n: RFC_RSA_N, e: "AQAB" }));
+    assert("RFC 7515 A.3 key as JWK JSON text",
+        Jwt.VerifyES256(RFC_ES256, "{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"" + RFC_EC_X + "\",\"y\":\"" + RFC_EC_Y + "\"}"));
+
+    // ============================================================
+    //  RS256 / RS384 / RS512 / PS256 / ES256 from openssl
+    // ============================================================
+
+    let rsaKey = Jwt.KeyFromJwk(RSA_JWK);
+    let ecKey  = Jwt.KeyFromJwk(EC_JWK);
+    let at     = { now: 1700000100 };
+    assert("RS256 verifies",                  Jwt.VerifyRS256(T_RS256, rsaKey));
+    assert("RS384 verifies",                  Jwt.VerifyRS384(T_RS384, rsaKey));
+    assert("RS512 verifies",                  Jwt.VerifyRS512(T_RS512, rsaKey));
+    assert("PS256 verifies",                  Jwt.VerifyPS256(T_PS256, rsaKey));
+    assert("ES256 verifies",                  Jwt.VerifyES256(T_ES256, ecKey));
+    assert("ES256 verifies twice with a key", Jwt.VerifyES256(T_ES256, ecKey));
+    assert("RS256 with a 4096-bit key",       Jwt.VerifyRS256(T_RS256_4096, RSA4096_JWK));
+    assert("RS256 WithClaims",                Jwt.VerifyRS256WithClaims(T_RS256, rsaKey, { now: 1700000100, aud: "api", iss: "auth.example" }));
+    assert("RS384 WithClaims",                Jwt.VerifyRS384WithClaims(T_RS384, rsaKey, at));
+    assert("RS512 WithClaims",                Jwt.VerifyRS512WithClaims(T_RS512, rsaKey, at));
+    assert("PS256 WithClaims",                Jwt.VerifyPS256WithClaims(T_PS256, rsaKey, at));
+    assert("ES256 WithClaims",                Jwt.VerifyES256WithClaims(T_ES256, ecKey, { now: 1700000100, aud: "api" }));
+    assert("RS256 WithClaims expired",        !Jwt.VerifyRS256WithClaims(T_RS256, rsaKey, { now: 1800000000 }));
+    assert("ES256 WithClaims wrong aud",      !Jwt.VerifyES256WithClaims(T_ES256, ecKey, { now: 1700000100, aud: "web" }));
+    assert("RS256 WithClaims wrong iss",      !Jwt.VerifyRS256WithClaims(T_RS256, rsaKey, { now: 1700000100, iss: "evil" }));
+
+    // Keys from PEM files.
+    assert("SubjectPublicKeyInfo RSA PEM",    Jwt.VerifyRS256(T_RS256, Jwt.KeyFromPem(RSA_PEM)));
+    assert("PKCS #1 RSA PEM",                 Jwt.VerifyPS256(T_PS256, Jwt.KeyFromPem(RSA_PKCS1_PEM)));
+    assert("SubjectPublicKeyInfo P-256 PEM",  Jwt.VerifyES256(T_ES256, Jwt.KeyFromPem(EC_PEM)));
+    assert("PEM text as the key",             Jwt.VerifyRS512(T_RS512, RSA_PEM));
+    assert("PEM without its end line",        Jwt.KeyFromPem(String.Substr(RSA_PEM, 0, 60)) == nil);
+    assert("PEM with a damaged body",         Jwt.KeyFromPem(String.Replace(RSA_PEM, "MIIB", "MIIC")) == nil);
+    assert("PEM of something else",           Jwt.KeyFromPem("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----") == nil);
+
+    // The call pins the algorithm.
+    assert("RS384 verifier rejects RS256",    !Jwt.VerifyRS384(T_RS256, rsaKey));
+    assert("RS256 verifier rejects PS256",    !Jwt.VerifyRS256(T_PS256, rsaKey));
+    assert("PS256 verifier rejects RS256",    !Jwt.VerifyPS256(T_RS256, rsaKey));
+    assert("ES256 verifier rejects RS256",    !Jwt.VerifyES256(T_RS256, rsaKey));
+    assert("RS256 verifier with an EC key",   !Jwt.VerifyRS256(T_RS256, ecKey));
+    assert("ES256 verifier with an RSA key",  !Jwt.VerifyES256(T_ES256, rsaKey));
+    assert("RS256 with the other RSA key",    !Jwt.VerifyRS256(T_RS256_KEY2, rsaKey));
+
+    // Tampering.
+    let rsParts = String.Split(T_RS256, ".");
+    let esParts = String.Split(T_ES256, ".");
+    let otherPayload = Jwt.Base64UrlEncodeString("{\"sub\":\"admin\",\"iat\":1700000000,\"exp\":1700003600,\"aud\":\"api\",\"iss\":\"auth.example\"}");
+    assert("RS256 tampered payload",          !Jwt.VerifyRS256(rsParts[0] + "." + otherPayload + "." + rsParts[2], rsaKey));
+    assert("ES256 tampered payload",          !Jwt.VerifyES256(esParts[0] + "." + otherPayload + "." + esParts[2], ecKey));
+    assert("RS256 tampered signature",        !Jwt.VerifyRS256(rsParts[0] + "." + rsParts[1] + "." + flipChar(rsParts[2], 40), rsaKey));
+    assert("PS256 tampered signature",        !Jwt.VerifyPS256(flipLast(T_PS256, 50), rsaKey));
+    assert("ES256 tampered r",                !Jwt.VerifyES256(esParts[0] + "." + esParts[1] + "." + flipChar(esParts[2], 10), ecKey));
+    assert("ES256 tampered s",                !Jwt.VerifyES256(esParts[0] + "." + esParts[1] + "." + flipChar(esParts[2], 60), ecKey));
+    assert("RS256 truncated signature",       !Jwt.VerifyRS256(rsParts[0] + "." + rsParts[1] + "." + String.Substr(rsParts[2], 0, 300), rsaKey));
+    assert("ES256 signature of zeros",        !Jwt.VerifyES256(esParts[0] + "." + esParts[1] + "." + Jwt.Base64UrlEncodeString(String.Repeat("\x01", 64)), ecKey));
+    let rsAsRs512 = Jwt.Base64UrlEncodeString("{\"alg\":\"RS512\",\"typ\":\"JWT\",\"kid\":\"rsa-1\"}");
+    let rsAsNone  = Jwt.Base64UrlEncodeString("{\"alg\":\"none\",\"typ\":\"JWT\"}");
+    assert("RS256 signature under an RS512 header", !Jwt.VerifyRS512(rsAsRs512 + "." + rsParts[1] + "." + rsParts[2], rsaKey));
+    assert("alg none with an empty signature",      !Jwt.VerifyWithKey(rsAsNone + "." + rsParts[1] + ".", rsaKey, at));
+    assert("alg none with the RS256 signature",     !Jwt.VerifyWithKey(rsAsNone + "." + rsParts[1] + "." + rsParts[2], rsaKey, at));
+    assert("HS256 MAC keyed with the RSA PEM",      !Jwt.VerifyWithKey(pemSigned, rsaKey));
+    assert("HS256 MAC keyed with the RSA PEM text", !Jwt.VerifyWithKey(pemSigned, RSA_PEM));
+    assert("not a token",                           !Jwt.VerifyES256("a.b", ecKey) && !Jwt.VerifyRS256(nil, rsaKey));
+    assert("no key",                                !Jwt.VerifyRS256(T_RS256, nil) && !Jwt.VerifyES256(T_ES256, "junk"));
+
+    // VerifyWithKey takes the algorithm from the header when the key allows it.
+    assert("VerifyWithKey RS256",             Jwt.VerifyWithKey(T_RS256, rsaKey, at));
+    assert("VerifyWithKey RS384",             Jwt.VerifyWithKey(T_RS384, rsaKey, at));
+    assert("VerifyWithKey PS256",             Jwt.VerifyWithKey(T_PS256, RSA_JWK, at));
+    assert("VerifyWithKey ES256",             Jwt.VerifyWithKey(T_ES256, EC_PEM, at));
+    assert("VerifyWithKey checks claims",     !Jwt.VerifyWithKey(T_RS256, rsaKey, { now: 1800000000 }));
+    assert("VerifyWithKey honours algs",      !Jwt.VerifyWithKey(T_PS256, rsaKey, { now: 1700000100, algs: ["RS256"] }));
+    assert("VerifyWithKey algs allows",       Jwt.VerifyWithKey(T_PS256, rsaKey, { now: 1700000100, algs: ["RS256", "PS256"] }));
+    let pinned = Jwt.KeyFromJwk({ kty: "RSA", n: RSA_JWK.n, e: RSA_JWK.e, alg: "RS256" });
+    assert("a JWK alg pins the key",          Jwt.VerifyWithKey(T_RS256, pinned, at) && !Jwt.VerifyWithKey(T_RS512, pinned, at));
+    assert("a pinned key refuses its other algs", !Jwt.VerifyPS256(T_PS256, pinned));
+
+    // ============================================================
+    //  JWK and JWK Set handling
+    // ============================================================
+
+    let set = Jwt.KeySet({ keys: [RSA_JWK, RSA2_JWK, EC_JWK, RSA1024_JWK, { kty: "oct", k: "c2VjcmV0" }] });
+    assert("KeySet keeps the usable keys",    len(set) == 3);
+    assert("JWKS picks rsa-1 by kid",         Jwt.VerifyWithJwks(T_RS256, set, at));
+    assert("JWKS picks rsa-2 by kid",         Jwt.VerifyWithJwks(T_RS256_KEY2, set, at));
+    assert("JWKS picks ec-1 by kid",          Jwt.VerifyWithJwks(T_ES256, set, at));
+    assert("JWKS PS256 by kid",               Jwt.VerifyWithJwks(T_PS256, set, at));
+    assert("JWKS checks claims",              !Jwt.VerifyWithJwks(T_RS256, set, { now: 1700000100, aud: "web" }));
+    assert("JWKS as JSON text",
+        Jwt.VerifyWithJwks(T_ES256, "{\"keys\":[" + Json.Stringify(EC_JWK) + "," + Json.Stringify(RSA_JWK) + "]}", at));
+    assert("JWKS as an array of JWKs",        Jwt.VerifyWithJwks(T_RS256, [RSA2_JWK, RSA_JWK], at));
+    assert("JWKS unknown kid",                !Jwt.VerifyWithJwks(T_RS256, [RSA2_JWK, EC_JWK], at));
+    assert("JWKS kid of the wrong type",      !Jwt.VerifyWithJwks(T_RS256, [{ kty: "EC", crv: "P-256", kid: "rsa-1", x: EC_JWK.x, y: EC_JWK.y }], at));
+    assert("JWKS without kid, one RSA key",   Jwt.VerifyWithJwks(T_RS256_NOKID, [RSA_JWK, EC_JWK], at));
+    assert("JWKS without kid, two RSA keys",  !Jwt.VerifyWithJwks(T_RS256_NOKID, [RSA_JWK, RSA2_JWK], at));
+    assert("JWKS skips use:enc keys",
+        !Jwt.VerifyWithJwks(T_RS256, [{ kty: "RSA", kid: "rsa-1", use: "enc", n: RSA_JWK.n, e: RSA_JWK.e }], at));
+    assert("JWKS honours key_ops",
+        Jwt.VerifyWithJwks(T_RS256, [{ kty: "RSA", kid: "rsa-1", key_ops: ["verify"], n: RSA_JWK.n, e: RSA_JWK.e }], at)
+        && !Jwt.VerifyWithJwks(T_RS256, [{ kty: "RSA", kid: "rsa-1", key_ops: ["encrypt"], n: RSA_JWK.n, e: RSA_JWK.e }], at));
+    assert("JWKS that is not one",            !Jwt.VerifyWithJwks(T_RS256, "not json", at) && len(Jwt.KeySet(42)) == 0);
+
+    assert("JWK: RSA below 2048 bits",        Jwt.KeyFromJwk(RSA1024_JWK) == nil);
+    assert("JWK: even exponent",              Jwt.KeyFromJwk({ kty: "RSA", n: RSA_JWK.n, e: "AQAA" }) == nil);
+    assert("JWK: exponent 1",                 Jwt.KeyFromJwk({ kty: "RSA", n: RSA_JWK.n, e: "AQ" }) == nil);
+    assert("JWK: RSA alg that is not RSA",    Jwt.KeyFromJwk({ kty: "RSA", n: RSA_JWK.n, e: "AQAB", alg: "ES256" }) == nil);
+    assert("JWK: EC point off the curve",     Jwt.KeyFromJwk({ kty: "EC", crv: "P-256", x: EC_JWK.x, y: RFC_EC_Y }) == nil);
+    assert("JWK: EC coordinate too short",    Jwt.KeyFromJwk({ kty: "EC", crv: "P-256", x: "AQID", y: EC_JWK.y }) == nil);
+    assert("JWK: P-384 is not supported",     Jwt.KeyFromJwk({ kty: "EC", crv: "P-384", x: EC_JWK.x, y: EC_JWK.y }) == nil);
+    assert("JWK: EC alg that is not ES256",   Jwt.KeyFromJwk({ kty: "EC", crv: "P-256", x: EC_JWK.x, y: EC_JWK.y, alg: "RS256" }) == nil);
+    assert("JWK: symmetric key",              Jwt.KeyFromJwk({ kty: "oct", k: "c2VjcmV0" }) == nil);
+    assert("JWK: not a JWK",                  Jwt.KeyFromJwk("nonsense") == nil && Jwt.KeyFromJwk(7) == nil && Jwt.KeyFromJwk({ kty: "RSA" }) == nil);
+
+    // ============================================================
     //  Summary
     // ============================================================
 
@@ -436,6 +640,37 @@ fn Main() {
     bench("GetClaimFromDecoded  (pre-decoded, O(1))", fn() {
         let v = bJwt.GetClaimFromDecoded(bDecoded, "sub"); _sink = _sink + 1;
     }, 2000);
+
+
+    Console.WriteLine("\n[ Public-key verification ]");
+    let bRsa  = Jwt.KeyFromJwk(RSA_JWK);
+    let bRsa4 = Jwt.KeyFromJwk(RSA4096_JWK);
+    let bEc   = Jwt.KeyFromJwk(EC_JWK);
+    let bSet  = Jwt.KeySet({ keys: [RSA_JWK, RSA2_JWK, EC_JWK] });
+    bench("VerifyRS256  (2048-bit key)", fn() {
+        if (Jwt.VerifyRS256(T_RS256, bRsa)) { _sink = _sink + 1; }
+    }, 50);
+    bench("VerifyPS256  (2048-bit key)", fn() {
+        if (Jwt.VerifyPS256(T_PS256, bRsa)) { _sink = _sink + 1; }
+    }, 50);
+    bench("VerifyRS256  (4096-bit key)", fn() {
+        if (Jwt.VerifyRS256(T_RS256_4096, bRsa4)) { _sink = _sink + 1; }
+    }, 20);
+    bench("VerifyES256  (P-256)", fn() {
+        if (Jwt.VerifyES256(T_ES256, bEc)) { _sink = _sink + 1; }
+    }, 10);
+    bench("VerifyWithJwks  (RS256, 3-key set, claims)", fn() {
+        if (Jwt.VerifyWithJwks(T_RS256, bSet, { now: 1700000100 })) { _sink = _sink + 1; }
+    }, 50);
+    bench("KeyFromJwk  (RSA 2048)", fn() {
+        if (Jwt.KeyFromJwk(RSA_JWK) != nil) { _sink = _sink + 1; }
+    }, 200);
+    bench("KeyFromJwk  (EC P-256, on-curve check)", fn() {
+        if (Jwt.KeyFromJwk(EC_JWK) != nil) { _sink = _sink + 1; }
+    }, 200);
+    bench("KeyFromPem  (RSA 2048)", fn() {
+        if (Jwt.KeyFromPem(RSA_PEM) != nil) { _sink = _sink + 1; }
+    }, 200);
 
     benchSep();
     Console.WriteLine("_sink=" + str(_sink));

@@ -43,6 +43,8 @@ global PROTO:string =
   + "  rpc Echo     (Kitchen)      returns (Kitchen);\n"
   + "  rpc Wrong    (HelloRequest) returns (HelloReply);\n"
   + "  rpc Garbage  (HelloRequest) returns (HelloReply);\n"
+  + "  rpc Later    (HelloRequest) returns (HelloReply);\n"
+  + "  rpc LaterBoom (HelloRequest) returns (HelloReply);\n"
   + "  rpc Chat     (stream HelloRequest) returns (stream HelloReply);\n"
   + "}\n";
 
@@ -87,6 +89,18 @@ fn startServer() {
         Boom: fn(msg, call) {
             throw new ConnectError(Code.ResourceExhausted,
                                    "no greetings left for " + msg.name);
+        },
+        // `fn async` implementations: the reply arrives after a wait.
+        Later: fn async (msg, call) {
+            Fiber.Sleep(5);
+            let out = Class.New(call.method.output);
+            out.text  = "later, " + msg.name;
+            out.count = msg.times;
+            return out;
+        },
+        LaterBoom: fn async (msg, _call) {
+            Fiber.Sleep(5);
+            throw new ConnectError(Code.FailedPrecondition, "not yet, " + msg.name);
         }
         // Wrong and Garbage are deliberately absent: an unimplemented rpc must
         // answer Unimplemented, and the malformed-reply cases are served raw
@@ -342,6 +356,29 @@ fn async test_errors() {
     check("error: undecodable body", code, Code.Internal);
 }
 
+fn async test_async_handlers() {
+    let g = API["Greeter"];
+    let c = new Connect(BASE);
+    let req = Class.New(g.methods.SayHello.input);
+    req.name = "world";
+    req.times = 3;
+
+    let rep = await c.CallAsync(g.methods.Later, req);
+    check("async handler: reply",  rep.text, "later, world");
+    check("async handler: field",  rep.count, 3);
+
+    let jc = new Connect(BASE, { codec: "json" });
+    let jrep = await jc.CallAsync(g.methods.Later, req);
+    check("async handler: json reply", jrep.text, "later, world");
+
+    var code:int = 0;
+    var msg:string = "";
+    try { await c.CallAsync(g.methods.LaterBoom, req); }
+    catch (e) { code = e.Code; msg = e.Error; }
+    check("async handler: error code",    code, Code.FailedPrecondition);
+    check("async handler: error message", msg, "not yet, world");
+}
+
 // A Connect body is arbitrary bytes: NULs, high bytes and multi-byte UTF-8 all
 // have to survive the HTTP round trip intact.
 // One message touching every field type, shared by the binary and JSON checks.
@@ -454,6 +491,7 @@ fn async Main() {
     await test_unary();
     await test_headers();
     await test_errors();
+    await test_async_handlers();
     await test_binary_fidelity();
     await test_json_codec();
 

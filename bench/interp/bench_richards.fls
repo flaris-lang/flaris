@@ -1,0 +1,239 @@
+// bench_richards.fls - Martin Richards' operating-system simulation, 500 runs of
+// count = 1000. A scheduler hands packets between an idle, a worker, two handler
+// and two device tasks; dominated by method calls on small objects and by
+// following links between them. Each run ends with queueCount 2322, holdCount 928.
+// result = runs * 10000000 + queueCount * 1000 + holdCount of the last run.
+//
+// The tasks never hold the scheduler: it is passed to Run instead, so the task
+// list stays acyclic and reference counting frees every run.
+enum TaskId { Idle, Worker, HandlerA, HandlerB, DeviceA, DeviceB }
+enum PacketKind { Device, Work }
+const DATA_SIZE = 4;
+
+class Packet {
+    var link: Packet = nil;
+    var id: int = 0;
+    var kind: int = 0;
+    var a1: int = 0;
+    var a2: [int] = nil;
+    fn Constructor(link: Packet, id: int, kind: int) {
+        this.link = link;
+        this.id = id;
+        this.kind = kind;
+        this.a2 = [0, 0, 0, 0];
+    }
+    // Appends this packet to the end of queue and returns the new head.
+    fn AddTo(queue: Packet): Packet {
+        this.link = nil;
+        if (queue == nil) { return this; }
+        let p = queue;
+        while (p.link != nil) { p = p.link; }
+        p.link = this;
+        return queue;
+    }
+}
+
+class Task {
+    var link: Task = nil;
+    var id: int = 0;
+    var priority: int = 0;
+    var queue: Packet = nil;
+    var packetPending: bool = false;
+    var waiting: bool = true;
+    var held: bool = false;
+    fn Constructor(id: int, priority: int, queue: Packet) {
+        this.id = id;
+        this.priority = priority;
+        this.queue = queue;
+        this.packetPending = queue != nil;
+    }
+    fn IsHeldOrWaiting(): bool {
+        return this.held || (this.waiting && !this.packetPending);
+    }
+    fn RunTask(s: TaskScheduler): Task {
+        let packet = nil;
+        if (this.waiting && this.packetPending) {
+            packet = this.queue;
+            this.queue = packet.link;
+            this.waiting = false;
+            this.packetPending = this.queue != nil;
+        }
+        return this.Run(s, packet);
+    }
+    // Every task kind overrides Run: it takes the packet handed over (or nil)
+    // and returns the task to run next.
+    fn Run(_s: TaskScheduler, _packet: Packet): Task { return nil; }
+    fn AddPacket(current: Task, packet: Packet): Task {
+        if (this.queue == nil) {
+            this.queue = packet;
+            this.packetPending = true;
+            if (this.priority > current.priority) { return this; }
+        } else {
+            this.queue = packet.AddTo(this.queue);
+        }
+        return current;
+    }
+}
+
+class IdleTask : Task {
+    var control: int = 1;
+    var count: int = 0;
+    fn Constructor(id: int, priority: int, count: int) {
+        super(id, priority, nil);
+        this.waiting = false;
+        this.count = count;
+    }
+    fn Run(s: TaskScheduler, _packet: Packet): Task {
+        this.count--;
+        if (this.count == 0) { return s.HoldCurrent(); }
+        if ((this.control & 1) == 0) {
+            this.control = this.control >> 1;
+            return s.Release(TaskId.DeviceA);
+        }
+        this.control = (this.control >> 1) ^ 0xD008;
+        return s.Release(TaskId.DeviceB);
+    }
+}
+
+class WorkerTask : Task {
+    var dest: int = TaskId.HandlerA;
+    var value: int = 0;
+    fn Run(s: TaskScheduler, packet: Packet): Task {
+        if (packet == nil) { return s.SuspendCurrent(); }
+        this.dest = this.dest == TaskId.HandlerA ? TaskId.HandlerB : TaskId.HandlerA;
+        packet.id = this.dest;
+        packet.a1 = 0;
+        let data = packet.a2;
+        iter (i from 0 to DATA_SIZE) {
+            this.value++;
+            if (this.value > 26) { this.value = 1; }
+            data[i] = this.value;
+        }
+        return s.Queue(packet);
+    }
+}
+
+class HandlerTask : Task {
+    var work: Packet = nil;
+    var devices: Packet = nil;
+    fn Run(s: TaskScheduler, packet: Packet): Task {
+        if (packet != nil) {
+            if (packet.kind == PacketKind.Work) {
+                this.work = packet.AddTo(this.work);
+            } else {
+                this.devices = packet.AddTo(this.devices);
+            }
+        }
+        let work = this.work;
+        if (work != nil) {
+            let count = work.a1;
+            if (count < DATA_SIZE) {
+                let dev = this.devices;
+                if (dev != nil) {
+                    this.devices = dev.link;
+                    dev.a1 = work.a2[count];
+                    work.a1 = count + 1;
+                    return s.Queue(dev);
+                }
+            } else {
+                this.work = work.link;
+                return s.Queue(work);
+            }
+        }
+        return s.SuspendCurrent();
+    }
+}
+
+class DeviceTask : Task {
+    var pending: Packet = nil;
+    fn Run(s: TaskScheduler, packet: Packet): Task {
+        if (packet == nil) {
+            let pending = this.pending;
+            if (pending == nil) { return s.SuspendCurrent(); }
+            this.pending = nil;
+            return s.Queue(pending);
+        }
+        this.pending = packet;
+        return s.HoldCurrent();
+    }
+}
+
+class TaskScheduler {
+    var tasks: Task = nil;
+    var byId = nil;
+    var current: Task = nil;
+    var queueCount: int = 0;
+    var holdCount: int = 0;
+    fn Constructor() {
+        this.byId = [nil, nil, nil, nil, nil, nil];
+    }
+    fn Add(t: Task) {
+        t.link = this.tasks;
+        this.tasks = t;
+        this.byId[t.id] = t;
+    }
+    fn Schedule() {
+        let t = this.tasks;
+        while (t != nil) {
+            if (t.IsHeldOrWaiting()) {
+                t = t.link;
+            } else {
+                this.current = t;
+                t = t.RunTask(this);
+            }
+        }
+    }
+    fn Release(id: int): Task {
+        let t = this.byId[id];
+        t.held = false;
+        if (t.priority > this.current.priority) { return t; }
+        return this.current;
+    }
+    fn HoldCurrent(): Task {
+        this.holdCount++;
+        this.current.held = true;
+        return this.current.link;
+    }
+    fn SuspendCurrent(): Task {
+        this.current.waiting = true;
+        return this.current;
+    }
+    fn Queue(packet: Packet): Task {
+        let t = this.byId[packet.id];
+        this.queueCount++;
+        packet.link = nil;
+        packet.id = this.current.id;
+        return t.AddPacket(this.current, packet);
+    }
+}
+
+fn richards(count: int): TaskScheduler {
+    let s = new TaskScheduler();
+    s.Add(new IdleTask(TaskId.Idle, 0, count));
+    let q = new Packet(nil, TaskId.Worker, PacketKind.Work);
+    q = new Packet(q, TaskId.Worker, PacketKind.Work);
+    s.Add(new WorkerTask(TaskId.Worker, 1000, q));
+    q = new Packet(nil, TaskId.DeviceA, PacketKind.Device);
+    q = new Packet(q, TaskId.DeviceA, PacketKind.Device);
+    q = new Packet(q, TaskId.DeviceA, PacketKind.Device);
+    s.Add(new HandlerTask(TaskId.HandlerA, 2000, q));
+    q = new Packet(nil, TaskId.DeviceB, PacketKind.Device);
+    q = new Packet(q, TaskId.DeviceB, PacketKind.Device);
+    q = new Packet(q, TaskId.DeviceB, PacketKind.Device);
+    s.Add(new HandlerTask(TaskId.HandlerB, 3000, q));
+    s.Add(new DeviceTask(TaskId.DeviceA, 4000, nil));
+    s.Add(new DeviceTask(TaskId.DeviceB, 5000, nil));
+    s.Schedule();
+    return s;
+}
+
+fn Main() {
+    let runs = 500;
+    let start = Time.Millis();
+    let s = nil;
+    iter (r from 0 to runs) { s = richards(1000); }
+    let elapsed = Time.Millis() - start;
+    Console.WriteLine("result: ", runs * 10000000 + s.queueCount * 1000 + s.holdCount);
+    Console.WriteLine("elapsed: ", elapsed, " ms");
+    return 0;
+}

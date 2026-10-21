@@ -10,32 +10,29 @@
 //   pg_scalar_string(conn: int, sql: string)            - string | nil
 //   pg_close(conn: int)                                 - bool
 //
-// Build (Linux):
-//   gcc -shared -fPIC -o pg_ffi.so pg_ffi.c -lpq
+// Build from the repo root (ffi_object.h sits next to this file):
 //
-// Build (macOS):
-//   gcc -shared -fPIC -o pg_ffi.dylib pg_ffi.c -lpq
+// Build (Linux / macOS):
+//   gcc -shared -fPIC -O2 -I ffi -o pg_ffi.so ffi/pg_ffi.c \
+//       -I"$(pg_config --includedir)" -L"$(pg_config --libdir)" -lpq     (pg_ffi.dylib on macOS)
 //
 // Build (Windows MinGW):
-//   gcc -shared -o pg_ffi.dll pg_ffi.c -lpq
+//   gcc -shared -O2 -I ffi -o pg_ffi.dll ffi/pg_ffi.c -lpq
 //
 // Build (Windows MSVC):
-//   cl /LD pg_ffi.c /link libpq.lib
+//   cl /LD /I ffi ffi/pg_ffi.c /link libpq.lib
 //
 // After building, get the SHA-256 for Flaris:
 //   flarisvm --sha256 pg_ffi.so     (Linux)
 //   flarisvm --sha256 pg_ffi.dylib  (macOS)
 //   flarisvm --sha256 pg_ffi.dll    (Windows)
-//
-// Or use the provided build_pg.sh script which compiles and patches the hash
-// into Postgres.fls automatically.
 
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "../vm/ffi_object.h"
+#include "ffi_object.h"
 
 /* Exports flaris_abi_version() so the runtime can verify this plugin was
  * built against a compatible FfiObject layout. */

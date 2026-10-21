@@ -1,11 +1,18 @@
 // test_http_extra.fls
-// Offline tests for the Http helpers that do NOT need a network: CookieJar,
-// Multipart form builder, and Http.Retry. (test_http.fls covers the request
-// path against a local server.)
+// Tests for the Http helpers that need no server process: CookieJar, the
+// Multipart form builder and Http.Retry, and the connection pool against a
+// scripted peer in this VM. (test_http.fls covers the request path against a
+// local HttpServer.)
+//
+// The scripted peer answers each request path with raw response bytes, so a
+// response can be framed in ways HttpServer never would. It runs on fibers in
+// this VM, so the requests it serves are the async ones.
 //
 //   flarisvm ./tests/test_http_extra.fls --libs='./libs'
 
-import { Http, CookieJar, Multipart } from library("Http", "1.0");
+import { Http, CookieJar, Multipart, ContentType, SseParser, HttpError } from library("Http", "1.0");
+import { HttpUtil } from library("HttpUtil", "1.0");
+import { Deflate } from library("Deflate", "1.0");
 
 global testsRun    = 0;
 global testsFailed = 0;
@@ -128,12 +135,56 @@ fn test_multipart() {
     f2.File("blob", "data.bin", "xyz", nil);
     check(String.Contains(f2.Body(), "Content-Type: application/octet-stream"), "default file content-type");
 
+    // A block file content goes into the body as bytes, and the body becomes a block.
+    let bin = Buffer.Create(4, 1);
+    bin[0] = 0; bin[1] = 255; bin[2] = 13; bin[3] = 10;
+    let f4 = new Multipart();
+    f4.Field("t", "x").File("raw", "raw.bin", bin, nil);
+    let b4 = f4.Body();
+    check(Type.Is(b4, Type.Block), "block file content: body is a block");
+    check(Buffer.IndexOf(b4, "[block]") < 0, "block file content: not rendered as text");
+    let at = Buffer.IndexOf(b4, "application/octet-stream\r\n\r\n") + 28;
+    check(Buffer.ReadU8At(b4, at) == 0 && Buffer.ReadU8At(b4, at + 1) == 255
+          && Buffer.ReadU8At(b4, at + 2) == 13 && Buffer.ReadU8At(b4, at + 3) == 10,
+          "block file content: the bytes follow the part headers");
+    check(Buffer.IndexOf(b4, "\r\n--" + f4.Boundary() + "--\r\n") == at + 4,
+          "block file content: closing boundary right after the bytes");
+
     // sanitisation: CR/LF and quotes in a field name must not break the part.
     let f3 = new Multipart();
     f3.Field("evil\r\nX-Injected: 1", "v");
     let b3 = f3.Body();
     check(!String.Contains(b3, "\r\nX-Injected: 1\r\n"), "CRLF stripped from field name");
     check(!String.Contains(f3.Body(), "name=\"a\"b"), "quotes escaped (no raw quote in name)");
+
+    // A file's content type is a header value: CR or LF in it is refused.
+    let f5 = new Multipart();
+    var refused = nil;
+    try { f5.File("f", "a.txt", "x", "text/plain\r\nX-Injected: 1"); } catch (e) { refused = e; }
+    check(refused is HttpError, "CRLF in a file content type raises HttpError");
+    var refusedLf = nil;
+    try { f5.File("f", "a.txt", "x", "text/plain\nX-Injected: 1"); } catch (e) { refusedLf = e; }
+    check(refusedLf is HttpError, "a bare LF in a file content type raises too");
+    check(!String.Contains(f5.Body(), "X-Injected"), "a refused part never reaches the body");
+}
+
+// A header value with CR or LF is refused before anything is sent: StreamPost
+// returns nil without connecting.
+fn test_stream_post_header_injection() {
+    Console.WriteLine("-- StreamPost header injection");
+    let l = Stream.Listen("tcp", 0, 16, "127.0.0.1");
+    let a: string = Stream.LocalAddr(l);
+    let base = "http://127.0.0.1:" + String.Substr(a, String.LastIndexOf(a, ":") + 1);
+    let lines = [];
+    let st = Http.StreamPost(base + "/x", "{}", fn(line) { Array.Append(lines, line); },
+                             { "X-A": "v\r\nX-Injected: 1" });
+    checkEq(st, nil, "StreamPost refuses a header value with CRLF");
+    let st2 = Http.StreamPost(base + "/x", "{}", fn(line) { Array.Append(lines, line); },
+                              { "X-A\nX-Injected": "1" });
+    checkEq(st2, nil, "StreamPost refuses a header name with LF");
+    checkEq(Stream.Accept(l), nil, "nothing connected");
+    checkEq(len(lines), 0, "no line was delivered");
+    Stream.Close(l);
 }
 
 // ============================================================
@@ -169,9 +220,59 @@ fn test_retry() {
 
     // a 2xx is not retried by default
     _calls = 0;
-    let r5 = Http.Retry(fn() { _calls += 1; return { status: 200, headers: {}, body: "" }; },
-                        { attempts: 3, delayMs: 1 });
+    let _r5 = Http.Retry(fn() { _calls += 1; return { status: 200, headers: {}, body: "" }; },
+                         { attempts: 3, delayMs: 1 });
     checkEq(_calls, 1, "successful response not retried");
+}
+
+// A 429 the first time, carrying Retry-After: `after`; then a 200.
+global _after = "";
+
+fn _limited() {
+    _calls += 1;
+    if (_calls < 2) return { status: 429, headers: { "retry-after": _after }, body: "" };
+    return { status: 200, headers: {}, body: "ok" };
+}
+
+fn timedRetry(after: string, opts): int {
+    _calls = 0;
+    _after = after;
+    let t0 = Time.Millis();
+    let r = Http.Retry(fn() { return _limited(); }, opts);
+    checkEq(r.status, 200, "retried after a 429 with Retry-After '" + after + "'");
+    return Time.Millis() - t0;
+}
+
+fn test_retry_after() {
+    Console.WriteLine("-- Retry-After");
+    let resp = fn(v) { return { status: 503, headers: { "retry-after": v }, body: "" }; };
+    checkEq(Http.RetryAfterMs(resp("2")), 2000, "delta-seconds");
+    checkEq(Http.RetryAfterMs(resp(" 0 ")), 0, "zero seconds");
+    let soon = Http.RetryAfterMs(resp(Time.Format(Time.Now() + 3, "%a, %d %b %Y %H:%M:%S GMT")));
+    check(soon != nil && soon >= 2000 && soon <= 3000, "IMF-fixdate three seconds ahead (" + str(soon) + ")");
+    checkEq(Http.RetryAfterMs(resp("Sun, 06 Nov 1994 08:49:37 GMT")), 0, "a date in the past waits nothing");
+    checkEq(Http.RetryAfterMs(resp("Sunday, 06-Nov-94 08:49:37 GMT")), 0, "the RFC 850 form");
+    checkEq(Http.RetryAfterMs(resp("Sun Nov  6 08:49:37 1994")), 0, "the asctime form");
+    checkEq(Http.RetryAfterMs(resp("soon")), nil, "a value that is neither is ignored");
+    checkEq(Http.RetryAfterMs(resp("-5")), nil, "a negative delay is ignored");
+    checkEq(Http.RetryAfterMs({ status: 503, headers: {}, body: "" }), nil, "no header");
+    checkEq(Http.RetryAfterMs(nil), nil, "no response");
+
+    // Retry-After "1" capped at 60 ms: the wait is the cap, not the 1 ms backoff.
+    let capped = timedRetry("1", { attempts: 2, delayMs: 1, maxRetryAfterMs: 60 });
+    check(capped >= 50 && capped < 900, "Retry-After waits, up to maxRetryAfterMs (" + str(capped) + " ms)");
+    let zero = timedRetry("0", { attempts: 2, delayMs: 500 });
+    check(zero < 400, "Retry-After: 0 retries at once instead of after delayMs (" + str(zero) + " ms)");
+    let ignored = timedRetry("1", { attempts: 2, delayMs: 1, retryAfter: false });
+    check(ignored < 400, "retryAfter: false keeps the backoff delay (" + str(ignored) + " ms)");
+
+    // Only 429 and 503 carry the meaning; a 500's Retry-After is not waited for.
+    _calls = 0;
+    let t0 = Time.Millis();
+    Http.Retry(fn() { _calls += 1; return { status: 500, headers: { "retry-after": "1" }, body: "" }; },
+               { attempts: 2, delayMs: 1 });
+    check(Time.Millis() - t0 < 400, "a 500's Retry-After is not waited for");
+    return 0;
 }
 
 // ============================================================
@@ -255,37 +356,607 @@ fn test_shell_quoting() {
     return 0;
 }
 
-global ndjsonLines = [];
-
-// A chunked NDJSON body where one JSON line spans two chunks: the line arrives
-// whole, and the blank and non-JSON lines are skipped.
-fn test_ndjson_chunked() {
+// A server that never answers: the transport's own timeoutMs ends the request
+// instead of the 30 s default.
+fn test_transport_timeout() {
     // Where the client connects: a dual-stack port 0 can be one held on 127.0.0.1 alone.
     let srv = Stream.Listen("tcp", 0, 128, "127.0.0.1");
     let a: string = Stream.LocalAddr(srv);
     let port = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10));
-    let cli = Stream.Connect("tcp", "127.0.0.1", port);
-    Stream.WaitReadable(srv, 2000);
-    let acc = Stream.Accept(srv);
-    Stream.WriteString(acc, "9\r\n{\"a\":1}\r\n\r\n5\r\n{\"b\":\r\n3\r\n22}\r\n3\r\n\nx\n\r\n0\r\n\r\n");
-    Stream.Close(acc);
-    ndjsonLines = [];
-    Http._ndjsonChunked(cli, fn (line) { Array.Append(ndjsonLines, line); });
-    checkEq(len(ndjsonLines), 2, "NDJSON lines from a chunked body");
-    checkEq(ndjsonLines[0], "{\"a\":1}", "... the first line");
-    checkEq(ndjsonLines[1], "{\"b\":22}", "... a line split across two chunks");
-    Stream.Close(cli);
+    let url = "http://127.0.0.1:" + Convert.ToString(port) + "/";
+
+    let tr = Http.Transport({ timeoutMs: 300 });
+    checkEq(tr.secure, false, "Http.Transport is plain TCP");
+    let t0 = Time.Ticks();
+    let res = Http.Request("POST", url, "{}", ContentType.JSON, nil, tr);
+    let ms = Time.TicksToMs(Time.Ticks() - t0);
+    checkEq(res, nil, "no answer -> nil");
+    check(ms < 5000, "the transport's timeout ended the request");
     Stream.Close(srv);
 }
 
-fn Main() {
+// ============================================================
+// Scripted peer
+// ============================================================
+
+global peerRoutes   = {};   // path -> raw response bytes
+global peerHandlers = {};   // path -> fn(conn) that writes its own response
+global peerDrop     = {};   // path -> true: close the connection after answering
+global peerAccepted = 0;    // connections accepted
+global peerLastHead = "";   // the last request head, lowercased
+global peerBase     = "";
+global peerListener = nil;
+
+fn async peerServe(l) {
+    while (Stream.WaitReadable(l, 10000) == true) {
+        let c = Stream.Accept(l);
+        if (c != nil) {
+            peerAccepted += 1;
+            Fiber.Run(fn() { peerConnection(c); });
+        }
+    }
+    return 0;
+}
+
+// Answer requests on one connection until either side closes it.
+fn peerConnection(c) {
+    while (true) {
+        let first = Fiber.Await(Stream.ReadLineAsync(c, 5000));
+        if (first == nil) { break; }
+        if (len(first) == 0) { continue; }
+        let path = String.Split(first, " ")[1];
+        var head = String.ToLower(first) + "\n";
+        var bodyLen = 0;
+        var h = Fiber.Await(Stream.ReadLineAsync(c, 5000));
+        while (h != nil && len(h) > 0) {
+            let lh = String.ToLower(h);
+            head += lh + "\n";
+            if (String.StartsWith(lh, "content-length:")) { bodyLen = Convert.ParseInt(String.Trim(String.Substr(lh, 15))) ?? 0; }
+            h = Fiber.Await(Stream.ReadLineAsync(c, 5000));
+        }
+        if (bodyLen > 0) { Fiber.Await(Stream.ReadAsync(c, bodyLen, 5000)); }
+        peerLastHead = head;
+        let handler = peerHandlers[path];
+        if (handler != nil) { handler(c); }
+        else { Fiber.Await(Stream.WriteAsync(c, peerRoutes[path] ?? "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")); }
+        if (peerDrop[path] == true) { break; }
+    }
+    Stream.Close(c);
+    return 0;
+}
+
+fn peerStart() {
+    // Where the client connects: a dual-stack port 0 can be one held on 127.0.0.1 alone.
+    peerListener = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(peerListener);
+    peerBase = "http://127.0.0.1:" + String.Substr(a, String.LastIndexOf(a, ":") + 1);
+    Scheduler.Schedule(peerServe(peerListener));
+    return 0;
+}
+
+fn route(path: string, raw: string) { peerRoutes[path] = raw; return 0; }
+
+fn ok(body: string): string {
+    return "HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)) + "\r\n\r\n" + body;
+}
+
+// A chunked response carrying the pieces as its chunks.
+fn chunked(head: string, pieces: array): string {
+    var out = "HTTP/1.1 200 OK\r\n" + head + "Transfer-Encoding: chunked\r\n\r\n";
+    foreach (piece in pieces) { out += Convert.ToRadixString(len(piece), 16) + "\r\n" + piece + "\r\n"; }
+    return out + "0\r\n\r\n";
+}
+
+fn async getBody(path: string) {
+    let r = await Http.GetAsync(peerBase + path);
+    return r == nil ? nil : r.body;
+}
+
+// ============================================================
+// Connection pool
+// ============================================================
+
+fn async test_pool_framing() {
+    Console.WriteLine("-- pool: framing on a reused connection");
+    Http.CloseIdle();
+    route("/len", ok("hello"));
+    route("/chunked", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+                      "3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\nX-Trailer: t\r\n\r\n");
+    route("/head", "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n");
+    route("/nocontent", "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    route("/notmodified", "HTTP/1.1 304 Not Modified\r\nContent-Length: 999\r\nETag: \"v1\"\r\n\r\n");
+    route("/interim", "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n" +
+                      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    route("/empty", "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+    let before = peerAccepted;
+    checkEq(await getBody("/len"), "hello", "Content-Length body");
+    checkEq(await getBody("/chunked"), "abcde", "chunked body, extension and trailer read past");
+    let h = await Http.HeadAsync(peerBase + "/head");
+    checkEq(h?.status, 200, "HEAD status");
+    checkEq(h?.headers["content-length"], "1234", "HEAD keeps the length header, reads no body");
+    let nc = await Http.GetAsync(peerBase + "/nocontent");
+    checkEq(nc?.status, 204, "204 status");
+    let nm = await Http.GetAsync(peerBase + "/notmodified");
+    checkEq(nm?.status, 304, "304 status despite a Content-Length");
+    checkEq(nm?.body, "", "304 has no body");
+    let im = await Http.GetAsync(peerBase + "/interim");
+    checkEq(im?.status, 200, "1xx interim responses are read past");
+    checkEq(im?.body, "ok", "the final response's body");
+    checkEq(await getBody("/empty"), "", "empty Content-Length body");
+    checkEq(await getBody("/len"), "hello", "still in step after every framing");
+    checkEq(peerAccepted - before, 1, "one connection carried all of them");
+    checkEq(Http.PoolStats().idle, 1, "and waits idle in the pool");
+    return 0;
+}
+
+fn async test_pool_not_reused() {
+    Console.WriteLine("-- pool: responses that end the connection");
+    Http.CloseIdle();
+    route("/close", "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nc1");
+    peerDrop["/close"] = true;
+    route("/http10", "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nv0");
+    peerDrop["/http10"] = true;
+    route("/eof", "HTTP/1.1 200 OK\r\n\r\nto the end");
+    peerDrop["/eof"] = true;
+    route("/shortka", "HTTP/1.1 200 OK\r\nKeep-Alive: timeout=1\r\nContent-Length: 2\r\n\r\nka");
+
+    var before = peerAccepted;
+    checkEq(await getBody("/close"), "c1", "Connection: close body");
+    checkEq(await getBody("/close"), "c1", "Connection: close again");
+    checkEq(peerAccepted - before, 2, "Connection: close is not reused");
+    checkEq(Http.PoolStats().idle, 0, "nothing pooled after Connection: close");
+
+    checkEq(await getBody("/http10"), "v0", "HTTP/1.0 body");
+    checkEq(Http.PoolStats().idle, 0, "HTTP/1.0 is not pooled");
+    checkEq(await getBody("/eof"), "to the end", "body delimited by the close");
+    checkEq(Http.PoolStats().idle, 0, "a body read to the end is not pooled");
+    checkEq(await getBody("/shortka"), "ka", "Keep-Alive: timeout=1 body");
+    checkEq(Http.PoolStats().idle, 0, "a server closing within a second is not pooled");
+
+    // A caller's Connection: close, and keepAlive: false, ask the server to close.
+    before = peerAccepted;
+    let r1 = await Http.RequestAsync("GET", peerBase + "/len", nil, nil, { "Connection": "close" });
+    checkEq(r1?.body, "hello", "caller's Connection: close");
+    check(String.Contains(peerLastHead, "connection: close"), "... is sent as given");
+    let r2 = await Http.RequestAsync("GET", peerBase + "/len", nil, nil, nil, { keepAlive: false });
+    checkEq(r2?.body, "hello", "keepAlive: false");
+    check(String.Contains(peerLastHead, "connection: close"), "... sends Connection: close");
+    checkEq(peerAccepted - before, 2, "neither is reused");
+    let r3 = await Http.GetAsync(peerBase + "/len");
+    checkEq(r3?.body, "hello", "a pooled request");
+    check(!String.Contains(peerLastHead, "connection:"), "... sends no Connection header");
+    return 0;
+}
+
+fn async test_pool_stale() {
+    Console.WriteLine("-- pool: a pooled connection the server closed");
+    Http.CloseIdle();
+    // Answers as if the connection stays open, then closes it.
+    route("/stale", ok("s"));
+    peerDrop["/stale"] = true;
+    route("/post", ok("posted"));
+    peerDrop["/post"] = true;
+
+    var before = peerAccepted;
+    checkEq(await getBody("/stale"), "s", "first answer");
+    Fiber.Sleep(50);
+    checkEq(await getBody("/stale"), "s", "GET on the closed connection is sent again");
+    checkEq(peerAccepted - before, 2, "... on a fresh connection");
+
+    // A POST is not repeated once it was fully sent.
+    Http.CloseIdle();
+    checkEq((await Http.PostAsync(peerBase + "/post", "{}"))?.body, "posted", "POST answered");
+    Fiber.Sleep(20);
+    checkEq(await Http.PostAsync(peerBase + "/post", "{}"), nil, "POST on the closed connection is not repeated");
+
+    // After a short idle spell the connection is checked before a POST uses it.
+    checkEq((await Http.PostAsync(peerBase + "/post", "{}"))?.body, "posted", "POST answered");
+    Fiber.Sleep(120);
+    before = peerAccepted;
+    checkEq((await Http.PostAsync(peerBase + "/post", "{}"))?.body, "posted", "POST after an idle spell");
+    checkEq(peerAccepted - before, 1, "... found the connection closed and opened one");
+    return 0;
+}
+
+fn async test_pool_bounds() {
+    Console.WriteLine("-- pool: concurrency and bounds");
+    Http.CloseIdle();
+    route("/slow", ok("x"));
+    let before = peerAccepted;
+    let fibers = [];
+    iter (i from 0 to 6) { Array.Append(fibers, Http.GetAsync(peerBase + "/slow")); }
+    let rs = Fiber.AwaitAll(fibers);
+    var good = 0;
+    foreach (r in rs) { if (r != nil && r.body == "x") { good += 1; } }
+    checkEq(good, 6, "six concurrent requests answered");
+    let opened = peerAccepted - before;
+    check(opened >= 1 && opened <= 6, "no more connections than requests");
+    checkEq(Http.PoolStats().idle, opened, "each connection back in the pool once");
+
+    let again = Fiber.AwaitAll([Http.GetAsync(peerBase + "/slow"), Http.GetAsync(peerBase + "/slow")]);
+    check(again[0] != nil && again[1] != nil, "a second round answered");
+    checkEq(peerAccepted - before, opened, "... on the pooled connections");
+
+    Http.Configure({ maxIdlePerHost: 2 });
+    Http.CloseIdle();
+    let more = [];
+    iter (i from 0 to 5) { Array.Append(more, Http.GetAsync(peerBase + "/slow")); }
+    Fiber.AwaitAll(more);
+    check(Http.PoolStats().idle <= 2, "maxIdlePerHost bounds the idle connections");
+
+    Http.Configure({ maxIdlePerHost: 8, idleTimeoutMs: 100 });
+    Http.CloseIdle();
+    await getBody("/slow");
+    Fiber.Sleep(150);
+    let b2 = peerAccepted;
+    await getBody("/slow");
+    checkEq(peerAccepted - b2, 1, "an idle connection past idleTimeoutMs is not reused");
+
+    Http.Configure({ idleTimeoutMs: 4000, keepAlive: false });
+    let b3 = peerAccepted;
+    await getBody("/slow");
+    await getBody("/slow");
+    checkEq(peerAccepted - b3, 2, "keepAlive: false turns pooling off");
+    checkEq(Http.PoolStats().idle, 0, "... and nothing waits idle");
+    Http.Configure({ keepAlive: true });
+
+    var threw = false;
+    try { Http.Configure({ maxIdel: 3 }); } catch (e) { threw = e is HttpError; }
+    check(threw, "Configure rejects an unknown option");
+
+    await getBody("/slow");
+    checkEq(Http.PoolStats().idle, 1, "pooled again");
+    Http.CloseIdle();
+    checkEq(Http.PoolStats().idle, 0, "CloseIdle empties the pool");
+    return 0;
+}
+
+// ============================================================
+// Deadline
+// ============================================================
+
+// Ten body bytes, one every 20 ms: each read is quick, the whole is not.
+fn trickle(c) {
+    Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"));
+    iter (i from 0 to 10) {
+        Fiber.Sleep(20);
+        if (Fiber.Await(Stream.WriteAsync(c, "x")) == nil) { break; }
+    }
+    return 0;
+}
+
+fn async test_deadline() {
+    Console.WriteLine("-- deadline");
+    Http.CloseIdle();
+    peerHandlers["/trickle"] = trickle;
+    route("/quick", ok("q"));
+
+    let full = await Http.RequestAsync("GET", peerBase + "/trickle", nil, nil, nil, { timeoutMs: 1000 });
+    checkEq(full?.body, "xxxxxxxxxx", "without a deadline a slow body completes");
+
+    let before = peerAccepted;
+    let t0 = Time.Millis();
+    let cut = await Http.RequestAsync("GET", peerBase + "/trickle", nil, nil, nil, { timeoutMs: 1000, deadlineMs: 80 });
+    let took = Time.Millis() - t0;
+    checkEq(cut, nil, "the deadline ends a body that keeps trickling");
+    check(took >= 70 && took < 180, "... when it passes (" + str(took) + " ms)");
+    await getBody("/quick");
+    checkEq(peerAccepted - before, 1, "the connection it cut is not reused");
+
+    let tr = Http.Transport({ deadlineMs: 80 });
+    checkEq(await Http.RequestAsync("GET", peerBase + "/trickle", nil, nil, nil, tr), nil,
+            "a transport's deadlineMs applies to every request through it");
+    let fast = await Http.RequestAsync("GET", peerBase + "/quick", nil, nil, nil, tr);
+    checkEq(fast?.body, "q", "a request that beats its deadline is answered");
+    return 0;
+}
+
+// ============================================================
+// SseParser
+// ============================================================
+
+// The text a list of byte values spells.
+fn bytes(vals: array): string {
+    let b = Buffer.Create(len(vals), 1);
+    iter (i from 0 to len(vals)) { b[i] = vals[i]; }
+    return Buffer.ToString(b);
+}
+
+// Feed the pieces in order; every event they complete, as "type=data#id".
+fn sse(pieces: array): string {
+    let p = new SseParser();
+    let out = [];
+    foreach (piece in pieces) {
+        foreach (ev in p.Feed(piece)) { Array.Append(out, ev.event + "=" + ev.data + "#" + ev.id); }
+    }
+    return String.Join(out, "|");
+}
+
+fn test_sse_parser() {
+    Console.WriteLine("-- SseParser");
+    checkEq(sse(["data: hello\n\n"]), "message=hello#", "one event");
+    checkEq(sse(["data: a\ndata: b\n\n"]), "message=a\nb#", "data lines join with LF");
+    checkEq(sse(["event: tick\ndata: 1\n\ndata: 2\n\n"]), "tick=1#|message=2#", "event type, reset after dispatch");
+    checkEq(sse([": keep-alive\n\n:x\ndata: y\n\n"]), "message=y#", "comments are skipped");
+    checkEq(sse(["data:x\n\ndata:  x\n\n"]), "message=x#|message= x#", "one space after the colon is dropped");
+    checkEq(sse(["data\n\n"]), "message=#", "a field without a colon has an empty value");
+    checkEq(sse(["data: a:b\n\n"]), "message=a:b#", "a colon in the value stays");
+    checkEq(sse(["event: only\n\n"]), "", "an event without data is not dispatched");
+    checkEq(sse(["foo: bar\ndata: x\n\n"]), "message=x#", "unknown fields are ignored");
+    checkEq(sse(["data: a\r\n\r\ndata: b\r\rdata: c\n\n"]), "message=a#|message=b#|message=c#",
+            "CRLF, CR and LF all end lines");
+    checkEq(sse(["data: a\r", "\n\r\n"]), "message=a#", "a CRLF split between pieces is one line end");
+    checkEq(sse(["data: a\r", "\rdata: b\r\r"]), "message=a#|message=b#", "a CR at the end of a piece ends the line");
+    checkEq(sse(["da", "ta: sp", "lit\n", "\n"]), "message=split#", "a line split between pieces");
+    checkEq(sse(["data: tail"]), "", "an event the stream never finished is dropped");
+    checkEq(sse(["\uFEFFdata: x\n\n"]), "message=x#", "a leading byte order mark is skipped");
+    checkEq(sse([bytes([239]), bytes([187, 191]) + "data: x\n\n"]), "message=x#",
+            "... also when it arrives in pieces");
+    checkEq(sse(["\uFEFF\uFEFFdata: x\n\n"]), "", "only one byte order mark is skipped");
+    checkEq(sse(["id: 7\ndata: a\n\ndata: b\n\nid\ndata: c\n\n"]), "message=a#7|message=b#7|message=c#",
+            "the id carries over until a new one, an empty id clears it");
+    checkEq(sse(["id: " + bytes([97, 0, 98]) + "\ndata: a\n\n"]), "message=a#", "an id holding NUL is ignored");
+
+    let p = new SseParser();
+    p.Feed("id: 9\n\n");
+    checkEq(p.LastEventId(), "9", "an id without data still sets the last event id");
+    checkEq(p.Retry(), nil, "no retry yet");
+    p.Feed("retry: 2500\n\nretry: 1x\n\nretry:\n\n");
+    checkEq(p.Retry(), 2500, "retry takes digits only");
+    let evs = p.Feed("data: z\n\n");
+    checkEq(evs[0].retry, 2500, "an event carries the retry time");
+    checkEq(evs[0].id, "9", "... and the last event id");
+    return 0;
+}
+
+// ============================================================
+// Streaming responses
+// ============================================================
+
+// A Content-Length body sent in three parts, 30 ms apart.
+fn inParts(c) {
+    Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nabc"));
+    Fiber.Sleep(30);
+    Fiber.Await(Stream.WriteAsync(c, "def"));
+    Fiber.Sleep(30);
+    Fiber.Await(Stream.WriteAsync(c, "ghi"));
+    return 0;
+}
+
+// Promises ten bytes and closes after three.
+fn cutShort(c) {
+    Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"));
+    return 0;
+}
+
+fn async lines(path: string) {
+    let st = await Http.OpenAsync("GET", peerBase + path);
+    if (st == nil) { return nil; }
+    let out = [];
+    var line = st.Line();
+    while (line != nil) { Array.Append(out, line); line = st.Line(); }
+    st.Close();
+    return out;
+}
+
+fn async test_streaming() {
+    Console.WriteLine("-- streaming responses");
+    Http.CloseIdle();
+    peerHandlers["/parts"] = inParts;
+    peerHandlers["/cut"] = cutShort;
+    peerDrop["/cut"] = true;
+    route("/lines", chunked("", ["{\"a\":1}\r\n", "{\"b\":", "22}\n\nx\r", "\nyz"]));
+    route("/sse", chunked("Content-Type: text/event-stream\r\n",
+                          ["id: 1\ndata: on", "e\n\nevent: up\r", "data: two\r\ndata: 3\r", "\n\r\n"]));
+
+    let ls = await lines("/lines");
+    checkEq(String.Join(ls, "|"), "{\"a\":1}|{\"b\":22}||x|yz",
+            "Line: CRLF and LF lines, lines split across chunks, the last without a terminator");
+
+    let st = await Http.OpenAsync("GET", peerBase + "/parts");
+    checkEq(st?.status, 200, "Open answers once the head is in");
+    let pieces = [];
+    var c = st.Chunk();
+    while (c != nil) { Array.Append(pieces, c); c = st.Chunk(); }
+    checkEq(String.Join(pieces, ""), "abcdefghi", "Chunk: the whole body");
+    check(len(pieces) >= 2, "... in the pieces it arrived in (" + str(len(pieces)) + ")");
+    check(st.IsDone() && st.Error() == nil, "a body read to its end is done, without error");
+    checkEq(Http.PoolStats().idle, 1, "... and its connection is back in the pool");
+    let before = peerAccepted;
+    let again = await Http.OpenAsync("GET", peerBase + "/parts");
+    checkEq(again?.ReadAll(), "abcdefghi", "ReadAll on the reused connection");
+    checkEq(peerAccepted - before, 0, "... no new connection");
+
+    let early = await Http.OpenAsync("GET", peerBase + "/parts");
+    checkEq(early?.Chunk(), "abc", "the first piece");
+    early.Close();
+    checkEq(Http.PoolStats().idle, 0, "a stream closed early does not go back to the pool");
+
+    let cut = await Http.OpenAsync("GET", peerBase + "/cut");
+    checkEq(cut?.Chunk(), "abc", "what arrived of a body cut short");
+    checkEq(cut.Chunk(), nil, "then the end");
+    checkEq(cut.Error(), "closed", "Error() says the connection ended first");
+    checkEq(cut.ReadAll(), nil, "ReadAll of a failed body is nil");
+
+    let es = await Http.OpenAsync("GET", peerBase + "/sse");
+    let evs = [];
+    var ev = es.Event();
+    while (ev != nil) { Array.Append(evs, ev.event + "=" + ev.data + "#" + ev.id); ev = es.Event(); }
+    checkEq(String.Join(evs, "|"), "message=one#1|up=two\n3#1", "Event over the wire, lines split across chunks");
+    checkEq(es.Retry(), nil, "no retry field was sent");
+
+    peerHandlers["/trickle"] = trickle;
+    let slow = await Http.OpenAsync("GET", peerBase + "/trickle", nil, nil, nil, { deadlineMs: 80 });
+    var got = "";
+    var piece = slow?.Chunk();
+    while (piece != nil) { got += piece; piece = slow.Chunk(); }
+    check(len(got) < 10, "a deadline cuts a stream short");
+    checkEq(slow?.Error(), "deadline", "... and Error() says so");
+
+    let head = await Http.OpenAsync("HEAD", peerBase + "/parts");
+    check(head != nil && head.IsDone() && head.Chunk() == nil, "a HEAD stream has no body");
+    return 0;
+}
+
+// The event stream behind /events: the first connection sends id 1 and
+// closes; the next ones send id 2 when asked to resume after 1.
+global sseServed = 0;
+
+fn sseEvents(c) {
+    sseServed += 1;
+    let resume = String.Contains(peerLastHead, "last-event-id: 1");
+    let body = (sseServed == 1) ? "retry: 20\nid: 1\ndata: a\n\n"
+             : (resume ? "id: 2\ndata: b\n\nid: 3\ndata: c\n\n" : "data: lost\n\n");
+    Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n" + body));
+    return 0;
+}
+
+global sseSeen = [];
+
+fn async test_sse_reconnect() {
+    Console.WriteLine("-- Http.Sse");
+    peerHandlers["/events"] = sseEvents;
+    peerDrop["/events"] = true;
+    sseSeen = [];
+    let r = await Http.SseAsync(peerBase + "/events", fn(ev) {
+        Array.Append(sseSeen, ev.data);
+        return ev.data != "b";
+    });
+    checkEq(String.Join(sseSeen, ","), "a,b", "events across a reconnect, until onEvent returns false");
+    checkEq(sseServed, 2, "one reconnect");
+    checkEq(r?.lastEventId, "2", "the id to resume from");
+    check(String.Contains(peerLastHead, "accept: text/event-stream"), "Sse asks for an event stream");
+
+    route("/notsse", ok("plain"));
+    let r2 = await Http.SseAsync(peerBase + "/notsse", fn(_ev) { return true; });
+    checkEq(r2?.status, 200, "a response that is not an event stream ends Sse");
+    return 0;
+}
+
+// ============================================================
+// Proxy selection
+// ============================================================
+
+fn proxyOf(url: string, opts) {
+    return Http._proxyFor(HttpUtil.ParseUrl(url), Http._pickTransport(HttpUtil.ParseUrl(url).scheme, opts));
+}
+
+fn test_proxy_selection() {
+    Console.WriteLine("-- proxy selection");
+    foreach (v in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY", "REQUEST_METHOD"]) {
+        Os.UnsetEnv(v);
+    }
+    let cases = [["example.com", 80, "example.com", true], ["a.example.com", 80, ".example.com", true],
+                 ["example.com", 80, ".example.com", true], ["badexample.com", 80, "example.com", false],
+                 ["example.com", 8080, "example.com:80", false], ["example.com", 80, "example.com:80", true],
+                 ["10.1.2.3", 80, "10.0.0.0/8", true], ["11.1.2.3", 80, "10.0.0.0/8", false],
+                 ["::1", 80, "[::1]", true], ["::1", 443, "[::1]:80", false],
+                 ["x.org", 80, "*", true], ["x.org", 80, " a.com , X.ORG ", true], ["x.org", 80, "", false]];
+    foreach (c in cases) {
+        checkEq(Http._bypass(c[0], c[1], c[2]), c[3], "no_proxy '" + c[2] + "' for " + c[0] + ":" + str(c[1]));
+    }
+
+    checkEq(proxyOf("http://example.com/", nil), nil, "no proxy configured");
+    Os.SetEnv("http_proxy", "http://u:p%40w@proxy.test:3128");
+    let p = proxyOf("http://example.com/", nil);
+    checkEq(p?.host, "proxy.test", "http_proxy: host");
+    checkEq(p?.port, 3128, "http_proxy: port");
+    checkEq(p?.auth, "Basic dTpwQHc=", "http_proxy: credentials percent-decoded into Basic");
+    checkEq(proxyOf("https://example.com/", nil), nil, "http_proxy is not used for https");
+    checkEq(proxyOf("http://localhost:8080/", nil), nil, "localhost is never sent to an environment proxy");
+    checkEq(proxyOf("http://127.0.0.1/", nil), nil, "nor 127.0.0.1");
+    checkEq(proxyOf("http://example.com/", { proxy: false }), nil, "proxy: false");
+    checkEq(proxyOf("http://127.0.0.1/", { proxy: "http://other:1" })?.host, "other", "an explicit proxy covers loopback too");
+    Os.SetEnv("no_proxy", "example.com");
+    checkEq(proxyOf("http://example.com/", nil), nil, "no_proxy");
+    checkEq(proxyOf("http://example.com/", { noProxy: "" })?.host, "proxy.test", "noProxy replaces no_proxy");
+    Os.UnsetEnv("no_proxy");
+    Os.UnsetEnv("http_proxy");
+
+    Os.SetEnv("HTTP_PROXY", "proxy2:8080");
+    checkEq(proxyOf("http://example.com/", nil)?.port, 8080, "HTTP_PROXY without a scheme");
+    Os.SetEnv("REQUEST_METHOD", "GET");
+    checkEq(proxyOf("http://example.com/", nil), nil, "HTTP_PROXY is ignored under CGI");
+    Os.SetEnv("http_proxy", "http://proxy3:81");
+    checkEq(proxyOf("http://example.com/", nil)?.host, "proxy3", "... http_proxy still counts");
+    foreach (v in ["http_proxy", "HTTP_PROXY", "REQUEST_METHOD"]) { Os.UnsetEnv(v); }
+    Os.SetEnv("HTTPS_PROXY", "http://secure-proxy:443");
+    checkEq(proxyOf("https://example.com/", nil)?.host, "secure-proxy", "HTTPS_PROXY for https");
+    Os.UnsetEnv("HTTPS_PROXY");
+
+    let b64 = [["", ""], ["f", "Zg=="], ["fo", "Zm8="], ["foo", "Zm9v"], ["foobar", "Zm9vYmFy"]];
+    foreach (c in b64) { checkEq(Http._base64(c[0]), c[1], "base64 '" + c[0] + "'"); }
+    return 0;
+}
+
+// ============================================================
+// Size cap
+// ============================================================
+
+fn async capped(path: string, cap: int) {
+    let r = await Http.RequestAsync("GET", peerBase + path, nil, nil, nil, { maxBodyBytes: cap });
+    return r == nil ? nil : r.body;
+}
+
+fn async test_size_cap() {
+    Console.WriteLine("-- maxBodyBytes");
+    Http.CloseIdle();
+    route("/ten", ok("0123456789"));
+    route("/chunks", chunked("", ["aaaa", "bbbb", "cccc"]));
+    route("/toend", "HTTP/1.1 200 OK\r\n\r\n" + String.Repeat("e", 20));
+    peerDrop["/toend"] = true;
+    let zipped = Deflate.Gzip(String.Repeat("z", 1000));
+    peerRoutes["/zipped"] = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: " + str(len(zipped)) +
+                            "\r\n\r\n" + Buffer.ToString(zipped);
+
+    checkEq(await capped("/ten", 10), "0123456789", "a body of exactly the cap");
+    let before = peerAccepted;
+    checkEq(await capped("/ten", 9), nil, "a Content-Length over the cap fails");
+    await getBody("/ten");
+    checkEq(peerAccepted - before, 1, "... and its connection is not reused");
+    checkEq(await capped("/chunks", 12), "aaaabbbbcccc", "chunked within the cap");
+    checkEq(await capped("/chunks", 10), nil, "chunked past the cap fails");
+    checkEq(await capped("/toend", 10), nil, "a body to the end of the stream past the cap fails");
+    checkEq(len(await capped("/zipped", 2000)), 1000, "gzip body within the cap");
+    checkEq(await capped("/zipped", 500), nil, "the cap applies to the decompressed body");
+
+    let st = await Http.OpenAsync("GET", peerBase + "/chunks", nil, nil, nil, { maxBodyBytes: 6 });
+    var got = "";
+    var c = st.Chunk();
+    while (c != nil) { got += c; c = st.Chunk(); }
+    checkEq(got, "aaaa", "a stream hands out what fits");
+    checkEq(st.Error(), "too large", "... then stops with Error() \"too large\"");
+    let big = await Http.OpenAsync("GET", peerBase + "/ten", nil, nil, nil, { maxBodyBytes: 5 });
+    check(big != nil && big.Chunk() == nil && big.Error() == "too large", "a stream whose Content-Length is past the cap");
+    return 0;
+}
+
+fn async Main() {
     test_shell_quoting();
-    Console.WriteLine("=== Http extra (offline) test suite ===");
+    Console.WriteLine("=== Http extra test suite ===");
 
     test_cookiejar();
     test_multipart();
+    test_stream_post_header_injection();
     test_retry();
-    test_ndjson_chunked();
+    test_retry_after();
+    test_transport_timeout();
+    test_sse_parser();
+    test_proxy_selection();
+
+    peerStart();
+    await test_pool_framing();
+    await test_pool_not_reused();
+    await test_pool_stale();
+    await test_pool_bounds();
+    await test_deadline();
+    await test_streaming();
+    await test_sse_reconnect();
+    await test_size_cap();
+    Stream.Close(peerListener);
+    Http.CloseIdle();
+
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

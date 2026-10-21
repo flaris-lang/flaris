@@ -14,13 +14,27 @@
 //   u.port    // 8443        (80/443 by scheme when absent)
 //   u.path    // "/v1/users" ("/" when absent)
 //   u.query   // "id=7"
+//   u.user    // nil         (from "user:pw@host"; never part of host)
 //
 //   let q = HttpUtil.ParseQuery("a=1&b=hello+world");   // { a: "1", b: "hello world" }
 //   let h = HttpUtil.ParseHeaders("Host: x\r\nAccept: */*\r\n");
 //   h["host"]   // keys are lowercased for consistent lookup
 //
 // URLs:
-//   ParseUrl(url)              -> { scheme, host, port, path, query, fragment } | nil
+//   ParseUrl(url)              -> { scheme, host, port, path, query, fragment,
+//                                   user, password } | nil
+//                                 user/password come from a "user:pw@" prefix
+//                                 of the authority, still percent-encoded, and
+//                                 are nil when absent
+//   ResolveUrl(base, ref)      -> string   resolve a reference (a Location
+//                                          header, a link) against an absolute
+//                                          base URL per RFC 3986 section 5:
+//                                          "page2", "../x", "?q=1", "//host/x"
+//                                          and absolute URLs; dot segments are
+//                                          removed
+//
+//     HttpUtil.ResolveUrl("http://a/b/c/d?q", "../g")     // "http://a/b/g"
+//     HttpUtil.ResolveUrl("https://a/b", "//cdn.x/y")     // "https://cdn.x/y"
 //
 // Query strings:
 //   ParseQuery(s)              -> object   percent-decoded, '+' as space,
@@ -183,59 +197,186 @@ class HttpUtil
         return res;
     }
 
-    // { scheme, host, port, path, query, fragment }; missing scheme defaults to
-    // http, missing port to 80/443, missing path to "/". IPv6 literals in [].
+    // { scheme, host, port, path, query, fragment, user, password }; missing
+    // scheme defaults to http, missing port to 80/443, missing path to "/".
+    // IPv6 literals in []. user/password are nil without a userinfo part.
     fn static ParseUrl(url: string): object {
-        if (url == nil || String.Length(url) == 0) { return nil; }
+        if (url == nil || len(url) == 0) { return nil; }
         let scheme: string = "http";
         let rest: string = url;
 
         let si: int = String.IndexOf(url, "://");
         if (si > 0) {
             scheme = String.ToLower(String.Left(url, si));
-            rest = String.Substr(url, si + 3, String.Length(url) - si - 3);
+            rest = String.Substr(url, si + 3);
         }
         let fragment: string = "";
-        let hi: int = String.IndexOf(rest, "#");
+        let hi: int = String.IndexOf(rest, '#');
         if (hi >= 0) {
-            fragment = String.Substr(rest, hi + 1, String.Length(rest) - hi - 1);
+            fragment = String.Substr(rest, hi + 1);
             rest = String.Left(rest, hi);
         }
         let query: string = "";
-        let qi: int = String.IndexOf(rest, "?");
+        let qi: int = String.IndexOf(rest, '?');
         if (qi >= 0) {
-            query = String.Substr(rest, qi + 1, String.Length(rest) - qi - 1);
+            query = String.Substr(rest, qi + 1);
             rest = String.Left(rest, qi);
         }
         let path: string = "/";
-        let pi: int = String.IndexOf(rest, "/");
+        let pi: int = String.IndexOf(rest, '/');
         if (pi >= 0) {
-            path = String.Substr(rest, pi, String.Length(rest) - pi);
+            path = String.Substr(rest, pi);
             rest = String.Left(rest, pi);
+        }
+
+        // Userinfo ends at the last '@': whatever precedes it is a credential,
+        // never the host to connect to.
+        let user = nil;
+        let password = nil;
+        let at: int = String.LastIndexOf(rest, '@');
+        if (at >= 0) {
+            let info: string = String.Left(rest, at);
+            rest = String.Substr(rest, at + 1);
+            let colon: int = String.IndexOf(info, ':');
+            if (colon >= 0) {
+                user = String.Left(info, colon);
+                password = String.Substr(info, colon + 1);
+            } else {
+                user = info;
+            }
         }
 
         let host: string = rest;
         let port: int = 0;
-        if (String.Length(host) > 0 && String.CharAt(host, 0) == '[') {
-            let close: int = String.IndexOf(host, "]");
+        if (len(host) > 0 && host[0] == '[') {
+            let close: int = String.IndexOf(host, ']');
             if (close > 0) {
-                let after: string = String.Substr(host, close + 1, String.Length(host) - close - 1);
+                let after: string = String.Substr(host, close + 1);
                 host = String.Substr(host, 1, close - 1);
-                if (String.Length(after) > 1 && String.CharAt(after, 0) == ':') {
-                    port = Convert.ParseInt(String.Substr(after, 1, String.Length(after) - 1)) ?? 0;
+                if (len(after) > 1 && after[0] == ':') {
+                    port = Convert.ParseInt(String.Substr(after, 1)) ?? 0;
                 }
             }
         } else {
-            let ci: int = String.LastIndexOf(host, ":");
+            let ci: int = String.LastIndexOf(host, ':');
             if (ci > 0) {
-                port = Convert.ParseInt(String.Substr(host, ci + 1, String.Length(host) - ci - 1)) ?? 0;
+                port = Convert.ParseInt(String.Substr(host, ci + 1)) ?? 0;
                 host = String.Left(host, ci);
             }
         }
         if (port == 0) { port = (scheme == "https") ? 443 : 80; }
 
         return { scheme: scheme, host: host, port: port,
-                 path: path, query: query, fragment: fragment };
+                 path: path, query: query, fragment: fragment,
+                 user: user, password: password };
+    }
+
+    // RFC 3986 5.2.2, strict: a reference with a scheme is used as it is.
+    fn static ResolveUrl(base: string, ref: string): string {
+        let r = HttpUtil._splitRef(String.Trim(ref ?? ""));
+        if (r.scheme != nil) {
+            r.path = HttpUtil._removeDots(r.path);
+            return HttpUtil._joinRef(r);
+        }
+        let b = HttpUtil._splitRef(base ?? "");
+        if (r.authority == nil) {
+            if (r.path == "") {
+                r.path = b.path;
+                if (r.query == nil) { r.query = b.query; }
+            } else if (String.StartsWith(r.path, "/")) {
+                r.path = HttpUtil._removeDots(r.path);
+            } else {
+                // 5.2.3 merge: the base path up to its last '/', or "/" for a
+                // base with an authority and an empty path.
+                let slash: int = String.LastIndexOf(b.path, "/");
+                let dir: string = (slash >= 0) ? String.Left(b.path, slash + 1)
+                                               : ((b.authority != nil) ? "/" : "");
+                r.path = HttpUtil._removeDots(dir + r.path);
+            }
+            r.authority = b.authority;
+        } else {
+            r.path = HttpUtil._removeDots(r.path);
+        }
+        r.scheme = b.scheme;
+        return HttpUtil._joinRef(r);
+    }
+
+    // Split a URI reference into the five parts of RFC 3986 appendix B. An
+    // absent part is nil; the path is always a string, possibly empty.
+    fn static _splitRef(s: string): object {
+        let r = { scheme: nil, authority: nil, path: "", query: nil, fragment: nil };
+        let end: int = String.IndexOfAnyFrom(s, ":/?#", 0);
+        if (end > 0 && String.CharAt(s, end) == ':' && HttpUtil._isScheme(String.Left(s, end))) {
+            r.scheme = String.ToLower(String.Left(s, end));
+            s = String.Substr(s, end + 1);
+        }
+        let hash: int = String.IndexOf(s, "#");
+        if (hash >= 0) {
+            r.fragment = String.Substr(s, hash + 1);
+            s = String.Left(s, hash);
+        }
+        let q: int = String.IndexOf(s, "?");
+        if (q >= 0) {
+            r.query = String.Substr(s, q + 1);
+            s = String.Left(s, q);
+        }
+        if (String.StartsWith(s, "//")) {
+            let slash: int = String.IndexOfFrom(s, "/", 2);
+            if (slash < 0) { slash = String.Length(s); }
+            r.authority = String.Substr(s, 2, slash - 2);
+            s = String.Substr(s, slash);
+        }
+        r.path = s;
+        return r;
+    }
+
+    // ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), tested by byte value.
+    fn static _isScheme(s: string): bool {
+        let n: int = String.Length(s);
+        let i: int = 0;
+        while (i < n) {
+            let c: int = Char.Code(String.CharAt(s, i));
+            let alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+            if (!alpha && (i == 0 || !((c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46))) {
+                return false;
+            }
+            i += 1;
+        }
+        return n > 0;
+    }
+
+    fn static _joinRef(r: object): string {
+        let out: string = (r.scheme != nil) ? r.scheme + ":" : "";
+        if (r.authority != nil) { out = out + "//" + r.authority; }
+        out = out + r.path;
+        if (r.query != nil)    { out = out + "?" + r.query; }
+        if (r.fragment != nil) { out = out + "#" + r.fragment; }
+        return out;
+    }
+
+    // RFC 3986 5.2.4: drop "." segments and let ".." remove its parent. A
+    // ".." above the root stays at the root.
+    fn static _removeDots(path: string): string {
+        if (!String.Contains(path, ".")) { return path; }
+        let segs: array = String.Split(path, "/");
+        let out = [];
+        let abs = String.StartsWith(path, "/");
+        // A path ending in "." or ".." still names a directory.
+        let dirEnd = false;
+        let i: int = abs ? 1 : 0;
+        while (i < len(segs)) {
+            let seg: string = segs[i];
+            dirEnd = (seg == "." || seg == "..");
+            if (seg == "..") {
+                if (len(out) > 0) { Array.RemoveAt(out, len(out) - 1); }
+            } else if (seg != ".") {
+                Array.Append(out, seg);
+            }
+            i += 1;
+        }
+        let res: string = String.Join(out, "/");
+        if (dirEnd && len(out) > 0) { res = res + "/"; }
+        return abs ? "/" + res : res;
     }
 
     // Match req.method/req.path against a route pattern. Segments support

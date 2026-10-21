@@ -67,6 +67,13 @@
 //     temperature: float   - sampling temperature (0.0–2.0)
 //     seed:        int     - RNG seed for reproducible output
 //     top_p:       float   - nucleus sampling (0.0–1.0)
+//     top_k, min_p, repeat_penalty, presence_penalty, frequency_penalty
+//     num_ctx:     int     - context window in tokens; a prompt longer than the
+//                            window is truncated without an error
+//     num_predict: int     - cap on generated tokens
+//     stop:        array   - stop sequences
+//     timeoutMs:   int     - how long to wait for the reply (default 600000); a
+//                            non-streamed reply arrives only when generation ends
 //   }
 //
 // API REFERENCE
@@ -122,35 +129,43 @@
 //
 // ============================================================
 
-import { Http } from library("Http", "1.0");
+import { Http, ContentType } from library("Http", "1.0");
 import { Util } from library("Util", "1.0");
+
+// A non-streamed reply arrives only when generation ends, which on a local
+// model with a long prompt takes minutes - far past Http's 30 s default.
+global _aiTimeoutMs = 600000;
+
+// Caller opts sent to Ollama under "options".
+global _aiModelOptionKeys = ["temperature", "seed", "top_p", "top_k", "min_p",
+                             "num_ctx", "num_predict", "stop", "repeat_penalty",
+                             "presence_penalty", "frequency_penalty"];
 
 // ── AIClient ──────────────────────────────────────────────────────────────────
 
 class AIClient {
-    let _base = nil; 
+    let _base = nil;
+    let _transport = nil;
 
     fn Constructor(baseUrl: string) {
         this._base = baseUrl;
+        this._transport = Http.Transport({ timeoutMs: _aiTimeoutMs });
     }
 
-    fn _post(path: string, payload) {
-        return Http.Post(this._base + path, Json.Stringify(payload));
+    fn _post(path: string, payload, opts?) {
+        let tr = this._transport;
+        if (opts != nil && "timeoutMs" in opts) { tr = Http.Transport({ timeoutMs: opts.timeoutMs }); }
+        return Http.Request("POST", this._base + path, Json.Stringify(payload), ContentType.JSON, nil, tr);
     }
 
     // Build Ollama model-level options sub-object from caller opts.
     fn _modelOptions(opts) {
         if (opts == nil) { return nil; }
-        if ("temperature" in opts && "seed" in opts) {
-            return { temperature: opts.temperature, seed: opts.seed };
+        let out = {};
+        foreach (k in _aiModelOptionKeys) {
+            if (k in opts) { out[k] = opts[k]; }
         }
-        if ("temperature" in opts && "top_p" in opts) {
-            return { temperature: opts.temperature, top_p: opts.top_p };
-        }
-        if ("temperature" in opts) { return { temperature: opts.temperature }; }
-        if ("seed"        in opts) { return { seed:        opts.seed        }; }
-        if ("top_p"       in opts) { return { top_p:       opts.top_p       }; }
-        return nil;
+        return len(out) == 0 ? nil : out;
     }
 
     fn _think(opts) {
@@ -197,7 +212,7 @@ class AIClient {
 
     // Chat(model, messages, opts?) → string | nil
     fn Chat(model: string, messages, opts?) {
-        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts));
+        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts), opts);
         if (res == nil || res.status != 200) { return nil; }
         let data = Json.Parse(res.body);
         if (data == nil) { return nil; }
@@ -216,15 +231,8 @@ class AIClient {
     // ChatJson(model, messages, opts?) → object | nil
     // Forces JSON output via Ollama's format option. Returns parsed object.
     fn ChatJson(model: string, messages, opts?) {
-        let think = this._think(opts);
-        let mopts = this._modelOptions(opts);
-        let payload = nil;
-        if (mopts != nil) {
-            payload = { model: model, messages: messages, stream: false, think: think, format: "json", options: mopts };
-        } else {
-            payload = { model: model, messages: messages, stream: false, think: think, format: "json" };
-        }
-        let res = this._post("/api/chat", payload);
+        let jsonOpts = AIClient._merge(opts, { format: "json" });
+        let res = this._post("/api/chat", this._chatPayload(model, messages, false, jsonOpts), opts);
         if (res == nil || res.status != 200) { return nil; }
         let data = Json.Parse(res.body);
         if (data == nil) { return nil; }
@@ -234,7 +242,7 @@ class AIClient {
     // ChatStats(model, messages, opts?) → { content, promptTokens, evalTokens, totalMs } | nil
     // Same as Chat but also returns token counts and timing from Ollama.
     fn ChatStats(model: string, messages, opts?) {
-        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts));
+        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts), opts);
         if (res == nil || res.status != 200) { return nil; }
         let data = Json.Parse(res.body);
         if (data == nil) { return nil; }
@@ -262,7 +270,7 @@ class AIClient {
     // ({ role, content, tool_calls? }), so callers can inspect tool_calls.
     // Pass tools via opts.tools (see AI.Tool).
     fn ChatMessage(model: string, messages, opts?) {
-        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts));
+        let res = this._post("/api/chat", this._chatPayload(model, messages, false, opts), opts);
         if (res == nil || res.status != 200) { return nil; }
         let data = Json.Parse(res.body);
         if (data == nil || !("message" in data)) { return nil; }
@@ -331,7 +339,7 @@ class AIClient {
 
     // Generate(model, prompt, opts?) → string | nil
     fn Generate(model: string, prompt: string, opts?) {
-        let res = this._post("/api/generate", this._genPayload(model, prompt, false, opts));
+        let res = this._post("/api/generate", this._genPayload(model, prompt, false, opts), opts);
         if (res == nil || res.status != 200) { return nil; }
         let data = Json.Parse(res.body);
         if (data == nil) { return nil; }

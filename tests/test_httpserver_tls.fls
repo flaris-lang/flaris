@@ -6,7 +6,8 @@
 // child VM as the HTTPS server ("serve <dir>"), and drives it from here with
 // the Https library and raw TLS streams: handshake, Date header, keep-alive
 // reuse, chunked streaming, a body above the write-coalescing threshold,
-// byte-exact static binary, and the handshake-failure path.
+// byte-exact static binary, the handshake-failure path, and stalled handshakes
+// that must not hold up other clients.
 // Skips (exit 0) when openssl is missing or this build cannot terminate TLS.
 //
 // The server prints its port as its first stdout line and runs until its
@@ -246,6 +247,26 @@ fn async runChecks(dir: string, port: int, out) {
           "plain HTTP to the TLS port reports a handshake failure");
     let after = Https.GetInsecure(base + "/json");
     checkEq(after == nil ? 0 : after.status, 200, "server still serving after a failed handshake");
+
+    Console.WriteLine("\n[ Stalled handshakes ]");
+    // One peer connects and sends nothing, another sends the first six bytes of
+    // a ClientHello and stops. Each waits out the 5 s handshake timeout on its
+    // own connection fiber; a request arriving after them is answered at once.
+    let silent = Stream.Connect("tcp", "127.0.0.1", port, 2000);
+    let partial = Stream.Connect("tcp", "127.0.0.1", port, 2000);
+    if (partial != nil) {
+        let hello = Buffer.Create(6, 1);
+        hello[0] = 0x16; hello[1] = 0x03; hello[2] = 0x01; hello[3] = 0x02; hello[4] = 0x00; hello[5] = 0x01;
+        Stream.WriteBytes(partial, hello, 6);
+    }
+    Fiber.Sleep(100);
+    let t0 = Time.Millis();
+    let quick = Https.GetInsecure(base + "/json");
+    let took = Time.Millis() - t0;
+    checkEq(quick == nil ? 0 : quick.status, 200, "a request is served while two handshakes stall");
+    check(took < 2000, "  without waiting for them (" + str(took) + " ms)");
+    if (silent != nil) { Stream.Close(silent); }
+    if (partial != nil) { Stream.Close(partial); }
 
     Console.WriteLine("===========================");
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

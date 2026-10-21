@@ -4,6 +4,47 @@
 import { QRCode } from library("QRCode", "1.0");
 import { Test }   from library("Test",   "1.0");
 
+// Module (r, c) of an n-module symbol from ToPixels(text, 1, ...), whose
+// 4-module quiet zone is skipped.
+fn qrBit(px: array, n: int, r: int, c: int) : int {
+    return px[(r + 4) * (n + 8) + c + 4] == 0xFF000000 ? 1 : 0;
+}
+
+// The 15 format bits of the top-left copy, read most significant first.
+fn qrFormat(px: array, n: int) : int {
+    let rs = [8, 8, 8, 8, 8, 8, 8, 8, 7, 5, 4, 3, 2, 1, 0];
+    let cs = [0, 1, 2, 3, 4, 5, 7, 8, 8, 8, 8, 8, 8, 8, 8];
+    var v = 0;
+    iter (i from 0 to 15) { v = (v << 1) | qrBit(px, n, rs[i], cs[i]); }
+    return v;
+}
+
+fn qrMask(mask: int, r: int, c: int) : int {
+    var m = false;
+    if (mask == 0)      m = (r + c) % 2 == 0;
+    else if (mask == 1) m = r % 2 == 0;
+    else if (mask == 2) m = c % 3 == 0;
+    else if (mask == 3) m = (r + c) % 3 == 0;
+    else if (mask == 4) m = (r / 2 + c / 3) % 2 == 0;
+    else if (mask == 5) m = (r * c) % 2 + (r * c) % 3 == 0;
+    else if (mask == 6) m = ((r * c) % 2 + (r * c) % 3) % 2 == 0;
+    else                m = ((r + c) % 2 + (r * c) % 3) % 2 == 0;
+    return m ? 1 : 0;
+}
+
+// The first data codeword: the eight modules in the bottom-right corner,
+// unmasked with the mask the format information names.
+fn qrFirstCodeword(px: array, n: int) : int {
+    let mask = ((qrFormat(px, n) ^ 0x5412) >> 10) & 7;
+    var v = 0;
+    iter (k from 0 to 8) {
+        let r = n - 1 - k / 2;
+        let c = n - 1 - k % 2;
+        v = (v << 1) | (qrBit(px, n, r, c) ^ qrMask(mask, r, c));
+    }
+    return v;
+}
+
 fn Main() {
 
     // ── Suite 1: PixelSize ────────────────────────────────────────────────────
@@ -190,6 +231,59 @@ fn Main() {
 
     let f5 = t5.run();
 
+    // ── Suite 6: symbol structure ─────────────────────────────────────────────
+
+    let t6 = Test.Suite("QRCode symbol structure");
+
+    t6.it("byte capacity at version 10 per EC level", fn() {
+        t6.eq(QRCode.PixelSize(String.Repeat("x", 213), 1, QRCode.QR_M), 65);
+        t6.eq(QRCode.PixelSize(String.Repeat("x", 214), 1, QRCode.QR_M), -1);
+        t6.eq(QRCode.PixelSize(String.Repeat("x", 271), 1, QRCode.QR_L), 65);
+        t6.eq(QRCode.PixelSize(String.Repeat("x", 272), 1, QRCode.QR_L), -1);
+        t6.eq(QRCode.PixelSize(String.Repeat("x", 151), 1, QRCode.QR_Q), 65);
+        t6.eq(QRCode.PixelSize(String.Repeat("x", 119), 1, QRCode.QR_H), 65);
+    });
+
+    t6.it("format information reads most significant bit first", fn() {
+        let px = QRCode.ToPixels("format", 1, QRCode.QR_M, false);
+        let words = [0x5412, 0x5125, 0x5E7C, 0x5B4B, 0x45F9, 0x40CE, 0x4F97, 0x4AA0];
+        t6.ok(Array.IndexOf(words, qrFormat(px, 21)) >= 0);
+    });
+
+    t6.it("dark module is set", fn() {
+        let px = QRCode.ToPixels("dark", 1, QRCode.QR_M, false);
+        t6.eq(qrBit(px, 21, 13, 8), 1);
+    });
+
+    t6.it("byte count is 8 bits below version 10", fn() {
+        let px = QRCode.ToPixels(String.Repeat("0", 150), 1, QRCode.QR_M, false);
+        t6.eq(len(px), 57 * 57);                    // version 8
+        t6.eq(qrFirstCodeword(px, 49), 0x49);       // mode 0100, count 150 = 1001 0110
+    });
+
+    t6.it("byte count is 16 bits at version 10", fn() {
+        let px = QRCode.ToPixels(String.Repeat("0", 213), 1, QRCode.QR_M, false);
+        t6.eq(len(px), 65 * 65);
+        t6.eq(qrFirstCodeword(px, 57), 0x40);       // mode 0100, count 213 = 0000 0000 1101 0101
+    });
+
+    t6.it("alignment patterns on the timing lines are drawn", fn() {
+        let px = QRCode.ToPixels(String.Repeat("a", 120), 1, QRCode.QR_M, false);
+        let n = 45;                                  // version 7: centres 6, 22, 38
+        var ok = len(px) == (n + 8) * (n + 8);
+        iter (d from -2 to 3) {
+            ok = ok && qrBit(px, n, 4, 22 + d) == 1 && qrBit(px, n, 22 + d, 4) == 1;
+            ok = ok && qrBit(px, n, 8, 22 + d) == 1 && qrBit(px, n, 22 + d, 8) == 1;
+        }
+        iter (d from -1 to 2) {
+            ok = ok && qrBit(px, n, 5, 22 + d) == 0 && qrBit(px, n, 22 + d, 5) == 0;
+            ok = ok && qrBit(px, n, 7, 22 + d) == 0 && qrBit(px, n, 22 + d, 7) == 0;
+        }
+        t6.ok(ok);
+    });
+
+    let f6 = t6.run();
+
     // ── Benchmarks: QR encode throughput ─────────────────────────────────────
 
     Console.WriteLine("=== QRCode benchmarks ===");
@@ -212,5 +306,5 @@ fn Main() {
 
     Console.WriteLine("=== benchmarks done ===");
 
-    return (f1 + f2 + f3 + f4 + f5) > 0 ? 1 : 0;
+    return (f1 + f2 + f3 + f4 + f5 + f6) > 0 ? 1 : 0;
 }

@@ -33,6 +33,12 @@
 //   {{> name}}                  Partial - renders a registered template by name
 //   {{! comment }}              Comment - stripped from output
 //
+// Inside each, {{.}} on a nil item renders nothing. Parse (and Apply) raise
+// TemplateError (Code Exception.InvalidArguments) when a close tag does not
+// match the block it ends ({{#if a}}…{{/each}}), when {{/if}}, {{/each}},
+// {{/unless}} or {{#else}} has no block of its own to end, and when a block is
+// never closed. An unclosed "{{" is text.
+//
 // API:
 //   Template.Parse(src)                →  Template instance
 //   Template.Apply(src, data)          →  string  (parse + render in one call)
@@ -41,6 +47,8 @@
 //   instance.Render(data)              →  string
 
 global _tpl_partials = {};
+
+class TemplateError : Exception {}
 
 class Template {
     let _nodes = nil; 
@@ -52,7 +60,7 @@ class Template {
     // Compile a template source string into a reusable Template.
     fn static Parse(src:string) {
         let c = { s: src, p: 0, n: String.Length(src) };
-        let r = Template._parseBlock(c);
+        let r = Template._parseBlock(c, "");
         return new Template(r.nodes);
     }
 
@@ -88,20 +96,24 @@ class Template {
     //   k = 0 text   1 var   2 raw   3 if   4 unless   5 partial   6 each
     //
     //   { t:"x",       k:0, v:"..." }                 literal text
-    //   { t:"var",     k:1, path:[...] }              escaped variable
-    //   { t:"raw",     k:2, path:[...] }              unescaped variable
-    //   { t:"if",      k:3, path:[...], thn:[...], els:[...] }
-    //   { t:"unless",  k:4, path:[...], body:[...] }
-    //   { t:"each",    k:6, path:[...], body:[...] }
+    //   { t:"var",     k:1, path:[...], m:bool }      escaped variable
+    //   { t:"raw",     k:2, path:[...], m:bool }      unescaped variable
+    //   { t:"if",      k:3, path:[...], m:bool, thn:[...], els:[...] }
+    //   { t:"unless",  k:4, path:[...], m:bool, body:[...] }
+    //   { t:"each",    k:6, path:[...], m:bool, body:[...] }
     //   { t:"partial", k:5, name:"..." }              partial reference
+    //
+    // m is true when path[0] is a loop meta-variable (_index, _first, _last, _count).
     //
     // The tags the parser consumes itself - "comment", "else", "end_if",
     // "end_each", "end_unless" - never reach the AST and carry no `k`.
     //
     // _parseBlock returns { nodes:[...], stop: nil | "else" | "end_if" | "end_each" | "end_unless" }
+    // `open` names the block being read: "" at the top, "if", "else" (the else
+    // part of an if), "unless" or "each"; a stop tag that does not end it raises.
     // =========================================================================
 
-    fn static _parseBlock(c) {
+    fn static _parseBlock(c, open:string) {
         var nodes = [];
         while (c.p < c.n) {
             let tagPos = Template._find(c.s, "{{", c.p);
@@ -120,25 +132,53 @@ class Template {
             if (tag.t == "x" or tag.t == "var" or tag.t == "raw" or tag.t == "partial") {
                 Array.Append(nodes, tag);
             } else if (tag.t == "if") {
-                let then_r = Template._parseBlock(c);
+                let then_r = Template._parseBlock(c, "if");
                 var els = [];
                 if (then_r.stop == "else") {
-                    let else_r = Template._parseBlock(c);
+                    let else_r = Template._parseBlock(c, "else");
                     els = else_r.nodes;
                 }
-                Array.Append(nodes, { t: "if", k: 3, path: tag.path, thn: then_r.nodes, els: els });
+                Array.Append(nodes, { t: "if", k: 3, path: tag.path, m: tag.m, thn: then_r.nodes, els: els });
             } else if (tag.t == "unless") {
-                let body_r = Template._parseBlock(c);
-                Array.Append(nodes, { t: "unless", k: 4, path: tag.path, body: body_r.nodes });
+                let body_r = Template._parseBlock(c, "unless");
+                Array.Append(nodes, { t: "unless", k: 4, path: tag.path, m: tag.m, body: body_r.nodes });
             } else if (tag.t == "each") {
-                let body_r = Template._parseBlock(c);
-                Array.Append(nodes, { t: "each", k: 6, path: tag.path, body: body_r.nodes });
+                let body_r = Template._parseBlock(c, "each");
+                Array.Append(nodes, { t: "each", k: 6, path: tag.path, m: tag.m, body: body_r.nodes });
             } else if (tag.t == "else" or tag.t == "end_if" or tag.t == "end_each" or tag.t == "end_unless") {
+                if (!Template._ends(open, tag.t)) {
+                    let what = (open == "") ? " has no open block to end"
+                                            : " does not end " + Template._openTag(open);
+                    throw new TemplateError(Exception.InvalidArguments,
+                        "Template: " + Template._stopTag(tag.t) + what + " (offset " + str(c.p) + ")");
+                }
                 return { nodes: nodes, stop: tag.t };
             }
             // tag.t == "comment" - stripped, no action
         }
+        if (open != "") {
+            throw new TemplateError(Exception.InvalidArguments,
+                "Template: " + Template._openTag(open) + " is never closed");
+        }
         return { nodes: nodes, stop: nil };
+    }
+
+    fn static _ends(open:string, stop:string): bool {
+        if (stop == "else")       return open == "if";
+        if (stop == "end_if")     return open == "if" or open == "else";
+        if (stop == "end_each")   return open == "each";
+        if (stop == "end_unless") return open == "unless";
+        return false;
+    }
+
+    fn static _openTag(open:string): string {
+        if (open == "else") return "{{#if}}…{{#else}}";
+        return "{{#" + open + "}}";
+    }
+
+    fn static _stopTag(stop:string): string {
+        if (stop == "else") return "{{#else}}";
+        return "{{/" + String.Substr(stop, 4) + "}}";
     }
 
     // Read one tag starting at c.p (which must point at "{{").
@@ -159,24 +199,29 @@ class Template {
         let inner = String.Trim(String.Substr(c.s, c.p, closePos - c.p));
         c.p = closePos + String.Length(closeStr);
 
-        if (raw)                                   return { t: "raw",     k: 2, path: Template._splitPath(inner) };
+        if (raw)                                   return Template._pathTag("raw", 2, inner);
         if (String.StartsWith(inner, "!"))         return { t: "comment" };
         if (inner == "#else")                      return { t: "else" };
         if (inner == "/if")                        return { t: "end_if" };
         if (inner == "/each")                      return { t: "end_each" };
         if (inner == "/unless")                    return { t: "end_unless" };
-        if (String.StartsWith(inner, "#if "))      return { t: "if",     path: Template._splitPath(String.Trim(String.Substr(inner, 4))) };
-        if (String.StartsWith(inner, "#unless "))  return { t: "unless", path: Template._splitPath(String.Trim(String.Substr(inner, 8))) };
-        if (String.StartsWith(inner, "#each "))    return { t: "each",   path: Template._splitPath(String.Trim(String.Substr(inner, 6))) };
+        if (String.StartsWith(inner, "#if "))      return Template._pathTag("if",     3, String.Trim(String.Substr(inner, 4)));
+        if (String.StartsWith(inner, "#unless "))  return Template._pathTag("unless", 4, String.Trim(String.Substr(inner, 8)));
+        if (String.StartsWith(inner, "#each "))    return Template._pathTag("each",   6, String.Trim(String.Substr(inner, 6)));
         if (String.StartsWith(inner, "> "))        return { t: "partial", k: 5, name: String.Trim(String.Substr(inner, 2)) };
-        return { t: "var", k: 1, path: Template._splitPath(inner) };
+        return Template._pathTag("var", 1, inner);
     }
 
+    // A tag naming a data path. Paths split on dots:
     // "user.name" - ["user", "name"],  "." - ["."],  "title" - ["title"]
-    fn static _splitPath(key:string) {
-        if (key == ".") return [key];
-        if (String.Contains(key, ".")) return String.Split(key, ".");
-        return [key];
+    fn static _pathTag(t:string, k:int, key:string) {
+        let path = (key != "." and String.Contains(key, ".")) ? String.Split(key, ".") : [key];
+        let p0 = path[0];
+        return { t: t, k: k, path: path, m: p0 == "_index" or p0 == "_first" or p0 == "_last" or p0 == "_count" };
+    }
+
+    fn static _isMeta(key:string): bool {
+        return key == "_index" or key == "_first" or key == "_last" or key == "_count";
     }
 
     // Index of needle at or after pos, or -1 (also for pos past the end).
@@ -198,7 +243,7 @@ class Template {
                 Array.Append(parts, node.v);
 
             } else if (k == 1) {
-                let val = Template._resolve(node.path, ctx);
+                let val = Template._resolve(node, ctx);
                 if (val != nil) {
                     // Most values hold none of the five escaped characters and
                     // go out as they are.
@@ -207,18 +252,18 @@ class Template {
                 }
 
             } else if (k == 2) {
-                let val = Template._resolve(node.path, ctx);
+                let val = Template._resolve(node, ctx);
                 if (val != nil) Array.Append(parts, str(val));
 
             } else if (k == 3) {
-                if (Template._truthy(Template._resolve(node.path, ctx))) {
+                if (Template._truthy(Template._resolve(node, ctx))) {
                     Template._render(node.thn, ctx, parts);
                 } else {
                     Template._render(node.els, ctx, parts);
                 }
 
             } else if (k == 4) {
-                if (!Template._truthy(Template._resolve(node.path, ctx))) {
+                if (!Template._truthy(Template._resolve(node, ctx))) {
                     Template._render(node.body, ctx, parts);
                 }
 
@@ -229,18 +274,19 @@ class Template {
                 }
 
             } else if (k == 6) {
-                let items = Template._resolve(node.path, ctx);
+                let items = Template._resolve(node, ctx);
                 if (items != nil and type(items) == Type.Array) {
                     let count = len(items);
+                    // One frame per loop, refilled per item. _parent is assigned,
+                    // not written into the literal: a literal walks everything
+                    // its values reach, and ctx reaches the whole data tree.
+                    let frame = { _value: nil, _index: 0, _first: true, _last: false, _count: count };
+                    frame._parent = ctx;
                     iter (j from 0 to count) {
-                        let frame = {
-                            _value:  items[j],
-                            _index:  j,
-                            _first:  j == 0,
-                            _last:   j == count - 1,
-                            _count:  count,
-                            _parent: ctx
-                        };
+                        frame._value = items[j];
+                        frame._index = j;
+                        frame._first = j == 0;
+                        frame._last  = j == count - 1;
                         Template._render(node.body, frame, parts);
                     }
                 }
@@ -257,35 +303,33 @@ class Template {
     //   "."              - current item (_value, or ctx itself at root)
     //   _index/_first/…  - loop meta-vars from the each-frame
     //   key              - property on _value (if object), then ctx, then _parent
-    fn static _resolve(path, ctx) {
-        return Template._resolveAt(path, 0, ctx);
+    fn static _resolve(node, ctx) {
+        return Template._resolveAt(node.path, 0, node.m, ctx);
     }
 
-    // _resolve for the path segments from index `at` on.
-    fn static _resolveAt(path, at:int, ctx) {
+    // _resolve for the path segments from index `at` on; meta = path[at] is a
+    // loop meta-variable.
+    fn static _resolveAt(path, at:int, meta:bool, ctx) {
         if (ctx == nil or path == nil or len(path) <= at) return nil;
         if (type(ctx) != Type.Object) return nil;
 
         let key  = path[at];
         let more = len(path) - at > 1;
 
-        // "." = the current iteration item
+        // "." = the current iteration item - nil included - in an each-frame
+        // (which always holds _value), the data itself at the root.
         if (key == ".") {
-            let dotVal = Object.TryGet(ctx, "_value", nil);
-            if (dotVal != nil) {
-                if (more) return Template._resolveAt(path, at + 1, dotVal);
-                return dotVal;
-            }
-            if (more) return Template._resolveAt(path, at + 1, ctx);
-            return ctx;
+            let dot = Object.HasKey(ctx, "_value") ? ctx._value : ctx;
+            if (more) return Template._resolveAt(path, at + 1, Template._isMeta(path[at + 1]), dot);
+            return dot;
         }
 
         // Loop meta-variables
-        if (key == "_index" or key == "_first" or key == "_last" or key == "_count") {
+        if (meta) {
             let mv = Object.TryGet(ctx, key, nil);
             if (mv != nil) return mv;
             let par0 = Object.TryGet(ctx, "_parent", nil);
-            if (par0 != nil) return Template._resolveAt(path, at, par0);
+            if (par0 != nil) return Template._resolveAt(path, at, true, par0);
             return nil;
         }
 
@@ -296,21 +340,18 @@ class Template {
             val = Object.TryGet(item, key, nil);
         }
 
-        // Fall back to the context frame / root data
+        // Fall back to the context frame / root data, then walk up the parent chain
         if (val == nil) {
             val = Object.TryGet(ctx, key, nil);
-        }
-
-        // Still nothing - walk up the parent chain
-        let par = Object.TryGet(ctx, "_parent", nil);
-        if (val == nil and par != nil) {
-            return Template._resolveAt(path, at, par);
+            if (val == nil) {
+                let par = Object.TryGet(ctx, "_parent", nil);
+                if (par != nil) return Template._resolveAt(path, at, false, par);
+                return nil;
+            }
         }
 
         // Traverse remaining path segments into the resolved value
-        if (val != nil and more) {
-            return Template._resolveAt(path, at + 1, val);
-        }
+        if (more) return Template._resolveAt(path, at + 1, Template._isMeta(path[at + 1]), val);
 
         return val;
     }
@@ -378,4 +419,4 @@ class Template {
         return out;
     }
 }
-export { Template };
+export { Template, TemplateError };

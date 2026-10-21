@@ -34,6 +34,9 @@
 //   Decimal.Zero()               - 0
 //   Decimal.One()                - 1
 //
+// Every function taking a Decimal also takes an int or a float in its place,
+// converted as From converts it; any other value raises TypeMismatch.
+//
 // Arithmetic:
 //   Decimal.Add(a, b)             →  Decimal  - scale: the larger of the two
 //   Decimal.Sub(a, b)             →  Decimal
@@ -45,8 +48,9 @@
 //   Decimal.Neg(d)                →  Decimal  - unary negation
 //   Decimal.Abs(d)                →  Decimal
 //
-// Rounding (places may be negative: -2 rounds to hundreds; a value that
-// already has no more than `places` fractional digits is returned unchanged):
+// Rounding (places may be negative: -2 rounds to hundreds). The result has
+// exactly `places` fractional digits - none when places <= 0 - padded with
+// zeros when d has fewer, so Round(From("0.3"), 2) prints as "0.30":
 //   Decimal.Round(d, places)         →  Decimal  - half away from zero
 //   Decimal.RoundHalfEven(d, places) →  Decimal  - banker's rounding
 //   Decimal.Truncate(d, places)      →  Decimal  - toward zero
@@ -553,11 +557,22 @@ class Decimal {
     fn static Zero() { return Decimal._zero(); }
     fn static One()  { return Decimal._one(); }
 
+    // An operand that is not a Decimal: an int or a float converts as From
+    // does; anything else, NaN and infinity raise.
+    fn static _dec(x) {
+        if (Type.Is(x, Type.Int) || Type.Is(x, Type.Float)) {
+            let d = Decimal.From(x);
+            if (d != nil) { return d; }
+        }
+        throw new Exception(Exception.TypeMismatch, "Decimal: expected a Decimal, an int or a finite float, got " + Type.Name(x));
+    }
+
     // ----------------------------------------------------------------
     // Output
     // ----------------------------------------------------------------
 
     fn static ToString(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         let raw = Decimal._unscaledStr(d.limbs);
         let sc = d.scale;
         var result = raw;
@@ -572,12 +587,14 @@ class Decimal {
     }
 
     fn static ToFloat(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         return Convert.ParseFloat(Decimal.ToString(d));
     }
 
     // Returns the integer part (truncated toward zero) as a Flaris int,
     // or nil if the value does not fit in int64.
     fn static ToInt(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         let ls = Decimal._scaleDownL(d.limbs, d.scale);
         let k = len(ls);
         if (k > 3) { return nil; }
@@ -598,6 +615,8 @@ class Decimal {
     // ----------------------------------------------------------------
 
     fn static Cmp(a, b) {
+        if (a.scale == nil) { a = Decimal._dec(a); }
+        if (b.scale == nil) { b = Decimal._dec(b); }
         let az = Decimal._isZeroL(a.limbs); let bz = Decimal._isZeroL(b.limbs);
         if (az && bz) { return 0; }
         if (a.sign != b.sign || az || bz) {
@@ -615,22 +634,28 @@ class Decimal {
     fn static Gt(a, b)  { return Decimal.Cmp(a, b) >  0; }
     fn static Gte(a, b) { return Decimal.Cmp(a, b) >= 0; }
 
-    fn static IsZero(d) { return Decimal._isZeroL(d.limbs); }
-    fn static IsNeg(d)  { return d.sign == -1 && !Decimal._isZeroL(d.limbs); }
-    fn static IsPos(d)  { return d.sign == 1  && !Decimal._isZeroL(d.limbs); }
+    fn static IsZero(d) { if (d.scale == nil) { d = Decimal._dec(d); } return Decimal._isZeroL(d.limbs); }
+    fn static IsNeg(d)  { if (d.scale == nil) { d = Decimal._dec(d); } return d.sign == -1 && !Decimal._isZeroL(d.limbs); }
+    fn static IsPos(d)  { if (d.scale == nil) { d = Decimal._dec(d); } return d.sign == 1  && !Decimal._isZeroL(d.limbs); }
 
     // ----------------------------------------------------------------
     // Arithmetic
     // ----------------------------------------------------------------
 
     fn static Neg(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         if (Decimal._isZeroL(d.limbs)) { return d; }
         return { sign: -d.sign, limbs: d.limbs, scale: d.scale };
     }
 
-    fn static Abs(d) { return { sign: 1, limbs: d.limbs, scale: d.scale }; }
+    fn static Abs(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
+        return { sign: 1, limbs: d.limbs, scale: d.scale };
+    }
 
     fn static Add(a, b) {
+        if (a.scale == nil) { a = Decimal._dec(a); }
+        if (b.scale == nil) { b = Decimal._dec(b); }
         var al = a.limbs; var bl = b.limbs; var sc = a.scale;
         if (a.scale < b.scale)      { al = Decimal._scaleUpL(al, b.scale - a.scale); sc = b.scale; }
         else if (b.scale < a.scale) { bl = Decimal._scaleUpL(bl, a.scale - b.scale); }
@@ -645,6 +670,8 @@ class Decimal {
     fn static Sub(a, b) { return Decimal.Add(a, Decimal.Neg(b)); }
 
     fn static Mul(a, b) {
+        if (a.scale == nil) { a = Decimal._dec(a); }
+        if (b.scale == nil) { b = Decimal._dec(b); }
         let al = a.limbs; let bl = b.limbs;
         let sc = a.scale + b.scale;
         if ((len(al) == 1 && al[0] == 0) || (len(bl) == 1 && bl[0] == 0)) {
@@ -658,6 +685,8 @@ class Decimal {
     // Divide a by b, keeping `precision` fractional digits (default 28) and
     // truncating the rest. Returns nil for division by zero.
     fn static Div(a, b, precision?: int) {
+        if (a.scale == nil) { a = Decimal._dec(a); }
+        if (b.scale == nil) { b = Decimal._dec(b); }
         if (Decimal._isZeroL(b.limbs)) { return nil; }
         if (precision == nil) { precision = _PRECISION; }
         if (precision < 0) { return Decimal.Truncate(Decimal.Div(a, b, 0), precision); }
@@ -682,6 +711,7 @@ class Decimal {
     // Integer exponentiation. exp must be a non-negative Flaris int.
     // Returns nil for negative exp.
     fn static Pow(d, exp: int) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         if (exp < 0) { return nil; }
         var result = Decimal._one(); var cur = d;
         while (exp > 0) {
@@ -709,9 +739,16 @@ class Decimal {
         return Decimal._make(d.sign, q, sc);
     }
 
+    // d with its fraction padded with zeros to `places` (>= d.scale) digits.
+    fn static _padScale(d, places: int) {
+        if (places == d.scale) { return d; }
+        return { sign: d.sign, limbs: Decimal._scaleUpL(d.limbs, places - d.scale), scale: places };
+    }
+
     // Truncate toward zero to `places` fractional digits.
     fn static Truncate(d, places: int) {
-        if (d.scale <= places) { return d; }
+        if (d.scale == nil) { d = Decimal._dec(d); }
+        if (d.scale <= places) { return Decimal._padScale(d, places); }
         let drop = d.scale - places;
         var q = Decimal._scaleDownL(d.limbs, drop);
         var sc = places;
@@ -721,7 +758,8 @@ class Decimal {
 
     // Round half-up (away from zero on ties) to `places` fractional digits.
     fn static Round(d, places: int) {
-        if (d.scale <= places) { return d; }
+        if (d.scale == nil) { d = Decimal._dec(d); }
+        if (d.scale <= places) { return Decimal._padScale(d, places); }
         return Decimal._roundDigits(d, d.scale - places, false);
     }
 
@@ -729,12 +767,14 @@ class Decimal {
     // discarded part of exactly half moves the last kept digit to the nearest
     // even value; otherwise it matches Round.
     fn static RoundHalfEven(d, places: int) {
-        if (d.scale <= places) { return d; }
+        if (d.scale == nil) { d = Decimal._dec(d); }
+        if (d.scale <= places) { return Decimal._padScale(d, places); }
         return Decimal._roundDigits(d, d.scale - places, true);
     }
 
     // Largest integer <= d.
     fn static Floor(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         let t = Decimal.Truncate(d, 0);
         if (d.sign == 1 || d.scale == 0 || Decimal._dropKindL(d.limbs, d.scale) == 0) { return t; }
         return Decimal._make(-1, Decimal._addL(t.limbs, Decimal._intL(1)), 0);
@@ -742,6 +782,7 @@ class Decimal {
 
     // Smallest integer >= d.
     fn static Ceil(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         let t = Decimal.Truncate(d, 0);
         if (d.sign == -1 || d.scale == 0 || Decimal._dropKindL(d.limbs, d.scale) == 0) { return t; }
         return Decimal._make(1, Decimal._addL(t.limbs, Decimal._intL(1)), 0);
@@ -753,22 +794,28 @@ class Decimal {
 
     // Return -1 if negative, 0 if zero, 1 if positive.
     fn static Sign(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         if (Decimal._isZeroL(d.limbs)) { return 0; }
         return d.sign;
     }
 
     // Return whichever of a, b is greater (or a if equal).
     fn static Max(a, b) {
+        if (a.scale == nil) { a = Decimal._dec(a); }
+        if (b.scale == nil) { b = Decimal._dec(b); }
         return Decimal.Cmp(a, b) >= 0 ? a : b;
     }
 
     // Return whichever of a, b is smaller (or a if equal).
     fn static Min(a, b) {
+        if (a.scale == nil) { a = Decimal._dec(a); }
+        if (b.scale == nil) { b = Decimal._dec(b); }
         return Decimal.Cmp(a, b) <= 0 ? a : b;
     }
 
     // True if d has no fractional part (scale == 0, or all fractional digits are zero).
     fn static IsInteger(d) {
+        if (d.scale == nil) { d = Decimal._dec(d); }
         if (d.scale == 0) { return true; }
         return Decimal._dropKindL(d.limbs, d.scale) == 0;
     }

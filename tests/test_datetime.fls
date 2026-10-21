@@ -88,9 +88,36 @@ fn test_duration_static() {
 fn test_duration_tostring_parse() {
     Console.WriteLine("== Duration ToString / Parse ==");
     checkEq(Duration.FromHours(1).Add(Duration.FromMinutes(2)).Add(Duration.FromSeconds(3)).ToString(),
-            "01:02:03", "ToString 01:02:03");
-    checkEq(new Duration(0).ToString(),     "00:00:00",  "ToString zero");
-    checkEq(new Duration(-3661).ToString(), "-01:01:01", "ToString negative");
+            "1h2m3s", "ToString 1h2m3s");
+    checkEq(Duration.FromHours(1).Add(Duration.FromMinutes(45)).ToString(), "1h45m", "ToString 1h45m");
+    checkEq(Duration.FromSeconds(45).ToString(),  "45s",     "ToString 45s");
+    checkEq(Duration.FromHours(-2).ToString(),    "-2h",     "ToString -2h");
+    checkEq(Duration.FromHours(28).ToString(),    "1d4h",    "ToString 1d4h");
+    checkEq(new Duration(86400 + 59).ToString(),  "1d59s",   "ToString skips zero units");
+    checkEq(new Duration(0).ToString(),           "0s",      "ToString zero");
+    checkEq(new Duration(-3661).ToString(),       "-1h1m1s", "ToString negative");
+
+    checkEq(Duration.Parse("1h30m").TotalSeconds(),    5400,   "Parse 1h30m");
+    checkEq(Duration.Parse("90s").TotalSeconds(),      90,     "Parse 90s");
+    checkEq(Duration.Parse("2d4h").TotalSeconds(),     187200, "Parse 2d4h");
+    checkEq(Duration.Parse("1d2h3m4s").TotalSeconds(), 93784,  "Parse 1d2h3m4s");
+    checkEq(Duration.Parse("-45m").TotalSeconds(),     -2700,  "Parse -45m");
+    checkEq(Duration.Parse(" 1h30m ").TotalSeconds(),  5400,   "Parse trims");
+    checkEq(Duration.Parse("0s").TotalSeconds(),       0,      "Parse 0s");
+    check(Duration.Parse("30m1h") == nil,          "Parse units out of order nil");
+    check(Duration.Parse("1h1h") == nil,           "Parse repeated unit nil");
+    check(Duration.Parse("90") == nil,             "Parse number without unit nil");
+    check(Duration.Parse("1h30") == nil,           "Parse trailing number nil");
+    check(Duration.Parse("5x") == nil,             "Parse unknown unit nil");
+    check(Duration.Parse("h") == nil,              "Parse unit without number nil");
+    check(Duration.Parse("1h 30m") == nil,         "Parse inner space nil");
+    check(Duration.Parse("") == nil,               "Parse empty nil");
+    check(Duration.Parse("-") == nil,              "Parse lone minus nil");
+    check(Duration.Parse("1234567890123s") == nil, "Parse 13-digit amount nil");
+    foreach (secs in [5400, 45, -7200, 100800, 86459, -93784, 0]) {
+        checkEq(Duration.Parse(new Duration(secs).ToString()).TotalSeconds(), secs, "ToString round-trip " + str(secs));
+    }
+
     checkEq(Duration.Parse("01:30:00").TotalSeconds(), 5400, "Parse 01:30:00");
     checkEq(Duration.Parse("00:00:45").TotalSeconds(), 45,   "Parse 00:00:45");
     checkEq(Duration.Parse("02:15").TotalSeconds(),    8100, "Parse 02:15");
@@ -169,6 +196,15 @@ fn test_datetime_of_parse() {
     checkEq(DateTime.Parse("2024-03-15T12:30:45+2:00").Unix(),               REF_TS,         "Parse malformed offset ignored");
     checkEq(DateTime.Parse("2024-03-15T12:30:45+02:00x").Unix(),             REF_TS,         "Parse trailing text ignored");
     checkEq(DateTime.Parse("1970-01-01T00:59:59+01:00").Unix(),              -1,             "Parse offset before the epoch");
+
+    // A date alone is midnight UTC; anything that is not ISO 8601 gives nil.
+    checkEq(DateTime.Parse("2024-03-15").Unix(),                             REF_TS - 45045, "Parse date only");
+    checkEq(DateTime.Parse("2024-02-27").ToISO(),                            "2024-02-27T00:00:00+00:00", "Parse date only is midnight");
+    checkEq(DateTime.Parse("2024-02-27", "Europe/Berlin").ToISO(),           "2024-02-27T01:00:00+01:00", "Parse date only, shown in tz");
+    check(DateTime.Parse("2024-02-27 10:00") == nil,                         "Parse date and space-separated time nil");
+    check(DateTime.Parse("2024-02-2x") == nil,                               "Parse malformed date nil");
+    check(DateTime.Parse("garbage") == nil,                                  "Parse garbage nil");
+    check(DateTime.Parse("") == nil,                                         "Parse empty nil");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,8 +354,12 @@ fn test_timezone_formatting() {
     checkEq(d.UtcOffset(),    0,        "UTC offset=0");
     checkEq(d.FormatOffset(), "+00:00", "FormatOffset UTC");
     checkEq(d.InZone("Europe/Berlin").FormatOffset(),    "+01:00", "FormatOffset Berlin");
-    checkEq(d.InZone("America/New_York").FormatOffset(), "-05:00", "FormatOffset NY");
+    checkEq(d.InZone("America/New_York").FormatOffset(), "-04:00", "FormatOffset NY, summer time from March 10");
     checkEq(d.InZone("Europe/Berlin").ToISO(), "2024-03-15T13:30:45+01:00", "ToISO Berlin");
+    let jan = DateTime.Of(2025, 1, 15, 14, 30, 0, "Europe/Berlin");
+    checkEq(jan.ToString(), "2025-01-15 14:30:00 Europe/Berlin", "ToString Berlin, header example");
+    checkEq(jan.ToISO(),    "2025-01-15T14:30:00+01:00",         "ToISO Berlin, header example");
+    checkEq(DateTime.Of(2025, 6, 1, 14, 30, 0, "Europe/Berlin").ToISO(), "2025-06-01T14:30:00+02:00", "ToISO Berlin in June: summer time");
     checkEq(d.ToISO(),                         "2024-03-15T12:30:45+00:00", "ToISO UTC");
     checkEq(d.Unix(), d.InZone("Europe/Berlin").Unix(), "InZone preserves ts");
     check(DateTime.HasTimezone("Europe/Berlin"),      "HasTimezone known");
@@ -360,6 +400,14 @@ fn test_datetime_formatting_extra() {
     DateTime.RegisterTimezone("Test/MinusHalf", -30);
     checkEq(DateTime.FromUnix(0).InZone("Test/MinusHalf").ToISO(), "1969-12-31T23:30:00-00:30", "ToISO negative minutes offset");
     checkEq(d.Format("%Y/%m/%d"), "2024/03/15", "Format strftime");
+    checkEq(d.Format("short"),    "2024-03-15",          "Format short");
+    checkEq(d.Format("date"),     "2024-03-15",          "Format date");
+    checkEq(d.Format("long"),     "2024-03-15 12:30:45", "Format long");
+    checkEq(d.Format("time"),     "12:30:45",            "Format time");
+    let auckland = d.InZone("Pacific/Auckland");
+    checkEq(auckland.Format("date"),    "2024-03-16", "Format date in zone");
+    checkEq(auckland.FormatUTC("date"), "2024-03-15", "FormatUTC date");
+    checkEq(auckland.Format("time"),    "01:30:45",   "Format time in zone, NZ summer time");
     let berlin = d.InZone("Europe/Berlin");
     checkEq(berlin.FormatUTC("%H:%M"), "12:30", "FormatUTC ignores zone");
     checkEq(berlin.Format("%H:%M"),    "13:30", "Format respects zone");
@@ -369,7 +417,7 @@ fn test_datetime_formatting_extra() {
     let ny = DateTime.FromUnixIn(REF_TS, "America/New_York");
     checkEq(ny.Unix(),     REF_TS,            "FromUnixIn ts");
     checkEq(ny.Timezone(), "America/New_York", "FromUnixIn tz");
-    checkEq(ny.Hour(),     7,                  "FromUnixIn local hour");
+    checkEq(ny.Hour(),     8,                  "FromUnixIn local hour, EDT");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -515,6 +563,8 @@ fn test_parsefmt() {
     // Without tz arg (nil → UTC)
     let parsed2 = DateTime.ParseFmt("2024-03-15 12:30:45", "%Y-%m-%d %H:%M:%S", nil);
     checkEq(parsed2.Unix(), ref.Unix(), "ParseFmt nil tz");
+    check(DateTime.ParseFmt("2024/03/15", "%Y-%m-%d") == nil, "ParseFmt mismatch nil");
+    check(DateTime.ParseFmt("nope", "%Y-%m-%d", "UTC") == nil, "ParseFmt garbage nil");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -710,9 +760,9 @@ fn test_inzone_chain_toutc() {
     checkEq(back.Unix(),     REF_TS, "ToUTC after chain ts");
     checkEq(back.Timezone(), "UTC",  "ToUTC after chain label");
 
-    // InZone on UTC gives correct local hour for LA (-480 min = UTC-8).
+    // InZone on UTC gives the local hour for LA: PDT (UTC-7) on 2024-03-15.
     let la = utc.InZone("America/Los_Angeles");
-    checkEq(la.Hour(), 4, "LA hour from UTC 12:30");
+    checkEq(la.Hour(), 5, "LA hour from UTC 12:30");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -979,6 +1029,362 @@ fn test_duration_between_same() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 45. DST transitions
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The offset of zone z (minutes) one second before instant t, and at t.
+fn checkChange(z: string, t: int, before: int, after: int, what: string) {
+    checkEq(DateTime.FromUnixIn(t - 1, z).UtcOffset(), before, what + ": offset before");
+    checkEq(DateTime.FromUnixIn(t, z).UtcOffset(),     after,  what + ": offset after");
+}
+
+fn test_dst_transitions() {
+    Console.WriteLine("== DST transitions ==");
+    // EU: the last Sundays of March and October at 01:00 UTC.
+    checkChange("Europe/Stockholm", 1774746000, 60, 120, "Stockholm 2026-03-29");
+    checkChange("Europe/Stockholm", 1792890000, 120, 60, "Stockholm 2026-10-25");
+    checkChange("Europe/Berlin",    1774746000, 60, 120, "Berlin 2026-03-29");
+    checkChange("Europe/Berlin",    1792890000, 120, 60, "Berlin 2026-10-25");
+    // US: the second Sunday of March and the first of November at 02:00 local.
+    checkChange("America/New_York", 1772953200, -300, -240, "New York 2026-03-08");
+    checkChange("America/New_York", 1793512800, -240, -300, "New York 2026-11-01");
+    // South-east Australia: the first Sundays of April and October.
+    checkChange("Australia/Sydney", 1775318400, 660, 600, "Sydney 2026-04-05");
+    checkChange("Australia/Sydney", 1791043200, 600, 660, "Sydney 2026-10-04");
+
+    checkEq(DateTime.FromUnixIn(1774746000 - 1, "Europe/Stockholm").ToISO(), "2026-03-29T01:59:59+01:00", "last second of winter time");
+    checkEq(DateTime.FromUnixIn(1774746000,     "Europe/Stockholm").ToISO(), "2026-03-29T03:00:00+02:00", "first second of summer time");
+    checkEq(DateTime.FromUnixIn(1792890000 - 1, "Europe/Stockholm").ToISO(), "2026-10-25T02:59:59+02:00", "last second of summer time");
+    checkEq(DateTime.FromUnixIn(1792890000,     "Europe/Stockholm").ToISO(), "2026-10-25T02:00:00+01:00", "first second of winter time");
+
+    // Fixed offsets, half and quarter hours included.
+    checkEq(DateTime.FromUnixIn(1782864000, "Asia/Kolkata").UtcOffset(),    330, "Kolkata +05:30");
+    checkEq(DateTime.FromUnixIn(1782864000, "Asia/Kolkata").FormatOffset(), "+05:30", "Kolkata FormatOffset");
+    checkEq(DateTime.FromUnixIn(1782864000, "Asia/Kathmandu").UtcOffset(),  345, "Kathmandu +05:45");
+    checkEq(DateTime.FromUnixIn(1782864000, "Asia/Tehran").UtcOffset(),     210, "Tehran +03:30");
+
+    // Past the last listed transition the zone's rule decides.
+    checkEq(DateTime.FromUnixIn(4103697600, "Europe/Stockholm").ToISO(), "2100-01-15T13:00:00+01:00", "Stockholm 2100 winter");
+    checkEq(DateTime.FromUnixIn(4118126400, "Europe/Stockholm").ToISO(), "2100-07-01T14:00:00+02:00", "Stockholm 2100 summer");
+    checkEq(DateTime.FromUnixIn(8851636800, "Europe/Stockholm").ToISO(), "2250-07-01T14:00:00+02:00", "Stockholm 2250 summer");
+
+    // Components, Format and ToString use the offset of their own instant.
+    let summer = DateTime.FromUnixIn(1784116800, "Europe/Berlin");
+    checkEq(summer.Hour(), 14, "Berlin summer Hour");
+    checkEq(summer.Format("time"), "14:00:00", "Berlin summer Format");
+    checkEq(summer.ToString(), "2026-07-15 14:00:00 Europe/Berlin", "Berlin summer ToString");
+    checkEq(DateTime.FromUnixIn(1768478400, "Europe/Berlin").Hour(), 13, "Berlin winter Hour");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 46. Offsets checked against Python's zoneinfo
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_dst_zoneinfo_history() {
+    Console.WriteLine("== Offsets from zoneinfo, past and future ==");
+    // [zone, instant, ISO text from Python zoneinfo, needs the zone's history]
+    let cases = [
+        ["Europe/Stockholm",  173448000,  "1975-07-01T13:00:00+01:00",    true],
+        ["Europe/Stockholm",  331300800,  "1980-07-01T14:00:00+02:00",    true],
+        ["Europe/Stockholm",  4103697600, "2100-01-15T13:00:00+01:00",    false],
+        ["Europe/Stockholm",  4118126400, "2100-07-01T14:00:00+02:00",    false],
+        ["America/New_York",  1142856000, "2006-03-20T07:00:00-05:00",    true],
+        ["America/New_York",  1162209600, "2006-10-30T07:00:00-05:00",    true],
+        ["America/New_York",  1174392000, "2007-03-20T08:00:00-04:00",    false],
+        ["America/New_York",  -2717668800, "1883-11-18T07:03:58-04:56:02", true],
+        ["Australia/Sydney",  1206964800, "2008-03-31T23:00:00+11:00",    true],
+        ["Australia/Sydney",  1768435200, "2026-01-15T11:00:00+11:00",    false],
+        ["Australia/Sydney",  1784073600, "2026-07-15T10:00:00+10:00",    false],
+        ["Asia/Kolkata",      -839030400, "1943-06-01T06:30:00+06:30",    true],
+        ["Asia/Kolkata",      1782864000, "2026-07-01T05:30:00+05:30",    false],
+        ["Asia/Kathmandu",    1782864000, "2026-07-01T05:45:00+05:45",    false],
+        ["Asia/Tehran",       1622505600, "2021-06-01T04:30:00+04:30",    true],
+        ["Asia/Tehran",       1780272000, "2026-06-01T03:30:00+03:30",    false],
+        ["Europe/London",     13089600,   "1970-06-01T13:00:00+01:00",    true],
+        ["Europe/Dublin",     1768478400, "2026-01-15T12:00:00+00:00",    false],
+        ["Europe/Dublin",     1784116800, "2026-07-15T13:00:00+01:00",    false],
+        ["America/Sao_Paulo", 1543665600, "2018-12-01T10:00:00-02:00",    true],
+        ["America/Sao_Paulo", 1579089600, "2020-01-15T09:00:00-03:00",    false],
+        ["Pacific/Auckland",  1780272000, "2026-06-01T12:00:00+12:00",    false],
+        ["Pacific/Auckland",  1796083200, "2026-12-01T13:00:00+13:00",    false],
+        ["Pacific/Apia",      1325239199, "2011-12-29T23:59:59-10:00",    true],
+        ["Pacific/Apia",      1325239200, "2011-12-31T00:00:00+14:00",    true]
+    ];
+    let dir = DateTime.ZoneInfoDir();
+    foreach (c in cases) {
+        // History is only in the TZif files; the embedded table has today's rules.
+        if (c[3] && (dir == "" || !File.Exists(dir + "/" + c[0]))) { continue; }
+        checkEq(DateTime.FromUnixIn(c[1], c[0]).ToISO(), c[2], c[0] + " at " + str(c[1]));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 47. Wall time across DST changes
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_dst_wall_time() {
+    Console.WriteLine("== Wall time across DST changes ==");
+    let se = "Europe/Stockholm";
+    // A wall time the spring change skips moves forward by the gap.
+    checkEq(DateTime.Of(2026, 3, 29, 2, 30, 0, se).ToISO(),                 "2026-03-29T03:30:00+02:00", "Of in the Stockholm gap");
+    checkEq(DateTime.Of(2026, 3, 8, 2, 30, 0, "America/New_York").ToISO(),  "2026-03-08T03:30:00-04:00", "Of in the New York gap");
+    // A wall time the autumn change repeats is the earlier instant.
+    let fold = DateTime.Of(2026, 10, 25, 2, 30, 0, se);
+    checkEq(fold.ToISO(), "2026-10-25T02:30:00+02:00", "Of in the Stockholm repeat");
+    checkEq(fold.Unix(),  1792888200,                  "Of in the Stockholm repeat: instant");
+    checkEq(DateTime.Of(2026, 11, 1, 1, 30, 0, "America/New_York").ToISO(), "2026-11-01T01:30:00-04:00", "Of in the New York repeat");
+    checkEq(DateTime.Of(2026, 4, 5, 2, 30, 0, "Australia/Sydney").ToISO(),  "2026-04-05T02:30:00+11:00", "Of in the Sydney repeat");
+    // Either side of the changes nothing moves.
+    checkEq(DateTime.Of(2026, 3, 29, 1, 59, 59, se).ToISO(), "2026-03-29T01:59:59+01:00", "Of before the gap");
+    checkEq(DateTime.Of(2026, 3, 29, 3, 0, 0, se).ToISO(),   "2026-03-29T03:00:00+02:00", "Of after the gap");
+    checkEq(DateTime.Of(2026, 10, 25, 3, 0, 0, se).ToISO(),  "2026-10-25T03:00:00+01:00", "Of after the repeat");
+
+    // AddDays keeps the wall clock, AddHours moves the instant.
+    let sat = DateTime.Of(2026, 3, 28, 12, 0, 0, se);
+    checkEq(sat.AddDays(1).ToISO(),             "2026-03-29T12:00:00+02:00", "AddDays(1) over the spring change");
+    checkEq(sat.AddDays(1).Unix() - sat.Unix(), 23 * 3600,                   "a spring Sunday lasts 23 hours");
+    checkEq(sat.AddHours(24).ToISO(),           "2026-03-29T13:00:00+02:00", "AddHours(24) over the spring change");
+    checkEq(sat.AddWeeks(1).ToISO(),            "2026-04-04T12:00:00+02:00", "AddWeeks(1) over the spring change");
+    checkEq(sat.AddDays(1).AddDays(-1).Unix(),  sat.Unix(),                  "AddDays back and forth");
+    let oct = DateTime.Of(2026, 10, 24, 12, 0, 0, se);
+    checkEq(oct.AddDays(1).Unix() - oct.Unix(), 25 * 3600,                   "an autumn Sunday lasts 25 hours");
+    checkEq(DateTime.Of(2026, 3, 1, 9, 0, 0, se).AddMonths(1).ToISO(), "2026-04-01T09:00:00+02:00", "AddMonths over the spring change");
+
+    // Day and week boundaries on the days of the changes.
+    let spring = DateTime.Of(2026, 3, 29, 12, 0, 0, se);
+    checkEq(spring.StartOfDay().ToISO(),  "2026-03-29T00:00:00+01:00", "StartOfDay on the spring Sunday");
+    checkEq(spring.EndOfDay().ToISO(),    "2026-03-29T23:59:59+02:00", "EndOfDay on the spring Sunday");
+    checkEq(spring.EndOfDay().Unix() - spring.StartOfDay().Unix(), 23 * 3600 - 1, "spring Sunday from start to end");
+    checkEq(spring.StartOfWeek().ToISO(), "2026-03-23T00:00:00+01:00", "StartOfWeek of the spring Sunday");
+    checkEq(spring.EndOfWeek().ToISO(),   "2026-03-29T23:59:59+02:00", "EndOfWeek of the spring Sunday");
+    let autumn = DateTime.Of(2026, 10, 25, 12, 0, 0, se);
+    checkEq(autumn.EndOfDay().Unix() - autumn.StartOfDay().Unix(), 25 * 3600 - 1, "autumn Sunday from start to end");
+    checkEq(autumn.StartOfWeek().AddDays(7).ToISO(), "2026-10-26T00:00:00+01:00", "the next week starts at midnight");
+    checkEq(autumn.StartOfMonth().ToISO(), "2026-10-01T00:00:00+02:00", "StartOfMonth in summer time");
+    checkEq(autumn.EndOfMonth().ToISO(),   "2026-10-31T23:59:59+01:00", "EndOfMonth in winter time");
+
+    // Business days over the autumn change count each day once.
+    let fri = DateTime.Of(2026, 10, 23, 9, 0, 0, se);
+    checkEq(fri.BusinessDaysUntil(DateTime.Of(2026, 10, 30, 9, 0, 0, se)), 5, "BusinessDaysUntil over the autumn change");
+    checkEq(fri.AddBusinessDays(1).ToISO(), "2026-10-26T09:00:00+01:00", "AddBusinessDays over the autumn change");
+    checkEq(fri.NextWeekday(1).ToISO(),     "2026-10-26T09:00:00+01:00", "NextWeekday over the autumn change");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 48. Embedded zone table
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_dst_embedded_table() {
+    Console.WriteLine("== Embedded zone table ==");
+    let zones = ["Europe/Stockholm", "Europe/Berlin", "Europe/London", "Europe/Dublin",
+                 "Europe/Helsinki", "Atlantic/Azores", "America/New_York", "America/Chicago",
+                 "America/Los_Angeles", "Australia/Sydney", "Australia/Adelaide",
+                 "Pacific/Auckland", "Asia/Kolkata", "Asia/Kathmandu", "Asia/Tehran"];
+    // The 2026 changes of section 45, one second either side, and later years.
+    let instants = [1774746000 - 1, 1774746000, 1792890000 - 1, 1792890000,
+                    1772953200 - 1, 1772953200, 1793512800 - 1, 1793512800,
+                    1775318400 - 1, 1775318400, 1791043200 - 1, 1791043200,
+                    1798761600, 1814400000, 1893456000, 1909094400];
+    let dir = DateTime.ZoneInfoDir();
+    let haveTzif = dir != "" && File.Exists(dir + "/Europe/Stockholm");
+    let fromTzif = {};
+    if (haveTzif) {
+        foreach (z in zones) {
+            foreach (t in instants) { fromTzif[z + " " + str(t)] = DateTime.FromUnixIn(t, z).ToISO(); }
+        }
+    }
+
+    DateTime.SetZoneInfoDir(nil);
+    checkEq(DateTime.ZoneInfoDir(), "", "SetZoneInfoDir(nil) leaves the table only");
+    checkChange("Europe/Stockholm", 1774746000, 60, 120,    "table: Stockholm spring");
+    checkChange("Europe/Stockholm", 1792890000, 120, 60,    "table: Stockholm autumn");
+    checkChange("America/New_York", 1772953200, -300, -240, "table: New York spring");
+    checkChange("America/New_York", 1793512800, -240, -300, "table: New York autumn");
+    checkChange("Australia/Sydney", 1775318400, 660, 600,   "table: Sydney autumn");
+    checkChange("Pacific/Auckland", 1775311200, 780, 720,   "table: Auckland autumn");
+    checkEq(DateTime.FromUnixIn(1782864000, "Asia/Kolkata").UtcOffset(), 330, "table: Kolkata");
+    check(DateTime.HasTimezone("Asia/Kathmandu"),             "table: Kathmandu is listed");
+    check(Array.Contains(DateTime.Timezones(), "Asia/Tehran"), "table: Timezones lists Tehran");
+    check(!DateTime.HasTimezone("America/Argentina/Cordoba"), "table: a zone outside it is unknown");
+    if (haveTzif) {
+        foreach (z in zones) {
+            foreach (t in instants) {
+                checkEq(DateTime.FromUnixIn(t, z).ToISO(), fromTzif[z + " " + str(t)], "table matches TZif: " + z + " at " + str(t));
+            }
+        }
+    }
+
+    DateTime.SetZoneInfoDir(dir);
+    checkEq(DateTime.ZoneInfoDir(), dir, "SetZoneInfoDir restores the directory");
+    if (haveTzif) {
+        check(DateTime.HasTimezone("America/Argentina/Cordoba"), "TZif: a zone outside the table");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 49. TZif files
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A TZif header: version byte v, then the six counts with leap seconds,
+// standard and UT indicators all zero.
+fn tzifHeader(v: int, times: int, types: int, chars: int): block {
+    let b = Buffer.Create(44, 1);
+    Buffer.CopyStringAt(b, 0, "TZif", 4);
+    Buffer.WriteU8At(b, 4, v);
+    Buffer.WriteU32At(b, 32, times, true);
+    Buffer.WriteU32At(b, 36, types, true);
+    Buffer.WriteU32At(b, 40, chars, true);
+    return b;
+}
+
+// A TZif data block: w-byte transition times, their type indexes, one type
+// per offset (seconds east), then the abbreviation bytes.
+fn tzifData(w: int, times: array, idx: array, offs: array, chars: string): block {
+    let b = Buffer.Create(len(times) * (w + 1) + len(offs) * 6 + len(chars), 1);
+    var p = 0;
+    foreach (t in times) {
+        if (w == 8) { Buffer.WriteU64At(b, p, t, true); } else { Buffer.WriteU32At(b, p, t, true); }
+        p += w;
+    }
+    foreach (k in idx) {
+        Buffer.WriteU8At(b, p, k);
+        p += 1;
+    }
+    foreach (o in offs) {
+        Buffer.WriteU32At(b, p, o, true);
+        p += 6;
+    }
+    Buffer.CopyStringAt(b, p, chars, len(chars));
+    return b;
+}
+
+fn test_tzif_files() {
+    Console.WriteLine("== TZif files ==");
+    let saved = DateTime.ZoneInfoDir();
+    let tmp = Directory.CreateTemp("flaris_dt");
+    Directory.Ensure(tmp + "/Test");
+    Directory.Ensure(tmp + "/Europe");
+
+    // Version 1: 32-bit times, no rule; the last transition's offset holds.
+    let v1 = Buffer.Concat(tzifHeader(0, 2, 2, 4),
+                           tzifData(4, [1000000000, 1100000000], [1, 0], [3600, -18000], "AAAB"));
+    File.WriteAllBytes(tmp + "/Test/V1", v1);
+    // Version 2, slim: an empty version 1 block, one transition, a footer rule.
+    let slim = Buffer.Concat(Buffer.Concat(tzifHeader(0x32, 0, 0, 0), tzifHeader(0x32, 1, 2, 4)),
+                             Buffer.Concat(tzifData(8, [0], [1], [1234, 0], "LMTX"),
+                                           Buffer.FromString("\nCET-1CEST,M3.5.0,M10.5.0/3\n")));
+    File.WriteAllBytes(tmp + "/Test/Slim", slim);
+    // Version 3 with an empty footer: the last transition's offset holds.
+    let bare = Buffer.Concat(Buffer.Concat(tzifHeader(0x33, 0, 0, 0), tzifHeader(0x33, 1, 2, 4)),
+                             Buffer.Concat(tzifData(8, [0], [1], [0, 19800], "UTCI"), Buffer.FromString("\n\n")));
+    File.WriteAllBytes(tmp + "/Test/Bare", bare);
+    // Not TZif: the embedded table answers for a name it lists.
+    File.WriteText(tmp + "/Europe/Stockholm", "not a zone file");
+    File.WriteText(tmp + "/Test/Junk", "TZif2 and then nothing");
+
+    DateTime.SetZoneInfoDir(tmp);
+    checkEq(DateTime.ZoneInfoDir(), tmp, "SetZoneInfoDir");
+    checkEq(DateTime.FromUnixIn(999999999,  "Test/V1").UtcOffset(), 60,   "v1: before the first transition, the first type");
+    checkEq(DateTime.FromUnixIn(1000000000, "Test/V1").UtcOffset(), -300, "v1: first transition");
+    checkEq(DateTime.FromUnixIn(1100000000, "Test/V1").UtcOffset(), 60,   "v1: second transition");
+    checkEq(DateTime.FromUnixIn(1900000000, "Test/V1").UtcOffset(), 60,   "v1: after the last transition");
+    checkEq(DateTime.FromUnixIn(-1, "Test/Slim").ToISO(), "1970-01-01T00:20:33+00:20:34", "v2: an offset with seconds");
+    checkEq(DateTime.FromUnixIn(100, "Test/Slim").UtcOffset(), 60, "v2: the footer rule from the last transition on");
+    checkChange("Test/Slim", 1774746000, 60, 120, "v2: footer rule spring");
+    checkChange("Test/Slim", 1792890000, 120, 60, "v2: footer rule autumn");
+    checkEq(DateTime.FromUnixIn(1774746000, "Test/Bare").UtcOffset(), 330, "v3: empty footer");
+    checkEq(DateTime.FromUnixIn(1784116800, "Europe/Stockholm").UtcOffset(), 120, "a broken file falls back to the table");
+    check(!DateTime.HasTimezone("Test/Junk"),        "a broken file outside the table is unknown");
+    check(!DateTime.HasTimezone("Test/Missing"),     "a missing file is unknown");
+    check(!DateTime.HasTimezone("../Test/V1"),       "a name leaving the directory is refused");
+    check(!DateTime.HasTimezone("Test/../Test/V1"),  "a name with .. is refused");
+    check(!DateTime.HasTimezone("/Test/V1"),         "an absolute name is refused");
+    check(!DateTime.HasTimezone("Test//V1"),         "an empty name part is refused");
+
+    DateTime.SetZoneInfoDir(saved);
+    Directory.DeleteAll(tmp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 50. POSIX TZ strings
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_posix_rules() {
+    Console.WriteLine("== POSIX TZ strings ==");
+    DateTime.RegisterTimezone("Test/EU", "CET-1CEST,M3.5.0,M10.5.0/3");
+    checkChange("Test/EU", 1774746000, 60, 120, "POSIX EU spring");
+    checkChange("Test/EU", 1792890000, 120, 60, "POSIX EU autumn");
+    // Without dates a DST zone takes the US rule.
+    DateTime.RegisterTimezone("Test/US", "EST5EDT");
+    checkChange("Test/US", 1772953200, -300, -240, "POSIX default rule spring");
+    checkChange("Test/US", 1793512800, -240, -300, "POSIX default rule autumn");
+    // Standard time in summer, DST in winter: Ireland's own description.
+    DateTime.RegisterTimezone("Test/IE", "IST-1GMT0,M10.5.0,M3.5.0/1");
+    checkEq(DateTime.FromUnixIn(1768478400, "Test/IE").UtcOffset(), 0,  "negative DST: winter");
+    checkEq(DateTime.FromUnixIn(1784116800, "Test/IE").UtcOffset(), 60, "negative DST: summer");
+    checkChange("Test/IE", 1774746000, 0, 60, "negative DST spring");
+    checkChange("Test/IE", 1792890000, 60, 0, "negative DST autumn");
+    // DST all year: from January 1 00:00 to December 31 25:00.
+    DateTime.RegisterTimezone("Test/AllYear", "EST5EDT,0/0,J365/25");
+    checkEq(DateTime.FromUnixIn(1767236400, "Test/AllYear").UtcOffset(), -240, "DST all year: New Year's Eve");
+    checkEq(DateTime.FromUnixIn(1767247200, "Test/AllYear").UtcOffset(), -240, "DST all year: New Year's Day");
+    checkEq(DateTime.FromUnixIn(1782864000, "Test/AllYear").UtcOffset(), -240, "DST all year: July");
+    // Jn never counts February 29; n counts it. Quoted names, minute offsets.
+    DateTime.RegisterTimezone("Test/Julian", "<+0330>-3:30<+0430>,J60/0,J244/0");
+    checkChange("Test/Julian", 1709238600, 210, 270, "J60 is March 1 in a leap year");
+    DateTime.RegisterTimezone("Test/Zero", "<+0330>-3:30<+0430>,59/0,243/0");
+    checkChange("Test/Zero", 1709152200, 210, 270, "59 is February 29 in a leap year");
+    // A registered zone takes precedence over the system's.
+    DateTime.RegisterTimezone("Africa/Lagos", 0);
+    checkEq(DateTime.FromUnixIn(1782864000, "Africa/Lagos").UtcOffset(), 0, "a registered name wins");
+    foreach (bad in ["", "CET", "C-1", "<>-1", "CET-200", "CET-1CEST,M3.5.0", "CET-1CEST,M13.5.0,M10.5.0",
+                     "CET-1CEST,M3.5.0,M10.5.0/3x", "CET-1CEST,J0,J100"]) {
+        var threw = false;
+        try { DateTime.RegisterTimezone("Test/Bad", bad); } catch (e) { threw = true; }
+        check(threw, "refuses POSIX TZ '" + bad + "'");
+    }
+    check(!DateTime.HasTimezone("Test/Bad"), "a refused string registers nothing");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 51. The local zone
+// ─────────────────────────────────────────────────────────────────────────────
+fn test_local_zone() {
+    Console.WriteLine("== local zone ==");
+    let dir = DateTime.ZoneInfoDir();
+    let savedTz = Os.GetEnv("TZ");
+
+    // SetZoneInfoDir drops the loaded zones, "local" included.
+    Os.SetEnv("TZ", "America/New_York");
+    DateTime.SetZoneInfoDir(dir);
+    checkChange("local", 1772953200, -300, -240, "TZ names a zone: spring");
+    checkChange("local", 1793512800, -240, -300, "TZ names a zone: autumn");
+    Os.SetEnv("TZ", ":Europe/Berlin");
+    DateTime.SetZoneInfoDir(dir);
+    checkChange("local", 1774746000, 60, 120, "TZ with a colon");
+    Os.SetEnv("TZ", "AEST-10AEDT,M10.1.0,M4.1.0/3");
+    DateTime.SetZoneInfoDir(dir);
+    checkChange("local", 1775318400, 660, 600, "TZ as a POSIX string");
+    if (dir != "" && File.Exists(dir + "/Asia/Kolkata")) {
+        Os.SetEnv("TZ", dir + "/Asia/Kolkata");
+        DateTime.SetZoneInfoDir(dir);
+        checkEq(DateTime.FromUnixIn(1782864000, "local").UtcOffset(), 330, "TZ as a TZif path");
+    }
+
+    // Without TZ: /etc/localtime, compared with the zone its link names.
+    Os.UnsetEnv("TZ");
+    DateTime.SetZoneInfoDir(dir);
+    let link = File.ReadLink("/etc/localtime");
+    let at = (link == nil ? -1 : String.IndexOf(link, "zoneinfo/"));
+    if (at >= 0) {
+        let name = String.Substr(link, at + 9, len(link) - at - 9);
+        foreach (t in [1774746000 - 1, 1774746000, 1792890000 - 1, 1792890000, 1768478400, 1784116800]) {
+            checkEq(DateTime.FromUnixIn(t, "local").UtcOffset(), DateTime.FromUnixIn(t, name).UtcOffset(),
+                    "local follows /etc/localtime (" + name + ") at " + str(t));
+        }
+    }
+
+    if (savedTz != nil) { Os.SetEnv("TZ", savedTz); } else { Os.UnsetEnv("TZ"); }
+    DateTime.SetZoneInfoDir(dir);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 fn Main() {
@@ -1029,6 +1435,13 @@ fn Main() {
     test_issame_month_year_edge();
     test_isinrange_edge();
     test_duration_between_same();
+    test_dst_transitions();
+    test_dst_zoneinfo_history();
+    test_dst_wall_time();
+    test_dst_embedded_table();
+    test_tzif_files();
+    test_posix_rules();
+    test_local_zone();
 
     Console.WriteLine("=== datetime.fls test done ===");
     Console.WriteLine("Tests run: " + str(testsRun) + "  failed: " + str(testsFailed));
@@ -1071,6 +1484,9 @@ fn Main() {
     bench("DateTime.Parse  ISO 8601", fn() {
         DateTime.Parse("2024-03-15T12:30:45", "UTC"); _sink = _sink + 1;
     }, 3000);
+    bench("DateTime.Parse  date only", fn() {
+        DateTime.Parse("2024-03-15", "UTC"); _sink = _sink + 1;
+    }, 3000);
     bench("DateTime  Year/Month/Day accessors", fn() {
         let y = dt_ref.Year();
         let m = dt_ref.Month();
@@ -1092,6 +1508,45 @@ fn Main() {
     bench("DateTime  AddDays(7)", fn() {
         dt_ref.AddDays(7); _sink = _sink + 1;
     }, 5000);
+
+    Console.WriteLine("\n[ DateTime - timezones with DST ]");
+    let se = DateTime.Of(2026, 7, 1, 12, 0, 0, "Europe/Stockholm");
+    bench("Stockholm  Year/Month/Day accessors", fn() {
+        let y = se.Year();
+        let m = se.Month();
+        let _d = se.Day();
+        _sink = _sink + y + m;
+    }, 10000);
+    bench("Stockholm  ToISO", fn() {
+        se.ToISO(); _sink = _sink + 1;
+    }, 5000);
+    bench("Stockholm  DateTime.Of", fn() {
+        DateTime.Of(2026, 7, 1, 12, 0, 0, "Europe/Stockholm"); _sink = _sink + 1;
+    }, 5000);
+    bench("Stockholm  AddDays(7)", fn() {
+        se.AddDays(7); _sink = _sink + 1;
+    }, 5000);
+    // A different year on every call, so each lookup starts cold: a search of
+    // the transition list, or the rule worked out past its end.
+    let listed = [];
+    let ruled  = [];
+    iter (i from 0 to 64) {
+        listed = Array.Append(listed, DateTime.FromUnixIn(i * 31000000 + i * 604800, "Europe/Stockholm"));
+        ruled  = Array.Append(ruled,  DateTime.FromUnixIn(2300000000 + i * 31000000 + i * 604800, "Europe/Stockholm"));
+    }
+    let at = [0];
+    bench("Stockholm  UtcOffset, 1970-2037, cold", fn() {
+        at[0] = at[0] + 1;
+        listed[at[0] & 63].UtcOffset(); _sink = _sink + 1;
+    }, 10000);
+    bench("Stockholm  UtcOffset, 2042-2105, cold", fn() {
+        at[0] = at[0] + 1;
+        ruled[at[0] & 63].UtcOffset(); _sink = _sink + 1;
+    }, 10000);
+    let loc = DateTime.FromUnixIn(1784116800, "local");
+    bench("local  UtcOffset", fn() {
+        loc.UtcOffset(); _sink = _sink + 1;
+    }, 10000);
 
     benchSep();
     Console.WriteLine("_sink=" + str(_sink));

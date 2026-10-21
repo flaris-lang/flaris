@@ -277,6 +277,66 @@ fn test_timeout_cancel() {
     check(String.Contains(msg3, "canceled"), "CancelAfter message");
 }
 
+// A timer holds its fiber only while its promise is pending: settling the
+// promise lets it go at once, so a long timeout cannot pin a fiber. Each round
+// starts more timers than the default fiber limit could hold at once if they
+// lived out their 60 s.
+fn test_timers_release_fibers() {
+    Console.WriteLine("== Timers end when their promise settles ==");
+    let t0 = Time.Millis();
+    var raised = nil;
+    try {
+        iter (round from 0 to 4) {
+            iter (i from 0 to 80) {
+                let p = new Promise();
+                p.Timeout(60000);
+                p.CancelAfter(60000);
+                p.Resolve(i);
+                Promise.Delay(60000, i).CancelNow();
+            }
+            Fiber.Sleep(5);
+        }
+    } catch (e) {
+        raised = e.Error;
+    }
+    checkEq(raised, nil, "960 timers on settled promises fit under the fiber limit");
+    check(Time.Millis() - t0 < 2000, "timers on settled promises do not wait out their delay");
+
+    let r = Promise.Retry(fn() { throw(1, "never"); }, 5, 60000);
+    Fiber.Sleep(5);
+    r.CancelNow();
+    Fiber.Sleep(5);
+    checkEq(r.State(), "canceled", "a canceled Retry stays canceled");
+}
+
+class PromiseTestError : Exception {}
+
+fn test_await_rethrows_exception() {
+    Console.WriteLine("== Await rethrows the rejection's exception ==");
+
+    let p = Promise.Rejected(new PromiseTestError(42, "typed failure"));
+    var e1 = nil;
+    try { p.Await(); } catch (e) { e1 = e; }
+    check(e1 is PromiseTestError, "Await keeps the exception class");
+    checkEq(e1 == nil ? nil : e1.Code,  42, "Await keeps the code");
+    checkEq(e1 == nil ? nil : e1.Error, "typed failure", "Await keeps the message");
+
+    let chained = Promise.Resolved(1).Then(fn(_v) { throw new PromiseTestError(7, "from Then"); });
+    var e2 = nil;
+    try { chained.Await(); } catch (e) { e2 = e; }
+    check(e2 is PromiseTestError, "a throw in Then reaches Await with its class");
+    checkEq(e2 == nil ? nil : e2.Code, 7, "a throw in Then reaches Await with its code");
+
+    var e3 = nil;
+    try { Promise.All([Promise.Resolved(1), p]); } catch (e) { e3 = e; }
+    checkEq(e3 == nil ? nil : e3.Code, 42, "All rethrows the rejection's exception");
+
+    var e4 = nil;
+    try { Promise.Rejected("plain reason").Await(); } catch (e) { e4 = e; }
+    checkEq(e4 == nil ? nil : e4.Code,  1, "a non-exception reason throws code 1");
+    checkEq(e4 == nil ? nil : e4.Error, "plain reason", "with the reason as message");
+}
+
 // 9. Await / TryAwait / AwaitResult
 fn test_waiters() {
     Console.WriteLine("== Await / TryAwait / AwaitResult ==");
@@ -564,6 +624,8 @@ fn async Main() {
     test_then_catch();
     test_finally();
     test_timeout_cancel();
+    test_timers_release_fibers();
+    test_await_rethrows_exception();
     test_waiters();
     test_parked_waiters();
     test_delayed_factories();

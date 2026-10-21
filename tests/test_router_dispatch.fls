@@ -98,8 +98,22 @@ fn test_matching() {
     // Non-matches.
     let r404 = app._dispatch(mkReq("GET", "/nope"));
     checkEq(r404.status, 404, "unknown path is 404");
+    // RFC 9110 15.5.6: a path with routes only for other methods is a 405,
+    // and Allow lists them (HEAD rides on GET).
     let rMethod = app._dispatch(mkReq("DELETE", "/health"));
-    checkEq(rMethod.status, 404, "known path, wrong method");
+    checkEq(rMethod.status, 405, "known path, wrong method is 405");
+    checkEq(rMethod.headers["Allow"], "GET, POST, HEAD", "405 lists the allowed methods");
+    checkEq(app._dispatch(mkReq("PUT", "/u/42")).headers["Allow"], "GET, HEAD",
+            "405 on a param route lists its methods");
+    // HEAD runs the GET handler; the server leaves the body out.
+    checkEq(bodyOf(app._dispatch(mkReq("HEAD", "/health"))), "ok", "HEAD runs the GET route");
+    checkEq(bodyOf(app._dispatch(mkReq("HEAD", "/u/9"))), "u:9", "HEAD runs a param GET route");
+    let headOnly = new Router();
+    headOnly.Head("/h", fn(_r) { return Response.Text("head", nil); });
+    headOnly.Get("/h", fn(_r) { return Response.Text("get", nil); });
+    checkEq(bodyOf(headOnly._dispatch(mkReq("HEAD", "/h"))), "head", "an explicit HEAD route wins over GET");
+    checkEq(headOnly._dispatch(mkReq("POST", "/h")).headers["Allow"], "HEAD, GET",
+            "Allow keeps registration order");
     let rShort = app._dispatch(mkReq("GET", "/u"));
     checkEq(rShort.status, 404, "param route needs its segment");
     let rLong = app._dispatch(mkReq("GET", "/a/b/c/d"));
@@ -119,7 +133,8 @@ fn test_matching() {
     checkEq(bodyOf(dyn._dispatch(mkReq("PUT", "//p//2/x/"))),  "put:2", "method and normalised path select the route");
     checkEq(bodyOf(dyn._dispatch(mkReq("GET", "/m/end/a/b"))), "m:a/b", "mid-pattern * captures the tail");
     checkEq(dyn._dispatch(mkReq("GET", "/m/x/end")).status,   404,     "mid-pattern * keeps the literal after it");
-    checkEq(dyn._dispatch(mkReq("PATCH", "/p/1/x")).status,   404,     "unregistered method");
+    checkEq(dyn._dispatch(mkReq("PATCH", "/p/1/x")).status,   405,     "unregistered method on a routed path");
+    checkEq(dyn._dispatch(mkReq("PATCH", "/zzz")).status,     404,     "unregistered method on an unrouted path");
     return 0;
 }
 
@@ -210,9 +225,13 @@ fn test_headers_and_request() {
     checkEq(h["Host"],            "example.com",      "single-word name");
 
     // Repeat with the same names to exercise the memo, and with a new one.
-    let h2 = app._canonHeaders({ "content-type": "text/plain", "x-new-name": "v" });
+    let src = { "content-type": "text/plain", "x-new-name": "v" };
+    let h2 = app._canonHeaders(src);
     checkEq(h2["Content-Type"], "text/plain", "memoised name maps to the new value");
     checkEq(h2["X-New-Name"],   "v",          "unseen name canonicalises correctly");
+    // The spellings are added to the parsed map itself, not to a copy.
+    checkEq(src["X-New-Name"], "v", "canonical names added in place");
+    checkEq(Object.Count(h2), 4, "one canonical entry beside each lowercase one");
 
     // The client address reaches the handler - middleware cannot identify a
     // peer from a header alone, since the client controls those.
@@ -376,15 +395,18 @@ fn test_rate_limit() {
     checkEq(hit(mw4, p1).status, 429, "trusted proxy: first client limited");
     checkEq(hit(mw4, p2).status, 200, "trusted proxy: second client independent");
 
-    // The left-most entry is the origin client, not the proxy chain.
+    // The proxy appends the address it saw: the right-most entry is the
+    // client, and anything before it is whatever the client sent.
     let mw5 = new RateLimitMiddleware(1, 60, { clock: clockMs, trustProxy: true });
-    let chain = mkPeerReq("10.0.0.5:1111");
-    chain.headers["X-Forwarded-For"] = "9.9.9.9, 10.0.0.1, 10.0.0.2";
-    hit(mw5, chain);
-    checkEq(hit(mw5, chain).status, 429, "left-most forwarded address is the client");
+    let forged1 = mkPeerReq("10.0.0.5:1111");
+    forged1.headers["X-Forwarded-For"] = "1.1.1.1, 9.9.9.9";
+    let forged2 = mkPeerReq("10.0.0.5:1111");
+    forged2.headers["X-Forwarded-For"] = "2.2.2.2, 9.9.9.9";
+    hit(mw5, forged1);
+    checkEq(hit(mw5, forged2).status, 429, "a client cannot mint identities with a forged X-Forwarded-For prefix");
     let other = mkPeerReq("10.0.0.5:1111");
-    other.headers["X-Forwarded-For"] = "8.8.8.8, 10.0.0.1";
-    checkEq(hit(mw5, other).status, 200, "a different origin behind the same proxy is separate");
+    other.headers["X-Forwarded-For"] = "1.1.1.1, 8.8.8.8";
+    checkEq(hit(mw5, other).status, 200, "a different client behind the same proxy is separate");
 
     // --- keyFn and skip ---
     let mw6 = new RateLimitMiddleware(1, 60, {
@@ -606,7 +628,7 @@ fn test_virtual_hosts() {
     Console.WriteLine("== virtual hosts ==");
     let app = new Router();
 
-    // A route with no host serves every host, as before.
+    // A route with no host serves every host.
     app.Get("/shared", fn(_r) { return Response.Text("shared", nil); });
 
     let a = app.Host("a.example.com");
@@ -725,6 +747,51 @@ fn test_route_mark() {
     checkEq(len(marks), 3, "nothing marked without one");
 }
 
+// One request to a served router; the raw response, lowercased.
+fn served(port:int, path:string): string {
+    let c = Stream.Connect("tcp", "127.0.0.1", port, 2000);
+    if (c == nil) { return ""; }
+    Stream.WriteString(c, "GET " + path + " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    Stream.WaitReadable(c, 4000);
+    let all = Stream.ReadAll(c, nil, 2);
+    Stream.Close(c);
+    return (all == nil) ? "" : String.ToLower(Buffer.ToString(all));
+}
+
+fn test_served_headers() {
+    Console.WriteLine("== served headers ==");
+    let app = new Router();
+    app.Get("/text", fn(_req) { return Response.Text("t", nil); });
+    app.Get("/csv",  fn(_req) { return { status: 200, body: "a,b", headers: { "Content-Type": "text/csv" } }; });
+    app.Get("/two",  fn(_req) {
+        return { status: 201, body: "x", headers: { "Content-Type": "text/csv", "X-Extra": "1" } };
+    });
+    app.Get("/none", fn(_req) { return { status: 200, body: "n" }; });
+    app.Get("/blob", fn(_req) {
+        return { status: 200, body: Buffer.FromString("bin"), headers: { "Content-Type": "image/x-test" } };
+    });
+    Fiber.Run(fn() { app.Listen(0, { host: "127.0.0.1" }); });
+    while (app._server == nil || !app._server.IsRunning()) { Fiber.Sleep(1); }
+    let port = app.Port();
+
+    check(String.Contains(served(port, "/text"), "content-type: text/plain\r\n"),
+          "Response.Text sends its own content type");
+    let csv = served(port, "/csv");
+    check(String.Contains(csv, "content-type: text/csv\r\n"), "a lone Content-Type is sent");
+    check(String.EndsWith(csv, "\r\n\r\na,b"), "with the body after it");
+    let two = served(port, "/two");
+    check(String.StartsWith(two, "http/1.1 201"), "status of a response with two headers");
+    check(String.Contains(two, "content-type: text/csv\r\n") && String.Contains(two, "x-extra: 1\r\n"),
+          "both headers are sent");
+    check(String.Contains(served(port, "/none"), "content-type: text/plain; charset=utf-8\r\n"),
+          "no headers at all gets the server's text type");
+    let blob = served(port, "/blob");
+    check(String.Contains(blob, "content-type: image/x-test\r\n") && String.EndsWith(blob, "\r\n\r\nbin"),
+          "a block body with a lone Content-Type");
+    app.Stop(500);
+    return 0;
+}
+
 fn Main() {
     Console.WriteLine("=== Router dispatch tests ===");
     test_matching();
@@ -738,6 +805,7 @@ fn Main() {
     test_route_mark();
     test_cors();
     test_security_headers();
+    test_served_headers();
 
     Console.WriteLine("=============================");
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

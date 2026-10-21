@@ -10,7 +10,7 @@
 //
 // SETUP
 // -----
-// None. TLS is provided by the built-in `Tls` module, which uses the operating
+// None. TLS comes from the built-in Stream.ConnectTls, which uses the operating
 // system's own TLS stack - no --unsafe flag, no plugin, no OpenSSL install:
 //
 //      macOS    -> Secure Transport   (trust: Keychain)
@@ -34,7 +34,8 @@
 //   }
 //
 //   // An object/array body is JSON-encoded automatically (Content-Type: JSON);
-//   // pass a pre-built string to send it verbatim (form-encoded, multipart, ...).
+//   // pass a pre-built string or a block to send it verbatim (form-encoded,
+//   // multipart, binary, ...).
 //   Https.Post("https://httpbin.org/post",
 //              { name: "Alice" },
 //              { "Authorization": "Bearer token" });
@@ -42,7 +43,8 @@
 // API (mirrors Http; all return a response object or nil):
 //   Https.Get(url, headers?)
 //   Https.Post(url, body, headers?)      - object/array auto-JSON-encoded;
-//                                          string sent as-is; default Content-Type: JSON
+//                                          string or block sent as-is;
+//                                          default Content-Type: JSON
 //   Https.Put(url, body, headers?)
 //   Https.Patch(url, body, headers?)
 //   Https.Delete(url, headers?)
@@ -71,6 +73,26 @@
 // Https requests follow redirects to http:// as well; the engine downgrades to
 // the plain transport for those hops automatically.
 //
+// PROXIES
+// -------
+// https_proxy / HTTPS_PROXY and no_proxy from the environment are honoured,
+// or pass { proxy: "http://host:port" } in a transport's options: the request
+// goes through a CONNECT tunnel, with TLS to the origin inside it, so the
+// proxy never sees the plaintext. See Http.fls.
+//
+// STREAMING
+// ---------
+// Http.Open, Http.StreamPost and Http.Sse work over https:// as well; for a
+// self-signed endpoint pass the options { insecure: true } as their transport.
+//
+// CONNECTIONS
+// -----------
+// Connections are kept alive and pooled exactly as for Http (see Http.fls):
+// a TLS connection is reused only by requests with the same host, port,
+// timeout and verification settings, so an *Insecure request never takes a
+// verified request's connection or the other way round. Http.CloseIdle() and
+// Http.Configure() govern both schemes.
+//
 // SECURITY
 // --------
 // Certificates and hostnames are verified by default (TLS >= 1.2). The OS trust
@@ -79,19 +101,21 @@
 //
 // TROUBLESHOOTING
 // ---------------
-//   throws "HTTPS requires ..."  - import Https (not Http) for https:// URLs
-//   throws "no TLS backend ..."  - built-in TLS unavailable on this build; on
+//   nil response                 - connection refused, TLS handshake failed, or
+//                                  cert verification failed. Stream.TlsLastError()
+//                                  says which; try GetInsecure to confirm it's a
+//                                  certificate issue
+//   TlsLastError() "no TLS backend available ..."
+//                                - built-in TLS unavailable on this build; on
 //                                  Linux this means libssl could not be loaded -
 //                                  install it (e.g. apt install libssl3)
-//   nil response                 - connection refused, TLS handshake failed, or
-//                                  cert verification failed; try GetInsecure to
-//                                  confirm it's a certificate issue
 // ============================================================
 
 import { Http, Status, ContentType, CookieJar, Multipart } from library("Http", "1.0");
 
-// Cached default (verifying) transport.
+// Cached default transports: verifying, and for the *Insecure calls.
 global _httpsTransportSecure = nil;
+global _httpsTransportInsecure = nil;
 
 // Default TLS connect/read timeout in milliseconds. Stream.ConnectTls
 // defaults to 30s, which is too short for slow upstreams - notably LLM
@@ -129,6 +153,12 @@ class Https {
         return _httpsTransportSecure;
     }
 
+    fn static _insecureTransport() {
+        if (_httpsTransportInsecure != nil) { return _httpsTransportInsecure; }
+        _httpsTransportInsecure = Https._buildTransport({ insecure: true });
+        return _httpsTransportInsecure;
+    }
+
     // --------------------------------------------------------
     //  Timeout configuration
     // --------------------------------------------------------
@@ -139,7 +169,8 @@ class Https {
     fn static SetTimeout(ms:int) {
         if (ms <= 0) throw(400, "Https.SetTimeout: ms must be > 0");
         _httpsTimeoutMs = ms;
-        _httpsTransportSecure = nil;   // rebuild the cached transport with the new timeout
+        _httpsTransportSecure = nil;   // rebuild the cached transports with the new timeout
+        _httpsTransportInsecure = nil;
     }
 
     // Current default TLS connect/read timeout in milliseconds.
@@ -181,42 +212,42 @@ class Https {
 
     fn static RequestInsecure(method:string, url:string, body, contentType, headers?) {
         return Http.Request(method, url, body, contentType, headers ?? nil,
-                            Https._buildTransport({ insecure: true }));
+                            Https._insecureTransport());
     }
 
     fn static GetInsecure(url:string, headers?) {
         return Http.Request("GET", url, nil, nil, headers ?? nil,
-                            Https._buildTransport({ insecure: true }));
+                            Https._insecureTransport());
     }
 
     fn static PostInsecure(url:string, body, headers?) {
         return Http.Request("POST", url, body, ContentType.JSON, headers ?? nil,
-                            Https._buildTransport({ insecure: true }));
+                            Https._insecureTransport());
     }
 
     fn static PutInsecure(url:string, body, headers?) {
         return Http.Request("PUT", url, body, ContentType.JSON, headers ?? nil,
-                            Https._buildTransport({ insecure: true }));
+                            Https._insecureTransport());
     }
 
     fn static PatchInsecure(url:string, body, headers?) {
         return Http.Request("PATCH", url, body, ContentType.JSON, headers ?? nil,
-                            Https._buildTransport({ insecure: true }));
+                            Https._insecureTransport());
     }
 
     fn static QueryInsecure(url:string, body, headers?) {
         return Http.Request("QUERY", url, body, ContentType.JSON, headers ?? nil,
-                            Https._buildTransport({ insecure: true }));
+                            Https._insecureTransport());
     }
 
     fn static DeleteInsecure(url:string, headers?) {
         return Http.Request("DELETE", url, nil, nil, headers ?? nil,
-                            Https._buildTransport({ insecure: true }));
+                            Https._insecureTransport());
     }
 
     fn static HeadInsecure(url:string, headers?) {
         let res = Http.Request("HEAD", url, nil, nil, headers ?? nil,
-                               Https._buildTransport({ insecure: true }));
+                               Https._insecureTransport());
         if (res == nil) { return nil; }
         return { status: res.status, headers: res.headers };
     }
@@ -225,42 +256,42 @@ class Https {
     // still want non-blocking behavior.
     fn static RequestInsecureAsync(method:string, url:string, body, contentType, headers?) {
         return Http.RequestAsync(method, url, body, contentType, headers ?? nil,
-                                 Https._buildTransport({ insecure: true }));
+                                 Https._insecureTransport());
     }
 
     fn static GetInsecureAsync(url:string, headers?) {
         return Http.RequestAsync("GET", url, nil, nil, headers ?? nil,
-                                 Https._buildTransport({ insecure: true }));
+                                 Https._insecureTransport());
     }
 
     fn static PostInsecureAsync(url:string, body, headers?) {
         return Http.RequestAsync("POST", url, body, ContentType.JSON, headers ?? nil,
-                                 Https._buildTransport({ insecure: true }));
+                                 Https._insecureTransport());
     }
 
     fn static PutInsecureAsync(url:string, body, headers?) {
         return Http.RequestAsync("PUT", url, body, ContentType.JSON, headers ?? nil,
-                                 Https._buildTransport({ insecure: true }));
+                                 Https._insecureTransport());
     }
 
     fn static PatchInsecureAsync(url:string, body, headers?) {
         return Http.RequestAsync("PATCH", url, body, ContentType.JSON, headers ?? nil,
-                                 Https._buildTransport({ insecure: true }));
+                                 Https._insecureTransport());
     }
 
     fn static QueryInsecureAsync(url:string, body, headers?) {
         return Http.RequestAsync("QUERY", url, body, ContentType.JSON, headers ?? nil,
-                                 Https._buildTransport({ insecure: true }));
+                                 Https._insecureTransport());
     }
 
     fn static DeleteInsecureAsync(url:string, headers?) {
         return Http.RequestAsync("DELETE", url, nil, nil, headers ?? nil,
-                                 Https._buildTransport({ insecure: true }));
+                                 Https._insecureTransport());
     }
 
     fn static async HeadInsecureAsync(url:string, headers?) {
         let res = await Http.RequestAsync("HEAD", url, nil, nil, headers ?? nil,
-                                          Https._buildTransport({ insecure: true }));
+                                          Https._insecureTransport());
         if (res == nil) { return nil; }
         return { status: res.status, headers: res.headers };
     }

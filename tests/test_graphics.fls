@@ -556,19 +556,19 @@ fn test_filters() {
     g2.Clear(RED);
     g2.GrayscaleAll();
     let gp = g2.GetPixel(8, 8);
-    let r = (gp >> 16) & 0xFF;
-    let gg = (gp >> 8) & 0xFF;
-    let b = gp & 0xFF;
+    let r = (u8)(gp >> 16);
+    let gg = (u8)(gp >> 8);
+    let b = (u8)gp;
     check(r == gg && gg == b, "GrayscaleAll gives r == g == b");
     check(r > 0 && r < 255,   "grayscale of red is a mid gray");
-    checkEq((gp >> 24) & 0xFF, 0xFF, "GrayscaleAll preserves alpha");
+    checkEq((u8)(gp >> 24), 0xFF, "GrayscaleAll preserves alpha");
 
     // Grayscale on a region only.
     let g3 = new Graphics(16, 16);
     g3.Clear(RED);
     g3.Grayscale(0, 0, 8, 8);
     let inR = g3.GetPixel(2, 2);
-    check(((inR >> 16) & 0xFF) == ((inR >> 8) & 0xFF), "Grayscale region converted");
+    check((u8)(inR >> 16) == (u8)(inR >> 8), "Grayscale region converted");
     checkEq(g3.GetPixel(12, 12), RED, "Grayscale outside region untouched");
 
     // BrightnessAll(2.0): 100 -> 200 per channel, exact.
@@ -673,12 +673,12 @@ fn test_png_roundtrip() {
     let blk = g.ToBlock();
     check(blk != nil,    "ToBlock returns a block");
     check(len(blk) > 8,  "ToBlock has content");
-    checkEq(blk[0] & 0xFF, 0x89, "PNG signature byte 0");
-    checkEq(blk[1] & 0xFF, 0x50, "PNG signature byte 1 ('P')");
-    checkEq(blk[2] & 0xFF, 0x4E, "PNG signature byte 2 ('N')");
-    checkEq(blk[3] & 0xFF, 0x47, "PNG signature byte 3 ('G')");
-    checkEq(((blk[18] & 0xFF) << 8) | (blk[19] & 0xFF), 20, "IHDR width");
-    checkEq(((blk[22] & 0xFF) << 8) | (blk[23] & 0xFF), 12, "IHDR height");
+    checkEq((u8)blk[0], 0x89, "PNG signature byte 0");
+    checkEq((u8)blk[1], 0x50, "PNG signature byte 1 ('P')");
+    checkEq((u8)blk[2], 0x4E, "PNG signature byte 2 ('N')");
+    checkEq((u8)blk[3], 0x47, "PNG signature byte 3 ('G')");
+    checkEq(((u8)blk[18] << 8) | (u8)blk[19], 20, "IHDR width");
+    checkEq(((u8)blk[22] << 8) | (u8)blk[23], 12, "IHDR height");
     checkEq(len(blk), File.Size(path), "ToBlock length equals saved file");
 
     let blkPath = path + ".blk.png";
@@ -818,6 +818,47 @@ fn test_filter_offload() {
 }
 
 // ============================================================
+// Arena: every canvas keeps its pixels in one shared arena
+// ============================================================
+
+fn test_arena() {
+    Console.WriteLine("-- arena");
+
+    // A dropped copy gives its span back, so a loop of copies keeps reusing the
+    // same space; a 512x512 copy is 262144 words, 300 stacked would reach 78M.
+    let big = new Graphics(512, 512);
+    big.Clear(RED);
+    var full = 0;
+    var maxOff = 0;
+    iter (i from 0 to 300) {
+        let c = big.CopyRect(0, 0, 512, 512);
+        if (c.Width() == 512 && c.GetPixel(511, 511) == RED) { full += 1; }
+        if (c.GetGfx().off > maxOff) { maxOff = c.GetGfx().off; }
+    }
+    checkEq(full, 300, "CopyRect in a loop returns full copies");
+    check(maxOff < 4194304, "dropped copies are reused, max offset " + str(maxOff));
+    checkEq(big.GetPixel(0, 0), RED, "source intact after the copies");
+
+    // Blit stages through a scratch surface and frees it again.
+    let px = [];
+    iter (i from 0 to 64 * 64) { Array.Append(px, GREEN); }
+    let target = new Graphics(128, 128);
+    target.Clear(BLACK);
+    iter (i from 0 to 300) { target.Blit(0, 0, 64, 64, px); }
+    checkEq(target.GetPixel(63, 63), GREEN, "Blit in a loop still draws");
+    checkEq(target.GetPixel(64, 64), BLACK, "Blit in a loop stays in its rectangle");
+
+    // Canvases kept alive past the arena's size: it grows, and each is real.
+    let keep = [];
+    iter (i from 0 to 64) { Array.Append(keep, new Graphics(256, 256)); }
+    var real = 0;
+    foreach (k in keep) {
+        if (k.Width() == 256) { real += 1; }
+    }
+    checkEq(real, 64, "canvases past the arena's size are all allocated");
+}
+
+// ============================================================
 // Benchmarks
 // ============================================================
 
@@ -860,6 +901,11 @@ fn test_benchmarks() {
                       String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
 
     t0 = Time.Ticks();
+    iter (i from 0 to 500) { let _c = g.CopyRect(0, 0, 256, 256); }
+    Console.WriteLine("CopyRect 256x256   (500 iters):  ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
+
+    t0 = Time.Ticks();
     iter (i from 0 to 20) { let _b = g.ToBlock(); }
     Console.WriteLine("PNG encode 256x256 (20 iters):   ",
                       String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t0)]), " ms");
@@ -886,6 +932,7 @@ fn Main() {
     test_png_roundtrip();
     test_draw_image();
     test_filter_offload();
+    test_arena();
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

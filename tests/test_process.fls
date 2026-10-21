@@ -175,6 +175,20 @@ fn test_benchmarks() {
     Console.WriteLine("Shell echo x", iters, ": ",
                       String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t1)]), " ms");
 
+    let t2 = Time.Ticks();
+    iter (i from 0 to iters) {
+        let _r = Fiber.Await(RunAsync("echo", ["hi"]));
+    }
+    Console.WriteLine("RunAsync echo x", iters, ": ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t2)]), " ms");
+
+    let t3 = Time.Ticks();
+    var batch = [];
+    iter (i from 0 to iters) { Array.Append(batch, RunAsync("echo", ["hi"])); }
+    let _all = Fiber.AwaitAll(batch);
+    Console.WriteLine("RunAsync echo x", iters, " at once: ",
+                      String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t3)]), " ms");
+
     Console.WriteLine("=== benchmarks done ===");
 }
 
@@ -196,13 +210,83 @@ fn test_process_extended_helpers() {
     check("ReadAll captures stdout", String.IndexOf(text, "alpha") >= 0);
     p.Close();
 
-    let asyncResult = RunAsync("printf", ["async-ok\n"], { timeout: 2000 });
+    let asyncResult = Fiber.Await(RunAsync("printf", ["async-ok\n"], { timeout: 2000 }));
     check("RunAsync returns result", asyncResult != nil);
     check("RunAsync success", asyncResult.Success == true);
+    check("RunAsync stdout", asyncResult.Stdout == "async-ok\n");
 
-    let asyncProc = StartAsync("printf", ["async-proc\n"], { timeout: 2000 });
+    let asyncProc = Fiber.Await(StartAsync("printf", ["async-proc\n"]));
     check("StartAsync returns Process", asyncProc != nil);
+    check("StartAsync process output", asyncProc.ReadLine() == "async-proc");
+    asyncProc.Wait();
     asyncProc.Close();
+}
+
+global _ticks = 0;
+
+fn async ticker(ms: int) {
+    let t0 = Time.Ticks();
+    while (Time.TicksToMs(Time.Ticks() - t0) < float(ms)) {
+        _ticks = _ticks + 1;
+        Fiber.Sleep(10);
+    }
+    return _ticks;
+}
+
+fn test_run_async_overlaps() {
+    Console.WriteLine("--- 16. RunAsync leaves other fibers running ---");
+    let t0 = Time.Ticks();
+    let rs = Fiber.AwaitAll([
+        RunAsync("sleep", ["0.3"]),
+        RunAsync("sh", ["-c", "sleep 0.3; echo out; echo err >&2; exit 3"]),
+        ticker(200)
+    ]);
+    let ms = Time.TicksToMs(Time.Ticks() - t0);
+    check("two 300 ms children take about 300 ms, not 600", ms >= 290.0 && ms < 550.0);
+    check("another fiber ran meanwhile", rs[2] >= 5);
+    check("first child exit 0",      rs[0].Exit == 0 && rs[0].Success);
+    check("second child exit code",  rs[1].Exit == 3 && !rs[1].Success);
+    check("second child stdout",     rs[1].Stdout == "out\n");
+    check("second child stderr",     rs[1].Stderr == "err\n");
+
+    let t1 = Time.Ticks();
+    let slow = Fiber.Await(RunAsync("sleep", ["5"], { timeout: 150 }));
+    check("RunAsync timeout returns early", Time.TicksToMs(Time.Ticks() - t1) < 1000.0);
+    check("RunAsync timeout TimedOut",      slow.TimedOut == true);
+    check("RunAsync timeout exit 124",      slow.Exit == 124);
+
+    let missing = Fiber.Await(RunAsync("__cmd_that_does_not_exist__"));
+    check("RunAsync no-cmd exit 127",       missing.Exit == 127);
+
+    let big = Fiber.Await(RunAsync("sh", ["-c", "head -c 200000 /dev/zero | tr '\\0' a; head -c 100000 /dev/zero | tr '\\0' b >&2"]));
+    check("RunAsync reads both pipes in full", len(big.Stdout) == 200000 && len(big.Stderr) == 100000);
+}
+
+fn test_launch_options() {
+    Console.WriteLine("--- 17. cwd / env / stdin / mergeStderr ---");
+    let opts = { cwd: "/", env: { PROCESS_TEST_VAR: "v1" }, stdin: "fed\n" };
+    let script = "pwd; echo $PROCESS_TEST_VAR; cat; echo e >&2";
+    let r = Run("sh", ["-c", script], opts);
+    check("Run cwd",          String.StartsWith(r.Stdout, "/\n"));
+    check("Run env + stdin",  r.Stdout == "/\nv1\nfed\n");
+    check("Run stderr apart", r.Stderr == "e\n");
+
+    let a = Fiber.Await(RunAsync("sh", ["-c", script], opts));
+    check("RunAsync cwd + env + stdin", a.Stdout == "/\nv1\nfed\n");
+    check("RunAsync stderr apart",      a.Stderr == "e\n");
+
+    let m = Fiber.Await(RunAsync("sh", ["-c", "echo o; echo e >&2"], { mergeStderr: true }));
+    check("RunAsync mergeStderr", m.Stdout == "o\ne\n" && m.Stderr == "");
+    let ms = Run("sh", ["-c", "echo o; echo e >&2"], { mergeStderr: true });
+    check("Run mergeStderr",      ms.Stdout == "o\ne\n" && ms.Stderr == "");
+
+    let sh = Shell("echo $PROCESS_TEST_VAR", { env: { PROCESS_TEST_VAR: "v2" } });
+    check("Shell env", sh.Stdout == "v2\n");
+
+    let p = Start("pwd", [], { cwd: "/" });
+    check("Start cwd", p.ReadLine() == "/");
+    p.Wait();
+    p.Close();
 }
 
 fn Main() {
@@ -221,6 +305,8 @@ fn Main() {
     test_getenv_all();
     test_run_multiline();
     test_process_extended_helpers();
+    test_run_async_overlaps();
+    test_launch_options();
     test_benchmarks();
 
     Console.WriteLine("");

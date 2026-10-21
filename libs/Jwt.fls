@@ -5,6 +5,13 @@
 //   HS256 / HS512 - symmetric, HMAC-SHA256 / HMAC-SHA512 with a shared secret.
 //   EdDSA         - asymmetric, Ed25519: sign with a secret key, verify with the
 //                   public key (verifiers never hold the signing secret).
+//   RS256 / RS384 / RS512 - RSASSA-PKCS1-v1_5 with SHA-256/384/512,
+//   PS256                 - RSASSA-PSS with SHA-256 and MGF1-SHA256,
+//   ES256                 - ECDSA on P-256 with SHA-256:
+//                   verification only, with a public key from a JWK, a JWK
+//                   Set or a PEM file. Signing with an RSA or EC secret key
+//                   is not offered: done in script, its timing would depend
+//                   on the secret.
 // All methods are static - use Jwt directly, no instance needed.
 // Tokens follow the standard three-part base64url format: header.payload.signature
 //
@@ -23,6 +30,11 @@
 //   let t2 = Jwt.EncodeEdDSA(payload, kp.SecretKey, { exp: Time.Now() + 3600 });
 //   let ok2 = Jwt.VerifyEdDSA(t2, kp.PublicKey); // verifier only needs PublicKey
 //
+//   // Tokens from an identity provider (RS256, ES256, ...): verify against its
+//   // published key set; the token's "kid" picks the key
+//   let keys = Jwt.KeySet(File.ReadText("jwks.json"));   // parse once, reuse
+//   let ok3  = Jwt.VerifyWithJwks(idToken, keys, { aud: "my-client", iss: "https://id.example" });
+//
 //   // Decode without verification (inspect contents)
 //   let decoded = Jwt.Decode(token);
 //   Console.WriteLine(decoded.payload.sub);   // "user-42"
@@ -33,14 +45,38 @@
 //       options: { iat:int, exp:int, nbf:int }  - Unix timestamps; omit to skip claim
 //       The caller's payload object is never modified: option claims go into a copy.
 //
-//   Verify<Alg>(token, key)
+//   Verify<Alg>(token, key)    - Alg = HS256 | HS512 | EdDSA | RS256 | RS384 | RS512
+//                                      | PS256 | ES256
 //       →  bool  - checks the signature only; does not check exp/nbf/iat/aud/iss.
-//       For EdDSA, key is the hex public key.
+//       For EdDSA, key is the hex public key. For the RSA and EC algorithms, key
+//       is a key from KeyFromJwk / KeyFromPem, or a JWK object, JWK JSON text or
+//       PEM text that is read on every call.
 //
 //   Verify<Alg>WithClaims(token, key, options?)
 //       →  bool  - Verify<Alg> + ValidateClaims in one call
 //   VerifyDecodedHS256(decoded, key, options?)
 //       →  bool  - VerifyHS256WithClaims for a token already through Decode (or nil)
+//
+//   VerifyWithKey(token, key, options?)
+//       →  bool  - signature and claims, with the algorithm the token's header
+//       names, provided the key is for it: RS256/RS384/RS512/PS256 for an RSA
+//       key, ES256 for a P-256 key - and only the JWK's own "alg" when it has one.
+//   VerifyWithJwks(token, keys, options?)
+//       →  bool  - VerifyWithKey with the key whose "kid" equals the token's; a
+//       token without a kid needs a set holding exactly one key for its
+//       algorithm. keys: the result of KeySet, or what KeySet accepts.
+//       Both also take options.algs: the algorithms to accept, e.g. ["ES256"].
+//
+//   KeyFromJwk(jwk)      →  key | nil  - a public JWK, as an object or JSON text:
+//                           { kty:"RSA", n, e } (2048 to 8192 bits) or
+//                           { kty:"EC", crv:"P-256", x, y }. nil for anything else,
+//                           a JWK whose "use" is not "sig", or whose "key_ops"
+//                           lacks "verify".
+//   KeyFromPem(pem)      →  key | nil  - "BEGIN PUBLIC KEY" (SubjectPublicKeyInfo,
+//                           RSA or P-256) or "BEGIN RSA PUBLIC KEY" (PKCS #1)
+//   KeySet(jwks)         →  array of keys - from a JWK Set ({ keys: [...] }, as an
+//                           object or JSON text) or an array of JWKs; the keys
+//                           KeyFromJwk refuses are left out
 //
 //   Decode(token)
 //       →  { header:object, payload:object, signatureHex:string, signingInput:string }
@@ -62,11 +98,389 @@
 //   Refresh(token, secret, newExpSeconds) → HS256 token with a new exp, or nil
 //   Base64UrlEncodeString(s) / Base64UrlDecodeToString(s)
 //
-// NOTE: the alg is taken from the call you make, not from the token header, so a
-// token cannot downgrade its own algorithm. Pick the verifier that matches how
-// the token was issued.
+// Algorithm pinning (RFC 8725): every verifier pins the algorithm by the call
+// you make or by the key, never by the token alone. A token whose header names
+// another algorithm, "none", or carries a "crit" parameter fails, and so does
+// an RSA or EC key offered to an HMAC verifier as a PEM secret.
+//
+// Cost: verifying RS256 with a 2048-bit key or ES256 takes milliseconds, not
+// microseconds - see the benchmark section of tests/test_jwt.fls.
 
 import { Util } from library("Util", "1.0");
+import { BigInt } from library("BigInt", "1.0");
+import { Digest } from library("CryptoKit", "1.0");
+
+// P-256 (secp256r1) as BigInts: field prime p, group order n, curve
+// coefficient b (a is -3) and the base point (gx, gy). Made on first use.
+global _p256 = nil;
+
+fn _curve() {
+    if (_p256 == nil) {
+        _p256 = {
+            p:   BigInt.FromHex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"),
+            n:   BigInt.FromHex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
+            b:   BigInt.FromHex("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"),
+            gx:  BigInt.FromHex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"),
+            gy:  BigInt.FromHex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"),
+            one: BigInt.One()
+        };
+    }
+    return _p256;
+}
+
+// Field arithmetic mod p on values already in [0, p).
+fn _fMul(a, b, p) { return BigInt.Mod(BigInt.Mul(a, b), p); }
+fn _fAdd(a, b, p) {
+    let r = BigInt.Add(a, b);
+    return BigInt.Gte(r, p) ? BigInt.Sub(r, p) : r;
+}
+fn _fSub(a, b, p) {
+    let r = BigInt.Sub(a, b);
+    return BigInt.IsNeg(r) ? BigInt.Add(r, p) : r;
+}
+
+// Points are Jacobian [X, Y, Z] (x = X/Z², y = Y/Z³; Z = 0 is the point at
+// infinity) or affine [x, y].
+
+// 2P, for a = -3 (dbl-2001-b).
+fn _ecDouble(P, p) {
+    let x = P[0];
+    let y = P[1];
+    let z = P[2];
+    let delta = _fMul(z, z, p);
+    let gamma = _fMul(y, y, p);
+    let beta  = _fMul(x, gamma, p);
+    let t     = _fMul(_fSub(x, delta, p), _fAdd(x, delta, p), p);
+    let alpha = _fAdd(_fAdd(t, t, p), t, p);
+    let beta2 = _fAdd(beta, beta, p);
+    let beta4 = _fAdd(beta2, beta2, p);
+    let x3    = _fSub(_fMul(alpha, alpha, p), _fAdd(beta4, beta4, p), p);
+    let yz    = _fAdd(y, z, p);
+    let z3    = _fSub(_fSub(_fMul(yz, yz, p), gamma, p), delta, p);
+    let g2    = _fMul(gamma, gamma, p);
+    let g4    = _fAdd(g2, g2, p);
+    let g8    = _fAdd(g4, g4, p);
+    let y3    = _fSub(_fMul(alpha, _fSub(beta4, x3, p), p), _fAdd(g8, g8, p), p);
+    return [x3, y3, z3];
+}
+
+// P + A for Jacobian P and affine A (madd-2007-bl).
+fn _ecAddAffine(P, A, c) {
+    let p = c.p;
+    if (BigInt.IsZero(P[2])) { return [A[0], A[1], c.one]; }
+    let x1 = P[0];
+    let y1 = P[1];
+    let z1 = P[2];
+    let z1z1 = _fMul(z1, z1, p);
+    let u2 = _fMul(A[0], z1z1, p);
+    let s2 = _fMul(A[1], _fMul(z1, z1z1, p), p);
+    let h  = _fSub(u2, x1, p);
+    let sd = _fSub(s2, y1, p);
+    if (BigInt.IsZero(h)) {
+        if (BigInt.IsZero(sd)) { return _ecDouble(P, p); }
+        return [c.one, c.one, BigInt.Zero()];
+    }
+    let r  = _fAdd(sd, sd, p);
+    let hh = _fMul(h, h, p);
+    let i2 = _fAdd(hh, hh, p);
+    let i  = _fAdd(i2, i2, p);
+    let j  = _fMul(h, i, p);
+    let v  = _fMul(x1, i, p);
+    let x3 = _fSub(_fSub(_fMul(r, r, p), j, p), _fAdd(v, v, p), p);
+    let yj = _fMul(y1, j, p);
+    let y3 = _fSub(_fMul(r, _fSub(v, x3, p), p), _fAdd(yj, yj, p), p);
+    let zh = _fAdd(z1, h, p);
+    let z3 = _fSub(_fSub(_fMul(zh, zh, p), z1z1, p), hh, p);
+    return [x3, y3, z3];
+}
+
+// Affine form of Jacobian P, or nil for the point at infinity.
+fn _ecAffine(P, p) {
+    if (BigInt.IsZero(P[2])) { return nil; }
+    let zi  = BigInt.ModInverse(P[2], p);
+    let zi2 = _fMul(zi, zi, p);
+    return [_fMul(P[0], zi2, p), _fMul(P[1], _fMul(zi2, zi, p), p)];
+}
+
+// The 32 big-endian bytes of a scalar below 2^256.
+fn _scalarBytes(k): array {
+    let b = BigInt.ToBytes(k);
+    var out = [];
+    iter (i from len(b) to 32) { Array.Append(out, 0); }
+    foreach (v in b) { Array.Append(out, v); }
+    return out;
+}
+
+// u1·G + u2·Q (Jacobian) by one pass of doublings over both scalars
+// (Shamir's trick); gq is G + Q in affine form, or nil when it is infinity.
+fn _ecMulAdd(c, u1, u2, q, gq) {
+    let p  = c.p;
+    let b1 = _scalarBytes(u1);
+    let b2 = _scalarBytes(u2);
+    let g  = [c.gx, c.gy];
+    var R  = [c.one, c.one, BigInt.Zero()];
+    iter (i from 0 to 256) {
+        R = _ecDouble(R, p);
+        let shift = 7 - (i & 7);
+        let k = ((b1[i >> 3] >> shift) & 1) | (((b2[i >> 3] >> shift) & 1) << 1);
+        if (k == 1) { R = _ecAddAffine(R, g, c); }
+        else if (k == 2) { R = _ecAddAffine(R, q, c); }
+        else if (k == 3 && gq != nil) { R = _ecAddAffine(R, gq, c); }
+    }
+    return R;
+}
+
+// True when (x, y) lies on P-256: y² = x³ - 3x + b, both below p.
+fn _onCurve(x, y, c): bool {
+    let p = c.p;
+    if (BigInt.Gte(x, p) || BigInt.Gte(y, p)) { return false; }
+    let x3 = _fMul(_fMul(x, x, p), x, p);
+    let rhs = _fAdd(_fSub(x3, _fAdd(_fAdd(x, x, p), x, p), p), c.b, p);
+    return BigInt.Eq(_fMul(y, y, p), rhs);
+}
+
+// The big-endian bytes of non-negative x in exactly n bytes, or nil when x
+// needs more.
+fn _bigToBlock(x, n: int): block {
+    let b = BigInt.ToBytes(x);
+    let m = len(b);
+    if (m > n) {
+        // ToBytes gives zero as one 0 byte.
+        if (!BigInt.IsZero(x)) { return nil; }
+        return Buffer.Create(n, 1);
+    }
+    let out = Buffer.Create(n, 1);
+    iter (i from 0 to m) { Buffer.WriteU8At(out, n - m + i, b[i]); }
+    return out;
+}
+
+// The digest of data with "sha256", "sha384" or "sha512", as bytes.
+fn _hashBytes(name: string, data): block {
+    if (name == "sha256") { return Util.HexToBin(Hash.Sha256(data)); }
+    if (name == "sha512") { return Util.HexToBin(Hash.Sha512(data)); }
+    let d = new Digest("sha384");
+    d.Update(data);
+    return d.Final(true);
+}
+
+// RSASSA-PKCS1-v1_5 (RFC 8017 8.2.2): sig^e mod n must be exactly
+// 00 01 FF..FF 00 || DigestInfo prefix || H(si).
+fn _rsaPkcs1Verify(key, si: string, sig: block, hashName: string, prefixHex: string): bool {
+    let k = key.size;
+    if (len(sig) != k) { return false; }
+    let s = BigInt.FromBytes(sig);
+    if (BigInt.Gte(s, key.n)) { return false; }
+    let em = _bigToBlock(BigInt.ModPow(s, key.e, key.n), k);
+    if (em == nil) { return false; }
+    let t = Buffer.Concat(Util.HexToBin(prefixHex), _hashBytes(hashName, si));
+    let tLen = len(t);
+    let want = Buffer.Create(k, 1);
+    Buffer.WriteU8At(want, 1, 1);
+    Buffer.FillRange(want, 2, k - 3 - tLen, 255);
+    Buffer.Copy(t, 0, want, k - tLen, tLen);
+    return Crypto.ConstantTimeEquals(em, want);
+}
+
+// MGF1 with SHA-256 (RFC 8017 B.2.1): n bytes from seed.
+fn _mgf1(seed: block, n: int): block {
+    let out = Buffer.Create(n, 1);
+    let ctr = Buffer.Create(4, 1);
+    var at = 0;
+    var i = 0;
+    while (at < n) {
+        Buffer.WriteU32At(ctr, 0, i, true);
+        let h = Util.HexToBin(Hash.Sha256(Buffer.Concat(seed, ctr)));
+        let take = (n - at < 32 ? n - at : 32);
+        Buffer.Copy(h, 0, out, at, take);
+        at += take;
+        i += 1;
+    }
+    return out;
+}
+
+// RSASSA-PSS with SHA-256, MGF1-SHA256 and a 32-byte salt (RFC 8017 8.1.2,
+// 9.1.2; RFC 7518 3.5).
+fn _rsaPssVerify(key, si: string, sig: block): bool {
+    let k = key.size;
+    if (len(sig) != k) { return false; }
+    let s = BigInt.FromBytes(sig);
+    if (BigInt.Gte(s, key.n)) { return false; }
+    let emBits = BigInt.BitLength(key.n) - 1;
+    let emLen = (emBits + 7) / 8;
+    let hLen = 32;
+    let sLen = 32;
+    if (emLen < hLen + sLen + 2) { return false; }
+    let em = _bigToBlock(BigInt.ModPow(s, key.e, key.n), emLen);
+    if (em == nil || Buffer.ReadU8At(em, emLen - 1) != 0xbc) { return false; }
+    let dbLen = emLen - hLen - 1;
+    let topMask = 255 >> (8 * emLen - emBits);
+    if ((Buffer.ReadU8At(em, 0) & (255 ^ topMask)) != 0) { return false; }
+    let h = Buffer.Slice(em, dbLen, hLen);
+    let db = _mgf1(h, dbLen);
+    iter (i from 0 to dbLen) {
+        Buffer.WriteU8At(db, i, Buffer.ReadU8At(db, i) ^ Buffer.ReadU8At(em, i));
+    }
+    Buffer.WriteU8At(db, 0, Buffer.ReadU8At(db, 0) & topMask);
+    let ps = dbLen - sLen - 1;
+    iter (i from 0 to ps) {
+        if (Buffer.ReadU8At(db, i) != 0) { return false; }
+    }
+    if (Buffer.ReadU8At(db, ps) != 1) { return false; }
+    let m2 = Buffer.Create(8 + hLen + sLen, 1);
+    Buffer.Copy(_hashBytes("sha256", si), 0, m2, 8, hLen);
+    Buffer.Copy(db, dbLen - sLen, m2, 8 + hLen, sLen);
+    return Crypto.ConstantTimeEquals(_hashBytes("sha256", m2), h);
+}
+
+// ECDSA P-256 with SHA-256 (FIPS 186-4 6.4.2); sig is r || s, 32 bytes each.
+fn _es256Verify(key, si: string, sig: block): bool {
+    if (len(sig) != 64) { return false; }
+    let c = _curve();
+    let n = c.n;
+    let r = BigInt.FromBytes(Buffer.Slice(sig, 0, 32));
+    let s = BigInt.FromBytes(Buffer.Slice(sig, 32, 32));
+    if (BigInt.IsZero(r) || BigInt.IsZero(s) || BigInt.Gte(r, n) || BigInt.Gte(s, n)) { return false; }
+    let e = BigInt.FromBytes(_hashBytes("sha256", si));
+    let w = BigInt.ModInverse(s, n);
+    let u1 = BigInt.Mod(BigInt.Mul(e, w), n);
+    let u2 = BigInt.Mod(BigInt.Mul(r, w), n);
+    if (key.gq == nil) {
+        // G + Q depends on the key alone; kept with it for the next token.
+        let gq = _ecAffine(_ecAddAffine([c.gx, c.gy, c.one], [key.x, key.y], c), c.p);
+        key.gq = (gq == nil ? false : gq);
+    }
+    let R = _ecMulAdd(c, u1, u2, [key.x, key.y], (key.gq == false ? nil : key.gq));
+    if (BigInt.IsZero(R[2])) { return false; }
+    // x(R) mod n == r without an inversion: X == r·Z² (mod p), or (r + n)·Z²
+    // when r + n is still below p.
+    let p = c.p;
+    let z2 = _fMul(R[2], R[2], p);
+    if (BigInt.Eq(R[0], _fMul(r, z2, p))) { return true; }
+    let rn = BigInt.Add(r, n);
+    return BigInt.Lt(rn, p) && BigInt.Eq(R[0], _fMul(rn, z2, p));
+}
+
+// Reads the DER header at b[at]: out = [tag, content start, content length].
+// False when it is malformed or runs past end.
+fn _der(b: block, at: int, end: int, out: [int]): bool {
+    if (at + 2 > end) { return false; }
+    out[0] = Buffer.ReadU8At(b, at);
+    var l = Buffer.ReadU8At(b, at + 1);
+    var p = at + 2;
+    if (l >= 0x80) {
+        let k = l & 0x7f;
+        if (k == 0 || k > 4 || p + k > end) { return false; }
+        l = 0;
+        iter (i from 0 to k) { l = (l << 8) | Buffer.ReadU8At(b, p + i); }
+        p += k;
+    }
+    if (p + l > end) { return false; }
+    out[1] = p;
+    out[2] = l;
+    return true;
+}
+
+// The content of the INTEGER at b[at] as a non-negative BigInt, or nil;
+// out is left on that item.
+fn _derUInt(b: block, at: int, end: int, out: [int]) {
+    if (!_der(b, at, end, out) || out[0] != 0x02 || out[2] == 0) { return nil; }
+    if ((Buffer.ReadU8At(b, out[1]) & 0x80) != 0) { return nil; }
+    return BigInt.FromBytes(Buffer.Slice(b, out[1], out[2]));
+}
+
+// The supported algorithms of a key's type.
+fn _keyAlgs(key): array {
+    return (key.kty == "RSA" ? ["RS256", "RS384", "RS512", "PS256"] : ["ES256"]);
+}
+
+// RSAPublicKey (PKCS #1): SEQUENCE { modulus INTEGER, publicExponent INTEGER }.
+fn _rsaFromDer(b, at, end, it) {
+    if (!_der(b, at, end, it) || it[0] != 0x30) return nil;
+    let seqEnd = it[1] + it[2];
+    let n = _derUInt(b, it[1], seqEnd, it);
+    if (n == nil) return nil;
+    let e = _derUInt(b, it[1] + it[2], seqEnd, it);
+    if (e == nil) return nil;
+    return _rsaKey(n, e, nil, nil);
+}
+
+// A modulus of 2048 to 8192 bits (RFC 7518 3.3 sets the floor) and an odd
+// exponent from 3 to 2^32 - 1; alg, when given, must be an RSA algorithm.
+fn _rsaKey(n, e, alg, kid) {
+    let bits = BigInt.BitLength(n);
+    if (bits < 2048 || bits > 8192) return nil;
+    if (BigInt.IsEven(e) || BigInt.Lt(e, 3) || BigInt.BitLength(e) > 32) return nil;
+    let key = { _pub: true, kty: "RSA", n: n, e: e, size: (bits + 7) / 8, alg: nil, kid: kid };
+    if (alg != nil) {
+        if (!Array.Contains(_keyAlgs(key), alg)) return nil;
+        key.alg = alg;
+    }
+    return key;
+}
+
+// A point on P-256; alg, when given, must be ES256. gq caches G + Q.
+fn _ecKey(x, y, alg, kid) {
+    if (!_onCurve(x, y, _curve())) return nil;
+    if (alg != nil && alg != "ES256") return nil;
+    return { _pub: true, kty: "EC", crv: "P-256", x: x, y: y, alg: alg, kid: kid, gq: nil };
+}
+
+// A key from KeyFromJwk / KeyFromPem as it is; a JWK (object or JSON
+// text) or PEM text read now; nil for anything else.
+fn _asKey(key) {
+    if (key == nil) return nil;
+    if (Type.IsObject(key) && key._pub == true) return key;
+    if (Type.IsString(key) && String.Contains(key, "-----BEGIN")) return Jwt.KeyFromPem(key);
+    return Jwt.KeyFromJwk(key);
+}
+
+// The signature of decoded token d checked with key for alg: the header
+// must name alg, the key must be of alg's type, and a key that names its
+// own algorithm must name alg.
+fn _verifyPub(d, key, alg): bool {
+    if (d == nil || key == nil || !Type.IsString(alg) || !_algIs(d, alg)) return false;
+    if (!Array.Contains(_keyAlgs(key), alg) || (key.alg != nil && key.alg != alg)) return false;
+    let sig = Util.HexToBin(d.signatureHex);
+    if (sig == nil) return false;
+    let si = d.signingInput;
+    if (alg == "ES256") return _es256Verify(key, si, sig);
+    if (alg == "PS256") return _rsaPssVerify(key, si, sig);
+    if (alg == "RS256") return _rsaPkcs1Verify(key, si, sig, "sha256", "3031300d060960864801650304020105000420");
+    if (alg == "RS384") return _rsaPkcs1Verify(key, si, sig, "sha384", "3041300d060960864801650304020205000430");
+    return _rsaPkcs1Verify(key, si, sig, "sha512", "3051300d060960864801650304020305000440");
+}
+
+// True when options leave alg allowed: no "algs" list, or one holding it.
+fn _algAllowed(alg, opts): bool {
+    if (!Type.IsString(alg)) return false;
+    return opts == nil || opts.algs == nil || Array.Contains(opts.algs, alg);
+}
+
+fn _verifyAs(token, key, alg: string, claims: bool, opts): bool {
+    try {
+        if (!Type.IsString(token)) return false;
+        let d = Jwt.Decode(token);
+        if (!_verifyPub(d, _asKey(key), alg)) return false;
+        return !claims || Jwt.ValidateClaims(d.payload, opts);
+    } catch (_e) {
+        return false;
+    }
+}
+
+// True when the header of decoded token d names exactly alg and asks for
+// no extension ("crit").
+fn _algIs(d, alg: string): bool {
+    let h = d.header;
+    return Type.IsObject(h) && h.alg == alg && h.crit == nil;
+}
+
+// An HMAC secret must be a string, and not a public key: a verifier that
+// took a PEM key as its secret would accept tokens anyone holding that
+// public key can make.
+fn _hmacSecretOk(secret): bool {
+    return Type.IsString(secret) && !String.Contains(secret, "-----BEGIN");
+}
+
 class Jwt {
 
     // --------------------------------------------------------
@@ -130,32 +544,19 @@ class Jwt {
         };
     }
 
-    // Constant-time comparison of two hex digests. A plain == stops at the
-    // first differing character, so how long it takes reveals how much of a
-    // guessed signature was right - which, over enough attempts, is enough to
-    // forge one byte at a time.
+    // Compares two lowercase hex digests in constant time. A plain == stops
+    // at the first differing character, so how long it takes reveals how much
+    // of a guessed signature was right - which, over enough attempts, is enough
+    // to forge one byte at a time.
     fn static _digestEq(a, b): bool {
         if (a == nil || b == nil) return false;
-        let x = String.ToLower(a);
-        let y = String.ToLower(b);
-        let n:int = String.Length(x);
-        // Length is not secret: a digest of this algorithm has a fixed one.
-        if (n != String.Length(y)) return false;
-        let bx = Buffer.FromString(x);
-        let by = Buffer.FromString(y);
-        let diff:int = 0;
-        let i:int = 0;
-        while (i < n) {
-            diff = diff | (Buffer.ReadU8At(bx, i) ^ Buffer.ReadU8At(by, i));
-            i += 1;
-        }
-        return diff == 0;
+        return Crypto.ConstantTimeEquals(a, b);
     }
 
-    fn static VerifyHS256(token:string, secret:string): bool {
+    fn static VerifyHS256(token:string, secret): bool {
         try {
             let d = Jwt.Decode(token);
-            if (d == nil) return false;
+            if (d == nil || !_algIs(d, "HS256") || !_hmacSecretOk(secret)) return false;
             let expected = Crypto.HmacSha256(secret, d.signingInput);
             return Jwt._digestEq(expected, d.signatureHex);
         } catch (_e) {
@@ -223,7 +624,7 @@ class Jwt {
         return false;
     }
 
-    fn static VerifyHS256WithClaims(token:string, secret:string, options?): bool {
+    fn static VerifyHS256WithClaims(token:string, secret, options?): bool {
         return Jwt.VerifyDecodedHS256(Jwt.Decode(token), secret, options ?? nil);
     }
 
@@ -232,8 +633,8 @@ class Jwt {
     // payload should decode once and come here, rather than decode, verify
     // (which decodes again) and read the payload from its own copy.
     //   d: the result of Jwt.Decode, or nil.
-    fn static VerifyDecodedHS256(d, secret:string, options?): bool {
-        if (d == nil) return false;
+    fn static VerifyDecodedHS256(d, secret, options?): bool {
+        if (d == nil || !_algIs(d, "HS256") || !_hmacSecretOk(secret)) return false;
         let expected = Crypto.HmacSha256(secret, d.signingInput);
         if (!Jwt._digestEq(expected, d.signatureHex)) return false;
         return Jwt.ValidateClaims(d.payload, options ?? nil);
@@ -257,10 +658,10 @@ class Jwt {
         return signingInput + "." + Util.Base64UrlEncode(sigBlock);
     }
 
-    fn static VerifyHS512(token:string, secret:string): bool {
+    fn static VerifyHS512(token:string, secret): bool {
         try {
             let d = Jwt.Decode(token);
-            if (d == nil) return false;
+            if (d == nil || !_algIs(d, "HS512") || !_hmacSecretOk(secret)) return false;
             let expected = Crypto.HmacSha512(secret, d.signingInput);
             return Jwt._digestEq(expected, d.signatureHex);
         } catch (_e) {
@@ -268,9 +669,9 @@ class Jwt {
         }
     }
 
-    fn static VerifyHS512WithClaims(token:string, secret:string, options?): bool {
+    fn static VerifyHS512WithClaims(token:string, secret, options?): bool {
         let d = Jwt.Decode(token);
-        if (d == nil) return false;
+        if (d == nil || !_algIs(d, "HS512") || !_hmacSecretOk(secret)) return false;
         let expected = Crypto.HmacSha512(secret, d.signingInput);
         if (!Jwt._digestEq(expected, d.signatureHex)) return false;
         return Jwt.ValidateClaims(d.payload, options ?? nil);
@@ -299,7 +700,7 @@ class Jwt {
     fn static VerifyEdDSA(token:string, publicKeyHex:string): bool {
         try {
             let d = Jwt.Decode(token);
-            if (d == nil) return false;
+            if (d == nil || !_algIs(d, "EdDSA")) return false;
             return Crypto.Ed25519Verify(d.signatureHex, publicKeyHex, d.signingInput);
         } catch (_e) {
             return false;
@@ -308,9 +709,149 @@ class Jwt {
 
     fn static VerifyEdDSAWithClaims(token:string, publicKeyHex:string, options?): bool {
         let d = Jwt.Decode(token);
-        if (d == nil) return false;
+        if (d == nil || !_algIs(d, "EdDSA")) return false;
         if (!Crypto.Ed25519Verify(d.signatureHex, publicKeyHex, d.signingInput)) return false;
         return Jwt.ValidateClaims(d.payload, options ?? nil);
+    }
+
+    // --------------------------------------------------------
+    //  RS256 / RS384 / RS512 / PS256 / ES256 - verification with a
+    //  public key
+    // --------------------------------------------------------
+
+    fn static KeyFromJwk(jwk) {
+        var j = jwk;
+        if (Type.IsString(j)) { j = Json.Parse(j); }
+        if (!Type.IsObject(j)) return nil;
+        if (j.use != nil && j.use != "sig") return nil;
+        let ops = j["key_ops"];
+        if (ops != nil && (!Type.IsArray(ops) || !Array.Contains(ops, "verify"))) return nil;
+        if (j.kty == "RSA") {
+            if (!Type.IsString(j.n) || !Type.IsString(j.e)) return nil;
+            let nb = Util.Base64DecodeBlock(j.n);
+            let eb = Util.Base64DecodeBlock(j.e);
+            if (nb == nil || eb == nil || len(nb) == 0 || len(eb) == 0) return nil;
+            return _rsaKey(BigInt.FromBytes(nb), BigInt.FromBytes(eb), j.alg, j.kid);
+        }
+        if (j.kty == "EC" && j.crv == "P-256") {
+            if (!Type.IsString(j.x) || !Type.IsString(j.y)) return nil;
+            let xb = Util.Base64DecodeBlock(j.x);
+            let yb = Util.Base64DecodeBlock(j.y);
+            // RFC 7518 6.2.1.2: each coordinate is the full 32 bytes.
+            if (xb == nil || yb == nil || len(xb) != 32 || len(yb) != 32) return nil;
+            return _ecKey(BigInt.FromBytes(xb), BigInt.FromBytes(yb), j.alg, j.kid);
+        }
+        return nil;
+    }
+
+    fn static KeyFromPem(pem) {
+        if (!Type.IsString(pem)) return nil;
+        var pkcs1 = false;
+        var label = "-----BEGIN PUBLIC KEY-----";
+        var at = String.IndexOf(pem, label);
+        if (at < 0) {
+            label = "-----BEGIN RSA PUBLIC KEY-----";
+            at = String.IndexOf(pem, label);
+            pkcs1 = true;
+        }
+        if (at < 0) return nil;
+        let start = at + len(label);
+        let stop = String.IndexOfFrom(pem, "-----END", start);
+        if (stop < 0) return nil;
+        var text = String.Substr(pem, start, stop - start);
+        text = String.Replace(String.Replace(String.Replace(String.Replace(text, "\r", ""), "\n", ""), " ", ""), "\t", "");
+        let b = Util.Base64DecodeBlock(text);
+        if (b == nil) return nil;
+        let end = len(b);
+        let it = Array.Create(3, Type.Int);
+        if (pkcs1) return _rsaFromDer(b, 0, end, it);
+        // SubjectPublicKeyInfo: SEQUENCE { SEQUENCE { OID, parameters }, BIT STRING }
+        if (!_der(b, 0, end, it) || it[0] != 0x30) return nil;
+        let spkiEnd = it[1] + it[2];
+        if (!_der(b, it[1], spkiEnd, it) || it[0] != 0x30) return nil;
+        let algEnd = it[1] + it[2];
+        if (!_der(b, it[1], algEnd, it) || it[0] != 0x06) return nil;
+        let oid = Util.BinToHex(Buffer.Slice(b, it[1], it[2]));
+        let paramAt = it[1] + it[2];
+        var curve = "";
+        if (paramAt < algEnd) {
+            if (!_der(b, paramAt, algEnd, it)) return nil;
+            if (it[0] == 0x06) { curve = Util.BinToHex(Buffer.Slice(b, it[1], it[2])); }
+        }
+        if (!_der(b, algEnd, spkiEnd, it) || it[0] != 0x03 || it[2] < 1 || Buffer.ReadU8At(b, it[1]) != 0) return nil;
+        let keyAt = it[1] + 1;
+        let keyEnd = it[1] + it[2];
+        if (oid == "2a864886f70d010101") return _rsaFromDer(b, keyAt, keyEnd, it);     // rsaEncryption
+        if (oid == "2a8648ce3d0201" && curve == "2a8648ce3d030107") {                     // id-ecPublicKey, P-256
+            if (keyEnd - keyAt != 65 || Buffer.ReadU8At(b, keyAt) != 4) return nil;      // uncompressed point
+            return _ecKey(BigInt.FromBytes(Buffer.Slice(b, keyAt + 1, 32)),
+                              BigInt.FromBytes(Buffer.Slice(b, keyAt + 33, 32)), nil, nil);
+        }
+        return nil;
+    }
+
+    fn static KeySet(jwks): array {
+        var j = jwks;
+        if (Type.IsString(j)) { j = Json.Parse(j); }
+        if (Type.IsObject(j) && j._pub == nil) { j = j.keys; }
+        let out = [];
+        if (!Type.IsArray(j)) return out;
+        foreach (x in j) {
+            let k = _asKey(x);
+            if (k != nil) { Array.Append(out, k); }
+        }
+        return out;
+    }
+
+    fn static VerifyRS256(token, key): bool { return _verifyAs(token, key, "RS256", false, nil); }
+    fn static VerifyRS384(token, key): bool { return _verifyAs(token, key, "RS384", false, nil); }
+    fn static VerifyRS512(token, key): bool { return _verifyAs(token, key, "RS512", false, nil); }
+    fn static VerifyPS256(token, key): bool { return _verifyAs(token, key, "PS256", false, nil); }
+    fn static VerifyES256(token, key): bool { return _verifyAs(token, key, "ES256", false, nil); }
+
+    fn static VerifyRS256WithClaims(token, key, options?): bool { return _verifyAs(token, key, "RS256", true, options ?? nil); }
+    fn static VerifyRS384WithClaims(token, key, options?): bool { return _verifyAs(token, key, "RS384", true, options ?? nil); }
+    fn static VerifyRS512WithClaims(token, key, options?): bool { return _verifyAs(token, key, "RS512", true, options ?? nil); }
+    fn static VerifyPS256WithClaims(token, key, options?): bool { return _verifyAs(token, key, "PS256", true, options ?? nil); }
+    fn static VerifyES256WithClaims(token, key, options?): bool { return _verifyAs(token, key, "ES256", true, options ?? nil); }
+
+    fn static VerifyWithKey(token, key, options?): bool {
+        try {
+            if (!Type.IsString(token)) return false;
+            let opts = options ?? nil;
+            let d = Jwt.Decode(token);
+            if (d == nil || !Type.IsObject(d.header)) return false;
+            let alg = d.header.alg;
+            if (!_algAllowed(alg, opts) || !_verifyPub(d, _asKey(key), alg)) return false;
+            return Jwt.ValidateClaims(d.payload, opts);
+        } catch (_e) {
+            return false;
+        }
+    }
+
+    fn static VerifyWithJwks(token, keys, options?): bool {
+        try {
+            if (!Type.IsString(token)) return false;
+            let opts = options ?? nil;
+            let d = Jwt.Decode(token);
+            if (d == nil || !Type.IsObject(d.header)) return false;
+            let alg = d.header.alg;
+            if (!_algAllowed(alg, opts)) return false;
+            let kid = d.header.kid;
+            var found = nil;
+            var count = 0;
+            foreach (k in Jwt.KeySet(keys)) {
+                if (!Array.Contains(_keyAlgs(k), alg) || (k.alg != nil && k.alg != alg)) continue;
+                if (kid != nil && k.kid != kid) continue;
+                if (found == nil) { found = k; }
+                count += 1;
+            }
+            if (found == nil || (kid == nil && count != 1)) return false;
+            if (!_verifyPub(d, found, alg)) return false;
+            return Jwt.ValidateClaims(d.payload, opts);
+        } catch (_e) {
+            return false;
+        }
     }
 
     // --------------------------------------------------------

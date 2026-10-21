@@ -1,0 +1,393 @@
+// Test suite for Modbus.fls
+//
+// Run: flarisvm tests/test_modbus.fls --libs=./libs
+//
+// Client and server run in this VM: TCP on an ephemeral loopback port, RTU over
+// a connected pair of loopback sockets (RTU over TCP, framed exactly as on a
+// serial line). Where the bytes on the wire matter, the test plays the other
+// side itself and compares against the frames printed in the Modbus specs.
+
+import { ModbusClient, ModbusServer, Modbus, ModbusError, ModbusTimeout, ModbusException } from library("Modbus", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) { testsFailed = testsFailed + 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+// Compared as JSON, so arrays compare by their elements.
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    let a = Json.Stringify(actual);
+    let e = Json.Stringify(expected);
+    if (a != e) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL: " + msg + "  expected=" + e + " got=" + a);
+    }
+}
+
+fn bytes(vals: array): block {
+    let b = Buffer.Create(len(vals), 1);
+    iter (i from 0 to len(vals)) { b[i] = vals[i]; }
+    return b;
+}
+
+fn hex(b): string {
+    if (b == nil) return "nil";
+    let parts = [];
+    iter (i from 0 to len(b)) { Array.Append(parts, String.PadLeft(Convert.ToRadixString(b[i], 16), 2, '0')); }
+    return String.ToUpper(String.Join(parts, " "));
+}
+
+// A connected pair of loopback TCP sockets: [client end, server end].
+fn async socketPair() {
+    let l = Stream.Listen("tcp", 0, 4, "127.0.0.1");
+    let a: string = Stream.LocalAddr(l);
+    let port = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1));
+    let c = await Stream.ConnectAsync("tcp", "127.0.0.1", port, 1000);
+    Stream.WaitReadable(l, 1000);
+    let s = Stream.Accept(l);
+    Stream.Close(l);
+    return [c, s];
+}
+
+// What the error raised by f is: [Kind, Code, is ModbusTimeout], or nil.
+fn failure(f) {
+    try { f(); } catch (e) {
+        if (e is ModbusError) return [e.Kind, e.Code, e is ModbusTimeout];
+        return ["other", e.Code, false];
+    }
+    return nil;
+}
+
+// ============================================================
+//  CRC-16/MODBUS
+// ============================================================
+
+fn test_crc() {
+    // The request in the Modbus over Serial Line guide: read 10 holding registers.
+    let crc = Modbus.Crc16(bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x0A]));
+    checkEq(hex(bytes([crc & 255, crc >> 8])), "C5 CD", "spec example 01 03 00 00 00 0A -> C5 CD");
+    // The read example of the application protocol spec, framed for RTU.
+    let c2 = Modbus.Crc16(bytes([0x11, 0x03, 0x00, 0x6B, 0x00, 0x03]));
+    checkEq(hex(bytes([c2 & 255, c2 >> 8])), "76 87", "11 03 00 6B 00 03 -> 76 87");
+    checkEq(Modbus.Crc16(bytes([])), 65535, "empty input is the initial register");
+    checkEq(Modbus.Crc16("123456789"), 0x4B37, "CRC-16/MODBUS check value");
+    checkEq(Modbus.Crc16(bytes([0x31])), Modbus.Crc16("1"), "one byte, block or string");
+}
+
+// ============================================================
+//  Register decoding
+// ============================================================
+
+fn test_decoding() {
+    // 10.0f is 0x41200000; its bytes A B C D are 41 20 00 00.
+    checkEq(Modbus.FromF32([10.0]),         [16672, 0], "F32 ABCD");
+    checkEq(Modbus.FromF32([10.0], "CDAB"), [0, 16672], "F32 CDAB");
+    checkEq(Modbus.FromF32([10.0], "BADC"), [8257, 0],  "F32 BADC");
+    checkEq(Modbus.FromF32([10.0], "DCBA"), [0, 8257],  "F32 DCBA");
+    foreach (o in ["ABCD", "CDAB", "BADC", "DCBA"]) {
+        checkEq(Modbus.ToF32(Modbus.FromF32([10.0, -1.5, 0.25], o), o), [10.0, -1.5, 0.25], "F32 round trip " + o);
+        checkEq(Modbus.ToU32(Modbus.FromU32([0x11223344, 4294967295], o), o), [287454020, 4294967295], "U32 round trip " + o);
+        checkEq(Modbus.ToI32(Modbus.FromI32([-2, 2147483647], o), o), [-2, 2147483647], "I32 round trip " + o);
+    }
+    checkEq(Modbus.FromU32([0x11223344]), [4386, 13124], "U32 ABCD is 0x1122 0x3344");
+    checkEq(Modbus.ToU32([0x3344, 0x1122], "CDAB"), [287454020], "U32 CDAB");
+    checkEq(Modbus.ToI16([65535, 32768, 32767, 0]), [-1, -32768, 32767, 0], "I16");
+    checkEq(Modbus.FromI16([-1, -32768, 5]), [65535, 32768, 5], "I16 to registers");
+    checkEq(len(Modbus.ToU32([1, 2, 3])), 1, "an odd register is left over");
+    check(failure(fn() { Modbus.ToU32([1, 2], "ABDC"); }) != nil, "an unknown order raises");
+}
+
+// ============================================================
+//  TCP: every function against the in-process server
+// ============================================================
+
+global gPort = 0;
+
+fn handler(unit, pdu) {
+    let f = pdu[0];
+    if (f == 8) return pdu;                                            // diagnostics echo
+    if (f == 3 && Buffer.ReadU16At(pdu, 1, true) == 900) {
+        throw new ModbusError(ModbusException.ServerDeviceBusy, "busy", 3, "exception");
+    }
+    if (f == 4 && Buffer.ReadU16At(pdu, 1, true) == 900) { Fiber.Sleep(250); }  // slower than the client waits
+    if (f == 3 && Buffer.ReadU16At(pdu, 1, true) == 901) { throw(1, "a handler bug"); }
+    if (unit == 99) return bytes([f, 0]);
+    return nil;
+}
+
+fn async test_tcp_functions() {
+    let srv = new ModbusServer({ holdingRegisters: 1000, inputRegisters: 1000, coils: 2000, discreteInputs: 2000,
+                                 handler: handler });
+    srv.HoldingRegisters[0] = 42;
+    srv.InputRegisters[10] = 7;
+    srv.InputRegisters[11] = 65535;
+    srv.DiscreteInputs[3] = 1;
+    srv.DiscreteInputs[1999] = 1;
+    gPort = srv.ListenTcp(0, "127.0.0.1");
+    check(gPort > 0, "ListenTcp returns the bound port");
+
+    let c = ModbusClient.Tcp("127.0.0.1", gPort, { timeoutMs: 120 });
+    checkEq(c.ReadHoldingRegisters(0, 3), [42, 0, 0], "0x03 read holding registers");
+    checkEq(c.ReadInputRegisters(10, 2), [7, 65535], "0x04 read input registers");
+    checkEq(c.ReadDiscreteInputs(0, 5), [false, false, false, true, false], "0x02 read discrete inputs");
+    checkEq(c.ReadDiscreteInputs(1990, 10)[9], true, "0x02 the last input of the table");
+
+    c.WriteSingleRegister(1, 65535);
+    checkEq(srv.HoldingRegisters[1], 65535, "0x06 write single register");
+    c.WriteMultipleRegisters(2, [1, 2, 3]);
+    checkEq(c.ReadHoldingRegisters(0, 5), [42, 65535, 1, 2, 3], "0x10 write multiple registers");
+    c.WriteSingleCoil(9, true);
+    checkEq(srv.Coils[9], 1, "0x05 write single coil on");
+    c.WriteSingleCoil(9, false);
+    checkEq(srv.Coils[9], 0, "0x05 write single coil off");
+    let pattern = [true, false, true, true, false, false, false, false, true, true, false, true];
+    c.WriteMultipleCoils(100, pattern);
+    checkEq(c.ReadCoils(100, 12), pattern, "0x0F write multiple coils, 0x01 read them back");
+    checkEq(c.ReadWriteMultipleRegisters(0, 4, 10, [9, 8]), [42, 65535, 1, 2], "0x17 read/write: the read");
+    checkEq(c.ReadHoldingRegisters(10, 2), [9, 8], "0x17 read/write: the write");
+    checkEq(c.ReadWriteMultipleRegisters(20, 2, 20, [5, 6]), [5, 6], "0x17 writes before it reads");
+    checkEq(len(c.ReadHoldingRegisters(0, 125)), 125, "125 registers in one read");
+    checkEq(len(c.ReadCoils(0, 2000)), 2000, "2000 coils in one read");
+    checkEq(hex(c.Request(8, bytes([0, 0, 0xA5, 0x37]))), "00 00 A5 37", "Request: a function from the handler");
+
+    // Exceptions
+    checkEq(failure(fn() { c.ReadHoldingRegisters(998, 5); }), ["exception", 2, false], "past the table: illegal data address");
+    checkEq(failure(fn() { c.Request(0x2B, bytes([14, 1, 0])); }), ["exception", 1, false], "unknown function: illegal function");
+    checkEq(failure(fn() { c.Request(3, bytes([0, 0, 0, 0])); }), ["exception", 3, false], "a zero count: illegal data value");
+    checkEq(failure(fn() { c.Request(5, bytes([0, 0, 0x12, 0x34])); }), ["exception", 3, false], "a coil value other than FF00/0000");
+    checkEq(failure(fn() { c.ReadHoldingRegisters(900, 1); }), ["exception", 6, false], "a handler's ModbusError answers its code");
+    checkEq(failure(fn() { c.ReadHoldingRegisters(901, 1); }), ["exception", 4, false], "any other handler error: device failure");
+    try { c.ReadHoldingRegisters(998, 5); } catch (e) {
+        checkEq(e.Function, 3, "the error names the function");
+        check(String.Contains(e.Error, "illegal data address"), "and says what went wrong");
+    }
+
+    // Arguments are checked before anything is sent
+    checkEq(failure(fn() { c.ReadCoils(0, 2001); }),             ["other", 3, false], "2001 coils is refused");
+    checkEq(failure(fn() { c.ReadHoldingRegisters(0, 126); }),   ["other", 3, false], "126 registers is refused");
+    checkEq(failure(fn() { c.ReadHoldingRegisters(65535, 2); }), ["other", 3, false], "a read past 65535 is refused");
+    let many = Array.Create(124, Type.Int);
+    checkEq(failure(fn() { c.WriteMultipleRegisters(0, many); }), ["other", 3, false], "124 registers to write is refused");
+
+    // Timeout, then the connection is made again
+    let t0 = Time.Millis();
+    checkEq(failure(fn() { c.ReadInputRegisters(900, 1); }), ["timeout", 0, true], "no answer in time is a ModbusTimeout");
+    check(Time.Millis() - t0 < 240, "the timeout is the client's, not the server's delay");
+    checkEq(c.ReadHoldingRegisters(0, 1), [42], "the next request reconnects");
+    c.SetTimeout(1000);
+    checkEq(c.ReadInputRegisters(900, 1), [0], "SetTimeout lengthens the wait");
+
+    // Unit ids
+    checkEq(hex(c.Request(3, bytes([0, 0, 0, 1]), 99)), "00", "the handler sees the unit id");
+    c.Close();
+
+    // Several fibers on one client take turns
+    let shared = ModbusClient.Tcp("127.0.0.1", gPort, { timeoutMs: 1000 });
+    let jobs = [];
+    iter (k from 0 to 8) {
+        Array.Append(jobs, (fn async (i) {
+            shared.WriteSingleRegister(500 + i, i * 3);
+            return shared.ReadHoldingRegisters(500 + i, 1)[0];
+        })(k));
+    }
+    checkEq(Fiber.AwaitAll(jobs), [0, 3, 6, 9, 12, 15, 18, 21], "concurrent requests on one client");
+    shared.Close();
+    srv.Stop();
+
+    let refused = ModbusClient.Tcp("127.0.0.1", gPort, { timeoutMs: 300 });
+    checkEq(failure(fn() { refused.ReadCoils(0, 1); }), ["io", 0, false], "nothing listening: an io error");
+    return 0;
+}
+
+// The MBAP header on the wire, against a hand-made request.
+fn async test_mbap_frames() {
+    let srv = new ModbusServer({ unit: 1 });
+    srv.HoldingRegisters[0] = 0x2A;
+    let port = srv.ListenTcp(0, "127.0.0.1");
+    let s = await Stream.ConnectAsync("tcp", "127.0.0.1", port, 1000);
+    await Stream.WriteAsync(s, bytes([0x00, 0x07, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01]));
+    checkEq(hex(await Stream.ReadAsync(s, 11, 1000)), "00 07 00 00 00 05 01 03 02 00 2A",
+            "MBAP: transaction id echoed, length, unit, PDU");
+    await Stream.WriteAsync(s, bytes([0x12, 0x34, 0x00, 0x00, 0x00, 0x06, 0x05, 0x03, 0x00, 0x00, 0x00, 0x01]));
+    checkEq(hex(await Stream.ReadAsync(s, 9, 1000)), "12 34 00 00 00 03 05 83 0B",
+            "a unit the server is not: gateway target exception");
+    // Two requests in one write are answered in order.
+    await Stream.WriteAsync(s, bytes([0, 1, 0, 0, 0, 6, 1, 6, 0, 3, 0, 9,  0, 2, 0, 0, 0, 6, 1, 3, 0, 3, 0, 1]));
+    checkEq(hex(await Stream.ReadAsync(s, 12, 1000)), "00 01 00 00 00 06 01 06 00 03 00 09", "pipelined: first answer");
+    checkEq(hex(await Stream.ReadAsync(s, 11, 1000)), "00 02 00 00 00 05 01 03 02 00 09", "pipelined: second answer");
+    Stream.Close(s);
+
+    // The client writes the frame the spec shows, and passes over a stale answer.
+    let l = Stream.Listen("tcp", 0, 4, "127.0.0.1");
+    let a: string = Stream.LocalAddr(l);
+    let c = ModbusClient.Tcp("127.0.0.1", Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1)),
+                             { unit: 0x11, timeoutMs: 1000 });
+    let req = (fn async () { return c.ReadHoldingRegisters(0x6B, 3); })();
+    Scheduler.Schedule(req);
+    Stream.WaitReadable(l, 1000);
+    let dev = Stream.Accept(l);
+    let got = await Stream.ReadAsync(dev, 12, 1000);
+    checkEq(hex(got), "00 01 00 00 00 06 11 03 00 6B 00 03", "client MBAP frame for the spec's read request");
+    await Stream.WriteAsync(dev, bytes([0x00, 0x00, 0, 0, 0, 9, 0x11, 3, 6, 0, 1, 0, 2, 0, 3]));                 // stale id 0
+    await Stream.WriteAsync(dev, bytes([0x00, 0x01, 0, 0, 0, 9, 0x11, 3, 6, 0x02, 0x2B, 0x00, 0x00, 0x00, 0x64])); // the answer
+    checkEq(await req, [555, 0, 100], "the spec's answer, after a stale one is skipped");
+    c.Close();
+    Stream.Close(dev);
+    Stream.Close(l);
+    srv.Stop();
+    return 0;
+}
+
+// ============================================================
+//  RTU
+// ============================================================
+
+// The client's frames against the serial-line guide, with the test as device.
+fn async test_rtu_client_frames() {
+    let p = await socketPair();
+    let c = ModbusClient.Rtu(p[0], { unit: 1, timeoutMs: 150, interFrameMs: 0 });
+    let req = (fn async () { return c.ReadHoldingRegisters(0, 10); })();
+    Scheduler.Schedule(req);
+    checkEq(hex(await Stream.ReadAsync(p[1], 8, 1000)), "01 03 00 00 00 0A C5 CD", "RTU request frame, CRC low byte first");
+    let answer = Buffer.Create(25, 1);
+    answer[0] = 1; answer[1] = 3; answer[2] = 20;
+    iter (i from 0 to 10) { answer[4 + 2 * i] = i + 1; }
+    let crc = Modbus.Crc16(Buffer.Slice(answer, 0, 23));
+    answer[23] = crc & 255; answer[24] = crc >> 8;
+    await Stream.WriteAsync(p[1], answer);
+    checkEq(await req, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "RTU answer decoded");
+
+    // A bad CRC is a protocol error.
+    let bad = (fn async () { return failure(fn() { c.ReadHoldingRegisters(0, 1); }); })();
+    Scheduler.Schedule(bad);
+    await Stream.ReadAsync(p[1], 8, 1000);
+    await Stream.WriteAsync(p[1], bytes([1, 3, 2, 0, 5, 0x00, 0x00]));
+    checkEq(await bad, ["protocol", 0, false], "a bad CRC is a protocol error");
+
+    // An exception answer.
+    let exc = (fn async () { return failure(fn() { c.WriteSingleCoil(1, true); }); })();
+    Scheduler.Schedule(exc);
+    checkEq(hex(await Stream.ReadAsync(p[1], 8, 1000)), "01 05 00 01 FF 00 DD FA", "write coil frame");
+    let e = bytes([1, 0x85, 2, 0, 0]);
+    let ec = Modbus.Crc16(Buffer.Slice(e, 0, 3));
+    e[3] = ec & 255; e[4] = ec >> 8;
+    await Stream.WriteAsync(p[1], e);
+    checkEq(await exc, ["exception", 2, false], "RTU exception answer");
+
+    // Silence: a timeout.
+    let t0 = Time.Millis();
+    checkEq(failure(fn() { c.ReadCoils(0, 1); }), ["timeout", 0, true], "no answer: ModbusTimeout");
+    check(Time.Millis() - t0 < 400, "after the client's timeout");
+    Stream.Close(p[0]);
+    Stream.Close(p[1]);
+    return 0;
+}
+
+fn async test_rtu_server() {
+    let p = await socketPair();
+    let srv = new ModbusServer({ unit: 17, handler: handler });
+    srv.HoldingRegisters[1] = 1234;
+    srv.ServeRtu(p[1]);
+    let c = ModbusClient.Rtu(p[0], { unit: 17, timeoutMs: 150, interFrameMs: 0 });
+    checkEq(c.ReadHoldingRegisters(0, 3), [0, 1234, 0], "RTU 0x03");
+    c.WriteMultipleRegisters(5, [7, 8]);
+    checkEq(srv.HoldingRegisters[6], 8, "RTU 0x10");
+    c.WriteSingleRegister(7, 70);
+    c.WriteSingleCoil(3, true);
+    c.WriteMultipleCoils(10, [true, true, false, true]);
+    checkEq(c.ReadCoils(0, 14), [false, false, false, true, false, false, false, false, false, false, true, true, false, true],
+            "RTU 0x05 / 0x0F / 0x01");
+    checkEq(c.ReadDiscreteInputs(0, 2), [false, false], "RTU 0x02");
+    checkEq(c.ReadInputRegisters(0, 2), [0, 0], "RTU 0x04");
+    checkEq(c.ReadWriteMultipleRegisters(5, 3, 8, [80]), [7, 8, 70], "RTU 0x17");
+    checkEq(hex(c.Request(8, bytes([0, 0, 0x12, 0x34]))), "00 00 12 34", "RTU: a function of no fixed layout");
+    checkEq(failure(fn() { c.ReadHoldingRegisters(9999, 2); }), ["exception", 2, false], "RTU exception from the map");
+    checkEq(failure(fn() { c.ReadHoldingRegisters(0, 1, 5); }), ["timeout", 0, true], "another unit is not answered");
+    checkEq(c.ReadHoldingRegisters(8, 1), [80], "and the line is usable after it");
+
+    c.WriteSingleRegister(20, 99, 0);
+    Fiber.Sleep(20);
+    checkEq(srv.HoldingRegisters[20], 99, "a broadcast write lands, with no answer awaited");
+    await Stream.WriteAsync(p[0], bytes([17, 3, 0, 0, 0, 1, 0, 0]));          // a corrupt frame
+    Fiber.Sleep(20);
+    checkEq(c.ReadHoldingRegisters(1, 1), [1234], "a corrupt frame gets no answer");
+    srv.Stop();
+    Stream.Close(p[0]);
+    Stream.Close(p[1]);
+    return 0;
+}
+
+// ============================================================
+//  Benchmarks
+// ============================================================
+
+fn async test_benchmarks() {
+    Console.WriteLine("");
+    Console.WriteLine("=== Modbus benchmarks ===");
+    let srv = new ModbusServer({});
+    let port = srv.ListenTcp(0, "127.0.0.1");
+    let c = ModbusClient.Tcp("127.0.0.1", port, { timeoutMs: 2000 });
+    c.ReadHoldingRegisters(0, 10);
+    let n = 2000;
+    let t0 = Time.Ticks();
+    iter (i from 0 to n) { c.ReadHoldingRegisters(0, 10); }
+    let ms = Time.TicksToMs(Time.Ticks() - t0);
+    Console.WriteLine("TCP loopback ReadHoldingRegisters(10): ",
+                      String.FormatArray("{0:.0f}", [float(n) / (ms / 1000.0)]), " requests/s");
+    c.Close();
+    srv.Stop();
+
+    let p = await socketPair();
+    let rs = new ModbusServer({});
+    rs.ServeRtu(p[1]);
+    let rc = ModbusClient.Rtu(p[0], { timeoutMs: 2000, interFrameMs: 0 });
+    let t1 = Time.Ticks();
+    iter (i from 0 to n) { rc.ReadHoldingRegisters(0, 10); }
+    let rms = Time.TicksToMs(Time.Ticks() - t1);
+    Console.WriteLine("RTU over a socket pair ReadHoldingRegisters(10): ",
+                      String.FormatArray("{0:.0f}", [float(n) / (rms / 1000.0)]), " requests/s");
+    rs.Stop();
+    Stream.Close(p[0]);
+    Stream.Close(p[1]);
+
+    let data = Buffer.Create(1048576, 1);
+    Buffer.FillPattern(data, "modbus");
+    Modbus.Crc16(data);
+    let t2 = Time.Ticks();
+    iter (i from 0 to 20) { Modbus.Crc16(data); }
+    let cms = Time.TicksToMs(Time.Ticks() - t2);
+    Console.WriteLine("CRC-16/MODBUS: ", String.FormatArray("{0:.0f}", [20.0 / (cms / 1000.0)]), " MB/s");
+
+    let frame = bytes([1, 3, 0, 0, 0, 10]);
+    let t3 = Time.Ticks();
+    iter (i from 0 to 100000) { Modbus.Crc16(frame); }
+    Console.WriteLine("CRC-16/MODBUS of an 8-byte frame: ",
+                      String.FormatArray("{0:.3f}", [Time.TicksToUs(Time.Ticks() - t3) / 100000.0]), " us");
+
+    let regs = Modbus.FromF32(Array.Create(5000, Type.Float));
+    let t4 = Time.Ticks();
+    Modbus.ToF32(regs, "CDAB");
+    Console.WriteLine("ToF32 of 10,000 registers: ", String.FormatArray("{0:.2f}", [Time.TicksToMs(Time.Ticks() - t4)]), " ms");
+    return 0;
+}
+
+fn async Main() {
+    Console.WriteLine("=== Modbus tests ===");
+    test_crc();
+    test_decoding();
+    await test_tcp_functions();
+    await test_mbap_frames();
+    await test_rtu_client_frames();
+    await test_rtu_server();
+    await test_benchmarks();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed > 0) { return 1; }
+    Console.WriteLine("✅ All Modbus tests passed!");
+    return 0;
+}

@@ -1,6 +1,7 @@
 // test_ai_extra.fls
 // Offline tests for AI helpers that do NOT need an Ollama server: the tool
-// (function-calling) definition builders and the image base64 helper.
+// (function-calling) definition builders, the image base64 helper, the request
+// payload and the reply timeout.
 // The live tool-calling loop (AI.RunTools) and Vision are exercised by
 // test_ai.fls when a capable model is available.
 //
@@ -70,6 +71,46 @@ fn test_image_file() {
     File.Delete(path);
 }
 
+fn test_model_options() {
+    Console.WriteLine("-- model options");
+
+    let c = AI.Client("http://127.0.0.1:1");
+    let p = c._chatPayload("m", [], false,
+        { temperature: 0.0, seed: 7, top_p: 0.9, num_ctx: 32768, think: true, timeoutMs: 5 });
+    checkEq(p.options.temperature, 0.0, "temperature");
+    checkEq(p.options.seed, 7, "seed together with temperature and top_p");
+    checkEq(p.options.top_p, 0.9, "top_p together with temperature and seed");
+    checkEq(p.options.num_ctx, 32768, "num_ctx reaches options");
+    checkEq(p.think, true, "think stays top-level");
+    check(!("think" in p.options), "think is not a model option");
+    check(!("timeoutMs" in p.options), "timeoutMs is not sent to Ollama");
+
+    let g = c._genPayload("m", "hi", false, { num_predict: 64, stop: ["\n\n"] });
+    checkEq(g.options.num_predict, 64, "generate: num_predict");
+    checkEq(g.options.stop[0], "\n\n", "generate: stop");
+
+    check(!("options" in c._chatPayload("m", [], false, { think: false })),
+          "no model option -> no options object");
+}
+
+// A server that never answers: the per-call timeoutMs ends the request.
+fn test_reply_timeout() {
+    Console.WriteLine("-- reply timeout");
+
+    // Where the client connects: a dual-stack port 0 can be one held on 127.0.0.1 alone.
+    let srv = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(srv);
+    let port = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10));
+    let c = AI.Client("http://127.0.0.1:" + Convert.ToString(port));
+
+    let t0 = Time.Ticks();
+    let reply = c.Chat("m", [{ role: "user", content: "hi" }], { timeoutMs: 300 });
+    let ms = Time.TicksToMs(Time.Ticks() - t0);
+    checkEq(reply, nil, "no answer -> nil");
+    check(ms < 5000, "timeoutMs ended the wait");
+    Stream.Close(srv);
+}
+
 fn test_benchmarks() {
     Console.WriteLine("=== AI helper benchmarks ===");
     let iters = 20000;
@@ -89,6 +130,8 @@ fn Main() {
     test_tool_builder();
     test_tool_result();
     test_image_file();
+    test_model_options();
+    test_reply_timeout();
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

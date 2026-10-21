@@ -1,4 +1,4 @@
-// WebSocket.fls - WebSocket client for Flaris. Requires --unsafe flag.
+// WebSocket.fls - WebSocket client and server side for Flaris.
 // Version: 1.0
 //
 // Implements RFC 6455 handshake and framing, for both directions: WebSocket
@@ -31,8 +31,7 @@
 //   WebSocket.ConnectUrl(url, extraHeaders?)  →  instance   - "ws://..." or "wss://..."
 //   - path defaults to "/"; secure=true upgrades the transport to TLS (wss://)
 //   - extraHeaders is an optional object: { "Authorization": "Bearer ..." }
-//   wss:// runs over Stream.ConnectTls (no plugin); --unsafe is still required
-//   because the framing uses the Memory module.
+//   wss:// runs over Stream.ConnectTls (no plugin, no --unsafe).
 //
 // Sending:
 //   SendText(text)       →  bool
@@ -48,6 +47,11 @@
 //                                        fibers keep running while it waits
 //   ReceiveTextWhenReady(timeoutMs?) →  string or nil on timeout
 //
+// Limits:
+//   SetMaxMessageBytes(bytes)  →  this  - largest payload accepted (default
+//       16 MiB). A peer that declares more gets close code 1009 and the
+//       connection ends without allocating the declared size.
+//
 // Control:
 //   Ping(data?)          →  bool
 //   Pong(data?)          →  bool
@@ -61,17 +65,26 @@
 //   Ws.OpcodePong()  Ws.OpcodeClose()   Ws.OpcodeCont()
 
 import { Util } from library("Util", "1.0");
+
+// Frame opcodes (RFC 6455 5.2), as the Ws.Opcode*() accessors return them.
+const WS_OP_CONT   = 0x0;
+const WS_OP_TEXT   = 0x1;
+const WS_OP_BINARY = 0x2;
+const WS_OP_CLOSE  = 0x8;
+const WS_OP_PING   = 0x9;
+const WS_OP_PONG   = 0xA;
+
 class Ws {
     fn static Guid(): string {
         return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     }
 
-    fn static OpcodeCont(): int   { return 0x0; }
-    fn static OpcodeText(): int   { return 0x1; }
-    fn static OpcodeBinary(): int { return 0x2; }
-    fn static OpcodeClose(): int  { return 0x8; }
-    fn static OpcodePing(): int   { return 0x9; }
-    fn static OpcodePong(): int   { return 0xA; }
+    fn static OpcodeCont(): int   { return WS_OP_CONT; }
+    fn static OpcodeText(): int   { return WS_OP_TEXT; }
+    fn static OpcodeBinary(): int { return WS_OP_BINARY; }
+    fn static OpcodeClose(): int  { return WS_OP_CLOSE; }
+    fn static OpcodePing(): int   { return WS_OP_PING; }
+    fn static OpcodePong(): int   { return WS_OP_PONG; }
 
     fn static EnsurePath(path: string): string {
         if (path == nil || path == "") return "/";
@@ -157,8 +170,8 @@ class Ws {
     }
 
     fn static WriteU16BE(buf: block, off: int, v: int) {
-        Buffer.WriteU8At(buf, off, (v >> 8) & 255);
-        Buffer.WriteU8At(buf, off + 1, v & 255);
+        Buffer.WriteU8At(buf, off, v >> 8);
+        Buffer.WriteU8At(buf, off + 1, v);
     }
 
     fn static ReadU64BE(buf: block, off: int): int {
@@ -174,54 +187,38 @@ class Ws {
     fn static WriteU64BE(buf: block, off: int, v: int) {
         let i = 7;
         while (i >= 0) {
-            Buffer.WriteU8At(buf, off + i, v & 255);
+            Buffer.WriteU8At(buf, off + i, v);
             v = v >> 8;
             i -= 1;
         }
     }
 
     fn static XorMaskInPlace(buf: block, mask: block, count: int) {
-        let m0 = Buffer.ReadU8At(mask, 0);
-        let m1 = Buffer.ReadU8At(mask, 1);
-        let m2 = Buffer.ReadU8At(mask, 2);
-        let m3 = Buffer.ReadU8At(mask, 3);
-        let i = 0;
-        let end4 = count - (count & 3);
-        while (i < end4) {
-            Buffer.WriteU8At(buf, i, Buffer.ReadU8At(buf, i)   ^ m0);
-            Buffer.WriteU8At(buf, i+1, Buffer.ReadU8At(buf, i+1) ^ m1);
-            Buffer.WriteU8At(buf, i+2, Buffer.ReadU8At(buf, i+2) ^ m2);
-            Buffer.WriteU8At(buf, i+3, Buffer.ReadU8At(buf, i+3) ^ m3);
-            i += 4;
-        }
-        let ms: [int] = [m0, m1, m2, m3];
-        while (i < count) {
-            Buffer.WriteU8At(buf, i, Buffer.ReadU8At(buf, i) ^ ms[i & 3]);
-            i += 1;
-        }
+        Ws.XorMaskRangeInPlace(buf, 0, mask, count);
     }
 
     fn static XorMaskRangeInPlace(buf: block, start: int, mask: block, count: int) {
-        let m0 = Buffer.ReadU8At(mask, 0);
-        let m1 = Buffer.ReadU8At(mask, 1);
-        let m2 = Buffer.ReadU8At(mask, 2);
-        let m3 = Buffer.ReadU8At(mask, 3);
-        let i = 0;
-        let end4 = count - (count & 3);
-        while (i < end4) {
-            let off = start + i;
-            Buffer.WriteU8At(buf, off, Buffer.ReadU8At(buf, off)   ^ m0);
-            Buffer.WriteU8At(buf, off+1, Buffer.ReadU8At(buf, off+1) ^ m1);
-            Buffer.WriteU8At(buf, off+2, Buffer.ReadU8At(buf, off+2) ^ m2);
-            Buffer.WriteU8At(buf, off+3, Buffer.ReadU8At(buf, off+3) ^ m3);
-            i += 4;
+        Ws.XorWordInPlace(buf, start, Buffer.ReadU32At(mask, 0), count);
+    }
+
+    // `m` is the masking key as Buffer.ReadU32At reads it (little-endian), so
+    // key byte k is (m >> 8k) & 255. Four bytes per step: the payload read the
+    // same way lines up with it byte for byte. The 0-3 bytes past the last
+    // whole word go one at a time.
+    fn static XorWordInPlace(buf: block, start: int, m: int, count: int): int {
+        let end4: int = start + count - (count & 3);
+        var off: int = start;
+        while (off < end4) {
+            Buffer.WriteU32At(buf, off, Buffer.ReadU32At(buf, off) ^ m);
+            off += 4;
         }
-        let ms: [int] = [m0, m1, m2, m3];
-        while (i < count) {
-            let off = start + i;
-            Buffer.WriteU8At(buf, off, Buffer.ReadU8At(buf, off) ^ ms[i & 3]);
-            i += 1;
+        var sh: int = 0;
+        while (off < start + count) {
+            Buffer.WriteU8At(buf, off, Buffer.ReadU8At(buf, off) ^ ((m >> sh) & 255));
+            off += 1;
+            sh += 8;
         }
+        return count;
     }
 
     fn static HeaderGet(headers: object, name: string): string {
@@ -288,7 +285,7 @@ class Ws {
     }
 
     fn static ValidateControlPayload(opcode:int, payloadLen:int) {
-        if (opcode == Ws.OpcodeClose() || opcode == Ws.OpcodePing() || opcode == Ws.OpcodePong()) {
+        if (opcode == WS_OP_CLOSE || opcode == WS_OP_PING || opcode == WS_OP_PONG) {
             if (payloadLen > 125) {
                 throw(Exception.RuntimeError, "Control frame payload too large");
             }
@@ -302,6 +299,8 @@ class Ws {
 
 // How long _readExact waits for a frame that has not fully arrived yet.
 global WS_READ_WAIT_MS:int = 5000;
+// The default for SetMaxMessageBytes.
+const WS_MAX_MESSAGE_BYTES = 16777216;
 
 class WebSocketClient {
     let host = nil; 
@@ -314,6 +313,7 @@ class WebSocketClient {
     let closed = nil; 
     let maskOut = true;      // clients mask outgoing frames; servers must not
     let requireMask = false; // servers must refuse an unmasked client frame
+    let maxMessageBytes:int = WS_MAX_MESSAGE_BYTES;
     fn static Connect(host: string, port: int, path, headers, secure): instance {
         // wss:// and ws:// differ only in how the stream is opened; the framing
         // below is identical for both. The connect (and TLS handshake) runs on
@@ -387,15 +387,24 @@ class WebSocketClient {
         return !this.closed && Stream.IsOpen(this.sock);
     }
 
+    // The largest frame payload this side accepts; fragments are refused, so
+    // that is also the largest message. A peer that declares more gets close
+    // code 1009 (message too big) and the connection ends before anything is
+    // allocated for the payload.
+    fn SetMaxMessageBytes(bytes: int) {
+        this.maxMessageBytes = bytes;
+        return this;
+    }
+
     fn CloseCode(): int { return this.closeCode; }
     fn CloseReason(): string { return this.closeReason; }
 
     fn SendText(text: string): bool {
-        return this.SendFrame(Ws.OpcodeText(), Ws.StringToBlock(text));
+        return this.SendFrame(WS_OP_TEXT, text);
     }
 
     fn SendBinary(data: block): bool {
-        return this.SendFrame(Ws.OpcodeBinary(), data);
+        return this.SendFrame(WS_OP_BINARY, data);
     }
 
     fn SendJson(value): bool {
@@ -418,7 +427,7 @@ class WebSocketClient {
             throw(Exception.RuntimeError, "Ping payload too large");
         }
 
-        return this.SendFrame(Ws.OpcodePing(), payload);
+        return this.SendFrame(WS_OP_PING, payload);
     }
 
     fn Pong(data): bool {
@@ -437,7 +446,7 @@ class WebSocketClient {
             throw(Exception.RuntimeError, "Pong payload too large");
         }
 
-        return this.SendFrame(Ws.OpcodePong(), payload);
+        return this.SendFrame(WS_OP_PONG, payload);
     }
 
     fn Close(code, reason): bool {
@@ -468,7 +477,7 @@ class WebSocketClient {
             payload = buf;
         }
 
-        this.SendFrame(Ws.OpcodeClose(), payload);
+        this.SendFrame(WS_OP_CLOSE, payload);
         this.closed = true;
         Stream.Close(this.sock);
         return true;
@@ -482,16 +491,17 @@ class WebSocketClient {
         return true;
     }
 
+    // `payload` is a block, a string (its bytes are sent as they are) or nil.
     fn SendFrame(opcode: int, payload): bool {
         if (this.closed) {
             throw(Exception.InvalidState, "WebSocket already closed");
         }
 
         let data = payload;
-        if (data == nil) data = Buffer.Create(0, 1);
-
-        let n = len(data);
-        Ws.ValidateControlPayload(opcode, n);
+        let isText = data != nil && Type.IsString(data);
+        let n:int = (data == nil) ? 0 : len(data);
+        // Only a control frame (opcode 8 and up) has a size limit to check.
+        if (opcode >= WS_OP_CLOSE && n > 125) { Ws.ValidateControlPayload(opcode, n); }
 
         let headerLen = 2;
         if (n >= 126 && n <= 65535) {
@@ -505,32 +515,30 @@ class WebSocketClient {
         let maskLen = this.maskOut ? 4 : 0;
         let maskBit = this.maskOut ? 0x80 : 0x00;
 
+        // Every byte is written below, so the frame is not cleared first.
         let frame = Buffer.Create(headerLen + maskLen + n, 1);
-        Buffer.Fill(frame, 0);
 
-        Buffer.WriteU8At(frame, 0, 0x80 | (opcode & 0x0F));
-
+        let b0 = 0x80 | (opcode & 0x0F);
         if (n < 126) {
-            Buffer.WriteU8At(frame, 1, maskBit | n);
+            Buffer.WriteU16At(frame, 0, (b0 << 8) | maskBit | n, true);
         } else if (n <= 65535) {
-            Buffer.WriteU8At(frame, 1, maskBit | 126);
-            Ws.WriteU16BE(frame, 2, n);
+            Buffer.WriteU16At(frame, 0, (b0 << 8) | maskBit | 126, true);
+            Buffer.WriteU16At(frame, 2, n, true);
         } else {
-            Buffer.WriteU8At(frame, 1, maskBit | 127);
+            Buffer.WriteU16At(frame, 0, (b0 << 8) | maskBit | 127, true);
             Ws.WriteU64BE(frame, 2, n);
         }
 
         let payloadOff = headerLen + maskLen;
 
+        if (n > 0) {
+            if (isText) { Buffer.CopyStringAt(frame, payloadOff, data, n); }
+            else        { Buffer.Copy(data, 0, frame, payloadOff, n); }
+        }
         if (this.maskOut) {
             let mask = Crypto.RandomBytes(4);
             Buffer.Copy(mask, 0, frame, headerLen, 4);
-            if (n > 0) {
-                Buffer.Copy(data, 0, frame, payloadOff, n);
-                Ws.XorMaskRangeInPlace(frame, payloadOff, mask, n);
-            }
-        } else if (n > 0) {
-            Buffer.Copy(data, 0, frame, payloadOff, n);
+            if (n > 0) { Ws.XorMaskRangeInPlace(frame, payloadOff, mask, n); }
         }
 
         return Stream.WriteAll(this.sock, frame);
@@ -544,12 +552,15 @@ class WebSocketClient {
     // goes quiet mid-frame is dead - and a nil read means the peer closed.
     fn _readExact(count:int) {
         if (count == 0) { return Buffer.Create(0, 1); }
-        let out = Buffer.Create(count, 1);
+        var out = nil;
         var off:int = 0;
         while (off < count) {
             if (Stream.WaitReadable(this.sock, WS_READ_WAIT_MS) != true) { return nil; }
             let chunk = Stream.ReadBytes(this.sock, count - off);
             if (chunk == nil) { return nil; }
+            // All of it in one read is the common case: that block is the result.
+            if (off == 0 && len(chunk) == count) { return chunk; }
+            if (out == nil) { out = Buffer.Create(count, 1); }
             Buffer.Copy(chunk, 0, out, off, len(chunk));
             off += len(chunk);
         }
@@ -567,8 +578,9 @@ class WebSocketClient {
             throw(Exception.IOError, "Failed to read WebSocket frame header");
         }
 
-        let b0 = Buffer.ReadU8At(head, 0);
-        let b1 = Buffer.ReadU8At(head, 1);
+        let hv = Buffer.ReadU16At(head, 0, true);
+        let b0 = hv >> 8;
+        let b1 = hv & 0xFF;
 
         let fin = (b0 & 0x80) != 0;
         let rsv = b0 & 0x70;
@@ -589,7 +601,7 @@ class WebSocketClient {
             if (ext2 == nil) {
                 throw(Exception.IOError, "Failed to read extended payload length");
             }
-            payloadLen = Ws.ReadU16BE(ext2, 0);
+            payloadLen = Buffer.ReadU16At(ext2, 0, true);
         } else {
             let ext8 = this._readExact(8);
             if (ext8 == nil) {
@@ -598,9 +610,20 @@ class WebSocketClient {
             payloadLen = Ws.ReadU64BE(ext8, 0);
         }
 
-        Ws.ValidateControlPayload(opcode, payloadLen);
+        if (opcode >= WS_OP_CLOSE && payloadLen > 125) { Ws.ValidateControlPayload(opcode, payloadLen); }
 
-        if ((opcode == Ws.OpcodeClose() || opcode == Ws.OpcodePing() || opcode == Ws.OpcodePong()) && !fin) {
+        // A 64-bit length with the top bit set reads as negative.
+        if (payloadLen < 0 || payloadLen > this.maxMessageBytes) {
+            let reason = "message of " + str(payloadLen) + " bytes exceeds the limit of "
+                       + str(this.maxMessageBytes);
+            if (Stream.IsOpen(this.sock)) { this.Close(1009, "message too big"); }
+            this.closed      = true;
+            this.closeCode   = 1009;
+            this.closeReason = reason;
+            throw(Exception.RuntimeError, reason);
+        }
+
+        if ((opcode == WS_OP_CLOSE || opcode == WS_OP_PING || opcode == WS_OP_PONG) && !fin) {
             throw(Exception.RuntimeError, "Fragmented control frames not allowed");
         }
 
@@ -610,25 +633,30 @@ class WebSocketClient {
             throw(Exception.RuntimeError, "Unmasked frame from client");
         }
 
-        let maskKey = nil;
-        if (masked) {
-            maskKey = this._readExact(4);
-            if (maskKey == nil) {
-                throw(Exception.IOError, "Failed to read masking key");
-            }
-        }
-
-        let payload = Buffer.Create(payloadLen, 1);
-        if (payloadLen > 0) {
-            let raw = this._readExact(payloadLen);
-            if (raw == nil) {
+        var payload = nil;
+        if (masked && payloadLen > 0 && payloadLen <= 1024) {
+            // A small frame's key and payload come in one read; the copy out
+            // costs less than a second read would.
+            let both = this._readExact(4 + payloadLen);
+            if (both == nil) {
                 throw(Exception.IOError, "Failed to read frame payload");
             }
-            Buffer.Copy(raw, 0, payload, 0, payloadLen);
-        }
-
-        if (masked && payloadLen > 0) {
-            Ws.XorMaskInPlace(payload, maskKey, payloadLen);
+            Ws.XorWordInPlace(both, 4, Buffer.ReadU32At(both, 0), payloadLen);
+            payload = Buffer.Slice(both, 4, payloadLen);
+        } else {
+            var m: int = 0;
+            if (masked) {
+                let maskKey = this._readExact(4);
+                if (maskKey == nil) {
+                    throw(Exception.IOError, "Failed to read masking key");
+                }
+                m = Buffer.ReadU32At(maskKey, 0);
+            }
+            payload = this._readExact(payloadLen);
+            if (payload == nil) {
+                throw(Exception.IOError, "Failed to read frame payload");
+            }
+            if (masked && payloadLen > 0) { Ws.XorWordInPlace(payload, 0, m, payloadLen); }
         }
 
         if (!fin) {
@@ -647,11 +675,11 @@ class WebSocketClient {
             CloseReason: nil
         };
 
-        if (opcode == Ws.OpcodeText()) {
+        if (opcode == WS_OP_TEXT) {
             frame.Text = Ws.BlockToString(payload);
         }
 
-        if (opcode == Ws.OpcodeClose()) {
+        if (opcode == WS_OP_CLOSE) {
             if (payloadLen == 1) {
                 throw(Exception.RuntimeError, "Invalid close frame payload length");
             }
@@ -674,20 +702,23 @@ class WebSocketClient {
         while (true) {
             let frame = this.ReadFrame();
 
-            if (frame.Opcode == Ws.OpcodePing()) {
+            if (frame.Opcode == WS_OP_PING) {
                 this.Pong(frame.Payload);
                 continue;
             }
 
-            if (frame.Opcode == Ws.OpcodeClose()) {
-                this.closed = true;
+            if (frame.Opcode == WS_OP_CLOSE) {
                 this.closeCode = frame.CloseCode ?? 0;
                 this.closeReason = frame.CloseReason ?? "";
 
+                // The reply completes the close handshake; it goes out before
+                // the connection is marked closed, since SendFrame refuses one
+                // that is.
                 if (Stream.IsOpen(this.sock)) {
-                    this.SendFrame(Ws.OpcodeClose(), nil);
+                    this.SendFrame(WS_OP_CLOSE, nil);
                     Stream.Close(this.sock);
                 }
+                this.closed = true;
 
                 return frame;
             }
@@ -739,7 +770,7 @@ class WebSocketClient {
 
     fn ReceiveText(): string {
         let frame = this.Receive();
-        if (frame.Opcode != Ws.OpcodeText()) {
+        if (frame.Opcode != WS_OP_TEXT) {
             throw(Exception.RuntimeError, "Expected text frame");
         }
         return frame.Text;
@@ -747,7 +778,7 @@ class WebSocketClient {
 
     fn ReceiveBinary(): block {
         let frame = this.Receive();
-        if (frame.Opcode != Ws.OpcodeBinary()) {
+        if (frame.Opcode != WS_OP_BINARY) {
             throw(Exception.RuntimeError, "Expected binary frame");
         }
         return frame.Payload;

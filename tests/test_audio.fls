@@ -343,6 +343,136 @@ fn test_wav_io(a) {
     check(!File.Exists(path), "WAV file cleaned up");
 }
 
+// A RIFF/WAVE file with a LIST chunk of odd size (so a pad byte follows) in
+// front of "fmt ", then "data".
+fn wavFile(format: int, channels: int, rate: int, bits: int, data: block, extensible: bool): block {
+    let fmtLen = extensible ? 40 : 16;
+    let dn = len(data);
+    let total = 12 + 22 + 8 + fmtLen + 8 + dn + (dn & 1);
+    let b = Buffer.Create(total, 1);
+    Buffer.CopyStringAt(b, 0, "RIFF", 4);
+    Buffer.WriteU32At(b, 4, total - 8);
+    Buffer.CopyStringAt(b, 8, "WAVELIST", 8);
+    Buffer.WriteU32At(b, 16, 13);
+    Buffer.CopyStringAt(b, 20, "INFOISFT", 8);
+    Buffer.WriteU32At(b, 28, 1);
+    Buffer.CopyStringAt(b, 32, "x", 1);
+    var p = 34;
+    Buffer.CopyStringAt(b, p, "fmt ", 4);
+    Buffer.WriteU32At(b, p + 4, fmtLen);
+    Buffer.WriteU16At(b, p + 8, extensible ? 0xFFFE : format);
+    Buffer.WriteU16At(b, p + 10, channels);
+    Buffer.WriteU32At(b, p + 12, rate);
+    Buffer.WriteU32At(b, p + 16, rate * channels * bits / 8);
+    Buffer.WriteU16At(b, p + 20, channels * bits / 8);
+    Buffer.WriteU16At(b, p + 22, bits);
+    if (extensible) {
+        Buffer.WriteU16At(b, p + 24, 22);
+        Buffer.WriteU16At(b, p + 26, bits);
+        Buffer.WriteU32At(b, p + 28, 4);
+        Buffer.WriteU16At(b, p + 32, format);       // the sub-format GUID starts with the format code
+    }
+    p = p + 8 + fmtLen;
+    Buffer.CopyStringAt(b, p, "data", 4);
+    Buffer.WriteU32At(b, p + 4, dn);
+    if (dn > 0) { Buffer.Copy(data, 0, b, p + 8, dn); }
+    return b;
+}
+
+fn readWavBytes(a, bytes: block) {
+    let path = Os.TempDir() + "/test_audio_chunks.wav";
+    File.WriteAllBytes(path, bytes);
+    let w = a.ReadWav(path);
+    File.Delete(path);
+    return w;
+}
+
+fn test_wav_chunks_and_encodings(a) {
+    Console.WriteLine("== WAV chunks and encodings ==");
+
+    let d16 = Buffer.Create(4, 1);
+    Buffer.WriteU16At(d16, 0, 1000);
+    Buffer.WriteU16At(d16, 2, 64536);               // -1000
+    let w16 = readWavBytes(a, wavFile(1, 1, 8000, 16, d16, false));
+    check(w16 != nil, "16-bit after a LIST chunk reads");
+    checkEq(w16.sampleRate, 8000, "16-bit sampleRate from the fmt chunk");
+    checkEq(w16.channels, 1, "16-bit channels");
+    checkEq(len(w16.signal), 2, "16-bit sample count from the data chunk");
+    checkEq(w16.signal[0], 1000 / 32768.0, "16-bit first sample");
+    checkEq(w16.signal[1], -1000 / 32768.0, "16-bit second sample");
+
+    let d24 = Buffer.Create(12, 1);
+    Buffer.WriteU32At(d24, 0, 8388607);             // 3 bytes per sample, little-endian
+    Buffer.WriteU32At(d24, 3, 8388608);             // -8388608 as 24 bits
+    Buffer.WriteU32At(d24, 6, 12345);
+    Buffer.WriteU16At(d24, 9, 0);
+    let w24 = readWavBytes(a, wavFile(1, 2, 44100, 24, d24, false));
+    check(w24 != nil, "24-bit stereo reads");
+    checkEq(w24.channels, 2, "24-bit channels");
+    checkEq(w24.bits, 24, "24-bit bits");
+    checkEq(len(w24.signal), 4, "24-bit stereo keeps both channels, interleaved");
+    checkEq(w24.signal[0], 8388607 / 8388608.0, "24-bit max");
+    checkEq(w24.signal[1], -1.0, "24-bit min");
+    checkEq(w24.signal[2], 12345 / 8388608.0, "24-bit positive");
+
+    let d8 = Buffer.Create(3, 1);
+    Buffer.WriteU8At(d8, 0, 0);
+    Buffer.WriteU8At(d8, 1, 128);
+    Buffer.WriteU8At(d8, 2, 255);
+    let w8 = readWavBytes(a, wavFile(1, 1, 8000, 8, d8, false));
+    check(w8 != nil, "8-bit reads (odd data size, padded)");
+    checkEq(w8.signal[0], -1.0, "8-bit 0 is -1");
+    checkEq(w8.signal[1], 0.0, "8-bit 128 is 0");
+    checkEq(w8.signal[2], 127 / 128.0, "8-bit 255");
+
+    let df = Buffer.Create(8, 1);
+    Buffer.WriteFloat32At(df, 0, 0.5);
+    Buffer.WriteFloat32At(df, 4, -0.25);
+    let wf = readWavBytes(a, wavFile(3, 2, 48000, 32, df, false));
+    check(wf != nil, "float32 reads");
+    checkEq(wf.signal[0], 0.5, "float32 first sample");
+    checkEq(wf.signal[1], -0.25, "float32 second sample");
+
+    let d32 = Buffer.Create(12, 1);
+    Buffer.WriteU32At(d32, 0, 2147483647);
+    Buffer.WriteU32At(d32, 4, 2147483648);          // -2147483648
+    Buffer.WriteU32At(d32, 8, 4294967295);          // -1
+    let w32 = readWavBytes(a, wavFile(1, 1, 8000, 32, d32, false));
+    check(w32 != nil, "32-bit reads");
+    checkEq(w32.signal[0], 2147483647 / 2147483648.0, "32-bit max");
+    checkEq(w32.signal[1], -1.0, "32-bit min");
+    checkEq(w32.signal[2], -1 / 2147483648.0, "32-bit -1");
+
+    let dd = Buffer.Create(16, 1);
+    Buffer.WriteFloat64At(dd, 0, 0.125);
+    Buffer.WriteFloat64At(dd, 8, -0.75);
+    let wd = readWavBytes(a, wavFile(3, 1, 48000, 64, dd, false));
+    check(wd != nil, "float64 reads");
+    checkEq(wd.signal[0], 0.125, "float64 first sample");
+    checkEq(wd.signal[1], -0.75, "float64 second sample");
+
+    let d16odd = Buffer.Create(5, 1);
+    Buffer.WriteU16At(d16odd, 0, 32767);
+    Buffer.WriteU16At(d16odd, 2, 32768);            // -32768
+    let wo = readWavBytes(a, wavFile(1, 1, 8000, 16, d16odd, false));
+    checkEq(len(wo.signal), 2, "16-bit: a trailing partial sample is dropped");
+    checkEq(wo.signal[1], -1.0, "16-bit min");
+
+    let short = wavFile(1, 1, 8000, 16, d16, false);
+    Buffer.WriteU32At(short, len(short) - 8, 1000); // data size past the end of the file
+    let ws = readWavBytes(a, short);
+    check(ws != nil && len(ws.signal) == 2, "16-bit: data size past the end reads what is there");
+
+    let we = readWavBytes(a, wavFile(1, 1, 22050, 16, d16, true));
+    check(we != nil, "WAVE_FORMAT_EXTENSIBLE PCM reads");
+    checkEq(we.sampleRate, 22050, "extensible sampleRate");
+    checkEq(we.signal[0], 1000 / 32768.0, "extensible first sample");
+
+    check(readWavBytes(a, wavFile(2, 1, 8000, 4, Buffer.Create(16, 1), false)) == nil, "ADPCM is rejected with nil");
+    check(readWavBytes(a, Buffer.FromString("RIFX....WAVEnot a wav file")) == nil, "a file that is not RIFF/WAVE gives nil");
+    check(a.ReadWav(Os.TempDir() + "/test_audio_missing.wav") == nil, "a missing file gives nil");
+}
+
 // ============================================================
 //  Benchmarks
 // ============================================================
@@ -472,6 +602,7 @@ fn Main() {
     test_utility(a);
     test_editing(a);
     test_wav_io(a);
+    test_wav_chunks_and_encodings(a);
 
     // ============================================================
     //  9. Additional Normalize / StereoToMono / Mix inline tests

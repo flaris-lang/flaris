@@ -20,6 +20,17 @@
 //   let dbLog = log.Child("[db]");
 //   dbLog.Debug("query", { sql: "SELECT ..." });
 //
+//   // Context fields carried by every record of a derived logger
+//   let reqLog = log.With({ request: "a1f3", user: 42 });
+//   reqLog.Info("served", { status: 200 });   // [INF] served {"request":"a1f3","user":42,"status":200}
+//
+//   // More destinations, each with its own level and format
+//   log.AddSink("file", { path: "app.log", level: "debug", format: "json" });
+//   log.AddSink("syslog", { host: "10.0.0.5", level: "error" });
+//
+//   // Your own line format
+//   log.SetFormatter(fn(r) { return r.levelName + " " + r.msg; });
+//
 // API:
 //   SetLevel(level:int|string)          - "debug"/"info"/"warn"/"error"/"fatal" or int
 //   GetLevel()  →  int
@@ -38,10 +49,122 @@
 //   Error(msg, obj?)  Fatal(msg, obj?)
 //   DebugWith(msg, fields)  InfoWith(msg, fields)    - structured key/value fields
 //   WarnWith(msg, fields)   ErrorWith(msg, fields)
-//   Child(prefix)  →  Logger            - inherits level/output; adds prefix
+//   Child(prefix)  →  Logger            - inherits level and format, adds prefix,
+//                                         and writes through this logger's sink
+//   With(fields)   →  Logger            - like Child without a prefix: every record
+//                                         carries fields (and this logger's own),
+//                                         a record's own fields winning on a clash
+//   AddSink(kind, opts?)                - one more destination for this logger's
+//                                         records: "stdout", "stderr", "file"
+//                                         (opts.path) or "syslog" (opts.host,
+//                                         opts.port, default 514). opts:
+//                                           level     - its own minimum level
+//                                                       (default: the logger's now)
+//                                           format    - "text", "json" or a
+//                                                       formatter fn(record) (default:
+//                                                       whatever the writing logger uses)
+//                                           timestamp - prepend the time (text format;
+//                                                       default: the logger's setting now)
+//                                           color     - ANSI level colors on a console
+//                                           maxBytes, maxFiles - rotation of a file
+//                                         A syslog sink sends "flaris: [TAG] msg fields"
+//                                         unless its format is "json" or a function.
+//   RemoveSinks()                       - close and drop the sinks AddSink added
+//   SetFormatter(fn(record))            - render every record with fn; nil restores
+//                                         the text / JSON format. record is
+//                                         { time, level, levelName, msg, logger, fields }
+//                                         (time in Unix seconds, logger the prefix,
+//                                         fields an object or nil; msg and fields
+//                                         as given, not escaped); fn returns the
+//                                         line, or nil to drop the record
 //   static LevelName(int)  →  string    - "DEBUG", "INFO", etc.
 //
 // Constants:  Logger.DEBUG  Logger.INFO  Logger.WARN  Logger.ERROR  Logger.FATAL
+//
+// Sinks: the destination (console, file, syslog) and the file's rotation live
+// in a sink that a logger and all its children (Child, With) share, so a
+// rotation by any of them moves every writer to the new file and syslog
+// reaches theirs too. The sinks AddSink adds hang off that shared sink, so the
+// children write to them as well. SetRotation, SetSyslog, AddSink, RemoveSinks
+// and Flush act on the shared sink; SetOutput on a child gives the child a sink
+// of its own (without the added ones) and leaves the parent's alone; Close on a
+// child flushes but leaves the shared sink open for the others.
+
+// Where records go: console, file (with its rotation state) and syslog. Shared
+// between a logger and its children; it holds no reference back to them.
+class _LogSink {
+    let kind:int      = 0;      // 0 stdout, 1 stderr, 2 file, 3 syslog alone
+    let file:string   = nil;
+    let stream        = nil;    // open stream for the file sink (avoids open/close per call)
+    let syslog        = nil;
+    let syshost:string = "";
+    let maxBytes:int  = 0;      // rotation threshold (0 = disabled)
+    let maxFiles:int  = 5;      // number of rotated backups to keep
+    let written:int   = 0;      // bytes written to the current file since open
+    let more          = nil;    // the sinks AddSink added (an array), or nil
+    let moreMin:int   = 99;     // the lowest level among them
+    // An added sink's own settings.
+    let level:int     = 0;
+    let format        = nil;    // nil (the writing logger's), "text", "json" or fn(record)
+    let color:bool    = false;
+    let timestamp:bool = false;
+
+    fn CloseFile() {
+        if (this.stream != nil) {
+            Stream.Close(this.stream);
+            this.stream = nil;
+        }
+    }
+
+    fn CloseSyslog() {
+        if (this.syslog != nil) {
+            Stream.Close(this.syslog);
+            this.syslog  = nil;
+            this.syshost = "";
+        }
+    }
+
+    fn Emit(line: string) {
+        if      (this.kind == 0) { Console.Write(line); }
+        else if (this.kind == 1) { Console.Error(line); }
+        else                     { this.WriteFile(line); }
+    }
+
+    fn WriteFile(line: string) {
+        if (this.stream == nil) { return; }
+        Stream.WriteString(this.stream, line);
+        // A log record must be visible to a reader - a tail, a test, a
+        // process that outlives this one - as soon as it is written, so
+        // the file's write buffer is handed over per record.
+        Stream.Flush(this.stream);
+        this.written = this.written + len(line);
+        if (this.maxBytes > 0 && this.written >= this.maxBytes) {
+            this.Rotate();
+        }
+    }
+
+    // <file>.<maxFiles> is dropped, each <file>.<k> shifts to <file>.<k+1>,
+    // the active file becomes <file>.1, and a fresh file opens.
+    fn Rotate() {
+        if (this.kind != 2 || this.file == nil) { return; }
+        this.CloseFile();
+
+        let oldest = this.file + "." + str(this.maxFiles);
+        if (File.Exists(oldest)) { File.Delete(oldest); }
+
+        var k = this.maxFiles - 1;
+        while (k >= 1) {
+            let src = this.file + "." + str(k);
+            let dst = this.file + "." + str(k + 1);
+            if (File.Exists(src)) { File.Move(src, dst); }
+            k -= 1;
+        }
+        if (File.Exists(this.file)) { File.Move(this.file, this.file + ".1"); }
+
+        this.stream = Stream.Open(this.file, "a");
+        this.written = 0;
+    }
+}
 
 class Logger {
 
@@ -54,27 +177,25 @@ class Logger {
 
     let _level:int     = 1;
     let _enabled:bool  = true;
-    let _sink:int      = 0;
-    let _file:string   = nil;
-    let _fileStream    = nil;  // open stream for file sink (avoids open/close per call)
-    let _syslog        = nil;
-    let _syshost:string = "";
+    let _out           = nil;    // the _LogSink, shared with children
+    let _ownsSink:bool = true;   // false for a child until it calls SetOutput
     let _prefix:string = "";
     let _timestamp:bool = false;
     let _useColor:bool  = false;
     let _json:bool      = false;  // structured JSON output
-    let _maxBytes:int   = 0;      // file-sink rotation threshold (0 = disabled)
-    let _maxFiles:int   = 5;      // number of rotated backups to keep
-    let _written:int    = 0;      // bytes written to the current file since open
+    let _format         = nil;    // SetFormatter's fn, or nil
+    let _fields         = nil;    // With's context fields (an object), or nil
 
-    fn _closeFileStream() {
-        if (this._fileStream != nil) {
-            Stream.Close(this._fileStream);
-            this._fileStream = nil;
-        }
+    fn Constructor() {
+        this._out = new _LogSink();
     }
 
     fn SetLevel(level: int|string) {
+        this._level = Logger._levelOf(level, "Logger.SetLevel");
+    }
+
+    // level as 0-4: an int (clamped) or a name; raises "<who>: invalid level".
+    fn static _levelOf(level, who: string): int {
         let lvl = -1;
         if (type(level) == Type.Int) {
             lvl = level;
@@ -90,8 +211,8 @@ class Logger {
             else if (s == "error") { lvl = 3; }
             else if (s == "fatal") { lvl = 4; }
         }
-        if (lvl < 0) throw(1, "Logger.SetLevel: invalid level");
-        this._level = lvl;
+        if (lvl < 0) throw(1, who + ": invalid level");
+        return lvl;
     }
 
     fn GetLevel(): int {
@@ -99,45 +220,48 @@ class Logger {
     }
 
     fn SetOutput(sink: int|string, path?: string): bool {
-        this._closeFileStream();
-        if (sink == "stdout" || sink == 0) {
-            this._sink = 0;
-            this._file = nil;
-        } else if (sink == "stderr" || sink == 1) {
-            this._sink = 1;
-            this._file = nil;
-        } else if (sink == "file" || sink == 2) {
-            if (path == nil || path == "") {
-                throw(1, "Logger.SetOutput: file path required");
-            }
-            this._sink = 2;
-            this._file = path;
-            this._fileStream = Stream.Open(path, "a");
-            if (this._fileStream == nil) {
+        let kind = -1;
+        if      (sink == "stdout" || sink == 0) { kind = 0; }
+        else if (sink == "stderr" || sink == 1) { kind = 1; }
+        else if (sink == "file"   || sink == 2) { kind = 2; }
+        else { throw(1, "Logger.SetOutput: unknown sink"); }
+        if (kind == 2 && (path == nil || path == "")) {
+            throw(1, "Logger.SetOutput: file path required");
+        }
+
+        // A child that names its own destination stops writing through the
+        // parent's sink; the parent's file stays open for the others.
+        if (!this._ownsSink) {
+            this._out = new _LogSink();
+            this._ownsSink = true;
+        }
+        let o = this._out;
+        o.CloseFile();
+        o.kind = kind;
+        o.file = nil;
+        if (kind == 2) {
+            o.file = path;
+            o.stream = Stream.Open(path, "a");
+            if (o.stream == nil) {
                 throw(1, "Logger.SetOutput: could not open file: " + path);
             }
             // Account for any pre-existing content so rotation triggers correctly.
-            this._written = File.Exists(path) ? File.Size(path) : 0;
-        } else {
-            throw(1, "Logger.SetOutput: unknown sink");
+            o.written = File.Exists(path) ? File.Size(path) : 0;
         }
         return true;
     }
 
     fn SetSyslog(host: string, port?: int): bool {
-        if (this._syslog != nil) {
-            Stream.Close(this._syslog);
-            this._syslog  = nil;
-            this._syshost = "";
-        }
+        let o = this._out;
+        o.CloseSyslog();
         if (host == nil || host == "" || host == "none") return true;
 
         let p = port ?? 514;
         let s = Stream.Connect("udp", host, p);
         if (s == nil) return false;
 
-        this._syslog  = s;
-        this._syshost = host;
+        o.syslog  = s;
+        o.syshost = host;
         return true;
     }
 
@@ -170,8 +294,66 @@ class Logger {
     // to "<file>.<maxFiles>", oldest discarded) and a fresh file is opened.
     // maxBytes <= 0 disables rotation.
     fn SetRotation(maxBytes:int, maxFiles?:int) {
-        this._maxBytes = (maxBytes == nil) ? 0 : maxBytes;
-        if (maxFiles != nil && maxFiles >= 1) { this._maxFiles = maxFiles; }
+        this._out.maxBytes = (maxBytes == nil) ? 0 : maxBytes;
+        if (maxFiles != nil && maxFiles >= 1) { this._out.maxFiles = maxFiles; }
+    }
+
+    // f is held by this logger: a formatter that refers to the logger keeps
+    // it alive, as any reference cycle does.
+    fn SetFormatter(f) {
+        if (f != nil && !Type.IsFunction(f)) throw(1, "Logger.SetFormatter: not a function");
+        this._format = f;
+    }
+
+    fn AddSink(kind: string, opts?): bool {
+        let o = opts ?? {};
+        let lvl = (o.level == nil) ? this._level : Logger._levelOf(o.level, "Logger.AddSink");
+        let f = o.format;
+        if (f != nil && f != "text" && f != "json" && !Type.IsFunction(f)) {
+            throw(1, "Logger.AddSink: format must be \"text\", \"json\" or a function");
+        }
+        let s = new _LogSink();
+        if      (kind == "stdout") { s.kind = 0; }
+        else if (kind == "stderr") { s.kind = 1; }
+        else if (kind == "file") {
+            if (o.path == nil || o.path == "") throw(1, "Logger.AddSink: file path required");
+            s.kind = 2;
+            s.file = o.path;
+            s.stream = Stream.Open(o.path, "a");
+            if (s.stream == nil) throw(1, "Logger.AddSink: could not open file: " + o.path);
+            s.written = File.Exists(o.path) ? File.Size(o.path) : 0;
+            if (o.maxBytes != nil) { s.maxBytes = o.maxBytes; }
+            if (o.maxFiles != nil && o.maxFiles >= 1) { s.maxFiles = o.maxFiles; }
+        } else if (kind == "syslog") {
+            if (o.host == nil || o.host == "") throw(1, "Logger.AddSink: syslog host required");
+            s.kind = 3;
+            s.syslog = Stream.Connect("udp", o.host, o.port ?? 514);
+            if (s.syslog == nil) throw(1, "Logger.AddSink: could not open syslog to " + o.host);
+            s.syshost = o.host;
+        } else {
+            throw(1, "Logger.AddSink: unknown sink");
+        }
+        s.level = lvl;
+        s.format = f;
+        s.color = (o.color == true);
+        s.timestamp = (o.timestamp == nil) ? this._timestamp : (o.timestamp == true);
+        let out = this._out;
+        if (out.more == nil) { out.more = []; }
+        Array.Append(out.more, s);
+        if (lvl < out.moreMin) { out.moreMin = lvl; }
+        return true;
+    }
+
+    fn RemoveSinks() {
+        let out = this._out;
+        if (out.more != nil) {
+            foreach (s in out.more) {
+                s.CloseFile();
+                s.CloseSyslog();
+            }
+        }
+        out.more = nil;
+        out.moreMin = 99;
     }
 
     // A log is a line-oriented record, so a newline inside a message is not
@@ -207,73 +389,28 @@ class Logger {
 
     // `obj` is the raw structured-fields object (or nil). In text mode it is
     // JSON-stringified and appended; in JSON mode its keys are merged into the
-    // log entry.
+    // log entry. The context fields of With come first.
     fn _write(lvl: int, msg: string, obj?) {
-        if (!this._enabled || lvl < this._level) return;
-        let prefix = "???";
-        if      (lvl == 0) { prefix = "DBG"; }
-        else if (lvl == 1) { prefix = "INF"; }
-        else if (lvl == 2) { prefix = "WRN"; }
-        else if (lvl == 3) { prefix = "ERR"; }
-        else if (lvl == 4) { prefix = "FTL"; }
+        if (!this._enabled) return;
+        let o = this._out;
+        let main = lvl >= this._level;
+        if (!main && lvl < o.moreMin) return;
+        var fields = obj ?? nil;
+        if (this._fields != nil) { fields = Logger._merge(this._fields, fields); }
 
-        let line = "";
-        if (this._json) {
-            let entry = { };
-            entry["time"]  = Time.Format(Time.Now(), "%Y-%m-%dT%H:%M:%S");
-            entry["level"] = Logger.LevelName(lvl);
-            if (this._prefix != "") { entry["logger"] = this._prefix; }
-            entry["msg"] = msg;
-            if ((obj ?? nil) != nil) {
-                foreach (v, k in obj) { entry[k] = v; }
-            }
-            line = Json.Stringify(entry) + "\n";
-        } else {
-            if (this._timestamp) {
-                line = Time.Format(Time.Now(), "%Y-%m-%dT%H:%M:%S") + " ";
-            }
-            if (this._prefix != "") {
-                line = line + this._prefix + " ";
-            }
-            let levelTag = "[" + prefix + "]";
-            if (this._useColor && (this._sink == 0 || this._sink == 1)) {
-                let ansi = "\x1b[0m";
-                if      (lvl == 0) { ansi = "\x1b[90m"; }
-                else if (lvl == 1) { ansi = "\x1b[32m"; }
-                else if (lvl == 2) { ansi = "\x1b[33m"; }
-                else if (lvl == 3) { ansi = "\x1b[31m"; }
-                else if (lvl == 4) { ansi = "\x1b[35m"; }
-                levelTag = ansi + levelTag + "\x1b[0m";
-            }
-            let fieldsStr = ((obj ?? nil) != nil) ? Json.Stringify(obj) : nil;
-            line = line + levelTag + " " + Logger._safe(msg) + (fieldsStr != nil ? " " + fieldsStr : "") + "\n";
-        }
-
-        if      (this._sink == 0)                              { Console.Write(line); }
-        else if (this._sink == 1)                              { Console.Error(line); }
-        else if (this._sink == 2 && this._fileStream != nil)   {
-            Stream.WriteString(this._fileStream, line);
-            // A log record must be visible to a reader - a tail, a test, a
-            // process that outlives this one - as soon as it is written, so
-            // the file's write buffer is handed over per record.
-            Stream.Flush(this._fileStream);
-            this._written = this._written + len(line);
-            if (this._maxBytes > 0 && this._written >= this._maxBytes) {
-                this._rotate();
+        if (main) {
+            let line = (this._format != nil)
+                ? this._custom(this._format, lvl, msg, fields)
+                : this._render(lvl, msg, fields, this._json, this._useColor && o.kind != 2, this._timestamp);
+            if (line != nil) { o.Emit(line); }
+            if (o.syslog != nil) {
+                Stream.WriteString(o.syslog, Logger._syslogPri(lvl) + Logger._syslogText(lvl, msg, fields));
             }
         }
-
-        if (this._syslog != nil) {
-            let sev = 6;
-            if      (lvl == 0) { sev = 7; }
-            else if (lvl == 1) { sev = 6; }
-            else if (lvl == 2) { sev = 4; }
-            else if (lvl == 3) { sev = 3; }
-            else if (lvl == 4) { sev = 2; }
-            let sfields = ((obj ?? nil) != nil) ? Json.Stringify(obj) : nil;
-            let smsg = "<" + str(8 + sev) + ">flaris: [" + prefix + "] " + Logger._safe(msg);
-            if (sfields != nil) { smsg = smsg + " " + sfields; }
-            Stream.WriteString(this._syslog, smsg);
+        if (o.more != nil) {
+            foreach (s in o.more) {
+                if (lvl >= s.level) { this._emitTo(s, lvl, msg, fields); }
+            }
         }
 
         if (lvl == 4) {
@@ -282,26 +419,114 @@ class Logger {
         }
     }
 
-    // Rotate the file sink: <file>.<maxFiles> is dropped, each <file>.<k> shifts
-    // to <file>.<k+1>, the active file becomes <file>.1, and a fresh file opens.
-    fn _rotate() {
-        if (this._sink != 2 || this._file == nil) { return; }
-        this._closeFileStream();
-
-        let oldest = this._file + "." + str(this._maxFiles);
-        if (File.Exists(oldest)) { File.Delete(oldest); }
-
-        var k = this._maxFiles - 1;
-        while (k >= 1) {
-            let src = this._file + "." + str(k);
-            let dst = this._file + "." + str(k + 1);
-            if (File.Exists(src)) { File.Move(src, dst); }
-            k -= 1;
+    // A record rendered as text or JSON, newline included.
+    fn _render(lvl: int, msg: string, fields, json: bool, color: bool, timestamp: bool): string {
+        if (json) {
+            let entry = { };
+            entry["time"]  = Time.Format(Time.Now(), "%Y-%m-%dT%H:%M:%S");
+            entry["level"] = Logger.LevelName(lvl);
+            if (this._prefix != "") { entry["logger"] = this._prefix; }
+            entry["msg"] = msg;
+            if (fields != nil) {
+                foreach (v, k in fields) { entry[k] = v; }
+            }
+            return Json.Stringify(entry) + "\n";
         }
-        if (File.Exists(this._file)) { File.Move(this._file, this._file + ".1"); }
+        var line = "";
+        if (timestamp) {
+            line = Time.Format(Time.Now(), "%Y-%m-%dT%H:%M:%S") + " ";
+        }
+        if (this._prefix != "") {
+            line = line + this._prefix + " ";
+        }
+        var levelTag = "[" + Logger._tag(lvl) + "]";
+        if (color) {
+            let ansi = "\x1b[0m";
+            if      (lvl == 0) { ansi = "\x1b[90m"; }
+            else if (lvl == 1) { ansi = "\x1b[32m"; }
+            else if (lvl == 2) { ansi = "\x1b[33m"; }
+            else if (lvl == 3) { ansi = "\x1b[31m"; }
+            else if (lvl == 4) { ansi = "\x1b[35m"; }
+            levelTag = ansi + levelTag + "\x1b[0m";
+        }
+        let fieldsStr = (fields != nil) ? Json.Stringify(fields) : nil;
+        return line + levelTag + " " + Logger._safe(msg) + (fieldsStr != nil ? " " + fieldsStr : "") + "\n";
+    }
 
-        this._fileStream = Stream.Open(this._file, "a");
-        this._written = 0;
+    // A record rendered by formatter f, newline included; nil when f drops it.
+    // msg and fields reach f as given, unescaped.
+    fn _custom(f, lvl: int, msg: string, fields): string|nil {
+        let r = f({ time: Time.Now(), level: lvl, levelName: Logger.LevelName(lvl),
+                    msg: msg, logger: this._prefix, fields: fields });
+        if (r == nil) return nil;
+        let line = str(r);
+        return String.EndsWith(line, "\n") ? line : line + "\n";
+    }
+
+    // A record to an added sink s, in s's format or else this logger's.
+    fn _emitTo(s, lvl: int, msg: string, fields) {
+        let f = s.format;
+        if (s.kind == 3) {
+            if (s.syslog == nil) return;
+            var body = nil;
+            if (f == "json") {
+                body = this._render(lvl, msg, fields, true, false, false);
+            } else if (f != nil && f != "text") {
+                body = this._custom(f, lvl, msg, fields);
+            } else {
+                body = Logger._syslogText(lvl, msg, fields);
+            }
+            if (body != nil) { Stream.WriteString(s.syslog, Logger._syslogPri(lvl) + String.TrimRight(body, "\n")); }
+            return;
+        }
+        var line = nil;
+        let color = s.color && s.kind != 2;
+        if (f == nil) {
+            line = (this._format != nil)
+                ? this._custom(this._format, lvl, msg, fields)
+                : this._render(lvl, msg, fields, this._json, color, s.timestamp);
+        } else if (f == "text") {
+            line = this._render(lvl, msg, fields, false, color, s.timestamp);
+        } else if (f == "json") {
+            line = this._render(lvl, msg, fields, true, false, false);
+        } else {
+            line = this._custom(f, lvl, msg, fields);
+        }
+        if (line != nil) { s.Emit(line); }
+    }
+
+    fn static _tag(lvl: int): string {
+        if (lvl == 0) return "DBG";
+        if (lvl == 1) return "INF";
+        if (lvl == 2) return "WRN";
+        if (lvl == 3) return "ERR";
+        if (lvl == 4) return "FTL";
+        return "???";
+    }
+
+    // "<PRI>" for a user-level record of lvl (RFC 3164: facility 1).
+    fn static _syslogPri(lvl: int): string {
+        let sev = 6;
+        if      (lvl == 0) { sev = 7; }
+        else if (lvl == 2) { sev = 4; }
+        else if (lvl == 3) { sev = 3; }
+        else if (lvl == 4) { sev = 2; }
+        return "<" + str(8 + sev) + ">";
+    }
+
+    fn static _syslogText(lvl: int, msg: string, fields): string {
+        let text = "flaris: [" + Logger._tag(lvl) + "] " + Logger._safe(msg);
+        return (fields != nil) ? text + " " + Json.Stringify(fields) : text;
+    }
+
+    // A new object with a's keys, then b's (b nil: a's alone).
+    fn static _merge(a, b) {
+        let r = {};
+        foreach (v, k in a) { r[k] = v; }
+        if (b != nil) {
+            foreach (v, k in b) { r[k] = v; }
+        }
+        return r;
     }
 
     fn Log(level: int|string, msg: string, obj?: object) {
@@ -325,44 +550,72 @@ class Logger {
         this._write(lvl, msg, obj ?? nil);
     }
 
-    // The level test is repeated here so a filtered record costs one call, not two.
-    fn Trace(msg: string, obj?: object) { if (this._enabled && this._level <= 0) this._write(0, msg, obj ?? nil); }
-    fn Debug(msg: string, obj?: object) { if (this._enabled && this._level <= 0) this._write(0, msg, obj ?? nil); }
-    fn Info (msg: string, obj?: object) { if (this._enabled && this._level <= 1) this._write(1, msg, obj ?? nil); }
-    fn Notice(msg: string, obj?: object) { if (this._enabled && this._level <= 2) this._write(2, msg, obj ?? nil); }
-    fn Warn (msg: string, obj?: object) { if (this._enabled && this._level <= 2) this._write(2, msg, obj ?? nil); }
-    fn Error(msg: string, obj?: object) { if (this._enabled && this._level <= 3) this._write(3, msg, obj ?? nil); }
+    // The level test is repeated here so a filtered record costs one call, not
+    // two; an added sink with a lower level lets the record through.
+    fn Trace(msg: string, obj?: object) { if (this._enabled && (this._level <= 0 || this._out.moreMin <= 0)) this._write(0, msg, obj ?? nil); }
+    fn Debug(msg: string, obj?: object) { if (this._enabled && (this._level <= 0 || this._out.moreMin <= 0)) this._write(0, msg, obj ?? nil); }
+    fn Info (msg: string, obj?: object) { if (this._enabled && (this._level <= 1 || this._out.moreMin <= 1)) this._write(1, msg, obj ?? nil); }
+    fn Notice(msg: string, obj?: object) { if (this._enabled && (this._level <= 2 || this._out.moreMin <= 2)) this._write(2, msg, obj ?? nil); }
+    fn Warn (msg: string, obj?: object) { if (this._enabled && (this._level <= 2 || this._out.moreMin <= 2)) this._write(2, msg, obj ?? nil); }
+    fn Error(msg: string, obj?: object) { if (this._enabled && (this._level <= 3 || this._out.moreMin <= 3)) this._write(3, msg, obj ?? nil); }
     fn Fatal(msg: string, obj?: object) { this._write(4, msg, obj ?? nil); }
 
     // Records are already delivered as they are written; this makes them
     // durable on the device as well.
     fn Flush(): bool {
-        if (this._fileStream != nil) { Stream.Sync(this._fileStream); }
-        if (this._syslog != nil) { Stream.Flush(this._syslog); }
+        let o = this._out;
+        if (o.stream != nil) { Stream.Sync(o.stream); }
+        if (o.syslog != nil) { Stream.Flush(o.syslog); }
+        if (o.more != nil) {
+            foreach (s in o.more) {
+                if (s.stream != nil) { Stream.Sync(s.stream); }
+                if (s.syslog != nil) { Stream.Flush(s.syslog); }
+            }
+        }
         return true;
     }
 
+    // A child does not own the sink it shares, so its Close only flushes.
     fn Close(): bool {
         this.Flush();
-        if (this._fileStream != nil) { this._closeFileStream(); }
-        if (this._syslog != nil) { Stream.Close(this._syslog); this._syslog = nil; this._syshost = ""; }
+        if (this._ownsSink) {
+            let o = this._out;
+            o.CloseFile();
+            o.CloseSyslog();
+            if (o.more != nil) {
+                foreach (s in o.more) {
+                    s.CloseFile();
+                    s.CloseSyslog();
+                }
+            }
+        }
         return true;
     }
 
     fn Child(prefix:string) : instance {
+        return this._derive((this._prefix != "" ? this._prefix + "." : "") + Logger._safe(prefix), nil);
+    }
+
+    // fields is copied: changing the object later does not change the records.
+    fn With(fields: object): instance {
+        let merged = (this._fields == nil) ? Logger._merge(fields, nil) : Logger._merge(this._fields, fields);
+        return this._derive(this._prefix, merged);
+    }
+
+    // A logger writing through this one's sink with its settings, prefix and
+    // context fields (nil: this logger's).
+    fn _derive(prefix: string, fields) : instance {
         let child = new Logger();
         child._level     = this._level;
-        child._sink      = this._sink;
-        child._file      = this._file;
-        child._fileStream = this._fileStream;
-        child._prefix    = (this._prefix != "" ? this._prefix + "." : "") + Logger._safe(prefix);
+        child._out       = this._out;
+        child._ownsSink  = false;
+        child._prefix    = prefix;
         child._timestamp = this._timestamp;
         child._useColor  = this._useColor;
         child._enabled   = this._enabled;
         child._json      = this._json;
-        child._maxBytes  = this._maxBytes;
-        child._maxFiles  = this._maxFiles;
-        child._written   = this._written;
+        child._format    = this._format;
+        child._fields    = (fields == nil) ? this._fields : fields;
         return child;
     }
 

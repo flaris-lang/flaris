@@ -8,19 +8,21 @@
 // All Redis commands go through redis_command - see examples below.
 // The return value is mapped to the most natural Flaris type based on the reply.
 //
+// Build from the repo root (ffi_object.h sits next to this file):
+//
 // Build (Linux):
-//   gcc -shared -fPIC -O2 -o redis_ffi.so redis_ffi.c -lhiredis
+//   gcc -shared -fPIC -O2 -I ffi -I /usr/include/hiredis -o redis_ffi.so ffi/redis_ffi.c -lhiredis
 //
 // Build (macOS):
-//   gcc -shared -fPIC -O2 -o redis_ffi.dylib redis_ffi.c \
+//   gcc -shared -fPIC -O2 -I ffi -o redis_ffi.dylib ffi/redis_ffi.c \
 //       -I$(brew --prefix hiredis)/include/hiredis \
 //       -L$(brew --prefix hiredis)/lib -lhiredis
 //
 // Build (Windows MinGW):
-//   gcc -shared -O2 -o redis_ffi.dll redis_ffi.c -lhiredis -lws2_32
+//   gcc -shared -O2 -I ffi -o redis_ffi.dll ffi/redis_ffi.c -lhiredis -lws2_32
 //
 // Build (Windows MSVC):
-//   cl /LD redis_ffi.c /link hiredis.lib ws2_32.lib
+//   cl /LD /I ffi ffi/redis_ffi.c /link hiredis.lib ws2_32.lib
 //
 
 #include <stdint.h>
@@ -28,7 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "../vm/ffi_object.h"
+#include "ffi_object.h"
 
 /* Exports flaris_abi_version() so the runtime can verify this plugin was
  * built against a compatible FfiObject layout. */

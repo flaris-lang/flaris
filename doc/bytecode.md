@@ -22,7 +22,7 @@ The specification covers:
 
 - the `.flx` binary container: header, signature, string pool, chunks, bundles
 - the serialization of constants, functions and classes
-- the instruction encoding and the semantics of all 197 opcodes
+- the instruction encoding and the semantics of all 203 opcodes
 - the abstract machine: value system, operand stack, call frames, fibers,
   exception handling
 - the validation rules a conforming loader must apply before execution
@@ -111,7 +111,7 @@ after `FIBER_QUANTUM` = 10000 checkpoints, or immediately at explicit
 involved; bytecode never observes preemption in the middle of an instruction.
 
 Implementation note (dispatch): the reference VM uses computed-goto dispatch
-over an `OP_LAST`-sized table (197 entries), caches
+over an `OP_LAST`-sized table (203 entries), caches
 `frame`/`constants`/`locals`/`code`/`ip` in locals, and re-derives them after
 any operation that can change the frame. The
 frame's stored `ip` is only guaranteed current at frame switches, raises and
@@ -135,8 +135,10 @@ type. Arguments bind to `locals[0..argc-1]`; for methods, `locals[0]` is the
 receiver (`this`) and arguments shift up by one.
 
 **Frame entry.** Exceeding the frame budget raises a catchable
-`StackError`; on entry the VM reserves `maxStack` (§8.3) operand slots so the
-body cannot overflow mid-execution. A frame owns its locals and function
+`StackError`; on entry the VM reserves `maxStack` (§8.3) operand slots, plus 20
+for the values it pushes itself to call back into a function (arguments,
+callee, result), so the body cannot overflow mid-execution. A frame that does
+not fit raises `StackError` before its first instruction. A frame owns its locals and function
 reference; on return every local and the function reference are released and
 any try-contexts belonging to the frame are discarded.
 
@@ -158,8 +160,8 @@ otherwise it is preserved on the fiber for a later `await`.
 
 Fiber states: `NEW`, `RUNNING`, `SUSPENDED`, `FINISHED`, `WAIT_IO`, `YIELD`,
 `WAIT_FIBER`. Scheduling checkpoints (quantum decrement) occur at backward
-jumps, taken conditional branches, iterator back-edges, and call/return
-boundaries; quantum expiry silently re-queues the fiber (no observable state
+jumps (`OP_LOOP`), iterator back-edges and function entries; quantum expiry
+silently re-queues the fiber (no observable state
 change). Semantics of `OP_YIELD`/`OP_AWAIT` are in their Chapter 7 entries;
 the model is: `await fiber` parks the awaiter until the target delivers its
 result (a finished target delivers immediately); `yield v` delivers `v` to a
@@ -273,6 +275,11 @@ ignore all of them. The reference VM guards JIT entry behind exact runtime
 type checks and falls back to interpretation, so JIT presence is never
 observable in program semantics (timing aside).
 
+The IR is checked for structure at load, not proven safe, so the reference VM
+lowers it to native code only for a file signed by a trusted key (§5.3); the IR
+of an unsigned file, or of one signed by an untrusted key, is skipped and its
+functions run interpreted. A bundled dependency takes the bundle's verdict.
+
 ---
 
 ## 4. The value system
@@ -298,8 +305,9 @@ annotations) may union several bits.
 | 6 | `VAL_ARRAY` | `0x00000040` | dynamic array |
 | 7 | `VAL_BOOL` | `0x00000080` | `true` / `false` |
 | 8 | `VAL_BLOCK` | `0x00000100` | raw memory block / typed buffer (element size 1–255 bytes) |
+| 14 | `VAL_MATRIX` | `0x00004000` | element modifier, never a value's own type: an array type with this bit and one element type T (`VAL_INT`, `VAL_FLOAT`, `VAL_CHAR` or `VAL_BOOL`) holds only arrays of exactly element type T - the source type `[[T]]` |
 
-Bits 9–15 are reserved for future basic types.
+Bits 9–13 and 15 are reserved for future basic types.
 
 **Complex runtime types (bits 16–28)** — never element types:
 
@@ -714,10 +722,10 @@ Every opcode appears in exactly one row, in opcode-number order within the row.
 | --- | --- |
 | 1 | `NOP`, `NIL`, `TRUE`, `FALSE`, `ONE`, `NEG_ONE`, `POP`, `DUP`, `NEGATE`, `NOT`, `BITWISE_NOT`, `ADD`, `SUBTRACT`, `MULTIPLY`, `DIVIDE`, `MODULO`, `POWER`, `BITWISE_AND`, `BITWISE_OR`, `XOR`, `SHL`, `SHR`, `USHR`, `IS_NIL`, `IS_NOT_NIL`, `EQUAL`, `NOT_EQUAL`, `LESS`, `LESS_EQUAL`, `GREATER`, `GREATER_EQUAL`, `APPROX_EQ`, `CMP_IS`, `GET_LOCAL0`, `GET_LOCAL1`, `GET_LOCAL2`, `GET_LOCAL3`, `SET_LOCAL0`, `SET_LOCAL1`, `SET_LOCAL2`, `SET_LOCAL3`, `GET_INDEX`, `SET_INDEX`, `MAKE_CONST`, `RETURN`, `RETURN_NONE`, `RETURN_NIL`, `YIELD`, `AWAIT`, `BIND_THIS`, `TRY_END`, `CATCH_BEGIN`, `CATCH_END`, `FINALLY_BEGIN`, `FINALLY_END`, `THROW`, `LEN`, `TYPE`, `HAS_KEY`, `TO_STRING`, `TO_INT`, `TO_FLOAT`, `TO_CHAR`, `TO_I8`, `TO_U8`, `TO_I16`, `TO_U16`, `TO_I32`, `TO_U32`, `SUPER`, `GUARD`, `CONCAT` |
 | 2 | `IMM8`, `GET_LOCAL`, `SET_LOCAL`, `INC_LOCAL`, `DEC_LOCAL`, `GET_ARR_LI`, `GET_INDEX_LOCAL`, `SET_INDEX_LOCAL`, `CALL`, `CALL_TYPED`, `CALL_SELF`, `TAIL_SELF`, `TAIL_CALL`, `RETURN_L`, `NEW`, `GET_BLK_LI`, `CONCAT_N`, `NIL_LOCAL`, `CALL_WITH_THIS` |
-| 3 | `CONSTANT`, `IMM16`, `JUMP_IF_FALSE`, `JUMP_IF_TRUE`, `JUMP`, `LOOP`, `DEFINE_GLOBAL`, `GET_GLOBAL`, `SET_GLOBAL`, `ARITH_L`, `ARITH_IMM8`, `GET_PROPERTY`, `SET_PROPERTY`, `GET_ARR_LC`, `GET_ARR_LL`, `SET_ARR_LC`, `SET_ARR_LL`, `GET_THIS_PROP`, `SET_THIS_PROP`, `BUILD_OBJECT`, `FN`, `PUSH_BUILTIN`, `CALL0_BUILTIN`, `CALL1_BUILTIN`, `CALL2_BUILTIN`, `CALL3_BUILTIN`, `CALL4_BUILTIN`, `CALL5_BUILTIN`, `DBG_LINE`, `DBG_FILE_NAME`, `DBG_BREAK`, `GET_BLK_LC`, `GET_BLK_LL`, `SET_BLK_LC`, `SET_BLK_LL`, `GET_THIS_SLOT`, `SET_THIS_SLOT`, `GET_THIS_CONST` |
-| 4 | `ARITH_LC`, `ARITH_LL`, `ARITH_L_IMM8`, `ARITH_LL_PUSH`, `SET_ARR_LLC`, `SET_ARR_LLL`, `SET_OBJ_L`, `LOCAL_ARR_LC`, `LOCAL_ARR_LL`, `THIS_INVOKE`, `SET_BLK_LLC`, `SET_BLK_LLL`, `LOCAL_BLK_LC`, `LOCAL_BLK_LL`, `GET_LOCAL_PROP`, `THIS_INVOKE_SLOT`, `GET_THIS_ARR_L`, `GET_THIS_ARR_SLOT_L`, `SUPER_INVOKE`, `CALL_GLOBAL`, `TAIL_THIS_INVOKE`, `TAIL_THIS_INVOKE_SLOT`, `SUPER_INVOKE_SLOT`, `SET_THIS_ARR_L`, `SET_THIS_ARR_SLOT_L`, `ARITH_IMM16` (aop:u8 imm:i16) |
+| 3 | `CONSTANT`, `CONSTANT_REF`, `IMM16`, `JUMP_IF_FALSE`, `JUMP_IF_TRUE`, `JUMP`, `LOOP`, `DEFINE_GLOBAL`, `GET_GLOBAL`, `SET_GLOBAL`, `ARITH_L`, `ARITH_IMM8`, `GET_PROPERTY`, `SET_PROPERTY`, `GET_ARR_LC`, `GET_ARR_LL`, `SET_ARR_LC`, `SET_ARR_LL`, `GET_THIS_PROP`, `SET_THIS_PROP`, `BUILD_OBJECT`, `FN`, `PUSH_BUILTIN`, `CALL0_BUILTIN`, `CALL1_BUILTIN`, `CALL2_BUILTIN`, `CALL3_BUILTIN`, `CALL4_BUILTIN`, `CALL5_BUILTIN`, `DBG_LINE`, `DBG_FILE_NAME`, `DBG_BREAK`, `GET_BLK_LC`, `GET_BLK_LL`, `SET_BLK_LC`, `SET_BLK_LL`, `GET_THIS_SLOT`, `SET_THIS_SLOT`, `GET_THIS_CONST` |
+| 4 | `ARITH_LC`, `ARITH_LL`, `ARITH_L_IMM8`, `ARITH_LL_PUSH`, `SET_ARR_LLC`, `SET_ARR_LLL`, `SET_OBJ_L`, `LOCAL_ARR_LC`, `LOCAL_ARR_LL`, `THIS_INVOKE`, `SET_BLK_LLC`, `SET_BLK_LLL`, `LOCAL_BLK_LC`, `LOCAL_BLK_LL`, `GET_LOCAL_PROP`, `THIS_INVOKE_SLOT`, `GET_THIS_ARR_L`, `GET_THIS_ARR_SLOT_L`, `SUPER_INVOKE`, `CALL_GLOBAL`, `TAIL_THIS_INVOKE`, `TAIL_THIS_INVOKE_SLOT`, `SUPER_INVOKE_SLOT`, `SET_THIS_ARR_L`, `SET_THIS_ARR_SLOT_L`, `ARITH_IMM16` (aop:u8 imm:i16), `GET_MAT_LLL`, `SET_MAT_LLL` |
 | 5 | `IMM32`, `IMM_CHAR` (u32 codepoint), `ARITH_ELC`, `ARITH_ELL`, `ARITH_EIC`, `ARITH_EIL`, `SET_OBJ_LL`, `THIS_ARITH_L`, `THIS_ARITH_C`, `BUILD_ARRAY` (count:u16 + elemType:u16), `TRY_LEAVE`, `ITER_BEGIN`, `ITER_NEXT`, `ARITH_BLK_LC`, `ARITH_BLK_LL`, `ARITH_BLK_IC`, `ARITH_BLK_IL`, `ARITH_FMA_LLL`, `THIS_ARITH_SLOT_L`, `THIS_ARITH_SLOT_C`, `SET_THIS_ARR_LL`, `SET_THIS_ARR_SLOT_LL` |
-| 6 | `CMP_JUMP_LL`, `CMP_JUMP_LC`, `TRY_BEGIN`, `INVOKE_INSTANCE` (key:u16 argc:u8 slotCache:u16 — the cache field is runtime-managed scratch), `OBJ_ARITH_L` (obj:u8 key:u16 aop:u8 src:u8) |
+| 6 | `CMP_JUMP_LL`, `CMP_JUMP_LC`, `TRY_BEGIN`, `INVOKE_INSTANCE` (key:u16 argc:u8 slotCache:u16 — the cache field is runtime-managed scratch), `OBJ_ARITH_L` (obj:u8 key:u16 aop:u8 src:u8), `ARITH_MLL` (m:u8 i:u8 j:u8 aop:u8 src:u8), `ARITH_MLC` (m:u8 i:u8 j:u8 aop:u8 imm:i8) |
 | 7 | `FOREACH` (slot1:u8 slot2:u8 iterable:u8 index:u8 endAddr:u16; slot operands may be the sentinel `0xFF` = unused), `CHECK_TYPE` (mask:u32 label:u16) |
 | 9 | `EXPORT` (aliasIdx:u16 nameIdx:u16 type:u32), `CMP_JUMP_LC32`, `PUSH_HOST`, `CALL0_HOST`, `CALL1_HOST`, `CALL2_HOST`, `CALL3_HOST`, `CALL4_HOST`, `CALL5_HOST` (host forms: modHash:u32 fnHash:u32, rewritten in place to one member pointer at load) |
 | 11 | `INVOKE_MEMBER` (key:u16 argc:u8 mode:u8 classIdGuard:u32 idx:u16 — the last three fields are runtime-managed cache, emitted as zero) |
@@ -758,6 +766,15 @@ replace unless a difference is stated.
 Pushes constant `idx`. A **string** constant is pushed as a fresh copy
 (strings are mutable; the pool object must not be aliased); other values are
 pushed by reference. Traps: —
+
+**`OP_CONSTANT_REF`** `<idx:const:u16>` — 3 bytes. Stack `→ v`.
+Pushes constant `idx` by reference, a string included. The compiler emits it
+for a string literal whose consumer only reads it: an argument of a builtin call
+(`OP_CALLn_BUILTIN`) whose builtin is pure and returns a scalar or an always-new
+string or block; an operand of a comparison, of `in` or `is`, of a `+` proven to
+be text concatenation or of an `OP_CONCAT_N` chain; the key of an index read;
+a `switch` case label. Nothing can keep or change the literal there; string
+constants are immutable, so a write raises instead of reaching the pool. Traps: —
 
 **`OP_NIL` / `OP_TRUE` / `OP_FALSE`** — 1 byte. Stack `→ v`.
 Push `nil` / `true` / `false`. Traps: —
@@ -857,6 +874,14 @@ false. Traps: —
 instance-of / subclass-of test of `v` (proto chain, ≤ 8 deep), so a class
 `v` tests as a subclass and `Base is Derived` is false. Otherwise plain
 identity `v == t`. Traps: —
+
+**`OP_CMP_C`** `<const:u16> <cop:u8>` — 4 bytes. Stack `a → r:bool`. Compares
+`a` with `constants[const]` per `cop` (§6.4), by the rules of `OP_EQUAL` and its
+siblings above. The constant is read where it sits and never pushed, so a string
+literal is not copied. Not compiler-emitted from source: the peephole pass writes
+it over `OP_CONSTANT` followed by a comparison, which has the same length. A
+`cop` above 5 is rejected at load. Traps: `NestingError` (deep structural
+compare).
 
 ### 7.4 Control flow
 
@@ -1030,7 +1055,7 @@ copied on store; the replaced value is released.
 **`OP_SET_INDEX`** — 1 byte. Stack `c, k, v →`.
 
 - array + int: a typed array checks the element type (`TypeMismatch`);
-  `k < 0` (after from-end adjust) or `k ≥ 10 000 000` raises
+  `k < 0` (after from-end adjust) or `k ≥ 16 777 216` raises
   `IndexOutOfBounds`; **writing past the end grows the array** to
   `length = k + 1`;
 - block + int: strict bounds (no growth), truncating element store;
@@ -1103,6 +1128,30 @@ receiver; **in-bounds only** (never grows). Traps: `InvalidArgs`,
 `local[dst] = local[arr][local[idx]]` (array + int index required; negative
 index from end). Traps: `NullPointer`, `IndexOutOfBounds`.
 
+Two-level indexing `m[i][j]` with all three operands in locals has its own
+forms; `i` is compiler-proven int as for `GET_ARR_LL`, `j` may be any value.
+Each behaves exactly as the unfused sequence it replaces - `m[i]` read as
+`GET_ARR_LL` reads it, then the one-level read, store or update of that row -
+with the same traps in the same order. An array of arrays at in-range int
+indexes is handled inline.
+
+**`OP_GET_MAT_LLL`** `<m:u8> <i:u8> <j:u8>` — 4 bytes. Stack `→ v`.
+`v = local[m][local[i]][local[j]]`.
+
+**`OP_SET_MAT_LLL`** `<m:u8> <i:u8> <j:u8>` — 4 bytes. Stack `v →`.
+`local[m][local[i]][local[j]] = v`; a store at the row's length grows it, as
+`OP_SET_INDEX` does. The row is read after `v` was computed, so a compiler
+emits it only for a `v` whose evaluation can neither raise nor change anything
+(a local or a literal); anything else keeps the row read first.
+
+**`OP_ARITH_MLL`** `<m:u8> <i:u8> <j:u8> <aop:u8> <src:u8>` — 6 bytes. Stack
+`→`. `local[m][local[i]][local[j]] aop= local[src]`. The element is read before
+it is written, so an out-of-range index traps `IndexOutOfBounds` and never grows
+the row.
+
+**`OP_ARITH_MLC`** `<m:u8> <i:u8> <j:u8> <aop:u8> <imm:i8>` — 6 bytes. As
+`OP_ARITH_MLL` with `imm` as the right operand.
+
 ### 7.9 Object property fast paths
 
 **`OP_SET_OBJ_L`** `<obj:u8> <key:u16>` — 4 bytes. Stack `v →`.
@@ -1120,6 +1169,14 @@ The compound-assign counterpart of that opcode and the non-`this` sibling of
 `DUP`/`GET_PROPERTY`/`<op>`/`SET_PROPERTY` sequence reads the field onto the
 stack, giving it a second reference, which makes an in-place append illegal and
 the surrounding loop quadratic.
+
+**`OP_OBJ_ARITH_S`** `<obj:u8> <key:u16> <aop:u8>` — 5 bytes. Stack `v →`.
+`local[obj].key aop= v`, with `v` popped; same checks and the same in-place
+string append as `OP_OBJ_ARITH_L`. The field is read after `v` was computed, so
+a compiler emits it only when the right-hand side has no effects (no call,
+assignment, `++`/`--`, `await`, `new` or `yield`); any other right-hand side
+keeps the `DUP`/`GET_PROPERTY`/`<op>`/`SET_PROPERTY` sequence, which reads the
+field first.
 
 ### 7.10 `this` access
 
@@ -1213,10 +1270,13 @@ function), `InvalidArgs` (arity), plus whatever the callee raises.
 
 ### 7.11 Construction
 
-**`OP_BUILD_OBJECT`** `<count:u16>` — 3 bytes. Stack
-`k₁, v₁, … k_n, v_n → obj`. Pops `count` key/value pairs (value above its
-key) and builds a fresh object. Scalar values copied. Traps: `StackError`
-(underflow), `NestingError` (result nesting ≥ 64 deep).
+**`OP_BUILD_OBJECT`** `<count:u16> <keys:const:u16>` — 5 bytes. Stack
+`v₁, … v_n → obj`. Pops `count` values and builds a fresh object, storing
+`vᵢ` under the string constant at index `keys + i − 1`: the keys are `count`
+consecutive pool entries, inserted in order. The object holds those
+constants themselves as its keys; string constants are immutable, so a write
+into one raises `ConstAssign`. Scalar values copied. Traps: `StackError`
+(underflow).
 
 **`OP_BUILD_ARRAY`** `<count:u16> <elemType:type:u16>` — 5 bytes. Stack
 `v₁, …, v_n → arr`. Consumes `count` values; the deepest is element 0 and
@@ -1224,9 +1284,11 @@ TOS is element `count−1`, so the compiler pushes `[a, b, c]` in source
 order. `elemType` = 0 → untyped
 array; `elemType = VAL_FLOAT` → flat float storage (each element converted
 to a double; a non-numeric element becomes 0.0, `true` 1.0); `elemType = VAL_INT` → flat int storage (a non-int element
-raises `TypeMismatch`); any other non-zero `elemType` → typed array — a value
+raises `TypeMismatch`); `elemType = VAL_MATRIX | T` → a `[[T]]` matrix, each
+element an array of exactly type `VAL_ARRAY | T` (anything else raises
+`TypeMismatch`); any other non-zero `elemType` → typed array — a value
 whose type doesn't intersect the mask raises `TypeMismatch`. Traps:
-`StackError`, `TypeMismatch`, `NestingError`.
+`StackError`, `TypeMismatch`.
 
 **`OP_MAKE_CONST`** — 1 byte. Stack `v → v`. Marks the (heap) value on TOS
 immutable in place; immediates are already immutable. Traps: —
@@ -1238,8 +1300,9 @@ default (deep-cloned), then runs the constructor if the class chain has
 one: a bytecode constructor runs in a frame prepared directly on the
 instance (no bound-method wrapper, so the instance's lifetime ends with its
 last script reference) with the given args and its return value discarded;
-a native constructor is called directly. Arity mismatch raises
-`InvalidArgs`. The instance is pushed.
+a native constructor is called directly. A class without a constructor
+drops the arguments. Arity mismatch raises `InvalidArgs`. The instance is
+pushed.
 Traps: `RuntimeError`, `InvalidArgs`, plus anything the constructor raises.
 
 **`OP_SUPER`** — 1 byte. Stack `→ bm`. Pushes `this` bound to the
@@ -1418,9 +1481,11 @@ no dynamic fallback).
 form: since the base class is fixed per call site, `memberIdx` indexes its
 member layout directly with no classId guard needed. Ref re-read every call.
 
-**`OP_CALL_GLOBAL`** `<globalKey:u16> <argc:u8>` — 4 bytes. Stack
+**`OP_CALL_GLOBAL`** `<globalKey:u16> <argc:u8> <pad:u8>` — 5 bytes. Stack
 `arg₁ … arg_n → r`. Fused `GET_GLOBAL + CALL`; the callee is resolved from
-the environment and never pushed. Produced by the peephole pass **after**
+the environment and never pushed. The pad byte keeps the fused instruction the
+length of the pair it replaces; it holds the value of `OP_NOP`, is skipped and is
+never executed. Produced by the peephole pass **after**
 tail-call optimization, so tail sites keep TCO. An undefined global
 resolves to nil → "call to non-callable" console error + nil result.
 Traps: as `OP_CALL`.
@@ -1487,7 +1552,8 @@ is where a caught exception will bind. Traps: `RuntimeError` (> 24 nested
 contexts).
 
 **`OP_TRY_END`** — 1 byte. Normal try-body completion: jumps to the
-finally landing pad. Traps: —
+finally landing pad. Traps: `RuntimeError` (no try context in this frame —
+crafted bytecode).
 
 **`OP_CATCH_BEGIN`** — 1 byte. Stack `e →`. Binds the delivered exception
 (pushed by the delivery machinery) into `local[catchSlot]`. Traps:
@@ -1594,10 +1660,10 @@ as decimal (garbage → 0); bool/char → value; nil → 0; other →
 **`OP_TO_CHAR`** — char/int/bool → codepoint; string → first byte (empty
 → 0); nil → 0; other → `InvalidArgs`.
 
-**`OP_TO_I8` / `OP_TO_I16` / `OP_TO_I32`** — coerce to int, then
-sign-extend the low 8/16/32 bits. **`OP_TO_U8` / `OP_TO_U16` /
-`OP_TO_U32`** — coerce to int, then zero-extend the low bits. Traps: as
-`OP_TO_INT`.
+**`OP_TO_I8` / `OP_TO_I16` / `OP_TO_I32`** — coerce to int as `OP_TO_INT`
+does, then sign-extend the low 8/16/32 bits. **`OP_TO_U8` / `OP_TO_U16` /
+`OP_TO_U32`** — coerce to int, then zero-extend the low bits. Traps: none; a
+value `OP_TO_INT` rejects coerces to 0.
 
 **`OP_CHECK_TYPE`** `<mask:u32> <label:u16>` — 7 bytes, stack `v → v'`. The
 value on top is about to be stored in a variable, or returned from a
@@ -1753,7 +1819,8 @@ legal).
 
 **Pass 1 — instruction decode.** Every instruction in `[0, codelen)` is
 decoded. Rejected: unknown opcode; truncated operands; constant index ≥
-`constCount`; key operands whose constant is not a real heap string; local
+`constCount`; key operands whose constant is not a real heap string (for
+`OP_BUILD_OBJECT`, each of its `count` keys); local
 slot ≥ 128 — including each `OP_FN_CAPTURE` `parentSlot` and the `OP_FOREACH`
 value, iterable and index slots, of which only the `OP_FOREACH` key slot
 may be the sentinel `0xFF` (the value, iterable and index slots are indexed
@@ -1778,10 +1845,21 @@ instruction is rejected).
 **Pass 3 — abstract stack simulation.** The validator symbolically executes
 the code, tracking operand-stack depth along all paths:
 
-- Any path whose depth would go negative (stack underflow) is rejected —
-  never clamped. This guarantees the dispatch loop can pop operands without
-  per-instruction underflow checks.
-- At merge points the **deeper** depth wins (a safe upper bound).
+- Every reachable instruction has **one** depth. All edges into it -
+  fall-through, forward and backward branches, absolute targets, the catch
+  and finally entries of a try, a tail call's fall-through - must agree, or
+  the chunk is rejected. A loop body therefore leaves the stack as it found
+  it, and `maxStack` bounds every path and every iteration.
+- An instruction that takes more values than the depth it runs at (the values
+  it pops plus any it reads below the top) is rejected - never clamped. This
+  holds for terminating instructions too.
+- Some instructions must run at an exact depth, so nothing below their operands
+  survives: `RETURN` at 1; `RETURN_NIL`, `RETURN_L` and `RETURN_NONE` at 0
+  (`RETURN_NONE` only at top level); `TAIL_SELF` and `TAIL_THIS_INVOKE` at
+  `argc`; `TAIL_CALL` at `argc + 1`; `TRY_BEGIN`, `TRY_END`, `CATCH_END` and
+  `FINALLY_END` at 0; `TRY_LEAVE` at 0 once its value is taken.
+- Together with the per-frame reservation, these rules let the dispatch loop
+  push and pop without bounds checks.
 - Code that can fall off the end of the chunk without a terminating
   instruction (`RETURN*`, `TAIL_*`, `THROW`, `JUMP`, `LOOP`, `JUMP_TABLE`,
   `TRY_LEAVE`) is rejected.
@@ -1795,9 +1873,9 @@ Per-instruction depth deltas (net effect; branch seeds in parentheses):
 
 | Delta | Instructions |
 | --- | --- |
-| +1 | `NIL` `TRUE` `FALSE` `ONE` `NEG_ONE` `DUP` `SUPER` `CONSTANT` `IMM8/16/32` `IMM_CHAR` `GET_LOCAL` `GET_LOCAL0-3` `GET_GLOBAL` `GET_THIS_PROP` `GET_THIS_SLOT` `GET_THIS_CONST` `GET_THIS_ARR_L` `GET_THIS_ARR_SLOT_L` `FN` `FN_CAPTURE` `GET_ARR_LC/LL` `GET_LOCAL_PROP` `GET_BLK_LC/LL` `PUSH_BUILTIN` `CALL0_BUILTIN` `PUSH_HOST` `CALL0_HOST` `ARITH_L_IMM8` `ARITH_LL_PUSH` |
-| 0 | unary ops, `TO_*` converters, `GET_PROPERTY` `GET_ARR_LI` `GET_BLK_LI` `GET_INDEX_LOCAL` `ARITH_IMM8/IMM16/LC/LL/ELC/ELL/EIC/EIL` `ARITH_BLK_*` `OBJ_ARITH_L` `INC/DEC_LOCAL` `NIL_LOCAL` `SET_ARR_LLC/LLL` `SET_OBJ_LL` `THIS_ARITH_*` `SET_THIS_ARR_LL` `SET_THIS_ARR_SLOT_LL` `LOCAL_ARR_*` `SET_BLK_LLC/LLL` `LOCAL_BLK_*` `DBG_*` `EXPORT` `CHECK_TYPE` `CALL1_BUILTIN` `CALL1_HOST` `ARITH_FMA_LLL` `CATCH_END` `FINALLY_BEGIN/END` `TRY_END` `MAKE_CONST` `GUARD` `BIND_THIS` `YIELD` `AWAIT` `NOP` |
-| −1 | `POP`, binary arithmetic and comparisons, `HAS_KEY` `GET_INDEX` `CONCAT` `SET_LOCAL` `SET_LOCAL0-3` `SET_GLOBAL` `DEFINE_GLOBAL` `SET_ARR_LC/LL` `SET_OBJ_L` `SET_THIS_PROP` `SET_THIS_SLOT` `SET_THIS_ARR_L` `SET_THIS_ARR_SLOT_L` `SET_BLK_LC/LL` `CALL2_BUILTIN` `CALL2_HOST` `ARITH_L` `CATCH_BEGIN` |
+| +1 | `NIL` `TRUE` `FALSE` `ONE` `NEG_ONE` `DUP` `SUPER` `CONSTANT` `CONSTANT_REF` `IMM8/16/32` `IMM_CHAR` `GET_LOCAL` `GET_LOCAL0-3` `GET_GLOBAL` `GET_THIS_PROP` `GET_THIS_SLOT` `GET_THIS_CONST` `GET_THIS_ARR_L` `GET_THIS_ARR_SLOT_L` `FN` `FN_CAPTURE` `GET_ARR_LC/LL` `GET_LOCAL_PROP` `GET_BLK_LC/LL` `PUSH_BUILTIN` `CALL0_BUILTIN` `PUSH_HOST` `CALL0_HOST` `ARITH_L_IMM8` `ARITH_LL_PUSH` `GET_MAT_LLL` |
+| 0 | unary ops, `TO_*` converters, `GET_PROPERTY` `GET_ARR_LI` `GET_BLK_LI` `GET_INDEX_LOCAL` `ARITH_IMM8/IMM16/LC/LL/ELC/ELL/EIC/EIL` `ARITH_BLK_*` `OBJ_ARITH_L` `INC/DEC_LOCAL` `NIL_LOCAL` `SET_ARR_LLC/LLL` `SET_OBJ_LL` `THIS_ARITH_*` `SET_THIS_ARR_LL` `SET_THIS_ARR_SLOT_LL` `LOCAL_ARR_*` `SET_BLK_LLC/LLL` `LOCAL_BLK_*` `DBG_*` `EXPORT` `CHECK_TYPE` `CALL1_BUILTIN` `CALL1_HOST` `ARITH_FMA_LLL` `CATCH_END` `FINALLY_BEGIN/END` `TRY_END` `MAKE_CONST` `GUARD` `BIND_THIS` `AWAIT` `CMP_C` `NOP` `ARITH_MLL/MLC` |
+| −1 | `POP`, binary arithmetic and comparisons, `HAS_KEY` `GET_INDEX` `CONCAT` `SET_LOCAL` `SET_LOCAL0-3` `SET_GLOBAL` `DEFINE_GLOBAL` `SET_ARR_LC/LL` `SET_OBJ_L` `SET_THIS_PROP` `SET_THIS_SLOT` `SET_THIS_ARR_L` `SET_THIS_ARR_SLOT_L` `SET_BLK_LC/LL` `CALL2_BUILTIN` `CALL2_HOST` `ARITH_L` `CATCH_BEGIN` `YIELD` `SET_MAT_LLL` |
 | −2 | `SET_PROPERTY` `SET_INDEX_LOCAL` `CALL3_BUILTIN` `CALL3_HOST` |
 | −3 | `SET_INDEX` `CALL4_BUILTIN` `CALL4_HOST` |
 | −4 | `CALL5_BUILTIN` `CALL5_HOST` |
@@ -1809,19 +1887,22 @@ Per-instruction depth deltas (net effect; branch seeds in parentheses):
 | 1−n | `CONCAT_N` |
 
 Branch seeding: `JUMP_IF_FALSE/TRUE` continue at `d−1` and seed their target
-at `d−1`; `CMP_JUMP_*` continue and seed at `d`; `TRY_BEGIN` seeds its catch
-target at `d+1` (the caught exception); `JUMP_TABLE` seeds all targets at
-`d−1` and terminates the fall-through path; `JUMP` seeds its target at `d` and
-terminates; `TRY_LEAVE` seeds its target at `d` and terminates;
-`LOOP`, `TAIL_CALL`, `TAIL_SELF`, `TAIL_THIS_INVOKE`, `TAIL_THIS_INVOKE_SLOT`,
-`RETURN*`, `THROW` terminate.
+at `d−1`; `CMP_JUMP_*`, `FOREACH`, `ITER_BEGIN` and `ITER_NEXT` continue and
+seed their target at `d`; `JUMP` and `LOOP` seed their target at `d` and
+terminate; `JUMP_TABLE` seeds all targets at `d−1` and terminates;
+`TRY_BEGIN` (at depth 0) seeds its catch target at 1 (the caught exception)
+and its finally target at 0; `TRY_END` and `CATCH_END` terminate (they go to
+the finally); a `break`/`continue` `TRY_LEAVE` seeds its target at 0 and
+terminates; `TAIL_CALL` and `TAIL_THIS_INVOKE` seed the next instruction at 1
+(a callee that cannot reuse the frame returns onto the `RETURN` left standing)
+and terminate; `TAIL_SELF`, `RETURN*` and `THROW` terminate.
 
 ---
 
 ## Appendix A. Opcode map
 
-Dense numbering for the current opcode set. `OP_LAST` = 197
-(not a real instruction). Any opcode ≥ 197 MUST be rejected.
+Dense numbering for the current opcode set. `OP_LAST` = 203
+(not a real instruction). Any opcode ≥ 203 MUST be rejected.
 
 | # | Hex | Mnemonic | # | Hex | Mnemonic |
 | --- | --- | --- | --- | --- | --- |
@@ -1923,7 +2004,13 @@ Dense numbering for the current opcode set. `OP_LAST` = 197
 | 95 | 0x5F | `OP_CALL_TYPED` | 194 | 0xC2 | `OP_SET_THIS_ARR_SLOT_LL` |
 | 96 | 0x60 | `OP_CALL_SELF` | 195 | 0xC3 | `OP_ARITH_IMM16` |
 | 97 | 0x61 | `OP_TAIL_SELF` | 196 | 0xC4 | `OP_CHECK_TYPE` |
-| 98 | 0x62 | `OP_TAIL_CALL` | | | |
+| 98 | 0x62 | `OP_TAIL_CALL` | 197 | 0xC5 | `OP_OBJ_ARITH_S` |
+| | | | 198 | 0xC6 | `OP_CMP_C` |
+| | | | 199 | 0xC7 | `OP_GET_MAT_LLL` |
+| | | | 200 | 0xC8 | `OP_SET_MAT_LLL` |
+| | | | 201 | 0xC9 | `OP_ARITH_MLL` |
+| | | | 202 | 0xCA | `OP_ARITH_MLC` |
+| | | | 203 | 0xCB | `OP_CONSTANT_REF` |
 
 ## Appendix B. Machine limits and named constants
 
@@ -1964,14 +2051,14 @@ time for portability of programs near the limits.
 | `MAX_CHUNK_DEPTH` | 64 | nested-chunk depth in a `.flx` |
 | `MAX_CODE_SIZE` | 10 MiB | bytecode bytes per chunk |
 | `MAX_CONST_COUNT` | 16384 | constants per chunk |
-| `MAX_ITEMS` | 10 000 000 | array elements / object properties |
+| `MAX_ITEMS` | 16 777 216 (2^24) | array elements / object properties |
 | `MAX_STRING_SIZE` | 256 MiB | string bytes |
 | `MAX_MEM_BLOCK_ALLOC` | 2 GiB | one memory block |
 | `MAX_TOTAL_BLOCK_ALLOCATION` | 64 GiB | total block memory |
 | `MAX_BLOCK_ELEM_SIZE` | 255 | block element size (stored in one byte) |
 | `MAX_EVAL_COMPILE_SRC_LEN` | 10 KiB | `Eval`/`Compile` source length |
 | `MAX_CONCAT_FUSE` | 16 | operands of one `OP_CONCAT_N` (§7.21) |
-| `MAX_NEST_DEPTH` | 64 | container nesting before `NestingError` (build/merge) |
+| `MAX_CLONE_DEPTH` | 512 | deep-clone recursion (container `+`, `Clone`) before `NestingError` |
 | `MAX_COMPARE_DEPTH` | 1024 | structural-comparison recursion before `NestingError` |
 | `MAX_PRINT_DEPTH` | 64 | console value printing descends this deep, then elides |
 | `FIBER_QUANTUM` | 10000 | scheduling checkpoints per time slice |
@@ -2047,7 +2134,7 @@ chunk, not inferred from the prose alone.
 
 | Code | Opcode(s) | Comment |
 | --- | --- | --- |
-| *(none — peephole filler)* | `OP_NOP` | Not compiler-emitted from source. Written by the tail-call optimization to reclaim the dead `RETURN` byte left behind after rewriting a tail call to `TAIL_CALL`/`TAIL_SELF`, so later jump offsets don't shift. (An unreachable statement after an earlier unconditional `return` is a different case, eliminated earlier at the AST level — the statement is dropped before codegen ever runs, so no `NOP` patch is involved there.) The bytecode-level peephole pass also pads reclaimed bytes with `OP_NOP` when it fuses a `this.field[index]` read or a call through a global into one opcode. |
+| *(none — peephole filler)* | `OP_NOP` | Not compiler-emitted from source. The bytecode-level peephole pass pads reclaimed bytes with `OP_NOP` when it fuses a `this.field[index]` read or a call through a global into one opcode, so later jump offsets don't shift. A tail call keeps the `RETURN` after it: a callee that cannot reuse the frame returns onto it. |
 | `let s = "hello";` | `OP_CONSTANT` | String constants are copied out of the pool on every push — strings are mutable at runtime, the pool object must not be aliased. |
 | `let x = nil;` | `OP_NIL` | |
 | `let x = true;` | `OP_TRUE` | |
@@ -2095,6 +2182,7 @@ chunk, not inferred from the prose alone.
 | `if (foo() >= bar()) { ... }` | `OP_GREATER_EQUAL` | |
 | `if (a ~= b) { ... }` | `OP_APPROX_EQ` | |
 | `if (x is MyClass) { ... }` | `OP_CMP_IS` | |
+| `if (cmd == "add") { ... }` | `OP_CMP_C` | A constant right operand: the peephole pass fuses `CONSTANT` with the comparison, so the literal is compared where it sits instead of being copied onto the stack first. Covers `==`, `!=`, `<`, `<=`, `>`, `>=`. |
 
 ### D.4 Control flow (§7.4)
 
@@ -2176,6 +2264,7 @@ chunk, not inferred from the prose alone.
 | `obj.field = foo();` (`obj` local) | `OP_SET_OBJ_L` | |
 | `obj.field = j;` (`j` local) | `OP_SET_OBJ_LL` | Zero-stack. |
 | `obj.field += j;` | `OP_OBJ_ARITH_L` | Exists specifically so a string field's `+=` can append in place — the generic `DUP`/`GET_PROPERTY`/op/`SET_PROPERTY` sequence would give the field a second reference and make the append (and the surrounding loop) quadratic. |
+| `obj.field -= dx * m;` | `OP_OBJ_ARITH_S` | The same with an expression on the right, when it has no effects: the expression, then one read-modify-write of the field. |
 
 ### D.10 `this` access (§7.10)
 
@@ -2296,15 +2385,15 @@ options or `FlarisRegisterModule`) — not exercised by any `.fls` in this repo.
 | `type(x)` | `OP_TYPE` | Same family of bare global builtins; `x`'s `ObjectType` bit, compare against `Type.*` constants. |
 | `if (k in c) { ... }` | `OP_HAS_KEY` | |
 | `str(x)` / `(string)x` | `OP_TO_STRING` | Both the bare-call and cast forms lower here. |
-| `int(x)` / `(int)x` | `OP_TO_INT` | Both forms; also where sized-int aliases as a **cast** land (see below). |
+| `int(x)` / `(int)x` | `OP_TO_INT` | Both forms; also the casts `(u64)x` and `(i64)x`, which do not narrow. |
 | `float(x)` / `(float)x` | `OP_TO_FLOAT` | |
 | `char(x)` / `(char)x` | `OP_TO_CHAR` | |
-| `i8(x)` | `OP_TO_I8` | Bare global call only — `(i8)x` as a **cast** normalizes to plain `int` before the cast is compiled, so the cast spelling compiles to `OP_TO_INT` instead. Same split for the five rows below. |
-| `u8(x)` | `OP_TO_U8` | |
-| `i16(x)` | `OP_TO_I16` | |
-| `u16(x)` | `OP_TO_U16` | |
-| `i32(x)` | `OP_TO_I32` | |
-| `u32(x)` | `OP_TO_U32` | |
+| `i8(x)` / `(i8)x` | `OP_TO_I8` | Both forms, as for the five rows below. |
+| `u8(x)` / `(u8)x` | `OP_TO_U8` | |
+| `i16(x)` / `(i16)x` | `OP_TO_I16` | |
+| `u16(x)` / `(u16)x` | `OP_TO_U16` | |
+| `i32(x)` / `(i32)x` | `OP_TO_I32` | |
+| `u32(x)` / `(u32)x` | `OP_TO_U32` | |
 | `let n: int = f(x)` / `n = o.k` / `return f(x)` in `fn g(): int` | … `OP_CHECK_TYPE` | Only when the stored value's type is not known at compile time; a statically known misfit is a compile error instead. |
 
 ### D.18 Modules (§7.18)

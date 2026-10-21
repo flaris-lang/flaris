@@ -824,6 +824,52 @@ fn test_readstring_fixed_and_cstring() {
     check("CString round-trip EOF",  r.IsEOF(), true);
 }
 
+// Writer, reader and Hash.Crc32 over the same bytes must agree for every
+// string, raw-byte, padding and skip method; Peek must leave the CRC alone.
+fn test_checksum_covers_every_method() {
+    let w = new BinaryWriter(nil);
+    w.EnableChecksum();
+    w.WriteU32(7);
+    w.WriteString("hello");
+    w.WriteString32("s32");
+    w.WriteStringVar("var");
+    w.WriteBytes(Buffer.FromString("xyz"));
+    w.WriteCString("cs");
+    w.WriteStringFixed("ab", 4);
+    w.WritePad(3);
+    w.WriteU8(9);
+    w.Align(4);
+    w.WriteU16(5);
+    let wcrc:int = w.Checksum();
+    check("Checksum writer == Hash.Crc32", wcrc, (u32)Hash.Crc32(w.ToBuffer()));
+
+    let r = new BinaryReader(w.ToBuffer(), nil);
+    r.EnableChecksum();
+    r.ReadU32();
+    check("Checksum ReadString value", r.ReadString(), "hello");
+    r.PeekU16();
+    r.PeekU32();
+    check("Checksum ReadString32 value", r.ReadString32(), "s32");
+    check("Checksum ReadStringVar value", r.ReadStringVar(), "var");
+    r.ReadBytes(3);
+    check("Checksum ReadCString value", r.ReadCString(), "cs");
+    r.ReadStringFixed(4);
+    r.Skip(3);
+    r.ReadU8();
+    r.Align(4);
+    r.ReadU16();
+    check("Checksum reader == writer over every method", r.Checksum(), wcrc);
+}
+
+fn test_readcstring_unterminated() {
+    let r = new BinaryReader(Buffer.FromString("abc"), nil);
+    check("ReadCString unterminated value",     r.ReadCString(), "abc");
+    check("ReadCString unterminated BytesLeft", r.BytesLeft(), 0);
+    check("ReadCString unterminated Position",  r.Position(), 3);
+    check("ReadCString past the end",           r.ReadCString(), "");
+    check("ReadCString past the end BytesLeft", r.BytesLeft(), 0);
+}
+
 // =============================================================================
 // Benchmark
 // =============================================================================
@@ -1013,6 +1059,8 @@ fn Main() {
     test_buffer_primitives();
     test_binary_float_io();
     test_stream_reader_end_and_parts();
+    test_checksum_covers_every_method();
+    test_readcstring_unterminated();
 
     test_benchmark();
 

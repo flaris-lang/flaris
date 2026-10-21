@@ -1,0 +1,959 @@
+// Modbus.fls - Modbus client and server: TCP (MBAP) and RTU over any stream.
+// Version: 1.0
+//
+// The client speaks Modbus TCP to a device or gateway, or RTU over a stream: a
+// serial port from Stream.OpenSerial, or a socket to an RTU-over-TCP gateway.
+// The server answers either from an in-memory register map, from a handler of
+// your own, or both - a device simulator in a few lines. Every wait parks only
+// the fiber that makes it.
+//
+// Exported:
+//   ModbusClient    - Tcp(host, port?, opts?) / Rtu(stream, opts?)
+//                     ReadCoils / ReadDiscreteInputs / ReadHoldingRegisters /
+//                     ReadInputRegisters / WriteSingleCoil / WriteSingleRegister /
+//                     WriteMultipleCoils / WriteMultipleRegisters /
+//                     ReadWriteMultipleRegisters / Request / SetTimeout / Close
+//   ModbusServer    - ListenTcp / ServeRtu / Stop, and the register map
+//   Modbus          - Crc16, and register decoding: ToI16 / ToU32 / ToI32 /
+//                     ToF32 and back: FromI16 / FromU32 / FromI32 / FromF32
+//   ModbusError     - every failure; ModbusTimeout is the subclass for "no reply"
+//   ModbusException - the exception codes by name
+//
+// Usage:
+//   import { ModbusClient, ModbusServer, Modbus, ModbusError } from library("Modbus", "1.0");
+//
+//   let plc = ModbusClient.Tcp("192.168.1.10", 502, { unit: 1, timeoutMs: 500 });
+//   let regs = plc.ReadHoldingRegisters(0, 10);           // [int], 10 x u16
+//   let temp = Modbus.ToF32(regs, "CDAB")[0];              // a float in two registers
+//   plc.WriteSingleRegister(100, 1234);
+//   plc.WriteMultipleCoils(0, [true, false, true]);
+//   plc.Close();
+//
+//   let rtu = ModbusClient.Rtu(Stream.OpenSerial("/dev/ttyUSB0", 19200, "8E1"),
+//                              { unit: 17, baud: 19200 });
+//   let on = rtu.ReadCoils(0, 8);                          // [bool]
+//
+//   let sim = new ModbusServer({ holdingRegisters: 1000 });
+//   sim.HoldingRegisters[0] = 42;
+//   let port = sim.ListenTcp(0);                           // 0 picks a free port
+//   ...
+//   sim.Stop();
+//
+// Client (all methods take an optional last `unit`, else the client's own):
+//   ReadCoils(addr, count) / ReadDiscreteInputs(addr, count)   → [bool]   count 1..2000
+//   ReadHoldingRegisters(addr, count) / ReadInputRegisters(addr, count)
+//                                                               → [int]    count 1..125
+//   WriteSingleCoil(addr, on:bool) / WriteSingleRegister(addr, value)
+//   WriteMultipleCoils(addr, values:[bool]) (1..1968) /
+//   WriteMultipleRegisters(addr, values:[int]) (1..123)
+//   ReadWriteMultipleRegisters(readAddr, readCount, writeAddr, values) → [int]
+//       (function 0x17: the write happens first)
+//   Request(function, data:block) → block - any other function: the response
+//       data after its function code. Over RTU a reply of a function this
+//       library does not know ends at the first silence of the inter-frame gap.
+//   SetTimeout(ms), Close()
+//
+// Options: unit (default 1; 0 over RTU is a broadcast - writes only, no
+// reply), timeoutMs (per request, default 1000). RTU also: baud (default
+// 9600), which sets the silent interval kept between frames (3.5 characters;
+// 1.75 ms above 19200 baud), or interFrameMs to set it directly.
+//
+// A TCP client connects on first use and again after a failure: a request
+// that timed out closes the connection, so a late answer cannot be taken for
+// the next one. Requests from several fibers on one client take turns.
+//
+// Errors raise ModbusError, with Function (the function code) and Kind:
+//   "exception" - the device answered with an exception; Code is its code
+//                 (ModbusException.IllegalDataAddress and the rest)
+//   "timeout"   - no complete answer in time (raised as ModbusTimeout)
+//   "io"        - the connection could not be made or broke
+//   "protocol"  - an answer that does not fit the request (bad CRC, wrong
+//                 function, wrong length)
+// Code is 0 for every Kind but "exception". Arguments out of the ranges above
+// raise Exception.InvalidArguments before anything is sent.
+//
+// Server: new ModbusServer(opts?) holds four [int] tables, sized by opts
+// coils, discreteInputs, holdingRegisters, inputRegisters (default 10000 each):
+//   Coils, DiscreteInputs (0/1), HoldingRegisters, InputRegisters (0..65535)
+// A request outside a table answers ILLEGAL DATA ADDRESS. opts.unit answers
+// only that unit id (others get GATEWAY TARGET over TCP and silence over RTU);
+// opts.handler, fn(unit, pdu:block) → block|nil, sees every request first:
+// return a response PDU (function code first) to answer it, nil to leave it to
+// the register map, or throw a ModbusError to answer with its Code.
+//   ListenTcp(port, host?) → int      the bound port; serves until Stop()
+//   ServeRtu(stream)                  answers RTU frames on the stream
+//   Stop()                            closes the listener and every connection
+// opts.idleTimeoutMs (default 60000) closes a TCP connection that sends nothing.
+//
+// Register decoding: a 32-bit value spans two registers. `order` names how its
+// bytes A (most significant) to D arrive: "ABCD" big-endian (default), "CDAB"
+// word-swapped, "BADC" byte-swapped, "DCBA" little-endian.
+
+// ---------------------------------------------------------------------------
+//  Constants
+// ---------------------------------------------------------------------------
+
+const FC_READ_COILS      = 1;
+const FC_READ_DISCRETE   = 2;
+const FC_READ_HOLDING    = 3;
+const FC_READ_INPUT      = 4;
+const FC_WRITE_COIL      = 5;
+const FC_WRITE_REGISTER  = 6;
+const FC_WRITE_COILS     = 15;
+const FC_WRITE_REGISTERS = 16;
+const FC_READ_WRITE      = 23;
+
+global ModbusException = {
+    IllegalFunction:        1,
+    IllegalDataAddress:     2,
+    IllegalDataValue:       3,
+    ServerDeviceFailure:    4,
+    Acknowledge:            5,
+    ServerDeviceBusy:       6,
+    MemoryParityError:      8,
+    GatewayPathUnavailable: 10,
+    GatewayTargetFailed:    11
+};
+
+class ModbusError : Exception {
+    let Function:int = 0;
+    let Kind:string  = "";
+
+    fn Constructor(code: int, msg: string, function: int, kind: string) {
+        super(code, msg);
+        this.Function = function;
+        this.Kind = kind;
+    }
+}
+
+class ModbusTimeout : ModbusError {}
+
+fn _mbExceptionName(code: int): string {
+    if (code == 1)  return "illegal function";
+    if (code == 2)  return "illegal data address";
+    if (code == 3)  return "illegal data value";
+    if (code == 4)  return "server device failure";
+    if (code == 5)  return "acknowledge";
+    if (code == 6)  return "server device busy";
+    if (code == 8)  return "memory parity error";
+    if (code == 10) return "gateway path unavailable";
+    if (code == 11) return "gateway target device failed to respond";
+    return "exception " + str(code);
+}
+
+fn _mbFail(kind: string, function: int, msg: string) {
+    if (kind == "timeout") throw new ModbusTimeout(0, "Modbus: " + msg, function, kind);
+    throw new ModbusError(0, "Modbus: " + msg, function, kind);
+}
+
+fn _mbArg(cond: bool, msg: string) {
+    if (!cond) throw(Exception.InvalidArguments, "Modbus: " + msg);
+}
+
+// ---------------------------------------------------------------------------
+//  CRC and bit/register packing
+// ---------------------------------------------------------------------------
+
+// CRC-16/MODBUS of the first n bytes of b. Hash.Crc16 is CRC-16/ARC: the same
+// reflected polynomial from an all-zero register. Starting from 0xFFFF instead
+// is the same as inverting the first two bytes, which is what is done here.
+fn _mbCrc(b: block, n: int): int {
+    if (n >= 2) {
+        let c = Buffer.Slice(b, 0, n);
+        c[0] = c[0] ^ 255;
+        c[1] = c[1] ^ 255;
+        return Hash.Crc16(c);
+    }
+    var crc: int = 65535;
+    var i: int = 0;
+    while (i < n) {
+        crc = crc ^ b[i];
+        var k: int = 0;
+        while (k < 8) {
+            crc = ((crc & 1) != 0) ? ((crc >> 1) ^ 40961) : (crc >> 1);
+            k += 1;
+        }
+        i += 1;
+    }
+    return crc;
+}
+
+// count bits packed LSB-first from b[off] on, as [bool].
+fn _mbUnpackBits(b: block, off: int, count: int): array {
+    let out = [];
+    iter (i from 0 to count) {
+        Array.Append(out, ((b[off + (i >> 3)] >> (i & 7)) & 1) == 1);
+    }
+    return out;
+}
+
+// values (bools, or ints where nonzero is on) packed LSB-first into b[off..].
+fn _mbPackBits(values, b: block, off: int) {
+    iter (i from 0 to len(values)) {
+        let v = values[i];
+        if (v == true || (Type.IsInt(v) && v != 0)) {
+            let at = off + (i >> 3);
+            b[at] = b[at] | (1 << (i & 7));
+        }
+    }
+}
+
+fn _mbGetRegs(b: block, off: int, count: int): [int] {
+    let out: [int] = Array.Create(count, Type.Int);
+    var i: int = 0;
+    while (i < count) {
+        out[i] = (b[off + 2 * i] << 8) | b[off + 2 * i + 1];
+        i += 1;
+    }
+    return out;
+}
+
+fn _mbPutRegs(values, b: block, off: int) {
+    iter (i from 0 to len(values)) {
+        let v: int = values[i];
+        b[off + 2 * i]     = (v >> 8) & 255;
+        b[off + 2 * i + 1] = v & 255;
+    }
+}
+
+fn _mbU16(b: block, off: int): int {
+    return (b[off] << 8) | b[off + 1];
+}
+
+fn _mbPut16(b: block, off: int, v: int) {
+    b[off]     = (v >> 8) & 255;
+    b[off + 1] = v & 255;
+}
+
+// A PDU: the function code, then `size` zero bytes to fill in.
+fn _mbPdu(function: int, size: int): block {
+    let p = Buffer.Create(size + 1, 1);
+    p[0] = function;
+    return p;
+}
+
+// The length of an RTU frame from its first `have` bytes, or -1 while it is
+// not known yet (byte-count functions need three bytes), -2 for a function
+// with no fixed layout. `request` picks the request or the response layout.
+fn _mbRtuLength(b: block, have: int, request: bool): int {
+    let f: int = b[1];
+    if ((f & 128) != 0) return request ? -2 : 5;
+    if (request) {
+        if (f >= 1 && f <= 6) return 8;
+        if (f == 15 || f == 16) return have < 7 ? -1 : 9 + b[6];
+        if (f == 23) return have < 11 ? -1 : 13 + b[10];
+        return -2;
+    }
+    if (f >= 1 && f <= 4 || f == 23) return have < 3 ? -1 : 5 + b[2];
+    if (f == 5 || f == 6 || f == 15 || f == 16) return 8;
+    return -2;
+}
+
+// ---------------------------------------------------------------------------
+//  Modbus - CRC and register decoding
+// ---------------------------------------------------------------------------
+
+class Modbus {
+    // CRC-16/MODBUS of a block or string; on the wire it goes low byte first.
+    fn static Crc16(data): int {
+        let b = (Type.Of(data) == Type.String) ? Buffer.FromString(data) : data;
+        return _mbCrc(b, len(b));
+    }
+
+    // The registers as signed 16-bit values.
+    fn static ToI16(regs): [int] {
+        let out: [int] = Array.Create(len(regs), Type.Int);
+        iter (i from 0 to len(regs)) { out[i] = (i16)regs[i]; }
+        return out;
+    }
+
+    fn static FromI16(values): [int] {
+        let out: [int] = Array.Create(len(values), Type.Int);
+        iter (i from 0 to len(values)) { out[i] = (u16)values[i]; }
+        return out;
+    }
+
+    // Each pair of registers as one unsigned 32-bit value.
+    fn static ToU32(regs, order?: string): [int] {
+        let n = len(regs) / 2;
+        let out: [int] = Array.Create(n, Type.Int);
+        iter (i from 0 to n) { out[i] = Modbus._join(regs[2 * i], regs[2 * i + 1], order ?? "ABCD"); }
+        return out;
+    }
+
+    fn static ToI32(regs, order?: string): [int] {
+        let u = Modbus.ToU32(regs, order);
+        iter (i from 0 to len(u)) { u[i] = (i32)u[i]; }
+        return u;
+    }
+
+    fn static ToF32(regs, order?: string): [float] {
+        let n = len(regs) / 2;
+        let out: [float] = Array.Create(n, Type.Float);
+        let b = Buffer.Create(4, 1);
+        iter (i from 0 to n) {
+            Buffer.WriteU32At(b, 0, Modbus._join(regs[2 * i], regs[2 * i + 1], order ?? "ABCD"), true);
+            out[i] = Buffer.ReadFloat32At(b, 0, true);
+        }
+        return out;
+    }
+
+    fn static FromU32(values, order?: string): [int] {
+        let out: [int] = Array.Create(2 * len(values), Type.Int);
+        iter (i from 0 to len(values)) { Modbus._split((u32)values[i], order ?? "ABCD", out, 2 * i); }
+        return out;
+    }
+
+    fn static FromI32(values, order?: string): [int] {
+        return Modbus.FromU32(values, order);
+    }
+
+    fn static FromF32(values, order?: string): [int] {
+        let out: [int] = Array.Create(2 * len(values), Type.Int);
+        let b = Buffer.Create(4, 1);
+        iter (i from 0 to len(values)) {
+            Buffer.WriteFloat32At(b, 0, float(values[i]), true);
+            Modbus._split(Buffer.ReadU32At(b, 0, true), order ?? "ABCD", out, 2 * i);
+        }
+        return out;
+    }
+
+    // The 32-bit value of two registers whose bytes arrive as A B C D, with
+    // `order` naming where the most to least significant bytes sit.
+    fn static _join(r0: int, r1: int, order: string): int {
+        let a = (r0 >> 8) & 255; let bb = r0 & 255;
+        let c = (r1 >> 8) & 255; let d = r1 & 255;
+        if (order == "ABCD") return (a << 24) | (bb << 16) | (c << 8) | d;
+        if (order == "CDAB") return (c << 24) | (d << 16) | (a << 8) | bb;
+        if (order == "BADC") return (bb << 24) | (a << 16) | (d << 8) | c;
+        if (order == "DCBA") return (d << 24) | (c << 16) | (bb << 8) | a;
+        throw(Exception.InvalidArguments, "Modbus: order must be ABCD, CDAB, BADC or DCBA");
+    }
+
+    fn static _split(v: int, order: string, out, at: int) {
+        let a = (v >> 24) & 255; let bb = (v >> 16) & 255;
+        let c = (v >> 8) & 255;  let d = v & 255;
+        var r0 = 0; var r1 = 0;
+        if (order == "ABCD")      { r0 = (a << 8) | bb; r1 = (c << 8) | d; }
+        else if (order == "CDAB") { r0 = (c << 8) | d;  r1 = (a << 8) | bb; }
+        else if (order == "BADC") { r0 = (bb << 8) | a; r1 = (d << 8) | c; }
+        else if (order == "DCBA") { r0 = (d << 8) | c;  r1 = (bb << 8) | a; }
+        else { throw(Exception.InvalidArguments, "Modbus: order must be ABCD, CDAB, BADC or DCBA"); }
+        out[at] = r0;
+        out[at + 1] = r1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  ModbusClient
+// ---------------------------------------------------------------------------
+
+class ModbusClient {
+    let _rtu:bool       = false;
+    let _host:string    = "";
+    let _port:int       = 502;
+    let _sock           = nil;
+    let _unit:int       = 1;
+    let _timeout:int    = 1000;
+    let _tid:int        = 0;
+    let _gap:int        = 4;       // RTU silent interval, ms
+    let _lastEnd:int    = 0;       // when the last RTU frame ended, Time.Millis
+    let _dirty:bool     = false;   // RTU: bytes of an abandoned answer may follow
+    let _busy:bool      = false;
+    let _waiters        = nil;     // fiber ids waiting for their turn
+
+    fn Constructor() { this._waiters = []; }
+
+    fn _options(opts) {
+        if (opts == nil) return;
+        if (opts.unit != nil)      { this._unit = opts.unit; }
+        if (opts.timeoutMs != nil) { this._timeout = opts.timeoutMs; }
+    }
+
+    // A Modbus TCP client for host:port (default 502). Connects on first use.
+    fn static Tcp(host: string, port?: int, opts?): ModbusClient {
+        let c = new ModbusClient();
+        c._host = host;
+        c._port = port ?? 502;
+        c._options(opts);
+        return c;
+    }
+
+    // A Modbus RTU client on `stream` (a serial port, or a socket to an
+    // RTU-over-TCP gateway). The stream stays the caller's: Close leaves it open.
+    fn static Rtu(stream, opts?): ModbusClient {
+        let c = new ModbusClient();
+        c._rtu = true;
+        c._sock = stream;
+        c._options(opts);
+        let baud = (opts != nil && opts.baud != nil) ? opts.baud : 9600;
+        // 3.5 characters of 11 bits; the standard fixes 1.75 ms above 19200 baud.
+        c._gap = (baud > 19200) ? 2 : (38500 + baud - 1) / baud;
+        if (opts != nil && opts.interFrameMs != nil) { c._gap = opts.interFrameMs; }
+        return c;
+    }
+
+    fn SetTimeout(ms: int) { this._timeout = ms; }
+
+    // Opens the TCP connection now rather than on the first request.
+    fn Connect() {
+        if (this._rtu || this._sock != nil) return true;
+        let s = Fiber.Await(Stream.ConnectAsync("tcp", this._host, this._port, this._timeout));
+        if (s == nil) { _mbFail("io", 0, "cannot connect to " + this._host + ":" + str(this._port)); }
+        Stream.SetNoDelay(s, true);
+        this._sock = s;
+        return true;
+    }
+
+    fn Close() {
+        if (!this._rtu && this._sock != nil) { Stream.Close(this._sock); }
+        this._sock = nil;
+    }
+
+    fn _drop() {
+        if (!this._rtu && this._sock != nil) { Stream.Close(this._sock); this._sock = nil; }
+        this._dirty = true;
+    }
+
+    fn _acquire() {
+        let me = Fiber.Id();
+        while (this._busy) {
+            Array.Append(this._waiters, me);
+            Fiber.Park(1000);
+            let kept = [];
+            foreach (w in this._waiters) { if (w != me) { Array.Append(kept, w); } }
+            this._waiters = kept;
+        }
+        this._busy = true;
+    }
+
+    fn _release() {
+        this._busy = false;
+        if (len(this._waiters) > 0) { Fiber.Unpark(Fiber.FromId(this._waiters[0])); }
+    }
+
+    // Sends one PDU and returns the answer's PDU, function code first (nil for
+    // an RTU broadcast). Raises on an exception answer or any failure.
+    fn _call(unit: int, pdu: block): block {
+        this._acquire();
+        try {
+            let resp = this._rtu ? this._rtuExchange(unit, pdu) : this._tcpExchange(unit, pdu);
+            if (resp == nil) return nil;
+            let f: int = pdu[0];
+            if (resp[0] == (f | 128)) {
+                let code: int = len(resp) > 1 ? resp[1] : 0;
+                throw new ModbusError(code, "Modbus: " + _mbExceptionName(code) + " (function " + str(f) + ")", f, "exception");
+            }
+            if (resp[0] != f) { _mbFail("protocol", f, "answer to function " + str(resp[0]) + ", asked " + str(f)); }
+            return resp;
+        } finally {
+            this._release();
+        }
+    }
+
+    fn _tcpExchange(unit: int, pdu: block): block {
+        let f: int = pdu[0];
+        if (this._sock == nil) { this.Connect(); }
+        this._tid = (this._tid + 1) & 65535;
+        let tid = this._tid;
+        let n = len(pdu);
+        let frame = Buffer.Create(7 + n, 1);
+        _mbPut16(frame, 0, tid);
+        _mbPut16(frame, 4, n + 1);
+        frame[6] = unit;
+        Buffer.Copy(pdu, 0, frame, 7, n);
+        let deadline = Time.Millis() + this._timeout;
+        let sent = Fiber.Await(Stream.WriteAsync(this._sock, frame, this._timeout));
+        if (sent == nil || sent != len(frame)) { this._drop(); _mbFail("io", f, "send failed"); }
+        while (true) {
+            let left = deadline - Time.Millis();
+            if (left <= 0) { this._drop(); _mbFail("timeout", f, "no answer in " + str(this._timeout) + " ms"); }
+            let head = Fiber.Await(Stream.ReadAsync(this._sock, 7, left));
+            if (head == nil || len(head) < 7) { this._readFailed(f, head); }
+            let length = _mbU16(head, 4);
+            if (_mbU16(head, 2) != 0 || length < 2 || length > 254) {
+                this._drop();
+                _mbFail("protocol", f, "bad MBAP header");
+            }
+            let body = Fiber.Await(Stream.ReadAsync(this._sock, length - 1, deadline - Time.Millis()));
+            if (body == nil || len(body) < length - 1) { this._readFailed(f, body); }
+            // An answer to an earlier request that timed out is passed over.
+            if (_mbU16(head, 0) == tid) return body;
+        }
+    }
+
+    // A read that came back short: the deadline, or the peer going away.
+    fn _readFailed(f: int, got) {
+        let why = Stream.LastError();
+        this._drop();
+        if (why == 1 || (got != nil && len(got) > 0 && why != 2 && why != 3)) {
+            _mbFail("timeout", f, "no complete answer in " + str(this._timeout) + " ms");
+        }
+        _mbFail("io", f, "connection closed");
+    }
+
+    fn _rtuExchange(unit: int, pdu: block): block {
+        let f: int = pdu[0];
+        let s = this._sock;
+        if (s == nil) { _mbFail("io", f, "no stream"); }
+        let quiet = this._lastEnd + this._gap - Time.Millis();
+        if (quiet > 0) { Fiber.Sleep(quiet); }
+        if (this._dirty) { this._drain(); }
+
+        let n = len(pdu);
+        let frame = Buffer.Create(n + 3, 1);
+        frame[0] = unit;
+        Buffer.Copy(pdu, 0, frame, 1, n);
+        let crc = _mbCrc(frame, n + 1);
+        frame[n + 1] = crc & 255;
+        frame[n + 2] = crc >> 8;
+        let deadline = Time.Millis() + this._timeout;
+        let sent = Fiber.Await(Stream.WriteAsync(s, frame, this._timeout));
+        if (sent == nil || sent != len(frame)) { this._dirty = true; _mbFail("io", f, "send failed"); }
+        if (unit == 0) { this._lastEnd = Time.Millis(); return nil; }
+
+        let resp = this._rtuRead(deadline, f);
+        this._lastEnd = Time.Millis();
+        let rn = len(resp);
+        let want = _mbCrc(resp, rn - 2);
+        if (resp[rn - 2] != (want & 255) || resp[rn - 1] != (want >> 8)) {
+            this._dirty = true;
+            _mbFail("protocol", f, "bad CRC");
+        }
+        if (resp[0] != unit) { this._dirty = true; _mbFail("protocol", f, "answer from unit " + str(resp[0])); }
+        return Buffer.Slice(resp, 1, rn - 3);
+    }
+
+    // One RTU answer: its length follows from the function and byte count; a
+    // function without a fixed layout ends at the first inter-frame silence.
+    fn _rtuRead(deadline: int, f: int): block {
+        let s = this._sock;
+        let got = Buffer.Create(0, 1);
+        var want = 3;
+        while (len(got) < want) {
+            let left = deadline - Time.Millis();
+            if (left <= 0) { this._dirty = true; _mbFail("timeout", f, "no complete answer in " + str(this._timeout) + " ms"); }
+            let part = Fiber.Await(Stream.ReadAsync(s, want - len(got), left));
+            if (part == nil || len(part) == 0) {
+                this._dirty = true;
+                if (Stream.LastError() == 1) { _mbFail("timeout", f, "no complete answer in " + str(this._timeout) + " ms"); }
+                _mbFail("io", f, "stream closed");
+            }
+            Buffer.Append(got, part);
+            if (len(got) >= 2) {
+                let full = _mbRtuLength(got, len(got), false);
+                if (full == -2) { return this._rtuUntilSilence(got, deadline, f); }
+                if (full > 0) { want = full; } else { want = 3; }
+            }
+        }
+        return got;
+    }
+
+    fn _rtuUntilSilence(got: block, deadline: int, f: int): block {
+        let gap = this._gap * 2 + 2;
+        while (Time.Millis() < deadline) {
+            let part = Fiber.Await(Stream.ReadAsync(this._sock, 256, gap));
+            if (part == nil || len(part) == 0) break;
+            Buffer.Append(got, part);
+            if (len(got) > 256) { this._dirty = true; _mbFail("protocol", f, "frame too long"); }
+        }
+        if (len(got) < 4) { this._dirty = true; _mbFail("protocol", f, "frame too short"); }
+        return got;
+    }
+
+    // Discards what is left of an abandoned answer.
+    fn _drain() {
+        while (true) {
+            let part = Fiber.Await(Stream.ReadAsync(this._sock, 256, this._gap + 1));
+            if (part == nil || len(part) == 0) break;
+        }
+        this._dirty = false;
+    }
+
+    fn _readBits(function: int, addr: int, count: int, unit): array {
+        _mbArg(addr >= 0 && addr <= 65535, "address out of range");
+        _mbArg(count >= 1 && count <= 2000 && addr + count <= 65536, "count must be 1..2000");
+        let p = _mbPdu(function, 4);
+        _mbPut16(p, 1, addr);
+        _mbPut16(p, 3, count);
+        let r = this._call(unit ?? this._unit, p);
+        if (r == nil) return nil;
+        if (len(r) < 2 || r[1] != (count + 7) / 8 || len(r) != 2 + r[1]) { _mbFail("protocol", function, "bad byte count"); }
+        return _mbUnpackBits(r, 2, count);
+    }
+
+    fn _readRegs(function: int, addr: int, count: int, unit): [int] {
+        _mbArg(addr >= 0 && addr <= 65535, "address out of range");
+        _mbArg(count >= 1 && count <= 125 && addr + count <= 65536, "count must be 1..125");
+        let p = _mbPdu(function, 4);
+        _mbPut16(p, 1, addr);
+        _mbPut16(p, 3, count);
+        let r = this._call(unit ?? this._unit, p);
+        if (r == nil) return nil;
+        if (len(r) < 2 || r[1] != 2 * count || len(r) != 2 + r[1]) { _mbFail("protocol", function, "bad byte count"); }
+        return _mbGetRegs(r, 2, count);
+    }
+
+    // Writes answer with the first four bytes of their request.
+    fn _write(p: block, unit) {
+        let r = this._call(unit ?? this._unit, p);
+        if (r == nil) return nil;
+        if (len(r) != 5 || r[1] != p[1] || r[2] != p[2] || r[3] != p[3] || r[4] != p[4]) {
+            _mbFail("protocol", p[0], "the answer does not echo the write");
+        }
+        return nil;
+    }
+
+    fn ReadCoils(addr: int, count: int, unit?: int): array {
+        return this._readBits(FC_READ_COILS, addr, count, unit);
+    }
+
+    fn ReadDiscreteInputs(addr: int, count: int, unit?: int): array {
+        return this._readBits(FC_READ_DISCRETE, addr, count, unit);
+    }
+
+    fn ReadHoldingRegisters(addr: int, count: int, unit?: int): [int] {
+        return this._readRegs(FC_READ_HOLDING, addr, count, unit);
+    }
+
+    fn ReadInputRegisters(addr: int, count: int, unit?: int): [int] {
+        return this._readRegs(FC_READ_INPUT, addr, count, unit);
+    }
+
+    fn WriteSingleCoil(addr: int, on: bool, unit?: int) {
+        _mbArg(addr >= 0 && addr <= 65535, "address out of range");
+        let p = _mbPdu(FC_WRITE_COIL, 4);
+        _mbPut16(p, 1, addr);
+        if (on) { p[3] = 255; }
+        return this._write(p, unit);
+    }
+
+    fn WriteSingleRegister(addr: int, value: int, unit?: int) {
+        _mbArg(addr >= 0 && addr <= 65535, "address out of range");
+        let p = _mbPdu(FC_WRITE_REGISTER, 4);
+        _mbPut16(p, 1, addr);
+        _mbPut16(p, 3, value);
+        return this._write(p, unit);
+    }
+
+    fn WriteMultipleCoils(addr: int, values, unit?: int) {
+        let n = len(values);
+        _mbArg(addr >= 0 && addr <= 65535, "address out of range");
+        _mbArg(n >= 1 && n <= 1968 && addr + n <= 65536, "1..1968 coils");
+        let bytes = (n + 7) / 8;
+        let p = _mbPdu(FC_WRITE_COILS, 5 + bytes);
+        _mbPut16(p, 1, addr);
+        _mbPut16(p, 3, n);
+        p[5] = bytes;
+        _mbPackBits(values, p, 6);
+        return this._write(p, unit);
+    }
+
+    fn WriteMultipleRegisters(addr: int, values, unit?: int) {
+        let n = len(values);
+        _mbArg(addr >= 0 && addr <= 65535, "address out of range");
+        _mbArg(n >= 1 && n <= 123 && addr + n <= 65536, "1..123 registers");
+        let p = _mbPdu(FC_WRITE_REGISTERS, 5 + 2 * n);
+        _mbPut16(p, 1, addr);
+        _mbPut16(p, 3, n);
+        p[5] = 2 * n;
+        _mbPutRegs(values, p, 6);
+        return this._write(p, unit);
+    }
+
+    fn ReadWriteMultipleRegisters(readAddr: int, readCount: int, writeAddr: int, values, unit?: int): [int] {
+        let n = len(values);
+        _mbArg(readAddr >= 0 && readAddr <= 65535 && writeAddr >= 0 && writeAddr <= 65535, "address out of range");
+        _mbArg(readCount >= 1 && readCount <= 125 && readAddr + readCount <= 65536, "read count must be 1..125");
+        _mbArg(n >= 1 && n <= 121 && writeAddr + n <= 65536, "1..121 registers to write");
+        let p = _mbPdu(FC_READ_WRITE, 9 + 2 * n);
+        _mbPut16(p, 1, readAddr);
+        _mbPut16(p, 3, readCount);
+        _mbPut16(p, 5, writeAddr);
+        _mbPut16(p, 7, n);
+        p[9] = 2 * n;
+        _mbPutRegs(values, p, 10);
+        let r = this._call(unit ?? this._unit, p);
+        if (r == nil) return nil;
+        if (len(r) < 2 || r[1] != 2 * readCount || len(r) != 2 + r[1]) { _mbFail("protocol", FC_READ_WRITE, "bad byte count"); }
+        return _mbGetRegs(r, 2, readCount);
+    }
+
+    // Any function: `data` follows the function code; returns the answer's data.
+    fn Request(function: int, data, unit?: int): block {
+        _mbArg(function >= 1 && function <= 127, "function must be 1..127");
+        let d = (data == nil) ? Buffer.Create(0, 1)
+              : (Type.Of(data) == Type.String) ? Buffer.FromString(data) : data;
+        _mbArg(len(d) <= 252, "at most 252 data bytes");
+        let p = _mbPdu(function, len(d));
+        if (len(d) > 0) { Buffer.Copy(d, 0, p, 1, len(d)); }
+        let r = this._call(unit ?? this._unit, p);
+        if (r == nil) return nil;
+        return Buffer.Slice(r, 1, len(r) - 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  ModbusServer
+// ---------------------------------------------------------------------------
+
+class ModbusServer {
+    let Coils: [int]            = nil;
+    let DiscreteInputs: [int]   = nil;
+    let HoldingRegisters: [int] = nil;
+    let InputRegisters: [int]   = nil;
+    let _unit                   = nil;
+    let _handler                = nil;
+    let _idle:int               = 60000;
+    let _listener               = nil;
+    let _running:bool           = false;
+    let _conns                  = nil;    // open streams, closed by Stop
+    let _rtuFibers              = nil;    // fiber ids of ServeRtu loops
+
+    fn Constructor(opts?) {
+        let o = opts ?? {};
+        this.Coils            = Array.Create(o.coils ?? 10000, Type.Int);
+        this.DiscreteInputs   = Array.Create(o.discreteInputs ?? 10000, Type.Int);
+        this.HoldingRegisters = Array.Create(o.holdingRegisters ?? 10000, Type.Int);
+        this.InputRegisters   = Array.Create(o.inputRegisters ?? 10000, Type.Int);
+        this._unit    = o.unit;
+        this._handler = o.handler;
+        if (o.idleTimeoutMs != nil) { this._idle = o.idleTimeoutMs; }
+        this._conns = [];
+        this._rtuFibers = [];
+    }
+
+    // Starts serving Modbus TCP; returns the port (pass 0 for a free one).
+    fn ListenTcp(port: int, host?: string): int {
+        let l = (host == nil) ? Stream.Listen("tcp", port, 64) : Stream.Listen("tcp", port, 64, host);
+        if (l == nil) { _mbFail("io", 0, "cannot listen on port " + str(port)); }
+        let a: string = Stream.LocalAddr(l);
+        this._listener = l;
+        this._running = true;
+        let self = this;
+        Fiber.Run(fn() { self._acceptLoop(l); });
+        return Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1)) ?? 0;
+    }
+
+    fn _acceptLoop(l) {
+        while (this._running) {
+            let ready = Stream.WaitReadable(l, 200);
+            if (!this._running) break;
+            if (ready != true) continue;
+            let c = Stream.Accept(l);
+            if (c == nil) continue;
+            Stream.SetNoDelay(c, true);
+            Array.Append(this._conns, c);
+            let self = this;
+            Fiber.Run(fn() { self._serveTcp(c); });
+        }
+        Stream.Close(l);
+    }
+
+    fn _serveTcp(c) {
+        try {
+            while (this._running) {
+                let head = Fiber.Await(Stream.ReadAsync(c, 7, this._idle));
+                if (head == nil || len(head) < 7) break;
+                let length = _mbU16(head, 4);
+                if (_mbU16(head, 2) != 0 || length < 2 || length > 254) break;
+                let pdu = Fiber.Await(Stream.ReadAsync(c, length - 1, 5000));
+                if (pdu == nil || len(pdu) < length - 1) break;
+                let unit: int = head[6];
+                let resp = (this._unit != nil && unit != this._unit)
+                         ? ModbusServer._exception(pdu[0], 11)
+                         : this._answer(unit, pdu);
+                let out = Buffer.Create(7 + len(resp), 1);
+                Buffer.Copy(head, 0, out, 0, 4);
+                _mbPut16(out, 4, len(resp) + 1);
+                out[6] = unit;
+                Buffer.Copy(resp, 0, out, 7, len(resp));
+                let sent = Fiber.Await(Stream.WriteAsync(c, out, 5000));
+                if (sent == nil) break;
+            }
+        } finally {
+            Stream.Close(c);
+            this._forget(c);
+        }
+    }
+
+    fn _forget(c) {
+        let kept = [];
+        foreach (x in this._conns) { if (x != c) { Array.Append(kept, x); } }
+        this._conns = kept;
+    }
+
+    // Answers RTU frames arriving on `stream` until Stop or the stream ends.
+    fn ServeRtu(stream) {
+        this._running = true;
+        let self = this;
+        let id = Fiber.Run(fn() { self._rtuLoop(stream); });
+        Array.Append(this._rtuFibers, id);
+        return id;
+    }
+
+    fn _rtuLoop(s) {
+        while (this._running) {
+            let frame = ModbusServer._readRtuRequest(s);
+            if (frame == nil) break;
+            let n = len(frame);
+            if (n < 4) continue;
+            let crc = _mbCrc(frame, n - 2);
+            if (frame[n - 2] != (crc & 255) || frame[n - 1] != (crc >> 8)) continue;   // a corrupt frame gets no answer
+            let unit: int = frame[0];
+            if (this._unit != nil && unit != this._unit && unit != 0) continue;
+            let resp = this._answer(unit, Buffer.Slice(frame, 1, n - 3));
+            if (unit == 0) continue;                                                  // broadcast: no answer
+            let out = Buffer.Create(len(resp) + 3, 1);
+            out[0] = unit;
+            Buffer.Copy(resp, 0, out, 1, len(resp));
+            let c = _mbCrc(out, len(resp) + 1);
+            out[len(resp) + 1] = c & 255;
+            out[len(resp) + 2] = c >> 8;
+            if (Fiber.Await(Stream.WriteAsync(s, out, 5000)) == nil) break;
+        }
+    }
+
+    // One RTU request frame, nil once the stream ends. A function without a
+    // fixed layout ends at a short silence.
+    fn static _readRtuRequest(s): block {
+        let got = Fiber.Await(Stream.ReadAsync(s, 2, 0));
+        if (got == nil || len(got) < 2) return nil;
+        var want = _mbRtuLength(got, 2, true);
+        while (want == -1 || (want > 0 && len(got) < want)) {
+            let need = (want == -1) ? ((got[1] == 23) ? 11 : 7) - len(got) : want - len(got);
+            let part = Fiber.Await(Stream.ReadAsync(s, need, 1000));
+            if (part == nil || len(part) == 0) return Buffer.Create(0, 1);
+            Buffer.Append(got, part);
+            want = _mbRtuLength(got, len(got), true);
+        }
+        if (want == -2) {
+            while (true) {
+                let part = Fiber.Await(Stream.ReadAsync(s, 256, 10));
+                if (part == nil || len(part) == 0) break;
+                Buffer.Append(got, part);
+                if (len(got) > 256) return Buffer.Create(0, 1);
+            }
+        }
+        return got;
+    }
+
+    fn Stop() {
+        this._running = false;
+        if (this._listener != nil) { Stream.Close(this._listener); this._listener = nil; }
+        foreach (c in this._conns) { Stream.Close(c); }
+        this._conns = [];
+        foreach (id in this._rtuFibers) {
+            let f = Fiber.FromId(id);
+            if (f != nil) { Fiber.Cancel(f); }
+        }
+        this._rtuFibers = [];
+    }
+
+    fn static _exception(function: int, code: int): block {
+        let p = Buffer.Create(2, 1);
+        p[0] = (function | 128) & 255;
+        p[1] = code;
+        return p;
+    }
+
+    // The response PDU for a request PDU: the handler's, or the register map's.
+    fn _answer(unit: int, pdu: block): block {
+        let f: int = pdu[0];
+        if (this._handler != nil) {
+            try {
+                let r = this._handler(unit, pdu);
+                if (r != nil) return r;
+            } catch (e) {
+                if (e is ModbusError && e.Kind == "exception") return ModbusServer._exception(f, e.Code);
+                return ModbusServer._exception(f, 4);
+            }
+        }
+        return this._fromMap(pdu);
+    }
+
+    fn _fromMap(p: block): block {
+        let f: int = p[0];
+        let n = len(p);
+        if (f == FC_READ_COILS || f == FC_READ_DISCRETE) {
+            if (n != 5) return ModbusServer._exception(f, 3);
+            let addr = _mbU16(p, 1);
+            let count = _mbU16(p, 3);
+            if (count < 1 || count > 2000) return ModbusServer._exception(f, 3);
+            let table = (f == FC_READ_COILS) ? this.Coils : this.DiscreteInputs;
+            if (addr + count > len(table)) return ModbusServer._exception(f, 2);
+            let bytes = (count + 7) / 8;
+            let r = _mbPdu(f, 1 + bytes);
+            r[1] = bytes;
+            _mbPackBits(Array.Slice(table, addr, addr + count), r, 2);
+            return r;
+        }
+        if (f == FC_READ_HOLDING || f == FC_READ_INPUT) {
+            if (n != 5) return ModbusServer._exception(f, 3);
+            let addr = _mbU16(p, 1);
+            let count = _mbU16(p, 3);
+            if (count < 1 || count > 125) return ModbusServer._exception(f, 3);
+            let table = (f == FC_READ_HOLDING) ? this.HoldingRegisters : this.InputRegisters;
+            if (addr + count > len(table)) return ModbusServer._exception(f, 2);
+            let r = _mbPdu(f, 1 + 2 * count);
+            r[1] = 2 * count;
+            _mbPutRegs(Array.Slice(table, addr, addr + count), r, 2);
+            return r;
+        }
+        if (f == FC_WRITE_COIL) {
+            if (n != 5) return ModbusServer._exception(f, 3);
+            let addr = _mbU16(p, 1);
+            let v = _mbU16(p, 3);
+            if (v != 0 && v != 65280) return ModbusServer._exception(f, 3);
+            if (addr >= len(this.Coils)) return ModbusServer._exception(f, 2);
+            this.Coils[addr] = (v == 0) ? 0 : 1;
+            return Buffer.Slice(p, 0, 5);
+        }
+        if (f == FC_WRITE_REGISTER) {
+            if (n != 5) return ModbusServer._exception(f, 3);
+            let addr = _mbU16(p, 1);
+            if (addr >= len(this.HoldingRegisters)) return ModbusServer._exception(f, 2);
+            this.HoldingRegisters[addr] = _mbU16(p, 3);
+            return Buffer.Slice(p, 0, 5);
+        }
+        if (f == FC_WRITE_COILS) {
+            if (n < 6) return ModbusServer._exception(f, 3);
+            let addr = _mbU16(p, 1);
+            let count = _mbU16(p, 3);
+            if (count < 1 || count > 1968 || p[5] != (count + 7) / 8 || n != 6 + p[5]) return ModbusServer._exception(f, 3);
+            if (addr + count > len(this.Coils)) return ModbusServer._exception(f, 2);
+            let bits = _mbUnpackBits(p, 6, count);
+            iter (i from 0 to count) { this.Coils[addr + i] = bits[i] ? 1 : 0; }
+            return Buffer.Slice(p, 0, 5);
+        }
+        if (f == FC_WRITE_REGISTERS) {
+            if (n < 6) return ModbusServer._exception(f, 3);
+            let addr = _mbU16(p, 1);
+            let count = _mbU16(p, 3);
+            if (count < 1 || count > 123 || p[5] != 2 * count || n != 6 + p[5]) return ModbusServer._exception(f, 3);
+            if (addr + count > len(this.HoldingRegisters)) return ModbusServer._exception(f, 2);
+            let regs = _mbGetRegs(p, 6, count);
+            iter (i from 0 to count) { this.HoldingRegisters[addr + i] = regs[i]; }
+            return Buffer.Slice(p, 0, 5);
+        }
+        if (f == FC_READ_WRITE) {
+            if (n < 10) return ModbusServer._exception(f, 3);
+            let ra = _mbU16(p, 1);
+            let rc = _mbU16(p, 3);
+            let wa = _mbU16(p, 5);
+            let wc = _mbU16(p, 7);
+            if (rc < 1 || rc > 125 || wc < 1 || wc > 121 || p[9] != 2 * wc || n != 10 + p[9]) return ModbusServer._exception(f, 3);
+            let table = this.HoldingRegisters;
+            if (ra + rc > len(table) || wa + wc > len(table)) return ModbusServer._exception(f, 2);
+            let regs = _mbGetRegs(p, 10, wc);
+            iter (i from 0 to wc) { table[wa + i] = regs[i]; }
+            let r = _mbPdu(f, 1 + 2 * rc);
+            r[1] = 2 * rc;
+            _mbPutRegs(Array.Slice(table, ra, ra + rc), r, 2);
+            return r;
+        }
+        return ModbusServer._exception(f, 1);
+    }
+}
+
+export { ModbusClient, ModbusServer, Modbus, ModbusError, ModbusTimeout, ModbusException };

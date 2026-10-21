@@ -45,6 +45,68 @@ fn bench(name: string, f: fn, n: int) {
     );
 }
 
+// One part of a concatenated message, as ReadMessage hands it to _deliver.
+fn smsPart(sender: string, ref: int, total: int, part: int, text: string) {
+    return { ok: true, index: part, sender: sender, when: nil, text: text,
+             concat: { ref: ref, total: total, part: part }, error: nil };
+}
+
+// _deliver without a device: parts go in, whole messages come out.
+fn checkReassembly() {
+    section("Multipart reassembly");
+
+    let rm = new Modem(nil);
+    let got = [];
+    rm.OnMessage(fn(sms) { Array.Append(got, sms); });
+
+    // Two senders that happen to pick the same reference and total.
+    rm._deliver(smsPart("+4611", 7, 2, 1, "Hel"));
+    rm._deliver(smsPart("+4622", 7, 2, 1, "Wor"));
+    rm._deliver(smsPart("+4611", 7, 2, 2, "lo"));
+    rm._deliver(smsPart("+4622", 7, 2, 2, "ld"));
+    assert("same reference from two senders gives two messages", len(got) == 2);
+    assert("  each with its own sender's text",
+           len(got) == 2 && got[0].sender == "+4611" && got[0].text == "Hello"
+                         && got[1].sender == "+4622" && got[1].text == "World");
+
+    // Part numbers outside 1..total are ignored, not raised on.
+    var raised = false;
+    try {
+        rm._deliver(smsPart("+4633", 1, 2, 0, "zero"));
+        rm._deliver(smsPart("+4633", 1, 2, 3, "three"));
+        rm._deliver(smsPart("+4633", 1, 0, 1, "no total"));
+    } catch (_e) {
+        raised = true;
+    }
+    assert("invalid part numbers do not raise", !raised);
+    assert("  and deliver nothing", len(got) == 2);
+    rm._deliver(smsPart("+4633", 1, 2, 2, "b"));
+    rm._deliver(smsPart("+4633", 1, 2, 1, "a"));
+    assert("  and leave the valid parts of the set intact", len(got) == 3 && got[2].text == "ab");
+
+    // A set older than a day is given up on when the next one starts.
+    rm._deliver(smsPart("+4644", 2, 2, 1, "old"));
+    foreach (k in Object.Keys(rm._parts)) { rm._parts[k].started -= 86400001; }
+    rm._deliver(smsPart("+4655", 3, 2, 1, "new"));
+    rm._deliver(smsPart("+4644", 2, 2, 2, "-tail"));
+    assert("an expired set is dropped", len(got) == 3);
+    assert("  leaving only the live sets pending", len(Object.Keys(rm._parts)) == 2);
+
+    // At most 32 sets wait at once; the oldest makes room.
+    let cap = new Modem(nil);
+    let capGot = [];
+    cap.OnMessage(fn(sms) { Array.Append(capGot, sms); });
+    iter (i from 0 to 33) { cap._deliver(smsPart("+47" + str(i), 1, 2, 1, "x")); }
+    assert("pending sets are capped at 32", len(Object.Keys(cap._parts)) == 32);
+    cap._deliver(smsPart("+470", 1, 2, 2, "y"));
+    cap._deliver(smsPart("+4732", 1, 2, 2, "y"));
+    assert("  the oldest was dropped, the newest completes",
+           len(capGot) == 1 && capGot[0].sender == "+4732");
+    rm.Close();
+    cap.Close();
+    return 0;
+}
+
 fn async Main() {
     if (Os.Which("python3") == nil) {
         Console.WriteLine("SKIP: python3 not available to run tests/fake_modem.py");
@@ -196,6 +258,8 @@ fn runChecks(port: string): int {
     assert("a URC racing a reply does not break the reply", mid["ok"]);
     m.Poll(200);
     assert("  and is dispatched afterwards", urcSeen == 1);
+
+    checkReassembly();
 
     // ---- releasing the port ------------------------------------------------
     section("Close and re-open");

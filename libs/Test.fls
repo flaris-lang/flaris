@@ -25,24 +25,70 @@
 //
 //   t.skip("not ready yet", fn() { ... });   // counts as skipped, not failed
 //
+//   t.each("{a} + {b} = {sum}", [{ a: 1, b: 2, sum: 3 }, { a: 2, b: 2, sum: 4 }], fn(row) {
+//       t.eq(row.a + row.b, row.sum);
+//   });
+//
+//   t.it("answers in time", fn async () { ... }, { timeout: 500 });
+//
 //   return t.run();       // prints results; returns 0 (pass) or 1 (fail)
 //
 //   // Multiple suites:
 //   return Test.RunAll([t1, t2, t3]);   // aggregate exit code
 //
+//   // A benchmark line in the format the bench tooling reads
+//   Test.Bench("Json.Parse  small object", fn() { Json.Parse(text); }, 10000);
+//
 // Suite lifecycle:
 //   Test.Suite(name)       →  Test instance
+//   .beforeAll(fn())       - run once before the suite's first test. One that
+//                            throws fails every test without running it; afterAll
+//                            still runs.
+//   .afterAll(fn())        - run once after the suite's last test. One that throws
+//                            adds a failed "afterAll" entry.
 //   .beforeEach(fn())      - run before every test in this suite. One that throws
 //                            fails that test: its body is not run, afterEach is.
 //   .afterEach(fn())       - run after every test in this suite, even a failed
 //                            one. One that throws fails the test.
-//   .it(label, fn())       - register a test case
+//   .it(label, fn(), opts?) - register a test case; opts: { timeout: ms }
+//   .only(label, fn(), opts?) - register a test case and run only such tests: in
+//                            this suite, and in every suite of the same RunAll
 //   .skip(label, fn())     - register but skip (marked in output, not failed)
+//   .each(label, rows, fn(row)) - one test per row of the array rows. "{key}"
+//                            in label takes row.key of an object row, "{0}" the
+//                            element of an array row or a plain value; a label
+//                            without a placeholder gets " [index]"
+//   .timeout(ms)           - limit for every test of this suite without its own
 //   .run()                 →  int  (0 = all passed, 1 = any failed)
 //   Test.RunAll(suites)    →  int  (0 = all passed, 1 = any failed)
 //
 //   Test bodies and hooks may be `fn async`: each is awaited before the next
 //   step, so an assertion or exception inside one counts like a plain one.
+//
+//   A test with a timeout runs in a fiber of its own and fails when it has no
+//   result within the limit; the fiber is then cancelled. The limit covers the
+//   body, not its hooks. Code the JIT compiled to native code is not paused by
+//   the scheduler, so a native loop that never ends is not stopped.
+//
+// Run options:
+//   Test.Configure(options) - for every later run(); options may set any of:
+//     filter:   run only the tests whose "<suite> <label>" contains this text
+//               (default: $FLARIS_TEST_FILTER)
+//     reporter: "pretty" (the default), "tap" (TAP version 14) or "junit"
+//               (JUnit XML) (default: $FLARIS_TEST_REPORTER)
+//     output:   the file a tap or junit report goes to; the console when not
+//               set (default: $FLARIS_TEST_OUTPUT). The file holds every
+//               suite run in this process with that reporter, rewritten
+//               after each run(); on the console each run() or RunAll()
+//               prints a report of its own
+//     timeout:  limit in ms for every test without one of its own (0: none)
+//   A test left out by the filter or by only() is neither run nor reported.
+//
+// Benchmarks:
+//   Test.Bench(name, fn(), n)  →  float  - calls fn 3 times, then n times on the
+//                            clock, and prints name padded to 48, the total in ms
+//                            and the µs per call - the benchmark line of the
+//                            library tests. Returns the µs per call.
 //
 // Assertions (all accept an optional label as last argument):
 //   t.eq(a, b)             - a == b
@@ -68,6 +114,7 @@
 //   t.throws(fn())         - fn must throw any exception
 //   t.throwsCode(fn(), code)  - fn must throw with the given error code
 //   t.notThrows(fn())      - fn must not throw
+//                            (these three await an `fn async` fn first)
 
 // Unique error code used by _fail so run() can distinguish assertion
 // failures (expected) from unexpected runtime errors in test bodies.
@@ -77,28 +124,133 @@ const _TEST_FAIL_CODE = 241;
 // run to completion - and what it throws surface - inside run()'s try.
 fn _settled(v) { return Type.IsFiber(v) ? Fiber.Await(v) : v; }
 
+// Calls f and waits for it, for at most ms milliseconds when ms > 0. Raises
+// what f raised, or a test failure when the time ran out.
+fn _runLimited(f, ms: int) {
+    if (ms <= 0) {
+        _settled(f());
+        return;
+    }
+    let runner = Fiber.FromId(Fiber.Id());
+    let box = [false, nil];       // [finished, what it raised]
+    let worker = Fiber.New(fn() {
+        try { _settled(f()); } catch (e) { box[1] = e; }
+        box[0] = true;
+        Fiber.Unpark(runner);
+    });
+    Fiber.Resume(worker, true);
+    let deadline = Time.Millis() + ms;
+    while (!box[0]) {
+        let left = deadline - Time.Millis();
+        if (left <= 0) {
+            Fiber.Cancel(worker);
+            throw(_TEST_FAIL_CODE, "timeout: no result after " + str(ms) + " ms");
+        }
+        Fiber.Park(left);
+    }
+    if (box[1] != nil) { throw box[1]; }
+}
+
+// Run options; nil until the first run or Configure reads the environment.
+global _testOpts = nil;
+
+// The report the last run wrote to a file, which the next run to the same
+// file carries on.
+global _testFileReport = nil;
+
+fn _envOpt(name: string) {
+    let v = Os.GetEnv(name);
+    return (v == nil || v == "") ? nil : v;
+}
+
+fn _options() {
+    if (_testOpts == nil) {
+        let r = _envOpt("FLARIS_TEST_REPORTER");
+        _testOpts = {
+            filter:   _envOpt("FLARIS_TEST_FILTER"),
+            reporter: (r == "tap" || r == "junit") ? r : "pretty",
+            output:   _envOpt("FLARIS_TEST_OUTPUT"),
+            timeout:  0
+        };
+    }
+    return _testOpts;
+}
+
+// Text for an XML attribute or element: the five markup characters escaped
+// and the control characters XML 1.0 cannot carry dropped.
+fn _xml(v): string {
+    let t = str(v);
+    var r = String.Replace(t, "&", "&amp;");
+    r = String.Replace(r, "<", "&lt;");
+    r = String.Replace(r, ">", "&gt;");
+    r = String.Replace(r, "\"", "&quot;");
+    r = String.Replace(r, "'", "&apos;");
+    let bad = "\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+    if (String.IndexOfAnyFrom(r, bad, 0) < 0) { return r; }
+    iter (i from 0 to len(bad)) { r = String.Replace(r, String.Substr(bad, i, 1), ""); }
+    return r;
+}
+
+// A TAP description: "#" starts a directive, so it is escaped; a line break
+// would end the line.
+fn _tapText(v): string {
+    var r = String.Replace(str(v), "\\", "\\\\");
+    r = String.Replace(r, "#", "\\#");
+    r = String.Replace(r, "\n", " ");
+    return String.Replace(r, "\r", " ");
+}
+
 class Test {
 
-    let name:     string = "Tests";
-    let _tests:   array  = [];
-    let _before:  array  = [];
-    let _after:   array  = [];
-    let _passed:  int    = 0;
-    let _failed:  int    = 0;
-    let _skipped: int    = 0;
+    let name:       string = "Tests";
+    let _tests:     array  = [];
+    let _before:    array  = [];
+    let _after:     array  = [];
+    let _beforeAll: array  = [];
+    let _afterAll:  array  = [];
+    let _timeout:   int    = 0;
+    let _passed:    int    = 0;
+    let _failed:    int    = 0;
+    let _skipped:   int    = 0;
 
     // ── Factory ───────────────────────────────────────────────────────────────
 
     fn static Suite(suiteName) {
-        let t     = new Test();
-        t.name    = str(suiteName);
-        t._tests  = [];
-        t._before = [];
-        t._after  = [];
+        let t        = new Test();
+        t.name       = str(suiteName);
+        t._tests     = [];
+        t._before    = [];
+        t._after     = [];
+        t._beforeAll = [];
+        t._afterAll  = [];
         return t;
     }
 
+    // options: any of { filter, reporter, output, timeout } (see the header).
+    fn static Configure(options) {
+        let o = _options();
+        if (options == nil) { return; }
+        if (Object.HasKey(options, "filter"))  { o.filter = options.filter; }
+        if (Object.HasKey(options, "output"))  { o.output = options.output; }
+        if (Object.HasKey(options, "timeout")) { o.timeout = (options.timeout == nil) ? 0 : int(options.timeout); }
+        if (Object.HasKey(options, "reporter")) {
+            let r = (options.reporter == nil) ? "pretty" : options.reporter;
+            if (r != "pretty" && r != "tap" && r != "junit") {
+                throw(1, "Test.Configure: reporter must be \"pretty\", \"tap\" or \"junit\"");
+            }
+            o.reporter = r;
+        }
+    }
+
     // ── Hooks ─────────────────────────────────────────────────────────────────
+
+    fn beforeAll(f: fn) {
+        this._beforeAll = Array.Append(this._beforeAll, f);
+    }
+
+    fn afterAll(f: fn) {
+        this._afterAll = Array.Append(this._afterAll, f);
+    }
 
     fn beforeEach(f: fn) {
         this._before = Array.Append(this._before, f);
@@ -110,12 +262,48 @@ class Test {
 
     // ── Test registration ─────────────────────────────────────────────────────
 
-    fn it(label: string, f: fn) {
-        this._tests = Array.Append(this._tests, { label: label, func: f, skipped: false });
+    fn it(label: string, f: fn, opts?) {
+        this._add(label, f, false, opts ?? nil);
+    }
+
+    fn only(label: string, f: fn, opts?) {
+        this._add(label, f, true, opts ?? nil);
     }
 
     fn skip(label: string, _f) {
-        this._tests = Array.Append(this._tests, { label: label, func: nil, skipped: true });
+        this._tests = Array.Append(this._tests, { label: label, func: nil, skipped: true, only: false, timeout: 0 });
+    }
+
+    fn each(label: string, rows, f: fn) {
+        iter (i from 0 to len(rows)) {
+            let row = rows[i];
+            this._add(Test._fill(label, row, i), fn() { return f(row); }, false, nil);
+        }
+    }
+
+    fn timeout(ms: int) {
+        this._timeout = ms;
+    }
+
+    fn _add(label: string, f, only: bool, opts) {
+        let ms = (opts != nil && opts.timeout != nil) ? int(opts.timeout) : 0;
+        this._tests = Array.Append(this._tests, { label: label, func: f, skipped: false, only: only, timeout: ms });
+    }
+
+    // label with "{key}" / "{index}" replaced by the row's values, or with
+    // " [i]" appended when it names none.
+    fn static _fill(label: string, row, i: int): string {
+        var out = label;
+        if (String.IndexOf(label, "{") >= 0) {
+            if (Type.IsObject(row)) {
+                foreach (k in Object.Keys(row)) { out = String.Replace(out, "{" + k + "}", str(row[k])); }
+            } else if (Type.IsArray(row)) {
+                iter (j from 0 to len(row)) { out = String.Replace(out, "{" + str(j) + "}", str(row[j])); }
+            } else {
+                out = String.Replace(out, "{0}", str(row));
+            }
+        }
+        return (out == label) ? label + " [" + str(i) + "]" : out;
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -330,10 +518,12 @@ class Test {
         return str(v);
     }
 
+    // throws, throwsCode and notThrows await an `fn async` f: its call only
+    // returns the fiber, and the exception surfaces when that is awaited.
     fn throws(f, label) {
         var threw = false;
         try {
-            f();
+            _settled(f());
         } catch (e) {
             threw = true;
         }
@@ -349,7 +539,7 @@ class Test {
         var threw = false;
         var actualCode = nil;
         try {
-            f();
+            _settled(f());
         } catch (e) {
             threw = true;
             actualCode = e.Code;
@@ -369,7 +559,7 @@ class Test {
     fn notThrows(f, label) {
         var caught = nil;
         try {
-            f();
+            _settled(f());
         } catch (e) {
             caught = str(e.Error);
         }
@@ -383,119 +573,324 @@ class Test {
     // ── Runner ────────────────────────────────────────────────────────────────
 
     fn run(): int {
-        Console.SetColor(33);
-        Console.Write("▶ ");
-        Console.SetColor(0);
-        Console.WriteLine(this.name);
+        let session = Test._open();
+        this._run(session, this._hasOnly());
+        Test._close(session);
+        // 0/1 rather than the failure count: the result is meant to be returned
+        // from Main, and an exit status keeps only the low 8 bits.
+        return (this._failed > 0) ? 1 : 0;
+    }
 
-        let n    = len(this._tests);
+    fn _hasOnly(): bool {
+        foreach (entry in this._tests) {
+            if (entry.only == true) return true;
+        }
+        return false;
+    }
+
+    // Runs the suite's tests into report session s; with anyOnly only the
+    // tests registered with only().
+    fn _run(s, anyOnly: bool) {
+        let pretty = (s.reporter == "pretty");
+        if (pretty) {
+            Console.SetColor(33);
+            Console.Write("▶ ");
+            Console.SetColor(0);
+            Console.WriteLine(this.name);
+        }
+
         this._passed  = 0;
         this._failed  = 0;
         this._skipped = 0;
 
-        iter (i from 0 to n) {
-            let entry = this._tests[i];
+        let picked = [];
+        var anyRuns = false;
+        foreach (entry in this._tests) {
+            if (anyOnly && entry.only != true) continue;
+            if (s.filter != nil && !String.Contains(this.name + " " + entry.label, s.filter)) continue;
+            Array.Append(picked, entry);
+            if (entry.skipped != true) { anyRuns = true; }
+        }
+        let cases = [];
+        // Only JUnit reports times.
+        let timed = (s.reporter == "junit");
+        let suiteStart = timed ? Time.Ticks() : 0;
+
+        // [reason, isError] once a beforeAll hook has thrown.
+        var allFailed = nil;
+        if (anyRuns) {
+            iter (bi from 0 to len(this._beforeAll)) {
+                if (allFailed == nil) {
+                    try {
+                        _settled(this._beforeAll[bi]());
+                    } catch (e) {
+                        allFailed = ["beforeAll: " + Test._reason(e), e.Code != _TEST_FAIL_CODE];
+                    }
+                }
+            }
+        }
+
+        iter (i from 0 to len(picked)) {
+            let entry = picked[i];
 
             if (entry.skipped == true) {
                 this._skipped += 1;
-                Console.SetColor(33);
-                Console.Write("  ◌ ");
-                Console.SetColor(0);
-                Console.WriteLine(entry.label);
+                this._report(s, cases, entry.label, "skip", "", 0);
             } else {
+                let start = timed ? Time.Ticks() : 0;
                 var passed = true;
                 var reason = "";
                 var isError = false;
 
-                iter (bi from 0 to len(this._before)) {
+                if (allFailed != nil) {
+                    passed  = false;
+                    reason  = allFailed[0];
+                    isError = allFailed[1];
+                } else {
+                    iter (bi from 0 to len(this._before)) {
+                        if (passed) {
+                            try {
+                                _settled(this._before[bi]());
+                            } catch (e) {
+                                passed  = false;
+                                reason  = "beforeEach: " + Test._reason(e);
+                                isError = e.Code != _TEST_FAIL_CODE;
+                            }
+                        }
+                    }
+
                     if (passed) {
+                        let limit = (entry.timeout > 0) ? entry.timeout : (this._timeout > 0 ? this._timeout : s.timeout);
                         try {
-                            _settled(this._before[bi]());
+                            _runLimited(entry.func, limit);
                         } catch (e) {
                             passed  = false;
-                            reason  = "beforeEach: " + Test._reason(e);
+                            reason  = Test._reason(e);
                             isError = e.Code != _TEST_FAIL_CODE;
                         }
                     }
-                }
 
-                if (passed) {
-                    try {
-                        _settled(entry.func());
-                    } catch (e) {
-                        passed  = false;
-                        reason  = Test._reason(e);
-                        isError = e.Code != _TEST_FAIL_CODE;
-                    }
-                }
-
-                // afterEach runs even after a failure; the first failure is the
-                // one reported.
-                iter (ai from 0 to len(this._after)) {
-                    try {
-                        _settled(this._after[ai]());
-                    } catch (e) {
-                        if (passed) {
-                            passed  = false;
-                            reason  = "afterEach: " + Test._reason(e);
-                            isError = e.Code != _TEST_FAIL_CODE;
+                    // afterEach runs even after a failure; the first failure is
+                    // the one reported.
+                    iter (ai from 0 to len(this._after)) {
+                        try {
+                            _settled(this._after[ai]());
+                        } catch (e) {
+                            if (passed) {
+                                passed  = false;
+                                reason  = "afterEach: " + Test._reason(e);
+                                isError = e.Code != _TEST_FAIL_CODE;
+                            }
                         }
                     }
                 }
 
                 if (passed) {
                     this._passed += 1;
-                    Console.SetColor(32);
-                    Console.Write("  ✓ ");
-                    Console.SetColor(0);
-                    Console.WriteLine(entry.label);
+                    this._report(s, cases, entry.label, "pass", "", timed ? Time.Ticks() - start : 0);
                 } else {
                     this._failed += 1;
-                    Console.SetColor(31);
-                    Console.Write(isError ? "  ! " : "  ✗ ");
-                    Console.SetColor(0);
-                    Console.Write(entry.label);
-                    Console.SetColor(90);
-                    Console.WriteLine("  - " + reason);
-                    Console.SetColor(0);
+                    this._report(s, cases, entry.label, isError ? "error" : "fail", reason, timed ? Time.Ticks() - start : 0);
                 }
             }
         }
 
-        Console.WriteLine("");
-        if (this._failed == 0 && this._skipped == 0) {
-            Console.SetColor(32);
-            Console.WriteLine("  " + str(n) + " passed");
-        } else {
-            Console.Write("  ");
-            Console.SetColor(32);
-            Console.Write(str(this._passed) + " passed");
+        if (anyRuns) {
+            iter (ai from 0 to len(this._afterAll)) {
+                try {
+                    _settled(this._afterAll[ai]());
+                } catch (e) {
+                    this._failed += 1;
+                    this._report(s, cases, "afterAll", (e.Code != _TEST_FAIL_CODE) ? "error" : "fail", Test._reason(e), 0);
+                }
+            }
+        }
+
+        if (pretty) {
+            Console.WriteLine("");
+            if (this._failed == 0 && this._skipped == 0) {
+                Console.SetColor(32);
+                Console.WriteLine("  " + str(this._passed) + " passed");
+            } else {
+                Console.Write("  ");
+                Console.SetColor(32);
+                Console.Write(str(this._passed) + " passed");
+                Console.SetColor(0);
+                if (this._skipped > 0) {
+                    Console.Write("  ");
+                    Console.SetColor(33);
+                    Console.Write(str(this._skipped) + " skipped");
+                    Console.SetColor(0);
+                }
+                if (this._failed > 0) {
+                    Console.Write("  ");
+                    Console.SetColor(31);
+                    Console.Write(str(this._failed) + " failed");
+                    Console.SetColor(0);
+                }
+                Console.WriteLine("");
+            }
             Console.SetColor(0);
-            if (this._skipped > 0) {
-                Console.Write("  ");
-                Console.SetColor(33);
-                Console.Write(str(this._skipped) + " skipped");
-                Console.SetColor(0);
-            }
-            if (this._failed > 0) {
-                Console.Write("  ");
-                Console.SetColor(31);
-                Console.Write(str(this._failed) + " failed");
-                Console.SetColor(0);
-            }
             Console.WriteLine("");
         }
-        Console.SetColor(0);
-        Console.WriteLine("");
+        if (timed) {
+            Array.Append(s.suites, { name: this.name, cases: cases, ticks: Time.Ticks() - suiteStart,
+                                     passed: this._passed, failed: this._failed, skipped: this._skipped });
+        }
 
         // Break the t→closure→t reference cycle so the GC can collect normally.
-        this._tests  = [];
-        this._before = [];
-        this._after  = [];
+        this._tests     = [];
+        this._before    = [];
+        this._after     = [];
+        this._beforeAll = [];
+        this._afterAll  = [];
+    }
 
-        // 0/1 rather than the failure count: the result is meant to be returned
-        // from Main, and an exit status keeps only the low 8 bits.
-        return (this._failed > 0) ? 1 : 0;
+    // One finished test: printed (pretty), a TAP line, or kept for JUnit.
+    // status is "pass", "fail", "error" or "skip".
+    fn _report(s, cases, label: string, status: string, reason: string, ticks: int) {
+        if (s.reporter == "pretty") {
+            if (status == "pass") {
+                Console.SetColor(32);
+                Console.Write("  ✓ ");
+                Console.SetColor(0);
+                Console.WriteLine(label);
+            } else if (status == "skip") {
+                Console.SetColor(33);
+                Console.Write("  ◌ ");
+                Console.SetColor(0);
+                Console.WriteLine(label);
+            } else {
+                Console.SetColor(31);
+                Console.Write(status == "error" ? "  ! " : "  ✗ ");
+                Console.SetColor(0);
+                Console.Write(label);
+                Console.SetColor(90);
+                Console.WriteLine("  - " + reason);
+                Console.SetColor(0);
+            }
+        } else if (s.reporter == "tap") {
+            s.count += 1;
+            let desc = str(s.count) + " - " + _tapText(this.name) + " > " + _tapText(label);
+            if (status == "pass") {
+                Test._emit(s, "ok " + desc);
+            } else if (status == "skip") {
+                Test._emit(s, "ok " + desc + " # SKIP");
+            } else {
+                Test._emit(s, "not ok " + desc);
+                Test._emit(s, "  ---");
+                Test._emit(s, "  message: " + Json.Stringify(reason));
+                Test._emit(s, "  severity: " + status);
+                Test._emit(s, "  ...");
+            }
+        } else {
+            Array.Append(cases, { name: label, status: status, reason: reason, ticks: ticks });
+        }
+    }
+
+    // A report in progress for run() or RunAll. A report to a file goes on
+    // from the one before it in this process, when that went to the same file
+    // with the same reporter.
+    fn static _open() {
+        let o = _options();
+        let s = { reporter: o.reporter, output: o.output, filter: o.filter, timeout: o.timeout,
+                  lines: [], count: 0, suites: [] };
+        if (s.output != nil && s.reporter != "pretty") {
+            let prev = _testFileReport;
+            if (prev != nil && prev.output == s.output && prev.reporter == s.reporter) {
+                s.lines  = prev.lines;
+                s.count  = prev.count;
+                s.suites = prev.suites;
+            }
+            _testFileReport = s;
+        } else if (s.reporter == "tap") {
+            Console.WriteLine("TAP version 14");
+        }
+        return s;
+    }
+
+    // A TAP line: to the console, or kept for the file.
+    fn static _emit(s, line: string) {
+        if (s.output == nil) { Console.WriteLine(line); } else { Array.Append(s.lines, line); }
+    }
+
+    // Ends report s: the TAP plan, or the JUnit document. A file is written
+    // whole, with every suite its report holds.
+    fn static _close(s) {
+        var doc = [];
+        if (s.reporter == "tap") {
+            if (s.output == nil) {
+                Console.WriteLine("1.." + str(s.count));
+                return;
+            }
+            Array.Append(doc, "TAP version 14");
+            foreach (line in s.lines) { Array.Append(doc, line); }
+            Array.Append(doc, "1.." + str(s.count));
+        } else if (s.reporter == "junit") {
+            doc = Test._junit(s.suites);
+            if (s.output == nil) {
+                foreach (line in doc) { Console.WriteLine(line); }
+                return;
+            }
+        } else {
+            return;
+        }
+        if (!File.WriteLines(s.output, doc)) {
+            throw(1, "Test: could not write the report to " + s.output);
+        }
+    }
+
+    // The JUnit XML document for suites, as lines.
+    fn static _junit(suites): array {
+        let doc = [];
+        var tests = 0;
+        var failures = 0;
+        var errors = 0;
+        var skipped = 0;
+        var ticks = 0;
+        foreach (st in suites) {
+            foreach (c in st.cases) {
+                tests += 1;
+                if (c.status == "fail")  { failures += 1; }
+                if (c.status == "error") { errors += 1; }
+                if (c.status == "skip")  { skipped += 1; }
+            }
+            ticks += st.ticks;
+        }
+        Array.Append(doc, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+        Array.Append(doc, "<testsuites tests=\"" + str(tests) + "\" failures=\"" + str(failures) + "\" errors=\"" + str(errors)
+                          + "\" skipped=\"" + str(skipped) + "\" time=\"" + Test._secs(ticks) + "\">");
+        foreach (st in suites) {
+            var sf = 0;
+            var se = 0;
+            var ss = 0;
+            foreach (c in st.cases) {
+                if (c.status == "fail")  { sf += 1; }
+                if (c.status == "error") { se += 1; }
+                if (c.status == "skip")  { ss += 1; }
+            }
+            Array.Append(doc, "  <testsuite name=\"" + _xml(st.name) + "\" tests=\"" + str(len(st.cases)) + "\" failures=\"" + str(sf)
+                              + "\" errors=\"" + str(se) + "\" skipped=\"" + str(ss) + "\" time=\"" + Test._secs(st.ticks) + "\">");
+            foreach (c in st.cases) {
+                let open = "    <testcase classname=\"" + _xml(st.name) + "\" name=\"" + _xml(c.name) + "\" time=\"" + Test._secs(c.ticks) + "\"";
+                if (c.status == "pass") {
+                    Array.Append(doc, open + "/>");
+                } else if (c.status == "skip") {
+                    Array.Append(doc, open + "><skipped/></testcase>");
+                } else {
+                    let tag = (c.status == "error") ? "error" : "failure";
+                    Array.Append(doc, open + "><" + tag + " message=\"" + _xml(c.reason) + "\">" + _xml(c.reason) + "</" + tag + "></testcase>");
+                }
+            }
+            Array.Append(doc, "  </testsuite>");
+        }
+        Array.Append(doc, "</testsuites>");
+        return doc;
+    }
+
+    // Seconds with three decimals, from a tick count.
+    fn static _secs(ticks: int): string {
+        return String.FormatArray("{0:.3f}", [Time.TicksToMs(ticks) / 1000.0]);
     }
 
     fn static _reason(e): string {
@@ -505,17 +900,41 @@ class Test {
 
     // Run an array of suites and print an aggregate summary.
     fn static RunAll(suites) : int {
+        let session = Test._open();
+        var anyOnly = false;
+        iter (i from 0 to len(suites)) {
+            if (suites[i]._hasOnly()) { anyOnly = true; }
+        }
         var failedTests = 0;
         iter (i from 0 to len(suites)) {
-            suites[i].run();
+            suites[i]._run(session, anyOnly);
             failedTests += suites[i]._failed;
         }
-        let col = (failedTests == 0) ? 32 : 31;
-        Console.SetColor(col);
-        let msg = (failedTests == 0) ? "all passed" : str(failedTests) + " failed";
-        Console.WriteLine("══ " + str(len(suites)) + " suite(s): " + msg);
-        Console.SetColor(0);
+        if (session.reporter == "pretty") {
+            let col = (failedTests == 0) ? 32 : 31;
+            Console.SetColor(col);
+            let msg = (failedTests == 0) ? "all passed" : str(failedTests) + " failed";
+            Console.WriteLine("══ " + str(len(suites)) + " suite(s): " + msg);
+            Console.SetColor(0);
+        }
+        Test._close(session);
         return (failedTests > 0) ? 1 : 0;
+    }
+
+    // ── Benchmarks ────────────────────────────────────────────────────────────
+
+    fn static Bench(name: string, f, n: int): float {
+        f(); f(); f();
+        let t0 = Time.Ticks();
+        iter (i from 0 to n) { f(); }
+        let dt = Time.Ticks() - t0;
+        let us = Time.TicksToUs(dt) / float(n);
+        Console.WriteLine(
+            String.PadRight(name, 48),
+            String.PadLeft(String.FormatArray("{0:.2f}", [Time.TicksToMs(dt)]), 9), " ms  ",
+            String.PadLeft(String.FormatArray("{0:.4f}", [us]), 11), " µs/call"
+        );
+        return us;
     }
 }
 

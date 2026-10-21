@@ -1,0 +1,1003 @@
+// Resp.fls - Redis client in pure Flaris: RESP2 and RESP3 over a Stream socket.
+// Version: 1.0
+//
+// Speaks the Redis serialization protocol directly, so it needs no plugin and
+// no --unsafe, and every wait parks only the calling fiber: a BLPOP holds up
+// its own fiber, never the VM. RESP2 by default, RESP3 (HELLO 3) on request;
+// AUTH (password, or ACL user and password) and SELECT on connect; TLS;
+// pipelines; MULTI/EXEC transactions; Pub/Sub on a connection of its own; a
+// connection pool. Works with Redis 2.6 and later, Valkey and KeyDB.
+//
+// Not covered: Redis Cluster (a MOVED or ASK redirect is raised like any other
+// error), Sentinel discovery, client-side caching (CLIENT TRACKING pushes are
+// only handed to onPush) and the RESP3 streamed aggregates.
+//
+// Usage:
+//   import { Resp, RespError } from library("Resp", "1.0");
+//
+//   let r = Resp.Connect("127.0.0.1", 6379);
+//   r.Set("greeting", "hello", { ex: 60 });
+//   let v = r.Get("greeting");                          // "hello"
+//   r.Command("HSET", "user:1", { name: "Ada", age: 36 });
+//   let u = r.HGetAll("user:1");                        // { name: "Ada", age: "36" }
+//   let job = r.BLPop(["jobs"], 5);                     // [key, value], nil after 5 s
+//   r.Close();
+//
+// Connecting:
+//   Resp.Connect(host, port?, opts?)   -> Resp     port defaults to 6379
+//   Resp.ConnectUrl(url, opts?)        -> Resp     redis://[user:password@]host[:port][/db]
+//                                                  rediss://... connects with TLS
+//   Both raise RespError when the server cannot be reached or refuses the login.
+//   opts:
+//     password, user     AUTH on connect (user for Redis 6 ACLs)
+//     db                 SELECT this database on connect
+//     resp3              true: HELLO 3 - maps come back as objects, doubles as
+//                        floats, booleans as bools; push messages go to onPush
+//     name               CLIENT SETNAME on connect
+//     tls                true: TLS from the first byte
+//     insecure           accept any certificate (self-signed test servers)
+//     sni                the name to verify the certificate against (default host)
+//     timeoutMs          how long each wait on the server may take (default 10000)
+//     connectTimeoutMs   how long connecting may take (default timeoutMs)
+//     binary             every bulk string comes back as a block, not a string
+//     onPush             fn(msg) for RESP3 push messages that arrive between replies
+//
+// Commands:
+//   Command(cmd, a1?, ..., a15?)  -> reply    any command; arguments are binary-safe
+//   Command([cmd, args...])       -> reply    the same with an argument array
+//   CommandBytes(...)             -> reply    bulk strings as blocks for this call
+//   An argument is a string, int, float, bool (sent as 1 or 0), block (its raw
+//   bytes), array (its elements) or object (its key/value pairs), so
+//   Command("HSET", "h", { a: 1 }) and Command("DEL", keys) both work. nil
+//   inside an array raises InvalidArguments; trailing nil arguments of the
+//   a1..a15 form count as left out.
+//
+// Replies:
+//   simple and bulk strings -> string (a block with binary or CommandBytes),
+//   integers -> int, a nil bulk, nil array or RESP3 null -> nil, arrays -> array.
+//   RESP3: map -> object (keys as text), set -> array, double -> float,
+//   boolean -> bool, big number -> string, verbatim string -> its text.
+//   An error reply raises RespError with Kind "server", Prefix the error code
+//   (ERR, WRONGTYPE, NOAUTH, ...) and Error the server's message. A failed
+//   connection raises RespError with Kind "connect", "tls", "auth", "timeout",
+//   "closed" or "protocol"; the socket is closed then and the next command
+//   connects again. The failed command is not repeated: it may have run.
+//
+// Convenience methods (they raise as Command does):
+//   Ping() Echo(s) Get(k) GetBytes(k) Set(k, v, opts?) MGet(keys) MSet(obj)
+//   Del(keys) Exists(keys) Incr(k) IncrBy(k, n) Decr(k) Append(k, v) StrLen(k)
+//   Expire(k, sec) PExpire(k, ms) Ttl(k) PTtl(k) Persist(k) KeyType(k) Rename(k, k2)
+//   Keys(pattern) Scan(cursor, match?, count?) -> { cursor, keys }
+//   HGet(k, f) HSet(k, field|obj, v?) HGetAll(k) -> object HDel(k, fields)
+//   HExists(k, f) HIncrBy(k, f, n) HKeys(k) HLen(k)
+//   LPush(k, vals) RPush(k, vals) LPop(k) RPop(k) LRange(k, start, stop) LLen(k)
+//   BLPop(keys, timeoutSec) BRPop(keys, timeoutSec) -> [key, value] | nil
+//   SAdd(k, vals) SRem(k, vals) SMembers(k) SIsMember(k, v) -> bool SCard(k)
+//   Publish(channel, message) -> receivers  Select(db)  DbSize()
+//   Set opts: { ex: seconds, px: ms, nx: true, xx: true, keepTtl: true, get: true }.
+//   Set returns true, or false when nx/xx kept it from setting; with get it
+//   returns the old value instead. keys/vals/fields take one value or an array.
+//
+// Connection:
+//   IsConnected()  IsResp3()  ServerInfo() -> the HELLO reply  Close()
+//
+// Wire format without a server:
+//   Resp.Encode(cmd, args...)  -> string     the bytes Command would send
+//   Resp.Decode(data, opts?)   -> array      every reply in a string or block,
+//                                            e.g. an AOF file or a captured stream
+//
+// Pipelines and transactions:
+//   r.Pipeline([["SET", "a", 1], ["INCR", "a"], ["GET", "a"]])   -> ["OK", 2, "2"]
+//     One write, then every reply. An error reply is returned in its place as
+//     a RespError instance instead of raising: test it with `x is RespError`.
+//   r.Transaction([["INCR", "a"], ["INCR", "b"]])                 -> [1, 1] | nil
+//     MULTI, the commands and EXEC in one round trip; nil when a WATCHed key
+//     changed. A command the server refuses while queueing raises (EXECABORT).
+//     Command("WATCH", key) before it gives optimistic locking.
+//
+// Pub/Sub - on a connection of its own, since a subscribed connection takes no
+// other commands:
+//   let sub = r.Subscriber();              // or Resp.ConnectSubscriber(host, port, opts)
+//   sub.Subscribe(["news", "alerts"]);     // SubscribePattern("news.*") for PSUBSCRIBE
+//   let m = sub.Receive(1000);             // { kind, channel, pattern, data } | nil after 1 s
+//                                          // or once the connection is closed
+//   sub.Listen(fn(m) { ...; return true; });   // until fn returns false, Close()
+//                                              // or nothing is subscribed any more
+//   sub.Unsubscribe(["alerts"]); sub.UnsubscribePattern(); sub.Close();
+//   kind is "message" or "pmessage" (pattern set). Close() from another fiber
+//   ends a Receive or Listen that is waiting. Subscribe from inside a Listen
+//   callback sends the command and lets the loop take the confirmation.
+//
+// Pool:
+//   let pool = new RespPool("127.0.0.1", 6379, opts, 8);
+//   let n = pool.Use(fn(r) { return r.Incr("hits"); });   // releases even on throw
+//   let r = pool.Acquire(timeoutMs?); ...; pool.Release(r);
+//   pool.Stats() -> { idle, inUse, size }   pool.Close()
+//
+// One Resp may be shared by several fibers: their commands queue and run one
+// at a time, each its own round trip. Each Resp is one socket; use a pool for
+// commands that should run side by side.
+
+const _CRLF = "\r\n";
+const _DEFAULT_PORT = 6379;
+const _DEFAULT_TIMEOUT_MS = 10000;
+
+class RespError : Exception {
+    let Kind: string = "server";   // server | connect | tls | auth | timeout | closed | protocol
+    let Prefix: string = "";       // a server error's code: ERR, WRONGTYPE, NOAUTH, ...
+}
+
+fn _err(kind: string, msg: string) {
+    let e = new RespError((kind == "server") ? Exception.RuntimeError : Exception.IOError, msg);
+    e.Kind = kind;
+    if (kind == "server") {
+        let sp = String.IndexOf(msg, " ");
+        e.Prefix = (sp < 0) ? msg : String.Substr(msg, 0, sp);
+    }
+    return e;
+}
+
+// The length or count after a reply's type byte: -1 (nil), 0 and up, or -2
+// when the rest of the line is not such a number.
+fn _len(line: string): int {
+    let n: int = String.Length(line);
+    if (n < 2 || n > 20) { return -2; }
+    if (n == 3 && String.CharAt(line, 1) == '-' && String.CharAt(line, 2) == '1') { return -1; }
+    var v: int = 0;
+    iter (i from 1 to n) {
+        let c: char = String.CharAt(line, i);
+        if (c < '0' || c > '9') { return -2; }
+        v = v * 10 + (Char.Code(c) - 48);
+    }
+    return v;
+}
+
+fn _floatText(f: float): string {
+    if (Math.IsNaN(f)) { throw(Exception.InvalidArguments, "Resp: NaN cannot be sent"); }
+    if (!Math.IsFinite(f)) { return (f > 0.0) ? "inf" : "-inf"; }
+    return Json.Stringify(f);
+}
+
+// The wire text of one scalar argument.
+fn _argText(a): string {
+    if (Type.IsString(a)) { return a; }
+    if (Type.IsInt(a)) { return str(a); }
+    if (Type.IsBlock(a)) { return Buffer.ToString(a); }
+    if (Type.IsFloat(a)) { return _floatText(a); }
+    if (Type.IsBool(a)) { return a ? "1" : "0"; }
+    if (Type.IsChar(a)) { return str(a); }
+    if (a == nil) { throw(Exception.InvalidArguments, "Resp: nil cannot be sent as an argument"); }
+    throw(Exception.InvalidArguments, "Resp: a " + Type.Name(a) + " cannot be sent as an argument");
+}
+
+// Arguments to wire strings, arrays and objects spread one level.
+fn _flatten(args) {
+    let out = [];
+    foreach (a in args) {
+        if (Type.IsArray(a)) {
+            foreach (x in a) { Array.Append(out, _argText(x)); }
+        } else if (Type.IsObject(a)) {
+            foreach (v, k in a) { Array.Append(out, k); Array.Append(out, _argText(v)); }
+        } else {
+            Array.Append(out, _argText(a));
+        }
+    }
+    return out;
+}
+
+// One command as RESP: an array of bulk strings.
+fn _encode(parts): string {
+    var out = "*" + str(len(parts)) + _CRLF;
+    foreach (p in parts) {
+        out += "$";
+        out += str(String.Length(p));
+        out += _CRLF;
+        out += p;
+        out += _CRLF;
+    }
+    return out;
+}
+
+// [cmd, a1, ..., a15] with the trailing nils of the unused parameters dropped.
+fn _gather(cmd, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) {
+    if (Type.IsArray(cmd)) { return cmd; }
+    let all = [cmd, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15];
+    var n = 16;
+    while (n > 1 && all[n - 1] == nil) { n -= 1; }
+    if (n == 16) { return all; }
+    return Array.Slice(all, 0, n);
+}
+
+fn _listArg(v) {
+    if (Type.IsArray(v)) { return v; }
+    return [v];
+}
+
+fn _pairsToObject(a) {
+    if (a == nil || Type.IsObject(a)) { return a ?? {}; }
+    let o = {};
+    let n = len(a);
+    var i = 0;
+    while (i + 1 < n) {
+        let k = a[i];
+        o[Type.IsBlock(k) ? Buffer.ToString(k) : str(k)] = a[i + 1];
+        i += 2;
+    }
+    return o;
+}
+
+fn _pctDecode(s: string): string {
+    if (!String.Contains(s, "%")) { return s; }
+    let b = Buffer.FromString(s);
+    let n = len(b);
+    let out = Buffer.Create(n, 1);
+    var o = 0;
+    var i = 0;
+    while (i < n) {
+        let c = b[i];
+        if (c == 37 && i + 2 < n) {
+            let h = Convert.ParseRadix(Buffer.ToString(b, i + 1, 2), 16);
+            if (h != nil) { out[o] = h; o += 1; i += 3; continue; }
+        }
+        out[o] = c;
+        o += 1;
+        i += 1;
+    }
+    return Buffer.ToString(out, 0, o);
+}
+
+class Resp {
+    let _host: string = "";
+    let _port: int = _DEFAULT_PORT;
+    let _opts = nil;
+    let _sock = nil;
+    let _timeoutMs: int = _DEFAULT_TIMEOUT_MS;
+    let _binary: bool = false;
+    let _resp3: bool = false;
+    let _closed: bool = false;      // Close() was called: no reconnect
+    let _busy: bool = false;        // a fiber is between its write and its reply
+    let _waiters = [];              // ids of fibers waiting for _busy to clear
+    let _pushed: bool = false;      // the reply just read was a RESP3 push
+    let _onPush = nil;
+    let _hello = nil;
+
+    fn Constructor(host: string, port: int, opts) {
+        _host = host;
+        _port = port;
+        _opts = opts ?? {};
+        _timeoutMs = Object.TryGet(_opts, "timeoutMs", _DEFAULT_TIMEOUT_MS) ?? _DEFAULT_TIMEOUT_MS;
+        _binary = Object.TryGet(_opts, "binary", false) == true;
+        _resp3 = Object.TryGet(_opts, "resp3", false) == true;
+        _onPush = Object.TryGet(_opts, "onPush", nil);
+    }
+
+    fn static Connect(host: string, port?: int, opts?) {
+        let r = new Resp(host, port ?? _DEFAULT_PORT, opts);
+        r._open();
+        return r;
+    }
+
+    // redis://[user:password@]host[:port][/db], rediss:// for TLS; opts add to
+    // and override what the URL says.
+    fn static ConnectUrl(url: string, opts?) {
+        let o = {};
+        var rest = url;
+        if (String.StartsWith(rest, "rediss://")) { o.tls = true; rest = String.Substr(rest, 9); }
+        else if (String.StartsWith(rest, "redis://")) { rest = String.Substr(rest, 8); }
+        else { throw(Exception.InvalidArguments, "Resp: not a redis:// or rediss:// URL: " + url); }
+        let q = String.IndexOf(rest, "?");
+        if (q >= 0) { rest = String.Substr(rest, 0, q); }
+        let at = String.LastIndexOf(rest, "@");
+        if (at >= 0) {
+            let cred = String.Substr(rest, 0, at);
+            rest = String.Substr(rest, at + 1);
+            let colon = String.IndexOf(cred, ":");
+            if (colon < 0) { o.password = _pctDecode(cred); }
+            else {
+                let u = String.Substr(cred, 0, colon);
+                if (u != "") { o.user = _pctDecode(u); }
+                o.password = _pctDecode(String.Substr(cred, colon + 1));
+            }
+        }
+        let slash = String.IndexOf(rest, "/");
+        if (slash >= 0) {
+            let db = String.Substr(rest, slash + 1);
+            if (db != "") { o.db = int(db); }
+            rest = String.Substr(rest, 0, slash);
+        }
+        var host = rest;
+        var port = _DEFAULT_PORT;
+        if (String.StartsWith(rest, "[")) {
+            let close = String.IndexOf(rest, "]");
+            host = String.Substr(rest, 1, close - 1);
+            if (close + 1 < String.Length(rest) && String.CharAt(rest, close + 1) == ':') {
+                port = int(String.Substr(rest, close + 2));
+            }
+        } else {
+            let colon = String.LastIndexOf(rest, ":");
+            if (colon >= 0) { host = String.Substr(rest, 0, colon); port = int(String.Substr(rest, colon + 1)); }
+        }
+        if (opts != nil) { foreach (v, k in opts) { o[k] = v; } }
+        return Resp.Connect(host, port, o);
+    }
+
+    // The wire form of one command, as Command would send it.
+    fn static Encode(cmd, a1?, a2?, a3?, a4?, a5?, a6?, a7?, a8?, a9?, a10?, a11?, a12?, a13?, a14?, a15?): string {
+        return _encode(_flatten(_gather(cmd, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15)));
+    }
+
+    // Every reply in data (a string or a block) decoded as Command decodes
+    // one, error replies as RespError instances in place. opts: { binary }.
+    // Raises RespError (Kind "protocol") on malformed or truncated input.
+    fn static Decode(data, opts?) {
+        let r = new Resp("memory", 0, opts);
+        r._sock = Stream.Open(Type.IsString(data) ? Buffer.FromString(data) : Buffer.Slice(data, 0, len(data)), "r");
+        let out = [];
+        try {
+            while (Stream.Peek(r._sock) != nil) { Array.Append(out, r._read(r._binary)); }
+        } catch (e) {
+            if (e is RespError && e.Kind == "closed") { throw _err("protocol", "Resp: truncated reply"); }
+            throw e;
+        } finally {
+            r.Close();
+        }
+        return out;
+    }
+
+    // A subscriber on its own connection to host:port.
+    fn static ConnectSubscriber(host: string, port?: int, opts?) {
+        return new RespSubscriber(Resp.Connect(host, port ?? _DEFAULT_PORT, opts));
+    }
+
+    // A subscriber on a new connection with this client's settings.
+    fn Subscriber() {
+        return new RespSubscriber(Resp.Connect(_host, _port, _opts));
+    }
+
+    fn IsConnected(): bool { return _sock != nil && Stream.IsOpen(_sock); }
+    fn IsResp3(): bool { return _resp3; }
+    // The HELLO reply (server, version, proto, id, mode, role) when resp3 is on.
+    fn ServerInfo() { return _hello; }
+
+    fn Close() {
+        _closed = true;
+        if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+        return nil;
+    }
+
+    fn Destructor() {
+        if (_sock != nil) { Stream.Close(_sock); }
+    }
+
+    // ---- commands ----
+
+    fn Command(cmd, a1?, a2?, a3?, a4?, a5?, a6?, a7?, a8?, a9?, a10?, a11?, a12?, a13?, a14?, a15?) {
+        return this._run(_flatten(_gather(cmd, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15)), _binary);
+    }
+
+    fn CommandBytes(cmd, a1?, a2?, a3?, a4?, a5?, a6?, a7?, a8?, a9?, a10?, a11?, a12?, a13?, a14?, a15?) {
+        return this._run(_flatten(_gather(cmd, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15)), true);
+    }
+
+    // Every command in one write, then every reply in order; error replies
+    // come back in place as RespError instances.
+    fn Pipeline(cmds) {
+        if (len(cmds) == 0) { return []; }
+        var text = "";
+        foreach (c in cmds) { text += _encode(_flatten(_listArg(c))); }
+        this._enter();
+        try {
+            this._send(text);
+            let out = [];
+            iter (i from 0 to len(cmds)) { Array.Append(out, this._top(_binary)); }
+            return out;
+        } finally {
+            this._leave();
+        }
+    }
+
+    // MULTI, cmds, EXEC in one round trip: the EXEC reply, or nil when a
+    // WATCHed key changed.
+    fn Transaction(cmds) {
+        var text = _encode(["MULTI"]);
+        foreach (c in cmds) { text += _encode(_flatten(_listArg(c))); }
+        text += _encode(["EXEC"]);
+        this._enter();
+        try {
+            this._send(text);
+            var firstErr = nil;
+            iter (i from 0 to len(cmds) + 1) {
+                let q = this._top(_binary);
+                if (firstErr == nil && q is RespError) { firstErr = q; }
+            }
+            let res = this._top(_binary);
+            if (res is RespError) {
+                if (firstErr != nil) { res.Error = res.Error + " (" + firstErr.Error + ")"; }
+                throw res;
+            }
+            return res;
+        } finally {
+            this._leave();
+        }
+    }
+
+    fn Ping() { return this._run(["PING"], false); }
+    fn Echo(s) { return this._run(["ECHO", _argText(s)], _binary); }
+    fn Select(db: int) { return this._run(["SELECT", str(db)], false); }
+    fn DbSize() { return this._run(["DBSIZE"], false); }
+
+    fn Get(key) { return this._run(["GET", _argText(key)], _binary); }
+    fn GetBytes(key) { return this._run(["GET", _argText(key)], true); }
+
+    fn Set(key, value, opts?) {
+        let parts = ["SET", _argText(key), _argText(value)];
+        var get = false;
+        if (opts != nil) {
+            let ex = Object.TryGet(opts, "ex", nil);
+            let px = Object.TryGet(opts, "px", nil);
+            if (ex != nil) { Array.Append(parts, "EX"); Array.Append(parts, _argText(ex)); }
+            if (px != nil) { Array.Append(parts, "PX"); Array.Append(parts, _argText(px)); }
+            if (Object.TryGet(opts, "nx", false) == true) { Array.Append(parts, "NX"); }
+            if (Object.TryGet(opts, "xx", false) == true) { Array.Append(parts, "XX"); }
+            if (Object.TryGet(opts, "keepTtl", false) == true) { Array.Append(parts, "KEEPTTL"); }
+            if (Object.TryGet(opts, "get", false) == true) { Array.Append(parts, "GET"); get = true; }
+        }
+        let r = this._run(parts, _binary);
+        if (get) { return r; }
+        return r != nil;
+    }
+
+    fn MGet(keys) { return this._run(_flatten(["MGET", keys]), _binary); }
+    fn MSet(pairs) { return this._run(_flatten(["MSET", pairs]), false); }
+    fn Del(keys) { return this._run(_flatten(["DEL", keys]), false); }
+    fn Exists(keys) { return this._run(_flatten(["EXISTS", keys]), false); }
+    fn Incr(key) { return this._run(["INCR", _argText(key)], false); }
+    fn IncrBy(key, n: int) { return this._run(["INCRBY", _argText(key), str(n)], false); }
+    fn Decr(key) { return this._run(["DECR", _argText(key)], false); }
+    fn Append(key, value) { return this._run(["APPEND", _argText(key), _argText(value)], false); }
+    fn StrLen(key) { return this._run(["STRLEN", _argText(key)], false); }
+    fn Expire(key, seconds: int) { return this._run(["EXPIRE", _argText(key), str(seconds)], false) == 1; }
+    fn PExpire(key, ms: int) { return this._run(["PEXPIRE", _argText(key), str(ms)], false) == 1; }
+    fn Ttl(key) { return this._run(["TTL", _argText(key)], false); }
+    fn PTtl(key) { return this._run(["PTTL", _argText(key)], false); }
+    fn Persist(key) { return this._run(["PERSIST", _argText(key)], false) == 1; }
+    fn KeyType(key) { return this._run(["TYPE", _argText(key)], false); }
+    fn Rename(key, newKey) { return this._run(["RENAME", _argText(key), _argText(newKey)], false); }
+    fn Keys(pattern) { return this._run(["KEYS", _argText(pattern)], false); }
+
+    fn Scan(cursor, match?, count?) {
+        let parts = ["SCAN", _argText(cursor)];
+        if (match != nil) { Array.Append(parts, "MATCH"); Array.Append(parts, _argText(match)); }
+        if (count != nil) { Array.Append(parts, "COUNT"); Array.Append(parts, _argText(count)); }
+        let r = this._run(parts, false);
+        return { cursor: int(r[0]), keys: r[1] };
+    }
+
+    fn HGet(key, field) { return this._run(["HGET", _argText(key), _argText(field)], _binary); }
+
+    fn HSet(key, fieldOrObj, value?) {
+        if (Type.IsObject(fieldOrObj)) { return this._run(_flatten(["HSET", key, fieldOrObj]), false); }
+        return this._run(["HSET", _argText(key), _argText(fieldOrObj), _argText(value)], false);
+    }
+
+    fn HGetAll(key) { return _pairsToObject(this._run(["HGETALL", _argText(key)], _binary)); }
+    fn HDel(key, fields) { return this._run(_flatten(["HDEL", key, fields]), false); }
+    fn HExists(key, field) { return this._run(["HEXISTS", _argText(key), _argText(field)], false) == 1; }
+    fn HIncrBy(key, field, n: int) { return this._run(["HINCRBY", _argText(key), _argText(field), str(n)], false); }
+    fn HKeys(key) { return this._run(["HKEYS", _argText(key)], false); }
+    fn HLen(key) { return this._run(["HLEN", _argText(key)], false); }
+
+    fn LPush(key, values) { return this._run(_flatten(["LPUSH", key, values]), false); }
+    fn RPush(key, values) { return this._run(_flatten(["RPUSH", key, values]), false); }
+    fn LPop(key) { return this._run(["LPOP", _argText(key)], _binary); }
+    fn RPop(key) { return this._run(["RPOP", _argText(key)], _binary); }
+    fn LRange(key, start: int, stop: int) { return this._run(["LRANGE", _argText(key), str(start), str(stop)], _binary); }
+    fn LLen(key) { return this._run(["LLEN", _argText(key)], false); }
+
+    // Wait up to timeoutSec (0 = for ever) for an element: [key, value] | nil.
+    fn BLPop(keys, timeoutSec) { return this._blocking(_flatten(["BLPOP", keys, timeoutSec]), timeoutSec); }
+    fn BRPop(keys, timeoutSec) { return this._blocking(_flatten(["BRPOP", keys, timeoutSec]), timeoutSec); }
+
+    fn SAdd(key, members) { return this._run(_flatten(["SADD", key, members]), false); }
+    fn SRem(key, members) { return this._run(_flatten(["SREM", key, members]), false); }
+    fn SMembers(key) { return this._run(["SMEMBERS", _argText(key)], _binary); }
+    fn SIsMember(key, member) { return this._run(["SISMEMBER", _argText(key), _argText(member)], false) == 1; }
+    fn SCard(key) { return this._run(["SCARD", _argText(key)], false); }
+
+    fn Publish(channel, message) { return this._run(["PUBLISH", _argText(channel), _argText(message)], false); }
+
+    // ---- the round trip ----
+
+    // One command whose arguments are wire strings already.
+    fn _run(parts, bin: bool) {
+        this._enter();
+        try {
+            this._send(_encode(parts));
+            let v = this._top(bin);
+            if (v is RespError) { throw v; }
+            return v;
+        } finally {
+            this._leave();
+        }
+    }
+
+    // A blocking pop: the socket waits as long as the server may.
+    fn _blocking(parts, timeoutSec) {
+        let secs = float(timeoutSec ?? 0);
+        this._enter();
+        try {
+            Stream.SetTimeout(_sock, (secs <= 0.0) ? 0 : int(secs * 1000.0) + _timeoutMs);
+            this._send(_encode(parts));
+            let v = this._top(_binary);
+            if (_sock != nil) { Stream.SetTimeout(_sock, _timeoutMs); }
+            if (v is RespError) { throw v; }
+            return v;
+        } finally {
+            this._leave();
+        }
+    }
+
+    // Take the connection for one exchange, connecting first when needed.
+    fn _enter() {
+        if (_busy) { this._waitTurn(); }
+        _busy = true;
+        if (_sock == nil) {
+            try { this._open(); }
+            catch (e) { this._leave(); throw e; }
+        }
+    }
+
+    fn _waitTurn() {
+        let deadline = Time.Millis() + _timeoutMs;
+        let me = Fiber.Id();
+        while (_busy) {
+            let left = deadline - Time.Millis();
+            if (left <= 0) { throw _err("timeout", "Resp: another fiber held the connection for " + str(_timeoutMs) + " ms"); }
+            Array.Append(_waiters, me);
+            Fiber.Park(left);
+        }
+    }
+
+    fn _leave() {
+        _busy = false;
+        while (len(_waiters) > 0) {
+            let f = Fiber.FromId(_waiters[0]);
+            Array.RemoveAt(_waiters, 0);
+            if (f != nil && Fiber.Unpark(f)) { break; }
+        }
+    }
+
+    fn _send(text: string) {
+        if (!Stream.WriteAll(_sock, text)) { this._lost(); }
+    }
+
+    // A reply as the caller sees it: RESP3 pushes in front of it go to onPush.
+    fn _top(bin: bool) {
+        while (true) {
+            _pushed = false;
+            let v = this._read(bin);
+            if (!_pushed) { return v; }
+            _pushed = false;
+            if (_onPush != nil) { _onPush(v); }
+        }
+    }
+
+    // One value off the wire; an error reply comes back as a RespError
+    // instance, raised by the caller.
+    fn _read(bin: bool) {
+        let line = Stream.ReadLine(_sock);
+        if (line == nil) { this._lost(); }
+        let t = String.CharAt(line, 0);
+        if (t == '$') {
+            let n = _len(line);
+            if (n >= 0) { return this._bulk(n, bin); }
+            if (n == -1) { return nil; }
+            this._protocol("bad bulk length: " + line);
+        }
+        if (t == ':') {
+            let v = Convert.ParseInt(String.Substr(line, 1));
+            if (v == nil) { this._protocol("bad integer: " + line); }
+            return v;
+        }
+        if (t == '+') { return String.Substr(line, 1); }
+        if (t == '*' || t == '~' || t == '>') {
+            let n = _len(line);
+            if (n == -1) { return nil; }
+            if (n < 0) { this._protocol("bad array length: " + line); }
+            let a = [];
+            iter (i from 0 to n) { Array.Append(a, this._read(bin)); }
+            if (t == '>') { _pushed = true; }
+            return a;
+        }
+        if (t == '-') { return _err("server", String.Substr(line, 1)); }
+        if (t == '%' || t == '|') {
+            let n = _len(line);
+            if (n < 0) { this._protocol("bad map length: " + line); }
+            let o = {};
+            iter (i from 0 to n) {
+                let k = this._read(false);
+                let v = this._read(bin);
+                o[Type.IsString(k) ? k : str(k)] = v;
+            }
+            if (t == '|') { return this._read(bin); }
+            return o;
+        }
+        if (t == '_') { return nil; }
+        if (t == '#') { return line == "#t"; }
+        if (t == ',') { return float(String.Substr(line, 1)); }
+        if (t == '(') { return String.Substr(line, 1); }
+        if (t == '!' || t == '=') {
+            let n = _len(line);
+            if (n < 0) { this._protocol("bad length: " + line); }
+            let s = this._bulk(n, false);
+            if (t == '!') { return _err("server", s); }
+            return (String.Length(s) >= 4 && String.CharAt(s, 3) == ':') ? String.Substr(s, 4) : s;
+        }
+        this._protocol("unexpected reply: " + String.Truncate(line, 40));
+        return nil;
+    }
+
+    // A bulk payload of n bytes and the CRLF after it.
+    fn _bulk(n: int, bin: bool) {
+        if (n == 0) {
+            this._crlf();
+            return bin ? Buffer.Create(0, 1) : "";
+        }
+        if (bin) {
+            let b = Stream.ReadBytes(_sock, n);
+            if (b == nil) { this._lost(); }
+            while (len(b) < n) {
+                let more = Stream.ReadBytes(_sock, n - len(b));
+                if (more == nil) { this._lost(); }
+                Buffer.Append(b, more);
+            }
+            this._crlf();
+            return b;
+        }
+        var s = Stream.ReadString(_sock, n);
+        if (s == nil) { this._lost(); }
+        while (String.Length(s) < n) {
+            let more = Stream.ReadString(_sock, n - String.Length(s));
+            if (more == nil) { this._lost(); }
+            s += more;
+        }
+        this._crlf();
+        return s;
+    }
+
+    fn _crlf() {
+        let tail = Stream.ReadLine(_sock);
+        if (tail == nil) { this._lost(); }
+        if (tail != "") { this._protocol("bulk string not followed by CRLF"); }
+    }
+
+    // ---- connection ----
+
+    fn _open() {
+        if (_closed) { throw _err("closed", "Resp: the connection was closed"); }
+        let connectMs = Object.TryGet(_opts, "connectTimeoutMs", nil) ?? _timeoutMs;
+        let sock = nil;
+        if (Object.TryGet(_opts, "tls", false) == true) {
+            let tlsOpts = { insecure: Object.TryGet(_opts, "insecure", false) == true, timeoutMs: connectMs };
+            let sni = Object.TryGet(_opts, "sni", nil);
+            if (sni != nil) { tlsOpts.sni = sni; }
+            sock = Fiber.Await(Stream.ConnectTlsAsync(_host, _port, tlsOpts));
+            if (sock == nil) {
+                throw _err("tls", "Resp: TLS connect to " + _host + ":" + str(_port) + " failed: " + (Stream.TlsLastError() ?? "unknown"));
+            }
+        } else {
+            sock = Fiber.Await(Stream.ConnectAsync("tcp", _host, _port, connectMs));
+            if (sock == nil) {
+                let why = (Stream.LastError() == 1) ? "timed out" : "refused or unreachable";
+                throw _err("connect", "Resp: cannot connect to " + _host + ":" + str(_port) + " (" + why + ")");
+            }
+            Stream.SetNoDelay(sock, true);
+        }
+        Stream.SetTimeout(sock, _timeoutMs);
+        _sock = sock;
+        try {
+            this._handshake();
+        } catch (e) {
+            if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+            throw e;
+        }
+    }
+
+    // HELLO or AUTH, SELECT and SETNAME, pipelined.
+    fn _handshake() {
+        let user = Object.TryGet(_opts, "user", nil);
+        let password = Object.TryGet(_opts, "password", nil);
+        let db = Object.TryGet(_opts, "db", nil);
+        let name = Object.TryGet(_opts, "name", nil);
+        let cmds = [];
+        let kinds = [];
+        if (_resp3) {
+            let hello = ["HELLO", "3"];
+            if (password != nil) {
+                Array.Append(hello, "AUTH");
+                Array.Append(hello, _argText(user ?? "default"));
+                Array.Append(hello, _argText(password));
+            }
+            if (name != nil) { Array.Append(hello, "SETNAME"); Array.Append(hello, _argText(name)); }
+            Array.Append(cmds, hello);
+            Array.Append(kinds, "hello");
+        } else {
+            if (password != nil) {
+                Array.Append(cmds, (user != nil) ? ["AUTH", _argText(user), _argText(password)] : ["AUTH", _argText(password)]);
+                Array.Append(kinds, "auth");
+            }
+            if (name != nil) { Array.Append(cmds, ["CLIENT", "SETNAME", _argText(name)]); Array.Append(kinds, "name"); }
+        }
+        if (db != nil && db != 0) { Array.Append(cmds, ["SELECT", str(db)]); Array.Append(kinds, "select"); }
+        if (len(cmds) == 0) { return; }
+        var text = "";
+        foreach (c in cmds) { text += _encode(c); }
+        this._send(text);
+        var failure = nil;
+        iter (i from 0 to len(cmds)) {
+            let v = this._top(false);
+            if (!(v is RespError)) {
+                if (kinds[i] == "hello") { _hello = _pairsToObject(v); }
+                continue;
+            }
+            if (failure != nil) { continue; }
+            if (kinds[i] == "hello" && v.Prefix == "NOPROTO") {
+                failure = _err("protocol", "Resp: the server does not speak RESP3: " + v.Error);
+            } else if (kinds[i] == "hello" && String.Contains(String.ToLower(v.Error), "unknown command")) {
+                failure = _err("protocol", "Resp: the server is older than Redis 6 and has no HELLO (RESP3)");
+            } else if (kinds[i] == "auth" || kinds[i] == "hello") {
+                failure = _err("auth", "Resp: login refused: " + v.Error);
+            } else {
+                failure = v;
+                failure.Error = "Resp: " + kinds[i] + " failed: " + v.Error;
+            }
+        }
+        if (failure != nil) { throw failure; }
+    }
+
+    // The link failed mid-exchange: close it and raise.
+    fn _lost() {
+        let code = Stream.LastError();
+        if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+        if (_closed) { throw _err("closed", "Resp: the connection was closed"); }
+        if (code == 1) { throw _err("timeout", "Resp: no reply from " + _host + ":" + str(_port) + " within " + str(_timeoutMs) + " ms"); }
+        throw _err("closed", "Resp: the server closed the connection");
+    }
+
+    fn _protocol(msg: string) {
+        if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+        throw _err("protocol", "Resp: " + msg);
+    }
+
+    // ---- used by RespSubscriber ----
+
+    fn _subSend(parts) {
+        if (_sock == nil) { this._open(); }
+        this._send(_encode(parts));
+    }
+
+    // One message off a subscribed connection: the value, or nil when nothing
+    // arrived within waitMs (< 0: no limit) or the connection was closed.
+    fn _subRead(waitMs: int) {
+        if (_sock == nil) { return nil; }
+        if (Stream.WaitReadable(_sock, (waitMs < 0) ? -1 : ((waitMs == 0) ? 1 : waitMs)) == nil) { return nil; }
+        return this._read(_binary);
+    }
+
+    fn _isClosed(): bool { return _closed || _sock == nil; }
+}
+
+// A connection in subscribed mode. Built by Resp.Subscriber() or
+// Resp.ConnectSubscriber().
+class RespSubscriber {
+    let _r = nil;
+    let _pending = [];      // messages that arrived while a confirmation was awaited
+    let _count: int = 0;    // channels + patterns the server confirmed
+    let _channels = {};
+    let _patterns = {};
+    let _confirmed: string = "";
+    let _reading: bool = false;
+
+    fn Constructor(r) { _r = r; }
+
+    fn Subscribe(channels) { return this._change("SUBSCRIBE", "subscribe", channels); }
+    fn SubscribePattern(patterns) { return this._change("PSUBSCRIBE", "psubscribe", patterns); }
+
+    // Without arguments: every channel (or pattern).
+    fn Unsubscribe(channels?) { return this._change("UNSUBSCRIBE", "unsubscribe", channels); }
+    fn UnsubscribePattern(patterns?) { return this._change("PUNSUBSCRIBE", "punsubscribe", patterns); }
+
+    // How many channels and patterns the server has confirmed.
+    fn Count(): int { return _count; }
+
+    // The next message: { kind, channel, pattern, data }, or nil when none
+    // arrived within timeoutMs (omitted or < 0: wait for ever) or the
+    // subscriber was closed.
+    fn Receive(timeoutMs?) {
+        if (len(_pending) > 0) {
+            let m = _pending[0];
+            Array.RemoveAt(_pending, 0);
+            return m;
+        }
+        let limit = timeoutMs ?? -1;
+        let deadline = Time.Millis() + limit;
+        _reading = true;
+        try {
+            while (true) {
+                let wait = (limit < 0) ? -1 : deadline - Time.Millis();
+                if (limit >= 0 && wait <= 0) { return nil; }
+                let v = _r._subRead(wait);
+                if (v == nil) { return nil; }
+                let m = this._message(v);
+                if (m != nil) { return m; }
+            }
+        } catch (e) {
+            if (_r._isClosed()) { return nil; }
+            throw e;
+        } finally {
+            _reading = false;
+        }
+    }
+
+    // Call f(message) for every message until f returns false, the
+    // subscriber is closed or nothing is subscribed any more.
+    fn Listen(f) {
+        while (true) {
+            if (_count == 0 && len(_pending) == 0) { return; }
+            let m = this.Receive(-1);
+            if (m == nil) { return; }
+            if (f(m) == false) { return; }
+        }
+    }
+
+    fn Close() {
+        if (_r != nil) { _r.Close(); }
+        return nil;
+    }
+
+    // Send one (un)subscribe command; when no other fiber is reading, wait for
+    // the server to confirm each name (every current one when names is nil).
+    fn _change(cmd: string, kind: string, names) {
+        let parts = [cmd];
+        if (names != nil) {
+            foreach (n in _listArg(names)) { Array.Append(parts, _argText(n)); }
+        }
+        var expect = len(parts) - 1;
+        if (names == nil) {
+            expect = Object.Count((kind == "unsubscribe") ? _channels : _patterns);
+            if (expect == 0) { expect = 1; }
+        }
+        _r._subSend(parts);
+        if (_reading) { return _count; }
+        var seen = 0;
+        _reading = true;
+        try {
+            while (seen < expect) {
+                let v = _r._subRead(-1);
+                if (v == nil) { break; }
+                let m = this._message(v);
+                if (m == nil) {
+                    if (_confirmed == kind) { seen += 1; }
+                    continue;
+                }
+                Array.Append(_pending, m);
+            }
+        } finally {
+            _reading = false;
+        }
+        return _count;
+    }
+
+    // A server push as a message; nil for a confirmation, which updates the
+    // subscriptions and sets _confirmed to its kind.
+    fn _message(v) {
+        _confirmed = "";
+        if (!Type.IsArray(v) || len(v) < 3) { return nil; }
+        let k = v[0];
+        let kind = Type.IsBlock(k) ? Buffer.ToString(k) : str(k);
+        if (kind == "message") {
+            return { kind: "message", channel: v[1], pattern: nil, data: v[2] };
+        }
+        if (kind == "pmessage" && len(v) >= 4) {
+            return { kind: "pmessage", channel: v[2], pattern: v[1], data: v[3] };
+        }
+        let name = (v[1] == nil) ? nil : (Type.IsBlock(v[1]) ? Buffer.ToString(v[1]) : str(v[1]));
+        if (kind == "subscribe" && name != nil) { _channels[name] = true; }
+        else if (kind == "psubscribe" && name != nil) { _patterns[name] = true; }
+        else if (kind == "unsubscribe" && name != nil) { Object.Delete(_channels, name); }
+        else if (kind == "punsubscribe" && name != nil) { Object.Delete(_patterns, name); }
+        else if (kind != "unsubscribe" && kind != "punsubscribe") { return nil; }
+        _confirmed = kind;
+        if (Type.IsInt(v[2])) { _count = v[2]; }
+        return nil;
+    }
+}
+
+// A fixed number of connections shared by many fibers.
+class RespPool {
+    let _host: string = "";
+    let _port: int = _DEFAULT_PORT;
+    let _opts = nil;
+    let _size: int = 4;
+    let _idle = [];
+    let _open: int = 0;
+    let _waiters = [];
+    let _closed: bool = false;
+
+    fn Constructor(host: string, port: int, opts, size: int) {
+        if (size <= 0) { throw(Exception.InvalidArguments, "RespPool: size must be at least 1"); }
+        _host = host;
+        _port = port;
+        _opts = opts ?? {};
+        _size = size;
+    }
+
+    // A connection, waiting up to timeoutMs (default the opts timeoutMs) for one
+    // to be released when all are in use.
+    fn Acquire(timeoutMs?) {
+        let limit = timeoutMs ?? (Object.TryGet(_opts, "timeoutMs", nil) ?? _DEFAULT_TIMEOUT_MS);
+        let deadline = Time.Millis() + limit;
+        while (true) {
+            if (_closed) { throw _err("closed", "RespPool: the pool is closed"); }
+            while (len(_idle) > 0) {
+                let r = _idle[len(_idle) - 1];
+                Array.RemoveAt(_idle, len(_idle) - 1);
+                if (r.IsConnected()) { return r; }
+                _open -= 1;
+            }
+            if (_open < _size) {
+                _open += 1;
+                try {
+                    return Resp.Connect(_host, _port, _opts);
+                } catch (e) {
+                    _open -= 1;
+                    throw e;
+                }
+            }
+            let left = deadline - Time.Millis();
+            if (left <= 0) { throw _err("timeout", "RespPool: no connection was free within " + str(limit) + " ms"); }
+            Array.Append(_waiters, Fiber.Id());
+            Fiber.Park(left);
+        }
+    }
+
+    // Give r back; a connection that failed is dropped.
+    fn Release(r) {
+        if (r == nil) { return; }
+        if (_closed || !r.IsConnected()) {
+            r.Close();
+            _open -= 1;
+        } else {
+            Array.Append(_idle, r);
+        }
+        while (len(_waiters) > 0) {
+            let f = Fiber.FromId(_waiters[0]);
+            Array.RemoveAt(_waiters, 0);
+            if (f != nil && Fiber.Unpark(f)) { break; }
+        }
+    }
+
+    // f(r) with a connection of the pool; it goes back even when f raises.
+    fn Use(f) {
+        let r = this.Acquire();
+        try {
+            return f(r);
+        } finally {
+            this.Release(r);
+        }
+    }
+
+    fn Stats() {
+        return { idle: len(_idle), inUse: _open - len(_idle), size: _size };
+    }
+
+    fn Close() {
+        _closed = true;
+        foreach (r in _idle) { r.Close(); }
+        _open -= len(_idle);
+        _idle = [];
+        return nil;
+    }
+}
+
+export { Resp, RespError, RespSubscriber, RespPool };

@@ -1149,7 +1149,127 @@ fn test_key_groups() {
 }
 
 // ============================================================
-// 33. Benchmark
+// 33. Many keys: random inserts and deletes across chunks
+// ============================================================
+
+// m holds exactly the keys of the sorted array ref, each with value key * 3.
+fn _matches(m:instance, ref:array): bool {
+    let ks = m.Keys();
+    if (m.Size() != len(ref) || len(ks) != len(ref)) return false;
+    iter (i from 0 to len(ref)) {
+        if (ks[i] != ref[i]) return false;
+    }
+    let es = m.Entries();
+    iter (i from 0 to len(es)) {
+        if (es[i].Key != ref[i] || es[i].Value != ref[i] * 3) return false;
+    }
+    if (len(ref) > 0 && (m.MinKey() != ref[0] || m.MaxKey() != ref[len(ref) - 1])) return false;
+    return true;
+}
+
+// Ordered queries on m agree with binary searches over ref.
+fn _queriesMatch(m:instance, ref:array, rng, count:int): bool {
+    let n = len(ref);
+    iter (t from 0 to count) {
+        let q = rng.NextInt(-5, 20005);
+        let p = Array.BinarySearch(ref, q);
+        let lo = (p >= 0) ? p : -p - 1;
+        let hi = (p >= 0) ? p + 1 : -p - 1;
+        if (m.Rank(q) != lo) return false;
+        if (m.CeilKey(q)  != ((lo < n) ? ref[lo] : nil)) return false;
+        if (m.NextKey(q)  != ((hi < n) ? ref[hi] : nil)) return false;
+        if (m.FloorKey(q) != ((hi > 0) ? ref[hi - 1] : nil)) return false;
+        if (m.PrevKey(q)  != ((lo > 0) ? ref[lo - 1] : nil)) return false;
+        if (n > 0) {
+            let r = rng.NextInt(0, n - 1);
+            if (m.Select(r) != ref[r]) return false;
+            if (m.SelectEntry(r).Value != ref[r] * 3) return false;
+        }
+        let q2 = q + rng.NextInt(0, 3000);
+        let p2 = Array.BinarySearch(ref, q2);
+        let lo2 = (p2 >= 0) ? p2 : -p2 - 1;
+        let hi2 = (p2 >= 0) ? p2 + 1 : -p2 - 1;
+        if (m.CountRange(q, q2) != hi2 - lo) return false;
+        let rg = m.Range(q, q2);
+        if (len(rg) != lo2 - lo) return false;
+        if (len(rg) > 0 && (rg[0].Key != ref[lo] || rg[len(rg) - 1].Key != ref[lo2 - 1])) return false;
+        if (len(m.HeadEntries(q)) != hi || len(m.TailEntries(q, false)) != n - hi) return false;
+    }
+    return true;
+}
+
+fn test_many_keys() {
+    Console.WriteLine("== Many keys ==");
+    let m = new TreeMap();
+    let ref = [];
+    let rng = Random.New(7);
+
+    iter (i from 0 to 6000) {
+        let k = rng.NextInt(0, 19999);
+        if (Array.BinarySearch(ref, k) < 0) Array.SortedInsert(ref, k);
+        m.Set(k, k * 3);
+    }
+    check("many: random inserts keep the order", _matches(m, ref));
+    check("many: queries after inserts", _queriesMatch(m, ref, rng, 2000));
+
+    let snap = m.Clone();
+    let snapRef = Array.Clone(ref);
+
+    var deleteOk = true;
+    iter (i from 0 to 9000) {
+        let k = rng.NextInt(0, 19999);
+        let p = Array.BinarySearch(ref, k);
+        if (m.Delete(k) != (p >= 0)) deleteOk = false;
+        if (p >= 0) Array.RemoveAt(ref, p);
+        if (i % 3 == 0) {
+            let a = rng.NextInt(0, 19999);
+            if (Array.BinarySearch(ref, a) < 0) Array.SortedInsert(ref, a);
+            m.Set(a, a * 3);
+        }
+    }
+    check("many: Delete reports whether the key was there", deleteOk);
+    check("many: interleaved deletes and inserts keep the order", _matches(m, ref));
+    check("many: queries after deletes", _queriesMatch(m, ref, rng, 2000));
+    check("many: clone untouched by later changes", _matches(snap, snapRef));
+
+    while (len(ref) > 40) {
+        let r = rng.NextInt(0, len(ref) - 1);
+        m.Delete(ref[r]);
+        Array.RemoveAt(ref, r);
+    }
+    check("many: shrunk to a few keys", _matches(m, ref));
+    check("many: queries on a few keys", _queriesMatch(m, ref, rng, 300));
+
+    iter (i from 0 to 5000) {
+        let k = 20000 + i;
+        Array.Append(ref, k);
+        m.Set(k, k * 3);
+    }
+    check("many: ascending inserts at the end", _matches(m, ref));
+    var popsOk = true;
+    iter (i from 0 to 1500) {
+        let lo = m.PopMin();
+        let hi = m.PopMax();
+        if (lo.Key != ref[0] || hi.Key != ref[len(ref) - 1] || hi.Value != hi.Key * 3) popsOk = false;
+        Array.RemoveAt(ref, 0);
+        Array.RemoveAt(ref, len(ref) - 1);
+    }
+    check("many: PopMin / PopMax from both ends", popsOk && _matches(m, ref));
+
+    m.Clear();
+    check("many: Clear empties every chunk", m.IsEmpty() && len(m.Keys()) == 0 && m.MinKey() == nil && m.Rank(5) == 0);
+
+    let big = [];
+    iter (i from 0 to 5000) { Array.Append(big, [i]); }
+    let mv = new TreeMap();
+    mv.Set(2, big).Set(1, big);
+    let ev = mv.Entries();
+    check("many: entries hold large values as they are", len(ev) == 2 && len(ev[0].Value) == 5000 && ev[1].Value[4999][0] == 4999);
+    check("many: PopMin returns a large value", len(mv.PopMin().Value) == 5000);
+}
+
+// ============================================================
+// 34. Benchmark
 // ============================================================
 fn _bench_fill(map:instance, n:int) {
     let i = 0;
@@ -1295,6 +1415,7 @@ fn Main() {
     test_utility_edge_cases();
     test_rank_select_edge_cases();
     test_head_tail_edge_cases();
+    test_many_keys();
 
     Console.WriteLine("");
     Console.WriteLine("Results: " + str(passed) + " passed, " + str(failed) + " failed.");

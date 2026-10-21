@@ -4,15 +4,21 @@
 // Parses well-formed XML into a node tree. All methods are static.
 //
 // Supported: elements, attributes, text content, self-closing tags, CDATA,
-//   entity references (&amp; &lt; &gt; &quot; &apos;).
-//   Comments and XML declarations are skipped silently.
+//   entity references (&amp; &lt; &gt; &quot; &apos; &#N; &#xN;).
+//   Comments, XML declarations and DOCTYPE (with an internal [...] subset) are
+//   skipped silently; entities a DOCTYPE declares are not expanded.
 //
 // Node structure (every node is a plain object):
 //   { tag: string, attrs: object, text: string, children: array }
 //   Element nodes: tag = element name, attrs = attribute map, children = child nodes.
 //   Text/CDATA nodes: tag = "", text = content, children = [].
-//   Mixed content: element nodes may have both children and a direct text field
-//   (the first text node's content is promoted to .text for convenience).
+//   An element holding only text keeps it, trimmed, in .text; whitespace-only
+//   text between child elements is dropped.
+//   Mixed content - text beside child elements or CDATA - keeps document order:
+//   every text run, whitespace included, is a text node in children and .text
+//   is "". <p>Hello <b>world</b> again</p> has children
+//   [text "Hello ", <b>, text " again"]; Build gives the same markup back and
+//   XML.Text gives "Hello world again".
 //
 // Usage:
 //   import { XML } from library("XML", "1.0");
@@ -71,14 +77,21 @@ class XML {
     //   2  attribute name of the element opened last; flag 16 = no "=value",
     //      the attribute is true
     //   3  attribute value, right after its name; flag 16 = holds "&"
+    //   4  text node of a mixed element, in document order; flag 16 = holds "&"
     //   5  one of several text runs of the element; flag 16 = holds "&"
     //   6  CDATA section (element = its parent, -1 for none)
     //   7  closing tag whose name differs from the element's tag
     //   8  the element's only text run, already trimmed; flag 16 = holds "&",
     //      flag 32 = decoding it can expose whitespace at an end
     //   9  the element's text runs are complete and want trimming
+    //  10  the element turns mixed: the text it holds so far becomes a text node
     // Text runs are the stretches between markup that hold a character
-    // String.Trim keeps; whitespace-only runs are dropped.
+    // String.Trim keeps; whitespace-only runs are dropped. An element is mixed
+    // once it holds both a text run and a child element or CDATA; from then on
+    // every run, whitespace-only too, is a text node, and the whitespace-only
+    // gaps between its earlier children are spliced in as text nodes.
+    // Per open element, runs is the count of text runs while it has no child,
+    // -1 once it has children and no text, -2 once it is mixed.
 
     fn static _ws(s: string, pos: int, n: int) : int {
         var p = pos;
@@ -90,8 +103,10 @@ class XML {
         return p;
     }
 
-    fn static _nameEnd(s: string, pos: int, n: int) : int {
-        let e = String.IndexOfAnyFrom(s, " \t\n\r>/=\"'<", pos);
+    // stop is _scan's nameStop: the interpreter copies a string literal each
+    // time it evaluates one, so _scan makes the set once and passes it down.
+    fn static _nameEnd(s: string, pos: int, n: int, stop: string) : int {
+        let e = String.IndexOfAnyFrom(s, stop, pos);
         if (e < 0) { return n; }
         return e;
     }
@@ -148,6 +163,96 @@ class XML {
         return 0;
     }
 
+    // A child element or CDATA opens inside the element at depth index d.
+    fn static _kid(ev: [int], d: int, dElem: [int], dRuns: [int], dRunAt: [int], dRunEnd: [int], dRunAmp: [int]) : int {
+        let r = dRuns[d];
+        if (r == 0) {
+            dRuns[d] = -1;
+        } else if (r > 0) {
+            if (r == 1) {
+                XML._ev(ev, 5 | dRunAmp[d] | ((dRunEnd[d] - dRunAt[d]) << 8), dRunAt[d], dElem[d]);
+            }
+            XML._ev(ev, 10, 0, dElem[d]);
+            dRuns[d] = -2;
+        }
+        return 0;
+    }
+
+    // elem, opened by the event at e0, had children and no text and turns
+    // mixed: the whitespace-only gap in front of each child becomes a
+    // text-node event.
+    fn static _keepGaps(s: string, ev: [int], e0: int, elem: int) : int {
+        let m   = len(ev);
+        let gap = Array.Create(0, Type.Int);   // [event index, start, end] per gap
+        var j = e0 + 3;
+        while (j < m) {
+            let k = ev[j] & 15;
+            if ((k == 1 || k == 6) && ev[j + 2] == elem) {
+                var lt = ev[j + 1] - 1;
+                if (k == 6) { lt = ev[j + 1] - 9; }
+                if (lt > 0 && lt < len(s)) {
+                    var a = lt;
+                    while (a > 0 && (s[a - 1] == ' ' || s[a - 1] == '\t' || s[a - 1] == '\n' || s[a - 1] == '\r')) { a -= 1; }
+                    if (a < lt && a > 0 && s[a - 1] == '>') {
+                        Array.Append(gap, j);
+                        Array.Append(gap, a);
+                        Array.Append(gap, lt);
+                    }
+                }
+            }
+            j += 3;
+        }
+        let g = len(gap);
+        if (g == 0) { return 0; }
+        var src = m;
+        iter (q from 0 to g) { Array.Append(ev, 0); }
+        var dst = len(ev);
+        var q = g - 3;
+        while (q >= 0) {
+            let at = gap[q];
+            while (src > at) {
+                src -= 1;
+                dst -= 1;
+                ev[dst] = ev[src];
+            }
+            dst -= 3;
+            ev[dst]     = 4 | ((gap[q + 2] - gap[q + 1]) << 8);
+            ev[dst + 1] = gap[q + 1];
+            ev[dst + 2] = elem;
+            q -= 3;
+        }
+        return 0;
+    }
+
+    // One past the ">" that ends the DOCTYPE starting at pos, skipping an
+    // internal subset in [...] with its quoted strings and comments.
+    fn static _doctypeEnd(s: string, pos: int, n: int) : int {
+        var p = pos;
+        while (p < n) {
+            let c = s[p];
+            if (c == '>') { return p + 1; }
+            if (c == '[') {
+                p += 1;
+                while (p < n && s[p] != ']') {
+                    let q = s[p];
+                    if (q == '"' || q == '\'') {
+                        let e = String.IndexOfFrom(s, q, p + 1);
+                        if (e < 0) { return n; }
+                        p = e + 1;
+                    } else if (q == '<' && p + 3 < n && s[p + 1] == '!' && s[p + 2] == '-' && s[p + 3] == '-') {
+                        let e = String.IndexOfFrom(s, "-->", p + 4);
+                        if (e < 0) { return n; }
+                        p = e + 3;
+                    } else {
+                        p += 1;
+                    }
+                }
+            }
+            p += 1;
+        }
+        return n;
+    }
+
     fn static _scan(s: string) : [int] {
         let ev = Array.Create(0, Type.Int);
         let n  = len(s);
@@ -160,10 +265,12 @@ class XML {
         let dRunAt  = Array.Create(0, Type.Int);
         let dRunEnd = Array.Create(0, Type.Int);
         let dRunAmp = Array.Create(0, Type.Int);
+        let dEvAt   = Array.Create(0, Type.Int);
 
         var depth  = 0;
         var elems  = 0;
         var amp    = -1;     // first "&" at or after the last range tested; n = none left
+        let nameStop = " \t\n\r>/=\"'<";   // characters that end a name
         var pos    = XML._ws(s, 0, n);
         if (pos >= n || s[pos] != '<') { return ev; }
         var markup = true;   // pos is on a "<" that starts markup
@@ -174,12 +281,15 @@ class XML {
                 if (s[pos] == '<') {
                     if (pos + 1 < n && s[pos + 1] == '/') {
                         let ns = pos + 2;
-                        let ne = XML._nameEnd(s, ns, n);
+                        let ne = XML._nameEnd(s, ns, n, nameStop);
                         depth -= 1;
                         if (!XML._same(s, ns, ne - ns, dTagAt[depth], dTagLen[depth])) {
                             XML._ev(ev, 7 | ((ne - ns) << 8), ns, dElem[depth]);
                         }
-                        XML._textDone(s, ev, dElem[depth], dRuns[depth], dRunAt[depth], dRunEnd[depth], dRunAmp[depth]);
+                        let r = dRuns[depth];
+                        if (r > 0) {
+                            XML._textDone(s, ev, dElem[depth], r, dRunAt[depth], dRunEnd[depth], dRunAmp[depth]);
+                        }
                         pos = XML._ws(s, ne, n);
                         if (pos < n && s[pos] == '>') { pos += 1; }
                         if (depth == 0) { break; }
@@ -188,18 +298,24 @@ class XML {
                     markup = true;
                     continue;
                 }
-                var te = String.IndexOfFrom(s, "<", pos);
+                var te = String.IndexOfFrom(s, '<', pos);
                 if (te < 0) { te = n; }
+                let d    = depth - 1;
+                let runs = dRuns[d];
                 if (XML._ink(s, pos, te) < te) {
                     if (amp < pos) {
-                        amp = String.IndexOfFrom(s, "&", pos);
+                        amp = String.IndexOfFrom(s, '&', pos);
                         if (amp < 0) { amp = n; }
                     }
                     var fl = 0;
                     if (amp < te) { fl = 16; }
-                    let d = depth - 1;
-                    let runs = dRuns[d];
-                    if (runs == 0) {
+                    if (runs < 0) {
+                        if (runs == -1) {
+                            XML._keepGaps(s, ev, dEvAt[d], dElem[d]);
+                            dRuns[d] = -2;
+                        }
+                        XML._ev(ev, 4 | fl | ((te - pos) << 8), pos, dElem[d]);
+                    } else if (runs == 0) {
                         dRunAt[d]  = pos;
                         dRunEnd[d] = te;
                         dRunAmp[d] = fl;
@@ -209,7 +325,9 @@ class XML {
                         }
                         XML._ev(ev, 5 | fl | ((te - pos) << 8), pos, dElem[d]);
                     }
-                    dRuns[d] = runs + 1;
+                    if (runs >= 0) { dRuns[d] = runs + 1; }
+                } else if (runs == -2) {
+                    XML._ev(ev, 4 | ((te - pos) << 8), pos, dElem[d]);
                 }
                 pos = te;
                 continue;
@@ -230,6 +348,7 @@ class XML {
                     let cs     = pos + 8;     // past "![CDATA["
                     let e      = String.IndexOfFrom(s, "]]>", cs);
                     let parent = (depth > 0) ? dElem[depth - 1] : -1;
+                    if (depth > 0) { XML._kid(ev, depth - 1, dElem, dRuns, dRunAt, dRunEnd, dRunAmp); }
                     if (e >= 0) {
                         XML._ev(ev, 6 | ((e - cs) << 8), cs, parent);
                         pos = e + 3;
@@ -248,8 +367,7 @@ class XML {
                     let e = String.IndexOfFrom(s, "-->", pos);
                     if (e >= 0) { pos = e + 3; }
                 } else {
-                    let e = String.IndexOfFrom(s, ">", pos);
-                    if (e >= 0) { pos = e + 1; }
+                    pos = XML._doctypeEnd(s, pos, n);
                 }
                 skipped = true;
             }
@@ -265,18 +383,28 @@ class XML {
                 continue;
             }
 
-            let ne = XML._nameEnd(s, pos, n);
+            let ne = XML._nameEnd(s, pos, n, nameStop);
             if (ne == pos) {
                 if (depth == 0) { break; }
                 continue;
             }
-            let parent = (depth > 0) ? dElem[depth - 1] : -1;
+            var parent = -1;
+            if (depth > 0) {
+                parent = dElem[depth - 1];
+                let r = dRuns[depth - 1];
+                if (r == 0) {
+                    dRuns[depth - 1] = -1;
+                } else if (r > 0) {
+                    XML._kid(ev, depth - 1, dElem, dRuns, dRunAt, dRunEnd, dRunAmp);
+                }
+            }
             XML._ev(ev, 1 | ((ne - pos) << 8), pos, parent);
             if (depth < len(dElem)) {
                 dElem[depth]   = elems;
                 dTagAt[depth]  = pos;
                 dTagLen[depth] = ne - pos;
                 dRuns[depth]   = 0;
+                dEvAt[depth]   = len(ev) - 3;
             } else {
                 Array.Append(dElem, elems);
                 Array.Append(dTagAt, pos);
@@ -285,6 +413,7 @@ class XML {
                 Array.Append(dRunAt, 0);
                 Array.Append(dRunEnd, 0);
                 Array.Append(dRunAmp, 0);
+                Array.Append(dEvAt, len(ev) - 3);
             }
             elems += 1;
             depth += 1;
@@ -296,7 +425,7 @@ class XML {
                 let c = s[pos];
                 if (c == '>' || c == '/' || c == '<') { break; }
                 let ks = pos;
-                let ke = XML._nameEnd(s, ks, n);
+                let ke = XML._nameEnd(s, ks, n, nameStop);
                 if (ke == ks) { break; }
                 pos = XML._ws(s, ke, n);
                 if (pos >= n || s[pos] != '=') {
@@ -310,9 +439,9 @@ class XML {
                 if (pos < n && (s[pos] == '"' || s[pos] == '\'')) {
                     vs = pos + 1;
                     if (s[pos] == '"') {
-                        ve = String.IndexOfFrom(s, "\"", vs);
+                        ve = String.IndexOfFrom(s, '"', vs);
                     } else {
-                        ve = String.IndexOfFrom(s, "'", vs);
+                        ve = String.IndexOfFrom(s, '\'', vs);
                     }
                     if (ve < 0) {
                         ve  = n;
@@ -324,7 +453,7 @@ class XML {
                 var fl = 0;
                 if (ve > vs) {
                     if (amp < vs) {
-                        amp = String.IndexOfFrom(s, "&", vs);
+                        amp = String.IndexOfFrom(s, '&', vs);
                         if (amp < 0) { amp = n; }
                     }
                     if (amp < ve) { fl = 16; }
@@ -345,7 +474,10 @@ class XML {
         // Elements still open at the end of the input end there.
         while (depth > 0) {
             depth -= 1;
-            XML._textDone(s, ev, dElem[depth], dRuns[depth], dRunAt[depth], dRunEnd[depth], dRunAmp[depth]);
+            let r = dRuns[depth];
+            if (r > 0) {
+                XML._textDone(s, ev, dElem[depth], r, dRunAt[depth], dRunEnd[depth], dRunAmp[depth]);
+            }
         }
         return ev;
     }
@@ -367,7 +499,7 @@ class XML {
     // Every reference is at least as long as the UTF-8 it stands for, so the
     // result never outgrows the input.
     fn static _decode(s: string) : string {
-        var at  = String.IndexOf(s, "&");
+        var at  = String.IndexOf(s, '&');
         let n   = len(s);
         let out = String.Create(n);
         var k   = 0;
@@ -390,7 +522,7 @@ class XML {
                 pos = semi + 1;
             }
             at = -1;
-            if (pos < n) { at = String.IndexOfFrom(s, "&", pos); }
+            if (pos < n) { at = String.IndexOfFrom(s, '&', pos); }
         }
         while (pos < n) {
             out[k] = s[pos];
@@ -594,6 +726,14 @@ class XML {
                 if ((w & 16) != 0) { run = XML._decode(run); }
                 let node = elems[ev[i + 2]];
                 node.text = node.text + run;
+            } else if (kind == 4) {
+                var run = String.Substr(src, ev[i + 1], w >> 8);
+                if ((w & 16) != 0) { run = XML._decode(run); }
+                Array.Append(elems[ev[i + 2]].children, { tag: "", text: run, attrs: {}, children: [] });
+            } else if (kind == 10) {
+                let node = elems[ev[i + 2]];
+                Array.Append(node.children, { tag: "", text: node.text, attrs: {}, children: [] });
+                node.text = "";
             } else if (kind == 9) {
                 let node = elems[ev[i + 2]];
                 node.text = String.Trim(node.text);
@@ -697,7 +837,7 @@ class XML {
             return open + ">" + XML._encode(str(node.text)) + "</" + node.tag + ">\n";
         }
 
-        var parts = [open + "\n"];
+        var parts = [open + ">\n"];
 
         if (hasText) {
             parts = Array.Append(parts, String.Repeat(indent, depth + 1) + XML._encode(str(node.text)) + "\n");

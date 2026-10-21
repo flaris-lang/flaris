@@ -53,7 +53,10 @@
 //               dotfiles:false, followSymlinks:false }
 //       Dotfiles (.env, .git, ...) and symlinks leaving the root are refused
 //       by default; ".well-known" stays reachable for ACME and security.txt.
-//   .NotFound(handler)          - custom 404 handler
+//   .NotFound(handler)          - custom 404 handler. A path with routes only
+//                                 for other methods gets 405 with an Allow
+//                                 header instead; HEAD runs the GET route and
+//                                 the body is left out
 //   .Listen(port, opts?)        - serve; blocks the calling fiber while requests
 //                                 are handled concurrently. opts pass through
 //                                 to HttpServer (tls, streamBodies, timeouts...)
@@ -68,8 +71,8 @@
 //   pattern with no ":param" and no "*" is answered from a map, so the route
 //   table can grow without slowing those routes down; only parametric routes
 //   are scanned in order, and each route caches its combined middleware chain
-//   until Use() adds another. Matching stays lenient about empty and trailing
-//   path segments, as before.
+//   until Use() adds another. Matching is lenient about empty and trailing
+//   path segments.
 //
 //   Note: global middleware also runs for unmatched routes, so CORS preflight
 //   (OPTIONS) and logging apply even without a registered handler.
@@ -89,7 +92,9 @@
 //   form:        parsed application/x-www-form-urlencoded body (empty otherwise)
 //   params:      path parameters from :name segments (req.params.name)
 //   headers:     readable under both spellings - req.headers["Content-Type"]
-//                and req.headers["content-type"] both resolve
+//                and req.headers["content-type"] both resolve. It is the
+//                server's parsed map with the canonical spellings added,
+//                not a copy
 //   peer:        client address as "ip:port"; identify a caller with this
 //                rather than a header, which the client controls
 //   secure:      true when the connection terminated TLS
@@ -141,7 +146,8 @@
 //         end of one window and again at the start of the next
 //       - keyed on req.peer (port stripped). X-Forwarded-For is honoured only
 //         with { trustProxy: true }: without a proxy in front it is
-//         client-controlled, and trusting it lets any caller mint identities
+//         client-controlled, and trusting it lets any caller mint identities.
+//         The key is then its right-most entry, the one the proxy appended
 //       - opts: { keyFn, skip, trustProxy, maxKeys, headers, clock }
 //       - emits RateLimit-Limit / -Remaining / -Reset, and Retry-After on 429
 //       - bounded memory: idle buckets are swept at maxKeys (default 10000)
@@ -204,6 +210,19 @@ global _MIME = {
 global _canonMemo = {};
 global _canonMemoN:int = 0;
 
+// Held in variables: a string literal passed to a call is copied each time.
+global _ROUTE:string    = "route";
+global _K_CTYPE:string  = "content-type";
+global _DSLASH:string   = "//";
+
+// True when path is already what Router._normPath returns: rooted, no empty
+// segment, no trailing "/" unless it is "/", no NUL byte.
+fn _isNormal(p:string): bool {
+    let n:int = len(p);
+    return n > 0 && p[0] == '/' && (n == 1 || p[n - 1] != '/')
+        && !String.Contains(p, _DSLASH) && String.IndexOf(p, '\0') < 0;
+}
+
 fn _canonName(k:string): string {
     let hit = Object.TryGet(_canonMemo, k, nil);
     if (hit != nil) { return hit; }
@@ -226,6 +245,9 @@ fn _canonName(k:string): string {
     _canonMemoN = _canonMemoN + 1;
     return canon;
 }
+
+// The terminal for an unmatched request when no NotFound handler is set.
+fn _notFound404(_req) { return Response.Error(404, "Not Found"); }
 
 // =============================================================================
 // _Pipeline - executes a middleware chain + terminal handler for one request.
@@ -320,6 +342,8 @@ class Router
 {
     let _routes:array     = [];   // dynamic routes (":param" or "*"), in order
     let _exact             = nil;  // "GET /api/users" -> route, for fixed patterns
+    let _exactAny          = nil;  // "GET" -> { "/api/users" -> route }, fixed patterns served on every host
+    let _fixedPaths        = nil;  // "/api/users" -> true, for fixed patterns served on every host
     let _middleware:array = [];
     let _server            = nil;
     let _notFound          = nil;
@@ -327,6 +351,7 @@ class Router
     let _gen:int          = 0;    // bumped by Use(); invalidates cached chains
     let _onAccess          = nil;
     let _hasHosts:bool     = false;  // any host-scoped routes at all?
+    let _methods           = nil;  // every method with a route, in registration order
 
     // _routes again, flattened for the _findRoute kernel (same order):
     let _rtFirst           = nil;  // [int] first segment of each route in _sgAt/_sgLen
@@ -341,6 +366,8 @@ class Router
     fn Constructor() {
         _routes     = [];
         _exact      = {};
+        _exactAny   = {};
+        _fixedPaths = {};
         _middleware = [];
         _gen        = 0;
         _rtFirst    = Array.Create(0, Type.Int);
@@ -350,6 +377,7 @@ class Router
         _sgAt       = Array.Create(0, Type.Int);
         _sgLen      = Array.Create(0, Type.Int);
         _methodIds  = {};
+        _methods    = [];
     }
 
     // ---- route registration ----
@@ -398,6 +426,7 @@ class Router
 
         let h = host ?? nil;
         if (h != nil) { _hasHosts = true; }
+        if (!Array.Contains(_methods, method)) { Array.Append(_methods, method); }
 
         let route = {
             method:     method,
@@ -438,6 +467,16 @@ class Router
             }
         } else {
             _exact[(h ?? "") + "\n" + method + " /" + String.Join(segs, "/")] = route;
+            if (h == nil) {
+                let path = "/" + String.Join(segs, "/");
+                _fixedPaths[path] = true;
+                var byMethod = _exactAny[method];
+                if (byMethod == nil) {
+                    byMethod = {};
+                    _exactAny[method] = byMethod;
+                }
+                byMethod[path] = route;
+            }
         }
     }
 
@@ -520,15 +559,12 @@ class Router
         return combined;
     }
 
-    fn _cookiesOf(req): object {
-        let h = req.Header("Cookie", nil);
-        if (h == nil) { return {}; }
-        return req.Cookies();
-    }
-
+    // The parsed header map holds lowercased names.
     fn _formOf(req): object {
-        let ct = String.ToLower(req.Header("Content-Type", "") ?? "");
-        if (!String.Contains(ct, "application/x-www-form-urlencoded")) { return {}; }
+        let ct = req.headers[_K_CTYPE];
+        if (ct == nil || !String.Contains(String.ToLower(ct), "application/x-www-form-urlencoded")) {
+            return {};
+        }
         return req.Form();
     }
 
@@ -539,21 +575,19 @@ class Router
     // or a request instance.
     // HTTP header names are case-insensitive, but a plain object lookup is not.
     // The parser lowercases keys while handlers conventionally write
-    // req.headers["Authorization"], so expose both spellings.
-    fn _canonHeaders(src): object {
-        let out = {};
-        if (src == nil) { return out; }
-        let keys = Object.Keys(src);
+    // req.headers["Authorization"], so each header is added again under its
+    // canonical spelling - into the parsed map itself, which saves a copy.
+    fn _canonHeaders(h): object {
+        if (h == nil) { return {}; }
+        let keys = Object.Keys(h);
         let i:int = 0;
         while (i < len(keys)) {
             let k:string = keys[i];
-            let v = src[k];
-            out[k] = v;
-            let c:string = _canonName(k);
-            if (c != k) { out[c] = v; }
+            let c:string = _canonMemo[k] ?? _canonName(k);
+            if (c != k) { h[c] = h[k]; }
             i += 1;
         }
-        return out;
+        return h;
     }
 
     // Split a request path into its non-empty segments. Once per request, not
@@ -596,27 +630,15 @@ class Router
     }
 
     // Index of the first route that is not host-scoped, has method id `mid`
-    // and matches the segments of `norm` (a _normPath result), or -1. The
-    // same test as _matchRoute, without the captures.
+    // (0: any method) and matches the segments of `norm` (a _normPath
+    // result), or -1. The same test as _matchRoute, without the captures.
     fn static _findRoute(norm:string, mid:int, rtFirst:[int], rtCount:[int], rtFlags:[int], rtMethod:[int], sgAt:[int], sgLen:[int], sgText:string): int {
-        let n     = len(norm);
-        let segAt = Array.Create(0, Type.Int);
-        let segTo = Array.Create(0, Type.Int);
-        if (n > 1) {
-            var start = 1;
-            iter (p from 1 to n) {
-                if (norm[p] == '/') {
-                    Array.Append(segAt, start);
-                    Array.Append(segTo, p);
-                    start = p + 1;
-                }
-            }
-            Array.Append(segAt, start);
-            Array.Append(segTo, n);
-        }
-        let ns = len(segAt);
+        let n  = len(norm);
+        // One segment per "/", none for "/" itself; each is found as a route
+        // needs it, so a scan allocates nothing.
+        let ns = (n > 1) ? String.Count(norm, "/") : 0;
         iter (r from 0 to len(rtFirst)) {
-            if (rtMethod[r] != mid || (rtFlags[r] & 2) != 0) { continue; }
+            if ((mid != 0 && rtMethod[r] != mid) || (rtFlags[r] & 2) != 0) { continue; }
             let cnt = rtCount[r];
             if ((rtFlags[r] & 1) != 0) {
                 if (ns < cnt) { continue; }
@@ -625,12 +647,14 @@ class Router
             }
             let f  = rtFirst[r];
             var ok = true;
+            var s  = 1;
             iter (i from 0 to cnt) {
+                var e = String.IndexOfFrom(norm, '/', s);
+                if (e < 0) { e = n; }
                 let a = sgAt[f + i];
                 if (a >= 0) {
                     let l = sgLen[f + i];
-                    let s = segAt[i];
-                    if (segTo[i] - s != l) {
+                    if (e - s != l) {
                         ok = false;
                         break;
                     }
@@ -642,6 +666,7 @@ class Router
                     }
                     if (!ok) { break; }
                 }
+                s = e + 1;
             }
             if (ok) { return r; }
         }
@@ -649,8 +674,9 @@ class Router
     }
 
     // Match pre-split request segments against a pre-split route, filling
-    // req.params on success. The params object is allocated only once a capture
-    // actually happens, so a route that fails on its first literal costs nothing.
+    // req.params on success; a nil req only tests. The params object is
+    // allocated only once a capture actually happens, so a route that fails on
+    // its first literal costs nothing.
     fn _matchRoute(route, segs:array, req): bool {
         let rs:array = route.segs;
         let n:int    = len(rs);
@@ -666,13 +692,16 @@ class Router
         while (i < n) {
             let ps:string = rs[i];
             if (String.CharAt(ps, 0) == ':') {
-                if (params == nil) { params = {}; }
-                params[String.Substr(ps, 1, String.Length(ps) - 1)] = segs[i];
+                if (req != nil) {
+                    if (params == nil) { params = {}; }
+                    params[String.Substr(ps, 1, String.Length(ps) - 1)] = segs[i];
+                }
             } else if (ps != segs[i]) {
                 return false;
             }
             i += 1;
         }
+        if (req == nil) { return true; }
 
         if (route.catchAll) {
             if (params == nil) { params = {}; }
@@ -700,11 +729,109 @@ class Router
         return route.chain;
     }
 
-    // Runs the matched pipeline. `res`, when the server passed one, gets the
-    // route phase closed here for its Server-Timing header.
-    fn _run(pipeline, req, res) {
-        if (res != nil) { res.Mark("route"); }
-        return pipeline.Run(req);
+    // Run `chain` and then `terminal` for req. `res`, when the server passed
+    // one, gets the route phase closed here for its Server-Timing header.
+    fn _run(chain:array, terminal, req, res) {
+        if (res != nil) { res.Mark(_ROUTE); }
+        // With no middleware there is nothing for a pipeline to sequence.
+        if (len(chain) == 0) {
+            let r = terminal(req);
+            return Type.IsFiber(r) ? Fiber.Await(r) : r;
+        }
+        return (new _Pipeline(chain, terminal)).Run(req);
+    }
+
+    // The route for `method` on this path, or nil; fills target.params on a
+    // match, and with a nil target only looks. Fixed patterns before dynamic
+    // ones, and a route bound to the request's host before one that serves
+    // every host.
+    fn _lookup(target, method, path, norm:string, host:string) {
+        // A string method and path take the native route: the path is
+        // normalised and the dynamic routes are scanned by kernels, and the
+        // segments are split only when a route needs its captures.
+        var segs = nil;
+
+        // Fixed patterns resolve in a single map lookup. Keying on the rejoined
+        // segments makes matching lenient: "/a/b/" and "//a//b" both match "/a/b".
+        var hit = nil;
+        if (norm != "" && !_hasHosts) {
+            let byMethod = _exactAny[method];
+            if (byMethod != nil) { hit = byMethod[norm]; }
+        } else {
+            var tail = "";
+            if (norm != "") {
+                tail = method + " " + norm;
+            } else {
+                segs = this._pathSegs(path);
+                tail = method + " /" + String.Join(segs, "/");
+            }
+            if (_hasHosts) { hit = Object.TryGet(_exact, host + "\n" + tail, nil); }
+            if (hit == nil) { hit = Object.TryGet(_exact, "\n" + tail, nil); }
+        }
+        if (hit != nil) {
+            if (target != nil) { target.params = {}; }
+            return hit;
+        }
+
+        if (_hasHosts) {
+            if (segs == nil) { segs = this._pathSegs(path); }
+            let hi:int = 0;
+            while (hi < len(_routes)) {
+                let hr = _routes[hi];
+                if (hr.host != nil && hr.method == method
+                    && _hostMatches(hr.host, host) && this._matchRoute(hr, segs, target)) {
+                    return hr;
+                }
+                hi += 1;
+            }
+        }
+
+        if (norm != "") {
+            let mid = _methodIds[method];
+            if (mid != nil) {
+                let ri = Router._findRoute(norm, mid, _rtFirst, _rtCount, _rtFlags, _rtMethod, _sgAt, _sgLen, _sgText);
+                if (ri >= 0) {
+                    let route = _routes[ri];
+                    if (target != nil) { this._matchRoute(route, this._pathSegs(path), target); }
+                    return route;
+                }
+            }
+        } else {
+            let i:int = 0;
+            while (i < len(_routes)) {
+                let route = _routes[i];
+                if (route.host == nil && route.method == method
+                    && this._matchRoute(route, segs, target)) {
+                    return route;
+                }
+                i += 1;
+            }
+        }
+        return nil;
+    }
+
+    // The Allow value for a path no route of req.method matches: every other
+    // method with a route for it, plus HEAD wherever GET is. "" when none.
+    fn _allowFor(req, norm:string, host:string): string {
+        // The usual 404 - no route for this path under any method - is
+        // settled by one map lookup and one scan, without probing each method.
+        if (norm != "" && !_hasHosts && !Object.HasKey(_fixedPaths, norm)
+            && Router._findRoute(norm, 0, _rtFirst, _rtCount, _rtFlags, _rtMethod, _sgAt, _sgLen, _sgText) < 0) {
+            return "";
+        }
+        var allow = nil;
+        iter (i from 0 to len(_methods)) {
+            let m = _methods[i];
+            if (m != req.method && this._lookup(nil, m, req.path, norm, host) != nil) {
+                if (allow == nil) { allow = []; }
+                Array.Append(allow, m);
+            }
+        }
+        if (allow == nil) { return ""; }
+        if (Array.Contains(allow, "GET") && !Array.Contains(allow, "HEAD")) {
+            Array.Append(allow, "HEAD");
+        }
+        return String.Join(allow, ", ");
     }
 
     fn _dispatch(req, res?) {
@@ -712,85 +839,43 @@ class Router
             return Response.Error(400, "Bad Request");
         }
 
-        // A string method and path take the native route: the path is
-        // normalised and the dynamic routes are scanned by kernels, and the
-        // segments are split only when a route needs its captures.
         var norm = "";
-        if (type(req.path) == Type.String && type(req.method) == Type.String) {
-            norm = Router._normPath(req.path);
-        }
-        var segs = nil;
-        var tail = "";
-        if (norm != "") {
-            tail = req.method + " " + norm;
-        } else {
-            segs = this._pathSegs(req.path);
-            tail = req.method + " /" + String.Join(segs, "/");
+        let rp = req.path;
+        if (Type.IsString(rp) && Type.IsString(req.method)) {
+            norm = _isNormal(rp) ? rp : Router._normPath(rp);
         }
         let host = _hasHosts ? _reqHostOf(req) : "";
 
-        // Fixed patterns resolve in a single map lookup. Keying on the rejoined
-        // segments makes matching lenient: "/a/b/" and "//a//b" both match "/a/b". A route bound to this host is preferred over one
-        // that serves every host.
-        let hit = nil;
-        if (_hasHosts) { hit = Object.TryGet(_exact, host + "\n" + tail, nil); }
-        if (hit == nil) { hit = Object.TryGet(_exact, "\n" + tail, nil); }
-        if (hit != nil) {
-            req.params = {};
-            let pipeline = new _Pipeline(this._chainFor(hit), hit.handler);
-            return this._run(pipeline, req, res);
+        var route = this._lookup(req, req.method, req.path, norm, host);
+        // HEAD runs the GET route; the server sends the headers GET would get
+        // and leaves the body out.
+        if (route == nil && req.method == "HEAD") {
+            route = this._lookup(req, "GET", req.path, norm, host);
         }
-
-        // Two passes for the same reason: host-scoped routes first, then the
-        // ones that serve any host. Skipped entirely when no host is in play.
-        if (_hasHosts) {
-            if (segs == nil) { segs = this._pathSegs(req.path); }
-            let hi:int = 0;
-            while (hi < len(_routes)) {
-                let hr = _routes[hi];
-                if (hr.host != nil && hr.method == req.method
-                    && _hostMatches(hr.host, host) && this._matchRoute(hr, segs, req)) {
-                    let pipeline = new _Pipeline(this._chainFor(hr), hr.handler);
-                    return this._run(pipeline, req, res);
-                }
-                hi += 1;
-            }
-        }
-
-        if (norm != "") {
-            let mid = _methodIds[req.method];
-            if (mid != nil) {
-                let ri = Router._findRoute(norm, mid, _rtFirst, _rtCount, _rtFlags, _rtMethod, _sgAt, _sgLen, _sgText);
-                if (ri >= 0) {
-                    let route = _routes[ri];
-                    this._matchRoute(route, this._pathSegs(req.path), req);
-                    let pipeline = new _Pipeline(this._chainFor(route), route.handler);
-                    return this._run(pipeline, req, res);
-                }
-            }
-        } else {
-            let i:int = 0;
-            while (i < len(_routes)) {
-                let route = _routes[i];
-                if (route.host == nil && route.method == req.method
-                    && this._matchRoute(route, segs, req)) {
-                    let pipeline = new _Pipeline(this._chainFor(route), route.handler);
-                    return this._run(pipeline, req, res);
-                }
-                i += 1;
-            }
+        if (route != nil) {
+            return this._run(this._chainFor(route), route.handler, req, res);
         }
 
         // No route matched. Still run the global middleware chain so that
         // cross-cutting concerns (CORS preflight, logging, ...) apply to
         // unmatched requests too - in particular OPTIONS preflight requests
-        // never match a GET/POST route. The chain terminates in the custom 404
-        // handler when set, otherwise a default 404.
-        let terminal = (_notFound != nil)
-            ? _notFound
-            : fn(_r) { return Response.Error(404, "Not Found"); };
-        let pipeline = new _Pipeline(_middleware, terminal);
-        return this._run(pipeline, req, res);
+        // never match a GET/POST route. The chain terminates in a 405 with
+        // Allow when the path has routes for other methods (RFC 9110 15.5.6),
+        // else in the custom 404 handler when set, otherwise a default 404.
+        let allow = this._allowFor(req, norm, host);
+        var terminal = nil;
+        if (allow != "") {
+            terminal = fn(_r) {
+                let e = Response.Error(405, "Method Not Allowed");
+                e.headers["Allow"] = allow;
+                return e;
+            };
+        } else if (_notFound != nil) {
+            terminal = _notFound;
+        } else {
+            terminal = _notFound404;
+        }
+        return this._run(_middleware, terminal, req, res);
     }
 
     // ---- server loop ----
@@ -826,14 +911,14 @@ class Router
                 params:  {},
                 // Parsed only when the request carries them, so an API call
                 // with neither pays nothing.
-                cookies: this._cookiesOf(req),
-                form:    this._formOf(req),
+                cookies: (req.headers.cookie == nil) ? {} : req.Cookies(),
+                form:    (req.headers[_K_CTYPE] == nil) ? {} : this._formOf(req),
                 // The client address, which middleware needs to identify a peer
                 // - a rate limiter keying on a header alone is keying on
                 // something the client controls.
                 peer:    req.peer,
                 secure:  req.secure,
-                body:    req.Text(),
+                body:    (req.body == nil && !req.HasPendingBody()) ? "" : req.Text(),
                 // The HttpRequest itself, for a handler that needs the body as
                 // bytes (`native.body` is a block; a string stops at NUL) or
                 // its streaming reads.
@@ -845,15 +930,22 @@ class Router
                 return;
             }
             // Headers first: _send only supplies a Content-Type when none is
-            // set, so the handler's own choice survives.
+            // set, so the handler's own choice survives. A lone Content-Type -
+            // what the Response helpers give - goes with the body instead,
+            // which spares the response a header map.
             let hdrs = r.headers ?? {};
             let keys = Object.Keys(hdrs);
-            iter (i from 0 to len(keys)) {
-                res.Header(keys[i], hdrs[keys[i]]);
+            var ctype = nil;
+            if (len(keys) == 1 && keys[0] == "Content-Type") {
+                ctype = str(hdrs[keys[0]]);
+            } else {
+                iter (i from 0 to len(keys)) {
+                    res.Header(keys[i], hdrs[keys[i]]);
+                }
             }
             // Cookies are applied before the body is written, and go out as
             // one Set-Cookie line each rather than overwriting one another.
-            let cookies = Object.TryGet(r, "cookies", nil);
+            let cookies = r.cookies;
             if (cookies != nil) {
                 iter (ci from 0 to len(cookies)) {
                     let ck = cookies[ci];
@@ -869,18 +961,21 @@ class Router
             // the path down lets the server answer with validators, honour a
             // conditional request or a byte range, and send the bytes without
             // routing them through this VM at all.
-            let ref = Object.TryGet(r, "file", nil);
+            let ref = r.file;
             if (ref != nil) {
                 // A middleware may have set its own status; File() only
                 // overrides it for a 206 range or a 304 revalidation.
                 let st = r.status ?? 200;
                 if (st != 200) { res.Status(st); }
+                if (ctype != nil) { res.ContentType(ctype); }
                 res.File(ref, nil);
                 return;
             }
             // Otherwise a block (images, generated binaries) or a string.
             let body = r.body ?? "";
-            if (Type.Is(body, Type.Block)) {
+            if (ctype != nil) {
+                res.Bytes(body, ctype, r.status ?? 200);
+            } else if (Type.IsBlock(body)) {
                 res.Bytes(body, nil, r.status ?? 200);
             } else {
                 res.Text(body, r.status ?? 200);
@@ -1001,6 +1096,7 @@ class Response
 class _StaticHandler
 {
     let _root:string  = ".";
+    let _rootAbs      = nil;   // _root resolved once, at mount time; nil if it cannot be
     let _index:string = "index.html";
     let _fallback     = nil;
     let _cache        = nil;
@@ -1018,6 +1114,7 @@ class _StaticHandler
             if (Object.HasKey(options, "dotfiles"))       _dotfiles       = options.dotfiles;
             if (Object.HasKey(options, "followSymlinks")) _followSymlinks = options.followSymlinks;
         }
+        _rootAbs = Path.Resolve(_root);
     }
 
     fn Serve(req) {
@@ -1036,33 +1133,38 @@ class _StaticHandler
             return Response.Error(404, "Not Found");
         }
 
-        var path:string = _root;
-        if (len(safe) > 0) path = _root + "/" + safe;
-
         // Belt as well as braces: _safeRel already rejects ".." segments, but
         // confirm the resolved path really lands inside the root. Path.Resolve
-        // collapses "..", and the separator boundary stops a root of "./www"
-        // from also accepting "./www-secret".
-        let rootAbs = Path.Resolve(_root);
-        let pathAbs = Path.Resolve(path);
-        if (rootAbs == nil or pathAbs == nil) { return Response.Error(403, "Forbidden"); }
-        if (pathAbs != rootAbs
-            and !String.StartsWith(pathAbs, rootAbs + "/")
-            and !String.StartsWith(pathAbs, rootAbs + "\\")) {
-            return Response.Error(403, "Forbidden");
+        // collapses "..", and the separator boundary stops a root of "/srv/www"
+        // from also accepting "/srv/www-secret". Joined to the absolute root,
+        // the path resolves without asking the OS for the working directory.
+        let rootAbs = _rootAbs;
+        if (rootAbs == nil) { return Response.Error(403, "Forbidden"); }
+        var path = rootAbs;
+        if (len(safe) > 0) {
+            path = Path.Resolve(rootAbs + "/" + safe);
+            if (path == nil
+                or (path != rootAbs
+                    and !String.StartsWith(path, rootAbs + "/")
+                    and !String.StartsWith(path, rootAbs + "\\"))) {
+                return Response.Error(403, "Forbidden");
+            }
         }
-        if (!_followSymlinks and _crossesLink(rootAbs, safe)) {
+
+        // One stat answers exists / is-a-directory / is-a-symlink for the last
+        // segment; _crossesLink stats only the segments before it.
+        var st = File.Stat(path);
+        if (!_followSymlinks and len(safe) > 0
+            and ((st != nil and st.IsSymlink) or _crossesLink(rootAbs, safe))) {
             return Response.Error(404, "Not Found");
         }
 
         // A directory request (including the mount root) serves the index file.
-        // Directory.Exists() uses stat()+S_ISDIR; File.Exists() (fopen) is true for
-        // directories too, so the regular-file check excludes them explicitly.
-        if (len(safe) == 0 or Directory.Exists(path)) {
+        if (st != nil and st.IsDir) {
             path = path + "/" + _index;
+            st = File.Stat(path);
         }
-
-        if (File.Exists(path) and !Directory.Exists(path)) {
+        if (st != nil and st.IsFile) {
             return this._fileResponse(path);
         }
 
@@ -1468,7 +1570,10 @@ class JwtMiddleware
 // port stripped - keep the port and every new connection is a fresh bucket, so
 // the limit never binds. X-Forwarded-For is consulted only when trustProxy is
 // set, because a client can put anything in it; without a proxy in front,
-// trusting it lets any caller mint unlimited identities.
+// trusting it lets any caller mint unlimited identities. Even behind the proxy
+// only the right-most entry counts: the proxy appends the address it saw, and
+// every entry before it is whatever the client sent. With a chain of proxies,
+// give keyFn the entry your outermost proxy added.
 //
 // Window: a sliding window rather than a fixed one. A fixed window lets a
 // caller spend its whole allowance at the end of one window and again at the
@@ -1495,11 +1600,17 @@ fn _hasDotSeg(rel:string): bool {
 // cannot see it - Path.Resolve is purely lexical. The final component alone is
 // not enough either: a file reached *through* a symlinked directory stats with
 // IsSymlink false. So every segment below the root is checked; the root itself
-// is not, since "/var/www -> /data/www" is an ordinary deployment.
+// is not, since "/var/www -> /data/www" is an ordinary deployment. This walks
+// the segments before the last: the caller's own stat of the full path
+// answers for that one.
 fn _crossesLink(root:string, rel:string): bool {
     if (rel == nil or rel == "") { return false; }
+    let segs = String.Split(rel, "/");
     let cur:string = root;
-    foreach (sg in String.Split(rel, "/")) {
+    let i:int = 0;
+    while (i < len(segs) - 1) {
+        let sg = segs[i];
+        i += 1;
         if (String.Length(sg) > 0) {
             cur = cur + "/" + sg;
             let st = File.Stat(cur);
@@ -1596,10 +1707,12 @@ class RateLimitMiddleware
             let hdrs = req.headers ?? {};
             let xff  = Object.TryGet(hdrs, "X-Forwarded-For", nil);
             if (xff != nil) {
-                // The left-most entry is the original client; the rest are proxies.
-                let comma = String.IndexOf(xff, ",");
-                let first = String.Trim((comma >= 0) ? String.Substr(xff, 0, comma) : xff);
-                if (String.Length(first) > 0) { return first; }
+                // The proxy appends the address it saw, so only the right-most
+                // entry is its word. Everything left of it came from the client
+                // and can be anything.
+                let comma = String.LastIndexOf(xff, ",");
+                let last = String.Trim((comma >= 0) ? String.Substr(xff, comma + 1) : xff);
+                if (String.Length(last) > 0) { return last; }
             }
         }
         return _hostOf(req.peer);

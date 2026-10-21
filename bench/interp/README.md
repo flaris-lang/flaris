@@ -7,7 +7,10 @@ that includes compiled languages and JITs.
 
 The three integer kernels are shared with `bench/kernels`; the six scenarios
 here are new, and deliberately reach for what ordinary programs spend their time
-on rather than for tight arithmetic.
+on rather than for tight arithmetic. The five standard benchmarks after them come
+from outside this project - four from The Computer Language Benchmarks Game and
+Martin Richards' scheduler simulation - so part of the comparison runs on
+workloads nobody picked for Flaris.
 
 | scenario | what it is dominated by |
 | -------- | ----------------------- |
@@ -20,6 +23,11 @@ on rather than for tight arithmetic.
 | `method` | finding and calling a method on an instance |
 | `strops` | the standard library's split / join / search routines |
 | `sortcb` | a sort whose comparator is written in the language |
+| `nbody` | float arithmetic on the fields of five objects |
+| `spectralnorm` | float multiply-adds over float arrays |
+| `fannkuch` | small integer-array permutations and swaps |
+| `richards` | method calls on small objects and following links between them |
+| `knucleotide` | substring creation, string hashing and map updates |
 
 ## Running it
 
@@ -43,7 +51,8 @@ table. Check it: `flarisvm` on `PATH` is easily an older install than the build
 you meant to measure.
 
 Runtimes used, if you want the full set: `lua`, `luau`, `qjs` (QuickJS),
-`python3`, and `flarisvm`.
+CPython, and `flarisvm`. CPython is the newest `python3.N` on `PATH`, not a
+bare `python3`, which is often an older system copy; `PYTHON=...` picks one.
 
 ## Reading the output
 

@@ -51,6 +51,9 @@
 // nothing here: an archive too large for classic ZIP is one that does not fit
 // in the buffer either.
 //
+// A name with non-ASCII characters is written with general-purpose flag bit 11
+// set, which tells other tools it is UTF-8.
+//
 // Timestamps are DOS-packed: two-second resolution, no timezone, and they are
 // read and written as UTC. A stored Unix mode is masked to 0755 on extraction,
 // which keeps the executable bit and a restrictive 0600 but refuses setuid,
@@ -65,6 +68,8 @@ const SIG_EOCD    = 0x06054B50;
 
 const METHOD_STORE   = 0;
 const METHOD_DEFLATE = 8;
+
+const FLAG_UTF8   = 2048;     // general-purpose bit 11: the name is UTF-8
 
 const MAX_U32     = 4294967295;
 const MAX_ENTRIES = 65535;
@@ -96,7 +101,7 @@ fn _zipDosStamp(unix?): array {
     if (y > 2107) { y = 2107; }     // the last year the 7-bit field can hold
     let dosDate = ((y - 1980) << 9) | (Time.Month(t) << 5) | Time.Day(t);
     let dosTime = (Time.Hour(t) << 11) | (Time.Minute(t) << 5) | (Time.Second(t) >> 1);
-    return [dosDate & 0xFFFF, dosTime & 0xFFFF];
+    return [(u16)dosDate, (u16)dosTime];
 }
 
 // The inverse: a packed DOS date/time as a Unix timestamp in seconds, or 0 when
@@ -117,8 +122,7 @@ fn _zipDosToUnix(dosDate: int, dosTime: int): int {
     let iso = String.PadLeft(str(y), 4, '0') + "-" + String.PadLeft(str(mo), 2, '0')
             + "-" + String.PadLeft(str(d), 2, '0') + "T" + String.PadLeft(str(h), 2, '0')
             + ":" + String.PadLeft(str(mi), 2, '0') + ":" + String.PadLeft(str(sec), 2, '0');
-    let u = Time.Parse(iso);
-    return u == nil ? 0 : u;
+    return Time.Parse(iso) ?? 0;
 }
 
 // A permission mode out of an archive is attacker-controlled data, so it is
@@ -202,7 +206,7 @@ fn _zipParse(buf: block): array {
         // but only when the producer said it was a Unix host (version-made-by
         // high byte 3). A DOS or Windows producer puts FAT attribute flags in
         // the low bits and nothing meaningful in the high ones.
-        let mode = ((madeBy >> 8) == 3) ? ((extAttrs >> 16) & 0xFFFF) : 0;
+        let mode = ((madeBy >> 8) == 3) ? (u16)(extAttrs >> 16) : 0;
 
         Array.Append(out, {
             Name: name, Size: usize, CompressedSize: csize,
@@ -636,10 +640,11 @@ class ZipWriter {
             let crc = usize == 0 ? 0 : (Hash.Crc32(raw) & MAX_U32);
             let off = w.Size();
             if (off > MAX_U32) return nil;
+            let flags = (String.Utf8Length(it.name) != len(it.name)) ? FLAG_UTF8 : 0;
 
             w.WriteU32(SIG_LOCAL);
             w.WriteU16(20);            // version needed
-            w.WriteU16(0);             // flags
+            w.WriteU16(flags);
             w.WriteU16(method);
             w.WriteU16(dosTime);
             w.WriteU16(dosDate);
@@ -651,7 +656,7 @@ class ZipWriter {
             w.WriteStringFixed(it.name, len(it.name));
             if (len(body) > 0) { w.WriteBytes(body); }
 
-            Array.Append(central, { name: it.name, method: method, crc: crc,
+            Array.Append(central, { name: it.name, flags: flags, method: method, crc: crc,
                                      csize: len(body), usize: usize,
                                      off: off, isDir: isDir, mode: it.mode,
                                      dosDate: dosDate, dosTime: dosTime });
@@ -670,7 +675,7 @@ class ZipWriter {
             w.WriteU32(SIG_CENTRAL);
             w.WriteU16(unixMode ? (3 << 8) | 20 : 20);   // version made by
             w.WriteU16(20);            // version needed
-            w.WriteU16(0);             // flags
+            w.WriteU16(c.flags);
             w.WriteU16(c.method);
             w.WriteU16(c.dosTime);
             w.WriteU16(c.dosDate);

@@ -264,6 +264,16 @@ fn async Main() {
     mixed.Expire();
     check("Expire: removes expired, keeps fresh", mixed.Size() == 1);
     check("Expire: fresh entry survives", mixed.Get("fresh") == 2);
+    // Keys leaves out expired entries; Size counts them until a sweep
+    let lk = new Cache(10, 150);
+    lk.Set("old", 1);
+    Os.Sleep(200);
+    lk.Set("fresh", 2);
+    let liveKeys = lk.Keys();
+    check("Keys: expired entry left out", len(liveKeys) == 1 && liveKeys[0] == "fresh");
+    check("Size: expired entry counts until swept", lk.Size() == 2);
+    lk.Expire();
+    check("Size: matches Keys after Expire", lk.Size() == 1);
 
     // ============================================================
     // 19. Persistence (Save / Load / FromFile)
@@ -298,6 +308,62 @@ fn async Main() {
     check("async GetOrSet computes value", av1 == 99);
     let av2 = await Cache.GetOrSetAsync(ac, "k", fn() { return -1; });
     check("async GetOrSet hits cache (no recompute)", av2 == 99);
+
+    // ============================================================
+    // 21. LRU order over many operations
+    Console.WriteLine("--- 21. LRU order over many operations ---");
+    let lru = new Cache(8);
+    let model = [];          // keys, oldest first
+    let rng = Random.New(3);
+    var orderOk = true;
+    var evicted = 0;
+    iter (i from 0 to 3000) {
+        let k = rng.NextInt(0, 15);
+        let op = rng.NextInt(0, 2);
+        let at = Array.IndexOf(model, k);
+        if (op == 0) {
+            lru.Set(k, k * 10);
+            if (at >= 0) {
+                Array.RemoveAt(model, at);
+            } else if (len(model) == 8) {
+                Array.RemoveAt(model, 0);
+                evicted += 1;
+            }
+            Array.Append(model, k);
+        } else if (op == 1) {
+            let v = lru.Get(k);
+            if (at >= 0) {
+                if (v != k * 10) orderOk = false;
+                Array.RemoveAt(model, at);
+                Array.Append(model, k);
+            } else if (v != nil) {
+                orderOk = false;
+            }
+        } else {
+            lru.Delete(k);
+            if (at >= 0) Array.RemoveAt(model, at);
+        }
+        if (lru.Size() != len(model)) orderOk = false;
+    }
+    check("LRU order matches a model after 3000 Set/Get/Delete", orderOk && Array.SequenceEqual(lru.Keys(), model));
+    check("LRU evictions counted", lru.Stats().Evictions == evicted);
+    lru.Clear();
+    lru.Set("x", 1).Set("y", 2);
+    check("LRU after Clear", lru.Size() == 2 && Array.SequenceEqual(lru.Keys(), ["x", "y"]));
+
+    let ts = new Cache(4, 150);
+    ts.Set("a", 1).Set("b", 2);
+    Os.Sleep(200);
+    ts.Set("c", 3);
+    check("TTL: an expired Get removes the entry", ts.Get("a") == nil && ts.Size() == 2);
+    ts.Set("d", 4).Set("e", 5);
+    let tk = ts.Keys();
+    check("TTL: live keys oldest first", len(tk) == 3 && tk[0] == "c" && tk[1] == "d" && tk[2] == "e");
+    check("TTL: expired entry counted until removed", ts.Size() == 4);
+    ts.Set("f", 6);
+    check("TTL: eviction takes the oldest entry", !ts.Has("b") && ts.Get("c") == 3 && ts.Stats().Evictions == 1);
+    ts.Set("c", 30);
+    check("TTL: update keeps one entry", ts.Size() == 4 && ts.Get("c") == 30);
 
     // ============================================================
     // Test summary

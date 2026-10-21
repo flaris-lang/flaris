@@ -245,11 +245,11 @@ fn _gsm7Pack(septets: array, fillBits: int): block {
         let v = septets[i] & 127;
         let byteIx = bit / 8;
         let shift  = bit % 8;
-        let lo = Buffer.ReadU8At(out, byteIx) | ((v << shift) & 255);
+        let lo = Buffer.ReadU8At(out, byteIx) | (u8)(v << shift);
         Buffer.WriteU8At(out, byteIx, lo);
         if (shift > 1 && byteIx + 1 < nOct) {
             Buffer.WriteU8At(out, byteIx + 1,
-                Buffer.ReadU8At(out, byteIx + 1) | ((v >> (8 - shift)) & 255));
+                Buffer.ReadU8At(out, byteIx + 1) | (u8)(v >> (8 - shift)));
         }
         bit = bit + 7;
     }
@@ -285,7 +285,7 @@ const _DCS_UCS2 = 8;
 fn _hexOf(b: block): string { return String.ToUpper(Util.BinToHex(b)); }
 
 fn _hexByte(v: int): string {
-    return String.ToUpper(String.PadLeft(Convert.ToRadixString(v & 255, 16), 2, '0'));
+    return String.ToUpper(String.PadLeft(Convert.ToRadixString((u8)v, 16), 2, '0'));
 }
 
 // Text as UCS-2 (big-endian UTF-16), the fallback whenever GSM 03.38 cannot
@@ -300,10 +300,10 @@ fn _ucs2Bytes(text: string): block {
             cp = cp - 65536;
             let hi = 55296 + ((cp >> 10) & 1023);
             let lo = 56320 + (cp & 1023);
-            Array.Append(out, (hi >> 8) & 255); Array.Append(out, hi & 255);
-            Array.Append(out, (lo >> 8) & 255); Array.Append(out, lo & 255);
+            Array.Append(out, (u8)(hi >> 8)); Array.Append(out, (u8)hi);
+            Array.Append(out, (u8)(lo >> 8)); Array.Append(out, (u8)lo);
         } else {
-            Array.Append(out, (cp >> 8) & 255); Array.Append(out, cp & 255);
+            Array.Append(out, (u8)(cp >> 8)); Array.Append(out, (u8)cp);
         }
         i = String.Utf8CpNext(text, i);
     }
@@ -546,7 +546,7 @@ fn _parseDeliver(hex: string): object {
                                             count < 0 ? 0 : count, fill));
     } else {
         let skip = udhi ? (udhLen + 1) : 0;
-        text = Buffer.ToString(Buffer.Slice(ud, skip, udOct - skip));
+        text = Buffer.ToString(ud, skip, udOct - skip);
     }
 
     // `sender` rather than the natural `from`: that is a reserved word in
@@ -1612,11 +1612,15 @@ fn _toModem(w, handler: fn): fn {
     };
 }
 
+// Bounds on multipart messages still waiting for parts (see _deliver).
+const _PARTS_TTL_MS = 86400000;
+const _PARTS_MAX_PENDING = 32;
+
 class Modem {
     let _at   = nil;
     let _ref  = 0;        // rolling concatenation reference
     let _onMsg = nil;
-    let _parts = nil;     // partial multipart messages, keyed "ref:total"
+    let _parts = nil;     // partial multipart messages, keyed "sender|ref|total"
     let _vendor = "";
     let _retryCmd = nil;  // which PIN-counter command this modem answers, once known
     let _iccid = nil;     // cached: it cannot change while the card is inserted
@@ -2031,7 +2035,9 @@ class Modem {
     }
 
     // Deliver assembled messages to the application. A multipart message is
-    // held until every part has arrived, so the callback never sees a fragment.
+    // held until every part has arrived, so the callback never sees a fragment;
+    // one still missing parts after 24 hours, or the oldest of 32 waiting, is
+    // given up on (its parts stay in storage for ListMessages).
     // Register a handler for incoming messages, enabling the notifications
     // that make it fire. Registering alone is not enough on real hardware -
     // see ConfigureMessaging - and a handler that never fires because of a
@@ -2236,18 +2242,28 @@ class Modem {
         return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
     }
 
-    // Reassemble concatenated messages before handing them up.
+    // Reassemble concatenated messages before handing them up. Parts belong
+    // together when sender, reference and total all match - two senders may
+    // well pick the same reference. A part numbered outside 1..total is
+    // ignored. A set still incomplete after _PARTS_TTL_MS, or the oldest
+    // one when _PARTS_MAX_PENDING are waiting, is dropped from memory; its
+    // parts stay in storage, where ListMessages reports them.
     fn _deliver(m: object): int {
         if (this._onMsg == nil) return 0;
         if (m.concat == nil) { this._onMsg(m); return 0; }
 
-        let key = str(m.concat.ref) + ":" + str(m.concat.total);
-        if (!(key in this._parts)) { this._parts[key] = { seen: 0, total: m.concat.total, text: [] }; }
+        let c = m.concat;
+        if (c.total < 1 || c.part < 1 || c.part > c.total) return 0;
+        let key = str(m.sender) + "|" + str(c.ref) + "|" + str(c.total);
+        if (!(key in this._parts)) {
+            let now = Time.Millis();
+            this._pruneParts(now);
+            this._parts[key] = { seen: 0, total: c.total, text: Array.Create(c.total), started: now };
+        }
         let slot = this._parts[key];
         // Parts are 1-based and can arrive out of order.
-        while (len(slot.text) < slot.total) { Array.Append(slot.text, nil); }
-        if (slot.text[m.concat.part - 1] == nil) {
-            slot.text[m.concat.part - 1] = m.text;
+        if (slot.text[c.part - 1] == nil) {
+            slot.text[c.part - 1] = m.text;
             slot.seen = slot.seen + 1;
         }
         if (slot.seen < slot.total) return 0;
@@ -2255,6 +2271,25 @@ class Modem {
         Object.Delete(this._parts, key);
         this._onMsg({ ok: true, index: m.index, sender: m.sender, when: m.when,
                       text: String.Join(slot.text, ""), concat: m.concat, error: nil });
+        return 0;
+    }
+
+    // Make room for one more pending set: drop the expired ones, then the
+    // oldest if the cap is still reached.
+    fn _pruneParts(now: int) {
+        var oldest = nil;
+        var oldestAt = 0;
+        var n = 0;
+        foreach (k in Object.Keys(this._parts)) {
+            let started = this._parts[k].started;
+            if (now - started > _PARTS_TTL_MS) {
+                Object.Delete(this._parts, k);
+            } else {
+                n = n + 1;
+                if (oldest == nil || started < oldestAt) { oldest = k; oldestAt = started; }
+            }
+        }
+        if (n >= _PARTS_MAX_PENDING) { Object.Delete(this._parts, oldest); }
         return 0;
     }
 
@@ -2273,7 +2308,7 @@ class Modem {
         }
         if (text == nil) { text = ""; }
 
-        this._ref = (this._ref + 1) & 255;
+        this._ref = (u8)(this._ref + 1);
         let pdus = _buildSubmit(number, text, this._ref, opts);
         if (pdus == nil) {
             return { ok: false, reference: nil, parts: 0,

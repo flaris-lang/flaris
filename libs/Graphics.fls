@@ -76,6 +76,9 @@
 //     FilterEvent hand the region to an offload kernel instead, which runs on
 //     another core when it qualifies - see FilterRegion on the rasteriser for
 //     the descriptor a kernel receives.
+//   - Every canvas keeps its pixels in one arena shared by all canvases, and a
+//     dropped canvas gives them back. A GetGfx() handle is valid only while its
+//     canvas is alive.
 // =============================================================================
 
 import { Png } from library("Png", "1.0");
@@ -126,6 +129,9 @@ class Raster {
     let _fontBase:int = 0;
     let _freeOff:array = [];
     let _freeLen:array = [];
+    // Spans of dropped canvases, held until no queued command can refer to them.
+    let _deadOff:array = [];
+    let _deadLen:array = [];
     let _lutBase:int  = 0;
 
     fn Constructor(pixelWords:int, cmdSlots:int) {
@@ -147,12 +153,14 @@ class Raster {
 
     fn Arena():block { return _arena; }
 
-    // NewSurface(w, h) -> { off, w, h } or nil when the arena cannot fit it.
+    // NewSurface(w, h) -> { off, w, h }, growing the arena when it cannot fit;
+    // nil only when it cannot grow that far.
     fn NewSurface(w:int, h:int) : object|nil {
         if (w <= 0 || h <= 0) { return nil; }
         if (w > Raster.MaxSide() || h > Raster.MaxSide()) { return nil; }
         if (w * h > Raster.MaxPixels()) { return nil; }
-        let off = this._reserve(w * h);
+        var off = this._reserve(w * h);
+        if (off < 0 && this.EnsureFree(w * h)) { off = this._reserve(w * h); }
         if (off < 0) { return nil; }
         return { off: off, w: w, h: h };
     }
@@ -162,16 +170,17 @@ class Raster {
     // Every surface must live in the one arena - that is what lets an operation
     // reading one surface and writing another stay a single-block kernel. But
     // surfaces are created and released in any order, so a bump pointer alone
-    // would leak: freed space would never come back and NewSurface would
-    // eventually return nil, at which point drawing silently does nothing.
+    // would leak: freed space would never come back and the arena would only
+    // grow.
     //
     // So: bump for fresh space, plus a free list of released spans for reuse.
     // Spans are coalesced on release, and a span adjacent to the bump pointer
     // gives the space back outright. Surfaces are few and large, so first fit
-    // over a short list costs nothing worth optimising.
+    // over a short list costs nothing worth optimising. A dropped canvas
+    // releases its span through FreeSurfaceLater.
     //
-    // Mark/Release remain for the scratch case (CopyRect, Resize, Blit staging),
-    // where strict LIFO is known and cheaper than touching the free list.
+    // Mark/Release hand scratch space back in strict LIFO order. They are only
+    // right when nothing in between takes a span from the free list or frees one.
     fn Mark():int { return _next; }
     fn Release(mark:int) {
         if (mark >= 0 && mark <= _next) { _next = mark; }
@@ -206,12 +215,38 @@ class Raster {
     fn FreeSurface(s:object) {
         if (s == nil) { return; }
         this.Flush();
-        let off = s.off;
-        let n = s.w * s.h;
+        this._freeSpan(s.off, s.w * s.h);
+        return;
+    }
+
+    // FreeSurfaceLater(s) - FreeSurface for a canvas's Destructor. A destructor
+    // can run in the middle of another call, where a flush (which waits on the
+    // kernels) must not happen, so the span is only queued: the next Flush
+    // returns it, once no queued command can refer to it.
+    fn FreeSurfaceLater(s:object) {
+        if (s == nil) { return; }
+        Array.Append(_deadOff, s.off);
+        Array.Append(_deadLen, s.w * s.h);
+        return;
+    }
+
+    fn _freeSpan(off:int, n:int) {
         if (off + n == _next) { _next = off; this._reclaim(); return; }
         Array.Append(_freeOff, off);
         Array.Append(_freeLen, n);
         this._coalesce();
+        return;
+    }
+
+    fn _freeDead() {
+        while (len(_deadOff) > 0) {
+            let i = len(_deadOff) - 1;
+            let off = _deadOff[i];
+            let n = _deadLen[i];
+            Array.RemoveAt(_deadOff, i);
+            Array.RemoveAt(_deadLen, i);
+            this._freeSpan(off, n);
+        }
         return;
     }
 
@@ -261,10 +296,18 @@ class Raster {
     fn static MaxSide():int   { return 16384; }
     fn static MaxPixels():int { return 268435456; }
 
-    // Make room for `words` more pixels, growing the arena if needed.
+    // Make room for `words` more pixels, growing the arena if needed. Dropped
+    // canvases are given back first. A grow adds at least half the arena, so a
+    // run of small surfaces on a full arena copies it a few times, not once each.
     fn EnsureFree(words:int):bool {
         if (this.Available() >= words) { return true; }
-        return this.Grow(_cap + words * 2);
+        if (len(_deadOff) > 0) {
+            this.Flush();
+            if (this.Available() >= words) { return true; }
+        }
+        let need = _cap + words;
+        if (need > Raster.MaxPixels()) { return false; }
+        return this.Grow(Math.Min(Raster.MaxPixels(), need + Math.Max(words, _cap / 2)));
     }
 
     fn Available():int {
@@ -371,7 +414,7 @@ class Raster {
     // Span semantics shared by every primitive except Clear.
     fn _span(s:object, x:int, y:int, w:int, h:int, col:int) {
         if (w <= 0 || h <= 0) { return; }
-        let sa = (col >> 24) & 0xFF;
+        let sa = (u8)(col >> 24);
         if (sa == 0) { return; }
         if (sa != 255) { this._push(Raster.OpBlend(), s, x, y, w, h, col); return; }
 
@@ -392,12 +435,11 @@ class Raster {
         return;
     }
 
-    // Full-stride store: rows are contiguous, so one row is written in bytecode
-    // and then doubled onto itself with native copies.
+    // Full-stride store: rows are contiguous, so one row is written and then
+    // doubled onto itself with native copies.
     fn _store(s:object, y:int, rows:int, col:int) {
         let base = s.off + y * s.w;
-        var i = 0;
-        while (i < s.w) { _arena[base + i] = col; i = i + 1; }
+        Raster._fillWords(_arena, base, s.w, col);
         var done = 1;
         while (done < rows) {
             var n = done;
@@ -406,6 +448,12 @@ class Raster {
             done = done + n;
         }
         return;
+    }
+
+    // ar[base, base + n) = col.
+    fn static _fillWords(ar:block, base:int, n:int, col:int): int {
+        iter (i from 0 to n) { ar[base + i] = col; }
+        return n;
     }
 
     // ----------------------------------------------------------------
@@ -469,7 +517,7 @@ class Raster {
 
     // Filled disk: one stamp command with coincident endpoints.
     fn _disk(s:object, cx:int, cy:int, r:int, col:int) {
-        if (((col >> 24) & 0xFF) == 0) { return; }
+        if ((u8)(col >> 24) == 0) { return; }
         this._emitStamp(s, cx, cy, cx, cy, r, col);
         return;
     }
@@ -477,7 +525,7 @@ class Raster {
     // DrawLine(x0,y0,x1,y1,colour,thickness). Thickness 1 is integer Bresenham;
     // thicker lines stamp disks of the matching radius along the segment.
     fn DrawLine(s:object, x0:int, y0:int, x1:int, y1:int, col:int, thickness:int) {
-        if (((col >> 24) & 0xFF) == 0) { return; }
+        if ((u8)(col >> 24) == 0) { return; }
         var t = thickness;
         if (t < 1) { t = 1; }
         if (t == 1) { this._emitLine(s, x0, y0, x1, y1, col); return; }
@@ -543,7 +591,7 @@ class Raster {
         var t = thickness;
         if (t < 0) { t = 0; }
         if (fill != 0 || t == 0 || t >= r) { this._disk(s, cx, cy, r, col); return; }
-        if (((col >> 24) & 0xFF) == 0) { return; }
+        if ((u8)(col >> 24) == 0) { return; }
         if (_nCmd >= _cmdCap) { this.Flush(); }
         let q = _cmdEnd;
         _arena[q]     = Raster.OpRing();
@@ -564,18 +612,17 @@ class Raster {
 
     // FillPolygon(points, colour) - scanline fill over an active edge table.
     // Coordinates may be int or float; floats truncate to whole pixels.
-    // The edge table is built and advanced here rather than in a kernel: it
-    // allocates, and a kernel may not. Only the resulting spans cross into the
-    // kernel, as ordinary fill commands.
+    // The edge table is built here, in typed arrays; _polyScan walks the rows
+    // and queues each span as an ordinary fill command.
     fn FillPolygon(s:object, pts:array, col:int) {
         let nflat = len(pts);
         if (nflat < 6 || (nflat & 1) == 1) { return; }
         let npts = nflat / 2;
 
-        let eYmax:array = [];
-        let eYmin:array = [];
-        let eX:array    = [];
-        let eInv:array  = [];
+        let eYmax:[int]   = Array.Create(0, Type.Int);
+        let eYmin:[int]   = Array.Create(0, Type.Int);
+        let eX:[float]    = Array.Create(0, Type.Float);
+        let eInv:[float]  = Array.Create(0, Type.Float);
 
         var i = 0;
         while (i < npts) {
@@ -622,38 +669,89 @@ class Raster {
         if (yBot > s.h) { yBot = s.h; }
         if (yTop >= yBot) { return; }
 
-        // At most one crossing per edge, so one buffer sized to the edge list
-        // serves every scanline - the crossings are inserted in order into the
-        // first nx entries rather than into a fresh array per row.
-        let xs:array = [];
-        k = 0;
-        while (k < ne) { Array.Append(xs, 0.0); k = k + 1; }
+        // Spans follow _span: nothing at alpha 0, a blend below 255.
+        let sa = (u8)(col >> 24);
+        if (sa == 0) { return; }
+        var op = Raster.OpFill();
+        if (sa != 255) { op = Raster.OpBlend(); }
 
-        var y = yTop;
+        // At most one crossing per edge, so one buffer sized to the edge list
+        // serves every scanline.
+        let xs:[float] = Array.Create(ne, Type.Float);
+        let st:[int]   = Array.Create(3, Type.Int);
+        st[0] = yTop;
+        st[1] = -1;
+        while (!this._polyScan(_arena, st, yBot, ne, eYmin, eYmax, eX, eInv, xs, s.off, s.w, s.h, op, col)) {
+            this.Flush();
+        }
+        return;
+    }
+
+    // The rows st[0] .. yBot of FillPolygon, queued into the arena `ar`: the
+    // crossings of each row are inserted in order into the first nx entries of
+    // xs, each edge advanced while it is in hand, and every pair of crossings
+    // becomes a clipped span command. Returns false when the command queue is
+    // full, with the row, the next crossing pair and the crossing count left in
+    // st[0..2]; the caller flushes and calls again. st[1] < 0 means the row's
+    // crossings are not built yet.
+    fn _polyScan(ar:block, st:[int], yBot:int, ne:int, eYmin:[int], eYmax:[int], eX:[float],
+                 eInv:[float], xs:[float], off:int, sw:int, sh:int, op:int, col:int): bool {
+        let size = Raster.CmdRect();
+        var y = st[0];
+        var c = st[1];
+        var nx = st[2];
         while (y < yBot) {
-            var nx = 0;
-            k = 0;
-            while (k < ne) {
-                if (eYmin[k] <= y && y < eYmax[k]) {
-                    let v = eX[k];
-                    var q = nx;
-                    while (q > 0 && xs[q - 1] > v) { xs[q] = xs[q - 1]; q = q - 1; }
-                    xs[q] = v;
-                    nx = nx + 1;
-                    eX[k] = v + eInv[k];   // advance while the edge is in hand
+            if (c < 0) {
+                nx = 0;
+                var k = 0;
+                while (k < ne) {
+                    if (eYmin[k] <= y && y < eYmax[k]) {
+                        let v = eX[k];
+                        var q = nx;
+                        while (q > 0 && xs[q - 1] > v) { xs[q] = xs[q - 1]; q = q - 1; }
+                        xs[q] = v;
+                        nx = nx + 1;
+                        eX[k] = v + eInv[k];
+                    }
+                    k = k + 1;
                 }
-                k = k + 1;
+                c = 0;
             }
-            var c = 0;
             while (c + 1 < nx) {
                 let a = int(Math.Floor(xs[c] + 0.5));
                 let b = int(Math.Floor(xs[c + 1] + 0.5));
-                if (b > a) { this._hspan(s, a, b, y, col); }
+                if (b > a) {
+                    var x0 = a;
+                    var x1 = b + 1;
+                    if (x0 < 0) { x0 = 0; }
+                    if (x1 > sw) { x1 = sw; }
+                    if (x1 > x0 && y >= 0 && y < sh) {
+                        if (this._nCmd >= this._cmdCap) {
+                            st[0] = y;
+                            st[1] = c;
+                            st[2] = nx;
+                            return false;
+                        }
+                        let p = this._cmdEnd;
+                        ar[p]     = op;
+                        ar[p + 1] = size;
+                        ar[p + 2] = off;
+                        ar[p + 3] = sw;
+                        ar[p + 4] = x0;
+                        ar[p + 5] = y;
+                        ar[p + 6] = x1 - x0;
+                        ar[p + 7] = 1;
+                        ar[p + 8] = col;
+                        this._cmdEnd = p + size;
+                        this._nCmd = this._nCmd + 1;
+                    }
+                }
                 c = c + 2;
             }
+            c = -1;
             y = y + 1;
         }
-        return;
+        return true;
     }
 
     // Source-over composite of `src` onto this surface at (dx,dy), with an
@@ -848,7 +946,7 @@ class Raster {
         if (sc < 1) { sc = 1; }
         var c = code;
         if (c < 0) { c = 0; }
-        if (c > 255) { c = c & 0xFF; }
+        if (c > 255) { c = (u8)c; }
         this._emitGlyph(s, x, y, c, sc, col);
         return;
     }
@@ -861,33 +959,72 @@ class Raster {
         var lp = linesp;  if (lp < 0) { lp = 0; }
         let adv = 8 * sc + ls;
         let lineAdv = 8 * sc + lp;
-        var penX = x;
-        var penY = y;
         // Read the raw bytes once; DrawTextRun indexes bytes, not codepoints.
         let bytes = Buffer.FromString(text);
+        let st:[int] = Array.Create(3, Type.Int);
+        st[1] = x;
+        st[2] = y;
+        while (!this._glyphRun(_arena, st, bytes, x, adv, lineAdv, s.off, s.w, s.h, sc, col)) {
+            this.Flush();
+        }
+        return;
+    }
+
+    // The glyph commands of DrawText for bytes[st[0] ..] with the pen at
+    // (st[1], st[2]), queued into the arena `ar`: a line feed returns the pen
+    // to x0 on the next line, a tab moves it four cells. Returns false when the
+    // command queue is full, with st holding where to resume; the caller
+    // flushes and calls again.
+    fn _glyphRun(ar:block, st:[int], bytes:block, x0:int, adv:int, lineAdv:int,
+                 off:int, sw:int, sh:int, sc:int, col:int): bool {
         let n = len(bytes);
-        var i = 0;
+        let op = Raster.OpGlyph();
+        let size = Raster.CmdGlyph();
+        let font = this._fontBase;
+        var i = st[0];
+        var penX = st[1];
+        var penY = st[2];
         while (i < n) {
-            let b = bytes[i] & 0xFF;
-            if (b == 10) { penX = x; penY = penY + lineAdv; }
+            let b = bytes[i];
+            if (b == 10) { penX = x0; penY = penY + lineAdv; }
             else if (b == 9) { penX = penX + adv * 4; }
             else {
-                this._emitGlyph(s, penX, penY, b, sc, col);
+                if (this._nCmd >= this._cmdCap) {
+                    st[0] = i;
+                    st[1] = penX;
+                    st[2] = penY;
+                    return false;
+                }
+                let p = this._cmdEnd;
+                ar[p]      = op;
+                ar[p + 1]  = size;
+                ar[p + 2]  = off;
+                ar[p + 3]  = sw;
+                ar[p + 4]  = sw;
+                ar[p + 5]  = sh;
+                ar[p + 6]  = penX;
+                ar[p + 7]  = penY;
+                ar[p + 8]  = b;
+                ar[p + 9]  = sc;
+                ar[p + 10] = font;
+                ar[p + 11] = col;
+                this._cmdEnd = p + size;
+                this._nCmd = this._nCmd + 1;
                 penX = penX + adv;
             }
             i = i + 1;
         }
-        return;
+        return true;
     }
 
     // ---- colour helpers (pure integer / double maths, no surface touched) ----
 
     fn static RGB(r:int, g:int, b:int):int {
-        return 0xFF000000 | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+        return 0xFF000000 | ((u8)r << 16) | ((u8)g << 8) | (u8)b;
     }
 
     fn static RGBA(r:int, g:int, b:int, a:int):int {
-        return ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+        return ((u8)a << 24) | ((u8)r << 16) | ((u8)g << 8) | (u8)b;
     }
 
     fn static _clamp255(v:int):int {
@@ -929,7 +1066,7 @@ class Raster {
     fn GetPixel(s:object, x:int, y:int):int {
         if (x < 0 || y < 0 || x >= s.w || y >= s.h) { return 0; }
         this.Flush();
-        return _arena[s.off + y * s.w + x] & 0xFFFFFFFF;
+        return _arena[s.off + y * s.w + x];
     }
 
     // ---- region filters ----
@@ -998,7 +1135,7 @@ class Raster {
             let ro = s.off + (rgn.y + yy) * s.w + rgn.x;
             var xx = 0;
             while (xx < rgn.w) {
-                let nv = fn0(_arena[ro + xx] & 0xFFFFFFFF);
+                let nv = fn0(_arena[ro + xx]);
                 if (nv != nil) { _arena[ro + xx] = nv; }
                 xx = xx + 1;
             }
@@ -1021,7 +1158,6 @@ class Raster {
     fn Blit(s:object, dx:int, dy:int, w:int, h:int, pixels:array) {
         if (w <= 0 || h <= 0) { return; }
         if (w * h > len(pixels)) { return; }
-        let mark = this.Mark();
         let tmp = this.NewSurface(w, h);
         if (tmp == nil) { return; }
         let n = w * h;
@@ -1043,8 +1179,7 @@ class Raster {
             }
         }
         this.BlendSurface(s, tmp, dx, dy, 255);
-        this.Flush();
-        this.Release(mark);
+        this.FreeSurface(tmp);
         return;
     }
 
@@ -1115,7 +1250,10 @@ class Raster {
     }
 
     fn Flush() {
-        if (_nCmd <= 0) { return; }
+        if (_nCmd <= 0) {
+            if (len(_deadOff) > 0) { this._freeDead(); }
+            return;
+        }
         var p = 1;
         var done = 0;
         while (done < _nCmd) {
@@ -1158,6 +1296,7 @@ class Raster {
         _arena[0] = 0;
         _nCmd = 0;
         _cmdEnd = 1;
+        if (len(_deadOff) > 0) { this._freeDead(); }
         return;
     }
 
@@ -1165,7 +1304,7 @@ class Raster {
     // The kernel. Straight-line integer work over one block: no calls, no
     // allocation, so it compiles to native code. Arena words read back as
     // unsigned 32-bit values; a coordinate that can be negative is restored
-    // with (w ^ 0x80000000) - 0x80000000.
+    // with (i32).
     // ----------------------------------------------------------------
     // Composite kernel: source-over of one arena region onto another, with an
     // optional global alpha scaling the source alpha first.
@@ -1186,7 +1325,7 @@ class Raster {
                 var x = 0;
                 while (x < bw) {
                     let sp = b[sr + x];
-                    var sa = (sp >> 24) & 0xFF;
+                    var sa = (u8)(sp >> 24);
                     if (ga != 255) { sa = (sa * ga + 127) / 255; }
                     if (sa != 0) {
                         if (sa == 255) {
@@ -1194,15 +1333,15 @@ class Raster {
                         } else {
                             let ia  = 255 - sa;
                             let srb = (sp & 0x00FF00FF) * sa + 0x007F007F;
-                            let sg  = ((sp >> 8) & 0xFF) * sa + 127;
+                            let sg  = (u8)(sp >> 8) * sa + 127;
                             let d = b[dr + x];
                             var rb = (d & 0x00FF00FF) * ia + srb;
                             rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                            var gg = ((d >> 8) & 0xFF) * ia + sg;
-                            gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                            var aa = ((d >> 24) & 0xFF) * ia + 127;
+                            var gg = (u8)(d >> 8) * ia + sg;
+                            gg = (u8)((gg + 1 + (gg >> 8)) >> 8);
+                            var aa = (u8)(d >> 24) * ia + 127;
                             aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                            b[dr + x] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                            b[dr + x] = ((u8)aa << 24) | rb | (gg << 8);
                         }
                     }
                     x = x + 1;
@@ -1259,8 +1398,8 @@ class Raster {
             let sz = b[p + 1];
             let dOff = b[p + 2]; let dStr = b[p + 3];
             let cw = b[p + 4];   let ch = b[p + 5];
-            let gx = (b[p + 6] ^ 0x80000000) - 0x80000000;
-            let gy = (b[p + 7] ^ 0x80000000) - 0x80000000;
+            let gx = (i32)b[p + 6];
+            let gy = (i32)b[p + 7];
             let code = b[p + 8]; let sc = b[p + 9];
             let fb = b[p + 10];  let col = b[p + 11];
             var ry = 0;
@@ -1269,7 +1408,7 @@ class Raster {
                 let y0 = gy + ry * sc;
                 if (y0 >= ch) { stop = 1; }
                 else {
-                    let row = (b[fb + code * 2 + (ry >> 2)] >> ((ry & 3) * 8)) & 0xFF;
+                    let row = (u8)(b[fb + code * 2 + (ry >> 2)] >> ((ry & 3) * 8));
                     if (row != 0) {
                         var rx = 0;
                         while (rx < 8) {
@@ -1322,16 +1461,16 @@ class Raster {
                 var x = 0;
                 while (x < rw) {
                     let px = b[ro + x];
-                    let a = (px >> 24) & 0xFF;
-                    let r = (px >> 16) & 0xFF;
-                    let g = (px >> 8) & 0xFF;
-                    let bl = px & 0xFF;
+                    let a = (u8)(px >> 24);
+                    let r = (u8)(px >> 16);
+                    let g = (u8)(px >> 8);
+                    let bl = (u8)px;
                     if (mode == 1) {
                         let lm = (r * 77 + g * 150 + bl * 29) >> 8;
-                        b[ro + x] = (a << 24) | ((lm & 0xFF) << 16) | ((lm & 0xFF) << 8) | (lm & 0xFF);
+                        b[ro + x] = (a << 24) | ((u8)lm << 16) | ((u8)lm << 8) | (u8)lm;
                     } else {
-                        b[ro + x] = (a << 24) | ((b[lut + r] & 0xFF) << 16) |
-                                    ((b[lut + g] & 0xFF) << 8) | (b[lut + bl] & 0xFF);
+                        b[ro + x] = (a << 24) | ((u8)b[lut + r] << 16) |
+                                    ((u8)b[lut + g] << 8) | (u8)b[lut + bl];
                     }
                     x = x + 1;
                 }
@@ -1357,14 +1496,14 @@ class Raster {
             let dst    = b[p + 2];
             let stride = b[p + 3];
             let cw = b[p + 4]; let ch = b[p + 5];
-            let cx = (b[p + 6] ^ 0x80000000) - 0x80000000;
-            let cy = (b[p + 7] ^ 0x80000000) - 0x80000000;
+            let cx = (i32)b[p + 6];
+            let cy = (i32)b[p + 7];
             let ro = b[p + 8]; let ri = b[p + 9];
             let col = b[p + 10];
-            let sa  = (col >> 24) & 0xFF;
+            let sa  = (u8)(col >> 24);
             let ia  = 255 - sa;
             let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
-            let sg  = ((col >> 8) & 0xFF) * sa + 127;
+            let sg  = (u8)(col >> 8) * sa + 127;
             let ro2 = ro * ro;
             let ri2 = ri * ri;
             var half = 0;
@@ -1404,11 +1543,11 @@ class Raster {
                                 let d = b[o];
                                 var rb = (d & 0x00FF00FF) * ia + srb;
                                 rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                                var gg = ((d >> 8) & 0xFF) * ia + sg;
-                                gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                                var aa = ((d >> 24) & 0xFF) * ia + 127;
+                                var gg = (u8)(d >> 8) * ia + sg;
+                                gg = (u8)((gg + 1 + (gg >> 8)) >> 8);
+                                var aa = (u8)(d >> 24) * ia + 127;
                                 aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                                b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                                b[o] = ((u8)aa << 24) | rb | (gg << 8);
                             }
                             xj = xj + 1;
                         }
@@ -1460,14 +1599,14 @@ class Raster {
                 // at 255*255+127 = 65152, so neither carries into the other),
                 // and the divide uses the identity y/255 == (y+1+(y>>8))>>8,
                 // exact over that range - three integer divisions per pixel
-                // would otherwise dominate. Every use of a pixel masks after
-                // shifting.
+                // would otherwise dominate. Every use of a pixel narrows to a
+                // byte after shifting.
                 let x = b[p + 4]; let y = b[p + 5];
                 let w = b[p + 6]; let h = b[p + 7];
-                let sa  = (col >> 24) & 0xFF;
+                let sa  = (u8)(col >> 24);
                 let ia  = 255 - sa;
                 let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
-                let sg  = ((col >> 8) & 0xFF) * sa + 127;
+                let sg  = (u8)(col >> 8) * sa + 127;
                 var yy = 0;
                 while (yy < h) {
                     let ro = dst + (y + yy) * stride + x;
@@ -1476,11 +1615,11 @@ class Raster {
                         let d = b[ro + xx];
                         var rb = (d & 0x00FF00FF) * ia + srb;
                         rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                        var gg = ((d >> 8) & 0xFF) * ia + sg;
-                        gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                        var aa = ((d >> 24) & 0xFF) * ia + 127;
+                        var gg = (u8)(d >> 8) * ia + sg;
+                        gg = (u8)((gg + 1 + (gg >> 8)) >> 8);
+                        var aa = (u8)(d >> 24) * ia + 127;
                         aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                        b[ro + xx] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                        b[ro + xx] = ((u8)aa << 24) | rb | (gg << 8);
                         xx = xx + 1;
                     }
                     yy = yy + 1;
@@ -1507,14 +1646,14 @@ class Raster {
                 // blend. Clipping is per pixel rather than up front, because
                 // clipping the endpoints would change the error term.
                 let cw = b[p + 4]; let ch = b[p + 5];
-                var lx = (b[p + 6] ^ 0x80000000) - 0x80000000;
-                var ly = (b[p + 7] ^ 0x80000000) - 0x80000000;
-                let ex = (b[p + 8] ^ 0x80000000) - 0x80000000;
-                let ey = (b[p + 9] ^ 0x80000000) - 0x80000000;
-                let sa  = (col >> 24) & 0xFF;
+                var lx = (i32)b[p + 6];
+                var ly = (i32)b[p + 7];
+                let ex = (i32)b[p + 8];
+                let ey = (i32)b[p + 9];
+                let sa  = (u8)(col >> 24);
                 let ia  = 255 - sa;
                 let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
-                let sg  = ((col >> 8) & 0xFF) * sa + 127;
+                let sg  = (u8)(col >> 8) * sa + 127;
                 var dx = ex - lx; if (dx < 0) { dx = 0 - dx; }
                 var dn = ey - ly; if (dn < 0) { dn = 0 - dn; }
                 dn = 0 - dn;
@@ -1531,11 +1670,11 @@ class Raster {
                             let d = b[o];
                             var rb = (d & 0x00FF00FF) * ia + srb;
                             rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                            var gg = ((d >> 8) & 0xFF) * ia + sg;
-                            gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                            var aa = ((d >> 24) & 0xFF) * ia + 127;
+                            var gg = (u8)(d >> 8) * ia + sg;
+                            gg = (u8)((gg + 1 + (gg >> 8)) >> 8);
+                            var aa = (u8)(d >> 24) * ia + 127;
                             aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                            b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                            b[o] = ((u8)aa << 24) | rb | (gg << 8);
                         }
                     }
                     if (lx == ex && ly == ey) {
@@ -1576,15 +1715,15 @@ class Raster {
             let stride = b[p + 3];
             let col    = b[p + sz - 1];
             let cw = b[p + 4]; let ch = b[p + 5];
-            let x0 = (b[p + 6] ^ 0x80000000) - 0x80000000;
-            let y0 = (b[p + 7] ^ 0x80000000) - 0x80000000;
-            let x1 = (b[p + 8] ^ 0x80000000) - 0x80000000;
-            let y1 = (b[p + 9] ^ 0x80000000) - 0x80000000;
+            let x0 = (i32)b[p + 6];
+            let y0 = (i32)b[p + 7];
+            let x1 = (i32)b[p + 8];
+            let y1 = (i32)b[p + 9];
             let rr = b[p + 10];
-            let sa  = (col >> 24) & 0xFF;
+            let sa  = (u8)(col >> 24);
             let ia  = 255 - sa;
             let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
-            let sg  = ((col >> 8) & 0xFF) * sa + 127;
+            let sg  = (u8)(col >> 8) * sa + 127;
             let ddx = x1 - x0;
             let ddy = y1 - y0;
             var adx = ddx; if (adx < 0) { adx = 0 - adx; }
@@ -1627,11 +1766,11 @@ class Raster {
                                     let d = b[o];
                                     var rb = (d & 0x00FF00FF) * ia + srb;
                                     rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                                    var gg = ((d >> 8) & 0xFF) * ia + sg;
-                                    gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                                    var aa = ((d >> 24) & 0xFF) * ia + 127;
+                                    var gg = (u8)(d >> 8) * ia + sg;
+                                    gg = (u8)((gg + 1 + (gg >> 8)) >> 8);
+                                    var aa = (u8)(d >> 24) * ia + 127;
                                     aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                                    b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                                    b[o] = ((u8)aa << 24) | rb | (gg << 8);
                                 }
                                 xj = xj + 1;
                             }
@@ -1659,14 +1798,14 @@ class Raster {
             let stride = b[p + 3];
             let col    = b[p + sz - 1];
             let cw = b[p + 4]; let ch = b[p + 5];
-            let x0 = (b[p + 6] ^ 0x80000000) - 0x80000000;
-            let y0 = (b[p + 7] ^ 0x80000000) - 0x80000000;
-            let x1 = (b[p + 8] ^ 0x80000000) - 0x80000000;
-            let y1 = (b[p + 9] ^ 0x80000000) - 0x80000000;
-            let sa  = (col >> 24) & 0xFF;
+            let x0 = (i32)b[p + 6];
+            let y0 = (i32)b[p + 7];
+            let x1 = (i32)b[p + 8];
+            let y1 = (i32)b[p + 9];
+            let sa  = (u8)(col >> 24);
             let ia  = 255 - sa;
             let srb = (col & 0x00FF00FF) * sa + 0x007F007F;
-            let sg  = ((col >> 8) & 0xFF) * sa + 127;
+            let sg  = (u8)(col >> 8) * sa + 127;
             let ddx = x1 - x0;
             let ddy = y1 - y0;
             var adx = ddx; if (adx < 0) { adx = 0 - adx; }
@@ -1693,11 +1832,11 @@ class Raster {
                         let d = b[o];
                         var rb = (d & 0x00FF00FF) * ia + srb;
                         rb = ((rb + 0x00010001 + ((rb >> 8) & 0x00FF00FF)) >> 8) & 0x00FF00FF;
-                        var gg = ((d >> 8) & 0xFF) * ia + sg;
-                        gg = ((gg + 1 + (gg >> 8)) >> 8) & 0xFF;
-                        var aa = ((d >> 24) & 0xFF) * ia + 127;
+                        var gg = (u8)(d >> 8) * ia + sg;
+                        gg = (u8)((gg + 1 + (gg >> 8)) >> 8);
+                        var aa = (u8)(d >> 24) * ia + 127;
                         aa = sa + ((aa + 1 + (aa >> 8)) >> 8);
-                        b[o] = ((aa & 0xFF) << 24) | rb | (gg << 8);
+                        b[o] = ((u8)aa << 24) | rb | (gg << 8);
                     }
                 }
                 k = k + 1;
@@ -1766,6 +1905,13 @@ class Graphics {
             this._width  = _s.w;
             this._height = _s.h;
         }
+    }
+
+    // A dropped canvas gives its pixels back to the shared arena. The engine is
+    // read directly: _r() would build a new one if it is already gone.
+    fn Destructor() {
+        if (_rasterEngine != nil) { _rasterEngine.FreeSurfaceLater(_s); }
+        return;
     }
     fn static Create(w:int, h:int) : instance {
         return new Graphics(w, h);

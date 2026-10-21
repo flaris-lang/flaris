@@ -76,32 +76,34 @@ class Png {
     // ----------------------------------------------------------------
     // Byte helpers
     //
-    // Block elements read back signed (a stored 0xFF reads as -1), so every
-    // byte load masks with 0xFF. Chunk types are compared as packed big-endian
-    // ints rather than strings - no allocation per chunk.
+    // A byte block reads back 0..255 and keeps the low byte of a stored
+    // value, so the codec's own buffers need no masks. Reads of the caller's
+    // `bytes` (and its PLTE/tRNS slices) go through (u8), so they stay
+    // byte-sized whatever block is passed. Chunk types are compared as packed
+    // big-endian ints rather than strings - no allocation per chunk.
     // ----------------------------------------------------------------
 
     fn static _be32(b:block, o:int):int {
-        return (((b[o] & 0xFF) << 24) | ((b[o + 1] & 0xFF) << 16) |
-                ((b[o + 2] & 0xFF) << 8) | (b[o + 3] & 0xFF));
+        return (((u8)b[o] << 24) | ((u8)b[o + 1] << 16) |
+                ((u8)b[o + 2] << 8) | (u8)b[o + 3]);
     }
 
     fn static _put32(b:block, o:int, v:int) {
-        b[o]     = (v >> 24) & 0xFF;
-        b[o + 1] = (v >> 16) & 0xFF;
-        b[o + 2] = (v >> 8) & 0xFF;
-        b[o + 3] = v & 0xFF;
+        b[o]     = v >> 24;
+        b[o + 1] = v >> 16;
+        b[o + 2] = v >> 8;
+        b[o + 3] = v;
         return;
     }
 
     // Sample `si` of a reconstructed row at bit depth `bd`. Returns the raw
     // value (0..2^bd-1), or the high byte when bd == 16.
     fn static _samp(row:block, base:int, si:int, bd:int):int {
-        if (bd == 8)  { return row[base + si] & 0xFF; }
-        if (bd == 16) { return row[base + si * 2] & 0xFF; }
+        if (bd == 8)  { return row[base + si]; }
+        if (bd == 16) { return row[base + si * 2]; }
         let bit   = si * bd;
         let shift = 8 - bd - (bit & 7);
-        return ((row[base + (bit >> 3)] & 0xFF) >> shift) & ((1 << bd) - 1);
+        return (row[base + (bit >> 3)] >> shift) & ((1 << bd) - 1);
     }
 
     // Spread a sub-8-bit grayscale sample across the full 0..255 range.
@@ -122,10 +124,10 @@ class Png {
         if (n < 33) { return nil; }
 
         // 137 P N G \r \n 26 \n
-        if ((bytes[0] & 0xFF) != 137 || (bytes[1] & 0xFF) != 80  ||
-            (bytes[2] & 0xFF) != 78  || (bytes[3] & 0xFF) != 71  ||
-            (bytes[4] & 0xFF) != 13  || (bytes[5] & 0xFF) != 10  ||
-            (bytes[6] & 0xFF) != 26  || (bytes[7] & 0xFF) != 10) { return nil; }
+        if ((u8)bytes[0] != 137 || (u8)bytes[1] != 80  ||
+            (u8)bytes[2] != 78  || (u8)bytes[3] != 71  ||
+            (u8)bytes[4] != 13  || (u8)bytes[5] != 10  ||
+            (u8)bytes[6] != 26  || (u8)bytes[7] != 10) { return nil; }
 
         var w = 0;
         var h = 0;
@@ -155,9 +157,9 @@ class Png {
             if (tag == 0x49484452 && clen >= 13) {          // IHDR
                 w         = Png._be32(bytes, p);
                 h         = Png._be32(bytes, p + 4);
-                bd        = bytes[p + 8] & 0xFF;
-                ct        = bytes[p + 9] & 0xFF;
-                interlace = bytes[p + 12] & 0xFF;
+                bd        = (u8)bytes[p + 8];
+                ct        = (u8)bytes[p + 9];
+                interlace = (u8)bytes[p + 12];
                 gotIhdr   = true;
             } else if (tag == 0x49444154) {                 // IDAT
                 Array.Append(idatOff, p);
@@ -267,7 +269,7 @@ class Png {
         var y = 0;
         while (y < h) {
             let base  = y * (1 + rowBytes);
-            let ftype = raw[base] & 0xFF;
+            let ftype = raw[base];
             let cur   = base + 1;
             let up    = cur - (1 + rowBytes);
 
@@ -281,9 +283,9 @@ class Png {
                 var a = 0;
                 var b = 0;
                 var c = 0;
-                if (x >= bpp) { a = raw[cur + x - bpp] & 0xFF; }
-                if (y > 0)    { b = raw[up + x] & 0xFF; }
-                if (x >= bpp && y > 0) { c = raw[up + x - bpp] & 0xFF; }
+                if (x >= bpp) { a = raw[cur + x - bpp]; }
+                if (y > 0)    { b = raw[up + x]; }
+                if (x >= bpp && y > 0) { c = raw[up + x - bpp]; }
 
                 var add = 0;
                 if (ftype == 1)      { add = a; }
@@ -300,7 +302,7 @@ class Png {
                     else                        { add = c; }
                 }
 
-                raw[cur + x] = ((raw[cur + x] & 0xFF) + add) & 0xFF;
+                raw[cur + x] = raw[cur + x] + add;
                 x = x + 1;
             }
             y = y + 1;
@@ -323,7 +325,7 @@ class Png {
 
         var base = 0;
         while (base + stride <= blen) {
-            let ftype = b[base] & 0xFF;
+            let ftype = b[base];
             if (ftype != 0) {
                 let cur = base + 1;
                 let up  = cur - stride;
@@ -332,9 +334,9 @@ class Png {
                     var a = 0;
                     var bb = 0;
                     var c = 0;
-                    if (x >= 4) { a = b[cur + x - 4] & 0xFF; }
-                    if (base > 0) { bb = b[up + x] & 0xFF; }
-                    if (x >= 4 && base > 0) { c = b[up + x - 4] & 0xFF; }
+                    if (x >= 4) { a = b[cur + x - 4]; }
+                    if (base > 0) { bb = b[up + x]; }
+                    if (x >= 4 && base > 0) { c = b[up + x - 4]; }
 
                     var add = 0;
                     if (ftype == 1)      { add = a; }
@@ -350,7 +352,7 @@ class Png {
                         else                      { add = c; }
                     }
 
-                    b[cur + x] = ((b[cur + x] & 0xFF) + add) & 0xFF;
+                    b[cur + x] = b[cur + x] + add;
                     x = x + 1;
                 }
             }
@@ -362,10 +364,10 @@ class Png {
         while (src + rowBytes <= blen) {
             var x = 0;
             while (x < rowBytes) {
-                let r  = b[src + x] & 0xFF;
-                let g  = b[src + x + 1] & 0xFF;
-                let bl = b[src + x + 2] & 0xFF;
-                let al = b[src + x + 3] & 0xFF;
+                let r  = b[src + x];
+                let g  = b[src + x + 1];
+                let bl = b[src + x + 2];
+                let al = b[src + x + 3];
                 b[dst]     = bl;
                 b[dst + 1] = g;
                 b[dst + 2] = r;
@@ -406,26 +408,26 @@ class Png {
             if (ct == 6) {                                   // RGBA
                 while (x < w) {
                     let s = cur + x * 4 * step;
-                    out[dst + x] = (((raw[s + 3 * step] & 0xFF) << 24) |
-                                    ((raw[s] & 0xFF) << 16) |
-                                    ((raw[s + step] & 0xFF) << 8) |
-                                    (raw[s + 2 * step] & 0xFF));
+                    out[dst + x] = ((raw[s + 3 * step] << 24) |
+                                    (raw[s] << 16) |
+                                    (raw[s + step] << 8) |
+                                    raw[s + 2 * step]);
                     x = x + 1;
                 }
             } else if (ct == 2) {                            // RGB
                 while (x < w) {
                     let s = cur + x * 3 * step;
                     out[dst + x] = (0xFF000000 |
-                                    ((raw[s] & 0xFF) << 16) |
-                                    ((raw[s + step] & 0xFF) << 8) |
-                                    (raw[s + 2 * step] & 0xFF));
+                                    (raw[s] << 16) |
+                                    (raw[s + step] << 8) |
+                                    raw[s + 2 * step]);
                     x = x + 1;
                 }
             } else if (ct == 4) {                            // grayscale + alpha
                 while (x < w) {
                     let s = cur + x * 2 * step;
-                    let g = raw[s] & 0xFF;
-                    let a = raw[s + step] & 0xFF;
+                    let g = raw[s];
+                    let a = raw[s + step];
                     out[dst + x] = ((a << 24) | (g << 16) | (g << 8) | g);
                     x = x + 1;
                 }
@@ -460,11 +462,11 @@ class Png {
             var idx = i;
             if (idx >= plteN) { idx = 0; }
             var a = 255;
-            if (idx < trnsN) { a = trns[idx] & 0xFF; }
+            if (idx < trnsN) { a = (u8)trns[idx]; }
             lut[i] = ((a << 24) |
-                      ((plte[idx * 3] & 0xFF) << 16) |
-                      ((plte[idx * 3 + 1] & 0xFF) << 8) |
-                      (plte[idx * 3 + 2] & 0xFF));
+                      ((u8)plte[idx * 3] << 16) |
+                      ((u8)plte[idx * 3 + 1] << 8) |
+                      (u8)plte[idx * 3 + 2]);
             i = i + 1;
         }
         return lut;
@@ -572,10 +574,10 @@ class Png {
             while (x < w) {
                 let v = px[src + x];
                 let o = cur + x * 4;
-                raw[o]     = (v >> 16) & 0xFF;
-                raw[o + 1] = (v >> 8) & 0xFF;
-                raw[o + 2] = v & 0xFF;
-                raw[o + 3] = (v >> 24) & 0xFF;
+                raw[o]     = v >> 16;
+                raw[o + 1] = v >> 8;
+                raw[o + 2] = v;
+                raw[o + 3] = v >> 24;
                 x = x + 1;
             }
             y = y + 1;
@@ -586,11 +588,16 @@ class Png {
     // Per-row filter selection. Each row is filtered five ways; the candidate
     // with the smallest sum of absolute signed deviations wins, which is the
     // heuristic the PNG spec recommends and what every real encoder uses.
+    // ln and pv hold this row and the previous one (RGBA) behind four zero
+    // bytes, so the left neighbours of the first pixel read as 0 without an
+    // edge test; pv is all zero for the first row.
     fn static _rowsAdaptive(px:block, raw:block, w:int, h:int, rowBytes:int) {
-        let line = Buffer.Create(rowBytes, 1);   // this row, unfiltered RGBA
-        let prev = Buffer.Create(rowBytes, 1);   // previous row, unfiltered
+        let ln = Buffer.Create(rowBytes + 4, 1);
+        let pv = Buffer.Create(rowBytes + 4, 1);
         let cand = Buffer.Create(rowBytes, 1);   // candidate under test
         let best = Buffer.Create(rowBytes, 1);   // best candidate so far
+        Buffer.Fill(ln, 0);
+        Buffer.Fill(pv, 0);
 
         var y = 0;
         while (y < h) {
@@ -598,52 +605,20 @@ class Png {
             var x = 0;
             while (x < w) {
                 let v = px[src + x];
-                let o = x * 4;
-                line[o]     = (v >> 16) & 0xFF;
-                line[o + 1] = (v >> 8) & 0xFF;
-                line[o + 2] = v & 0xFF;
-                line[o + 3] = (v >> 24) & 0xFF;
+                let o = 4 + x * 4;
+                ln[o]     = v >> 16;
+                ln[o + 1] = v >> 8;
+                ln[o + 2] = v;
+                ln[o + 3] = v >> 24;
                 x = x + 1;
             }
 
             var bestType = 0;
-            var bestScore = -1;
-
-            var f = 0;
+            var bestScore = Png._filterRow(ln, pv, rowBytes, 0, best);
+            var f = 1;
             while (f < 5) {
-                var score = 0;
-                var i = 0;
-                while (i < rowBytes) {
-                    let cv = line[i] & 0xFF;
-                    var a = 0;
-                    var b = 0;
-                    var c = 0;
-                    if (i >= 4) { a = line[i - 4] & 0xFF; }
-                    if (y > 0)  { b = prev[i] & 0xFF; }
-                    if (i >= 4 && y > 0) { c = prev[i - 4] & 0xFF; }
-
-                    var pred = 0;
-                    if (f == 1)      { pred = a; }
-                    else if (f == 2) { pred = b; }
-                    else if (f == 3) { pred = (a + b) >> 1; }
-                    else if (f == 4) {
-                        let pp = a + b - c;
-                        var pa = pp - a; if (pa < 0) { pa = 0 - pa; }
-                        var pb = pp - b; if (pb < 0) { pb = 0 - pb; }
-                        var pc = pp - c; if (pc < 0) { pc = 0 - pc; }
-                        if (pa <= pb && pa <= pc) { pred = a; }
-                        else if (pb <= pc)        { pred = b; }
-                        else                      { pred = c; }
-                    }
-
-                    let d = (cv - pred) & 0xFF;
-                    cand[i] = d;
-                    // Sum of absolute deviations, bytes read as signed.
-                    if (d < 128) { score = score + d; } else { score = score + (256 - d); }
-                    i = i + 1;
-                }
-
-                if (bestScore < 0 || score < bestScore) {
+                let score = Png._filterRow(ln, pv, rowBytes, f, cand);
+                if (score < bestScore) {
                     bestScore = score;
                     bestType = f;
                     Buffer.Copy(cand, 0, best, 0, rowBytes);
@@ -654,10 +629,66 @@ class Png {
             let base = y * (1 + rowBytes);
             raw[base] = bestType;
             Buffer.Copy(best, 0, raw, base + 1, rowBytes);
-            Buffer.Copy(line, 0, prev, 0, rowBytes);
+            Buffer.Copy(ln, 4, pv, 4, rowBytes);
             y = y + 1;
         }
         return;
+    }
+
+    // Filter f (0-4) of the n-byte row in ln (laid out as in _rowsAdaptive)
+    // into out[0..n); returns the sum of the filtered bytes read as signed,
+    // absolute. One loop per filter keeps the filter test out of the byte loop.
+    fn static _filterRow(ln:block, pv:block, n:int, f:int, out:block):int {
+        var score = 0;
+        var i = 4;
+        let end = n + 4;
+        if (f == 0) {
+            while (i < end) {
+                let d = ln[i];
+                out[i - 4] = d;
+                score += d < 128 ? d : 256 - d;
+                i += 1;
+            }
+        } else if (f == 1) {
+            while (i < end) {
+                let d = (u8)(ln[i] - ln[i - 4]);
+                out[i - 4] = d;
+                score += d < 128 ? d : 256 - d;
+                i += 1;
+            }
+        } else if (f == 2) {
+            while (i < end) {
+                let d = (u8)(ln[i] - pv[i]);
+                out[i - 4] = d;
+                score += d < 128 ? d : 256 - d;
+                i += 1;
+            }
+        } else if (f == 3) {
+            while (i < end) {
+                let d = (u8)(ln[i] - ((ln[i - 4] + pv[i]) >> 1));
+                out[i - 4] = d;
+                score += d < 128 ? d : 256 - d;
+                i += 1;
+            }
+        } else {
+            while (i < end) {
+                let a = ln[i - 4];
+                let b = pv[i];
+                let c = pv[i - 4];
+                let pp = a + b - c;
+                var pa = pp - a; if (pa < 0) { pa = 0 - pa; }
+                var pb = pp - b; if (pb < 0) { pb = 0 - pb; }
+                var pc = pp - c; if (pc < 0) { pc = 0 - pc; }
+                var pred = c;
+                if (pa <= pb && pa <= pc) { pred = a; }
+                else if (pb <= pc)        { pred = b; }
+                let d = (u8)(ln[i] - pred);
+                out[i - 4] = d;
+                score += d < 128 ? d : 256 - d;
+                i += 1;
+            }
+        }
+        return score;
     }
 }
 

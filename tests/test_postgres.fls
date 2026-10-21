@@ -13,6 +13,8 @@
 
 import { Postgres, PostgresPool } from library("Postgres", "1.0");
 
+class TxTestError : Exception {}
+
 global testsRun    = 0;
 global testsFailed = 0;
 global skipped     = 0;
@@ -115,6 +117,23 @@ fn test_live_server() {
 
     let bad = db.Query("SELECT * FROM a_table_that_does_not_exist");
     check(bad != nil && ("error" in bad), "a failing query reports an error object");
+
+    // Transaction: a throw rolls back and reaches the caller unchanged.
+    let caught = nil;
+    try {
+        db.Transaction(fn() {
+            db.ExecParams("INSERT INTO _pg_test_pool(name) VALUES ($1)", ["tx-throw"]);
+            throw new TxTestError(77, "boom");
+        });
+    } catch (e) {
+        caught = e;
+    }
+    check(caught != nil, "a throw inside Transaction reaches the caller");
+    check(caught != nil && caught.Code == 77, "  with its code");
+    check(caught != nil && caught.Error == "boom", "  and its message");
+    check(caught is TxTestError, "  and its class");
+    check(db.ScalarIntParams("SELECT COUNT(*) FROM _pg_test_pool WHERE name = $1", ["tx-throw"]) == 0,
+          "  and the insert was rolled back");
 
     db.Exec("DROP TABLE IF EXISTS _pg_test_pool");
     db.Close();

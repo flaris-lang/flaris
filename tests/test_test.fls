@@ -94,6 +94,18 @@ fn Main() {
         t.notThrows(fn() { let x = 1 + 1; });
     });
 
+    // An async function's call only returns its fiber; the assertion has to
+    // await it to see what it throws.
+    t.it("throws awaits an async function", fn() {
+        t.throws(fn async () { Fiber.Sleep(1); throw(5, "async"); });
+    });
+
+    t.it("notThrows awaits an async function", fn() {
+        var fired = false;
+        try { t.notThrows(fn async () { Fiber.Sleep(1); throw(5, "async"); }); } catch (e) { fired = true; }
+        t.ok(fired);
+    });
+
     t.it("label appears in failure message", fn() {
         var msg = "";
         try { t.eq(1, 2, "my label"); } catch (e) { msg = str(e.Error); }
@@ -227,6 +239,10 @@ fn Main() {
         var fired = false;
         try { t3.throwsCode(fn() { let x = 1; }, 1); } catch (e) { fired = true; }
         t3.ok(fired);
+    });
+
+    t3.it("throwsCode awaits an async function", fn() {
+        t3.throwsCode(fn async () { Fiber.Sleep(1); throw(42, "msg"); }, 42);
     });
 
     // matches
@@ -405,6 +421,236 @@ fn Main() {
     tAgg.it("RunAll returns 1 when any test fails", fn() { tAgg.eq(aggMixed, 1); });
     let f4 = tAgg.run();
 
+    // ── only, filter, each, timeouts, beforeAll / afterAll ────────────────
+
+    let ran = { a: 0, b: 0, c: 0, all: [], body: false, after: 0, rows: [] };
+
+    let to = Test.Suite("only (2 of 3 run)");
+    to.it("not chosen", fn() { ran.a += 1; });
+    to.only("chosen 1", fn() { ran.b += 1; });
+    to.only("chosen 2", fn() { ran.b += 1; });
+    let onlyResult = to.run();
+
+    let ro1 = Test.Suite("RunAll with only: suite without (nothing runs)");
+    ro1.it("left out", fn() { ran.c += 1; });
+    let ro2 = Test.Suite("RunAll with only: suite with");
+    ro2.only("chosen", fn() { ran.c += 10; });
+    ro2.it("left out", fn() { ran.c += 100; });
+    let onlyAll = Test.RunAll([ro1, ro2]);
+
+    Test.Configure({ filter: "keep" });
+    let tfl = Test.Suite("filter");
+    tfl.it("keep me", fn() { ran.a += 10; });
+    tfl.it("drop me", fn() { ran.a += 100; });
+    tfl.skip("keep, skipped", fn() { });
+    let filterResult = tfl.run();
+    let tfs = Test.Suite("filter keeps a whole suite by its name");
+    tfs.it("any label", fn() { ran.a += 1000; });
+    tfs.run();
+    Test.Configure({ filter: nil });
+
+    let te = Test.Suite("each");
+    te.each("{a} + {b} = {sum}", [{ a: 1, b: 2, sum: 3 }, { a: 2, b: 2, sum: 4 }], fn(row) {
+        te.eq(row.a + row.b, row.sum);
+        Array.Append(ran.rows, row.sum);
+    });
+    te.each("pair {0}/{1}", [[1, "x"], [2, "y"]], fn(row) { Array.Append(ran.rows, row[1]); });
+    te.each("square of {0}", [3, 4], fn(n) { te.eq(n * n > 0, true); });
+    te.each("no placeholder", [7, 8], fn(n) { Array.Append(ran.rows, n); });
+    te.each("{a} fails", [{ a: "row" }], fn(row) { te.eq(row.a, "other"); });
+    let eachLabels = [];
+    foreach (entry in te._tests) { Array.Append(eachLabels, entry.label); }
+    let eachResult = te.run();
+
+    let tt = Test.Suite("timeouts (2 of 4 must fail)");
+    tt.timeout(100);
+    tt.it("async body in time", fn async () { Fiber.Sleep(5); });
+    tt.it("async body too slow", fn async () { Fiber.Sleep(300); }, { timeout: 30 });
+    tt.it("sync body in time", fn() { tt.ok(true); }, { timeout: 50 });
+    tt.it("suite limit applies", fn async () { Fiber.Sleep(400); }, { timeout: 0 });
+    let slowStart = Time.Millis();
+    let timeoutResult = tt.run();
+    let timeoutMs = Time.Millis() - slowStart;
+
+    let tba = Test.Suite("beforeAll / afterAll");
+    tba.beforeAll(fn() { Array.Append(ran.all, "beforeAll"); });
+    tba.beforeEach(fn() { Array.Append(ran.all, "beforeEach"); });
+    tba.afterEach(fn() { Array.Append(ran.all, "afterEach"); });
+    tba.afterAll(fn async () { Fiber.Sleep(1); Array.Append(ran.all, "afterAll"); });
+    tba.it("first", fn() { Array.Append(ran.all, "first"); });
+    tba.it("second", fn() { Array.Append(ran.all, "second"); });
+    let allResult = tba.run();
+
+    let tbf = Test.Suite("throwing beforeAll (both tests must fail)");
+    tbf.beforeAll(fn() { throw(5, "no server"); });
+    tbf.afterAll(fn() { ran.after += 1; });
+    tbf.it("one", fn() { ran.body = true; });
+    tbf.it("two", fn() { ran.body = true; });
+    let beforeAllResult = tbf.run();
+
+    let taf = Test.Suite("throwing afterAll (adds a failure)");
+    taf.afterAll(fn() { taf.ok(false, "cleanup"); });
+    taf.it("passes", fn() { taf.ok(true); });
+    let afterAllResult = taf.run();
+
+    let tsk = Test.Suite("hooks of a suite with nothing to run");
+    tsk.beforeAll(fn() { ran.after += 100; });
+    tsk.skip("skipped", fn() { });
+    tsk.run();
+
+    // ── TAP and JUnit reports ─────────────────────────────────────────────
+
+    let tmp = Directory.CreateTemp("flaris_test");
+    let tapPath = tmp + "/report.tap";
+    let xmlPath = tmp + "/report.xml";
+
+    Test.Configure({ reporter: "tap", output: tapPath });
+    let tp1 = Test.Suite("TAP <1>");
+    tp1.it("passes", fn() { tp1.ok(true); });
+    tp1.it("fails # here", fn() { tp1.eq(1, 2, "sum"); });
+    tp1.skip("later", fn() { });
+    let tp2 = Test.Suite("TAP 2");
+    tp2.it("throws", fn() { throw(77, "bad \"input\""); });
+    let tapResult = Test.RunAll([tp1, tp2]);
+    let tp3 = Test.Suite("TAP 3");
+    tp3.it("a later run", fn() { tp3.ok(true); });
+    tp3.run();
+
+    Test.Configure({ reporter: "junit", output: xmlPath });
+    let tj = Test.Suite("JUnit & <xml>");
+    tj.it("passes", fn() { tj.ok(true); });
+    tj.it("fails <here>", fn() { tj.eq("a", "b"); });
+    tj.it("errors", fn() { throw(12, "boom & bust"); });
+    tj.it("control characters", fn() { throw(13, "bell\x07 and tab\t"); });
+    tj.skip("skipped", fn() { });
+    let junitResult = tj.run();
+    let tj2 = Test.Suite("JUnit 2");
+    tj2.it("a later run", fn() { tj2.ok(true); });
+    tj2.run();
+    Test.Configure({ reporter: "pretty", output: nil });
+
+    let tapLines = File.ReadLines(tapPath);
+    let xml = File.ReadText(xmlPath);
+    Directory.DeleteAll(tmp);
+
+    // ── The environment: a child VM run ───────────────────────────────────
+
+    let child = Directory.CreateTemp("flaris_test_env");
+    File.WriteText(child + "/env_suite.fls",
+        "import { Test } from library(\"Test\", \"1.0\");\n" +
+        "fn Main() {\n" +
+        "    let t = Test.Suite(\"env\");\n" +
+        "    t.it(\"alpha one\", fn() { t.ok(true); });\n" +
+        "    t.it(\"beta two\", fn() { t.ok(true); });\n" +
+        "    let r = t.run();\n" +
+        "    Test.Bench(\"bench line\", fn() { }, 10);\n" +
+        "    return r;\n" +
+        "}\n");
+    let vm = Os.GetEnv("FLARISVM") ?? "../flaris-lang/flarisvm";
+    let envRun = Os.RunEx(vm, ["--libs=./libs", child + "/env_suite.fls"],
+                          { Env: { FLARIS_TEST_FILTER: "alpha", FLARIS_TEST_REPORTER: "junit", FLARIS_TEST_OUTPUT: nil } });
+    let plainRun = Os.RunEx(vm, ["--libs=./libs", child + "/env_suite.fls"],
+                            { Env: { FLARIS_TEST_FILTER: nil, FLARIS_TEST_REPORTER: nil, FLARIS_TEST_OUTPUT: nil } });
+    Directory.DeleteAll(child);
+    let envOut = (envRun == nil) ? "" : envRun.Stdout;
+    let plainOut = (plainRun == nil) ? "" : plainRun.Stdout;
+    var benchLine = "";
+    foreach (line in String.SplitLines(plainOut)) {
+        if (String.StartsWith(line, "bench line")) { benchLine = line; }
+    }
+
+    let tn = Test.Suite("only, filter, each, timeouts, hooks, reports");
+    tn.it("only runs the chosen tests", fn() {
+        tn.eq(ran.b, 2);
+        tn.eq(to._passed, 2);
+        tn.eq(onlyResult, 0);
+    });
+    tn.it("only in one suite of RunAll leaves the others out", fn() {
+        tn.eq(ran.c, 10);
+        tn.eq(ro1._passed, 0);
+        tn.eq(onlyAll, 0);
+    });
+    tn.it("the filter matches suite name and label", fn() {
+        tn.eq(ran.a, 1010);
+        tn.eq(tfl._passed, 1);
+        tn.eq(tfl._skipped, 1);
+        tn.eq(filterResult, 0);
+    });
+    tn.it("each fills labels from the rows", fn() {
+        tn.deepEq(eachLabels, ["1 + 2 = 3", "2 + 2 = 4", "pair 1/x", "pair 2/y", "square of 3",
+                               "square of 4", "no placeholder [0]", "no placeholder [1]", "row fails"]);
+        tn.deepEq(ran.rows, [3, 4, "x", "y", 7, 8]);
+        tn.eq(te._passed, 8);
+        tn.eq(te._failed, 1);
+        tn.eq(eachResult, 1);
+    });
+    tn.it("a test past its limit fails, the others pass", fn() {
+        tn.eq(tt._passed, 2);
+        tn.eq(tt._failed, 2);
+        tn.eq(timeoutResult, 1);
+        tn.lt(timeoutMs, 380);
+    });
+    tn.it("beforeAll and afterAll run once around the tests", fn() {
+        tn.deepEq(ran.all, ["beforeAll", "beforeEach", "first", "afterEach",
+                            "beforeEach", "second", "afterEach", "afterAll"]);
+        tn.eq(allResult, 0);
+    });
+    tn.it("a throwing beforeAll fails every test, afterAll still runs", fn() {
+        tn.eq(tbf._failed, 2);
+        tn.notOk(ran.body);
+        tn.eq(ran.after, 1);
+        tn.eq(beforeAllResult, 1);
+    });
+    tn.it("a throwing afterAll adds a failure", fn() {
+        tn.eq(taf._passed, 1);
+        tn.eq(taf._failed, 1);
+        tn.eq(afterAllResult, 1);
+    });
+    tn.it("TAP report, carried on by a later run to the same file", fn() {
+        tn.eq(tapResult, 1);
+        tn.deepEq(tapLines, [
+            "TAP version 14",
+            "ok 1 - TAP <1> > passes",
+            "not ok 2 - TAP <1> > fails \\# here",
+            "  ---",
+            "  message: \"sum: eq: expected=2 got=1\"",
+            "  severity: fail",
+            "  ...",
+            "ok 3 - TAP <1> > later # SKIP",
+            "not ok 4 - TAP 2 > throws",
+            "  ---",
+            "  message: \"ERROR [77]: bad \\\"input\\\"\"",
+            "  severity: error",
+            "  ...",
+            "ok 5 - TAP 3 > a later run",
+            "1..5"]);
+    });
+    tn.it("JUnit report, carried on by a later run to the same file", fn() {
+        tn.eq(junitResult, 1);
+        tn.startsWith(xml, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites tests=\"6\" failures=\"1\" errors=\"2\" skipped=\"1\"");
+        tn.contains(xml, "<testsuite name=\"JUnit 2\" tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"0\"");
+        tn.contains(xml, "<testsuite name=\"JUnit &amp; &lt;xml&gt;\" tests=\"5\" failures=\"1\" errors=\"2\" skipped=\"1\"");
+        tn.contains(xml, "><error message=\"ERROR [13]: bell and tab\t\">");
+        tn.contains(xml, "name=\"passes\" time=\"");
+        tn.contains(xml, "><failure message=\"eq: expected=b got=a\">eq: expected=b got=a</failure></testcase>");
+        tn.contains(xml, "name=\"fails &lt;here&gt;\"");
+        tn.contains(xml, "><error message=\"ERROR [12]: boom &amp; bust\">");
+        tn.contains(xml, "name=\"skipped\" time=\"0.000\"><skipped/></testcase>");
+        tn.endsWith(xml, "  </testsuite>\n</testsuites>\n");
+    });
+    tn.it("FLARIS_TEST_FILTER and FLARIS_TEST_REPORTER from the environment", fn() {
+        tn.notNil(envRun);
+        tn.contains(envOut, "<testcase classname=\"env\" name=\"alpha one\"");
+        tn.notOk(String.Contains(envOut, "beta two"));
+        tn.contains(envOut, "<testsuites tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"0\"");
+    });
+    tn.it("Bench prints the standard benchmark line", fn() {
+        tn.matches(benchLine, "^bench line {38}\\s*[0-9]+\\.[0-9]{2} ms  \\s*[0-9]+\\.[0-9]{4} µs/call$");
+        tn.eq(len(String.Left(benchLine, 48)), 48);
+        tn.contains(plainOut, "beta two");
+    });
+    let f6 = tn.run();
+
     // ── Benchmarks: assertion throughput ──────────────────────────────────
 
     Console.WriteLine("=== Test framework benchmarks ===");
@@ -433,5 +679,5 @@ fn Main() {
 
     Console.WriteLine("=== benchmarks done ===");
 
-    return (f1 + f2 + f3 + f4 + f5) > 0 ? 1 : 0;
+    return (f1 + f2 + f3 + f4 + f5 + f6) > 0 ? 1 : 0;
 }

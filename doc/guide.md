@@ -786,7 +786,7 @@ a = a.Append(2);             // same as Array.Append(a, 2)
 a.First()                    // 1
 a.Last()                     // 2
 a.Contains(1)                // true
-a.Sum()                      // 3.0
+Math.Sum(a)                  // 3 - Sum is a Math function, not an array method
 a = a.Reverse()
 let evens = a.Where(fn(x) { return x % 2 == 0; });
 let doubled = a.Select(fn(x) { return x * 2; });
@@ -802,23 +802,28 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 - `^^` is exponentiation: `2 ^^ 3` - `8`. It binds tightest and nests to the right: `2 * 3 ^^ 2` is `18`, `2 ^^ 3 ^^ 2` is `512`, and `-2 ^^ 2` is `-4`
 - An assignment is an expression: `a = b = 5` sets both, `let c = (a = 3)` stores and reads `3`. It is still an error as an `if`/`while` condition.
 - `++`/`--` work on variables, fields and elements: `i++`, `o.n++`, `a[i]--`
+- A `nil` operand on either side makes the result `nil`, for every arithmetic and bitwise operator: `nil + 5`, `"a" + nil` and `-nil` are all `nil`. A misspelled field (`o.cuont + 1`) gives `nil` too, not a number. Supply a default with `??` when you need one: `(o.count ?? 0) + 1`
 
 **Bitwise:** `&` `|` `^` `~` `<<` `>>` `>>>` (and, or, xor, not, shl, arithmetic shr, logical shr)
 
+- A cast to a sized int keeps the low bits: `(u8)x` gives what `x & 255` gives for an int, and `(i8)x` also sign-extends them, so `(i8)200` is `-56`. `(u16)`, `(i16)`, `(u32)` and `(i32)` do the same for 16 and 32 bits
+
 **Comparison:** `==` `!=` `<` `<=` `>` `>=` `is`
+
+- `x is C` tests for an instance of class `C`, subclasses included; with any other right side it compares identity (`x is nil`). It is not a type test: use `Type.IsInt(x)`, `Type.IsString(x)` and the other `Type.Is*` functions for that
 
 **Logical:** `&&` `||` `!`  - aliases: `and` `or`
 
 - Short-circuiting: `x && y` only evaluates `y` if `x` is truthy
 - Falsy: `nil`, `false`, `0`, `0.0`, `""`, `'\0'`, empty arrays/objects; everything else is truthy
-- `x && y` yields the value of `y` when `x` is truthy, otherwise `false`; `x || y` yields `true` when `x` is truthy, otherwise the value of `y`
+- `x && y` and `x || y` always yield a bool, as in C#: `x && y` is `true` when both are truthy, `x || y` when either is. For a fallback value use `??`: `port ?? 8080`
 - `and` / `or` are exact tokenizer aliases - identical precedence and behaviour to `&&` / `||`
 
 **Increment / Decrement:** `++` `--` (prefix or postfix)
 
 `++` and `--` work on variables (locals and globals), fields and array elements, in
 either position. They mutate in place and **produce no value** - they are statements
-and cannot be used inside expressions. The target must be numeric.
+and cannot be used inside expressions. The target must be numeric, or `nil` (it stays `nil`).
 
 ```js
 let i = 0;
@@ -872,8 +877,21 @@ conn?.Close();                        // no call when conn is nil
 ```js
 array[i]       // 0-based integer index
 object["key"]  // string key (equivalent to object.key)
+object[42]     // an int or char key names its text: object["42"]
 string[i]      // byte at index i
 block[i]       // element i of a block, as an int
+```
+
+A negative index counts from the end, as in Python: `a[-1]` is the last
+element and `a[-len(a)]` the first. This works for arrays, strings and blocks,
+both when reading and when assigning (`a[-1] = 0`). An index before the start
+or at or after the end raises `Exception.OutOfBounds`.
+
+```js
+let a = [10, 20, 30];
+a[-1];         // 30
+a[-2] = 99;    // a is now [10, 99, 30]
+"abc"[-1];     // 'c'
 ```
 
 Null-safe: `nil[x]` returns `nil`.
@@ -957,7 +975,7 @@ When in doubt, use parentheses.
 
 ---
 
-# 6. Control Flow
+## 6. Control Flow
 
 Every statement ends with `;`. Newlines are not statement terminators.
 
@@ -1051,8 +1069,11 @@ foreach (ch in "hello") {
 | HashMap, OrderedMap | key | value (OrderedMap: insertion order) |
 
 The loop variables need no annotation: over an `[int]`, `[float]`, `[char]` or
-`[bool]` array the value has the element type, over a string it is a `char`,
-and the index is an `int`. They cannot be assigned inside the body.
+`[bool]` array the value has the element type, over a `[[T]]` matrix it is a
+`[T]` row, over a string it is a `char`,
+and the index is an `int`. They cannot be assigned inside the body, but the
+value they name can be changed - `foreach (p in points) { p.x += 1; }` moves
+every point.
 
 ## Iter
 
@@ -1148,6 +1169,25 @@ class NetworkError : Exception {}
 class TimeoutError : NetworkError {}
 
 throw new NetworkError(503, "service unavailable");
+```
+
+A subclass that carries more data declares its fields and its own constructor,
+and passes the code and message on with `super(code, msg)`:
+
+```js
+class ParseError : Exception {
+    let line = 0;
+    fn Constructor(msg: string, line: int) {
+        super(Exception.InvalidArguments, msg);   // sets Code and Error, captures StackTrace
+        this.line = line;
+    }
+}
+
+try {
+    throw new ParseError("unexpected '}'", 12);
+} catch (e) {
+    Console.WriteLine(e.ToString(), " at line ", e.line);   // ParseError (code 3): unexpected '}' at line 12
+}
 ```
 
 **Try / Catch / Finally:**
@@ -1487,17 +1527,38 @@ log("result", 42);       // ✓ OK
 log("result", [1,2,3]);  // ✓ OK - any type accepted
 ```
 
+Array types nest one level for numbers, chars and bools: `[[float]]` is a matrix
+whose rows are `[float]` arrays, and code typed this way can run compiled.
+
+```js
+fn trace(m: [[float]]): float {
+    var s = 0.0;
+    iter (i from 0 to len(m)) { s += m[i][i]; }
+    return s;
+}
+
+let m: [[float]] = [[0.5, 9.0], [9.0, 1.25]];
+trace(m);    // 1.75
+```
+
+A matrix only takes rows that are exactly `[T]` arrays; the reference lists the
+rules under Run-time checks.
+
 Type annotations are **completely optional** - all existing code works without them. See **Reference R3** for the full type keyword list and union type syntax.
 
 ### Parameters
 
-By default all parameters are required. Append `?` to a parameter name to mark a parameter as optional - the VM will pass `nil` for any omitted trailing arguments:
+A typed parameter is required: leaving it out is a compile error. Append `?` to a parameter name to make it optional. An untyped (or `any`) parameter is always optional. The VM passes `nil` for every omitted trailing argument:
 
 ```js
-fn add(a, b) { return a + b; }
+fn add(a: int, b: int) { return a + b; }
 
 add(1, 2);   // OK
-add(1);      // Error: too few arguments
+add(1);      // Error: Function 'add' expects 2 arguments, got 1.
+
+fn show(a, b) { Console.WriteLine(a, " ", b); }
+
+show(1);     // 1 nil - an untyped parameter may be left out
 
 
 fn greet(name?: string) {
@@ -1554,6 +1615,11 @@ fn async fetchData(url) {
 let fiber = fetchData("http://example.com");  // returns fiber
 let data = await fiber;                        // wait for result
 ```
+
+The call only creates the fiber; the body runs when the fiber is awaited (`await`,
+`Fiber.AwaitAll`). An async call used as a statement - `fetchData(url);` with no
+`await` and the fiber not kept - therefore never runs, and the analyzer warns about
+it (code 2024).
 
 Error handling in async:
 
@@ -2198,14 +2264,17 @@ Fiber.Resume(f, true);  // caller continues immediately, fiber runs independentl
 
 ### Fiber States
 
+`Fiber.Status(f)` returns one of these, also available as `Fiber.Status.New` and so on:
+
 | State | Meaning |
 | ------- | --------- |
-| READY | Queued to run |
-| RUNNING | Currently executing |
-| YIELD | Yielded a value |
-| WAIT_FIBER | Waiting for another fiber |
-| WAIT_IO | Sleeping or waiting for IO/timer |
-| FINISHED | Completed |
+| New (0) | Created, not started yet |
+| Running (1) | Currently executing |
+| Suspended (2) | Not running: sleeping (`Fiber.Sleep`), parked (`Fiber.Park`), or queued to run again |
+| Finished (3) | Completed |
+| WaitIO (4) | Waiting for I/O |
+| Yield (5) | Yielded a value |
+| WaitFiber (6) | Waiting for another fiber |
 
 ### Yield
 
@@ -2732,7 +2801,8 @@ while ((line = Next()) != nil) { ... }
 
 - Convert explicitly - `(int)x`, `Convert.ToInt(s)`. Note that `<<`, `>>`, `>>>`, `&`,
   `|` and `^` run on integers only and never widen to float. `+` is never
-  reported: it falls back to string concatenation for any operand pair.
+  reported: it falls back to string concatenation for any operand pair without
+  a `nil`, and a `nil` operand makes any arithmetic result `nil`.
 
 ## 12. Debugging
 
@@ -3847,7 +3917,7 @@ flarispm add https://example.com/MyLib.flx --key <ed25519-pubkey-hex>
 
 Git/source packages are compiled locally and left unsigned on purpose - a signature applied at install time would attest to *you*, not the publisher - so they rely on the git ref plus fingerprint instead. To enforce signatures at runtime, trust the publisher's key (`flarisvm --import-key <name> <pubkey>`) and run with `--require-signed`.
 
-**A `.flx` is executable code, not a sandbox.** It can touch the filesystem, spawn processes, and (with `--unsafe`) call FFI and raw memory - so only run bytecode you trust, and pin third-party libraries to a known hash. Note that the JIT widens the trust surface: JIT-compiled code omits the interpreter's runtime type checks, so run untrusted bytecode with `--jit-disable`. See Reference R1 "Security model".
+**A `.flx` is executable code, not a sandbox.** It can touch the filesystem, spawn processes, and (with `--unsafe`) call FFI and raw memory - so only run bytecode you trust, and pin third-party libraries to a known hash. Note that the JIT widens the trust surface: JIT-compiled code omits the interpreter's runtime type checks, so a `.flx` is JIT-compiled only when it is signed by a trusted key - anything else runs in the interpreter. See Reference R1 "Security model".
 
 ---
 

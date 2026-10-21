@@ -1,0 +1,683 @@
+// Tar.fls - tar archive reading and writing, plain or gzip-compressed.
+// Version: 1.0
+//
+// Writes POSIX ustar. What ustar cannot hold goes into a pax extended header
+// (an "x" entry in front of the one it describes): a name or link target that
+// is not ASCII or does not fit its field (100 bytes, a name also 255 split at a
+// "/"), and an id or time the octal fields cannot hold. Reads ustar, pax ("x"
+// and global "g" headers), GNU ("L" and "K" long names, base-256 numbers) and
+// pre-POSIX v7 headers. gzip goes through the Deflate library: Read sniffs it,
+// ToGzip and Save (for a .gz or .tgz path) write it.
+//
+// Exported classes:
+//   Tar       - Create / Read / List / ExtractTo / SafeName / LastError
+//   TarWriter - AddFile / AddDirectory / AddSymlink / AddHardLink / AddTree /
+//               Count / ToBlock / ToGzip / Save
+//
+// Usage:
+//   import { Tar } from library("Tar", "1.0");
+//
+//   let w = Tar.Create();
+//   w.AddFile("hello.txt", "hello world", { mode: 420, mtime: 1700000000 });
+//   w.AddDirectory("docs");
+//   w.AddSymlink("latest.txt", "hello.txt");
+//   w.AddTree("./dist", "app/");                  // a directory from disk
+//   let tgz = w.ToGzip();                          // w.ToBlock() for a plain tar
+//
+//   foreach (e in Tar.Read(tgz)) {                 // gzip or plain, sniffed
+//       Console.WriteLine(e.name, " ", e.type, " ", e.size);
+//   }
+//   let r = Tar.ExtractTo(tgz, "./out");           // { written, skipped }
+//
+// Entries - Read returns them with data, List without:
+//   { name, type, size, mode, mtime, uid, gid, uname, gname, linkname, data }
+//   type is "file", "dir", "symlink", "hardlink", "char", "block", "fifo" or
+//   "other"; a directory's name ends in "/". data is the payload as a block,
+//   empty for anything but a file. mode holds the permission bits (07777),
+//   mtime Unix seconds.
+//
+// Writer options, every key optional: mode (default 0644 for a file, 0755 for
+// a directory, 0777 for a link), mtime (Unix seconds, default now), uid and
+// gid (default 0), uname and gname (default ""). File data is a string or a
+// block of 1-byte elements.
+//
+// Read and List return nil when the bytes are not a tar archive or are damaged
+// (a header whose checksum does not add up, a header or entry cut off by the
+// end); LastError() says why. An archive that just stops after a whole entry, with
+// no end marker, reads as far as it goes.
+//
+// ExtractTo treats every name as hostile. An absolute or drive-relative name,
+// a ".." segment, a path through a symlink already on disk, a symlink whose
+// target leaves the directory and a hard link to anything outside it are
+// skipped and named in `skipped`, never written; so are device and fifo
+// entries. A symlink already on disk at an entry's own path is replaced, not
+// written through. Modes are masked to 0755 (no setuid, setgid, sticky or
+// group/other write) as Zip does, and directories keep owner rwx so their
+// contents can be written.
+//
+// Limits: the whole archive is held in memory both ways, so an entry is capped
+// by the 2 GiB block limit.
+
+import { Inflate, Deflate } from library("Deflate", "1.0");
+
+const TAR_BLOCK  = 512;
+const TAR_RECORD = 10240;            // tar's default 20-block record; archives end on one
+const TAR_OCT7   = 2097151;          // largest value of a 7-digit octal field (uid, gid)
+const TAR_OCT11  = 8589934591;       // largest value of an 11-digit octal field (size, mtime)
+
+global _tarErr = nil;
+
+// ---------------------------------------------------------------------------
+//  Kernels - typed, so they compile to native code
+// ---------------------------------------------------------------------------
+
+// Writes v as width-1 zero-padded octal digits and a NUL at b[off]; false when
+// v does not fit (the field then holds its low digits).
+fn _tarPutOctal(b: block, off: int, width: int, v: int): bool {
+    var x: int = v;
+    var i: int = off + width - 2;
+    while (i >= off) {
+        b[i] = 48 + (x & 7);
+        x = x >> 3;
+        i -= 1;
+    }
+    b[off + width - 1] = 0;
+    return x == 0;
+}
+
+// A numeric field: octal digits after leading spaces or NULs, up to the first
+// other byte, or GNU base-256 when the top bit of the first byte is set.
+// -1 for a negative or oversized base-256 value.
+fn _tarGetNum(b: block, off: int, width: int): int {
+    let end: int = off + width;
+    let first: int = b[off];
+    if ((first & 128) != 0) {
+        if (first != 128) return -1;
+        var bv: int = 0;
+        var k: int = off + 1;
+        while (k < end) {
+            if (bv > 36028797018963967) return -1;
+            bv = (bv << 8) | b[k];
+            k += 1;
+        }
+        return bv;
+    }
+    var i: int = off;
+    while (i < end && (b[i] == 32 || b[i] == 0)) i += 1;
+    var v: int = 0;
+    while (i < end) {
+        let c: int = b[i];
+        if (c < 48 || c > 55) break;
+        v = v * 8 + (c - 48);
+        i += 1;
+    }
+    return v;
+}
+
+// Unsigned byte sum of the header at off with the checksum field counted as
+// 8 spaces, as POSIX defines the checksum.
+fn _tarSum(b: block, off: int): int {
+    var s: int = 256;
+    var i: int = off;
+    let mid: int = off + 148;
+    while (i < mid) {
+        s += b[i];
+        i += 1;
+    }
+    i = off + 156;
+    let end: int = off + 512;
+    while (i < end) {
+        s += b[i];
+        i += 1;
+    }
+    return s;
+}
+
+// The same sum with bytes taken as signed, as some old tars computed it.
+fn _tarSumSigned(b: block, off: int): int {
+    var s: int = _tarSum(b, off);
+    var i: int = off;
+    let end: int = off + 512;
+    while (i < end) {
+        if ((i < off + 148 || i >= off + 156) && b[i] >= 128) s -= 256;
+        i += 1;
+    }
+    return s;
+}
+
+fn _tarIsZero(b: block, off: int): bool {
+    var i: int = off;
+    let end: int = off + 512;
+    while (i < end) {
+        if (b[i] != 0) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fn _tarIsZeroRange(b: block, from: int, to: int): bool {
+    var i: int = from;
+    while (i < to) {
+        if (b[i] != 0) return false;
+        i += 1;
+    }
+    return true;
+}
+
+// Length of the NUL-terminated text in a fixed-width field.
+fn _tarFieldLen(b: block, off: int, width: int): int {
+    var n: int = 0;
+    while (n < width && b[off + n] != 0) n += 1;
+    return n;
+}
+
+fn _tarPad(n: int): int {
+    return (n + 511) & ~511;
+}
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+
+fn _tarStr(b: block, off: int, width: int): string {
+    let n = _tarFieldLen(b, off, width);
+    if (n == 0) return "";
+    return Buffer.ToString(b, off, n);
+}
+
+fn _tarIsAscii(s: string): bool {
+    return String.Utf8Length(s) == len(s);
+}
+
+// One pax record, "<len> <key>=<value>\n", where <len> counts itself.
+fn _tarPaxRecord(key: string, value: string): string {
+    let body = len(key) + len(value) + 3;
+    var total = body + len(str(body));
+    if (len(str(total)) > len(str(body))) { total = body + len(str(total)); }
+    return str(total) + " " + key + "=" + value + "\n";
+}
+
+// [prefix, name] for the ustar fields, or nil when the name needs pax.
+fn _tarSplit(name: string): array {
+    let n = len(name);
+    if (!_tarIsAscii(name)) return nil;
+    if (n <= 100) return ["", name];
+    if (n > 256) return nil;
+    var i = (n - 1 < 155) ? n - 1 : 155;
+    while (i > 0) {
+        if (String.CharAt(name, i) == '/' && n - i - 1 <= 100 && n - i - 1 > 0) {
+            return [String.Substr(name, 0, i), String.Substr(name, i + 1)];
+        }
+        i -= 1;
+    }
+    return nil;
+}
+
+fn _tarTypeName(flag: int): string {
+    if (flag == 48 || flag == 0 || flag == 55) return "file";
+    if (flag == 53) return "dir";
+    if (flag == 50) return "symlink";
+    if (flag == 49) return "hardlink";
+    if (flag == 51) return "char";
+    if (flag == 52) return "block";
+    if (flag == 54) return "fifo";
+    return "other";
+}
+
+// Applies pax records (the payload of an "x" or "g" entry) to `into`.
+fn _tarPaxParse(text: string, into: object): bool {
+    var p = 0;
+    let n = len(text);
+    while (p < n) {
+        let sp = String.IndexOfFrom(text, " ", p);
+        if (sp < 0) return false;
+        let rlen = Convert.ParseInt(String.Substr(text, p, sp - p));
+        if (rlen == nil || rlen <= sp - p + 1 || p + rlen > n) return false;
+        let rec = String.Substr(text, sp + 1, rlen - (sp - p) - 2);   // without the "\n"
+        let eq = String.IndexOf(rec, "=");
+        if (eq > 0) { into[String.Substr(rec, 0, eq)] = String.Substr(rec, eq + 1); }
+        p += rlen;
+    }
+    return true;
+}
+
+// The integer part of a pax decimal ("1700000000.25" or "-5.5"), or nil.
+fn _tarPaxInt(v): int|nil {
+    if (v == nil) return nil;
+    let dot = String.IndexOf(v, ".");
+    return Convert.ParseInt(dot < 0 ? v : String.Substr(v, 0, dot));
+}
+
+fn _tarApplyPax(e: object, src: object) {
+    if (src["path"] != nil)     { e.name = src["path"]; }
+    if (src["linkpath"] != nil) { e.linkname = src["linkpath"]; }
+    if (src["mtime"] != nil)    { e.mtime = _tarPaxInt(src["mtime"]) ?? e.mtime; }
+    if (src["uid"] != nil)      { e.uid = _tarPaxInt(src["uid"]) ?? e.uid; }
+    if (src["gid"] != nil)      { e.gid = _tarPaxInt(src["gid"]) ?? e.gid; }
+    if (src["uname"] != nil)    { e.uname = src["uname"]; }
+    if (src["gname"] != nil)    { e.gname = src["gname"]; }
+}
+
+fn _tarFail(why: string) {
+    _tarErr = why;
+    return nil;
+}
+
+// The entries of a tar (or tar.gz) image; with `withData` each carries its
+// payload. nil with _tarErr set when the image is not a readable archive.
+fn _tarParse(input: block, withData: bool): array {
+    _tarErr = nil;
+    if (input == nil) return _tarFail("no data");
+    var b = input;
+    if (len(b) >= 2 && b[0] == 31 && b[1] == 139) {
+        b = Inflate.Gzip(b);
+        if (b == nil) return _tarFail("gzip stream does not decode");
+    }
+    let n = len(b);
+    let out = [];
+    var off = 0;
+    var pax = {};          // overrides for the next entry
+    var globalPax = {};    // overrides for every entry that follows
+    var paxSeen = false;
+    var globalSeen = false;
+    var longName = nil;
+    var longLink = nil;
+    while (off + TAR_BLOCK <= n) {
+        if (_tarIsZero(b, off)) break;
+        let want = _tarGetNum(b, off + 148, 8);
+        if (want != _tarSum(b, off) && want != _tarSumSigned(b, off)) {
+            return _tarFail("bad header checksum at offset " + str(off));
+        }
+        let flag: int = b[off + 156];
+        var size = _tarGetNum(b, off + 124, 12);
+        if (paxSeen && pax["size"] != nil) { size = _tarPaxInt(pax["size"]) ?? -1; }
+        if (size < 0) return _tarFail("bad size at offset " + str(off));
+        let dataOff = off + TAR_BLOCK;
+        // Links, directories and devices carry no payload whatever the size says.
+        let carries = flag != 49 && flag != 50 && flag != 51 && flag != 52 && flag != 53 && flag != 54;
+        let body = carries ? size : 0;
+        if (dataOff + body > n) return _tarFail("entry at offset " + str(off) + " runs past the end");
+        let next = dataOff + _tarPad(body);
+
+        if (flag == 120 || flag == 103) {                 // 'x' / 'g' pax headers
+            let into = (flag == 120) ? pax : globalPax;
+            if (flag == 120) { paxSeen = true; } else { globalSeen = true; }
+            if (!_tarPaxParse(Buffer.ToString(b, dataOff, size), into)) {
+                return _tarFail("bad pax header at offset " + str(off));
+            }
+            off = next;
+            continue;
+        }
+        if (flag == 76 || flag == 75) {                   // GNU 'L' / 'K' long names
+            let s = Buffer.ToString(b, dataOff, _tarFieldLen(b, dataOff, size));
+            if (flag == 76) { longName = s; } else { longLink = s; }
+            off = next;
+            continue;
+        }
+
+        var name = _tarStr(b, off, 100);
+        // POSIX ustar ("ustar\0") adds a prefix field; GNU's "ustar  " uses that
+        // space for other things.
+        if (b[off + 257] == 117 && b[off + 258] == 115 && b[off + 262] == 0) {
+            let prefix = _tarStr(b, off + 345, 155);
+            if (len(prefix) > 0) { name = prefix + "/" + name; }
+        }
+        var link = _tarStr(b, off + 157, 100);
+        var e = {
+            name: name, type: _tarTypeName(flag), size: body,
+            mode: _tarGetNum(b, off + 100, 8) & 4095,
+            mtime: _tarGetNum(b, off + 136, 12),
+            uid: _tarGetNum(b, off + 108, 8), gid: _tarGetNum(b, off + 116, 8),
+            uname: _tarStr(b, off + 265, 32), gname: _tarStr(b, off + 297, 32),
+            linkname: link
+        };
+        if (longName != nil) { e.name = longName; longName = nil; }
+        if (longLink != nil) { e.linkname = longLink; longLink = nil; }
+        if (globalSeen) { _tarApplyPax(e, globalPax); }
+        if (paxSeen) {
+            _tarApplyPax(e, pax);
+            pax = {};
+            paxSeen = false;
+        }
+        // A v7 archive marks a directory only by its trailing slash.
+        if (e.type == "file" && String.EndsWith(e.name, "/")) { e.type = "dir"; e.size = 0; }
+        if (e.type == "dir" && !String.EndsWith(e.name, "/")) { e.name = e.name + "/"; }
+        if (withData) {
+            e.data = (e.type == "file" && body > 0) ? Buffer.Slice(b, dataOff, body) : Buffer.Create(0, 1);
+        }
+        Array.Append(out, e);
+        off = next;
+    }
+    if (off < n && off + TAR_BLOCK > n && !_tarIsZeroRange(b, off, n)) {
+        return _tarFail("truncated header at offset " + str(off));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Extraction safety (the same rules as Zip's ExtractAll)
+// ---------------------------------------------------------------------------
+
+fn _tarSafeRel(name: string): string {
+    if (name == nil || len(name) == 0) return nil;
+    let s = String.Replace(name, "\\", "/");
+    if (String.StartsWith(s, "/")) return nil;
+    if (len(s) >= 2 && String.CharAt(s, 1) == ':') return nil;
+    let parts = [];
+    foreach (sg in String.Split(s, "/")) {
+        if (len(sg) == 0 || sg == ".") { continue; }
+        if (sg == "..") return nil;
+        Array.Append(parts, sg);
+    }
+    if (len(parts) == 0) return nil;
+    return String.Join(parts, "/");
+}
+
+fn _tarIsUnder(child: string, root: string): bool {
+    if (child == root) return true;
+    return String.StartsWith(child, root + "/");
+}
+
+// A directory on the way to `rel` that is a symlink leads anywhere on disk.
+fn _tarCrossesSymlink(root: string, rel: string): bool {
+    let segs = String.Split(rel, "/");
+    var cur = root;
+    var i = 0;
+    while (i < len(segs) - 1) {
+        cur = cur + "/" + segs[i];
+        i += 1;
+        let st = File.Stat(cur);
+        if (st != nil && st.IsSymlink) return true;
+    }
+    return false;
+}
+
+fn _tarSafeMode(mode: int, isDir: bool): int {
+    let m = mode & 493;                  // 0755
+    return isDir ? (m | 448) : m;        // a directory keeps owner rwx
+}
+
+// Clears whatever sits at `path` that is not a directory to keep, so a link
+// there is replaced rather than followed.
+fn _tarClear(path: string): int {
+    let st = File.Stat(path);
+    if (st != nil && (st.IsSymlink || !st.IsDir)) { File.Delete(path); }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+//  TarWriter
+// ---------------------------------------------------------------------------
+
+class TarWriter {
+    let _items = nil;
+
+    fn Constructor() { this._items = []; }
+
+    fn _add(name: string, flag: int, data: block, link: string, defMode: int, opts): int {
+        if (name == nil || len(name) == 0) return 0;
+        var mode  = defMode;
+        var mtime = Time.Now();
+        var uid   = 0;
+        var gid   = 0;
+        var uname = "";
+        var gname = "";
+        if (opts != nil) {
+            if (opts.mode  != nil) { mode  = opts.mode;  }
+            if (opts.mtime != nil) { mtime = opts.mtime; }
+            if (opts.uid   != nil) { uid   = opts.uid;   }
+            if (opts.gid   != nil) { gid   = opts.gid;   }
+            if (opts.uname != nil) { uname = opts.uname; }
+            if (opts.gname != nil) { gname = opts.gname; }
+        }
+        Array.Append(this._items, {
+            name: name, flag: flag, data: data, link: link, mode: mode & 4095,
+            mtime: mtime, uid: uid, gid: gid, uname: uname, gname: gname
+        });
+        return 1;
+    }
+
+    // A regular file. `data` is a string or a block of 1-byte elements.
+    fn AddFile(name: string, data, opts?): int {
+        var b = data;
+        if (data == nil) { b = Buffer.Create(0, 1); }
+        else if (Type.Of(data) == Type.String) { b = Buffer.FromString(data); }
+        return this._add(name, 48, b, "", 420, opts);
+    }
+
+    // A directory entry; the name gets its trailing "/".
+    fn AddDirectory(name: string, opts?): int {
+        let n = String.EndsWith(name, "/") ? name : name + "/";
+        return this._add(n, 53, nil, "", 493, opts);
+    }
+
+    // A symbolic link entry pointing at `target`.
+    fn AddSymlink(name: string, target: string, opts?): int {
+        return this._add(name, 50, nil, target, 511, opts);
+    }
+
+    // A hard link entry: `name` is another name for the earlier entry `target`.
+    fn AddHardLink(name: string, target: string, opts?): int {
+        return this._add(name, 49, nil, target, 420, opts);
+    }
+
+    // Everything under the directory `dir` on disk, named by its path below
+    // `dir` with `prefix` in front: files with their mode and time, directories,
+    // and symlinks as links (never followed). Returns the entries added.
+    fn AddTree(dir: string, prefix?: string): int {
+        let root = Path.Resolve(dir);
+        if (root == nil || !Directory.Exists(root)) return 0;
+        var p = prefix ?? "";
+        if (len(p) > 0 && !String.EndsWith(p, "/")) { p = p + "/"; }
+        return this._walk(root, p);
+    }
+
+    fn _walk(abs: string, rel: string): int {
+        var n = 0;
+        let names = Directory.List(abs);
+        Array.Sort(names);
+        foreach (nm in names) {
+            let path = Path.Combine(abs, nm);
+            let st = File.Stat(path);
+            if (st == nil) { continue; }
+            let o = { mode: st.Mode & 4095, mtime: st.Modified };
+            if (st.IsSymlink) {
+                let target = File.ReadLink(path);
+                if (target != nil) { n += this.AddSymlink(rel + nm, target, o); }
+            } else if (st.IsDir) {
+                n += this.AddDirectory(rel + nm, o);
+                n += this._walk(path, rel + nm + "/");
+            } else if (st.IsFile) {
+                let data = File.ReadAllBytes(path);
+                if (data != nil) { n += this.AddFile(rel + nm, data, o); }
+            }
+        }
+        return n;
+    }
+
+    fn Count(): int { return len(this._items); }
+
+    // The pax records an item needs, "" when ustar holds it all.
+    fn static _paxFor(it): string {
+        var recs = "";
+        if (_tarSplit(it.name) == nil) { recs += _tarPaxRecord("path", it.name); }
+        if (len(it.link) > 100 || !_tarIsAscii(it.link)) { recs += _tarPaxRecord("linkpath", it.link); }
+        if (it.uid < 0 || it.uid > TAR_OCT7) { recs += _tarPaxRecord("uid", str(it.uid)); }
+        if (it.gid < 0 || it.gid > TAR_OCT7) { recs += _tarPaxRecord("gid", str(it.gid)); }
+        if (it.mtime < 0 || it.mtime > TAR_OCT11) { recs += _tarPaxRecord("mtime", str(it.mtime)); }
+        if (len(it.uname) > 31 || !_tarIsAscii(it.uname)) { recs += _tarPaxRecord("uname", it.uname); }
+        if (len(it.gname) > 31 || !_tarIsAscii(it.gname)) { recs += _tarPaxRecord("gname", it.gname); }
+        return recs;
+    }
+
+    // One 512-byte ustar header at b[off]. Values the fields cannot hold are
+    // written as 0 (or cut short) - a pax header in front carries them.
+    fn static _header(b: block, off: int, name: string, flag: int, size: int, it) {
+        var nm = name;
+        var prefix = "";
+        let split = _tarSplit(name);
+        if (split != nil) { prefix = split[0]; nm = split[1]; }
+        Buffer.CopyStringAt(b, off, nm, len(nm) < 100 ? len(nm) : 100);
+        _tarPutOctal(b, off + 100, 8, it.mode);
+        _tarPutOctal(b, off + 108, 8, (it.uid >= 0 && it.uid <= TAR_OCT7) ? it.uid : 0);
+        _tarPutOctal(b, off + 116, 8, (it.gid >= 0 && it.gid <= TAR_OCT7) ? it.gid : 0);
+        _tarPutOctal(b, off + 124, 12, size);
+        _tarPutOctal(b, off + 136, 12, (it.mtime >= 0 && it.mtime <= TAR_OCT11) ? it.mtime : 0);
+        b[off + 156] = flag;
+        let link = it.link;
+        if (len(link) > 0) { Buffer.CopyStringAt(b, off + 157, link, len(link) < 100 ? len(link) : 100); }
+        Buffer.CopyStringAt(b, off + 257, "ustar", 5);           // magic "ustar\0"
+        b[off + 263] = 48; b[off + 264] = 48;                     // version "00"
+        if (len(it.uname) > 0) { Buffer.CopyStringAt(b, off + 265, it.uname, len(it.uname) < 31 ? len(it.uname) : 31); }
+        if (len(it.gname) > 0) { Buffer.CopyStringAt(b, off + 297, it.gname, len(it.gname) < 31 ? len(it.gname) : 31); }
+        _tarPutOctal(b, off + 329, 8, 0);
+        _tarPutOctal(b, off + 337, 8, 0);
+        if (len(prefix) > 0) { Buffer.CopyStringAt(b, off + 345, prefix, len(prefix)); }
+        _tarPutOctal(b, off + 148, 7, _tarSum(b, off));           // 6 digits, NUL
+        b[off + 155] = 32;                                         // then a space
+    }
+
+    // The archive as a plain tar block.
+    fn ToBlock(): block {
+        let paxes = [];
+        var total = 0;
+        foreach (it in this._items) {
+            let pax = TarWriter._paxFor(it);
+            Array.Append(paxes, pax);
+            if (len(pax) > 0) { total += TAR_BLOCK + _tarPad(len(pax)); }
+            total += TAR_BLOCK + _tarPad(it.data == nil ? 0 : len(it.data));
+        }
+        total += 2 * TAR_BLOCK;
+        total = ((total + TAR_RECORD - 1) / TAR_RECORD) * TAR_RECORD;
+
+        let b = Buffer.Create(total, 1);
+        var off = 0;
+        var i = 0;
+        while (i < len(this._items)) {
+            let it = this._items[i];
+            let pax = paxes[i];
+            i += 1;
+            if (len(pax) > 0) {
+                TarWriter._header(b, off, "././@PaxHeader", 120, len(pax),
+                    { mode: 420, uid: 0, gid: 0, mtime: (it.mtime >= 0 && it.mtime <= TAR_OCT11) ? it.mtime : 0,
+                      link: "", uname: "", gname: "" });
+                Buffer.CopyStringAt(b, off + TAR_BLOCK, pax, len(pax));
+                off += TAR_BLOCK + _tarPad(len(pax));
+            }
+            let size = it.data == nil ? 0 : len(it.data);
+            TarWriter._header(b, off, it.name, it.flag, size, it);
+            off += TAR_BLOCK;
+            if (size > 0) {
+                Buffer.Copy(it.data, 0, b, off, size);
+                off += _tarPad(size);
+            }
+        }
+        return b;
+    }
+
+    // The archive as tar.gz.
+    fn ToGzip(): block {
+        return Deflate.Gzip(this.ToBlock());
+    }
+
+    // Writes the archive to `path`, gzip-compressed when it ends in .gz or .tgz.
+    fn Save(path: string): bool {
+        let low = String.ToLower(path);
+        let gz = String.EndsWith(low, ".gz") || String.EndsWith(low, ".tgz");
+        let bytes = gz ? this.ToGzip() : this.ToBlock();
+        if (bytes == nil) return false;
+        let dir = Path.GetDirectoryName(path);
+        if (dir != nil && len(dir) > 0 && !Directory.Exists(dir)) { Directory.Ensure(dir); }
+        return File.WriteAllBytes(path, bytes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Tar - factories and whole-archive operations
+// ---------------------------------------------------------------------------
+
+class Tar {
+    fn static Create(): TarWriter { return new TarWriter(); }
+
+    // Every entry with its payload, or nil (see LastError) for bytes that are
+    // not a readable archive. `data` is a tar or tar.gz image, as File.ReadAllBytes
+    // returns one.
+    fn static Read(data: block): array {
+        return _tarParse(data, true);
+    }
+
+    // As Read, without the payloads.
+    fn static List(data: block): array {
+        return _tarParse(data, false);
+    }
+
+    // Why the last Read, List or ExtractTo failed, or nil.
+    fn static LastError() { return _tarErr; }
+
+    // The name reduced to the relative path ExtractTo would write, or nil when
+    // it would escape the destination.
+    fn static SafeName(name: string): string { return _tarSafeRel(name); }
+
+    // Writes the archive's files, directories and links under `dir` (created if
+    // missing). Returns { written, skipped } - the count written and the names
+    // refused - or nil when `data` is not a readable archive.
+    fn static ExtractTo(data: block, dir: string) {
+        let entries = _tarParse(data, true);
+        if (entries == nil) return nil;
+        if (!Directory.Ensure(dir)) return _tarFail("cannot create " + dir);
+        let root = Path.Resolve(dir);
+        var written = 0;
+        let skipped = [];
+        let dirs = [];
+        foreach (e in entries) {
+            let rel = _tarSafeRel(e.name);
+            let dest = (rel == nil) ? nil : Path.Resolve(Path.Combine(root, rel));
+            if (dest == nil || !_tarIsUnder(dest, root) || dest == root || _tarCrossesSymlink(root, rel)) {
+                Array.Append(skipped, e.name);
+                continue;
+            }
+            let parent = Path.GetDirectoryName(dest);
+            if (e.type == "dir") {
+                _tarClear(dest);
+                if (!Directory.Ensure(dest)) { Array.Append(skipped, e.name); continue; }
+                Array.Append(dirs, [dest, e]);
+                written += 1;
+            } else if (e.type == "file") {
+                Directory.Ensure(parent);
+                _tarClear(dest);
+                if (!File.WriteAllBytes(dest, e.data)) { Array.Append(skipped, e.name); continue; }
+                File.SetMode(dest, _tarSafeMode(e.mode, false));
+                if (e.mtime > 0) { File.SetModifiedTime(dest, e.mtime); }
+                written += 1;
+            } else if (e.type == "symlink") {
+                let t = e.linkname;
+                let aim = (len(t) == 0 || Path.IsAbsolute(t)) ? nil : Path.Resolve(Path.Combine(parent, t));
+                if (aim == nil || !_tarIsUnder(aim, root)) { Array.Append(skipped, e.name); continue; }
+                Directory.Ensure(parent);
+                _tarClear(dest);
+                if (File.CreateSymlink(t, dest)) { written += 1; } else { Array.Append(skipped, e.name); }
+            } else if (e.type == "hardlink") {
+                let trel = _tarSafeRel(e.linkname);
+                let target = (trel == nil) ? nil : Path.Resolve(Path.Combine(root, trel));
+                if (target == nil || !_tarIsUnder(target, root) || _tarCrossesSymlink(root, trel) || !File.Exists(target)) {
+                    Array.Append(skipped, e.name);
+                    continue;
+                }
+                Directory.Ensure(parent);
+                _tarClear(dest);
+                if (File.CreateHardLink(target, dest)) { written += 1; } else { Array.Append(skipped, e.name); }
+            } else {
+                Array.Append(skipped, e.name);
+            }
+        }
+        // Directory modes and times last: writing into a directory moves its time.
+        foreach (d in dirs) {
+            let e = d[1];
+            File.SetMode(d[0], _tarSafeMode(e.mode, true));
+            if (e.mtime > 0) { File.SetModifiedTime(d[0], e.mtime); }
+        }
+        return { written: written, skipped: skipped };
+    }
+}
+
+export { Tar, TarWriter };

@@ -10,17 +10,23 @@
 //   sqlite_last_insert_id(db: int)                        - int
 //   sqlite_close(db: int)                                 - bool
 //
+// Parameters bind nil, int, float, bool, string and block (as a BLOB);
+// BLOB cells come back as byte blocks.
+//
+// Build from the repo root (ffi_object.h sits next to this file), or run
+// ffi/build_sqlite_ffi.sh:
+//
 // Build (Linux):
-//   gcc -shared -fPIC -O2 -o sqlite_ffi.so sqlite_ffi.c -lsqlite3
+//   gcc -shared -fPIC -O2 -I ffi -o sqlite_ffi.so ffi/sqlite_ffi.c -lsqlite3
 //
 // Build (macOS):
-//   gcc -shared -fPIC -O2 -o sqlite_ffi.dylib sqlite_ffi.c -lsqlite3
+//   gcc -shared -fPIC -O2 -I ffi -o sqlite_ffi.dylib ffi/sqlite_ffi.c -lsqlite3
 //
 // Build (Windows MinGW):
-//   gcc -shared -O2 -o sqlite_ffi.dll sqlite_ffi.c -lsqlite3
+//   gcc -shared -O2 -I ffi -o sqlite_ffi.dll ffi/sqlite_ffi.c -lsqlite3
 //
 // Build (Windows MSVC):
-//   cl /LD sqlite_ffi.c /link sqlite3.lib
+//   cl /LD /I ffi ffi/sqlite_ffi.c /link sqlite3.lib
 //
 
 #include <stdint.h>
@@ -74,6 +80,30 @@ static FfiObject make_string_copy(const char *s) {
     memcpy(copy, s, len + 1);
     return make_string_owned(copy, (uint32_t)len);
 }
+// A byte block the VM adopts. Never NULL memory, so an empty blob is an empty
+// block rather than nil.
+static FfiObject make_block_copy(const void *data, int len) {
+    size_t n = len > 0 ? (size_t)len : 0;
+    void *mem = malloc(n ? n : 1);
+    if (!mem) return make_nil();
+    if (n) memcpy(mem, data, n);
+    FfiObject v = {0};
+    v.type = FFIVAL_BLOCK;
+    v.block.memory = mem;
+    v.block.block_size = 1;
+    v.block.block_count = (uint32_t)n;
+    return v;
+}
+
+// Frees cells that were built but never handed to the VM.
+static void free_cells(FfiObject *cells, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (cells[i].type == FFIVAL_STRING) free(cells[i].string.data);
+        else if (cells[i].type == FFIVAL_BLOCK) free(cells[i].block.memory);
+    }
+    free(cells);
+}
+
 static FfiObject make_error(const char *msg) {
     FfiObject out = ffi_object_n(1);
     if (out.type != FFIVAL_OBJECT) return make_nil();
@@ -94,21 +124,8 @@ static FfiObject sqlite_cell_value(sqlite3_stmt *stmt, int c) {
             return make_float(sqlite3_column_double(stmt, c));
         case SQLITE_TEXT:
             return make_string_copy((const char *)sqlite3_column_text(stmt, c));
-        case SQLITE_BLOB: {
-            // Return blobs as hex strings
-            const void *blob = sqlite3_column_blob(stmt, c);
-            int blen = sqlite3_column_bytes(stmt, c);
-            char *hex = (char *)malloc((size_t)blen * 2 + 1);
-            if (!hex) return make_nil();
-            static const char HEX[] = "0123456789abcdef";
-            const unsigned char *b = (const unsigned char *)blob;
-            for (int i = 0; i < blen; i++) {
-                hex[i * 2]     = HEX[b[i] >> 4];
-                hex[i * 2 + 1] = HEX[b[i] & 0x0F];
-            }
-            hex[blen * 2] = '\0';
-            return make_string_owned(hex, (uint32_t)(blen * 2));
-        }
+        case SQLITE_BLOB:
+            return make_block_copy(sqlite3_column_blob(stmt, c), sqlite3_column_bytes(stmt, c));
         default:
             return make_nil();
     }
@@ -131,6 +148,11 @@ static int sqlite_bind_param(sqlite3_stmt *stmt, int idx, const FfiObject *v) {
                                      v->string.data ? v->string.data : "",
                                      v->string.data ? (int)v->string.length : 0,
                                      SQLITE_TRANSIENT);
+        case FFIVAL_BLOCK:
+            return sqlite3_bind_blob64(stmt, idx,
+                                       v->block.memory ? v->block.memory : "",
+                                       v->block.memory ? (sqlite3_uint64)FFI_BLOCK_BYTES(*v) : 0,
+                                       SQLITE_TRANSIENT);
         default:
             return sqlite3_bind_null(stmt, idx);
     }
@@ -170,10 +192,7 @@ static FfiObject sqlite_run_stmt(sqlite3 *db, sqlite3_stmt *stmt) {
             if (!tmp) {
                 // Report OOM instead of silently truncating: falling through with
                 // rc == SQLITE_ROW would look like a successful (short) result.
-                for (size_t i = 0; i < (size_t)nrows * ncols; i++)
-                    if (cells[i].type == FFIVAL_STRING && cells[i].string.data)
-                        free(cells[i].string.data);
-                free(cells);
+                free_cells(cells, (size_t)nrows * ncols);
                 for (uint32_t c = 0; c < ncols; c++) free(col_names[c]);
                 free(col_names);
                 sqlite3_finalize(stmt);
@@ -188,10 +207,7 @@ static FfiObject sqlite_run_stmt(sqlite3 *db, sqlite3_stmt *stmt) {
 
     if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
         // Step error - free what we built and return error
-        for (size_t i = 0; i < (size_t)nrows * ncols; i++)
-            if (cells[i].type == FFIVAL_STRING && cells[i].string.data)
-                free(cells[i].string.data);
-        free(cells);
+        free_cells(cells, (size_t)nrows * ncols);
         for (uint32_t c = 0; c < ncols; c++) free(col_names[c]);
         free(col_names);
         FfiObject err = make_error(sqlite3_errmsg(db));

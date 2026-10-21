@@ -2,8 +2,17 @@
 // Version: 1.0
 //
 // Parses TOML (primary) and a YAML subset. Supports: string, int, float, bool,
-// array, inline table, [sections], [[array of tables]], dotted keys,
-// multi-line strings, hex/octal/binary integer literals.
+// array, inline table, [sections], [[array of tables]], dotted and quoted keys,
+// multi-line strings, \uXXXX/\UXXXXXXXX escapes, hex/octal/binary integer literals.
+// TOML dates and times (1979-05-27T07:32:00Z, 1979-05-27, 07:32:00) load as
+// their text, a string, and save as a quoted string. Arrays and inline tables
+// nest to any depth and save the same way. A value that does not parse (a bare
+// word, an array or inline table holding one, or one left unclosed) loads as
+// nil and the rest of its line is skipped; Load never raises on bad input.
+// YAML: block mappings and sequences (also "- item" at the key's own indent),
+// flow {}/[], quoted strings with escapes, | and > blocks with -/+ chomping.
+// A "#" starts a comment at the line start or after a space or tab, so
+// "http://x/#frag" and "a#b" are values.
 //
 // Usage:
 //   import { Config } from library("Config", "1.0");
@@ -93,24 +102,67 @@ class Config {
     }
 
     fn static _cSkipIws(c) {
-        while (c.p < c.n) {
-            let ch = Config._cCh(c);
-            if (ch == " " || ch == "\t") c.p += 1;
-            else break;
-        }
+        c.p = Config._iwsEnd(c.s, c.p, c.n);
     }
 
     fn static _cSkipWs(c) {
-        while (c.p < c.n) {
-            let ch = Config._cCh(c);
-            if (ch == " " || ch == "\t" || ch == "\n" || ch == "\r") {
-                c.p += 1;
-            } else if (ch == "#") {
-                while (c.p < c.n && Config._cCh(c) != "\n") c.p += 1;
+        c.p = Config._wsEnd(c.s, c.p, c.n);
+    }
+
+    // The scanners below take the cursor's fields as typed values, so they
+    // compile to native code; each returns the position it stopped at.
+
+    // First position at or after p, below n, that is not a space or a tab.
+    fn static _iwsEnd(s:string, p:int, n:int): int {
+        while (p < n) {
+            let b = s[p];
+            if (b != ' ' && b != '\t') break;
+            p += 1;
+        }
+        return p;
+    }
+
+    // As _iwsEnd, also stepping over line breaks and "#" comments.
+    fn static _wsEnd(s:string, p:int, n:int): int {
+        while (p < n) {
+            let b = s[p];
+            if (b == ' ' || b == '\t' || b == '\n' || b == '\r') {
+                p += 1;
+            } else if (b == '#') {
+                p = Config._eolAt(s, p, n);
             } else {
                 break;
             }
         }
+        return p;
+    }
+
+    // Position of the next "\n" at or after p, or n.
+    fn static _eolAt(s:string, p:int, n:int): int {
+        while (p < n && s[p] != '\n') p += 1;
+        return p;
+    }
+
+    // End of the run of bare-key bytes (A-Z a-z 0-9 - _) starting at p.
+    fn static _bareEnd(s:string, p:int, n:int): int {
+        while (p < n) {
+            let b = s[p];
+            if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+                (b >= '0' && b <= '9') || b == '-' || b == '_') {
+                p += 1;
+            } else break;
+        }
+        return p;
+    }
+
+    // Position of the next `stop` or backslash at or after p, or n.
+    fn static _runEnd(s:string, p:int, n:int, stop:char): int {
+        while (p < n) {
+            let b = s[p];
+            if (b == stop || b == '\\') break;
+            p += 1;
+        }
+        return p;
     }
 
     // =========================================================================
@@ -125,7 +177,35 @@ class Config {
         if (ch == "\"") return "\"";
         if (ch == "b")  return "\b";
         if (ch == "f")  return "\f";
+        if (ch == "e")  return "\x1b";
+        if (ch == "a")  return "\a";
+        if (ch == "v")  return "\v";
+        if (ch == "0")  return "\uFFFD";
         return ch;
+    }
+
+    // Reads the escape after a backslash (TOML and YAML double-quoted forms).
+    // An unknown escape yields its letter; a code point a string cannot hold
+    // (U+0000, a surrogate) yields U+FFFD.
+    fn static _escape(c): string {
+        let ch = Config._cAdv(c);
+        if (ch == "u") return Config._hexCp(c, 4, ch);
+        if (ch == "U") return Config._hexCp(c, 8, ch);
+        if (ch == "x") return Config._hexCp(c, 2, ch);
+        return Config._escChar(ch);
+    }
+
+    fn static _hexCp(c, k:int, letter:string): string {
+        let hex = Config._cAhead(c, k);
+        if (String.Length(hex) != k) return letter;
+        var cp = 0;
+        iter (i from 0 to k) {
+            let v = String.IndexOf("0123456789abcdef", String.ToLower(String.Substr(hex, i, 1)));
+            if (v < 0) return letter;
+            cp = cp * 16 + v;
+        }
+        c.p += k;
+        return String.Utf8Concat(cp) ?? "\uFFFD";
     }
 
     // =========================================================================
@@ -136,10 +216,16 @@ class Config {
         c.p += 1;
         var s = "";
         while (c.p < c.n) {
+            let e = Config._runEnd(c.s, c.p, c.n, '"');
+            if (e > c.p) {
+                let run = String.Substr(c.s, c.p, e - c.p);
+                s += run;
+                c.p = e;
+                if (c.p >= c.n) break;
+            }
             let ch = Config._cAdv(c);
             if (ch == "\"") return s;
-            if (ch == "\\") s += Config._escChar(Config._cAdv(c));
-            else             s += ch;
+            s += Config._escape(c);
         }
         return s;
     }
@@ -161,7 +247,7 @@ class Config {
                         else break;
                     }
                 } else {
-                    s += Config._escChar(Config._cAdv(c));
+                    s += Config._escape(c);
                 }
             } else {
                 s += ch;
@@ -172,12 +258,14 @@ class Config {
 
     fn static _parseLiteralStr(c): string {
         c.p += 1;
-        var s = "";
-        while (c.p < c.n) {
-            let ch = Config._cAdv(c);
-            if (ch == "'") return s;
-            s += ch;
+        let q = String.IndexOfFrom(c.s, "'", c.p);
+        if (q < 0 || q >= c.n) {
+            let rest = String.Substr(c.s, c.p, c.n - c.p);
+            c.p = c.n;
+            return rest;
         }
+        let s = String.Substr(c.s, c.p, q - c.p);
+        c.p = q + 1;
         return s;
     }
 
@@ -197,7 +285,36 @@ class Config {
     // Number parser
     // =========================================================================
 
+    fn static _isDigit(ch:string): bool {
+        return ch >= "0" && ch <= "9";
+    }
+
+    // "1979-05-27..." or "07:32:00..." ahead of the cursor
+    fn static _atDateTime(c): bool {
+        let a = Config._cAhead(c, 5);
+        if (String.Length(a) < 3 || !Config._isDigit(String.Substr(a, 0, 1)) || !Config._isDigit(String.Substr(a, 1, 1))) return false;
+        if (String.Substr(a, 2, 1) == ":") return true;
+        return String.Length(a) == 5 && Config._isDigit(String.Substr(a, 2, 1)) &&
+               Config._isDigit(String.Substr(a, 3, 1)) && String.Substr(a, 4, 1) == "-";
+    }
+
+    fn static _parseDateTime(c): string {
+        let start = c.p;
+        while (c.p < c.n) {
+            let d = Config._cCh(c);
+            if (Config._isDigit(d) || d == "-" || d == ":" || d == "." || d == "+" ||
+                d == "T" || d == "t" || d == "Z" || d == "z") {
+                c.p += 1;
+            } else if (d == " " && c.p - start == 10 && c.p + 1 < c.n &&
+                       Config._isDigit(String.Substr(c.s, c.p + 1, 1))) {
+                c.p += 1;
+            } else break;
+        }
+        return String.Substr(c.s, start, c.p - start);
+    }
+
     fn static _parseNumber(c) {
+        if (Config._atDateTime(c)) return Config._parseDateTime(c);
         var s = "";
         let sign = Config._cCh(c);
         if (sign == "+" || sign == "-") s += Config._cAdv(c);
@@ -251,15 +368,9 @@ class Config {
     // =========================================================================
 
     fn static _parseBareKey(c): string {
-        var k = "";
-        while (c.p < c.n) {
-            let ch = Config._cCh(c);
-            if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") ||
-                (ch >= "0" && ch <= "9") || ch == "-" || ch == "_") {
-                k += Config._cAdv(c);
-            } else break;
-        }
-        return k;
+        let start = c.p;
+        c.p = Config._bareEnd(c.s, start, c.n);
+        return String.Substr(c.s, start, c.p - start);
     }
 
     fn static _parseSimpleKey(c): string {
@@ -304,11 +415,17 @@ class Config {
         }
     }
 
+    // An array of tables on the path resolves to its last table, as in TOML.
     fn static _ensurePath(root, parts) {
         var o = root;
         foreach (p in parts) {
-            if (o[p] == nil || !Type.Is(o[p], Type.Object)) o[p] = {};
-            o = o[p];
+            let v = o[p];
+            if (Config._isAoT(v)) {
+                o = v[len(v) - 1];
+            } else {
+                if (v == nil || !Type.Is(v, Type.Object)) o[p] = {};
+                o = o[p];
+            }
         }
         return o;
     }
@@ -317,6 +434,8 @@ class Config {
     // Value parser - recursive
     // =========================================================================
 
+    // A TOML value is never nil: nil from _parseValue marks text that is not a
+    // value, and an array or inline table holding one (or left unclosed) is nil.
     fn static _parseArray(c) {
         c.p += 1;
         var arr = [];
@@ -326,27 +445,29 @@ class Config {
             if (ch == "]") { c.p += 1; return arr; }
             if (ch == ",") { c.p += 1; continue; }
             let val = Config._parseValue(c);
+            if (val == nil) return nil;
             Array.Append(arr, val);
         }
-        return arr;
+        return nil;
     }
 
     fn static _parseInlineTable(c) {
         c.p += 1;
         var obj = {};
         while (c.p < c.n) {
-            Config._cSkipIws(c);
+            Config._cSkipWs(c);
             let ch = Config._cCh(c);
             if (ch == "}") { c.p += 1; return obj; }
             if (ch == ",") { c.p += 1; continue; }
             let parts = Config._parseKeyParts(c);
             Config._cSkipIws(c);
-            if (Config._cCh(c) == "=") c.p += 1;
-            Config._cSkipIws(c);
+            if (Config._cCh(c) != "=") return nil;
+            c.p += 1;
             let val = Config._parseValue(c);
+            if (val == nil) return nil;
             Config._setDotted(obj, parts, val);
         }
-        return obj;
+        return nil;
     }
 
     fn static _parseValue(c) {
@@ -380,21 +501,12 @@ class Config {
 
             if (Config._cAhead(c, 2) == "[[") {
                 c.p += 2;
-                var name = "";
-                while (c.p < c.n && Config._cAhead(c, 2) != "]]") name += Config._cAdv(c);
+                let parts = Config._parseKeyParts(c);
+                while (c.p < c.n && Config._cAhead(c, 2) != "]]") c.p += 1;
                 c.p += 2;
-                let parts  = String.Split(String.Trim(name), ".");
-                var parent = data;
-                var pidx   = 0;
-                var plen   = len(parts);
-                foreach (pseg in parts) {
-                    if (pidx < plen - 1) {
-                        if (parent[pseg] == nil) parent[pseg] = {};
-                        parent = parent[pseg];
-                    }
-                    pidx += 1;
-                }
                 let last = parts[len(parts) - 1];
+                Array.RemoveAt(parts, len(parts) - 1);
+                let parent = Config._ensurePath(data, parts);
                 if (!Type.Is(parent[last], Type.Array)) parent[last] = [];
                 var tbl = {};
                 Array.Append(parent[last], tbl);
@@ -404,23 +516,24 @@ class Config {
 
             if (ch == "[") {
                 c.p += 1;
-                var name = "";
-                while (c.p < c.n && Config._cCh(c) != "]") name += Config._cAdv(c);
+                let parts = Config._parseKeyParts(c);
+                while (c.p < c.n && Config._cCh(c) != "]") c.p += 1;
                 c.p += 1;
-                current = Config._ensurePath(data, String.Split(String.Trim(name), "."));
+                current = Config._ensurePath(data, parts);
                 continue;
             }
 
             let keyParts = Config._parseKeyParts(c);
             Config._cSkipIws(c);
             if (Config._cCh(c) != "=") {
-                while (c.p < c.n && Config._cCh(c) != "\n") c.p += 1;
+                c.p = Config._eolAt(c.s, c.p, c.n);
                 continue;
             }
             c.p += 1;
-            Config._setDotted(current, keyParts, Config._parseValue(c));
+            let val = Config._parseValue(c);
+            Config._setDotted(current, keyParts, val);
             Config._cSkipIws(c);
-            if (Config._cCh(c) == "#") while (c.p < c.n && Config._cCh(c) != "\n") c.p += 1;
+            if (val == nil || Config._cCh(c) == "#") c.p = Config._eolAt(c.s, c.p, c.n);
         }
         return data;
     }
@@ -442,36 +555,65 @@ class Config {
         if (v == nil)               return "\"\"";
         if (type(v) == Type.Bool)   return v ? "true" : "false";
         if (type(v) == Type.Int)    return str(v);
-        if (type(v) == Type.Float)  return str(v);
+        if (type(v) == Type.Float) {
+            if (Math.IsNaN(v))       return "nan";
+            if (v == Math.Infinity)  return "inf";
+            if (v == -Math.Infinity) return "-inf";
+            return Json.Stringify(v);
+        }
         if (type(v) == Type.String) return Config._escapeStr(v);
         return "\"\"";
     }
 
+    fn static _key(k:string): string {
+        if (k == "") return "\"\"";
+        foreach (ch in k) {
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')) return Config._escapeStr(k);
+        }
+        return k;
+    }
+
     fn static _isAoT(v): bool {
         if (!Type.Is(v, Type.Array) || len(v) == 0) return false;
-        return Type.Is(v[0], Type.Object);
+        foreach (item in v) {
+            if (!Type.Is(item, Type.Object)) return false;
+        }
+        return true;
+    }
+
+    // A value in inline form: arrays and tables nest, the rest is a scalar.
+    fn static _inline(v): string {
+        if (Type.Is(v, Type.Array)) {
+            var parts = [];
+            foreach (item in v) Array.Append(parts, Config._inline(item));
+            return "[" + String.Join(parts, ", ") + "]";
+        }
+        if (Type.Is(v, Type.Object)) {
+            var parts = [];
+            foreach (entry in Object.Entries(v)) {
+                if (entry[1] != nil) Array.Append(parts, Config._key(entry[0]) + " = " + Config._inline(entry[1]));
+            }
+            if (len(parts) == 0) return "{}";
+            return "{ " + String.Join(parts, ", ") + " }";
+        }
+        return Config._scalar(v);
     }
 
     fn static _serializeSection(obj, prefix:string): string {
         var out = "";
         // Pass 1: scalars and plain arrays in this object
         foreach (entry in Object.Entries(obj)) {
-            let k = entry[0];
             let v = entry[1];
             if (v == nil || Type.Is(v, Type.Object) || Config._isAoT(v)) continue;
-            if (Type.Is(v, Type.Array)) {
-                var parts = [];
-                foreach (item in v) Array.Append(parts, Config._scalar(item));
-                out += k + " = [" + String.Join(parts, ", ") + "]\n";
-            } else {
-                out += k + " = " + Config._scalar(v) + "\n";
-            }
+            let k = Config._key(entry[0]);
+            out += k + " = " + Config._inline(v) + "\n";
         }
         // Pass 2: subsections and array-of-tables
         foreach (entry in Object.Entries(obj)) {
-            let k = entry[0];
             let v = entry[1];
             if (v == nil) continue;
+            let k = Config._key(entry[0]);
             let fp = prefix == "" ? k : prefix + "." + k;
             if (Type.Is(v, Type.Object)) {
                 out += "\n[" + fp + "]\n";
@@ -479,7 +621,7 @@ class Config {
             } else if (Config._isAoT(v)) {
                 foreach (item in v) {
                     out += "\n[[" + fp + "]]\n";
-                    out += Config._serializeSection(item, "");
+                    out += Config._serializeSection(item, fp);
                 }
             }
         }
@@ -489,8 +631,8 @@ class Config {
     // =========================================================================
     // YAML parsing
     // Supports: scalars, block mappings/sequences, inline flow ({}/[]),
-    //           quoted strings, multiline literal (|) and folded (>) blocks,
-    //           booleans, null, numbers, inline comments.
+    //           quoted strings, multiline literal (|) and folded (>) blocks
+    //           with chomping (-/+), booleans, null, numbers, inline comments.
     // Not supported: anchors/aliases, multiple documents, complex tags.
     // =========================================================================
 
@@ -503,15 +645,26 @@ class Config {
         if (n >= 2) {
             let f = String.Substr(s, 0, 1);
             let l = String.Substr(s, n - 1, 1);
-            if ((f == "\"" && l == "\"") || (f == "'" && l == "'")) {
-                return String.Substr(s, 1, n - 2);
-            }
+            if (f == "\"" && l == "\"") return Config._yUnescape(String.Substr(s, 1, n - 2));
+            if (f == "'" && l == "'")   return String.Replace(String.Substr(s, 1, n - 2), "''", "'");
         }
         let iv = Convert.TryParseInt(s);
         if (iv != nil) { return iv; }
         let fv = Convert.TryParseFloat(s);
         if (fv != nil) { return fv; }
         return s;
+    }
+
+    fn static _yUnescape(s:string): string {
+        if (String.IndexOf(s, "\\") < 0) return s;
+        let c = Config._cNew(s);
+        var out = "";
+        while (c.p < c.n) {
+            let ch = Config._cAdv(c);
+            if (ch == "\\") out += Config._escape(c);
+            else             out += ch;
+        }
+        return out;
     }
 
     fn static _yIndent(line:string):int {
@@ -522,16 +675,41 @@ class Config {
     }
 
     fn static _yStripComment(s:string):string {
-        let dq = false; let sq = false;
-        let n = String.Length(s); let i = 0;
+        let n = String.Length(s);
+        let at = Config._yCommentAt(s, n);
+        if (at == n) return s;
+        return String.Substr(s, 0, at);
+    }
+
+    // Position of the "#" that starts a comment, or n. A comment starts at the
+    // line start or after a space or tab, never inside quotes; a quote opens a
+    // quoted scalar only where a scalar starts, so "it's" and "a#b" are plain.
+    fn static _yCommentAt(s:string, n:int): int {
+        var dq = false;
+        var sq = false;
+        var prev = ' ';
+        var i = 0;
         while (i < n) {
-            let ch = String.Substr(s, i, 1);
-            if      (ch == "\"" && !sq) { dq = !dq; }
-            else if (ch == "'"  && !dq) { sq = !sq; }
-            else if (ch == "#"  && !dq && !sq) { return String.Substr(s, 0, i); }
+            let b = s[i];
+            if (dq) {
+                if (b == '\\') i += 1;
+                else if (b == '"') dq = false;
+            } else if (sq) {
+                if (b == '\'') {
+                    if (i + 1 < n && s[i + 1] == '\'') i += 1;
+                    else sq = false;
+                }
+            } else if (b == '#') {
+                if (prev == ' ' || prev == '\t') return i;
+            } else if ((b == '"' || b == '\'') &&
+                       (prev == ' ' || prev == '\t' || prev == '[' || prev == '{' || prev == ',')) {
+                if (b == '"') dq = true;
+                else sq = true;
+            }
+            prev = b;
             i += 1;
         }
-        return s;
+        return n;
     }
 
     fn static _yFindColon(s:string):int {
@@ -539,7 +717,8 @@ class Config {
         let n = String.Length(s); let i = 0;
         while (i < n) {
             let ch = String.Substr(s, i, 1);
-            if      (ch == "\"" && !sq) { dq = !dq; }
+            if      (ch == "\\" && dq)  { i += 1; }
+            else if (ch == "\"" && !sq) { dq = !dq; }
             else if (ch == "'"  && !dq) { sq = !sq; }
             else if (ch == ":"  && !dq && !sq) {
                 if (i + 1 >= n || String.Substr(s, i + 1, 1) == " ") { return i; }
@@ -557,7 +736,12 @@ class Config {
         let dq = false; let sq = false;
         while (pos < n) {
             let ch = String.Substr(s, pos, 1); pos += 1;
-            if (dq) { cur_val += ch; if (ch == "\"") { dq = false; } continue; }
+            if (dq) {
+                cur_val += ch;
+                if (ch == "\\" && pos < n) { cur_val += String.Substr(s, pos, 1); pos += 1; }
+                else if (ch == "\"") { dq = false; }
+                continue;
+            }
             if (sq) { cur_val += ch; if (ch == "'")  { sq = false; } continue; }
             if (ch == "\"") { dq = true;  cur_val += ch; continue; }
             if (ch == "'")  { sq = true;  cur_val += ch; continue; }
@@ -594,6 +778,71 @@ class Config {
         return { val: result, end: pos };
     }
 
+    // "|" or ">" with an optional chomping indicator (- strip, + keep) and
+    // indentation digit, in either order.
+    fn static _yIsBlockHeader(v:string): bool {
+        let n = String.Length(v);
+        if (n == 0 || n > 3) return false;
+        let f = String.Substr(v, 0, 1);
+        if (f != "|" && f != ">") return false;
+        var chomp = 0; var digit = 0;
+        iter (j from 1 to n) {
+            let ch = String.Substr(v, j, 1);
+            if (ch == "-" || ch == "+") chomp += 1;
+            else if (ch >= "1" && ch <= "9") digit += 1;
+            else return false;
+        }
+        return chomp <= 1 && digit <= 1;
+    }
+
+    // Reads the block scalar whose header ends the line before lines[i]; the
+    // content is indented deeper than parentInd. Returns {val, next}.
+    fn static _yBlock(lines, i:int, header:string, parentInd:int) {
+        let nlines = len(lines);
+        let isLit = String.StartsWith(header, "|");
+        let strip = String.Contains(header, "-");
+        let keep  = String.Contains(header, "+");
+        var base = -1;
+        let hn = String.Length(header);
+        iter (j from 1 to hn) {
+            let ch = String.Substr(header, j, 1);
+            if (ch >= "1" && ch <= "9") base = parentInd + Convert.ParseInt(ch);
+        }
+        let ml = [];
+        while (i < nlines) {
+            let nl = lines[i];
+            let ni = Config._yIndent(nl);
+            if (String.Trim(nl) == "") {
+                Array.Append(ml, ""); i += 1;
+            } else if ((base < 0 && ni > parentInd) || (base >= 0 && ni >= base)) {
+                if (base < 0) base = ni;
+                Array.Append(ml, String.Substr(nl, base, String.Length(nl) - base));
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        var end = len(ml);
+        while (end > 0 && ml[end - 1] == "") end -= 1;
+        var body = "";
+        if (isLit) {
+            iter (j from 0 to end) {
+                if (j > 0) body += "\n";
+                body += ml[j];
+            }
+        } else {
+            iter (j from 0 to end) {
+                let ml_line = ml[j];
+                if (ml_line == "") { body += "\n"; }
+                else if (body == "" || String.EndsWith(body, "\n")) { body += ml_line; }
+                else { body += " " + ml_line; }
+            }
+        }
+        if (!strip && end > 0) body += "\n";
+        if (keep) body += String.Repeat("\n", len(ml) - end);
+        return { val: body, next: i };
+    }
+
     fn static _parseYaml(src:string) {
         let lines = String.SplitLines(src);
         let nlines = len(lines);
@@ -611,20 +860,25 @@ class Config {
             let s   = String.Trim(Config._yStripComment(line));
             // Skip blanks, comments, and document markers
             if (s != "" && s != "---" && s != "...") {
-                // Pop frames whose items live at a deeper indent than current line
-                while (len(stack) > 1 && stack[len(stack) - 1].indent > ind) {
-                    Array.RemoveAt(stack, len(stack) - 1);
+                let isItem = String.StartsWith(s, "- ") || s == "-";
+                // Pop frames whose items live at a deeper indent than current line;
+                // a sequence at its key's own indent ends at the first non-item line.
+                while (len(stack) > 1) {
+                    let f = stack[len(stack) - 1];
+                    if (f.indent > ind || (!isItem && f.stype == "seq" && f.indent == ind)) {
+                        Array.RemoveAt(stack, len(stack) - 1);
+                    } else break;
                 }
                 var top = stack[len(stack) - 1];
 
                 // Resolve pending key: is this line the start of its value?
+                // ("key:" followed by "- item" at the key's indent is a sequence too)
                 if (top.pending != nil) {
-                    if (ind > top.pind) {
-                        let is_seq = (String.StartsWith(s, "- ") || s == "-");
-                        let child  = is_seq ? [] : {};
+                    if (ind > top.pind || (isItem && ind == top.pind)) {
+                        let child  = isItem ? [] : {};
                         top.obj[top.pending] = child;
                         top.pending = nil; top.pind = -1;
-                        let frame = {indent: ind, obj: child, stype: is_seq ? "seq" : "map", pending: nil, pind: -1};
+                        let frame = {indent: ind, obj: child, stype: isItem ? "seq" : "map", pending: nil, pind: -1};
                         Array.Append(stack, frame);
                         top = frame;
                     } else {
@@ -633,13 +887,16 @@ class Config {
                 }
 
                 // ── Sequence item ─────────────────────────────────────────
-                if (top.stype == "seq" || String.StartsWith(s, "- ") || s == "-") {
-                    if (Type.Is(top.obj, Type.Array) && (String.StartsWith(s, "- ") || s == "-")) {
+                if (top.stype == "seq" || isItem) {
+                    if (Type.Is(top.obj, Type.Array) && isItem) {
                         let val_s = s == "-" ? "" : String.Trim(String.Substr(s, 2, String.Length(s) - 2));
                         if (val_s == "") {
                             let child = {};
                             Array.Append(top.obj, child);
                             Array.Append(stack, {indent: ind + 2, obj: child, stype: "map", pending: nil, pind: -1});
+                        } else if (Config._yIsBlockHeader(val_s)) {
+                            let r = Config._yBlock(lines, i, val_s, ind);
+                            Array.Append(top.obj, r.val); i = r.next;
                         } else if (String.StartsWith(val_s, "[")) {
                             let r = Config._yFlow(val_s, 1, "]"); Array.Append(top.obj, r.val);
                         } else if (String.StartsWith(val_s, "{")) {
@@ -651,10 +908,15 @@ class Config {
                                 let k = String.Trim(String.Substr(val_s, 0, ci));
                                 let v = ci + 2 <= vlen ? String.Trim(String.Substr(val_s, ci + 2, vlen - ci - 2)) : "";
                                 let child = {};
-                                if (v != "") { child[k] = Config._yScalar(v); }
+                                if (Config._yIsBlockHeader(v)) {
+                                    let r = Config._yBlock(lines, i, v, ind + 2);
+                                    child[k] = r.val; i = r.next;
+                                } else if (v != "") {
+                                    child[k] = Config._yScalar(v);
+                                }
                                 Array.Append(top.obj, child);
                                 Array.Append(stack, {indent: ind + 2, obj: child, stype: "map",
-                                                     pending: (v == "" ? k : nil), pind: (v == "" ? ind : -1)});
+                                                     pending: (v == "" ? k : nil), pind: (v == "" ? ind + 2 : -1)});
                             } else {
                                 Array.Append(top.obj, Config._yScalar(val_s));
                             }
@@ -671,37 +933,9 @@ class Config {
                         if (val_s == "") {
                             top.obj[key] = nil;
                             top.pending = key; top.pind = ind;
-                        } else if (val_s == "|" || val_s == ">") {
-                            let is_lit = (val_s == "|");
-                            let ml = []; let base = -1;
-                            while (i < nlines) {
-                                let nl = lines[i];
-                                let ni = Config._yIndent(nl);
-                                let ns = String.Trim(nl);
-                                if (ns == "") {
-                                    Array.Append(ml, ""); i += 1;
-                                } else if (base < 0) {
-                                    base = ni;
-                                    Array.Append(ml, String.Substr(nl, base, String.Length(nl) - base));
-                                    i += 1;
-                                } else if (ni >= base) {
-                                    Array.Append(ml, String.Substr(nl, base, String.Length(nl) - base));
-                                    i += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            if (is_lit) {
-                                top.obj[key] = String.Join(ml, "\n");
-                            } else {
-                                var folded = "";
-                                foreach (ml_line in ml) {
-                                    if (ml_line == "") { folded += "\n"; }
-                                    else if (folded == "" || String.EndsWith(folded, "\n")) { folded += ml_line; }
-                                    else { folded += " " + ml_line; }
-                                }
-                                top.obj[key] = folded;
-                            }
+                        } else if (Config._yIsBlockHeader(val_s)) {
+                            let r = Config._yBlock(lines, i, val_s, ind);
+                            top.obj[key] = r.val; i = r.next;
                         } else if (String.StartsWith(val_s, "[")) {
                             let r = Config._yFlow(val_s, 1, "]"); top.obj[key] = r.val;
                         } else if (String.StartsWith(val_s, "{")) {

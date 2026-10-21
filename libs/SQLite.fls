@@ -54,7 +54,9 @@
 // PARAMETERS
 // -----------
 // SQLite uses ? as the placeholder (not $1 like PostgreSQL).
-// All array element types are supported: int, float, bool, string, nil (- NULL).
+// Parameter types: int, float, bool, string, block (- BLOB), nil (- NULL).
+//
+//   db.ExecParams("INSERT INTO files (name, data) VALUES (?, ?)", [name, File.ReadAllBytes(path)]);
 //
 //   db.QueryParams("SELECT * FROM t WHERE a = ? AND b = ?", [42, "hello"]);
 //
@@ -63,7 +65,7 @@
 //   SQLite INTEGER  -  int
 //   SQLite REAL     -  float
 //   SQLite TEXT     -  string
-//   SQLite BLOB     -  string (hex-encoded)
+//   SQLite BLOB     -  block (the raw bytes, element size 1)
 //   SQLite NULL     -  nil
 //
 // ERROR HANDLING
@@ -98,6 +100,8 @@
 //       db.ExecParams("UPDATE counters SET n = n + 1 WHERE key = ?", [key]);
 //   });
 //   // ROLLBACKs automatically on exception or if the callback returns false.
+//   // Transaction calls nest: an inner one is a SAVEPOINT, so its rollback
+//   // undoes only its own work and its commit leaves the outer one open.
 //
 // TROUBLESHOOTING
 // ---------------
@@ -129,6 +133,8 @@
 //
 // Transactions (automatic):
 //   Transaction(fn)   - calls fn(); auto-COMMIT on success, ROLLBACK on throw or false return
+//                       (the exception is rethrown unchanged). Nests, also inside Begin():
+//                       each call is a SAVEPOINT released on success and rolled back to on failure
 //
 // Transactions (manual):
 //   Begin()   Commit()   Rollback()
@@ -343,22 +349,30 @@ class SQLite {
     }
 
     // db.Transaction(f) - bool
-    // Wraps f() in BEGIN/COMMIT. ROLLBACKs and rethrows on exception; rolls back
-    // and returns false if f() returns false.
+    // Runs f() inside a SAVEPOINT: outside a transaction that begins one and its
+    // RELEASE commits; inside one (Begin() or an outer Transaction) it nests.
+    // ROLLBACK TO undoes f's work on a throw (rethrown) or a false return.
     fn Transaction(f: fn): bool {
-        this.Exec("BEGIN");
+        this.Exec("SAVEPOINT flaris_tx");
         try {
             let ok = f();
             if (ok == false) {
-                this.Exec("ROLLBACK");
+                this._rollbackSavepoint();
                 return false;
             }
-            this.Exec("COMMIT");
+            this.Exec("RELEASE flaris_tx");
             return true;
         } catch (e) {
-            this.Exec("ROLLBACK");
-            throw(e.Code, e.Message);
+            this._rollbackSavepoint();
+            throw e;
         }
+    }
+
+    // ROLLBACK TO keeps the savepoint open; RELEASE then pops it (and ends the
+    // transaction when it was the outermost).
+    fn _rollbackSavepoint() {
+        this.Exec("ROLLBACK TO flaris_tx");
+        this.Exec("RELEASE flaris_tx");
     }
 
     // db.LastInsertId() - int

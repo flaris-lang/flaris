@@ -31,12 +31,14 @@
 //   let r2 = Fiber.Await(p2);
 //
 // Response object: { status:int, headers:object, body:string|block }
-// Returns nil on connection failure or unrecoverable I/O error.
+// Returns nil on connection failure or unrecoverable I/O error. A URL whose
+// scheme is not http or https raises HttpUnsupportedError.
 //
 // Synchronous methods (all return response object or nil):
 //   Http.Get(url, headers?)
-//   Http.Post(url, body, headers?)       - body: string sent as-is, or object/array
-//                                          auto-JSON-encoded; default Content-Type: JSON
+//   Http.Post(url, body, headers?)       - body: string or block sent as-is, or
+//                                          object/array auto-JSON-encoded;
+//                                          default Content-Type: JSON
 //   Http.Put(url, body, headers?)
 //   Http.Patch(url, body, headers?)
 //   Http.Query(url, body, headers?)      - safe/idempotent request WITH a body
@@ -46,7 +48,83 @@
 //   Http.Curl(url, options?)             - full-control request; options: { method, headers, body, timeout }
 //   Http.WGet(url, destPath?)            - download to file via wget(1); returns { status, path }
 //                                          (path defaults to the url's last segment in the cwd)
-//   Http.StreamPost(url, body, onLine, headers?) - NDJSON streaming POST; calls onLine(line) per JSON line received
+//   Http.StreamPost(url, body, onLine, headers?, transport?) - NDJSON streaming
+//                                          POST; calls onLine(line) per JSON line
+//   Http.Request(method, url, body, contentType, headers?, transport?) - full control
+//
+// Streaming responses (http and https):
+//   Http.Open(method, url, body?, contentType?, headers?, transport?)
+//       -> HttpStream once the response head is in, or nil; read the body
+//          as it arrives with st.Chunk(), st.Line() or st.Event(), then
+//          st.Close(). See HttpStream below.
+//   Http.OpenAsync(...)  - the same as a fiber; reads on the stream it
+//                          resolves to park only their own fiber
+//   Http.Sse(url, onEvent, options?) / Http.SseAsync(...)
+//       - follow a text/event-stream, reconnecting with Last-Event-ID;
+//         onEvent(ev) gets { event, data, id, retry }, returning false stops
+//   new SseParser() - the event-stream parser on its own: Feed(text) -> events
+//
+// Redirects: 301/302/303/307/308 are followed up to 5 hops, the Location
+// resolved against the current URL (relative paths, "../", "//host/x"). A
+// redirect to a scheme other than http/https ends the request with nil.
+// Credentials in a URL ("user:pw@host") are never sent: pass an Authorization
+// header instead.
+//
+// Timeouts: the connect and every read wait at most 30 s. For a slower server
+// pass a transport with its own limit:
+//   Http.Request("POST", url, body, ContentType.JSON, nil, Http.Transport({ timeoutMs: 300000 }));
+//
+// Options: the transport argument of Request/RequestAsync may also be a plain
+// options object, which then applies to whichever scheme each hop uses:
+//   Http.Request("GET", url, nil, nil, nil, { timeoutMs: 5000, keepAlive: false });
+//   timeoutMs  - the connect and every read (default 30000)
+//   readTimeoutMs - every read, when it should differ from timeoutMs; 0
+//                waits as long as it takes
+//   deadlineMs - the whole request: connect, send, every redirect and the
+//                full response. Once it passes the request returns nil and
+//                its connection is closed. With a transport the caller
+//                supplies, only the gaps between its calls are bounded.
+//   maxBodyBytes - the largest response body accepted, after decompression
+//                as well; a larger one fails the request (nil) and closes
+//                its connection. Default: no limit
+//   keepAlive  - false sends the request on a connection of its own
+//   proxy      - "http://[user:password@]host:port", or false for none; by
+//                default http_proxy / https_proxy from the environment
+//                (lowercase first, then uppercase; HTTP_PROXY is ignored
+//                under CGI), never for localhost, 127.x or ::1, and not for
+//                hosts on no_proxy. http:// requests go to the proxy in
+//                absolute form, https:// ones through a CONNECT tunnel with
+//                TLS to the origin inside it; credentials in the proxy URL
+//                become Proxy-Authorization: Basic. A proxy that is not
+//                http:// raises HttpUnsupportedError.
+//   noProxy    - hosts that skip the proxy, in no_proxy form: "*", domains
+//                (".example.com" or "example.com" - with every name under
+//                it), IP addresses, IPv4 ranges ("10.0.0.0/8"), each with an
+//                optional ":port"; overrides no_proxy
+//   insecure, sni - https only, as for Stream.ConnectTls
+// Http.Transport(opts) and Https.Transport(opts) take the same keys.
+//
+// Connections (HTTP/1.1 keep-alive): a connection whose response was read to
+// its end waits in a pool, and the next request to the same scheme, host and
+// port - with the same read timeout, insecure, sni and proxy - takes it
+// instead of opening a new one, from any fiber. A connection carries one
+// request at a time. The server's "Connection: close", an HTTP/1.0 response,
+// a body that runs to the end of the stream, or any error closes it instead.
+// A pooled connection the server has meanwhile closed fails before any
+// response byte arrives; the request then goes out once more on a fresh
+// connection when repeating it is safe - GET, HEAD, OPTIONS, TRACE, PUT,
+// DELETE and QUERY, or any request that was not yet fully sent. Before reuse
+// a connection idle for a second (a tenth of a second for the other methods)
+// is checked, which costs about a millisecond.
+//   Http.Configure({ keepAlive, maxIdlePerHost, maxIdle, idleTimeoutMs })
+//       process-wide pool settings, defaults true, 8, 64 and 4000 ms; a
+//       server's "Keep-Alive: timeout=n" shortens the idle time for its
+//       connections. keepAlive: false turns pooling off.
+//   Http.CloseIdle()    close every idle pooled connection
+//   Http.PoolStats()    { idle, hosts } - idle connections and how many
+//                       pool keys hold at least one
+// A request header "Connection: close", or keepAlive: false in its options,
+// keeps that one request out of the pool.
 //
 // Async variants (fiber-based; call Fiber.Await() to get the result):
 //   Http.GetAsync(url, headers?)
@@ -59,8 +137,11 @@
 //
 // Retry (with exponential backoff):
 //   Http.Retry(requestFn, opts?)  - requestFn: fn() → response; returns the last
-//       response. opts: { attempts:3, delayMs:200, backoff:2.0, retryOn:fn(resp)→bool }
-//       Default retryOn: nil response, status >= 500, or 429.
+//       response. opts: { attempts:3, delayMs:200, backoff:2.0, retryOn:fn(resp)→bool,
+//       retryAfter:true, maxRetryAfterMs:60000 }
+//       Default retryOn: nil response, status >= 500, or 429. A 429 or 503
+//       with Retry-After waits what the server asked, up to maxRetryAfterMs.
+//   Http.RetryAfterMs(resp)      - the response's Retry-After in ms, or nil
 //
 // CookieJar (carry cookies across requests):
 //   let jar = new CookieJar();
@@ -73,16 +154,19 @@
 // Multipart (multipart/form-data body builder):
 //   let form = new Multipart();
 //   form.Field(name, value).File(name, filename, content, contentType?);
-//   form.Body() →  string body;  form.ContentTypeHeader() →  Content-Type value
+//   form.Body() →  string body (a block when a file's content is a block);
+//   form.ContentTypeHeader() →  Content-Type value
 //   Http.Post(url, form.Body(), { "Content-Type": form.ContentTypeHeader() });
 //
 // Constants:
 //   Status.OK(200)  Created(201)  NoContent(204)  BadRequest(400)
-//   Status.Unauthorized(401)  Forbidden(403)  NotFound(404)
-//   Status.InternalServerError(500)  BadGateway(502)  … and more
+//   Status.Unauthorized(401)  Forbidden(403)  NotFound(404)  Conflict(409)
+//   Status.InternalError(500)  NotImplemented(501)  BadGateway(502)
+//   Status.ServiceUnavailable(503)
 //
-//   ContentType.JSON  ContentType.Form  ContentType.Text  ContentType.HTML
-//   ContentType.XML   ContentType.Multipart  ContentType.OctetStream
+//   ContentType.JSON  ContentType.HTML  ContentType.Text  ContentType.XML
+//   ContentType.FormEncoded  ContentType.MultipartForm  ContentType.Binary
+//   ContentType.Javascript  ContentType.CSV
 
 // --------------------------------------------------------
 //  Status codes
@@ -122,6 +206,13 @@ global ContentType = {
     CSV:           "text/csv",
 };
 
+// Header names held in variables: a string literal passed as an index or an
+// argument is copied on every use.
+global _K_CENC:string = "content-encoding";
+global _K_TE:string   = "transfer-encoding";
+global _K_CL:string   = "content-length";
+global _K_KA:string   = "keep-alive";
+
 // --------------------------------------------------------
 //  Pluggable transport
 // --------------------------------------------------------
@@ -135,8 +226,20 @@ global ContentType = {
 //     readN(conn,n)       -> string|nil,   // exactly n bytes
 //     readAll(conn)       -> string,       // until peer closes
 //     close(conn) }
+// plus connectAsync/writeAsync/readLineAsync/readNAsync/readAllAsync for the
+// async calls. The built-in transports are marked `builtin`: the engine drives
+// their streams directly, and only their connections are pooled.
 global _httpPlainTransport = nil;
 global _httpSecureTransport = nil;
+
+// Idle keep-alive connections, shared by every request and fiber in the VM:
+// pool key -> array of { s, at, until }, most recently used last. A connection
+// is in here only while no request holds it, so taking it out is what checks
+// it out. Entries hold streams and times only, never a request or transport.
+global _httpIdle      = {};
+global _httpIdleCount = 0;
+global _httpIdleSwept = 0;
+global _httpPoolCfg   = { keepAlive: true, maxIdlePerHost: 8, maxIdle: 64, idleTimeoutMs: 4000 };
 
 // --------------------------------------------------------
 //  Exception types
@@ -157,10 +260,11 @@ class HttpUnsupportedError : HttpError {}   // an operation/scheme this library 
 class Http {
 
     // --------------------------------------------------------
-    //  Internal: read response body - tolerates I/O errors
+    //  Internal: transports
     // --------------------------------------------------------
 
-    // Parse a hex chunk-size line (e.g. "1a" -> 26). Returns 0 on invalid input.
+    // Parse a hex chunk-size line (e.g. "1a" -> 26); a ";ext" after the digits
+    // is ignored. -1 when the line does not start with a hex digit.
     // Uses s[i] byte indexing (returns int) to avoid char/string type issues.
     fn static _parseHexSize(line: string) {
         let n = 0;
@@ -175,11 +279,9 @@ class Http {
             n = n * 16 + d;
             i = i + 1;
         }
-        return n;
+        return i == 0 ? -1 : n;
     }
 
-    // Default plain-TCP transport (cached). Backs all http:// requests and is
-    // the building block the Https library mirrors over TLS.
     // Normalise an async read result to text: Stream's async reads resolve to a
     // block, a supplied transport may resolve to a string. Both are accepted.
     fn static _asText(v) {
@@ -188,6 +290,8 @@ class Http {
         return v;
     }
 
+    // Default plain-TCP transport (cached). Backs all http:// requests and is
+    // the building block the Https library mirrors over TLS.
     fn static _plainTransport() {
         if (_httpPlainTransport != nil) { return _httpPlainTransport; }
         _httpPlainTransport = Http._streamTransport(false, nil);
@@ -197,17 +301,41 @@ class Http {
     // One transport shape over Stream. Plain TCP and TLS differ only in how the
     // connection is opened; every call after that is identical.
     //
-    // `opts` (TLS only): { insecure, timeoutMs, sni }.
+    // `opts`: the request options (see the header); { insecure, sni } are TLS
+    // only and go to Stream.ConnectTls with every other key the caller set.
     fn static _streamTransport(secure: bool, opts) {
-        // The connect and every synchronous read wait at most this long, so a
-        // host that never answers or a server that stalls ends the request
+        // The connect waits at most timeoutMs and every read readTimeoutMs, so
+        // a host that never answers or a server that stalls ends the request
         // instead of holding every fiber.
         let ms = (opts != nil && ("timeoutMs" in opts)) ? opts["timeoutMs"] : 30000;
+        let rms = (opts != nil && ("readTimeoutMs" in opts)) ? opts["readTimeoutMs"] : ms;
         let idleSec = ms >= 1000 ? ms / 1000 : 1;
+        let insecure = opts != nil && ("insecure" in opts) && opts["insecure"] == true;
+        let sni = (opts != nil && ("sni" in opts)) ? opts["sni"] : nil;
+        let tls = { };
+        if (opts != nil) {
+            foreach (val, key in opts) { tls[key] = val; }
+        }
+        tls["timeoutMs"] = ms;
         return {
-            secure:   secure,
+            secure:    secure,
+            builtin:   true,
+            opts:      opts,
+            ms:        ms,
+            rms:       rms,
+            tls:       tls,
+            insecure:  insecure,
+            sni:       sni,
+            keepAlive: !(opts != nil && ("keepAlive" in opts) && opts["keepAlive"] == false),
+            deadlineMs: (opts != nil && ("deadlineMs" in opts)) ? opts["deadlineMs"] : nil,
+            maxBodyBytes: (opts != nil && ("maxBodyBytes" in opts)) ? opts["maxBodyBytes"] : nil,
+            // What a pooled connection must agree on besides scheme, host and
+            // port: the socket timeout it carries and how its TLS was verified.
+            key:       (secure ? "https|" : "http|") + Convert.ToString(rms) + "|" +
+                       (insecure ? "insecure" : "verify") + "|" + Convert.ToString(sni ?? ""),
+            twin:      nil,
             connect:  fn(host, port) {
-                          if (secure) { return Stream.ConnectTls(host, port, opts); }
+                          if (secure) { return Stream.ConnectTls(host, port, tls); }
                           return Stream.Connect("tcp", host, port, ms);
                       },
             write:    fn(c, d)       { Stream.WriteAll(c, d); },
@@ -225,7 +353,7 @@ class Http {
             // Async closures the engine awaits, so requests overlap instead of
             // taking the scheduler one at a time.
             connectAsync:  fn(host, port) {
-                               if (secure) { return Stream.ConnectTlsAsync(host, port, opts); }
+                               if (secure) { return Stream.ConnectTlsAsync(host, port, tls); }
                                return Stream.ConnectAsync("tcp", host, port, ms);
                            },
             writeAsync:    fn(c, d)  { return Stream.WriteAsync(c, d); },
@@ -242,6 +370,24 @@ class Http {
         if (_httpSecureTransport != nil) { return _httpSecureTransport; }
         _httpSecureTransport = Http._streamTransport(true, nil);
         return _httpSecureTransport;
+    }
+
+    // The caller's transport serves the scheme it was built for. A hop to the
+    // other scheme gets a built-in transport's twin with the same options, or
+    // that scheme's default for a supplied one. An options object (no
+    // `connect`) builds a transport for whichever scheme the hop uses.
+    fn static _pickTransport(scheme, given) {
+        let secure = scheme == "https";
+        if (given == nil) {
+            return secure ? Http._secureTransport() : Http._plainTransport();
+        }
+        if (!("connect" in given)) { return Http._streamTransport(secure, given); }
+        if (given.secure == secure) { return given; }
+        if (("builtin" in given) && given.builtin) {
+            if (given.twin == nil) { given.twin = Http._streamTransport(secure, given.opts); }
+            return given.twin;
+        }
+        return secure ? Http._secureTransport() : Http._plainTransport();
     }
 
     // Headers that authenticate the caller to *one* origin. A 302 can point
@@ -273,7 +419,7 @@ class Http {
     // The Host header carries the URL's authority: a non-default port is part
     // of it, and an IPv6 literal keeps its brackets.
     fn static _hostHeader(scheme, host, port) {
-        let h = String.Contains(host, ":") ? "[" + host + "]" : host;
+        let h = String.Contains(host, ':') ? "[" + host + "]" : host;
         let dflt = (scheme == "https") ? 443 : 80;
         return (port == nil || port == dflt) ? h : h + ":" + Convert.ToString(port);
     }
@@ -285,33 +431,36 @@ class Http {
         return String.ToLower(scheme) + "://" + String.ToLower(host) + ":" + Convert.ToString(p);
     }
 
-    // Build the full request text (headers + body), or nil if any component
-    // carries a CR/LF that would inject a header or split the request. Shared by
-    // the sync and async engines so the injection check lives in one place.
-    fn static _buildRequestStr(method, path, host, body, contentType, userHeaders) {
-        if (String.Contains(path, "\r") || String.Contains(path, "\n") ||
-            String.Contains(host, "\r") || String.Contains(host, "\n")) {
+    // Build the full request (headers + body): a string, or a block when the
+    // body is a block. nil if any component carries a CR/LF that would inject a
+    // header or split the request. `close` asks the server to close the
+    // connection after this response, unless the caller set Connection itself;
+    // `gzip` asks for a compressed body, unless the caller set Accept-Encoding;
+    // `extra` is header lines of the engine's own, CRLF-terminated.
+    fn static _buildRequestStr(method, path, host, body, contentType, userHeaders, close: bool, gzip: bool, extra: string) {
+        if (String.Contains(path, '\r') || String.Contains(path, '\n') ||
+            String.Contains(host, '\r') || String.Contains(host, '\n')) {
             return nil;
         }
         if (userHeaders != nil) {
             foreach (val, key in userHeaders) {
                 let vs = Convert.ToString(val);
-                if (String.Contains(key, "\r") || String.Contains(key, "\n") ||
-                    String.Contains(vs, "\r")  || String.Contains(vs, "\n")) {
+                if (String.Contains(key, '\r') || String.Contains(key, '\n') ||
+                    String.Contains(vs, '\r')  || String.Contains(vs, '\n')) {
                     return nil;
                 }
             }
         }
 
-        let req = method + " " + path + " HTTP/1.1\r\n";
-        req = req + "Host: " + host + "\r\n";
-        req = req + "Connection: close\r\n";
-        req = req + "User-Agent: Flaris/1.0\r\n";
-        req = req + "Accept: */*\r\n";
+        var req = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\n";
+        if (close && (userHeaders == nil || !Http._hasHeader(userHeaders, "connection"))) {
+            req = req + "Connection: close\r\n";
+        }
+        req = req + extra + "User-Agent: Flaris/1.0\r\nAccept: */*\r\n";
         // Ask for gzip unless the caller set its own policy. Without it every
         // server sends identity and the transfer is several times larger than
         // it needs to be; _decodeBody puts it back.
-        if (!Http._hasHeader(userHeaders, "accept-encoding")) {
+        if (gzip && (userHeaders == nil || !Http._hasHeader(userHeaders, "accept-encoding"))) {
             req = req + "Accept-Encoding: gzip\r\n";
         }
         if (userHeaders != nil) {
@@ -324,14 +473,13 @@ class Http {
         // Connect sends a zero-length message that still has to be typed.
         let bodyLen:int = (body == nil) ? 0 : len(body);
         if (bodyLen > 0 || contentType != nil) {
-            let ct = contentType;
-            if (ct == nil) { ct = ContentType.Binary; }
-            req = req + "Content-Type: " + ct + "\r\n";
-            req = req + "Content-Length: " + Convert.ToString(bodyLen) + "\r\n";
+            req = req + "Content-Type: " + (contentType ?? ContentType.Binary)
+                + "\r\nContent-Length: " + Convert.ToString(bodyLen) + "\r\n";
         }
-        req = req + "\r\n";
-        if (body != nil && len(body) > 0) { req = req + body; }
-        return req;
+        if (bodyLen == 0) { return req + "\r\n"; }
+        // A block is bytes: `req + body` would render it as the text "[block]".
+        if (Type.IsBlock(body)) { return Buffer.Concat(Buffer.FromString(req + "\r\n"), body); }
+        return req + "\r\n" + body;
     }
 
     // Case-insensitive presence test over a caller's header object.
@@ -349,8 +497,9 @@ class Http {
     // header and deal with it.
     fn static _decodeBody(hdrs, body) {
         if (body == nil || len(body) == 0) { return body; }
-        if (hdrs == nil || !("content-encoding" in hdrs)) { return body; }
-        let enc:string = String.ToLower(String.Trim(hdrs["content-encoding"]));
+        let ce = (hdrs == nil) ? nil : hdrs[_K_CENC];
+        if (ce == nil) { return body; }
+        let enc:string = String.ToLower(String.Trim(ce));
         if (enc == "gzip" || enc == "x-gzip") {
             let out = Inflate.Gzip(body);
             return (out == nil) ? body : Buffer.ToString(out);
@@ -364,66 +513,588 @@ class Http {
         return body;
     }
 
-    // Resolve a Location header against the current origin. Absolute URLs pass
-    // through; relative ones are anchored to scheme://host[:port]. Shared by both
-    // engines.
-    fn static _resolveRedirectUrl(loc, scheme, host, port) {
-        if (String.StartsWith(loc, "http://") || String.StartsWith(loc, "https://")) {
-            return loc;
-        }
-        let origin = scheme + "://" + host;
-        if ((scheme == "http" && port != 80) || (scheme == "https" && port != 443)) {
-            origin = origin + ":" + Convert.ToString(port);
-        }
-        if (!String.StartsWith(loc, "/")) { loc = "/" + loc; }
-        return origin + loc;
+    // Resolve a Location header against the URL of the hop that sent it
+    // (RFC 3986 section 5). nil when the target is not http or https - there is
+    // no other scheme this client can follow.
+    fn static _redirectTarget(loc, parsed, target) {
+        let base = parsed.scheme + "://" + Http._hostHeader(parsed.scheme, parsed.host, parsed.port) + target;
+        let next = HttpUtil.ResolveUrl(base, loc);
+        let lower = String.ToLower(next);
+        if (String.StartsWith(lower, "http://") || String.StartsWith(lower, "https://")) { return next; }
+        return nil;
     }
 
-    fn static _readBody(s, hdrs, tr) {
-        let te = "";
-        let cl = "";
+    // --------------------------------------------------------
+    //  Internal: connection pool
+    // --------------------------------------------------------
 
-        if ("transfer-encoding" in hdrs) { te = hdrs["transfer-encoding"]; }
-        if ("content-length"    in hdrs) { cl = hdrs["content-length"];    }
+    // An idle connection for `key`, or nil. The most recently used one is
+    // taken first. One idle for at least checkMs is checked before it is
+    // handed out: a server that has closed it has left it readable. The check
+    // waits a millisecond on a live connection.
+    fn static _checkout(key: string, checkMs: int) {
+        let list = _httpIdle[key];
+        if (list == nil) { return nil; }
+        let now = Time.Millis();
+        while (len(list) > 0) {
+            let e = list[len(list) - 1];
+            Array.RemoveAt(list, len(list) - 1);
+            _httpIdleCount -= 1;
+            if (now < e.until && (now - e.at < checkMs || Stream.WaitReadable(e.s, 1) == nil)) {
+                return e.s;
+            }
+            Stream.Close(e.s);
+        }
+        return nil;
+    }
 
-        try {
-            if (String.Contains(te, "chunked")) {
-                // Pure-string chunked decoder - avoids block allocations that can
-                // confuse the GC when mixed with later string-only operations.
-                // A chunk that stops short, anything but the CRLF after its data,
-                // or a stream that ends before the last chunk is a broken body.
-                let result = "";
-                let sizeLine = tr.readLine(s);
-                while (sizeLine != nil) {
-                    let n = Http._parseHexSize(sizeLine);
-                    if (n == 0) {
-                        // Trailer fields, if any, end at an empty line.
-                        let t = tr.readLine(s);
-                        while (t != nil && len(t) > 0) { t = tr.readLine(s); }
-                        return result;
-                    }
-                    let chunk = tr.readN(s, n);
-                    if (chunk == nil) { return nil; }
-                    result = result + chunk;
-                    if (tr.readLine(s) != "") { return nil; }
-                    sizeLine = tr.readLine(s);
-                }
+    // Park a connection whose response was read to its end. keepMs is how long
+    // it may stay idle. The oldest idle connection of the same key makes room.
+    fn static _checkin(key: string, s, keepMs: int) {
+        if (keepMs <= 0 || !_httpPoolCfg.keepAlive || _httpPoolCfg.maxIdlePerHost <= 0) {
+            Stream.Close(s);
+            return 0;
+        }
+        let now = Time.Millis();
+        if (now - _httpIdleSwept >= 1000) { Http._sweep(now); }
+        var list = _httpIdle[key];
+        if (list == nil) {
+            list = [];
+            _httpIdle[key] = list;
+        }
+        while (len(list) > 0 && len(list) >= _httpPoolCfg.maxIdlePerHost) {
+            let old = list[0];
+            Array.RemoveAt(list, 0);
+            _httpIdleCount -= 1;
+            Stream.Close(old.s);
+        }
+        if (_httpIdleCount >= _httpPoolCfg.maxIdle) {
+            Stream.Close(s);
+            return 0;
+        }
+        Array.Append(list, { s: s, at: now, until: now + keepMs });
+        _httpIdleCount += 1;
+        return 0;
+    }
+
+    // Close the idle connections whose time is up, for every key.
+    fn static _sweep(now: int) {
+        _httpIdleSwept = now;
+        foreach (list in Object.Values(_httpIdle)) {
+            while (len(list) > 0 && list[0].until <= now) {
+                let old = list[0];
+                Array.RemoveAt(list, 0);
+                _httpIdleCount -= 1;
+                Stream.Close(old.s);
+            }
+        }
+        return 0;
+    }
+
+    // How long a connection may wait idle: the pool's limit, or less when the
+    // server's Keep-Alive header says it closes sooner (a second of margin).
+    fn static _keepMs(hdrs): int {
+        var ms: int = _httpPoolCfg.idleTimeoutMs;
+        let ka = hdrs[_K_KA];
+        if (ka != nil) {
+            let at = String.IndexOf(String.ToLower(ka), "timeout=");
+            if (at >= 0) {
+                let secs = Convert.ParseInt(String.Trim(String.Split(String.Substr(ka, at + 8), ",")[0]));
+                if (secs != nil && secs * 1000 - 1000 < ms) { ms = secs * 1000 - 1000; }
+            }
+        }
+        return ms;
+    }
+
+    // --------------------------------------------------------
+    //  Internal: one request on one connection
+    // --------------------------------------------------------
+    // `x` is the state of one hop: the transport, whether its stream is driven
+    // directly (built-in) or through the closures, whether the caller is an
+    // async fiber, the stream once there is one, and how its body is framed
+    // (mode 0 none, 1 Content-Length with `left` bytes, 2 chunked, 3 to the end
+    // of the stream). An async caller parks only its own fiber - in
+    // Fiber.Await, or in a read on a stream it has waited on - so one engine
+    // serves both kinds of call. `nb` marks a connection from the pool.
+
+    // `dl` is the request's deadline as a Time.Millis() instant, 0 for none;
+    // `cap` the largest body accepted, 0 for any; `px` the proxy from
+    // _proxyFor. Every http:// request through one proxy can share its
+    // connections; an https:// tunnel belongs to its origin.
+    fn static _ctx(tr, parsed, awaits: bool, close: bool, dl: int, cap: int, px) {
+        let b = tr.builtin == true;
+        let pooled = b && !close && tr.keepAlive && _httpPoolCfg.keepAlive;
+        var key = nil;
+        if (pooled) {
+            if (px != nil && !tr.secure) { key = "http|" + Convert.ToString(tr.rms) + "|via|" + px.url; }
+            else {
+                key = tr.key + "|" + String.ToLower(parsed.host) + "|" + Convert.ToString(parsed.port);
+                if (px != nil) { key = key + "|via|" + px.url; }
+            }
+        }
+        return {
+            tr: tr, b: b, a: awaits, s: nil, ms: b ? tr.rms : 0, dl: dl, cap: cap, px: px,
+            host: parsed.host, port: parsed.port, key: key,
+            quiet: false, cut: false, reuse: false, mode: 0, left: 0, keepMs: 0, nb: false
+        };
+    }
+
+    // --------------------------------------------------------
+    //  Internal: proxies
+    // --------------------------------------------------------
+
+    // The proxy a hop goes through, or nil for a direct connection: the
+    // options' `proxy` (false or "" for none), else http_proxy / https_proxy
+    // from the environment. Environment proxies are skipped for this machine
+    // (localhost, 127.x, ::1) and for hosts on no_proxy; an explicit proxy
+    // only for hosts on the options' `noProxy`. Only built-in transports are
+    // proxied. Returns { host, port, auth, url }.
+    fn static _proxyFor(parsed, tr) {
+        if (!tr.builtin) { return nil; }
+        let o = tr.opts;
+        var url = nil;
+        var skip = (o != nil) ? o.noProxy : nil;
+        if (o != nil && o.proxy != nil) {
+            let v = o.proxy;
+            if (v == false || v == "") { return nil; }
+            url = v;
+        } else {
+            let h = String.ToLower(parsed.host);
+            if (h == "localhost" || h == "::1" || String.StartsWith(h, "127.")) { return nil; }
+            url = Http._env(parsed.scheme == "https" ? "https_proxy" : "http_proxy");
+            if (url == nil) { return nil; }
+            if (skip == nil) { skip = Http._env("no_proxy"); }
+        }
+        if (skip != nil && Http._bypass(parsed.host, parsed.port, skip)) { return nil; }
+        let u = HttpUtil.ParseUrl(String.Contains(url, "://") ? url : "http://" + url);
+        if (u == nil || u.scheme != "http" || len(u.host) == 0) {
+            throw new HttpUnsupportedError(100, "Http: proxy '" + url + "' is not an http:// proxy");
+        }
+        var auth = nil;
+        if (u.user != nil) {
+            auth = "Basic " + Http._base64(HttpUtil.UrlDecode(u.user) + ":" + HttpUtil.UrlDecode(u.password ?? ""));
+        }
+        return { host: u.host, port: u.port, auth: auth, url: url };
+    }
+
+    // An environment variable by its lowercase name, else its uppercase one;
+    // nil when neither is set. Under CGI (REQUEST_METHOD set) HTTP_PROXY is a
+    // request header the client chose, so only the lowercase name counts.
+    fn static _env(name: string) {
+        let low = Os.GetEnv(name);
+        if (low != nil && low != "") { return low; }
+        let up = String.ToUpper(name);
+        if (up == "HTTP_PROXY" && (Os.GetEnv("REQUEST_METHOD") ?? "") != "") { return nil; }
+        let v = Os.GetEnv(up);
+        return (v == nil || v == "") ? nil : v;
+    }
+
+    // Whether a no_proxy list names this host: "*", a domain (".example.com"
+    // and "example.com" both cover the domain and every name under it), an
+    // IP address, or an IPv4 range ("10.0.0.0/8"); any of them may end in
+    // ":port" to match that port only.
+    fn static _bypass(host: string, port: int, list: string): bool {
+        let h = String.ToLower(host);
+        foreach (raw in String.Split(list, ",")) {
+            var e = String.ToLower(String.Trim(raw));
+            if (len(e) == 0) { continue; }
+            if (e == "*") { return true; }
+            // An optional ":port" - after the "]" of a bracketed IPv6 address.
+            let close = String.IndexOf(e, "]");
+            let colon = String.LastIndexOf(e, ":");
+            if (colon > close && (close >= 0 || String.IndexOf(e, ":") == colon)) {
+                let p = Convert.ParseInt(String.Substr(e, colon + 1));
+                e = String.Left(e, colon);
+                if (p != nil && p != port) { continue; }
+            }
+            if (String.StartsWith(e, "[")) { e = String.Trim(e, "[]"); }
+            if (String.StartsWith(e, ".")) { e = String.Substr(e, 1); }
+            if (h == e || String.EndsWith(h, "." + e)) { return true; }
+            let slash = String.IndexOf(e, "/");
+            if (slash > 0 && Http._inRange(h, String.Left(e, slash), Convert.ParseInt(String.Substr(e, slash + 1)))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // IPv4 a.b.c.d as an int, or -1.
+    fn static _ipv4(s: string): int {
+        let parts = String.Split(s, ".");
+        if (len(parts) != 4) { return -1; }
+        var v = 0;
+        foreach (p in parts) {
+            let n = Convert.ParseInt(p);
+            if (n == nil || n < 0 || n > 255 || !String.IsNumeric(p)) { return -1; }
+            v = v * 256 + n;
+        }
+        return v;
+    }
+
+    fn static _inRange(host: string, net: string, bits): bool {
+        let a = Http._ipv4(host);
+        let b = Http._ipv4(net);
+        if (a < 0 || b < 0 || bits == nil || bits < 0 || bits > 32) { return false; }
+        let drop = 32 - bits;
+        return (a >> drop) == (b >> drop);
+    }
+
+    // RFC 4648 Base64 of a string's bytes, for Proxy-Authorization.
+    fn static _base64(s: string): string {
+        let abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let n = len(s);
+        var out = "";
+        var i = 0;
+        while (i < n) {
+            let b0: int = s[i];
+            let b1: int = i + 1 < n ? s[i + 1] : 0;
+            let b2: int = i + 2 < n ? s[i + 2] : 0;
+            let v = (b0 << 16) | (b1 << 8) | b2;
+            out += String.Substr(abc, (v >> 18) & 63, 1) + String.Substr(abc, (v >> 12) & 63, 1);
+            out += i + 1 < n ? String.Substr(abc, (v >> 6) & 63, 1) : "=";
+            out += i + 2 < n ? String.Substr(abc, v & 63, 1) : "=";
+            i += 3;
+        }
+        return out;
+    }
+
+    // "host:port", an IPv6 literal in brackets: the CONNECT target.
+    fn static _authority(host: string, port: int): string {
+        let h = String.Contains(host, ':') ? "[" + host + "]" : host;
+        return h + ":" + Convert.ToString(port);
+    }
+
+    // Ask the proxy for a tunnel to the origin, then speak TLS through it.
+    // The stream comes back upgraded in place, or nil with it closed.
+    fn static _tunnel(x, s, ms: int) {
+        let tr = x.tr;
+        let target = Http._authority(x.host, x.port);
+        var req = "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n";
+        if (x.px.auth != nil) { req += "Proxy-Authorization: " + x.px.auth + "\r\n"; }
+        x.s = s;
+        let h = Http._write(x, req + "\r\n") ? Http._head(x) : nil;
+        x.s = nil;
+        if (h == nil || h.status < 200 || h.status > 299) {
+            Stream.Close(s);
+            return nil;
+        }
+        let o = { sni: tr.sni ?? x.host, timeoutMs: ms };
+        if (tr.insecure) { o["insecure"] = true; }
+        return Stream.StartTls(s, o);
+    }
+
+    // The longest the next wait may take: the read timeout, cut to what is
+    // left before the deadline, and -1 once it has passed. A built-in
+    // stream gets it as its timeout, which bounds the reads that park.
+    fn static _wait(x): int {
+        var t: int = x.dl - Time.Millis();
+        if (t <= 0) { return -1; }
+        if (x.ms > 0 && x.ms < t) { t = x.ms; }
+        if (x.b && x.s != nil) { Stream.SetTimeout(x.s, t); }
+        return t;
+    }
+
+    fn static _open(x) {
+        let tr = x.tr;
+        if (x.dl > 0 && x.dl <= Time.Millis()) { return nil; }
+        if (!x.b) {
+            let c = x.a ? Fiber.Await(tr.connectAsync(x.host, x.port)) : tr.connect(x.host, x.port);
+            return (c == 0) ? nil : c;
+        }
+        var ms: int = tr.ms;
+        if (x.dl > 0) {
+            let left = x.dl - Time.Millis();
+            if (left <= 0) { return nil; }
+            if (ms <= 0 || left < ms) { ms = left; }
+        }
+        var s = nil;
+        if (x.px != nil) {
+            s = x.a ? Fiber.Await(Stream.ConnectAsync("tcp", x.px.host, x.px.port, ms))
+                    : Stream.Connect("tcp", x.px.host, x.px.port, ms);
+            if (s != nil && tr.secure) { s = Http._tunnel(x, s, ms); }
+        } else if (tr.secure) {
+            var tls = tr.tls;
+            if (ms != tr.ms) {
+                tls = Object.Clone(tr.tls);
+                tls["timeoutMs"] = ms;
+            }
+            s = x.a ? Fiber.Await(Stream.ConnectTlsAsync(x.host, x.port, tls))
+                    : Stream.ConnectTls(x.host, x.port, tls);
+        } else {
+            s = x.a ? Fiber.Await(Stream.ConnectAsync("tcp", x.host, x.port, ms))
+                    : Stream.Connect("tcp", x.host, x.port, ms);
+        }
+        // The connect timeout is now the socket's; reads get their own.
+        if (s != nil && ms != tr.rms) { Stream.SetTimeout(s, tr.rms); }
+        return s;
+    }
+
+    // true when every byte went out. A supplied transport reports nothing, so
+    // its failures surface at the first read.
+    fn static _write(x, data): bool {
+        if (x.b) {
+            var t: int = x.ms;
+            if (x.dl > 0) {
+                t = Http._wait(x);
+                if (t < 0) { return false; }
+            }
+            // A small request fits the send buffer of a connection from the
+            // pool, so writing it directly cannot hold the VM. A larger one
+            // goes async: a connection that only ever carried synchronous
+            // calls may still be a blocking socket.
+            if (!x.a || (x.nb && len(data) <= 16384)) { return Stream.WriteAll(x.s, data); }
+            let n = Fiber.Await(Stream.WriteAsync(x.s, data, t));
+            return n != nil && n == len(data);
+        }
+        if (x.a) { Fiber.Await(x.tr.writeAsync(x.s, data)); }
+        else     { x.tr.write(x.s, data); }
+        return true;
+    }
+
+    // An async caller waits in WaitReadable, parking only its own fiber, until
+    // bytes are there, and the synchronous read takes them. A socket that has
+    // been parked on stays non-blocking, so a read that still has to wait
+    // parks too - plain or TLS.
+    fn static _line(x) {
+        if (x.b) {
+            var t: int = x.ms;
+            if (x.dl > 0) {
+                t = Http._wait(x);
+                if (t < 0) { return nil; }
+            }
+            if (x.a && Stream.WaitReadable(x.s, t) != true) { return nil; }
+            return Stream.ReadLine(x.s);
+        }
+        if (x.dl > 0 && x.dl <= Time.Millis()) { return nil; }
+        if (x.a) { return Http._asText(Fiber.Await(x.tr.readLineAsync(x.s))); }
+        return x.tr.readLine(x.s);
+    }
+
+    // Exactly n bytes as a string, or nil when the stream ends or times out first.
+    fn static _exact(x, n: int) {
+        if (x.b) {
+            if (x.dl == 0) {
+                if (x.a && Stream.WaitReadable(x.s, x.ms) != true) { return nil; }
+                let b = HttpUtil.ReadExact(x.s, n);
+                return b == nil ? nil : Buffer.ToString(b);
+            }
+            // Every wait re-armed, so bytes that trickle in cannot outlast the deadline.
+            var got = nil;
+            while (got == nil || len(got) < n) {
+                if (Http._wait(x) < 0) { return nil; }
+                let more = Stream.ReadBytes(x.s, got == nil ? n : n - len(got));
+                if (more == nil) { return nil; }
+                if (got == nil) { got = more; } else { Buffer.Append(got, more); }
+            }
+            return Buffer.ToString(got);
+        }
+        if (x.dl > 0 && x.dl <= Time.Millis()) { return nil; }
+        let d = x.a ? Http._asText(Fiber.Await(x.tr.readNAsync(x.s, n))) : x.tr.readN(x.s, n);
+        return (d == nil || len(d) < n) ? nil : d;
+    }
+
+    // What has arrived, at least one byte and at most n, as a string; nil at
+    // the end of the stream, on a timeout or once the deadline has passed.
+    fn static _some(x, n: int) {
+        if (!x.b) {
+            if (x.mode != 3) { return Http._exact(x, n); }
+            x.mode = 0;
+            let all = x.a ? Http._asText(Fiber.Await(x.tr.readAllAsync(x.s))) : x.tr.readAll(x.s);
+            return (all == nil || len(all) == 0) ? nil : all;
+        }
+        var t: int = x.ms;
+        if (x.dl > 0) {
+            t = Http._wait(x);
+            if (t < 0) { return nil; }
+        }
+        // An async caller parks in WaitReadable until bytes are there to take.
+        if (x.a && Stream.WaitReadable(x.s, t) != true) { return nil; }
+        let b = Stream.ReadBytes(x.s, n);
+        return b == nil ? nil : Buffer.ToString(b);
+    }
+
+    fn static _drop(x) {
+        if (x.s == nil) { return 0; }
+        if (x.b) { Stream.Close(x.s); } else { x.tr.close(x.s); }
+        x.s = nil;
+        return 0;
+    }
+
+    // Status line and header block. Interim 1xx responses, and empty lines
+    // before a status line, are read past. nil when the connection ends first
+    // or the status line is malformed; x.quiet then tells whether the
+    // connection ended before a single response byte.
+    fn static _head(x) {
+        x.quiet = false;
+        var any = false;
+        while (true) {
+            let statusLine = Http._line(x);
+            if (statusLine == nil) {
+                let why = x.b ? Stream.LastError() : 0;
+                x.quiet = !any && why != 1 && why != 7;
                 return nil;
             }
+            if (len(statusLine) == 0) { continue; }
+            any = true;
+            let sp = String.IndexOf(statusLine, ' ');
+            let status = sp > 0 ? Convert.ParseInt(String.Substr(statusLine, sp + 1, 3)) : nil;
+            if (status == nil || status < 100) { return nil; }
 
-            if (len(cl) > 0) {
-                let n = Convert.ParseInt(cl);
-                if (n > 0) {
-                    return tr.readN(s, n);
+            // Header names are lowercased; a repeated name keeps its last
+            // value. Every Set-Cookie is kept, in res.setCookies.
+            let hdrs = { };
+            let setCookies = [];
+            var line = Http._line(x);
+            while (line != nil && len(line) > 0) {
+                let c = String.IndexOf(line, ':');
+                if (c > 0) {
+                    let k = String.ToLower(String.Left(line, c));
+                    let v = String.TrimLeft(String.Substr(line, c + 1));
+                    hdrs[k] = v;
+                    if (k == "set-cookie") { Array.Append(setCookies, String.Trim(v)); }
                 }
-                return "";
+                line = Http._line(x);
             }
+            if (line == nil) { x.cut = true; }
+            if (status >= 200 || status == 101) {
+                return { status: status, version: String.Left(statusLine, sp),
+                         headers: hdrs, setCookies: setCookies };
+            }
+        }
+    }
 
-            // No length hint - read until connection closes
-            return tr.readAll(s);
+    // How the body is delimited (RFC 9112 section 6.3), and whether the
+    // connection can carry another request after it. false for a malformed
+    // Content-Length.
+    fn static _frame(x, method, h): bool {
+        let hdrs = h.headers;
+        let st = h.status;
+        x.reuse = x.key != nil && !x.cut && h.version == "HTTP/1.1";
+        let conn = hdrs.connection;
+        if (conn != nil && conn != "keep-alive" && String.Contains(String.ToLower(conn), "close")) { x.reuse = false; }
+        let te = hdrs[_K_TE];
+        let cl = hdrs[_K_CL];
+        if (method == "HEAD" || st == 204 || st == 304 || st == 101) {
+            x.mode = 0;
+            if (st == 101) { x.reuse = false; }
+        } else if (te != nil) {
+            x.mode = String.Contains(String.ToLower(te), "chunked") ? 2 : 3;
+        } else if (cl != nil) {
+            let n = Convert.ParseInt(String.Trim(cl));
+            if (n == nil || n < 0) { return false; }
+            x.mode = 1;
+            x.left = n;
+        } else {
+            x.mode = 3;
+        }
+        if (x.mode == 3) { x.reuse = false; }
+        if (x.reuse) { x.keepMs = Http._keepMs(hdrs); }
+        return true;
+    }
 
-        } catch (e) {
-            return nil;
+    // The whole body as a string, or nil when it is malformed, cut short or
+    // larger than x.cap. Leaves the connection with the pool when it is still
+    // in step, closed otherwise.
+    fn static _body(x) {
+        var out = "";
+        if (x.mode == 1) {
+            if (x.cap > 0 && x.left > x.cap) { out = nil; }
+            else if (x.left > 0) { out = Http._exact(x, x.left); }
+        } else if (x.mode == 2) {
+            out = Http._chunked(x);
+        } else if (x.mode == 3) {
+            out = Http._toEnd(x);
+        }
+        if (out != nil && x.reuse && x.s != nil) {
+            // A deadline shortened the socket's timeout; the next user expects the transport's.
+            if (x.dl > 0) { Stream.SetTimeout(x.s, x.ms); }
+            Http._checkin(x.key, x.s, x.keepMs);
+            x.s = nil;
+        }
+        Http._drop(x);
+        return out;
+    }
+
+    // A chunk that stops short, anything but the CRLF after its data, or a
+    // stream that ends before the last chunk is a broken body.
+    fn static _chunked(x) {
+        var out = "";
+        while (true) {
+            let sizeLine = Http._line(x);
+            if (sizeLine == nil) { return nil; }
+            let n = Http._parseHexSize(sizeLine);
+            if (n < 0) { return nil; }
+            if (n == 0) {
+                // Trailer fields, if any, end at an empty line.
+                var t = Http._line(x);
+                while (t != nil && len(t) > 0) { t = Http._line(x); }
+                if (t == nil) { x.reuse = false; }
+                return out;
+            }
+            if (x.cap > 0 && len(out) + n > x.cap) { return nil; }
+            let chunk = Http._exact(x, n);
+            if (chunk == nil) { return nil; }
+            out += chunk;
+            if (Http._line(x) != "") { return nil; }
+        }
+    }
+
+    // Until the server closes. A read that times out ends the body with what
+    // had arrived.
+    fn static _toEnd(x) {
+        if (!x.b) {
+            let all = x.a ? Http._asText(Fiber.Await(x.tr.readAllAsync(x.s))) : x.tr.readAll(x.s);
+            return (x.cap > 0 && all != nil && len(all) > x.cap) ? nil : (all ?? "");
+        }
+        var out = "";
+        while (true) {
+            var t: int = x.ms;
+            if (x.dl > 0) {
+                t = Http._wait(x);
+                if (t < 0) { return nil; }
+            }
+            let piece = x.a ? Fiber.Await(Stream.ReadAsync(x.s, 65536, t)) : Stream.ReadBytes(x.s, 65536);
+            if (piece == nil) { break; }
+            out += Buffer.ToString(piece);
+            if (x.cap > 0 && len(out) > x.cap) { return nil; }
+            if (x.a && len(piece) < 65536) { break; }
+        }
+        let why = Stream.LastError();
+        if (why == 1 && x.dl > 0 && x.dl <= Time.Millis()) { return nil; }
+        return (why == 0 || why == 1) ? out : nil;
+    }
+
+    // RFC 9110 section 9.2.2: sending one of these twice has the effect of
+    // sending it once.
+    fn static _idempotent(method): bool {
+        return method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" ||
+               method == "OPTIONS" || method == "TRACE" || method == "QUERY";
+    }
+
+    // Write the request and read the response head, on an idle pooled
+    // connection when there is one. A pooled connection the server closed
+    // meanwhile fails before any response byte; the request is then sent once
+    // more on a fresh connection if that cannot repeat its effect: the method
+    // is idempotent, or the request was not fully written. A request that may
+    // not be repeated checks an idle connection after a tenth of a second,
+    // the others after a second.
+    fn static _send(x, req, method) {
+        let idem = Http._idempotent(method);
+        var fresh = x.key == nil;
+        while (true) {
+            var s = fresh ? nil : Http._checkout(x.key, idem ? 1000 : 100);
+            let reused = s != nil;
+            if (s == nil) { s = Http._open(x); }
+            if (s == nil) { return nil; }
+            x.s = s;
+            x.nb = reused;
+            let wrote = Http._write(x, req);
+            let h = wrote ? Http._head(x) : nil;
+            if (h != nil) { return h; }
+            Http._drop(x);
+            if (!reused || fresh || !(!wrote || (x.quiet && idem))) { return nil; }
+            if (x.dl > 0 && x.dl <= Time.Millis()) { return nil; }
+            fresh = true;
         }
     }
 
@@ -431,7 +1102,11 @@ class Http {
     //  Internal: core request + redirect loop
     // --------------------------------------------------------
 
-    fn static _request(method, url, body, contentType, userHeaders, tlsTransport?) {
+    // Both kinds of call run this. With `awaits` every wait goes through
+    // Fiber.Await, so only the calling fiber parks at each connect, write and
+    // read. With `open` the final response comes back as an HttpStream, its
+    // body still on the connection.
+    fn static _request(method, url, body, contentType, userHeaders, transport, awaits: bool, open: bool) {
         let curUrl    = url;
         let curMethod = method;
         let curBody   = body;
@@ -440,9 +1115,26 @@ class Http {
         // The origin the caller asked for. Credential headers survive only as
         // long as the hops stay on it - see _stripCredentials.
         let start     = HttpUtil.ParseUrl(url);
-        let homeOrigin = (start == nil) ? nil
-                       : Http._origin(start.scheme, start.host, start.port);
+        if (start != nil && start.scheme != "http" && start.scheme != "https") {
+            throw new HttpUnsupportedError(100, "Http: unsupported scheme '" + start.scheme + "'");
+        }
         var curHeaders = userHeaders;
+
+        // One deadline for the whole request: every hop, retry, wait and byte.
+        let dms = (transport == nil) ? nil : transport.deadlineMs;
+        let dl: int = (dms != nil && dms > 0) ? Time.Millis() + dms : 0;
+        // The largest body accepted, decompressed or not; 0 for any.
+        let mbb = (transport == nil) ? nil : transport.maxBodyBytes;
+        let cap: int = (mbb != nil && mbb > 0) ? mbb : 0;
+
+        // A caller's "Connection: close" keeps this request out of the pool.
+        var close = false;
+        if (userHeaders != nil) {
+            foreach (val, key in userHeaders) {
+                if (String.ToLower(key) == "connection" &&
+                    String.Contains(String.ToLower(Convert.ToString(val)), "close")) { close = true; }
+            }
+        }
 
         // Normalize a structured body (object/array) to a JSON string. Without
         // this, an object body would be written via the default value->string
@@ -456,263 +1148,95 @@ class Http {
         }
 
         while (redirects <= 5) {
-            let parsed = HttpUtil.ParseUrl(curUrl);
+            let parsed = (redirects == 0) ? start : HttpUtil.ParseUrl(curUrl);
             if (parsed == nil) { return nil; }
 
-            let host  = parsed.host;
-            let port  = parsed.port;
-            let path  = parsed.path;
-            let query = parsed.query;
+            let path = parsed.path;
+            if (len(parsed.query) > 0) { path = path + "?" + parsed.query; }
 
-            if (len(query) > 0) {
-                path = path + "?" + query;
+            // Pick the transport per hop so cross-scheme redirects work.
+            let tr = Http._pickTransport(parsed.scheme, transport);
+            let px = Http._proxyFor(parsed, tr);
+            var x  = Http._ctx(tr, parsed, awaits, close, dl, cap, px);
+
+            // Through a proxy an http:// request names its whole URL, and
+            // carries the proxy's credentials; https:// goes through a tunnel.
+            let hostHdr = Http._hostHeader(parsed.scheme, parsed.host, parsed.port);
+            var target = path;
+            var extra = "";
+            if (px != nil && !tr.secure) {
+                target = "http://" + hostHdr + path;
+                if (px.auth != nil) { extra = "Proxy-Authorization: " + px.auth + "\r\n"; }
             }
 
-            // Pick the transport per hop so cross-scheme redirects work. A
-            // caller-supplied TLS transport wins when one is passed.
-            let tr = nil;
-            if (parsed.scheme == "https") {
-                tr = tlsTransport ?? Http._secureTransport();
-            } else {
-                tr = Http._plainTransport();
-            }
+            // nil means a CR/LF injection in the path/host/headers.
+            let req = Http._buildRequestStr(curMethod, target, hostHdr,
+                                            curBody, contentType, curHeaders, x.key == nil, !open, extra);
+            if (req == nil) { return nil; }
 
-            let s = tr.connect(host, port);
-            if (s == nil) { return nil; }
-
-            // Set outside try so redirect loop back happens after try exits cleanly.
             let redirectUrl = nil;
             let response    = nil;
-
             try {
-                // Assemble the request; nil means a CR/LF injection was detected
-                // in the path/host/headers - drop the connection and fail.
-                let req = Http._buildRequestStr(curMethod, path, Http._hostHeader(parsed.scheme, host, port),
-                                                 curBody, contentType, curHeaders);
-                if (req == nil) { tr.close(s); return nil; }
-                tr.write(s, req);
-
-                // --- status line: "HTTP/1.1 200 OK" ---
-                let statusLine = tr.readLine(s);
-                if (statusLine == nil || len(statusLine) == 0) {
-                    tr.close(s);
-                    return nil;
-                }
-
-                let parts  = String.Split(statusLine, " ");
-                let status = Convert.ParseInt(parts[1]);
-
-                // --- accumulate header block ---
-                let headerStr = "";
-                // Collect Set-Cookie lines separately: ParseHeaders folds
-                // duplicate header keys into one, but a response may set several
-                // cookies. CookieJar.StoreFromResponse() reads this array.
-                let setCookies = [];
-                let line = tr.readLine(s);
-                while (line != nil && len(line) > 0) {
-                    headerStr = headerStr + line + "\r\n";
-                    if (String.StartsWith(String.ToLower(line), "set-cookie:")) {
-                        Array.Append(setCookies, String.Trim(String.Substr(line, 11, len(line) - 11)));
+                let h = Http._send(x, req, curMethod);
+                if (h != nil && Http._frame(x, curMethod, h)) {
+                    let st = h.status;
+                    if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) &&
+                        ("location" in h.headers)) {
+                        // Read past the redirect's own body so its connection
+                        // can carry the next hop.
+                        Http._body(x);
+                        redirectUrl = Http._redirectTarget(h.headers["location"], parsed, path);
+                        if (redirectUrl != nil &&
+                            (st == 303 || ((st == 301 || st == 302) && curMethod != "GET"))) {
+                            curMethod = "GET";
+                            curBody   = nil;
+                        }
+                    } else if (open) {
+                        response = new HttpStream(x, h, curUrl);
+                        x = nil;
+                    } else {
+                        let raw = Http._body(x);
+                        let decoded = (raw == nil) ? nil : Http._decodeBody(h.headers, raw);
+                        if (decoded != nil && (cap == 0 || len(decoded) <= cap)) {
+                            response = {
+                                status:     st,
+                                headers:    h.headers,
+                                body:       decoded,
+                                setCookies: h.setCookies
+                            };
+                        }
                     }
-                    line = tr.readLine(s);
                 }
-
-                let hdrs = HttpUtil.ParseHeaders(headerStr);
-
-                // --- redirect: store target URL, handle loop back outside try ---
-                if ((status == 301 || status == 302 || status == 303 ||
-                     status == 307 || status == 308) && ("location" in hdrs)) {
-                    tr.close(s);
-                    redirectUrl = Http._resolveRedirectUrl(hdrs["location"], parsed.scheme, host, parsed.port);
-                    if (status == 303 || ((status == 301 || status == 302) && curMethod != "GET")) {
-                        curMethod = "GET";
-                        curBody   = nil;
-                    }
-                } else {
-                    // --- normal response ---
-                    let responseBody = Http._decodeBody(hdrs, Http._readBody(s, hdrs, tr));
-                    tr.close(s);
-                    response = {
-                        status:     status,
-                        headers:    hdrs,
-                        body:       responseBody,
-                        setCookies: setCookies
-                    };
-                }
-
             } catch (e) {
-                tr.close(s);
+                response = nil;
             }
+            if (x != nil) { Http._drop(x); }
 
-            // Act on redirect OUTSIDE the try block
-            if (redirectUrl != nil) {
-                curUrl = redirectUrl;
-                redirects = redirects + 1;
-                // Leaving the caller's origin drops whatever authenticated them
-                // to it. Once dropped they stay dropped, even if a later hop
-                // returns to the origin: a redirect chain through a third party
-                // is not a reason to re-issue the credential.
-                let next = HttpUtil.ParseUrl(curUrl);
-                if (homeOrigin == nil || next == nil
-                    || Http._origin(next.scheme, next.host, next.port) != homeOrigin) {
-                    curHeaders = Http._stripCredentials(curHeaders);
-                }
-            } else {
-                return response; // nil on I/O error, object on success
+            if (redirectUrl == nil) { return response; }
+            curUrl = redirectUrl;
+            redirects = redirects + 1;
+            // Leaving the caller's origin drops whatever authenticated them
+            // to it. Once dropped they stay dropped, even if a later hop
+            // returns to the origin: a redirect chain through a third party
+            // is not a reason to re-issue the credential.
+            let next = HttpUtil.ParseUrl(curUrl);
+            let homeOrigin = (start == nil) ? nil : Http._origin(start.scheme, start.host, start.port);
+            if (homeOrigin == nil || next == nil
+                || Http._origin(next.scheme, next.host, next.port) != homeOrigin) {
+                curHeaders = Http._stripCredentials(curHeaders);
             }
         }
 
         return nil; // too many redirects
     }
 
-    // --------------------------------------------------------
-    //  Internal: async engine (mirrors _request; awaits the transport)
-    // --------------------------------------------------------
-
-    // Read the response body over an async transport (awaits readLine/readN/
-    // readAll). Same framing as _readBody; tolerates I/O errors (returns nil).
-    fn static async _readBodyAsync(s, hdrs, tr) {
-        let te = "";
-        let cl = "";
-        if ("transfer-encoding" in hdrs) { te = hdrs["transfer-encoding"]; }
-        if ("content-length"    in hdrs) { cl = hdrs["content-length"];    }
-        try {
-            if (String.Contains(te, "chunked")) {
-                let result = "";
-                let sizeLine = await tr.readLineAsync(s);
-                while (sizeLine != nil) {
-                    let n = Http._parseHexSize(sizeLine);
-                    if (n == 0) {
-                        let t = await tr.readLineAsync(s);
-                        while (t != nil && len(t) > 0) { t = await tr.readLineAsync(s); }
-                        return result;
-                    }
-                    let chunk = Http._asText(await tr.readNAsync(s, n));
-                    if (chunk == nil || len(chunk) < n) { return nil; }
-                    result = result + chunk;
-                    if ((await tr.readLineAsync(s)) != "") { return nil; }
-                    sizeLine = await tr.readLineAsync(s);
-                }
-                return nil;
-            }
-            if (len(cl) > 0) {
-                let n = Convert.ParseInt(cl);
-                if (n > 0) { return Http._asText(await tr.readNAsync(s, n)); }
-                return "";
-            }
-            return Http._asText(await tr.readAllAsync(s)) ?? "";
-        } catch (e) {
-            return nil;
-        }
+    // The async twin of _request: a fiber running the same engine.
+    fn static async _requestAsync(method, url, body, contentType, userHeaders, transport) {
+        return Http._request(method, url, body, contentType, userHeaders, transport, true, false);
     }
 
-    // Async twin of _request. Suspends the calling fiber (instead of blocking the
-    // whole scheduler) at each connect/write/read by awaiting the transport's
-    // *Async closures - so several requests overlap, and a client can share a VM
-    // with a server without either starving the other. Both schemes have async
-    // closures, so no hop falls back to the synchronous engine.
-    fn static async _requestAsync(method, url, body, contentType, userHeaders, tlsTransport) {
-        let curUrl    = url;
-        let curMethod = method;
-        let curBody   = body;
-        let redirects = 0;
-
-        // The origin the caller asked for. Credential headers survive only as
-        // long as the hops stay on it - see _stripCredentials.
-        let start     = HttpUtil.ParseUrl(url);
-        let homeOrigin = (start == nil) ? nil
-                       : Http._origin(start.scheme, start.host, start.port);
-        var curHeaders = userHeaders;
-
-        if (curBody != nil &&
-            (Type.Is(curBody, Type.Object) || Type.Is(curBody, Type.Array))) {
-            curBody = Json.Stringify(curBody);
-        }
-
-        while (redirects <= 5) {
-            let parsed = HttpUtil.ParseUrl(curUrl);
-            if (parsed == nil) { return nil; }
-
-            // Both schemes provide async closures, so no hop falls back to the
-            // synchronous engine.
-            let tr = (parsed.scheme == "https")
-                         ? (tlsTransport ?? Http._secureTransport())
-                         : Http._plainTransport();
-
-            let host  = parsed.host;
-            let port  = parsed.port;
-            let path  = parsed.path;
-            let query = parsed.query;
-            if (len(query) > 0) { path = path + "?" + query; }
-
-            let s  = await tr.connectAsync(host, port);
-            if (s == nil || s == 0) { return nil; }
-
-            let redirectUrl = nil;
-            let response    = nil;
-
-            try {
-                let req = Http._buildRequestStr(curMethod, path, Http._hostHeader(parsed.scheme, host, port),
-                                                 curBody, contentType, curHeaders);
-                if (req == nil) { tr.close(s); return nil; }
-                await tr.writeAsync(s, req);
-
-                let statusLine = await tr.readLineAsync(s);
-                if (statusLine == nil || len(statusLine) == 0) {
-                    tr.close(s);
-                    return nil;
-                }
-                let parts  = String.Split(statusLine, " ");
-                let status = Convert.ParseInt(parts[1]);
-
-                let headerStr  = "";
-                let setCookies = [];
-                let line = await tr.readLineAsync(s);
-                while (line != nil && len(line) > 0) {
-                    headerStr = headerStr + line + "\r\n";
-                    if (String.StartsWith(String.ToLower(line), "set-cookie:")) {
-                        Array.Append(setCookies, String.Trim(String.Substr(line, 11, len(line) - 11)));
-                    }
-                    line = await tr.readLineAsync(s);
-                }
-                let hdrs = HttpUtil.ParseHeaders(headerStr);
-
-                if ((status == 301 || status == 302 || status == 303 ||
-                     status == 307 || status == 308) && ("location" in hdrs)) {
-                    tr.close(s);
-                    redirectUrl = Http._resolveRedirectUrl(hdrs["location"], parsed.scheme, host, parsed.port);
-                    if (status == 303 || ((status == 301 || status == 302) && curMethod != "GET")) {
-                        curMethod = "GET";
-                        curBody   = nil;
-                    }
-                } else {
-                    let responseBody = Http._decodeBody(hdrs,
-                                           await Http._readBodyAsync(s, hdrs, tr));
-                    tr.close(s);
-                    response = {
-                        status:     status,
-                        headers:    hdrs,
-                        body:       responseBody,
-                        setCookies: setCookies
-                    };
-                }
-            } catch (e) {
-                tr.close(s);
-            }
-
-            if (redirectUrl != nil) {
-                curUrl = redirectUrl;
-                redirects = redirects + 1;
-                let next = HttpUtil.ParseUrl(curUrl);
-                if (homeOrigin == nil || next == nil
-                    || Http._origin(next.scheme, next.host, next.port) != homeOrigin) {
-                    curHeaders = Http._stripCredentials(curHeaders);
-                }
-            } else {
-                return response;
-            }
-        }
-        return nil; // too many redirects
+    fn static async _openAsync(method, url, body, contentType, userHeaders, transport) {
+        return Http._request(method, url, body, contentType, userHeaders, transport, true, true);
     }
 
     // --------------------------------------------------------
@@ -725,6 +1249,10 @@ class Http {
     //    backoff  : float  - delay multiplier per retry (default 2.0)
     //    retryOn  : fn(resp) -> bool  - decide if a response is retryable.
     //                         Default: nil/no-status response, status >= 500, or 429.
+    //    retryAfter      : bool - honour Retry-After on a 429 or 503 (default true):
+    //                      the next try waits as long as the server asked
+    //                      instead of the backoff delay
+    //    maxRetryAfterMs : int  - the longest such wait (default 60000)
     //
     //  Returns the last response (which may still be a failure after all tries).
     // --------------------------------------------------------
@@ -733,11 +1261,15 @@ class Http {
         var delayMs:int  = 200;
         var backoff      = 2.0;
         var retryOn      = nil;
+        var honour       = true;
+        var maxAfter:int = 60000;
         if (options != nil) {
             if (Object.HasKey(options, "attempts")) attempts = options.attempts;
             if (Object.HasKey(options, "delayMs"))  delayMs  = options.delayMs;
             if (Object.HasKey(options, "backoff"))  backoff  = options.backoff;
             if (Object.HasKey(options, "retryOn"))  retryOn  = options.retryOn;
+            if (Object.HasKey(options, "retryAfter")) honour = options.retryAfter;
+            if (Object.HasKey(options, "maxRetryAfterMs")) maxAfter = options.maxRetryAfterMs;
         }
         if (attempts < 1) attempts = 1;
 
@@ -752,11 +1284,36 @@ class Http {
             }
             attempt = attempt + 1;
             if (attempt < attempts) {
-                Fiber.Sleep(wait);
+                var pause = wait;
+                if (honour && resp != nil && (resp.status == 429 || resp.status == 503)) {
+                    let after = Http.RetryAfterMs(resp);
+                    if (after != nil) { pause = after < maxAfter ? after : maxAfter; }
+                }
+                Fiber.Sleep(pause);
                 wait = Convert.ToInt(float(wait) * backoff);
             }
         }
         return resp;
+    }
+
+    // How long a response's Retry-After asks the client to wait, in ms: the
+    // header's delta-seconds, or the time until its HTTP-date (0 once it has
+    // passed). nil without a header that parses.
+    fn static RetryAfterMs(resp) {
+        if (resp == nil || resp.headers == nil) { return nil; }
+        let raw = resp.headers["retry-after"];
+        if (raw == nil) { return nil; }
+        let v = String.Trim(Convert.ToString(raw));
+        if (len(v) > 0 && String.IsNumeric(v)) { return Convert.ParseInt(v) * 1000; }
+        // RFC 9110 section 5.6.7: IMF-fixdate, and the obsolete RFC 850 and asctime forms.
+        foreach (fmt in ["%a, %d %b %Y %H:%M:%S GMT", "%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]) {
+            let at = Time.Parse(v, fmt);
+            if (at != nil) {
+                let ms = (at - Time.Now()) * 1000;
+                return ms > 0 ? ms : 0;
+            }
+        }
+        return nil;
     }
 
     // Default retry predicate: transport failures and transient server errors.
@@ -918,145 +1475,181 @@ class Http {
         return { status: status, path: path };
     }
 
-    // A chunked NDJSON body: decode the chunks and carry a partial line across
-    // them, since a line can end in one chunk and continue in the next.
-    fn static _ndjsonChunked(s: stream, onLine: fn) {
-        let pending = "";
-        let sizeLine = Stream.ReadLine(s);
-        while (sizeLine != nil) {
-            let n = Http._parseHexSize(sizeLine);
-            if (n == 0) { break; }
-            let data = HttpUtil.ReadExact(s, n);
-            if (data == nil) { break; }
-            Stream.ReadLine(s); // the CRLF after the chunk data
-            pending = pending + Buffer.ToString(data);
-            var nl = String.IndexOf(pending, "\n");
-            while (nl >= 0) {
-                Http._ndjsonLine(String.Left(pending, nl), onLine);
-                pending = String.Substr(pending, nl + 1);
-                nl = String.IndexOf(pending, "\n");
-            }
-            sizeLine = Stream.ReadLine(s);
-        }
-        Http._ndjsonLine(pending, onLine);
-    }
-
     fn static _ndjsonLine(line: string, onLine: fn) {
         if (String.EndsWith(line, "\r")) { line = String.Left(line, len(line) - 1); }
         if (len(line) > 0 && String.StartsWith(line, "{")) { onLine(line); }
     }
 
     // --------------------------------------------------------
-    //  Http.StreamPost(url, body, onLine, headers?)
+    //  Http.StreamPost(url, body, onLine, headers?, transport?)
     //
     //  POST url with a JSON body and call onLine(rawLine) for each
     //  NDJSON line received. Designed for Ollama / OpenAI-compatible
-    //  streaming endpoints (plain HTTP only).
+    //  streaming endpoints, over http or https. Without a transport only the
+    //  connect is bounded: a stream may pause for minutes between lines.
     //
     //  Returns the HTTP status code, or nil on connection failure.
     // --------------------------------------------------------
 
-    fn static StreamPost(url: string, body: string, onLine: fn, headers?) {
-        if (String.StartsWith(url, "https://")) {
-            throw new HttpUnsupportedError(100, "Http: HTTPS not supported for streaming.");
+    fn static StreamPost(url: string, body: string, onLine: fn, headers?, transport?) {
+        let st = Http._request("POST", url, body, ContentType.JSON, headers ?? nil,
+                               transport ?? { readTimeoutMs: 0 }, false, true);
+        if (st == nil) { return nil; }
+        var line = st.Line();
+        while (line != nil) {
+            Http._ndjsonLine(line, onLine);
+            line = st.Line();
         }
-        let parsed = HttpUtil.ParseUrl(url);
-        if (parsed == nil) { return nil; }
-
-        let host  = parsed.host;
-        let port  = parsed.port;
-        let path  = parsed.path;
-        let query = parsed.query;
-        if (len(query) > 0) { path = path + "?" + query; }
-
-        let s = Stream.Connect("tcp", host, port, 30000);
-        if (s == nil) { return nil; }
-        Stream.SetTimeout(s, 0); // only the connect is bounded: a stream may pause for minutes between lines
-
-        let status = nil;
-        try {
-            let req = "POST " + path + " HTTP/1.1\r\n";
-            req = req + "Host: " + Http._hostHeader(parsed.scheme, host, port) + "\r\n";
-            req = req + "Connection: close\r\n";
-            req = req + "User-Agent: Flaris/1.0\r\n";
-            req = req + "Accept: */*\r\n";
-            req = req + "Content-Type: application/json\r\n";
-            req = req + "Content-Length: " + Convert.ToString(len(body)) + "\r\n";
-            if (headers != nil) {
-                foreach (val, key in headers) {
-                    req = req + key + ": " + Convert.ToString(val) + "\r\n";
-                }
-            }
-            req = req + "\r\n" + body;
-            Stream.WriteAll(s, req);
-
-            let statusLine = Stream.ReadLine(s);
-            if (statusLine != nil && len(statusLine) > 0) {
-                let parts = String.Split(statusLine, " ");
-                if (len(parts) >= 2) { status = Convert.ParseInt(parts[1]); }
-            }
-
-            // Consume response headers (blank line terminates)
-            let chunked = false;
-            let hline = Stream.ReadLine(s);
-            while (hline != nil && len(hline) > 0) {
-                let lower = String.ToLower(hline);
-                if (String.StartsWith(lower, "transfer-encoding:") && String.Contains(lower, "chunked")) {
-                    chunked = true;
-                }
-                hline = Stream.ReadLine(s);
-            }
-
-            // NDJSON lines (Ollama's always start with '{').
-            if (chunked) {
-                Http._ndjsonChunked(s, onLine);
-            } else {
-                let line = Stream.ReadLine(s);
-                while (line != nil) {
-                    Http._ndjsonLine(line, onLine);
-                    line = Stream.ReadLine(s);
-                }
-            }
-        } catch (e) {
-            // A read error mid-stream just ends the line loop: report whatever
-            // status was parsed and let the caller decide. 0 = no status seen.
-            status = status ?? 0;
-        }
-
-        Stream.Close(s);
-        return status;
+        st.Close();
+        return st.status;
     }
 
     // --------------------------------------------------------
-    //  Http.Request(method, url, body, contentType, headers?, tlsTransport?)
+    //  Streaming responses
+    // --------------------------------------------------------
+
+    // Send a request and return as soon as the response head is in: an
+    // HttpStream whose body is read piece by piece (Chunk, Line, Event), or
+    // nil on failure. Redirects are followed as for Request.
+    fn static Open(method: string, url: string, body?, contentType?, headers?, transport?) {
+        return Http._request(method, url, body ?? nil, contentType ?? nil, headers ?? nil, transport ?? nil, false, true);
+    }
+
+    // Async twin of Open: a fiber resolving to the HttpStream. Its reads then
+    // park only the fiber that makes them.
+    fn static OpenAsync(method: string, url: string, body?, contentType?, headers?, transport?) {
+        return Http._openAsync(method, url, body ?? nil, contentType ?? nil, headers ?? nil, transport ?? nil);
+    }
+
+    // Follow a text/event-stream, calling onEvent(ev) for each event (see
+    // SseParser); onEvent returning false stops. A stream that ends or fails
+    // is opened again after the server's retry time (default 3000 ms), with
+    // Last-Event-ID set to the last id seen. Stops for good on a status other
+    // than 200, a content type other than text/event-stream, or after
+    // `maxRetries` attempts in a row that delivered no event.
+    //   options: { headers, lastEventId, retryMs: 3000, maxRetries: 3,
+    //              transport } - transport as for Request
+    // Returns { status, lastEventId }: the last response's status (nil when
+    // none came) and the id to resume from.
+    fn static Sse(url: string, onEvent: fn, options?) {
+        return Http._sse(url, onEvent, options ?? { }, false);
+    }
+
+    fn static async SseAsync(url: string, onEvent: fn, options?) {
+        return Http._sse(url, onEvent, options ?? { }, true);
+    }
+
+    fn static _sse(url: string, onEvent: fn, o, awaits: bool) {
+        var lastId = Object.TryGet(o, "lastEventId", nil);
+        var retryMs: int = Object.TryGet(o, "retryMs", 3000);
+        let maxRetries: int = Object.TryGet(o, "maxRetries", 3);
+        let transport = Object.TryGet(o, "transport", nil);
+        var status = nil;
+        var misses = 0;
+        while (true) {
+            let hdrs = { "Accept": "text/event-stream", "Cache-Control": "no-cache" };
+            let given = Object.TryGet(o, "headers", nil);
+            if (given != nil) { foreach (val, key in given) { hdrs[key] = val; } }
+            if (lastId != nil && lastId != "") { hdrs["Last-Event-ID"] = lastId; }
+            let st = Http._request("GET", url, nil, nil, hdrs, transport, awaits, true);
+            var got = false;
+            if (st != nil) {
+                status = st.status;
+                let ct = String.ToLower(st.headers["content-type"] ?? "");
+                if (st.status != 200 || !String.StartsWith(ct, "text/event-stream")) {
+                    st.Close();
+                    return { status: status, lastEventId: lastId };
+                }
+                var ev = st.Event();
+                while (ev != nil) {
+                    got = true;
+                    lastId = ev.id;
+                    if (onEvent(ev) == false) {
+                        st.Close();
+                        return { status: status, lastEventId: lastId };
+                    }
+                    ev = st.Event();
+                }
+                if (st.Retry() != nil) { retryMs = st.Retry(); }
+                st.Close();
+            }
+            misses = got ? 0 : misses + 1;
+            if (misses >= maxRetries) { return { status: status, lastEventId: lastId }; }
+            Fiber.Sleep(retryMs);
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Http.Request(method, url, body, contentType, headers?, transport?)
     //
-    //  Transport-aware request core. Pass a TLS transport (see the Https
-    //  library) to enable https:// URLs; omit it for plain http://. Returns the
-    //  response object { status, headers, body, setCookies } or nil on failure.
-    //  This is the seam the Https library uses to reuse the whole HTTP engine.
+    //  Transport-aware request core. `transport` overrides the connect options:
+    //  Http.Transport or the Https library's Https.Transport, or a plain
+    //  options object (see the header). Returns the response object
+    //  { status, headers, body, setCookies } or nil on failure. This is the
+    //  seam the Https library uses to reuse the whole HTTP engine.
     // --------------------------------------------------------
-    fn static Request(method:string, url:string, body, contentType, headers?, tlsTransport?) {
-        return Http._request(method, url, body, contentType, headers ?? nil, tlsTransport ?? nil);
+    fn static Request(method:string, url:string, body, contentType, headers?, transport?) {
+        return Http._request(method, url, body, contentType, headers ?? nil, transport ?? nil, false, false);
     }
 
-    // Async twin of Request: returns a fiber - `await` it for the response. The
-    // supplied transport must expose the *Async closures (the Https library's
-    // does); requests driven this way suspend only the caller, so several run
-    // concurrently. https:// only - see _requestAsync.
-    fn static RequestAsync(method:string, url:string, body, contentType, headers?, tlsTransport?) {
-        return Http._requestAsync(method, url, body, contentType, headers ?? nil, tlsTransport ?? nil);
+    // Async twin of Request: returns a fiber - `await` it for the response.
+    // Requests driven this way suspend only the caller, so several run
+    // concurrently.
+    fn static RequestAsync(method:string, url:string, body, contentType, headers?, transport?) {
+        return Http._requestAsync(method, url, body, contentType, headers ?? nil, transport ?? nil);
     }
 
-    fn static Get(url:string, headers?)    { return Http._request("GET",    url, nil,  nil,              headers ?? nil); }
-    fn static Post(url:string, body, headers?)   { return Http._request("POST",   url, body, ContentType.JSON, headers ?? nil); }
-    fn static Put(url:string, body, headers?)    { return Http._request("PUT",    url, body, ContentType.JSON, headers ?? nil); }
-    fn static Patch(url:string, body, headers?)  { return Http._request("PATCH",  url, body, ContentType.JSON, headers ?? nil); }
-    fn static Query(url:string, body, headers?)  { return Http._request("QUERY",  url, body, ContentType.JSON, headers ?? nil); }
-    fn static Delete(url:string, headers?) { return Http._request("DELETE", url, nil,  nil,              headers ?? nil); }
+    // A plain-TCP transport for Request/RequestAsync with its own options (see
+    // the header): opts: { timeoutMs?:int, keepAlive?:bool, ... }.
+    fn static Transport(opts) { return Http._streamTransport(false, opts); }
+
+    // Process-wide pool settings; keys left out keep their value.
+    //   keepAlive       pool connections at all              (default true)
+    //   maxIdlePerHost  idle connections per pool key        (default 8)
+    //   maxIdle         idle connections in all              (default 64)
+    //   idleTimeoutMs   how long one may wait idle           (default 4000)
+    fn static Configure(opts) {
+        foreach (val, key in opts) {
+            if (!(key in _httpPoolCfg)) {
+                throw new HttpError(400, "Http.Configure: unknown option '" + key + "'");
+            }
+            _httpPoolCfg[key] = val;
+        }
+        if (!_httpPoolCfg.keepAlive) { Http.CloseIdle(); }
+        return 0;
+    }
+
+    // Close every idle pooled connection. Connections in use are not touched.
+    fn static CloseIdle() {
+        let all = _httpIdle;
+        _httpIdle = { };
+        _httpIdleCount = 0;
+        foreach (list in Object.Values(all)) {
+            foreach (e in list) { Stream.Close(e.s); }
+        }
+        return 0;
+    }
+
+    // { idle, hosts }: the idle pooled connections, and how many pool keys
+    // hold at least one.
+    fn static PoolStats() {
+        var hosts = 0;
+        foreach (list in Object.Values(_httpIdle)) {
+            if (len(list) > 0) { hosts += 1; }
+        }
+        return { idle: _httpIdleCount, hosts: hosts };
+    }
+
+    fn static Get(url:string, headers?)          { return Http._request("GET",    url, nil,  nil,              headers ?? nil, nil, false, false); }
+    fn static Post(url:string, body, headers?)   { return Http._request("POST",   url, body, ContentType.JSON, headers ?? nil, nil, false, false); }
+    fn static Put(url:string, body, headers?)    { return Http._request("PUT",    url, body, ContentType.JSON, headers ?? nil, nil, false, false); }
+    fn static Patch(url:string, body, headers?)  { return Http._request("PATCH",  url, body, ContentType.JSON, headers ?? nil, nil, false, false); }
+    fn static Query(url:string, body, headers?)  { return Http._request("QUERY",  url, body, ContentType.JSON, headers ?? nil, nil, false, false); }
+    fn static Delete(url:string, headers?)       { return Http._request("DELETE", url, nil,  nil,              headers ?? nil, nil, false, false); }
 
     // Returns only response headers, no body (HEAD method).
     fn static Head(url:string, headers?) {
-        let res = Http._request("HEAD", url, nil, nil, headers ?? nil);
+        let res = Http._request("HEAD", url, nil, nil, headers ?? nil, nil, false, false);
         if (res == nil) { return nil; }
         return { status: res.status, headers: res.headers };
     }
@@ -1065,17 +1658,316 @@ class Http {
     //  Async API
     // --------------------------------------------------------
 
-    fn static async GetAsync(url:string, headers?)    { return await Http._requestAsync("GET",    url, nil,  nil,              headers ?? nil, nil); }
-    fn static async PostAsync(url:string, body, headers?)   { return await Http._requestAsync("POST",   url, body, ContentType.JSON, headers ?? nil, nil); }
-    fn static async PutAsync(url:string, body, headers?)    { return await Http._requestAsync("PUT",    url, body, ContentType.JSON, headers ?? nil, nil); }
-    fn static async PatchAsync(url:string, body, headers?)  { return await Http._requestAsync("PATCH",  url, body, ContentType.JSON, headers ?? nil, nil); }
-    fn static async QueryAsync(url:string, body, headers?)   { return await Http._requestAsync("QUERY",  url, body, ContentType.JSON, headers ?? nil, nil); }
-    fn static async DeleteAsync(url:string, headers?) { return await Http._requestAsync("DELETE", url, nil,  nil,              headers ?? nil, nil); }
+    fn static async GetAsync(url:string, headers?)          { return Http._request("GET",    url, nil,  nil,              headers ?? nil, nil, true, false); }
+    fn static async PostAsync(url:string, body, headers?)   { return Http._request("POST",   url, body, ContentType.JSON, headers ?? nil, nil, true, false); }
+    fn static async PutAsync(url:string, body, headers?)    { return Http._request("PUT",    url, body, ContentType.JSON, headers ?? nil, nil, true, false); }
+    fn static async PatchAsync(url:string, body, headers?)  { return Http._request("PATCH",  url, body, ContentType.JSON, headers ?? nil, nil, true, false); }
+    fn static async QueryAsync(url:string, body, headers?)  { return Http._request("QUERY",  url, body, ContentType.JSON, headers ?? nil, nil, true, false); }
+    fn static async DeleteAsync(url:string, headers?)       { return Http._request("DELETE", url, nil,  nil,              headers ?? nil, nil, true, false); }
 
     fn static async HeadAsync(url:string, headers?) {
-        let res = await Http._requestAsync("HEAD", url, nil, nil, headers ?? nil, nil);
+        let res = Http._request("HEAD", url, nil, nil, headers ?? nil, nil, true, false);
         if (res == nil) { return nil; }
         return { status: res.status, headers: res.headers };
+    }
+}
+
+// =============================================================================
+// HttpStream - a response whose body is read as it arrives.
+//
+//   let st = Http.Open("GET", url);
+//   if (st != nil && st.status == Status.OK) {
+//       var line = st.Line();
+//       while (line != nil) { Console.WriteLine(line); line = st.Line(); }
+//   }
+//   st?.Close();
+//
+// Fields: status, headers, setCookies, url (the one that answered, after
+// redirects). Read the body with one of:
+//   Chunk() -> string|nil   the next piece as it arrives (at most 64 KB);
+//                           nil at the end of the body
+//   Line()  -> string|nil   the next line, "\n" or "\r\n" stripped; the last
+//                           line may have no terminator
+//   Event() -> object|nil   the next server-sent event (see SseParser)
+//   ReadAll() -> string|nil the rest of the body
+// One stream is read one way: Line and Event keep what they have read ahead.
+// The body is not decompressed - Open does not ask for gzip. Each read waits
+// at most the read timeout (readTimeoutMs, else timeoutMs; 0 waits as long
+// as it takes), and the request's deadlineMs covers the whole body.
+//   Close()                 done with it: a body read to its end hands the
+//                           connection back to the pool, anything else closes it
+//   IsDone() -> bool        the body has been read to its end, or failed
+//   Error()  -> string|nil  why the body ended early: "timeout", "deadline",
+//                           "closed" (the connection ended first),
+//                           "malformed" or "too large" (past maxBodyBytes);
+//                           nil while all is well
+//   Retry()  -> int|nil     the reconnection time the event stream asked for
+// =============================================================================
+
+class HttpStream
+{
+    let status     = 0;
+    let headers    = nil;
+    let setCookies = nil;
+    let url        = "";
+    let _x         = nil;    // the connection and its framing, nil once released
+    let _buf       = "";     // Line: text read past the last line handed out
+    let _pos       = 0;
+    let _sse       = nil;    // Event: the parser, and the events it has ready
+    let _events    = nil;
+    let _next      = 0;
+    let _err       = nil;
+    let _total     = 0;      // body bytes handed out
+
+    fn Constructor(x, head, url: string) {
+        this.status     = head.status;
+        this.headers    = head.headers;
+        this.setCookies = head.setCookies;
+        this.url        = url;
+        _x = x;
+        if (x.mode == 0) { this._finish(); }
+        else if (x.mode == 1 && x.cap > 0 && x.left > x.cap) { this._fail("too large"); }
+    }
+
+    fn IsDone(): bool    { return _x == nil; }
+    fn Error()           { return _err; }
+    fn Retry()           { return _sse == nil ? nil : _sse.Retry(); }
+
+    fn Close() {
+        if (_x != nil) {
+            Http._drop(_x);
+            _x = nil;
+        }
+        return 0;
+    }
+
+    // The body ended where its framing said: the connection can serve again.
+    fn _finish() {
+        let x = _x;
+        _x = nil;
+        if (x.reuse && x.s != nil) {
+            if (x.dl > 0) { Stream.SetTimeout(x.s, x.ms); }
+            Http._checkin(x.key, x.s, x.keepMs);
+            x.s = nil;
+        }
+        Http._drop(x);
+        return nil;
+    }
+
+    // A read that came back empty-handed ("closed") says why: the deadline,
+    // or a read timeout.
+    fn _fail(why: string) {
+        let x = _x;
+        _x = nil;
+        if (_err == nil) {
+            _err = why;
+            if (why == "closed" && x.dl > 0 && x.dl <= Time.Millis()) { _err = "deadline"; }
+            else if (why == "closed" && x.b && Stream.LastError() == 1) { _err = "timeout"; }
+        }
+        Http._drop(x);
+        return nil;
+    }
+
+    fn Chunk() {
+        let piece = this._piece();
+        if (piece == nil || _x == nil || _x.cap == 0) { return piece; }
+        _total += len(piece);
+        if (_total > _x.cap) { return this._fail("too large"); }
+        return piece;
+    }
+
+    fn _piece() {
+        let x = _x;
+        if (x == nil) { return nil; }
+        if (x.mode == 1) {
+            if (x.left <= 0) { return this._finish(); }
+            let piece = Http._some(x, x.left < 65536 ? x.left : 65536);
+            if (piece == nil) { return this._fail("closed"); }
+            x.left -= len(piece);
+            return piece;
+        }
+        if (x.mode == 2) {
+            if (x.left <= 0) {
+                let sizeLine = Http._line(x);
+                if (sizeLine == nil) { return this._fail("closed"); }
+                let n = Http._parseHexSize(sizeLine);
+                if (n < 0) { return this._fail("malformed"); }
+                if (n == 0) {
+                    var tl = Http._line(x);
+                    while (tl != nil && len(tl) > 0) { tl = Http._line(x); }
+                    if (tl == nil) { x.reuse = false; }
+                    return this._finish();
+                }
+                x.left = n;
+            }
+            let piece = Http._some(x, x.left < 65536 ? x.left : 65536);
+            if (piece == nil) { return this._fail("closed"); }
+            x.left -= len(piece);
+            if (x.left == 0 && Http._line(x) != "") { this._fail("malformed"); }
+            return piece;
+        }
+        if (x.mode == 3) {
+            let piece = Http._some(x, 65536);
+            if (piece != nil) { return piece; }
+            if (x.b && Stream.LastError() != 0) { return this._fail("closed"); }
+            return this._finish();
+        }
+        return this._finish();
+    }
+
+    fn Line() {
+        while (true) {
+            let nl = String.IndexOfFrom(_buf, "\n", _pos);
+            if (nl >= 0) {
+                var end = nl;
+                if (end > _pos && _buf[end - 1] == 13) { end -= 1; }
+                let line = String.Substr(_buf, _pos, end - _pos);
+                _pos = nl + 1;
+                return line;
+            }
+            let more = this.Chunk();
+            if (more == nil) {
+                let rest = _pos < len(_buf) ? String.Substr(_buf, _pos) : nil;
+                _buf = "";
+                _pos = 0;
+                return rest;
+            }
+            _buf = (_pos < len(_buf) ? String.Substr(_buf, _pos) : "") + more;
+            _pos = 0;
+        }
+    }
+
+    fn Event() {
+        if (_sse == nil) {
+            _sse = new SseParser();
+            _events = [];
+        }
+        while (_next >= len(_events)) {
+            let more = this.Chunk();
+            if (more == nil) { return nil; }
+            _events = _sse.Feed(more);
+            _next = 0;
+        }
+        let ev = _events[_next];
+        _next += 1;
+        return ev;
+    }
+
+    fn ReadAll() {
+        var out = _pos < len(_buf) ? String.Substr(_buf, _pos) : "";
+        _buf = "";
+        _pos = 0;
+        var more = this.Chunk();
+        while (more != nil) {
+            out += more;
+            more = this.Chunk();
+        }
+        return _err == nil ? out : nil;
+    }
+}
+
+// =============================================================================
+// SseParser - the text/event-stream format (WHATWG HTML, "Server-sent events").
+//
+//   let p = new SseParser();
+//   foreach (ev in p.Feed("event: tick\ndata: 1\n\n")) { ... }
+//
+// Feed(text) takes the stream in pieces of any size and returns the events the
+// piece completed, each { event, data, id, retry }:
+//   event  the event type, "message" unless the stream named one
+//   data   every "data:" line of the event joined with "\n"
+//   id     the last event ID - it carries over to later events
+//   retry  the reconnection time in ms from the last valid "retry:", or nil
+// Lines end with "\r\n", "\n" or "\r", also when a piece splits the pair; a
+// leading byte order mark is skipped; ":" lines are comments; an event without
+// data is not dispatched; an id with a NUL and a non-numeric retry are
+// ignored. An event still open when the stream ends is dropped, as the spec
+// says - there is nothing to call at the end.
+//   LastEventId() -> string   Retry() -> int|nil
+// =============================================================================
+
+class SseParser
+{
+    let _buf     = "";      // the unterminated end of the last piece
+    let _started = false;   // the byte order mark check is done
+    let _cr      = false;   // the last piece ended in CR: a leading LF is its pair
+    let _data    = "";
+    let _type    = "";
+    let _idBuf   = "";
+    let _lastId  = "";
+    let _retry   = nil;
+
+    fn LastEventId(): string { return _lastId; }
+    fn Retry()               { return _retry; }
+
+    fn Feed(text: string): array {
+        let out = [];
+        var s = _buf + text;
+        _buf = "";
+        if (!_started) {
+            // Wait for three bytes: a byte order mark can arrive in pieces.
+            if (len(s) < 3 && String.StartsWith("\uFEFF", s)) {
+                _buf = s;
+                return out;
+            }
+            _started = true;
+            if (String.StartsWith(s, "\uFEFF")) { s = String.Substr(s, 3); }
+        }
+        let n = len(s);
+        var pos = 0;
+        if (_cr && n > 0) {
+            if (s[0] == 10) { pos = 1; }
+            _cr = false;
+        }
+        while (pos < n) {
+            let e = String.IndexOfAnyFrom(s, "\r\n", pos);
+            if (e < 0) { break; }
+            let line = String.Substr(s, pos, e - pos);
+            pos = e + 1;
+            if (s[e] == 13) {
+                if (pos < n) {
+                    if (s[pos] == 10) { pos += 1; }
+                } else {
+                    _cr = true;
+                }
+            }
+            this._line(line, out);
+        }
+        if (pos < n) { _buf = String.Substr(s, pos); }
+        return out;
+    }
+
+    fn _line(line: string, out: array) {
+        if (len(line) == 0) {
+            _lastId = _idBuf;
+            if (len(_data) > 0) {
+                let data = String.EndsWith(_data, "\n") ? String.Left(_data, len(_data) - 1) : _data;
+                Array.Append(out, { event: len(_type) > 0 ? _type : "message", data: data,
+                                    id: _lastId, retry: _retry });
+            }
+            _data = "";
+            _type = "";
+            return 0;
+        }
+        let colon = String.IndexOf(line, ":");
+        if (colon == 0) { return 0; }
+        var field = line;
+        var value = "";
+        if (colon > 0) {
+            field = String.Left(line, colon);
+            value = String.Substr(line, colon + 1);
+            if (String.StartsWith(value, " ")) { value = String.Substr(value, 1); }
+        }
+        if (field == "data") {
+            _data += value + "\n";
+        } else if (field == "event") {
+            _type = value;
+        } else if (field == "id") {
+            if (Buffer.IndexOf(Buffer.FromString(value), 0) < 0) { _idBuf = value; }
+        } else if (field == "retry") {
+            if (len(value) > 0 && String.IsNumeric(value)) { _retry = Convert.ParseInt(value); }
+        }
+        return 0;
     }
 }
 
@@ -1196,7 +2088,9 @@ class CookieJar
 //   let r = Http.Post(url, form.Body(), { "Content-Type": form.ContentTypeHeader() });
 //
 // The body is built as a string, so text fields and text file content work
-// directly. Field/file names are sanitised to keep the part structure intact.
+// directly. Field/file names are sanitised to keep the part structure intact;
+// a file's content type is a header value, and File raises HttpError (400) when
+// it holds a CR or LF, as a request refuses such a header.
 // =============================================================================
 
 class Multipart
@@ -1221,10 +2115,14 @@ class Multipart
     }
 
     fn File(name:string, filename:string, content, contentType?): instance {
+        let ct = (contentType == nil) ? "application/octet-stream" : Convert.ToString(contentType);
+        if (String.Contains(ct, '\r') || String.Contains(ct, '\n')) {
+            throw new HttpError(400, "Multipart.File: a CR or LF in the content type would inject a header");
+        }
         Array.Append(_parts, {
             name:        Multipart._san(name),
             filename:    Multipart._san(filename),
-            contentType: (contentType == nil) ? "application/octet-stream" : contentType,
+            contentType: ct,
             value:       content
         });
         return this;
@@ -1233,8 +2131,11 @@ class Multipart
     fn Boundary(): string          { return _boundary; }
     fn ContentTypeHeader(): string { return "multipart/form-data; boundary=" + _boundary; }
 
-    fn Body(): string {
+    // A string, or a block once any file's content is a block: string
+    // concatenation would render the bytes as the text "[block]".
+    fn Body() {
         var out:string = "";
+        var bin = nil;
         var i:int = 0;
         while (i < len(_parts)) {
             let p = _parts[i];
@@ -1246,11 +2147,19 @@ class Multipart
             } else {
                 out = out + "Content-Disposition: form-data; name=\"" + p.name + "\"\r\n\r\n";
             }
-            out = out + p.value + "\r\n";
+            if (Type.Is(p.value, Type.Block)) {
+                if (bin == nil) { bin = Buffer.FromString(out); } else { Buffer.Append(bin, out); }
+                Buffer.Append(bin, p.value);
+                out = "\r\n";
+            } else {
+                out = out + p.value + "\r\n";
+            }
             i = i + 1;
         }
         out = out + "--" + _boundary + "--\r\n";
-        return out;
+        if (bin == nil) { return out; }
+        Buffer.Append(bin, out);
+        return bin;
     }
 
     // Strip CR/LF and escape double quotes so a field/file name cannot break out
@@ -1262,4 +2171,4 @@ class Multipart
     }
 }
 
-export { Http, Status, ContentType, CookieJar, Multipart, HttpError, HttpUnsupportedError };
+export { Http, Status, ContentType, CookieJar, Multipart, HttpStream, SseParser, HttpError, HttpUnsupportedError };

@@ -1,6 +1,6 @@
 // test_template.fls - tests for Template.fls
 
-import { Template } from library("./libs/Template", "1.0");
+import { Template, TemplateError } from library("./libs/Template", "1.0");
 
 global passed = 0;
 global failed = 0;
@@ -23,6 +23,17 @@ fn chk(label:string, ok:bool) {
         Console.Warn("[FAIL] " + label);
         failed += 1;
     }
+}
+
+// The message of the TemplateError Parse raised, or "" when it parsed.
+fn parseError(src:string): string {
+    try {
+        Template.Parse(src);
+    } catch (e) {
+        if (e is TemplateError && e.Code == Exception.InvalidArguments) return e.Error;
+        return "other: " + e.ToString();
+    }
+    return "";
 }
 
 fn Main() {
@@ -178,6 +189,30 @@ fn Main() {
         }),
         "[12][34]");
 
+    eq("nested each keeps the outer _index",
+        Template.Apply("{{#each rows}}{{_index}}:[{{#each cells}}{{_index}}{{.}}{{/each}}]{{_index}};{{/each}}", {
+            rows: [{ cells: ["a", "b"] }, { cells: ["c"] }]
+        }),
+        "0:[0a1b]0;1:[0c]1;");
+
+    eq("inner each reads the outer item",
+        Template.Apply("{{#each rows}}{{#each cells}}{{label}}{{.}} {{/each}}{{/each}}", {
+            rows: [{ label: "r", cells: [1, 2] }, { label: "s", cells: [3] }]
+        }),
+        "r1 r2 s3 ");
+
+    eq("_first and _last after an inner each",
+        Template.Apply("{{#each xs}}{{#each ys}}.{{/each}}{{#if _first}}F{{/if}}{{#if _last}}L{{/if}}{{/each}}", {
+            xs: [1, 2, 3], ys: [1, 2]
+        }),
+        "..F....L");
+
+    let many = [];
+    iter (n from 0 to 1000) { Array.Append(many, { v: n }); }
+    eq("each over 1000 items",
+        Template.Apply("{{#each xs}}{{#if _last}}{{v}}:{{_index}}/{{_count}}{{/if}}{{/each}}", { xs: many }),
+        "999:999/1000");
+
     // --- Compile-once, render-many ---
     let t = Template.Parse("Hi {{name}}, you are {{age}}.");
     eq("compile once render 1", t.Render({ name: "Alice", age: 30 }), "Hi Alice, you are 30.");
@@ -232,6 +267,14 @@ fn Main() {
         Template.Apply("{{#each xs}}{{> item}}{{/each}}", { xs: ["a", "b"] }),
         "<li>a</li><li>b</li>");
 
+    Template.Register("tree", Template.Parse("{{name}}{{_index}}({{#each kids}}{{> tree}}{{/each}})"));
+    eq("recursive partial inside nested each",
+        Template.Apply("{{#each roots}}{{> tree}}{{/each}}", { roots: [
+            { name: "a", kids: [{ name: "b", kids: [] }, { name: "c", kids: [{ name: "d", kids: [] }] }] },
+            { name: "e", kids: [] }
+        ] }),
+        "a0(b0()c1(d0()))e1()");
+
     // unknown partial renders nothing (no crash)
     chk("unknown partial does not crash",
         String.Length(Template.Apply("{{> nosuchpartial}}", {})) == 0);
@@ -254,6 +297,40 @@ fn Main() {
     eq("GetPartial sees re-registered partial",
         gp2.Render({ name: "Dave" }),
         "Hi Dave");
+
+    // --- {{.}} on a nil item ---
+    eq("{{.}} on a nil item renders nothing",
+        Template.Apply("{{#each xs}}[{{.}}]{{/each}}", { xs: [nil, "a", 0, false] }),
+        "[][a][0][false]");
+    eq("{{{.}}} on a nil item renders nothing",
+        Template.Apply("{{#each xs}}[{{{.}}}]{{/each}}", { xs: ["<b>", nil] }),
+        "[<b>][]");
+    eq("a nil item is falsy, not the loop frame",
+        Template.Apply("{{#each xs}}{{#if .}}y{{#else}}n{{/if}}{{/each}}", { xs: [nil, 1] }),
+        "ny");
+
+    // --- Block structure errors ---
+    chk("{{/each}} closing {{#if}} raises",
+        String.Contains(parseError("{{#if a}}x{{/each}}"), "{{/each}} does not end {{#if}}"));
+    chk("{{/if}} closing {{#each}} raises",
+        String.Contains(parseError("{{#each a}}x{{/if}}"), "{{/if}} does not end {{#each}}"));
+    chk("{{/each}} closing {{#unless}} raises",
+        String.Contains(parseError("{{#unless a}}x{{/each}}"), "does not end {{#unless}}"));
+    chk("{{/unless}} closing the else part of an if raises",
+        String.Contains(parseError("{{#if a}}x{{#else}}y{{/unless}}"), "does not end {{#if}}"));
+    chk("{{#else}} inside each raises",
+        String.Contains(parseError("{{#each a}}x{{#else}}y{{/each}}"), "{{#else}} does not end {{#each}}"));
+    chk("a stray close tag raises",
+        String.Contains(parseError("x{{/if}}"), "has no open block"));
+    chk("a stray {{#else}} raises",
+        String.Contains(parseError("{{#else}}"), "has no open block"));
+    chk("an unclosed block raises",
+        String.Contains(parseError("{{#if a}}{{#each b}}x{{/each}}"), "{{#if}} is never closed"));
+    eq("well-nested blocks parse",
+        parseError("{{#if a}}{{#each b}}{{#unless c}}x{{/unless}}{{/each}}{{#else}}y{{/if}}"), "");
+    chk("Apply raises the same error", String.Contains(
+        (fn() { try { Template.Apply("{{#if a}}{{/each}}", {}); } catch (e) { return e.Error; } return ""; })(),
+        "does not end"));
 
     // --- Report ---
     Console.WriteLine("\nResults: " + str(passed) + " passed, " + str(failed) + " failed.");

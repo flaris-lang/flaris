@@ -83,6 +83,9 @@
 //       serverName           Server: header                    (default "Flaris")
 //       timing               per-request phase times           (default false)
 //                            see Timing below
+//       fileCacheBytes       memory for small files that File() (default 4194304)
+//                            and Static() serve - see Files;
+//                            0 turns the cache off
 //       tls                  AcceptTls options -> serve HTTPS  (default nil)
 //                            { pkcs12File, password } on any platform, or
 //                            { certFile, keyFile } (PEM, OpenSSL only);
@@ -198,6 +201,14 @@
 //   the header in one write, which costs less than the extra syscall SendFile
 //   would add. HEAD never touches the file at all.
 //
+//   Files of 16 KB or less are kept in memory once read, up to fileCacheBytes
+//   per server (then the cache starts over). The stat every request makes
+//   anyway decides whether a copy is still good: same size and mtime, the
+//   identity the ETag stands for, and read in a later second than that mtime,
+//   so a file rewritten within one second is never served stale. A change
+//   that keeps both size and mtime - a copy that preserves times - is not
+//   seen; run with { fileCacheBytes: 0 } where files change that way.
+//
 //   Compression is by precompressed sidecar only: mount with { gzip: true } and
 //   put "app.js.gz" next to "app.js" (`gzip -k -9 app.js`, or any build step).
 //   The sidecar is used only when the client accepts gzip and the .gz is no
@@ -242,13 +253,16 @@
 //       res.Json({ user: mp.fields.user, files: len(mp.files) });
 //   });
 //
-//   Each file is written under a name this server picks; the client-supplied
-//   `filename` is reported for display and never used to build a path.
+//   Each file is written under a name this server picks (upload_<ms>_<64
+//   random bits in hex>.part); the client-supplied `filename` is reported for
+//   display and never used to build a path.
 //
 // Limits and safety:
 //   Request line, header count/size and body size are all capped; a request
 //   that exceeds them gets 431 or 413 instead of allocating. Header names and
 //   values are validated so a handler cannot inject CRLF into the response.
+//   The only Transfer-Encoding accepted is a lone `chunked`; any other value
+//   gets 400 and a closed connection, as does Content-Length beside it.
 //   Sockets carry a read timeout (readTimeoutMs): the accept loop, the
 //   keep-alive idle wait and a request whose bytes are still in flight all
 //   park their own fiber, never the VM, and a peer that stays silent for
@@ -294,30 +308,112 @@ fn _fileExists(path:string): bool { return File.Exists(path); }
 fn _fileBytes(path:string)        { return File.ReadAllBytes(path); }
 fn _fileStat(path:string)         { return File.Stat(path); }
 
+// Small files kept in memory between requests, one cache per server; Files in
+// the header above has the rules. Past `cap` bytes it starts over rather than
+// evicting entry by entry: it exists to hold a site's hot assets.
+class _FileCache
+{
+    let _entries     = nil;    // path -> { size, mtime, data }
+    let _bytes:int   = 0;
+    let _cap:int     = 0;
+    let _maxFile:int = 0;
+
+    fn Constructor(cap:int, maxFile:int) {
+        _entries = {};
+        _cap     = cap;
+        _maxFile = (maxFile < cap) ? maxFile : cap;
+    }
+
+    // The whole file as a block, from memory when `st` - the caller's fresh
+    // stat - still matches, or nil when it cannot be read.
+    fn Get(path:string, st) {
+        let hit = Object.TryGet(_entries, path, nil);
+        if (hit != nil && hit.size == st.Size && hit.mtime == st.Modified) { return hit.data; }
+        let data = _fileBytes(path);
+        // Not kept when read within its mtime's second: a rewrite later in
+        // that second would leave size and mtime unchanged.
+        if (data == nil || st.Size > _maxFile || len(data) != st.Size
+            || Time.Now() <= st.Modified) {
+            return data;
+        }
+        if (hit != nil) { _bytes = _bytes - hit.size; }
+        if (_bytes + st.Size > _cap) {
+            _entries = {};
+            _bytes   = 0;
+        }
+        _entries[path] = { size: st.Size, mtime: st.Modified, data: data };
+        _bytes = _bytes + st.Size;
+        return data;
+    }
+}
+
 // RFC 9110 token characters - the only ones allowed in a header name (or a
 // method). Anything else and this server and a proxy in front may disagree
 // about what the header is even called, which is how a smuggled request hides.
-// A leading '-' is the one spelling of a literal hyphen this regex engine
-// accepts inside a class.
-const _TOKEN_RE = "^[-A-Za-z0-9!#$%&'*+.^_`|~]+$";
+const _TOKEN_CHARS = "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const _HEX_CHARS   = "0123456789ABCDEFabcdef";
 
-// Every byte a request line or header must not carry: 1-31 and DEL. NUL cannot
-// occur, a string ends there. Built on first use: a module global cannot call a
-// function of its own module in its initialiser.
-global _CTL_BYTES = nil;
+// The byte sets the scans below test against, each one String.IndexOfAnyFrom
+// away. They hold NUL, which no string literal can, so they are built on first
+// use: a module global cannot call a function of its own module in its
+// initialiser.
+global _CTL_BYTES = nil;   // 0-31 and DEL
+global _NON_TOKEN = nil;   // every byte that is not a token character
+global _NON_HEX   = nil;   // every byte that is not a hex digit
+
+// Every byte value that does not occur in `keep`.
+fn _bytesExcept(keep:string): string {
+    let inKeep = Buffer.Create(256, 1);
+    let kb = Buffer.FromString(keep);
+    iter (i from 0 to len(kb)) { inKeep[kb[i]] = 1; }
+    let out = Buffer.Create(256, 1);
+    let n:int = 0;
+    iter (i from 0 to 256) {
+        if (inKeep[i] == 0) { out[n] = i; n += 1; }
+    }
+    return Buffer.ToString(out, 0, n);
+}
 
 fn _ctlBytes(): string {
     if (_CTL_BYTES == nil) {
-        let s = "";
-        let i = 1;
-        while (i < 32) { s = s + Char.FromInt(i); i += 1; }
-        _CTL_BYTES = s + Char.FromInt(127);
+        let b = Buffer.Create(33, 1);
+        iter (i from 1 to 32) { b[i] = i; }
+        b[32] = 127;
+        _CTL_BYTES = Buffer.ToString(b);
     }
     return _CTL_BYTES;
 }
 
-fn _isToken(s:string): bool {
-    return String.Length(s) > 0 && Regex.IsMatch(s, _TOKEN_RE);
+// Strings held in variables: a literal argument is copied on every call.
+global _SPACE:string     = " ";
+global _SLASH_DOT:string = "/.";
+global _DOTDOT:string    = "..";
+global _QUERY_OR_ESCAPE:string = "?%+";
+global _H_INM:string     = "if-none-match";
+global _H_IMS:string     = "if-modified-since";
+global _H_IFR:string     = "if-range";
+
+// Control bytes and the space: none may appear in a Host value.
+global _HOST_BAD = nil;
+
+fn _hostBadBytes(): string {
+    if (_HOST_BAD == nil) { _HOST_BAD = _ctlBytes() + " "; }
+    return _HOST_BAD;
+}
+
+fn _nonToken(): string {
+    if (_NON_TOKEN == nil) { _NON_TOKEN = _bytesExcept(_TOKEN_CHARS); }
+    return _NON_TOKEN;
+}
+
+fn _nonHex(): string {
+    if (_NON_HEX == nil) { _NON_HEX = _bytesExcept(_HEX_CHARS); }
+    return _NON_HEX;
+}
+
+// `nonToken` is _nonToken(), passed in so this stays a leaf the JIT compiles.
+fn _isToken(s:string, nonToken:string): bool {
+    return String.Length(s) > 0 && String.IndexOfAnyFrom(s, nonToken, 0) < 0;
 }
 
 // Content-Length is DIGIT only. Convert.ParseInt would otherwise accept "+5"
@@ -331,12 +427,12 @@ fn _isToken(s:string): bool {
 // that differ are the dangerous case and RFC 9112 6.3 requires a 400.
 fn _collapseCL(v:string) {
     if (!String.Contains(v, ",")) {
-        return _isDigits(v) ? v : nil;
+        return String.IsNumeric(v) ? v : nil;
     }
     let first = nil;
     foreach (p in String.Split(v, ",")) {
         let t = String.Trim(p);
-        if (!_isDigits(t)) { return nil; }
+        if (!String.IsNumeric(t)) { return nil; }
         if (first == nil) { first = t; }
         else if (t != first) { return nil; }
     }
@@ -347,9 +443,7 @@ fn _collapseCL(v:string) {
 // RFC 9112 3.2 requires a 400 for an invalid field value just as it does for a
 // missing one.
 fn _isValidHost(v:string): bool {
-    if (String.Length(v) == 0) { return false; }
-    if (String.Contains(v, " ") || String.Contains(v, "\t")) { return false; }
-    return !_hasCtlBytes(v);
+    return len(v) > 0 && String.IndexOfAnyFrom(v, _hostBadBytes(), 0) < 0;
 }
 
 // Validate one header line and return the index of its colon, or a negative
@@ -357,23 +451,23 @@ fn _isValidHost(v:string): bool {
 //
 // Real requests carry ten or more headers, so this is the hot loop of the
 // whole parser: every check is one builtin scan of the line, never a byte
-// loop in script (that cost 2 ms per request on a 650 MHz router).
-fn _validateHeaderLine(hl:string): int {
-    if (String.Length(hl) == 0) { return -1; }
-    if (String.StartsWith(hl, " ") || String.StartsWith(hl, "\t")) { return -2; }  // obs-fold
-    if (String.IndexOf(hl, "\r") >= 0) { return -3; }         // a bare CR anywhere in the line
-    let colon:int = String.IndexOf(hl, ":");
-    if (colon <= 0) { return -1; }
-    if (!Regex.IsMatch(String.Left(hl, colon), _TOKEN_RE)) { return -1; }
+// loop in script (that cost 2 ms per request on a 650 MHz router). Searches
+// take a char, not a one-character string: a string literal argument is
+// copied on every call.
+fn _validateHeaderLine(hl:string, nonToken:string): int {
+    if (len(hl) == 0) { return -1; }
+    let c0 = hl[0];
+    if (c0 == ' ' || c0 == '\t') { return -2; }               // obs-fold
+    if (String.IndexOf(hl, '\r') >= 0) { return -3; }         // a bare CR anywhere in the line
+    // The first byte that is not a token character must be the colon that
+    // ends a non-empty name.
+    let colon:int = String.IndexOfAnyFrom(hl, nonToken, 0);
+    if (colon <= 0 || hl[colon] != ':') { return -1; }
     return colon;
 }
 
-fn _isHex(s:string): bool {
-    return String.Length(s) > 0 && Regex.IsMatch(s, "^[0-9A-Fa-f]+$");
-}
-
-fn _isDigits(s:string): bool {
-    return String.Length(s) > 0 && Regex.IsMatch(s, "^[0-9]+$");
+fn _isHex(s:string, nonHex:string): bool {
+    return String.Length(s) > 0 && String.IndexOfAnyFrom(s, nonHex, 0) < 0;
 }
 
 // Bodies at or below this size are written together with the header block in a
@@ -408,6 +502,39 @@ fn _httpDateRefresh() {
     _dateStr  = Time.Format(now, "%a, %d %b %Y %H:%M:%S GMT");
     _dateLine = "Date: " + _dateStr;
     return nil;
+}
+
+// "Server: <name>\r\nDate: <now>\r\n" - what a response that sets no headers
+// of its own starts with after the status line. Rebuilt when the second or the
+// server name changes.
+global _sdName          = nil;
+global _sdSec:int       = -1;
+global _sdLines:string  = "";
+
+fn _serverDateLines(serverName:string): string {
+    let now:int = Time.Now();
+    if (now != _sdSec || serverName != _sdName) {
+        if (now != _dateSec) { _httpDateRefresh(); }
+        _sdLines = "Server: " + serverName + "\r\n" + _dateLine + "\r\n";
+        _sdSec   = now;
+        _sdName  = serverName;
+    }
+    return _sdLines;
+}
+
+// "HTTP/1.1 <code> <reason>\r\n", built once per status code.
+global _statusLines = nil;
+
+fn _statusLine(code:int): string {
+    if (code < 100 || code > 599) {
+        return "HTTP/1.1 " + str(code) + " " + HttpStatus.Reason(code) + "\r\n";
+    }
+    if (_statusLines == nil) { _statusLines = Array.Create(600); }
+    let hit = _statusLines[code];
+    if (hit != nil) { return hit; }
+    let line = "HTTP/1.1 " + str(code) + " " + HttpStatus.Reason(code) + "\r\n";
+    _statusLines[code] = line;
+    return line;
 }
 
 // Format an arbitrary timestamp as an HTTP-date (Last-Modified, Expires, ...).
@@ -454,20 +581,19 @@ fn _sendFileAll(conn, path:string, offset:int, count:int): bool {
     return true;
 }
 
-// Any control byte in a decoded path. A "%00" would otherwise reach the
-// filesystem layer and truncate the name there, so a check on the extension
-// (".js", ".txt") can be walked straight past.
-// The charset scan cannot name NUL, so that byte is looked for on the bytes.
+// Any control byte in a decoded path, NUL included. A "%00" would otherwise
+// reach the filesystem layer and truncate the name there, so a check on the
+// extension (".js", ".txt") can be walked straight past.
 fn _hasCtlBytes(s:string): bool {
-    if (String.IndexOfAnyFrom(s, _ctlBytes(), 0) >= 0) { return true; }
-    return Buffer.IndexOf(Buffer.FromString(s), 0) >= 0;
+    return String.IndexOfAnyFrom(s, _ctlBytes(), 0) >= 0;
 }
 
 // A path segment beginning with "." marks a file that is conventionally
 // private but perfectly readable: .env, .git, .htpasswd. ".well-known" is the
 // standard exception - ACME challenges and security.txt live there.
 fn _hasDotSegment(rel:string): bool {
-    if (rel == "") { return false; }
+    // A segment can only start with "." at the start or after a "/".
+    if (String.CharAt(rel, 0) != '.' && !String.Contains(rel, _SLASH_DOT)) { return false; }
     foreach (sg in String.Split(rel, "/")) {
         if (String.StartsWith(sg, ".") && sg != ".well-known") { return true; }
     }
@@ -542,7 +668,7 @@ fn _streamChunked(conn, maxBytes:int, sink, timeoutMs:int) {
         let semi = String.IndexOf(line, ";");     // drop any chunk extension
         if (semi >= 0) { line = String.Substr(line, 0, semi); }
         let sizeStr = String.Trim(line);
-        if (!_isHex(sizeStr)) { return { ok: false, status: 400, total: total }; }
+        if (!_isHex(sizeStr, _nonHex())) { return { ok: false, status: 400, total: total }; }
         let n = Convert.ParseInt("0x" + sizeStr);
         if (n == nil || n < 0) { return { ok: false, status: 400, total: total }; }
 
@@ -811,7 +937,7 @@ class _Buf
 
     fn ByteAt(i:int): int { return Buffer.ReadU8At(_b, i); }
     fn Slice(off:int, n:int) { return Buffer.Slice(_b, off, n); }
-    fn Str(off:int, n:int): string { return Buffer.ToString(Buffer.Slice(_b, off, n)); }
+    fn Str(off:int, n:int): string { return Buffer.ToString(_b, off, n); }
 
     fn Drop(n:int) {
         if (n <= 0) { return nil; }
@@ -1017,7 +1143,11 @@ class _MultipartParser
         if (_pFilename != nil && _dir != nil) {
             // A server-chosen name. The client's filename is display data and
             // never touches the path - that is the upload traversal defence.
-            _sinkPath = Path.Combine(_dir, "upload_" + str(Time.Millis()) + "_" + str(_nParts) + ".part");
+            // The random part keeps uploads that start in the same millisecond,
+            // or servers sharing the directory, out of each other's files.
+            let rnd = Crypto.RandomBytes(8);
+            _sinkPath = Path.Combine(_dir, "upload_" + str(Time.Millis()) + "_"
+                + String.Format("{0:x8}{1:x8}", Buffer.ReadU32At(rnd, 0), Buffer.ReadU32At(rnd, 4)) + ".part");
             _sinkFile = Stream.Open(_sinkPath, "w");
             if (_sinkFile == nil) { return this._fail("cannot open upload file"); }
         } else {
@@ -1077,15 +1207,18 @@ class _MultipartParser
 
 class HttpRequest
 {
-    let method:string   = "GET";
-    let path:string     = "/";      // decoded path, no query string
-    let rawPath:string  = "/";      // path exactly as sent, query included
-    let version:string  = "HTTP/1.1";
+    // The server fills in every field below before a handler sees the request.
+    // String fields start out nil: a string initialiser is copied into every
+    // instance, and this class is built once per request.
+    let method:string   = nil;
+    let path:string     = nil;      // decoded path, no query string
+    let rawPath:string  = nil;      // path exactly as sent, query included
+    let version:string  = nil;
     let headers          = nil;     // lowercased name -> value
     let query            = nil;     // decoded query parameters
     let params           = nil;     // captured path parameters
     let body             = nil;     // block, or nil when there is no body
-    let peer:string     = "";
+    let peer:string     = nil;
     let keepAlive:bool  = true;
     let secure:bool     = false;    // true when the connection terminated TLS
 
@@ -1269,15 +1402,16 @@ class HttpResponse
 {
     let _conn            = nil;
     let _status:int     = 200;
-    let _headers         = nil;    // name -> value, in insertion order
-    let _order:array    = [];
+    // Built on the first Header() call, so a response that sets none - most
+    // of them - allocates neither.
+    let _headers         = nil;    // name -> value
+    let _order           = nil;    // names in insertion order, framing headers left out
     let _sent:bool      = false;
     let _headOnly:bool  = false;   // HEAD: send headers, suppress the body
     let _keepAlive:bool = true;
     let _chunked:bool   = false;
-    let _serverName:string = "Flaris";
-    let _serverLine:string = "Server: Flaris";
-    let _setCookies:array = [];    // one entry per Set-Cookie line
+    let _serverName:string = nil;
+    let _setCookies      = nil;    // one entry per Set-Cookie line, nil until the first
     let _hijacked:bool   = false;  // the caller took the socket
     let _bodyBytes:int   = 0;      // payload written, for the access log
     let _req             = nil;    // the request being answered, for If-* / Range
@@ -1285,20 +1419,15 @@ class HttpResponse
     let _tmNames         = nil;
     let _tmTicks         = nil;
     let _tmHead:int      = 0;      // when the response head was built
+    let _files           = nil;    // the server's _FileCache, nil when it has none
 
-    fn Constructor(conn, headOnly:bool, keepAlive:bool, serverName:string, req?) {
+    fn Constructor(conn, headOnly:bool, keepAlive:bool, serverName:string, req?, files?) {
         _conn       = conn;
         _headOnly   = headOnly;
         _keepAlive  = keepAlive;
         _serverName = serverName;
-        _serverLine = "Server: " + serverName;
-        _setCookies = [];
         _req        = req ?? nil;
-        _headers    = {};
-        _order      = [];
-        _status     = 200;
-        _sent       = false;
-        _chunked    = false;
+        _files      = files ?? nil;
     }
 
     fn Sent(): bool        { return _sent; }
@@ -1366,21 +1495,44 @@ class HttpResponse
     fn Status(code:int) { _status = code; return this; }
 
     // Reject CRLF in either half so a header can never split the response.
+    // Length and framing are decided by the server, never by the handler, so
+    // those names are kept but never written.
     fn Header(name:string, value) {
         let v = str(value);
-        if (String.Contains(name, "\r") || String.Contains(name, "\n")
-            || String.Contains(name, ":") || name == "") {
+        if (String.Contains(name, '\r') || String.Contains(name, '\n')
+            || String.Contains(name, ':') || name == "") {
             throw(1, "HttpServer: invalid header name");
         }
-        if (String.Contains(v, "\r") || String.Contains(v, "\n")) {
+        if (String.Contains(v, '\r') || String.Contains(v, '\n')) {
             throw(1, "HttpServer: invalid header value for '" + name + "'");
         }
-        if (!Object.HasKey(_headers, name)) { Array.Append(_order, name); }
+        if (_headers == nil) {
+            _headers = {};
+            _order   = [];
+        }
+        if (!Object.HasKey(_headers, name)) {
+            let lk = String.ToLower(name);
+            if (lk != "content-length" && lk != "connection" && lk != "transfer-encoding") {
+                Array.Append(_order, name);
+            }
+        }
         _headers[name] = v;
         return this;
     }
 
     fn ContentType(ct:string) { return this.Header("Content-Type", ct); }
+
+    // A header whose name and value the server produced itself: nothing to
+    // validate, and never one of the framing names Header() keeps back.
+    fn _put(name:string, v:string) {
+        if (_headers == nil) {
+            _headers = {};
+            _order   = [];
+        }
+        if (!Object.HasKey(_headers, name)) { Array.Append(_order, name); }
+        _headers[name] = v;
+        return this;
+    }
 
     // Set a cookie. Several calls produce several Set-Cookie lines - a cookie
     // is one of the few headers that legitimately repeats, so these are kept
@@ -1391,7 +1543,7 @@ class HttpResponse
     // automatically whenever the request itself arrived over TLS.
     //   opts: { maxAge, expires, path, domain, httpOnly, secure, sameSite }
     fn SetCookie(name:string, value, opts?) {
-        if (!_isToken(name)) { throw(1, "HttpServer: invalid cookie name"); }
+        if (!_isToken(name, _nonToken())) { throw(1, "HttpServer: invalid cookie name"); }
         let o = opts ?? nil;
 
         // Encoding the value is what makes ";" or a newline in it harmless.
@@ -1421,6 +1573,7 @@ class HttpResponse
         if (httpOnly) { Array.Append(parts, "HttpOnly"); }
         if (secure)   { Array.Append(parts, "Secure"); }
 
+        if (_setCookies == nil) { _setCookies = []; }
         Array.Append(_setCookies, String.Join(parts, "; "));
         return this;
     }
@@ -1440,25 +1593,24 @@ class HttpResponse
     }
 
     // Serialize the status line plus headers. bodyLen < 0 means chunked.
-    fn _headBlock(bodyLen:int): string {
-        let sb = [];
-        Array.Append(sb, "HTTP/1.1 " + str(_status) + " " + HttpStatus.Reason(_status));
-
-        if (!Object.HasKey(_headers, "Server")) {
-            Array.Append(sb, _serverLine);
+    // `ctype` is a Content-Type the server chose, written when the handler set
+    // none; nil writes none.
+    fn _headBlock(bodyLen:int, ctype): string {
+        var h:string = "";
+        if (_headers == nil) {
+            h = _statusLine(_status) + _serverDateLines(_serverName);
+        } else {
+            h = _statusLine(_status);
+            if (!Object.HasKey(_headers, "Server")) { h = h + "Server: " + _serverName + "\r\n"; }
+            // RFC 9110 requires Date on any response from a clock-bearing server.
+            if (!Object.HasKey(_headers, "Date")) { h = h + _httpDateLine() + "\r\n"; }
+            let hs = _headers;
+            foreach (k in _order) { h = h + k + ": " + hs[k] + "\r\n"; }
         }
-        // RFC 9110 requires Date on any response from a clock-bearing server.
-        if (!Object.HasKey(_headers, "Date")) {
-            Array.Append(sb, _httpDateLine());
+        if (ctype != nil) { h = h + "Content-Type: " + ctype + "\r\n"; }
+        if (_setCookies != nil) {
+            foreach (c in _setCookies) { h = h + "Set-Cookie: " + c + "\r\n"; }
         }
-        foreach (k in _order) {
-            // Length and framing are decided here, never by the handler.
-            let lk = String.ToLower(k);
-            if (lk != "content-length" && lk != "connection" && lk != "transfer-encoding") {
-                Array.Append(sb, k + ": " + _headers[k]);
-            }
-        }
-        foreach (c in _setCookies) { Array.Append(sb, "Set-Cookie: " + c); }
         if (_tmTicks != nil && _tmHead == 0) {
             _tmHead = Time.Ticks();
             let ph    = this._phases(_tmHead);
@@ -1466,58 +1618,56 @@ class HttpResponse
             foreach (k in Object.Keys(ph)) {
                 Array.Append(parts, k + ";dur=" + String.FormatArray("{0:.2f}", [ph[k]]));
             }
-            Array.Append(sb, "Server-Timing: " + String.Join(parts, ", "));
+            h = h + "Server-Timing: " + String.Join(parts, ", ") + "\r\n";
         }
-        if (bodyLen >= 0) {
-            Array.Append(sb, "Content-Length: " + str(bodyLen));
+        if (bodyLen < 0) {
+            h = h + "Transfer-Encoding: chunked\r\n";
         } else {
-            Array.Append(sb, "Transfer-Encoding: chunked");
+            h = h + "Content-Length: " + str(bodyLen) + "\r\n";
         }
-        Array.Append(sb, "Connection: " + (_keepAlive ? "keep-alive" : "close"));
-        Array.Append(sb, "");
-        Array.Append(sb, "");
-        return String.Join(sb, "\r\n");
+        return h + (_keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n");
     }
 
     // Send a complete response. `body` is a string, a block, or nil.
+    // `contentType` is trusted: only the server's own constants arrive here,
+    // anything a caller supplies goes through Header() first.
     fn _send(body, contentType?: string, status?) {
         if (_sent) return false;
         if (status != nil) { _status = int(status); }
-        if (contentType != nil && !Object.HasKey(_headers, "Content-Type")) {
-            this.ContentType(contentType);
-        }
+        let ct = (contentType != nil && (_headers == nil || !Object.HasKey(_headers, "Content-Type")))
+               ? contentType : nil;
 
-        let isBlock = (body != nil) && Type.Is(body, Type.Block);
-        let bodyLen = 0;
-        if (body != nil) { bodyLen = isBlock ? len(body) : String.Length(body); }
+        let isBlock = (body != nil) && Type.IsBlock(body);
+        var bodyLen:int = 0;
+        if (body != nil) { bodyLen = len(body); }
 
         // 204 and 304 carry no body at all.
         if (_status == 204 || _status == 304) { body = nil; bodyLen = 0; }
 
-        let head    = this._headBlock(bodyLen);
         let hasBody = (body != nil) && !_headOnly && bodyLen > 0;
         _bodyBytes  = hasBody ? bodyLen : 0;
 
         if (!hasBody) {
-            Stream.WriteAll(_conn, head);
+            Stream.WriteAll(_conn, this._headBlock(bodyLen, ct));
         } else if (bodyLen <= _COALESCE_MAX) {
             // One write for the whole response: header and body reach the wire
             // in a single syscall, and a single packet.
             if (isBlock) {
-                let hl:int = String.Length(head);
+                let head   = this._headBlock(bodyLen, ct);
+                let hl:int = len(head);
                 let out    = Buffer.Create(hl + bodyLen, 1);
                 Buffer.CopyStringAt(out, 0, head, hl);
                 Buffer.Copy(body, 0, out, hl, bodyLen);
                 _writeBlock(_conn, out, hl + bodyLen);
             } else {
-                Stream.WriteAll(_conn, head + body);
+                Stream.WriteAll(_conn, this._headBlock(bodyLen, ct) + body);
             }
         } else {
             // Large body: joining it to the header would copy more than the
             // extra write costs. WriteAll/_writeBlock still guarantee the whole
             // body goes out - a short write here would desynchronise framing on
             // a keep-alive connection.
-            Stream.WriteAll(_conn, head);
+            Stream.WriteAll(_conn, this._headBlock(bodyLen, ct));
             if (isBlock) { _writeBlock(_conn, body, bodyLen); }
             else         { Stream.WriteAll(_conn, body); }
         }
@@ -1529,8 +1679,14 @@ class HttpResponse
     fn Html(s:string, status?: int)  { return this._send(s, "text/html; charset=utf-8",  status); }
     fn Json(value, status?: int)     { return this._send(_jsonEncode(value), "application/json", status); }
 
+    // `data` may also be a string; a Content-Type the handler set wins over
+    // `contentType`, as it does for every other builder.
     fn Bytes(data, contentType?: string, status?: int) {
-        return this._send(data, contentType ?? "application/octet-stream", status);
+        if (contentType == nil) { return this._send(data, "application/octet-stream", status); }
+        if (String.Contains(contentType, '\r') || String.Contains(contentType, '\n')) {
+            throw(1, "HttpServer: invalid header value for 'Content-Type'");
+        }
+        return this._send(data, contentType, status);
     }
 
     fn NoContent() { return this._send(nil, nil, 204); }
@@ -1563,21 +1719,25 @@ class HttpResponse
 
         let size:int = st.Size;
         let etag     = _etagFor(st, encoding);
+        if (_headers == nil) {
+            _headers = {};
+            _order   = [];
+        }
 
         if (!Object.HasKey(_headers, "Content-Type"))  { this.ContentType(contentType); }
-        if (!Object.HasKey(_headers, "Last-Modified")) { this.Header("Last-Modified", _httpDateOf(st.Modified)); }
-        if (!Object.HasKey(_headers, "ETag"))          { this.Header("ETag", etag); }
-        if (!Object.HasKey(_headers, "Accept-Ranges")) { this.Header("Accept-Ranges", "bytes"); }
+        if (!Object.HasKey(_headers, "Last-Modified")) { this._put("Last-Modified", _httpDateOf(st.Modified)); }
+        if (!Object.HasKey(_headers, "ETag"))          { this._put("ETag", etag); }
+        if (!Object.HasKey(_headers, "Accept-Ranges")) { this._put("Accept-Ranges", "bytes"); }
         if (encoding != nil) {
-            this.Header("Content-Encoding", encoding);
+            this._put("Content-Encoding", encoding);
             // Caches must not hand this body to a client that cannot decode it.
-            this.Header("Vary", "Accept-Encoding");
+            this._put("Vary", "Accept-Encoding");
         }
 
         // A validated cache costs no body and no file read at all.
         if (this._notModified(etag, st.Modified)) {
             _status = 304;
-            Stream.WriteAll(_conn, this._headBlock(0));
+            Stream.WriteAll(_conn, this._headBlock(0, nil));
             _sent = true;
             return true;
         }
@@ -1599,7 +1759,7 @@ class HttpResponse
 
         // HEAD: the headers are the whole answer, so never touch the file.
         if (_headOnly) {
-            Stream.WriteAll(_conn, this._headBlock(count));
+            Stream.WriteAll(_conn, this._headBlock(count, nil));
             _sent = true;
             return true;
         }
@@ -1610,7 +1770,7 @@ class HttpResponse
         // once the copy it avoids outweighs them - which is not true of the
         // small files that dominate a real static mount.
         if (count <= _COALESCE_MAX) {
-            let data = _fileBytes(path);
+            let data = (_files != nil) ? _files.Get(path, st) : _fileBytes(path);
             if (data != nil) {
                 if (start > 0 || count < size) { data = Buffer.Slice(data, start, count); }
                 return this._send(data, nil, nil);
@@ -1620,7 +1780,7 @@ class HttpResponse
         // Large body: the kernel moves it straight from page cache to socket,
         // so the bytes never enter the VM heap and a file bigger than memory
         // still streams.
-        Stream.WriteAll(_conn, this._headBlock(count));
+        Stream.WriteAll(_conn, this._headBlock(count, nil));
         _bodyBytes = count;
         if (count > 0) { _sendFileAll(_conn, path, start, count); }
         _sent = true;
@@ -1633,7 +1793,7 @@ class HttpResponse
         if (_req == nil) return false;
         if (_req.method != "GET" && _req.method != "HEAD") return false;
 
-        let inm = _req.Header("If-None-Match", nil);
+        let inm = _req.headers[_H_INM];
         if (inm != nil) {
             let v = String.Trim(inm);
             if (v == "*") return true;
@@ -1642,7 +1802,7 @@ class HttpResponse
             return String.Contains(v, etag);
         }
 
-        let ims = _req.Header("If-Modified-Since", nil);
+        let ims = _req.headers[_H_IMS];
         if (ims != nil) {
             let t = Time.Parse(String.Trim(ims), "RFC");
             if (t != nil && modified <= t) return true;
@@ -1656,13 +1816,13 @@ class HttpResponse
     fn _parseRange(size:int, etag:string) {
         if (_req == nil || _req.method != "GET") return nil;
 
-        let h = _req.Header("Range", nil);
+        let h = _req.headers.range;
         if (h == nil) return nil;
 
         // If-Range guards the slice against a changed entity: when the validator
         // no longer matches, the client needs the whole thing, not a fragment of
         // something new.
-        let ifr = _req.Header("If-Range", nil);
+        let ifr = _req.headers[_H_IFR];
         if (ifr != nil && !String.Contains(String.Trim(ifr), etag)) return nil;
 
         let v = String.Trim(h);
@@ -1708,7 +1868,7 @@ class HttpResponse
             this.ContentType(contentType);
         }
         _chunked = true;
-        Stream.WriteAll(_conn, this._headBlock(-1));
+        Stream.WriteAll(_conn, this._headBlock(-1, nil));
         return true;
     }
 
@@ -1750,6 +1910,7 @@ class _Route
 {
     let method:string  = "GET";
     let segs:array    = [];      // pattern split on "/"
+    let names:array   = [];      // per segment: the ":name" without its colon, "" for a literal
     let handler        = nil;
     let catchAll:bool = false;   // pattern ends with "*"
 
@@ -1761,30 +1922,42 @@ class _Route
             catchAll = true;
             p = String.Substr(p, 0, String.Length(p) - 1);
         }
-        segs = _splitPath(p);
+        segs  = _splitPath(p);
+        names = [];
+        foreach (s in segs) {
+            Array.Append(names, String.StartsWith(s, ":") ? String.Substr(s, 1) : "");
+        }
     }
 
-    // Match `parts` against this route, filling `params` on success.
-    fn Matches(parts:array, params): bool {
+    // True when `parts` matches this route. With a `req` the captures replace
+    // req.params; nil only tests the path. Nothing is allocated for a route
+    // that does not match.
+    fn Matches(parts:array, req): bool {
+        let n:int = len(segs);
         if (catchAll) {
-            if (len(parts) < len(segs)) return false;
-        } else if (len(parts) != len(segs)) {
+            if (len(parts) < n) return false;
+        } else if (len(parts) != n) {
             return false;
         }
 
-        iter (i from 0 to len(segs)) {
-            let s = segs[i];
-            if (String.StartsWith(s, ":")) {
-                params[String.Substr(s, 1)] = parts[i];
-            } else if (s != parts[i]) {
-                return false;
+        let params = nil;
+        iter (i from 0 to n) {
+            let name = names[i];
+            if (name == "") {
+                if (segs[i] != parts[i]) return false;
+            } else if (req != nil) {
+                if (params == nil) { params = {}; }
+                params[name] = parts[i];
             }
         }
+        if (req == nil) return true;
         if (catchAll) {
+            if (params == nil) { params = {}; }
             let tail = [];
-            iter (i from len(segs) to len(parts)) { Array.Append(tail, parts[i]); }
+            iter (i from n to len(parts)) { Array.Append(tail, parts[i]); }
             params["*"] = String.Join(tail, "/");
         }
+        if (params != nil) { req.params = params; }
         return true;
     }
 }
@@ -1830,6 +2003,9 @@ class HttpServer
     let _activeConns:int       = 0;
 
     let _routes:array          = [];
+    // GET routes without captures, by canonical path, that no earlier route
+    // shadows: a hit is the route the in-order scan would pick.
+    let _exactGet               = nil;
     let _onRequest              = nil;
     let _notFound               = nil;
     let _onError                = nil;
@@ -1839,10 +2015,12 @@ class HttpServer
     let _inFlight:int          = 0;    // requests being handled right now
     let _statics:array         = [];   // { prefix, root, index, cacheControl }
     let _timing:bool           = false;
+    let _files                  = nil;   // _FileCache for File() and Static(), nil when off
 
     fn Constructor(opts?) {
         _routes  = [];
         _statics = [];
+        let cacheBytes:int = 4194304;
         if (opts != nil) {
             _port               = Object.TryGet(opts, "port",               8080);
             _host               = Object.TryGet(opts, "host",               nil);
@@ -1860,7 +2038,9 @@ class HttpServer
             _serverName         = Object.TryGet(opts, "serverName",         "Flaris");
             _tls                = Object.TryGet(opts, "tls",                nil);
             _timing             = Object.TryGet(opts, "timing",             false);
+            cacheBytes          = Object.TryGet(opts, "fileCacheBytes",     4194304);
         }
+        if (cacheBytes > 0) { _files = new _FileCache(cacheBytes, _COALESCE_MAX); }
     }
 
     // -------------------------------------------------------------------------
@@ -1868,7 +2048,17 @@ class HttpServer
     // -------------------------------------------------------------------------
 
     fn Route(method:string, pattern:string, handler) {
-        Array.Append(_routes, new _Route(method, pattern, handler));
+        let r = new _Route(method, pattern, handler);
+        if (r.method == "GET" && !r.catchAll && !Array.Any(r.names, fn(n) { return n != ""; })) {
+            let key = "/" + String.Join(r.segs, "/");
+            var shadowed = false;
+            foreach (e in _routes) {
+                if (e.method == "GET" && e.Matches(r.segs, nil)) { shadowed = true; }
+            }
+            if (_exactGet == nil) { _exactGet = {}; }
+            if (!shadowed && !Object.HasKey(_exactGet, key)) { _exactGet[key] = r; }
+        }
+        Array.Append(_routes, r);
         return this;
     }
 
@@ -1912,8 +2102,8 @@ class HttpServer
         Array.Append(_statics, {
             prefix:       urlPrefix,
             root:         rootDir,
-            // Resolved once: it cannot change, and Path.Resolve on every
-            // request was pure repetition.
+            // Resolved once, here: a relative root is read against the
+            // working directory at mount time, never per request.
             rootAbs:      Path.Resolve(rootDir),
             index:        Object.TryGet(o, "index",        "index.html"),
             cacheControl: Object.TryGet(o, "cacheControl", ""),
@@ -2119,13 +2309,12 @@ class HttpServer
     // over and this server must neither close nor touch it again.
     fn _serveOne(conn, peer:string, served:int): int {
         let tStart:int = _timing ? Time.Ticks() : 0;
-        let parsed = this._readRequest(conn, peer);
-        let req    = parsed.req;
+        let req = this._readRequest(conn, peer);
 
         // A parse failure still gets a well-formed reply, then closes.
-        if (parsed.status != 0) {
+        if (!Type.IsInstance(req)) {
             let res = new HttpResponse(conn, false, false, _serverName);
-            if (parsed.status > 0) { res.Error(parsed.status, parsed.message); }
+            if (req.status > 0) { res.Error(req.status, req.message); }
             return 0;
         }
 
@@ -2134,10 +2323,11 @@ class HttpServer
         // client does not wait on a connection that is going away.
         let keep = _keepAlive && req.keepAlive && _running
                    && (served + 1) < _maxRequestsPerConn;
-        let res  = new HttpResponse(conn, req.method == "HEAD", keep, _serverName, req);
+        let res  = new HttpResponse(conn, req.method == "HEAD", keep, _serverName, req, _files);
         if (_timing) { res._timeFrom(tStart, Time.Ticks()); }
 
-        let t0:int = Time.Millis();
+        // Only the access log reads the duration.
+        let t0:int = (_onAccess != nil) ? Time.Millis() : 0;
         _inFlight = _inFlight + 1;
         this._dispatch(req, res);
         _inFlight = _inFlight - 1;
@@ -2171,53 +2361,74 @@ class HttpServer
 
         // A body the handler never read is still sitting on the socket, and
         // would frame the next request on this connection. Close instead.
-        if (req.HasPendingBody()) { return 0; }
+        if (req._conn != nil && req.HasPendingBody()) { return 0; }
         return keep ? 1 : 0;
     }
 
     // Route the request to a handler, converting a raised error into a 500.
     fn _dispatch(req, res) {
         try {
-            // 1. Explicit routes.
-            let parts   = _splitPath(req.path);
+            // 1. Explicit routes. The method is the cheaper test, so it goes
+            // first; HEAD falls back to the GET handler.
+            let method  = req.method;
+            let isHead  = method == "HEAD";
             let matched = false;
-            let methodMismatch = false;
-
-            foreach (r in _routes) {
-                if (!matched) {
-                    let p = {};
-                    if (r.Matches(parts, p)) {
-                        // HEAD falls back to the GET handler.
-                        let m = r.method;
-                        if (m == req.method || (req.method == "HEAD" && m == "GET")) {
-                            req.params = p;
-                            matched = true;
-                            res.Mark("route");
-                            _settled(r.handler(req, res));
-                        } else {
-                            methodMismatch = true;
-                        }
-                    }
+            var parts   = nil;
+            if (method == "GET" && _exactGet != nil) {
+                let r = _exactGet[req.path];
+                if (r != nil) {
+                    matched = true;
+                    if (_timing) { res.Mark("route"); }
+                    let hv = r.handler(req, res);
+                    if (hv != nil && Type.IsFiber(hv)) { Fiber.Await(hv); }
+                }
+            }
+            if (!matched) { parts = _splitPath(req.path); }
+            let ri:int  = 0;
+            while (!matched && ri < len(_routes)) {
+                let r = _routes[ri];
+                ri += 1;
+                let m = r.method;
+                if ((m == method || (isHead && m == "GET")) && r.Matches(parts, req)) {
+                    matched = true;
+                    if (_timing) { res.Mark("route"); }
+                    let hv = r.handler(req, res);
+                    if (hv != nil && Type.IsFiber(hv)) { Fiber.Await(hv); }
                 }
             }
 
             // 2. Static mounts.
-            if (!matched) {
-                res.Mark("route");
+            if (!matched && len(_statics) > 0) {
+                if (_timing) { res.Mark("route"); }
                 matched = this._serveStatic(req, res);
             }
 
             // 3. Catch-all handler.
             if (!matched && _onRequest != nil) {
                 matched = true;
-                res.Mark("route");
-                _settled(_onRequest(req, res));
+                if (_timing) { res.Mark("route"); }
+                let hv = _onRequest(req, res);
+                if (hv != nil && Type.IsFiber(hv)) { Fiber.Await(hv); }
             }
 
-            // 4. Nothing claimed it.
+            // 4. Nothing claimed it. A route that matches the path can only
+            // be one for another method: a 405 with those in Allow
+            // (RFC 9110 15.5.6).
             if (!matched && !res.Sent()) {
-                res.Mark("route");
-                if (methodMismatch) {
+                if (_timing) { res.Mark("route"); }
+                if (parts == nil) { parts = _splitPath(req.path); }
+                let allowed = nil;
+                foreach (r in _routes) {
+                    if (r.Matches(parts, nil)) {
+                        if (allowed == nil) { allowed = []; }
+                        if (!Array.Contains(allowed, r.method)) { Array.Append(allowed, r.method); }
+                    }
+                }
+                if (allowed != nil) {
+                    if (Array.Contains(allowed, "GET") && !Array.Contains(allowed, "HEAD")) {
+                        Array.Append(allowed, "HEAD");
+                    }
+                    res.Header("Allow", String.Join(allowed, ", "));
                     res.Error(405, "method not allowed");
                 } else if (_notFound != nil) {
                     _settled(_notFound(req, res));
@@ -2247,13 +2458,13 @@ class HttpServer
 
         foreach (m in _statics) {
             if (!res.Sent() && String.StartsWith(req.path, m.prefix)) {
-                let rel = String.Substr(req.path, String.Length(m.prefix));
-                if (String.StartsWith(rel, "/")) { rel = String.Substr(rel, 1); }
+                var rel = String.Substr(req.path, String.Length(m.prefix));
+                if (String.CharAt(rel, 0) == '/') { rel = String.Substr(rel, 1); }
                 if (rel == "") { rel = m.index; }
 
                 // Reject traversal before touching the filesystem.
-                if (String.Contains(rel, "..") || String.StartsWith(rel, "/")
-                    || String.Contains(rel, "\\")) {
+                if (String.Contains(rel, _DOTDOT) || String.CharAt(rel, 0) == '/'
+                    || String.Contains(rel, '\\')) {
                     res.Error(403, "forbidden");
                     return true;
                 }
@@ -2265,13 +2476,14 @@ class HttpServer
                     return true;
                 }
 
-                let full = Path.Combine(m.root, rel);
                 // Confirm the resolved path really is inside the mount root.
                 // Path.Resolve collapses "..", which GetFullPath does not, and
                 // _isUnder requires a separator boundary so a root of "/srv/www"
-                // cannot also match "/srv/www-secret".
+                // cannot also match "/srv/www-secret". Joined to the absolute
+                // root, the path resolves without asking the OS for the working
+                // directory - which costs more than the rest of the request.
                 let rootFull = m.rootAbs;
-                let fileFull = Path.Resolve(full);
+                let fileFull = (rootFull == nil) ? nil : Path.Resolve(Path.Combine(rootFull, rel));
                 if (rootFull == nil || fileFull == nil || !_isUnder(fileFull, rootFull)) {
                     res.Error(403, "forbidden");
                     return true;
@@ -2323,7 +2535,8 @@ class HttpServer
                     }
                 }
 
-                res.File(fileFull);
+                // The stat above is the one File() would make again.
+                res._sendFile(fileFull, st, HttpStatus.MimeFor(fileFull), nil);
                 return true;
             }
         }
@@ -2335,8 +2548,9 @@ class HttpServer
     // -------------------------------------------------------------------------
 
     // Read and parse one request.
-    // Returns { req, status, message }: status 0 is success, > 0 is the error
-    // code to report, -1 means the peer closed and nothing should be sent.
+    // Returns the HttpRequest, or { req: nil, status, message } when there is
+    // none: status > 0 is the error code to report, -1 means the peer closed
+    // and nothing should be sent.
     fn _readRequest(conn, peer:string) {
         let line = Stream.ReadLine(conn);
         // RFC 9112 asks a server to ignore an empty line before the request
@@ -2345,83 +2559,76 @@ class HttpServer
         if (line == nil || line == "") {
             return { req: nil, status: -1, message: "closed" };
         }
-        if (String.Length(line) > 8192) {
+        if (len(line) > 8192) {
             return { req: nil, status: 414, message: "request line too long" };
         }
 
         // Exactly three fields. "GET /a b HTTP/1.1" otherwise parses as a
         // target of "/a" with a version of "b", which is a different request
         // from the one a proxy in front would have seen.
-        let parts = String.Split(line, " ");
+        let parts = String.Split(line, _SPACE);
         if (len(parts) != 3) {
             return { req: nil, status: 400, message: "malformed request line" };
         }
-        if (!_isToken(parts[0])) {
+        let nonToken = _nonToken();
+        let rawMethod:string = parts[0];
+        if (!_isToken(rawMethod, nonToken)) {
             return { req: nil, status: 400, message: "invalid method" };
         }
 
         let req = new HttpRequest();
-        req.method  = String.ToUpper(parts[0]);
+        req.method  = (rawMethod == "GET" || rawMethod == "POST") ? rawMethod : String.ToUpper(rawMethod);
         req.rawPath = parts[1];
-        req.version = String.Trim(parts[2]);
+        let ver:string = parts[2];
+        req.version = (ver == "HTTP/1.1") ? ver : String.Trim(ver);
         req.peer    = peer;
         req.secure  = (_tls != nil);
 
-        // Split off the query string, then percent-decode the path.
-        let target = req.rawPath;
-        let q      = String.IndexOf(target, "?");
-        if (q >= 0) {
-            let qs = String.Substr(target, q + 1);
-            target = String.Substr(target, 0, q);
-            req.query = HttpUtil.ParseQuery(qs) ?? {};
+        // Split off the query string, then percent-decode the path. Most
+        // targets have neither, and one scan says so.
+        var target = req.rawPath;
+        if (String.IndexOfAnyFrom(target, _QUERY_OR_ESCAPE, 0) < 0) {
+            req.path = target;
+        } else {
+            let q = String.IndexOf(target, '?');
+            if (q >= 0) {
+                let qs = String.Substr(target, q + 1);
+                target = String.Substr(target, 0, q);
+                req.query = HttpUtil.ParseQuery(qs) ?? {};
+            }
+            req.path = HttpUtil.UrlDecode(target) ?? target;
         }
-        req.path = HttpUtil.UrlDecode(target) ?? target;
-        if (!String.StartsWith(req.path, "/")) {
+        if (len(req.path) == 0 || req.path[0] != '/') {
             return { req: nil, status: 400, message: "path must be absolute" };
         }
         if (_hasCtlBytes(req.path)) {
             return { req: nil, status: 400, message: "control character in path" };
         }
 
-        // Headers, bounded by both count and total size.
-        let raw   = [];
-        let total = 0;
-        let count = 0;
-        let h     = Stream.ReadLine(conn);
-        while (h != nil && h != "") {
-            total = total + String.Length(h) + 2;
-            count = count + 1;
-            if (count > _maxHeaders || total > _maxHeaderBytes) {
-                return { req: nil, status: 431, message: "header block too large" };
-            }
-            Array.Append(raw, h);
-            h = Stream.ReadLine(conn);
-        }
-        // ReadLine returns "" for the blank line that ends the headers, and nil
-        // when the peer closed or went silent for readTimeoutMs before it.
-        // Treating the two alike answers a request the client never finished
-        // sending - and leaves whatever it sends next to be read as a second
-        // request.
-        if (h == nil) {
-            return { req: nil, status: 400, message: "incomplete request headers" };
-        }
-        // Validate the header block before trusting any of it. ParseHeaders
-        // resolves a duplicate by keeping the last one; here ambiguity is
-        // refused instead, because "resolved differently by each hop" is
-        // precisely what request smuggling needs.
+        // Headers, bounded by both count and total size, each validated as it
+        // arrives and stored under its lowercased name in the same pass. A
+        // repeated header keeps its last value, except for the framing and
+        // Host headers below: there ambiguity is refused, because "resolved
+        // differently by each hop" is precisely what request smuggling needs.
+        let hdrs          = req.headers;
+        let total:int     = 0;
+        let count:int     = 0;
         let clCount:int   = 0;
         let clVal:string  = "";
         let teSeen:bool   = false;
         let hostCount:int = 0;
-        let vi:int = 0;
-        while (vi < len(raw)) {
-            let hl:string = raw[vi];
-            vi += 1;
+        let hl = Stream.ReadLine(conn);
+        while (hl != nil && hl != "") {
+            total = total + len(hl) + 2;
+            count = count + 1;
+            if (count > _maxHeaders || total > _maxHeaderBytes) {
+                return { req: nil, status: 431, message: "header block too large" };
+            }
 
-            // One pass checks for a bare CR (which a proxy may split on),
+            // One scan checks for a bare CR (which a proxy may split on),
             // obsolete line folding, and that the name is a token - so
             // "Transfer-Encoding :" is rejected rather than quietly ignored.
-            let ci:int = _validateHeaderLine(hl);
+            let ci:int = _validateHeaderLine(hl, nonToken);
             if (ci == -2) {
                 return { req: nil, status: 400, message: "obsolete line folding" };
             }
@@ -2433,8 +2640,10 @@ class HttpServer
             }
 
             let lname:string = String.ToLower(String.Left(hl, ci));
+            let value:string = String.TrimLeft(String.Substr(hl, ci + 1));
+            hdrs[lname] = value;
             if (lname == "content-length") {
-                let v = _collapseCL(String.Trim(String.Substr(hl, ci + 1)));
+                let v = _collapseCL(String.TrimRight(value));
                 if (v == nil) {
                     return { req: nil, status: 400, message: "bad Content-Length" };
                 }
@@ -2446,13 +2655,28 @@ class HttpServer
                 clCount = clCount + 1;
                 clVal   = v;
             } else if (lname == "transfer-encoding") {
+                // Only a lone "chunked" is decoded. Any other coding, a list or
+                // a repeat leaves the body length unknown, and RFC 9112 6.3 then
+                // requires a 400 and a closed connection.
+                if (teSeen || String.ToLower(String.TrimRight(value)) != "chunked") {
+                    return { req: nil, status: 400, message: "unsupported Transfer-Encoding" };
+                }
                 teSeen = true;
             } else if (lname == "host") {
                 hostCount = hostCount + 1;
-                if (!_isValidHost(String.Trim(String.Substr(hl, ci + 1)))) {
+                if (!_isValidHost(String.TrimRight(value))) {
                     return { req: nil, status: 400, message: "invalid Host" };
                 }
             }
+            hl = Stream.ReadLine(conn);
+        }
+        // ReadLine returns "" for the blank line that ends the headers, and nil
+        // when the peer closed or went silent for readTimeoutMs before it.
+        // Treating the two alike answers a request the client never finished
+        // sending - and leaves whatever it sends next to be read as a second
+        // request.
+        if (hl == nil) {
+            return { req: nil, status: 400, message: "incomplete request headers" };
         }
 
         // RFC 9112 3.2: an HTTP/1.1 request carries exactly one Host. None, or
@@ -2471,17 +2695,14 @@ class HttpServer
             return { req: nil, status: 400, message: "Content-Length with Transfer-Encoding" };
         }
 
-        if (len(raw) > 0) {
-            req.headers = HttpUtil.ParseHeaders(String.Join(raw, "\r\n") + "\r\n") ?? {};
-        }
-
         // HTTP/1.1 keeps the connection open unless asked otherwise; 1.0 is the
         // reverse and needs an explicit keep-alive.
-        let connHdr = String.ToLower(req.Header("Connection", "") ?? "");
+        let conn0 = hdrs.connection;
         if (req.version == "HTTP/1.0") {
-            req.keepAlive = String.Contains(connHdr, "keep-alive");
+            req.keepAlive = conn0 != nil && String.Contains(String.ToLower(conn0), "keep-alive");
         } else {
-            req.keepAlive = !String.Contains(connHdr, "close");
+            req.keepAlive = conn0 == nil || conn0 == "keep-alive" || conn0 == "Keep-Alive"
+                         || !String.Contains(String.ToLower(conn0), "close");
         }
 
         // RFC 9110 10.1.1: a client that sent "Expect: 100-continue" is waiting
@@ -2491,7 +2712,8 @@ class HttpServer
         // read - which looks exactly like a truncated request. curl sends this
         // for any body over 1 KB, so it affects ordinary large POSTs, not just
         // uploads.
-        let expectHdr = String.ToLower(String.Trim(req.Header("Expect", "") ?? ""));
+        var expectHdr = hdrs.expect ?? "";
+        if (expectHdr != "") { expectHdr = String.ToLower(String.Trim(expectHdr)); }
         if (expectHdr != "") {
             if (expectHdr != "100-continue") {
                 return { req: nil, status: 417, message: "expectation failed" };
@@ -2508,11 +2730,10 @@ class HttpServer
         req._maxBody     = _maxBodyBytes;
         req._readTimeout = _readTimeoutMs;
         if (_streamBodies) {
-            let teS = String.ToLower(req.Header("Transfer-Encoding", "") ?? "");
-            if (String.Contains(teS, "chunked")) {
+            if (teSeen) {
                 req._conn        = conn;
                 req._chunkedBody = true;
-                return { req: req, status: 0, message: "" };
+                return req;
             }
             if (clCount > 0) {
                 let clS = Convert.ParseInt(clVal);
@@ -2527,12 +2748,10 @@ class HttpServer
                     req._pending = clS;
                 }
             }
-            return { req: req, status: 0, message: "" };
+            return req;
         }
 
-        // Body: chunked wins over Content-Length, per RFC 9112.
-        let te = String.ToLower(req.Header("Transfer-Encoding", "") ?? "");
-        if (String.Contains(te, "chunked")) {
+        if (teSeen) {
             let r = this._readChunkedBody(conn);
             if (!r.ok) {
                 // 400 for a malformed body, 413 when it simply ran over the cap.
@@ -2568,18 +2787,17 @@ class HttpServer
             }
         }
 
-        return { req: req, status: 0, message: "" };
+        return req;
     }
 
     // Decode a chunked body into one block.
     //
     // Returns { ok, status, body }. `ok` false means the body was not a
-    // well-formed chunked body and `status` says how to answer. This
-    // distinction is the whole point: the previous version treated a malformed
-    // chunk size as end-of-body and reported success, which left the rest of
-    // the stream to be parsed as a *second* request - a smuggled one the proxy
-    // in front never saw. Anything it cannot decode exactly is now a 400 and a
-    // closed connection.
+    // well-formed chunked body and `status` says how to answer. Anything it
+    // cannot decode exactly is a 400 and a closed connection: treating a
+    // malformed chunk size as end-of-body would leave the rest of the stream to
+    // be parsed as a second request - a smuggled one the proxy in front never
+    // saw.
     fn _readChunkedBody(conn) {
         let parts = [];
         let r = _streamChunked(conn, _maxBodyBytes, fn(p) { Array.Append(parts, p); return true; },

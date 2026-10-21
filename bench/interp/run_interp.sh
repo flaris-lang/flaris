@@ -10,11 +10,14 @@
 #   ./run_interp.sh                            # whatever is on PATH
 #   RUNS=7 ./run_interp.sh                     # more repetitions
 #   FLARISVM=/path/to/flarisvm ./run_interp.sh # explicit interpreter
+#   PYTHON=python3.13 ./run_interp.sh          # a specific CPython (default: newest on PATH)
 #   BENCHES="matmul dict" ./run_interp.sh      # a subset
 set -uo pipefail
 cd "$(dirname "$0")"
+source ../lib.sh
+resolve_tool PYTHON $(newest_python) python3 python || true
 RUNS=${RUNS:-3}
-BENCHES=${BENCHES-"binarytrees matmul dict method strops sortcb"}
+BENCHES=${BENCHES-"binarytrees matmul dict method strops sortcb nbody spectralnorm fannkuch richards knucleotide"}
 # The three integer kernels live in ../kernels and are shared with run_bench.sh.
 # Included here too so one table covers every interpreted scenario in the repo.
 KERNEL_DIR=../kernels
@@ -39,9 +42,9 @@ cmd_for() { # $1=lang $2=bench $3=dir -> command, empty if unavailable
         flaris) { command -v "$FLARISVM" >/dev/null 2>&1 || [ -x "$FLARISVM" ]; } &&
                 echo "$FLARISVM $d/bench_$2.fls --strip --jit-disable" ;;
         lua)    command -v lua  >/dev/null && echo "lua $d/bench_$2.lua" ;;
-        luau)   command -v luau >/dev/null && [ -f "$d/bench_$2.luau" ] && echo "luau $d/bench_$2.luau" ;;
+        luau)   command -v luau >/dev/null && [ -f "$d/bench_$2.luau" ] && echo "luau -O2 $d/bench_$2.luau" ;;
         qjs)    command -v qjs  >/dev/null && echo "qjs $d/bench_$2.js" ;;
-        python) command -v python3 >/dev/null && echo "python3 $d/bench_$2.py" ;;
+        python) [ -n "$PYTHON" ] && echo "$PYTHON $d/bench_$2.py" ;;
     esac
 }
 
@@ -82,7 +85,7 @@ fi
 command -v lua     >/dev/null && printf '  %-8s %s (%s)\n' lua    "$(command -v lua)"     "$(lua -v 2>&1 | head -1)"
 command -v luau    >/dev/null && printf '  %-8s %s\n'      luau   "$(command -v luau)"
 command -v qjs     >/dev/null && printf '  %-8s %s (%s)\n' qjs    "$(command -v qjs)"     "$(qjs -h 2>&1 | head -1)"
-command -v python3 >/dev/null && printf '  %-8s %s (%s)\n' python "$(command -v python3)" "$(python3 --version 2>&1)"
+[ -n "$PYTHON" ]           && printf '  %-8s %s (%s)\n' python "$(command -v "$PYTHON")" "$("$PYTHON" --version 2>&1)"
 echo
 
 printf '%-13s' "scenario"; for l in $(declare_langs); do printf '%9s' "$l"; done; printf '   %s\n' "result"

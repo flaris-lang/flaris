@@ -9,14 +9,17 @@
 // Usage:
 //   import { Promise } from library("Promise", "1.0");
 //
-//   // Run work in a fiber and await the result
-//   let p = Promise.Run(fn() { return Http.Get("http://example.com"); });
+//   // Run work in a fiber: the worker takes its promise's id and settles it
+//   let url = "http://example.com";
+//   let p = Promise.Run(fn() {
+//       let id = Promise.ReceiveId();
+//       Promise.Notify(id, Http.Get(url));        // or Promise.Fail(id, reason)
+//   });
 //   let res = p.Await();
 //
 //   // Chain: Then / Catch / Finally
-//   Promise.Run(fn() { return fetchData(); })
-//       .Then(fn(v) { Console.WriteLine("ok:", v); })
-//       .Catch(fn(e) { Console.WriteLine("err:", e); });
+//   p.Then(fn(v) { Console.WriteLine("ok:", v); })
+//    .Catch(fn(e) { Console.WriteLine("err:", e); });
 //
 //   // Combinators (blocking: yield until all settle)
 //   let results = Promise.All([p1, p2, p3]);   // array of resolved values
@@ -29,7 +32,12 @@
 //   Promise.Rejected(reason)        - already-rejected promise
 //   Promise.Canceled(reason)
 //   Promise.From(value)             - wraps value if not already a Promise
-//   Promise.Run(workFn)             - run fn in a fiber; returns Promise
+//   Promise.Run(workFn)             - run workFn in a fiber; returns Promise.
+//                                     workFn gets the promise's id from
+//                                     Promise.ReceiveId() and settles it with
+//                                     Promise.Notify(id, value) or
+//                                     Promise.Fail(id, reason); its return
+//                                     value is not used
 //   Promise.Delay(ms, value?)       - resolves after ms milliseconds
 //   Promise.RejectAfter(ms, reason)
 //
@@ -47,7 +55,11 @@
 //   Finally(onFinally)              - called always on settle
 //
 // Awaiting:
-//   Await()                         - blocks fiber; returns resolved value or throws
+//   Await()                         - blocks fiber; returns resolved value or throws:
+//                                     a rejection whose reason is an Exception
+//                                     rethrows that exception (class, Code and
+//                                     message intact), any other reason throws
+//                                     code 1 with the reason as its message
 //   AwaitResult()                   →  { ok:bool, value, reason }  - never throws
 //   TryAwait(defaultValue)          - returns defaultValue on rejection/cancel
 //
@@ -55,6 +67,10 @@
 //   Timeout(ms)                     - reject after ms if still pending
 //   CancelAfter(ms)                 - cancel after ms if still pending
 //   CancelNow()
+//   Each timer (also Delay, RejectAfter, CancelAfterNew, Retry's pause) holds
+//   one fiber while its promise is pending and lets it go as soon as the
+//   promise settles, so timers on promises that settle early do not pile up
+//   against the fiber limit.
 //
 // Combinators (static, blocking):
 //   Promise.All(promises)           →  array of values; throws if any rejects
@@ -63,9 +79,11 @@
 //   Promise.AllSettled(promises)    →  array of { ok, value, reason }
 //   Promise.FirstSettled(promises)  →  { ok, value, reason }
 //
-// Constraints:
-//   Lambdas passed to Then/Catch/Finally/Run cannot capture enclosing locals -
-//   only parameters and globals are accessible inside them (Flaris language rule).
+// Closures:
+//   Lambdas passed to Then/Catch/Finally/Run capture enclosing locals as any
+//   closure does: by value when the lambda is made, arrays and objects by
+//   reference. Assigning to a captured local inside one is not seen outside, so
+//   hand a result back through the promise or a shared object.
 
 global _pr_store = {};   // id -> Promise instance
 global _pr_next  = 0;    // monotonic id counter
@@ -83,6 +101,8 @@ fn _PromiseRetryWorker() {
     var attempt = 0;
     var lastErr = nil;
     while (attempt < maxAttempts) {
+        let p = _pr_store[str(pid)];
+        if (p == nil) { return; }
         attempt = attempt + 1;
         try {
             let result = fn_();
@@ -90,8 +110,8 @@ fn _PromiseRetryWorker() {
             return;
         } catch (e) {
             lastErr = e.Error;
-            if (attempt < maxAttempts && delayMs > 0) {
-                Fiber.Sleep(delayMs);
+            if (attempt < maxAttempts && delayMs > 0 && !p._ParkWhilePending(delayMs)) {
+                return;
             }
         }
     }
@@ -108,7 +128,8 @@ fn _PromiseDelayedWorker() {
     let kind = msg.kind;
     let value = msg.value;
 
-    Fiber.Sleep(delay);
+    let p = _pr_store[str(pid)];
+    if (p == nil || !p._ParkWhilePending(delay)) { return; }
 
     if (kind == "resolve") {
         Promise.Notify(pid, value);
@@ -124,6 +145,7 @@ class Promise {
     let _state: string = "pending"; 
     let _value = nil; 
     let _waiters = nil;
+    let _timers = nil;
     let id = 0;
 
     fn Constructor() {
@@ -133,6 +155,7 @@ class Promise {
         this._value     = nil;
         this._handlers  = [];          // [{onFulfilled, onRejected, onFinally, next}]
         this._waiters   = [];          // ids of fibers parked until this settles
+        this._timers    = [];          // ids of timer fibers parked until this settles or their time is up
         _pr_store[str(this.id)] = this;
     }
 
@@ -258,6 +281,9 @@ class Promise {
         let waiters = this._waiters;
         this._waiters = [];
         foreach (w in waiters) { Fiber.Unpark(Fiber.FromId(w)); }
+        let timers = this._timers;
+        this._timers = [];
+        foreach (t in timers) { Fiber.Unpark(Fiber.FromId(t)); }
     }
 
     // ── Chaining ──────────────────────────────────────────────────────────────
@@ -337,6 +363,30 @@ class Promise {
         this._waiters = kept;
     }
 
+    // Park until `ms` have passed or this promise settles (_Dispatch wakes the
+    // _timers); true when the time ran out with it still pending.
+    fn _ParkWhilePending(ms:int): bool {
+        let me = Fiber.Id();
+        let t0:int = Time.Ticks();
+        while (this._state == "pending") {
+            let left:int = ms - int(Time.TicksToMs(Time.Ticks() - t0));
+            if (left <= 0) { return true; }
+            Array.Append(this._timers, me);
+            Fiber.Park(left);
+            this._timers = Promise._Without(this._timers, me);
+        }
+        return false;
+    }
+
+    fn static _Without(ids:array, id:int): array {
+        if (len(ids) == 0) { return ids; }
+        let kept = [];
+        foreach (w in ids) {
+            if (w != id) { Array.Append(kept, w); }
+        }
+        return kept;
+    }
+
     // Park until one of `promises` that is still pending settles.
     fn static _WaitAny(promises:array) {
         let me = Fiber.Id();
@@ -349,16 +399,14 @@ class Promise {
 
     fn Await() {
         this._Wait();
-
-        if (this._state == "rejected") {
-            throw(1, str(this._value));
-        }
-
-        if (this._state == "canceled") {
-            throw(1, str(this._value));
-        }
-
+        if (this._state != "resolved") { Promise._Raise(this._value); }
         return this._value;
+    }
+
+    // Throws a rejection reason: an Exception as itself, anything else as code 1.
+    fn static _Raise(reason) {
+        if (reason is Exception) { throw reason; }
+        throw(1, str(reason));
     }
 
     fn AwaitResult(): object {
@@ -477,7 +525,7 @@ class Promise {
         let results = [];
         foreach (p in promises) {
             if (p._state == "rejected" || p._state == "canceled") {
-                throw(1, str(p._value));
+                Promise._Raise(p._value);
             }
             Array.Append(results, p._value);
         }
@@ -489,7 +537,7 @@ class Promise {
             foreach (p in promises) {
                 if (p._state != "pending") {
                     if (p._state == "rejected" || p._state == "canceled") {
-                        throw(1, str(p._value));
+                        Promise._Raise(p._value);
                     }
                     return p._value;
                 }

@@ -12,6 +12,7 @@ global testsRun    = 0;
 global testsFailed = 0;
 global gPort       = 0;
 global gLastPath   = "";
+global gSmallClose = 0;
 
 fn check(cond, msg) {
     testsRun = testsRun + 1;
@@ -46,6 +47,19 @@ fn buildServer() {
             if (m.Opcode == Ws.OpcodeText())   { ws.SendText("echo:" + m.Text); }
             if (m.Opcode == Ws.OpcodeBinary()) { ws.SendBinary(m.Payload); }
         }
+    });
+    // The same echo with a 64-byte message limit; records how it closed.
+    srv.Get("/ws-small", fn(req, res) {
+        let sock = res.Hijack();
+        let ws   = Ws.Accept(sock, req.headers);
+        if (ws == nil) { Stream.Close(sock); return; }
+        ws.SetMaxMessageBytes(64);
+        while (ws.IsOpen()) {
+            let m = ws.ReceiveWhenReady(4000);
+            if (m == nil) { break; }
+            if (m.Opcode == Ws.OpcodeText()) { ws.SendText("echo:" + m.Text); }
+        }
+        gSmallClose = ws.CloseCode();
     });
     return srv;
 }
@@ -86,6 +100,32 @@ fn test_handshake_and_echo() {
 
     ws.Close(1000, "done");
     check(!ws.IsOpen(), "closed after Close()");
+    return 0;
+}
+
+// Every length form (7-bit, 16-bit, 64-bit), payloads that do and do not
+// end on a whole 4-byte masking word, and both sides of the size at which a
+// frame's key and payload are read together.
+fn test_payload_sizes() {
+    Console.WriteLine("== payload sizes ==");
+    let ws = WebSocket.Connect("127.0.0.1", gPort, "/ws", nil, false);
+    var bad = 0;
+    foreach (n in [0, 1, 2, 3, 4, 5, 7, 125, 126, 127, 1023, 1024, 1025, 65535, 65536, 70001]) {
+        let b = Buffer.Create(n, 1);
+        iter (i from 0 to n) { b[i] = (i * 31 + 7) & 255; }
+        ws.SendBinary(b);
+        let m = ws.ReceiveWhenReady(4000);
+        if (m == nil || m.Length != n || (n > 0 && !Buffer.Equals(m.Payload, b))) {
+            bad += 1;
+            Console.WriteLine("  binary payload of ", n, " bytes did not round-trip");
+        }
+    }
+    checkEq(bad, 0, "binary payloads of every length form round-trip byte-exact");
+    let t = String.Repeat("\u00e4bc", 25000);
+    ws.SendText(t);
+    let mt = ws.ReceiveWhenReady(4000);
+    checkEq(mt == nil ? nil : mt.Text, "echo:" + t, "a 100 KB text message round-trips");
+    ws.Close(1000, "done");
     return 0;
 }
 
@@ -146,6 +186,56 @@ fn test_refusals() {
     return 0;
 }
 
+// A raw upgrade to `path`, for frames the library client would never send.
+fn rawUpgrade(path: string) {
+    let c = Stream.Connect("tcp", "127.0.0.1", gPort);
+    Stream.SetTimeout(c, 3000);
+    Stream.WriteAll(c, "GET " + path + " HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+        + "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        + "Sec-WebSocket-Version: 13\r\n\r\n");
+    Stream.WaitReadable(c, 3000);
+    let h = Stream.ReadLine(c);
+    while (h != nil && h != "") { h = Stream.ReadLine(c); }
+    return c;
+}
+
+fn test_message_limit() {
+    Console.WriteLine("== message size limit ==");
+
+    // Within the limit: still an ordinary echo.
+    let ws = WebSocket.Connect("127.0.0.1", gPort, "/ws-small", nil, false);
+    ws.SendText(String.Repeat("a", 64));
+    let ok = ws.ReceiveWhenReady(4000);
+    checkEq(ok == nil ? nil : String.Length(ok.Text), 69, "a message at the limit is accepted");
+
+    // Over it: the server closes with 1009 and ends the connection.
+    ws.SendText(String.Repeat("b", 65));
+    let m = ws.ReceiveWhenReady(4000);
+    checkEq(m == nil ? nil : m.Opcode, Ws.OpcodeClose(), "an oversized message is answered with a close frame");
+    checkEq(m == nil ? nil : m.CloseCode, 1009, "close code 1009 (message too big)");
+    check(!ws.IsOpen(), "the connection is over");
+    Fiber.Sleep(50);
+    checkEq(gSmallClose, 1009, "the server side reports 1009 too");
+
+    // A frame that declares 2^40 bytes and sends none of them: the answer is
+    // the same close, not an attempt to allocate a terabyte.
+    gSmallClose = 0;
+    let c = rawUpgrade("/ws-small");
+    let hdr = Buffer.Create(14, 1);
+    Buffer.WriteU8At(hdr, 0, 0x82);          // FIN + binary
+    Buffer.WriteU8At(hdr, 1, 0x80 | 127);    // masked, 64-bit length
+    Buffer.WriteU8At(hdr, 5, 1);             // 2^40, big-endian
+    Stream.WriteAll(c, hdr);
+    Stream.WaitReadable(c, 3000);
+    let reply = Stream.ReadBytes(c, 4);
+    check(reply != nil && len(reply) == 4 && Buffer.ReadU8At(reply, 0) == 0x88
+          && Ws.ReadU16BE(reply, 2) == 1009, "a declared 2^40-byte frame gets close 1009");
+    Stream.Close(c);
+    Fiber.Sleep(50);
+    checkEq(gSmallClose, 1009, "and the server ends that connection");
+    return 0;
+}
+
 fn test_abrupt_disconnect() {
     Console.WriteLine("== abrupt disconnect ==");
     // A peer that vanishes without a close frame must read as a close, not as
@@ -164,8 +254,10 @@ fn Main() {
     gPort = srv.ListenAsync();
 
     test_handshake_and_echo();
+    test_payload_sizes();
     test_ping();
     test_refusals();
+    test_message_limit();
     test_abrupt_disconnect();
 
     Console.WriteLine("==============================");

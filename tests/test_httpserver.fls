@@ -236,7 +236,35 @@ fn test_routing() {
     checkEq(Json.Parse(req1(gPort, "GET", "/nope").body).error, "not found", "404 body");
 
     // Registered path, wrong method.
-    checkEq(req1(gPort, "DELETE", "/only-get").code, 405, "method mismatch is 405");
+    let mismatch = req1(gPort, "DELETE", "/only-get");
+    checkEq(mismatch.code, 405, "method mismatch is 405");
+    checkEq(mismatch.headers["allow"], "GET, HEAD", "405 lists the routed methods in Allow");
+    let verbs = req1(gPort, "POST", "/verb");
+    checkEq(verbs.code, 405, "POST to a path routed for other methods is 405");
+    checkEq(verbs.headers["allow"], "PUT, PATCH, QUERY, DELETE, OPTIONS",
+            "Allow lists every routed method, in registration order");
+    let pm = req1(gPort, "DELETE", "/users/7");
+    checkEq(pm.code, 405, "method mismatch on a parametric route is 405");
+    checkEq(pm.headers["allow"], "GET, HEAD", "Allow for a parametric route");
+    let hd = request(gPort, "HEAD /users/9 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", true);
+    checkEq(hd.code, 200, "HEAD runs the GET route with its captures");
+
+    // A route that fails after capturing leaves no captures behind for the
+    // route that does match.
+    let later = Json.Parse(req1(gPort, "GET", "/pick/7/b").body);
+    checkEq(later.b, "7", "the matching route's capture");
+    check(!Object.HasKey(later, "a"), "no capture from a route that failed later in the path");
+
+    // Routes are tried in registration order, fixed or not.
+    checkEq(req1(gPort, "GET", "/shadow/me").body, "param me",
+            "an earlier route with a capture wins over a later fixed one");
+    checkEq(req1(gPort, "GET", "/shadow/you").body, "param you", "the capture route still captures");
+    checkEq(req1(gPort, "GET", "/dup").body, "first", "the first of two identical routes answers");
+    checkEq(req1(gPort, "GET", "/dup/").body, "first", "a trailing slash matches the fixed route");
+    checkEq(req1(gPort, "GET", "//dup").body, "first", "an empty segment matches the fixed route");
+    let hdup = request(gPort, "HEAD /dup HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", true);
+    checkEq(hdup.code, 200, "HEAD runs a fixed GET route");
+    checkEq(req1(gPort, "POST", "/dup").code, 405, "a fixed GET route answers 405 to POST");
     return 0;
 }
 
@@ -315,6 +343,15 @@ fn test_response_builders() {
     checkEq(len(r6.body), 256, "binary body fully received");
     checkEq(Buffer.ReadU8At(r6.body, 0),   0,   "binary body keeps a leading NUL");
     checkEq(Buffer.ReadU8At(r6.body, 255), 255, "binary body keeps the last byte");
+
+    let bt = req1(gPort, "GET", "/bytes-typed");
+    checkEq(Object.TryGet(bt.headers, "content-type", ""), "text/x-b", "Bytes with a content type");
+    checkEq(bt.body, "abc", "Bytes sends a string body as it is");
+    checkEq(Object.TryGet(req1(gPort, "GET", "/bytes-preset").headers, "content-type", ""), "text/x-a",
+            "a Content-Type the handler set wins over the one Bytes names");
+    let bb = req1(gPort, "GET", "/bytes-badtype");
+    checkEq(bb.code, 500, "a content type carrying CRLF is refused");
+    check(!Object.HasKey(bb.headers, "x-evil"), "a content type cannot inject a header");
 
     // A handler that raises still produces a 500 rather than killing the fiber.
     let r7 = req1(gPort, "GET", "/boom");
@@ -655,6 +692,23 @@ fn test_request_framing() {
     // A header name outside the token characters.
     checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nX Bad: v\r\nConnection: close\r\n\r\n", false).code,
         400, "invalid header name rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nX(Bad): v\r\nConnection: close\r\n\r\n", false).code,
+        400, "separator in a header name rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\n: v\r\nConnection: close\r\n\r\n", false).code,
+        400, "empty header name rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nX-å: v\r\nConnection: close\r\n\r\n", false).code,
+        400, "non-ASCII byte in a header name rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nNoColon\r\nConnection: close\r\n\r\n", false).code,
+        400, "header line without a colon rejected");
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nX-Tok!#$%&'*+.^_`|~: v\r\nConnection: close\r\n\r\n", false).code,
+        200, "every token character accepted in a header name");
+    // NUL cannot be written in a literal; Buffer.ToString keeps it.
+    let nul = Buffer.Create(1, 1);
+    checkEq(request(gPort, "GET / HTTP/1.1\r\nHost: t\r\nX-A" + Buffer.ToString(nul)
+        + "B: v\r\nConnection: close\r\n\r\n", false).code, 400, "NUL in a header name rejected");
+    // The method is a token too.
+    checkEq(request(gPort, "G@T / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false).code,
+        400, "non-token method rejected");
 
     // A bare CR inside a header line: ReadLine keeps it, and a proxy may split
     // the line there.
@@ -665,8 +719,8 @@ fn test_request_framing() {
     checkEq(request(gPort, "GET /a b HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", false).code,
         400, "space in the request target rejected");
 
-    // The desync itself. A bad chunk size used to truncate the body and report
-    // success, leaving the rest of the stream to be parsed as a second request.
+    // The desync itself: a bad chunk size fails the request, so the rest of the
+    // stream is never parsed as a second request.
     let smuggled = rawExchange(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
         + "ZZZ\r\nGET / HTTP/1.1\r\nHost: t\r\n\r\n");
     checkEq(smuggled.code, 400, "a bad chunk size is a 400");
@@ -689,6 +743,25 @@ fn test_request_framing() {
     // HTTP/1.0 predates Host and must still work without one.
     checkEq(request(gPort, "GET / HTTP/1.0\r\nConnection: close\r\n\r\n", false).code,
             200, "HTTP/1.0 without Host still served");
+
+    // RFC 9112 6.3: only a lone "chunked" frames a body this server can read.
+    // Any other coding leaves the length unknown, and reading it as "no body"
+    // would answer whatever the body holds as a second request.
+    let gz = rawExchange(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip\r\n\r\n"
+        + "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    checkEq(gz.code, 400, "Transfer-Encoding: gzip is a 400");
+    check(!gz.second, "the body behind an unsupported coding is NOT answered as a request");
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: xchunked\r\n"
+        + "Connection: close\r\n\r\n0\r\n\r\n", false).code, 400, "Transfer-Encoding: xchunked rejected");
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip, chunked\r\n"
+        + "Connection: close\r\n\r\n0\r\n\r\n", false).code, 400, "a coding list rejected");
+    checkEq(request(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+        + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n", false).code,
+        400, "repeated Transfer-Encoding rejected");
+    let teCase = request(gPort, "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding:  Chunked \r\n"
+        + "Connection: close\r\n\r\n2\r\nok\r\n0\r\n\r\n", false);
+    checkEq(teCase.code, 200, "Transfer-Encoding is matched trimmed and case-insensitively");
+    checkEq(teCase.body, "ok", "and the chunked body is read");
 
     // A truncated chunked body must not be accepted as a complete one.
     let truncated = rawExchange(gPort, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -718,6 +791,16 @@ fn test_request_framing() {
         + "Connection: close\r\n\r\n4\r\nabcd\r\n3\r\nefg\r\n0\r\n\r\n", false);
     checkEq(good.code, 200, "valid chunked body still accepted");
     checkEq(good.body, "abcdefg", "valid chunked body reassembled");
+
+    // Chunk sizes are hex digits of either case and nothing else.
+    let hex = request(gPort, "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+        + "Connection: close\r\n\r\nA\r\n0123456789\r\nb\r\nabcdefghijk\r\n0\r\n\r\n", false);
+    checkEq(hex.code, 200, "chunk sizes in upper- and lowercase hex accepted");
+    checkEq(String.Length(hex.body), 21, "hex chunk sizes frame the body");
+    checkEq(request(gPort, "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+        + "Connection: close\r\n\r\n0x4\r\nabcd\r\n0\r\n\r\n", false).code, 400, "chunk size '0x4' rejected");
+    checkEq(request(gPort, "POST /raw HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+        + "Connection: close\r\n\r\n4g\r\nabcd\r\n0\r\n\r\n", false).code, 400, "chunk size '4g' rejected");
     return 0;
 }
 
@@ -1056,6 +1139,10 @@ fn test_multipart() {
     checkEq(j.files[0].contentType, "image/png", "part content type");
     checkEq(j.files[0].size, 18, "file size");
     checkEq(j.files[0].onDisk, true, "file written to disk");
+    // The stored name carries 64 random bits, so uploads that start in the
+    // same millisecond never share a file.
+    check(Regex.IsMatch(j.files[0].file, "^upload_[0-9]+_[0-9a-f]{16}\\.part$"),
+          "upload file name has a random part");
 
     // The client's filename must never become the path. A traversing name is
     // reported verbatim but the bytes land under a name the server chose.
@@ -1314,6 +1401,8 @@ fn test_static_exposure() {
     // Dotfiles.
     checkEq(req1(gPort, "GET", "/pub/.env").code, 404, ".env not served");
     checkEq(req1(gPort, "GET", "/pub/.git/config").code, 404, ".git/config not served");
+    checkEq(req1(gPort, "GET", "/pub/sub/.private/key.txt").code, 404, "a dot segment deeper in the path is not served");
+    checkEq(req1(gPort, "GET", "/pub/sub/a.b.txt").body, "DOTTED_NAME_OK", "a dot inside a name is served");
     // .well-known is the standard exception - ACME and security.txt live there.
     let wk = req1(gPort, "GET", "/pub/.well-known/probe.txt");
     checkEq(wk.code, 200, ".well-known is still reachable");
@@ -1408,6 +1497,20 @@ fn test_request_object() {
     checkEq(j.xtest,   "hi",              "case-insensitive header lookup");
     checkEq(j.missing, "dflt",            "header default when absent");
     check(String.Contains(j.peer, "127.0.0.1"), "peer address recorded");
+
+    // req.headers: lowercased names, the value with its leading whitespace
+    // removed, and the last of a repeated header.
+    let hr = request(gPort, "GET /headers HTTP/1.1\r\nHost: t\r\nX-Mixed-Case:   v1 \r\n"
+        + "X-Dup: first\r\nx-dup: second\r\nX-Empty:\r\nX-Utf8: " + "åäö"
+        + "\r\nConnection: close\r\n\r\n", false);
+    let hj = Json.Parse(hr.body);
+    checkEq(hj["x-mixed-case"], "v1 ", "header value left-trimmed only");
+    checkEq(hj["x-dup"], "second", "repeated header keeps the last value");
+    checkEq(hj["x-empty"], "", "empty header value kept");
+    checkEq(hj["x-utf8"], "åäö", "non-ASCII bytes allowed in a value");
+    checkEq(hj["host"], "t", "Host present under its lowercased name");
+    check(!Object.HasKey(hj, "X-Dup"), "only the lowercased spelling is stored");
+    checkEq(Object.Count(hj), 6, "one entry per distinct header name");
     return 0;
 }
 
@@ -1454,6 +1557,65 @@ fn test_bind_address() {
 }
 
 // ---------------------------------------------------------------------------
+// The small-file cache
+// ---------------------------------------------------------------------------
+fn test_file_cache() {
+    Console.WriteLine("== file cache ==");
+
+    let dir = Path.Combine(Os.TempDir(), "flaris_httpserver_cache");
+    Os.Execute("mkdir -p '" + dir + "'");
+    let f = Path.Combine(dir, "c.txt");
+    let past:int = Time.Now() - 3600;
+
+    let on = new HttpServer({ port: 0, idleTimeoutMs: 400 });
+    on.Static("/c", dir);
+    on.Get("/file", fn(_req, res) { res.File(f); });
+    let off = new HttpServer({ port: 0, idleTimeoutMs: 400, fileCacheBytes: 0 });
+    off.Static("/c", dir);
+    let pOn  = on.ListenAsync();
+    let pOff = off.ListenAsync();
+
+    // A copy is kept once read, and dropped as soon as the stat shows another
+    // size or mtime.
+    File.WriteText(f, "one");
+    File.SetModifiedTime(f, past);
+    checkEq(req1(pOn, "GET", "/c/c.txt").body, "one", "first read");
+    File.WriteText(f, "three");
+    File.SetModifiedTime(f, past);
+    checkEq(req1(pOn, "GET", "/c/c.txt").body, "three", "a new size is a new file");
+    File.WriteText(f, "THREE");
+    File.SetModifiedTime(f, past + 1);
+    checkEq(req1(pOn, "GET", "/c/c.txt").body, "THREE", "a new mtime is a new file");
+    checkEq(req1(pOn, "GET", "/file").body, "THREE", "res.File() reads through the same cache");
+    let part = request(pOn, "GET /c/c.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=1-2\r\n"
+        + "Connection: close\r\n\r\n", false);
+    checkEq(part.code, 206, "a range of a cached file is 206");
+    checkEq(part.body, "HR", "and holds the requested bytes");
+
+    // Size and mtime are the file's identity, as for the ETag: a change that
+    // keeps both is not seen while the cache is on, and is with it off.
+    File.WriteText(f, "three");
+    File.SetModifiedTime(f, past + 1);
+    checkEq(req1(pOn, "GET", "/c/c.txt").body, "THREE", "same size and mtime: the cached copy");
+    checkEq(req1(pOff, "GET", "/c/c.txt").body, "three", "fileCacheBytes 0 reads the file every time");
+
+    // A file whose mtime has not yet passed is not kept: a rewrite within that
+    // second would leave size and mtime as they were.
+    let soon:int = Time.Now() + 60;
+    File.WriteText(f, "fresh");
+    File.SetModifiedTime(f, soon);
+    checkEq(req1(pOn, "GET", "/c/c.txt").body, "fresh", "a just-written file is served");
+    File.WriteText(f, "FRESH");
+    File.SetModifiedTime(f, soon);
+    checkEq(req1(pOn, "GET", "/c/c.txt").body, "FRESH", "and read again, not kept");
+
+    on.Stop(500);
+    off.Stop(500);
+    Os.Execute("rm -rf '" + dir + "'");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Server setup
 // ---------------------------------------------------------------------------
 
@@ -1467,6 +1629,12 @@ fn buildServer() {
         res.Json({ id: req.Param("id"), x: req.Query("x"), n: req.Query("n") });
     });
     srv.Get("/files/*",   fn(req, res) { res.Json({ rest: req.Param("*") }); });
+    srv.Get("/pick/:a/a", fn(req, res) { res.Json(req.params); });
+    srv.Get("/pick/:b/b", fn(req, res) { res.Json(req.params); });
+    srv.Get("/shadow/:x", fn(req, res) { res.Text("param " + req.Param("x")); });
+    srv.Get("/shadow/me", fn(_req, res) { res.Text("fixed"); });
+    srv.Get("/dup",       fn(_req, res) { res.Text("first"); });
+    srv.Get("/dup",       fn(_req, res) { res.Text("second"); });
 
     srv.Post("/echo",   fn(req, res) { res.Json(req.Json()); });
     srv.Post("/raw",    fn(req, res) { res.Text(req.Text()); });
@@ -1495,6 +1663,11 @@ fn buildServer() {
         iter (i from 0 to 256) { Buffer.WriteU8At(b, i, i); }
         res.Bytes(b);
     });
+    srv.Get("/bytes-typed", fn(_req, res) { res.Bytes("abc", "text/x-b"); });
+    srv.Get("/bytes-preset", fn(_req, res) {
+        res.Header("Content-Type", "text/x-a").Bytes("abc", "text/x-b");
+    });
+    srv.Get("/bytes-badtype", fn(_req, res) { res.Bytes("abc", "text/x\r\nX-Evil: 1"); });
     // Either side of the 16 KB write-coalescing threshold: the small body goes
     // out with the header block in one write, the large one takes the second
     // write path, and both must arrive byte-for-byte with an exact length.
@@ -1556,6 +1729,7 @@ fn buildServer() {
         res.Text("real");
     });
 
+    srv.Get("/headers", fn(req, res) { res.Json(req.headers); });
     srv.Get("/introspect", fn(req, res) {
         res.Json({
             method:  req.method,
@@ -1618,7 +1792,8 @@ fn buildStreamServer() {
             let f = mp.files[i];
             Array.Append(out, { name: f.name, filename: f.filename,
                                 contentType: f.contentType, size: f.size,
-                                onDisk: File.Exists(f.path) });
+                                onDisk: File.Exists(f.path),
+                                file: Path.GetFileName(f.path) });
         }
         res.Json({ ok: true, fields: mp.fields, files: out });
     });
@@ -1689,6 +1864,9 @@ fn setupStaticDir() {
     File.WriteText(Path.Combine(dir, ".env"), "SECRET_TOKEN=hunter2");
     Os.Execute("mkdir -p '" + Path.Combine(dir, ".git") + "'");
     File.WriteText(Path.Combine(dir, ".git", "config"), "GIT_SECRET");
+    Os.Execute("mkdir -p '" + Path.Combine(dir, "sub", ".private") + "'");
+    File.WriteText(Path.Combine(dir, "sub", ".private", "key.txt"), "NESTED_SECRET");
+    File.WriteText(Path.Combine(dir, "sub", "a.b.txt"), "DOTTED_NAME_OK");
     Os.Execute("mkdir -p '" + Path.Combine(dir, ".well-known") + "'");
     File.WriteText(Path.Combine(dir, ".well-known", "probe.txt"), "WELLKNOWN_OK");
     File.WriteText(Path.Combine(Os.TempDir(), "flaris_outside_root.txt"), "OUTSIDE_THE_ROOT");
@@ -1742,6 +1920,7 @@ fn async Main() {
     test_file_semantics();
     test_gzip_sidecar();
     test_static_exposure();
+    test_file_cache();
     test_request_object();
     test_status_helpers();
     test_bind_address();

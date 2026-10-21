@@ -17,9 +17,11 @@
 //   Has(key)                   - returns bool (false if expired)
 //   Delete(key)                - removes a specific key
 //   Clear()                    - removes all entries
-//   Size()                     - number of currently live entries
+//   Size()                     - number of stored entries; an expired entry counts until
+//                                Get, Has, GetOrSet or Expire() removes it
 //   Capacity()                 - maximum number of entries (as passed to Constructor)
-//   Keys()                     - array of live keys in LRU order (oldest first)
+//   Keys()                     - array of live keys in LRU order (oldest first);
+//                                expired entries are left out
 //   Stats()                    - { Hits, Misses, Evictions, Expired } counters
 //   HitRate()                  - float in [0,1]; 0.0 if no accesses yet
 //   GetOrSet(key, f)           - return cached value or call f(), store and return result
@@ -41,89 +43,81 @@
 // TTL of 0 means "never expire".
 //
 // All operations are O(1) except Keys(), Expire(), GetMany(), SetMany(), and ToString()
-// which are O(n).  The LRU doubly-linked list is embedded directly in the HashMap entries
-// (Prev/Next fields hold neighbour keys), so no separate order array is needed.
+// which are O(n).  Every entry lives in a slot of parallel arrays (key, value, deadline,
+// and the LRU list's previous/next slot), and a HashMap maps each key to its slot, so a
+// lookup, hit or miss, is one hash lookup.
 
 class Cache {
     let _cap = 0;
-    let _data = nil; 
     let _evictions = 0;
     let _expired = 0;
-    let _head = nil; 
     let _hits = 0;
+    let _index = nil;
+    let _keys = nil;
+    let _vals = nil;
+    let _exp = nil;
+    let _prev = nil;
+    let _next = nil;
+    let _free = 0;
     let _misses = 0;
     let _size = 0;
-    let _tail = nil; 
     let _ttl = 0;
     fn Constructor(capacity: int, ttl?) {
         if (capacity <= 0) throw(400, "Cache: capacity must be > 0");
         this._cap  = capacity;
-        // _ttl is stored in milliseconds; conversion to nanoseconds happens in Set/_isExpired.
+        // _ttl is stored in milliseconds; conversion to nanoseconds happens in Set.
         this._ttl  = ttl == nil ? 0 : ttl;
-        this._data = Collections.HashMap(); // key → { Value, ExpiresAt, Prev, Next }
-        this._head = nil;  // MRU key
-        this._tail = nil;  // LRU key
-        this._size = 0;
         this._hits      = 0;
         this._misses    = 0;
         this._evictions = 0;  // capacity-driven evictions
         this._expired   = 0;  // TTL-driven removals
+        this._reset();
     }
 
     // ---------- Private ----------
 
-    // Returns true when the entry has a TTL and that deadline has passed.
-    // TTL is stored in ms; Time.Ticks() is in ns, so deadline = ticks + ttl * 1_000_000.
-    fn _isExpired(entry): bool {
-        if (this._ttl == 0) return false;
-        return Time.Ticks() > entry.ExpiresAt;
+    // Slot 0 is the list head: _next[0] is the MRU slot, _prev[0] the LRU slot,
+    // and the list runs in a ring through it. Free slots chain through _next
+    // from _free (0 when there is none).
+    fn _reset() {
+        this._index = Collections.HashMap();  // key -> slot
+        this._keys  = [nil];
+        this._vals  = [nil];
+        this._exp   = Array.Create(1, Type.Int);  // deadline in Time.Ticks() ns; 0 without TTL
+        this._prev  = Array.Create(1, Type.Int);
+        this._next  = Array.Create(1, Type.Int);
+        this._free  = 0;
+        this._size  = 0;
     }
 
-    // Unlink key from the doubly-linked list. Entry stays in _data.
-    fn _detach(key) {
-        let e = this._data.Get(key);
-        let p = e.Prev;  // toward MRU head
-        let n = e.Next;  // toward LRU tail
-        if (p != nil) {
-            this._data.Get(p).Next = n;
-        } else {
-            this._head = n;
-        }
-        if (n != nil) {
-            this._data.Get(n).Prev = p;
-        } else {
-            this._tail = p;
-        }
-        e.Prev = nil;
-        e.Next = nil;
+    // Move slot s to the MRU end of the list.
+    fn static _toFront(prev: [int], next: [int], s: int) {
+        let h = next[0];
+        if (h == s) return;
+        let p = prev[s];
+        let n = next[s];
+        next[p] = n;
+        prev[n] = p;
+        next[s] = h;
+        prev[s] = 0;
+        prev[h] = s;
+        next[0] = s;
     }
 
-    // Insert key at head (MRU end). Entry must already be in _data.
-    fn _pushHead(key) {
-        let e = this._data.Get(key);
-        let h = this._head;
-        e.Next = h;
-        e.Prev = nil;
-        if (h != nil) {
-            this._data.Get(h).Prev = key;
-        }
-        this._head = key;
-        if (this._tail == nil) {
-            this._tail = key;
-        }
-    }
-
-    // Move an existing key to the MRU head.
-    fn _touch(key) {
-        if (this._head == key) return;
-        this._detach(key);
-        this._pushHead(key);
-    }
-
-    // Remove key from both list and _data. Does NOT update counters - callers do.
-    fn _remove(key) {
-        this._detach(key);
-        this._data.Delete(key);
+    // Unlink slot s, drop its key from the index and put it on the free list.
+    // The hit/miss/eviction/expiry counters are left to the callers.
+    fn _removeSlot(s: int) {
+        let prev = this._prev;
+        let next = this._next;
+        let p = prev[s];
+        let n = next[s];
+        next[p] = n;
+        prev[n] = p;
+        this._index.Delete(this._keys[s]);
+        this._keys[s] = nil;
+        this._vals[s] = nil;
+        next[s] = this._free;
+        this._free = s;
         this._size = this._size - 1;
     }
 
@@ -133,49 +127,68 @@ class Cache {
         // Deadline in nanoseconds: ttl (ms) * 1_000_000 converts to ns.
         let expiresAt: int = this._ttl == 0 ? 0 : Time.Ticks() + this._ttl * 1000000;
 
-        if (this._data.Has(key)) {
-            let e = this._data.Get(key);
-            e.Value     = value;
-            e.ExpiresAt = expiresAt;
-            this._touch(key);
+        let index = this._index;
+        var s = index.Get(key);
+        if (s != nil) {
+            this._vals[s] = value;
+            this._exp[s]  = expiresAt;
+            Cache._toFront(this._prev, this._next, s);
             return this;
         }
 
         while (this._size >= this._cap) {
-            let lru = this._tail;
-            this._detach(lru);
-            this._data.Delete(lru);
-            this._size      = this._size - 1;
+            this._removeSlot(this._prev[0]);
             this._evictions = this._evictions + 1;
         }
 
-        this._data.Set(key, { Value: value, ExpiresAt: expiresAt, Prev: nil, Next: nil });
+        let prev = this._prev;
+        let next = this._next;
+        s = this._free;
+        if (s != 0) {
+            this._free = next[s];
+            this._keys[s] = key;
+            this._vals[s] = value;
+            this._exp[s]  = expiresAt;
+        } else {
+            s = len(next);
+            Array.Append(this._keys, key);
+            Array.Append(this._vals, value);
+            Array.Append(this._exp, expiresAt);
+            Array.Append(prev, 0);
+            Array.Append(next, 0);
+        }
+        let h = next[0];
+        next[s] = h;
+        prev[s] = 0;
+        prev[h] = s;
+        next[0] = s;
+        index.Set(key, s);
         this._size = this._size + 1;
-        this._pushHead(key);
         return this;
     }
 
     fn Get(key) {
-        if (!this._data.Has(key)) {
+        let s = this._index.Get(key);
+        if (s == nil) {
             this._misses = this._misses + 1;
             return nil;
         }
-        let entry = this._data.Get(key);
-        if (this._isExpired(entry)) {
-            this._remove(key);
+        if (this._ttl != 0 && Time.Ticks() > this._exp[s]) {
+            this._removeSlot(s);
             this._expired = this._expired + 1;
             this._misses  = this._misses + 1;
             return nil;
         }
         this._hits = this._hits + 1;
-        this._touch(key);
-        return entry.Value;
+        Cache._toFront(this._prev, this._next, s);
+        return this._vals[s];
     }
 
     fn Has(key): bool {
-        if (!this._data.Has(key)) return false;
-        if (this._isExpired(this._data.Get(key))) {
-            this._remove(key);
+        let s = this._index.Get(key);
+        if (s == nil) return false;
+        if (this._ttl != 0 && Time.Ticks() > this._exp[s]) {
+            this._removeSlot(s);
             this._expired = this._expired + 1;
             return false;
         }
@@ -183,16 +196,13 @@ class Cache {
     }
 
     fn Delete(key): instance {
-        if (!this._data.Has(key)) return this;
-        this._remove(key);
+        let s = this._index.Get(key);
+        if (s != nil) this._removeSlot(s);
         return this;
     }
 
     fn Clear(): instance {
-        this._data = Collections.HashMap();
-        this._head = nil;
-        this._tail = nil;
-        this._size = 0;
+        this._reset();
         return this;
     }
 
@@ -205,13 +215,19 @@ class Cache {
         return this._cap;
     }
 
+    // Walks the list from the LRU end (oldest first); expired entries are
+    // skipped, not removed.
     fn Keys(): array {
-        // Walk from LRU tail → MRU head via Prev pointers (oldest first).
         let result: array = [];
-        let k = this._tail;
-        while (k != nil) {
-            Array.Append(result, k);
-            k = this._data.Get(k).Prev;
+        let ttl  = this._ttl != 0;
+        let now  = ttl ? Time.Ticks() : 0;
+        let keys = this._keys;
+        let exp  = this._exp;
+        let prev = this._prev;
+        var s = prev[0];
+        while (s != 0) {
+            if (!ttl || now <= exp[s]) { Array.Append(result, keys[s]); }
+            s = prev[s];
         }
         return result;
     }
@@ -236,15 +252,15 @@ class Cache {
     // Return the cached value for key if present and not expired.
     // Otherwise call f(), store the result under key, and return it.
     fn GetOrSet(key, f: fn) {
-        if (this._data.Has(key)) {
-            let entry = this._data.Get(key);
-            if (!this._isExpired(entry)) {
+        let s = this._index.Get(key);
+        if (s != nil) {
+            if (this._ttl == 0 || Time.Ticks() <= this._exp[s]) {
                 this._hits = this._hits + 1;
-                this._touch(key);
-                return entry.Value;
+                Cache._toFront(this._prev, this._next, s);
+                return this._vals[s];
             }
             // Expired - remove and fall through to recompute.
-            this._remove(key);
+            this._removeSlot(s);
             this._expired = this._expired + 1;
         }
         let value = f();
@@ -253,15 +269,21 @@ class Cache {
     }
 
     // Sweep all keys, remove expired ones.  Returns this for chaining.
-    // Collects keys first so we don't mutate the map during iteration.
+    // Collects the expired slots first so the list is not changed while walked.
     fn Expire(): instance {
-        let all = this.Keys();
-        iter (i from 0 to len(all)) {
-            let k = all[i];
-            if (this._data.Has(k) && this._isExpired(this._data.Get(k))) {
-                this._remove(k);
-                this._expired = this._expired + 1;
-            }
+        if (this._ttl == 0) return this;
+        let now  = Time.Ticks();
+        let dead = Array.Create(0, Type.Int);
+        let exp  = this._exp;
+        let prev = this._prev;
+        var s = prev[0];
+        while (s != 0) {
+            if (now > exp[s]) { Array.Append(dead, s); }
+            s = prev[s];
+        }
+        iter (i from 0 to len(dead)) {
+            this._removeSlot(dead[i]);
+            this._expired = this._expired + 1;
         }
         return this;
     }
@@ -296,7 +318,7 @@ class Cache {
         let keys = this.Keys();                  // oldest first
         iter (i from 0 to len(keys)) {
             let k = keys[i];
-            Array.Append(entries, { k: k, v: this._data.Get(k).Value });
+            Array.Append(entries, { k: k, v: this._vals[this._index.Get(k)] });
         }
         let payload = { capacity: this._cap, ttl: this._ttl, entries: entries };
         return File.WriteText(path, Json.Stringify(payload)) == true;

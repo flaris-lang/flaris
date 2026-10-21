@@ -9,14 +9,21 @@
 //   import { Audio } from library("Audio", "1.0");
 //   let a = new Audio();
 //
-//   let wav = a.ReadWav("speech.wav");       // { signal:array, sampleRate:int }
+//   let wav = a.ReadWav("speech.wav");       // { signal, sampleRate, channels, bits }
 //   let env = a.ADSR(len(wav.signal), wav.sampleRate, 0.01, 0.1, 0.7, 0.2);
 //   let out = a.ApplyEnvelope(wav.signal, env);
 //   a.WriteWav("out.wav", out, wav.sampleRate);
 //
-// WAV I/O (16-bit PCM mono):
-//   ReadWav(path)                             →  { signal, sampleRate } or nil
-//   WriteWav(path, signal, sampleRate)        →  bool
+// WAV I/O:
+//   ReadWav(path)                             →  { signal: [float], sampleRate, channels, bits } or nil
+//     - PCM 8/16/24/32-bit and IEEE float 32/64-bit (also as WAVE_FORMAT_EXTENSIBLE),
+//       any channel count; with several channels `signal` holds the frames
+//       interleaved (Deinterleave splits a stereo one)
+//     - the "fmt " and "data" chunks are found by walking the RIFF chunks, so
+//       LIST, fact and other chunks in front of them are skipped
+//     - nil for a missing file, a file that is not RIFF/WAVE, a missing chunk
+//       or another encoding (ADPCM, A-law, mu-law, ...)
+//   WriteWav(path, signal, sampleRate)        →  bool  - 16-bit PCM mono
 //
 // A `[float]` result is a flat float array: storing an int into it stores a float,
 // storing a non-number raises. ApplyEnvelope/FadeIn/FadeOut keep the layout of `signal`.
@@ -181,14 +188,53 @@ class Audio : Signals {
         return 0;
     }
 
+    // n 16- or 32-bit PCM samples into out, from their unsigned words in w.
+    fn _aud_pcm_kernel(w: [int], out: [float], n: int, bits: int): int {
+        if (bits == 16) {
+            iter(i from 0 to n) { out[i] = (i16)w[i] / 32768.0; }
+        } else {
+            iter(i from 0 to n) { out[i] = (i32)w[i] / 2147483648.0; }
+        }
+        return 0;
+    }
+
+    // n 8- or 24-bit PCM samples from the bytes buf[at..] into out.
+    fn _aud_pcm_bytes_kernel(buf: block, at: int, out: [float], n: int, bits: int): int {
+        if (bits == 8) {
+            iter(i from 0 to n) { out[i] = (buf[at + i] - 128) / 128.0; }
+        } else {
+            iter(i from 0 to n) {
+                let q = at + i * 3;
+                out[i] = (buf[q] | (buf[q + 1] << 8) | ((i8)buf[q + 2] << 16)) / 8388608.0;
+            }
+        }
+        return 0;
+    }
+
+    // n IEEE float samples of `bytes` bytes (4 or 8) from buf[at..] into out.
+    fn _aud_float_kernel(buf: block, at: int, out: [float], n: int, bytes: int): int {
+        if (bytes == 4) {
+            iter(i from 0 to n) { out[i] = Buffer.ReadFloat32At(buf, at + i * 4); }
+        } else {
+            iter(i from 0 to n) { out[i] = Buffer.ReadFloat64At(buf, at + i * 8); }
+        }
+        return 0;
+    }
+
     fn _aud_fadeout_kernel(out: [float], start: int, n: int): int {
         iter(i from 0 to n) { out[start + i] = out[start + i] * (1.0 - (i + 1) / float(n)); }
         return 0;
     }
 
     // ============================================================
-    //  WAV I/O  (16-bit PCM mono)
+    //  WAV I/O
     // ============================================================
+
+    // RIFF chunk ids read as little-endian u32
+    const _WAV_RIFF = 0x46464952;   // "RIFF"
+    const _WAV_WAVE = 0x45564157;   // "WAVE"
+    const _WAV_FMT  = 0x20746D66;   // "fmt "
+    const _WAV_DATA = 0x61746164;   // "data"
 
     fn WriteWav(path:string, signal:array, sampleRate:int) : bool {
         let n         = len(signal);
@@ -221,17 +267,49 @@ class Audio : Signals {
     fn ReadWav(path:string) {
         let buf = File.ReadAllBytes(path);
         if (buf == nil) return nil;
+        let size = len(buf);
+        if (size < 12 || Buffer.ReadU32At(buf, 0) != _WAV_RIFF || Buffer.ReadU32At(buf, 8) != _WAV_WAVE) return nil;
 
-        let sr     = Buffer.ReadU32At(buf, 24);
-        let nBytes = Buffer.ReadU32At(buf, 40);
-        let n      = nBytes / 2;
-        let out    = Array.Create(n);
-
-        iter(i from 0 to n) {
-            out[i] = Buffer.ReadI16At(buf, 44 + i * 2) / 32768.0;
+        var fmt = -1;  var fmtLen  = 0;
+        var data = -1; var dataLen = 0;
+        var p = 12;
+        while (p + 8 <= size && (fmt < 0 || data < 0)) {
+            let id = Buffer.ReadU32At(buf, p);
+            let cl = Buffer.ReadU32At(buf, p + 4);
+            if (id == _WAV_FMT)       { fmt  = p + 8; fmtLen  = cl; }
+            else if (id == _WAV_DATA) { data = p + 8; dataLen = cl; }
+            p = p + 8 + cl + (cl & 1);          // chunks are padded to an even size
         }
+        if (fmt < 0 || data < 0 || fmtLen < 16 || fmt + 16 > size) return nil;
 
-        return { signal: out, sampleRate: sr };
+        var format   = Buffer.ReadU16At(buf, fmt);
+        let channels = Buffer.ReadU16At(buf, fmt + 2);
+        let sr       = Buffer.ReadU32At(buf, fmt + 4);
+        let bits     = Buffer.ReadU16At(buf, fmt + 14);
+        // WAVE_FORMAT_EXTENSIBLE: the real format leads the sub-format GUID.
+        if (format == 0xFFFE && fmtLen >= 26 && fmt + 26 <= size) { format = Buffer.ReadU16At(buf, fmt + 24); }
+        var kind = 0;
+        if (format == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) { kind = bits; }
+        else if (format == 3 && (bits == 32 || bits == 64))                       { kind = -bits; }
+        if (kind == 0 || channels < 1) return nil;
+
+        // A writer that streams may leave the data size too large or unset.
+        if (data + dataLen > size) { dataLen = size - data; }
+        let frameBytes = (bits / 8) * channels;
+        let n = (dataLen / frameBytes) * channels;
+        let out: [float] = Array.Create(n, Type.Float);
+        if (kind < 0) {
+            _aud_float_kernel(buf, data, out, n, -kind / 8);
+        } else if (kind == 8 || kind == 24) {
+            _aud_pcm_bytes_kernel(buf, data, out, n, kind);
+        } else {
+            // The samples as one block of 2- or 4-byte elements, read in bulk:
+            // the loop over them then calls nothing.
+            let words = Buffer.Create(n, kind / 8);
+            Buffer.Copy(buf, data, words, 0, n * (kind / 8));
+            _aud_pcm_kernel(Buffer.ToArray(words), out, n, kind);
+        }
+        return { signal: out, sampleRate: sr, channels: channels, bits: bits };
     }
 
     // ============================================================
@@ -464,15 +542,15 @@ class Audio : Signals {
     }
 
     fn _setI32(bytes:array, offset:int, value:int) {
-        bytes[offset]     =  value        & 0xFF;
-        bytes[offset + 1] = (value >>  8) & 0xFF;
-        bytes[offset + 2] = (value >> 16) & 0xFF;
-        bytes[offset + 3] = (value >> 24) & 0xFF;
+        bytes[offset]     = (u8)value;
+        bytes[offset + 1] = (u8)(value >>  8);
+        bytes[offset + 2] = (u8)(value >> 16);
+        bytes[offset + 3] = (u8)(value >> 24);
     }
 
     fn _setI16(bytes:array, offset:int, value:int) {
-        bytes[offset]     =  value       & 0xFF;
-        bytes[offset + 1] = (value >> 8) & 0xFF;
+        bytes[offset]     = (u8)value;
+        bytes[offset + 1] = (u8)(value >> 8);
     }
 
     fn _getI32(bytes:array, offset:int) : int {
@@ -480,12 +558,6 @@ class Audio : Signals {
              | (bytes[offset + 1] <<  8)
              | (bytes[offset + 2] << 16)
              | (bytes[offset + 3] << 24);
-    }
-
-    fn _getI16Signed(bytes:array, offset:int) : int {
-        let v = bytes[offset] | (bytes[offset + 1] << 8);
-        if (v >= 32768) v = v - 65536;
-        return v;
     }
 
     // ============================================================

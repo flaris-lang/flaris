@@ -2,11 +2,15 @@
 // Version: 1.0
 //
 // Keys are kept in ascending sorted order at all times.
-// Backed by a sorted array of keys plus a HashMap of values. Get / Has are one
-// hash lookup; ordered queries (Rank, Floor, Range, ...) binary-search the key
-// array with Array.BinarySearch, so they are O(log n) (+ k for the entries a
-// range returns). Inserting or deleting a new key is a native O(log n) search
-// plus a memmove of the keys after it; updating an existing key is O(1).
+// Backed by a HashMap of values plus the keys in sorted chunks: a list of
+// sorted arrays of at most 1024 keys, each chunk's keys below the next one's.
+// Get / Has are one hash lookup. Inserting or deleting a new key binary-searches
+// the chunks' last keys, then inserts into or removes from one chunk, so it
+// moves at most 1024 keys; updating an existing key is O(1). Ordered queries
+// are O(log n) (+ k for the entries a range returns); the ones that work with
+// positions (Rank, Select, Range, CountRange, Head/TailEntries, ...) first
+// recount where each chunk starts, O(n / 256), when keys were inserted or
+// deleted since the last such query.
 //
 // One key type per instance: int/bool/char, float, or string. Keys of
 // different types cannot be mixed in the same map. Within the int/bool/char
@@ -66,12 +70,24 @@
 //   EachKey(fn(key))                 - returns this
 //   EachValue(fn(value))             - returns this
 
+// A chunk that grows past _TM_CHUNK_MAX keys splits in two; one that shrinks
+// below _TM_CHUNK_MIN joins a neighbour.
+const _TM_CHUNK_MAX = 1024;
+const _TM_CHUNK_MIN = 256;
+
 class TreeMap {
     let _keyType: int = 0;      // key group of the keys held: 0 none yet, see _groupOf
-    let _keys: array = nil;     // ascending, in the default order Array.BinarySearch uses
+    let _chunks: array = nil;   // sorted key arrays, none empty, in the default order Array.BinarySearch uses
+    let _maxes: array = nil;    // _maxes[i] = last key of _chunks[i]
+    let _offs = nil;            // [int] _offs[i] = number of keys before _chunks[i]; valid while _offsOk
+    let _offsOk: bool = false;
+    let _size: int = 0;
     let _map = nil;             // key -> value
     fn Constructor() {
-        this._keys    = [];
+        this._chunks  = [];
+        this._maxes   = [];
+        this._offsOk  = false;
+        this._size    = 0;
         this._map     = Collections.HashMap();
         this._keyType = 0;
     }
@@ -88,7 +104,8 @@ class TreeMap {
     }
 
     // Raise unless `key` may live in this map. Only an insert passes `adopt`,
-    // so a query on an empty map never sets the key group.
+    // so a query on an empty map never sets the key group. Hot callers skip
+    // the call when the key's group already matches.
     fn _checkKeyType(key, adopt:bool) {
         let g:int = TreeMap._groupOf(key);
         if (g < 0) {
@@ -103,36 +120,122 @@ class TreeMap {
         }
     }
 
+    // ---------- Chunks ----------
+
+    // The chunk that holds key, or that an insert of key goes to: the first
+    // chunk whose last key is >= key, else the last chunk. The hot paths
+    // repeat this inline (as `ci`) to save the call.
+    fn _chunkFor(key): int {
+        let maxes = this._maxes;
+        var ci:int = len(maxes) - 1;
+        if (ci > 0) {
+            let i:int = Array.BinarySearch(maxes, key);
+            let at:int = (i >= 0) ? i : 0 - i - 1;
+            if (at < ci) ci = at;
+        }
+        return ci;
+    }
+
+    fn _split(ci:int) {
+        let chunks = this._chunks;
+        let chunk = chunks[ci];
+        let half = len(chunk) / 2;
+        let right = Array.Slice(chunk, half);
+        chunks[ci] = Array.Slice(chunk, 0, half);
+        Array.InsertAt(chunks, ci + 1, right);
+        this._maxes[ci] = chunk[half - 1];
+        Array.InsertAt(this._maxes, ci + 1, right[len(right) - 1]);
+    }
+
+    // Join chunks ci and ci + 1, splitting the result again when too large.
+    fn _join(ci:int) {
+        let chunks = this._chunks;
+        let joined = Array.Concat(chunks[ci], chunks[ci + 1]);
+        chunks[ci] = joined;
+        Array.RemoveAt(chunks, ci + 1);
+        this._maxes[ci] = this._maxes[ci + 1];
+        Array.RemoveAt(this._maxes, ci + 1);
+        if (len(joined) > _TM_CHUNK_MAX) this._split(ci);
+    }
+
+    fn _offsets() {
+        if (!this._offsOk) {
+            let chunks = this._chunks;
+            let n = len(chunks);
+            let offs = Array.Create(n, Type.Int);
+            var at = 0;
+            iter (i from 0 to n) {
+                offs[i] = at;
+                at += len(chunks[i]);
+            }
+            this._offs   = offs;
+            this._offsOk = true;
+        }
+        return this._offs;
+    }
+
     // Index of the first key >= key (inclusive) or > key (exclusive).
     fn _lowerIndex(key, inclusive:bool): int {
-        let idx:int = Array.BinarySearch(this._keys, key);
-        if (idx < 0) return 0 - idx - 1;
-        return inclusive ? idx : idx + 1;
+        let chunks = this._chunks;
+        let nc = len(chunks);
+        if (nc == 0) return 0;
+        var ci:int  = 0;
+        var off:int = 0;
+        if (nc > 1) {
+            ci = nc - 1;
+            let r:int = Array.BinarySearch(this._maxes, key);
+            let at:int = (r >= 0) ? r : 0 - r - 1;
+            if (at < ci) ci = at;
+            off = (this._offsOk ? this._offs : this._offsets())[ci];
+        }
+        let i:int = Array.BinarySearch(chunks[ci], key);
+        if (i < 0) return off - i - 1;
+        return inclusive ? off + i : off + i + 1;
     }
 
     // Index just past the last key <= key (inclusive) or < key (exclusive).
     fn _upperIndex(key, inclusive:bool): int {
-        let idx:int = Array.BinarySearch(this._keys, key);
-        if (idx < 0) return 0 - idx - 1;
-        return inclusive ? idx + 1 : idx;
+        return this._lowerIndex(key, !inclusive);
+    }
+
+    // The value is stored after the literal is built: a literal holding a
+    // large array or object walks all of it.
+    fn _entry(k) {
+        let e = { Key: k, Value: nil };
+        e.Value = this._map.Get(k);
+        return e;
     }
 
     fn _entryAt(index:int) {
-        if (index < 0 || index >= len(this._keys)) return nil;
-        let k = this._keys[index];
-        return { Key: k, Value: this._map.Get(k) };
+        if (index < 0 || index >= this._size) return nil;
+        return this._entry(this.Select(index));
     }
 
-    // Entries for key indexes [from, to).
+    // Entries for key positions [from, to).
     fn _entries(from:int, to:int): array {
         let result = [];
-        let keys = this._keys;
+        if (from >= to) return result;
+        Array.Reserve(result, to - from);
+        let chunks = this._chunks;
         let map  = this._map;
-        var i:int = from;
-        while (i < to) {
-            let k = keys[i];
-            Array.Append(result, { Key: k, Value: map.Get(k) });
-            i += 1;
+        let offs = this._offsOk ? this._offs : this._offsets();
+        let r:int = Array.BinarySearch(offs, from);
+        var ci:int = (r >= 0) ? r : 0 - r - 2;
+        var i:int = from - offs[ci];
+        var left:int = to - from;
+        while (left > 0) {
+            let chunk = chunks[ci];
+            var end:int = len(chunk);
+            if (end - i > left) end = i + left;
+            iter (j from i to end) {
+                let k = chunk[j];
+                let e = { Key: k, Value: nil };
+                e.Value = map.Get(k);
+                Array.Append(result, e);
+            }
+            left -= end - i;
+            ci += 1;
+            i = 0;
         }
         return result;
     }
@@ -140,17 +243,39 @@ class TreeMap {
     // ---------- Core API ----------
 
     fn Set(key, value): instance {
-        this._checkKeyType(key, true);
-        if (!this._map.Has(key)) { Array.SortedInsert(this._keys, key); }
-        this._map.Set(key, value);
+        if (TreeMap._groupOf(key) != this._keyType) this._checkKeyType(key, true);
+        let map = this._map;
+        if (!map.Has(key)) {
+            let chunks = this._chunks;
+            let maxes  = this._maxes;
+            var ci:int = len(maxes) - 1;
+            if (ci < 0) {
+                let first = [];
+                Array.Append(first, key);
+                Array.Append(chunks, first);
+                Array.Append(maxes, key);
+            } else {
+                if (ci > 0) {
+                    let i:int = Array.BinarySearch(maxes, key);
+                    let at:int = (i >= 0) ? i : 0 - i - 1;
+                    if (at < ci) ci = at;
+                }
+                let chunk = chunks[ci];
+                let n = len(chunk);
+                if (Array.SortedInsert(chunk, key) == n) maxes[ci] = key;
+                if (n >= _TM_CHUNK_MAX) this._split(ci);
+            }
+            this._size += 1;
+            this._offsOk = false;
+        }
+        map.Set(key, value);
         return this;
     }
 
     fn PutIfAbsent(key, value): bool {
         this._checkKeyType(key, true);
         if (this._map.Has(key)) return false;
-        Array.SortedInsert(this._keys, key);
-        this._map.Set(key, value);
+        this.Set(key, value);
         return true;
     }
 
@@ -170,11 +295,31 @@ class TreeMap {
     fn Has(key): bool { return this._map.Has(key); }
 
     fn Delete(key): bool {
-        if (!this._map.Has(key)) return false;
-        Array.RemoveAt(this._keys, Array.BinarySearch(this._keys, key));
-        this._map.Delete(key);
+        let map = this._map;
+        if (!map.Has(key)) return false;
+        let chunks = this._chunks;
+        let maxes  = this._maxes;
+        var ci:int = len(maxes) - 1;
+        if (ci > 0) {
+            let i:int = Array.BinarySearch(maxes, key);
+            let at:int = (i >= 0) ? i : 0 - i - 1;
+            if (at < ci) ci = at;
+        }
+        let chunk = chunks[ci];
+        Array.RemoveAt(chunk, Array.BinarySearch(chunk, key));
+        let n = len(chunk);
+        if (n == 0) {
+            Array.RemoveAt(chunks, ci);
+            Array.RemoveAt(maxes, ci);
+        } else {
+            maxes[ci] = chunk[n - 1];
+            if (n < _TM_CHUNK_MIN && len(chunks) > 1) this._join((ci > 0) ? ci - 1 : ci);
+        }
+        map.Delete(key);
+        this._size -= 1;
+        this._offsOk = false;
 
-        if (len(this._keys) == 0) {
+        if (this._size == 0) {
             this._keyType = 0;
         }
         return true;
@@ -193,7 +338,10 @@ class TreeMap {
     }
 
     fn Clear() {
-        this._keys    = [];
+        this._chunks  = [];
+        this._maxes   = [];
+        this._offsOk  = false;
+        this._size    = 0;
         this._map     = Collections.HashMap();
         this._keyType = 0;
     }
@@ -202,29 +350,34 @@ class TreeMap {
     fn Clone(): instance {
         let m = new TreeMap();
         m._keyType = this._keyType;
-        m._keys    = Array.Clone(this._keys);
+        m._size    = this._size;
+        m._maxes   = Array.Clone(this._maxes);
+        let chunks = m._chunks;
         let src = this._map;
         let dst = m._map;
-        foreach (k in this._keys) {
-            dst.Set(k, src.Get(k));
+        foreach (chunk in this._chunks) {
+            Array.Append(chunks, Array.Clone(chunk));
+            foreach (k in chunk) {
+                dst.Set(k, src.Get(k));
+            }
         }
         return m;
     }
 
-    fn Size(): int      { return len(this._keys); }
-    fn IsEmpty(): bool  { return len(this._keys) == 0; }
+    fn Size(): int      { return this._size; }
+    fn IsEmpty(): bool  { return this._size == 0; }
 
     // ---------- Ordered basics ----------
 
     fn MinKey() {
-        if (len(this._keys) == 0) return nil;
-        return this._keys[0];
+        if (this._size == 0) return nil;
+        return this._chunks[0][0];
     }
 
     fn MaxKey() {
-        let n = len(this._keys);
+        let n = len(this._maxes);
         if (n == 0) return nil;
-        return this._keys[n - 1];
+        return this._maxes[n - 1];
     }
 
     fn FirstKey() { return this.MinKey(); }
@@ -235,26 +388,32 @@ class TreeMap {
     }
 
     fn MaxEntry() {
-        return this._entryAt(len(this._keys) - 1);
+        return this._entryAt(this._size - 1);
     }
 
     fn FirstEntry() { return this.MinEntry(); }
     fn LastEntry()  { return this.MaxEntry(); }
 
-    fn Keys(): array { return Array.Clone(this._keys); }
+    fn Keys(): array {
+        let chunks = this._chunks;
+        return (len(chunks) == 1) ? Array.Clone(chunks[0]) : Array.Flatten(chunks);
+    }
 
     fn KeySet(): array { return this.Keys(); }
 
     fn Values(): array {
         let result = [];
+        Array.Reserve(result, this._size);
         let map = this._map;
-        foreach (k in this._keys) {
-            Array.Append(result, map.Get(k));
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                Array.Append(result, map.Get(k));
+            }
         }
         return result;
     }
 
-    fn Entries(): array { return this._entries(0, len(this._keys)); }
+    fn Entries(): array { return this._entries(0, this._size); }
 
     fn ReverseEntries(): array {
         let result = this.Entries();
@@ -280,7 +439,7 @@ class TreeMap {
 
     fn HeadEntries(toKey, inclusive?:bool): array {
         if (inclusive == nil) inclusive = true;
-        if (len(this._keys) == 0) return [];
+        if (this._size == 0) return [];
 
         this._checkKeyType(toKey, false);
         return this._entries(0, this._upperIndex(toKey, inclusive));
@@ -288,29 +447,35 @@ class TreeMap {
 
     fn TailEntries(fromKey, inclusive?:bool): array {
         if (inclusive == nil) inclusive = true;
-        if (len(this._keys) == 0) return [];
+        if (this._size == 0) return [];
 
         this._checkKeyType(fromKey, false);
-        return this._entries(this._lowerIndex(fromKey, inclusive), len(this._keys));
+        return this._entries(this._lowerIndex(fromKey, inclusive), this._size);
     }
 
     fn ForEach(fnIter:fn): instance {
-        foreach (k in this._keys) {
-            fnIter(k, this._map.Get(k));
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                fnIter(k, this._map.Get(k));
+            }
         }
         return this;
     }
 
     fn EachKey(fnIter:fn): instance {
-        foreach (k in this._keys) {
-            fnIter(k);
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                fnIter(k);
+            }
         }
         return this;
     }
 
     fn EachValue(fnIter:fn): instance {
-        foreach (k in this._keys) {
-            fnIter(this._map.Get(k));
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                fnIter(this._map.Get(k));
+            }
         }
         return this;
     }
@@ -319,9 +484,15 @@ class TreeMap {
 
     fn Rank(key): int { return this._lowerIndex(key, true); }
 
+    // The chunk holding the key at a rank is the last one starting at or before it.
     fn Select(rank:int) {
-        if (rank < 0 || rank >= len(this._keys)) return nil;
-        return this._keys[rank];
+        if (rank < 0 || rank >= this._size) return nil;
+        let chunks = this._chunks;
+        if (len(chunks) == 1) return chunks[0][rank];
+        let offs = this._offsOk ? this._offs : this._offsets();
+        let r:int = Array.BinarySearch(offs, rank);
+        let ci:int = (r >= 0) ? r : 0 - r - 2;
+        return chunks[ci][rank - offs[ci]];
     }
 
     fn SelectEntry(rank:int) {
@@ -331,35 +502,47 @@ class TreeMap {
     // ---------- Ordered neighbor helpers ----------
 
     fn FloorKey(key) {
-        if (len(this._keys) == 0) return nil;
-        this._checkKeyType(key, false);
-        let i:int = this._upperIndex(key, true);
-        if (i == 0) return nil;
-        return this._keys[i - 1];
+        if (this._size == 0) return nil;
+        if (TreeMap._groupOf(key) != this._keyType) this._checkKeyType(key, false);
+        let ci = this._chunkFor(key);
+        let chunk = this._chunks[ci];
+        let i:int = Array.BinarySearch(chunk, key);
+        if (i >= 0) return chunk[i];
+        let at:int = 0 - i - 1;
+        if (at > 0) return chunk[at - 1];
+        return (ci > 0) ? this._maxes[ci - 1] : nil;
     }
 
     fn CeilKey(key) {
-        if (len(this._keys) == 0) return nil;
-        this._checkKeyType(key, false);
-        let i:int = this._lowerIndex(key, true);
-        if (i >= len(this._keys)) return nil;
-        return this._keys[i];
+        if (this._size == 0) return nil;
+        if (TreeMap._groupOf(key) != this._keyType) this._checkKeyType(key, false);
+        let chunk = this._chunks[this._chunkFor(key)];
+        let i:int = Array.BinarySearch(chunk, key);
+        if (i >= 0) return chunk[i];
+        let at:int = 0 - i - 1;
+        return (at < len(chunk)) ? chunk[at] : nil;
     }
 
     fn PrevKey(key) {
-        if (len(this._keys) == 0) return nil;
-        this._checkKeyType(key, false);
-        let i:int = this._lowerIndex(key, true);
-        if (i == 0) return nil;
-        return this._keys[i - 1];
+        if (this._size == 0) return nil;
+        if (TreeMap._groupOf(key) != this._keyType) this._checkKeyType(key, false);
+        let ci = this._chunkFor(key);
+        let chunk = this._chunks[ci];
+        let i:int = Array.BinarySearch(chunk, key);
+        let at:int = (i >= 0) ? i : 0 - i - 1;
+        if (at > 0) return chunk[at - 1];
+        return (ci > 0) ? this._maxes[ci - 1] : nil;
     }
 
     fn NextKey(key) {
-        if (len(this._keys) == 0) return nil;
-        this._checkKeyType(key, false);
-        let i:int = this._upperIndex(key, true);
-        if (i >= len(this._keys)) return nil;
-        return this._keys[i];
+        if (this._size == 0) return nil;
+        if (TreeMap._groupOf(key) != this._keyType) this._checkKeyType(key, false);
+        let ci = this._chunkFor(key);
+        let chunk = this._chunks[ci];
+        let i:int = Array.BinarySearch(chunk, key);
+        let at:int = (i >= 0) ? i + 1 : 0 - i - 1;
+        if (at < len(chunk)) return chunk[at];
+        return (ci + 1 < len(this._chunks)) ? this._chunks[ci + 1][0] : nil;
     }
 
     fn LowerKey(key)  { return this.PrevKey(key); }
@@ -368,36 +551,39 @@ class TreeMap {
     fn PopMin() {
         let k = this.MinKey();
         if (k == nil) return nil;
-        let v = this._map.Get(k);
+        let e = this._entry(k);
         this.Delete(k);
-        return { Key: k, Value: v };
+        return e;
     }
 
     fn PopMax() {
         let k = this.MaxKey();
         if (k == nil) return nil;
-        let v = this._map.Get(k);
+        let e = this._entry(k);
         this.Delete(k);
-        return { Key: k, Value: v };
+        return e;
     }
 
     // ---------- Search / utility ----------
 
     fn CountWhere(fnPred:fn): int {
         let count = 0;
-        foreach (k in this._keys) {
-            if (fnPred(k, this._map.Get(k))) {
-                count = count + 1;
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                if (fnPred(k, this._map.Get(k))) {
+                    count = count + 1;
+                }
             }
         }
         return count;
     }
 
     fn Find(fnPred:fn) {
-        foreach (k in this._keys) {
-            let v = this._map.Get(k);
-            if (fnPred(k, v)) {
-                return { Key: k, Value: v };
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                if (fnPred(k, this._map.Get(k))) {
+                    return this._entry(k);
+                }
             }
         }
         return nil;
@@ -407,22 +593,25 @@ class TreeMap {
         if (other == nil) return false;
         if (this.Size() != other.Size()) return false;
 
-        let n = len(this._keys);
-        iter (i from 0 to n) {
-            let k = this._keys[i];
-            if (other.Has(k) == false) return false;
-            if (other.Get(k) != this._map.Get(k)) return false;
+        let map = this._map;
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                if (other.Has(k) == false) return false;
+                if (other.Get(k) != map.Get(k)) return false;
+            }
         }
         return true;
     }
 
     fn ToString(): string {
         let s = "{";
-        let n = len(this._keys);
-        iter (i from 0 to n) {
-            let k = this._keys[i];
-            if (i > 0) s = s + ", ";
-            s = s + str(k) + ": " + str(this._map.Get(k));
+        var first = true;
+        foreach (chunk in this._chunks) {
+            foreach (k in chunk) {
+                if (!first) s = s + ", ";
+                first = false;
+                s = s + str(k) + ": " + str(this._map.Get(k));
+            }
         }
         s = s + "}";
         return s;

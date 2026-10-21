@@ -3,12 +3,12 @@
 //
 // Implements QR versions 1–10 in byte mode. Version 10 is the upper limit
 // of this implementation (full QR goes to v40 / ~3 KB, but that requires
-// significantly more code). Practical limits per EC level at version 10:
+// significantly more code). Byte capacity per EC level at version 10:
 //
-//   QRCode.QR_M (default, 15% recovery):  ~212 bytes
-//   QRCode.QR_L (7%  recovery, most data): ~270 bytes
-//   QRCode.QR_Q (25% recovery):            ~150 bytes
-//   QRCode.QR_H (30% recovery, fewest data): ~118 bytes
+//   QRCode.QR_M (default, 15% recovery):    213 bytes
+//   QRCode.QR_L (7%  recovery, most data):  271 bytes
+//   QRCode.QR_Q (25% recovery):             151 bytes
+//   QRCode.QR_H (30% recovery, fewest data): 119 bytes
 //
 // If the input exceeds the capacity for the chosen EC level, ToPixels/ToLines/ToSVG
 // return an empty result. Use a lower EC level or shorter text to fit.
@@ -111,7 +111,7 @@ fn _ensureGf() {
         _GF_EXP[i + 255] = x;
         _GF_LOG[x]       = i;
         x = x * 2;
-        if (x >= 256) x = (x ^ 0x11D) & 0xFF;
+        if (x >= 256) x = (u8)(x ^ 0x11D);
     }
     _GF_EXP[255] = 1;  _GF_EXP[510] = 1;  _GF_LOG[1] = 0;
 }
@@ -152,17 +152,27 @@ class QRCode {
         let n   = len(data);
         let msg = Array.Create(n + nsym, Type.Int);
         iter (i from 0 to n) { msg[i] = data[i]; }
-        iter (i from 0 to n) {
-            let coef = msg[i];
-            if (coef != 0) {
-                iter (j from 1 to nsym + 1) {
-                    msg[i + j] = msg[i + j] ^ this._mul(gen[j], coef);
-                }
-            }
-        }
+        QRCode._rsDivide(msg, n, gen, nsym, _GF_EXP, _GF_LOG);
         let ec = Array.Create(nsym, Type.Int);
         iter (i from 0 to nsym) { ec[i] = msg[n + i]; }
         return ec;
+    }
+
+    // Reed-Solomon division in place: msg[n, n + nsym) ends as the remainder
+    // of msg[0, n) * x^nsym by gen, over GF(256) with the exp/log tables (a
+    // product is exp[log a + log b], zero when either factor is).
+    fn static _rsDivide(msg: [int], n: int, gen: [int], nsym: int, exp: [int], lg: [int]): int {
+        iter (i from 0 to n) {
+            let coef = msg[i];
+            if (coef != 0) {
+                let lc = lg[coef];
+                iter (j from 1 to nsym + 1) {
+                    let g = gen[j];
+                    if (g != 0) { msg[i + j] = msg[i + j] ^ exp[(lg[g] + lc) % 255]; }
+                }
+            }
+        }
+        return n;
     }
 
     fn _set(m: [int], sz: int, r: int, c: int, v: int) {
@@ -193,6 +203,8 @@ class QRCode {
         }
     }
 
+    // Every centre pair except the three in finder corners; patterns on row
+    // or column 6 sit on the timing pattern, which they match there.
     fn _alignPat(m: array, sz: int, ver: int) {
         let pos = _AP[ver - 1];
         let np  = len(pos);
@@ -200,7 +212,7 @@ class QRCode {
             iter (bi from 0 to np) {
                 let r = pos[ai];
                 let c = pos[bi];
-                if (m[r*sz+c] != -1) continue;
+                if ((ai == 0 && bi == 0) || (ai == 0 && bi == np - 1) || (ai == np - 1 && bi == 0)) continue;
                 iter (dr from -2 to 3) {
                     iter (dc from -2 to 3) {
                         let dark = (dr == -2 || dr == 2 || dc == -2 || dc == 2 ||
@@ -215,11 +227,11 @@ class QRCode {
     fn _reserveFmt(m: [int], sz: int) {
         iter (i from 0 to 6) { m[8*sz+i] = 2;  m[i*sz+8] = 2; }
         m[8*sz+7] = 2;  m[7*sz+8] = 2;  m[8*sz+8] = 2;
-        m[(sz-8)*sz+8] = 1;
         iter (i from 0 to 8) {
             m[8*sz+(sz-1-i)] = 2;
             m[(sz-1-i)*sz+8] = 2;
         }
+        m[(sz-8)*sz+8] = 1;   // the dark module, always set
     }
 
     fn _versionInfo(m: array, sz: int, ver: int) {
@@ -261,15 +273,17 @@ class QRCode {
         }
     }
 
+    // Most significant bit first: at (8,0) in the top-left copy and at
+    // (sz-1,8) in the split copy.
     fn _writeFmt(m: array, sz: int, fi: int) {
         let seq_r = [8,8,8,8,8,8,8,8,7,5,4,3,2,1,0];
         let seq_c = [0,1,2,3,4,5,7,8,8,8,8,8,8,8,8];
         iter (i from 0 to 15) {
-            let bit = (fi >> i) & 1;
+            let bit = (fi >> (14 - i)) & 1;
             m[seq_r[i]*sz + seq_c[i]] = bit;
         }
-        iter (i from 0 to 7) { m[(sz-1-i)*sz+8] = (fi >> i) & 1; }
-        iter (i from 7 to 15) { m[8*sz+(sz-15+i)] = (fi >> i) & 1; }
+        iter (i from 0 to 7) { m[(sz-1-i)*sz+8] = (fi >> (14 - i)) & 1; }
+        iter (i from 7 to 15) { m[8*sz+(sz-15+i)] = (fi >> (14 - i)) & 1; }
     }
 
     fn _maskBit(mask: int, r: int, c: int) : int {
@@ -377,14 +391,25 @@ class QRCode {
         return ((d1 < d2) ? d1 : d2) * 10;
     }
 
+    // Bits of the byte-mode character count: 8 up to version 9, 16 from 10.
+    fn static _countBits(ver: int) : int {
+        return ver < 10 ? 8 : 16;
+    }
+
+    // Smallest version whose data codewords hold the mode, the count and blen
+    // bytes, or -1.
+    fn static _version(blen: int, ecLevel: int) : int {
+        iter (v from 1 to 11) {
+            if (_VC[(v-1)*4*6 + ecLevel*6] * 8 >= 4 + QRCode._countBits(v) + 8 * blen) return v;
+        }
+        return -1;
+    }
+
     fn _encode(text: string, ecLevel: int, fast: bool) : object {
         _ensureGf();
 
         let blen = String.Length(text);
-        var ver  = -1;
-        iter (v from 1 to 11) {
-            if (ver < 0 && _VC[(v-1)*4*6 + ecLevel*6] >= blen + 4) ver = v;
-        }
+        let ver  = QRCode._version(blen, ecLevel);
         if (ver < 0) return nil;
 
         let base   = (ver-1)*4*6 + ecLevel*6;
@@ -402,7 +427,8 @@ class QRCode {
         var nb      = 0;
 
         bitBuf[0]=0; bitBuf[1]=1; bitBuf[2]=0; bitBuf[3]=0; nb=4;
-        iter (b from 0 to 8) { bitBuf[nb] = (blen >> (7 - b)) & 1; nb = nb + 1; }
+        let cc = QRCode._countBits(ver);
+        iter (b from 0 to cc) { bitBuf[nb] = (blen >> (cc - 1 - b)) & 1; nb = nb + 1; }
         iter (i from 0 to blen) {
             let ch = String.CharAt(text, i);
             iter (b from 0 to 8) { bitBuf[nb] = (ch >> (7 - b)) & 1; nb = nb + 1; }
@@ -538,7 +564,16 @@ class QRCode {
         let sz     = res.size;
         let qz     = 4;
         let full   = (sz + qz * 2) * sc;
-        let pixels = Array.Create(full * full);
+        if (full <= 0) return Array.Create(full * full);
+        let pixels: [int] = Array.Create(full * full, Type.Int);
+        QRCode._pixelsInto(pixels, mat, sz, full, sc, qz);
+        // Callers get a plain array; the typed one is the kernel's working copy.
+        return Array.Concat(pixels, []);
+    }
+
+    // Paint the full x full pixel grid of module matrix `mat` (sz x sz), `sc`
+    // pixels per module inside a quiet zone of qz modules.
+    fn static _pixelsInto(pixels: [int], mat: [int], sz: int, full: int, sc: int, qz: int): int {
         iter (py from 0 to full) {
             let my = int(py / sc) - qz;
             iter (px from 0 to full) {
@@ -550,19 +585,16 @@ class QRCode {
                 pixels[py*full+px] = dark ? 0xFF000000 : 0xFFFFFFFF;
             }
         }
-        return pixels;
+        return full;
     }
 
     // Pixel width/height of the ToPixels result.
     fn static PixelSize(text: string, scale, ecLevel) : int {
         let ec = (ecLevel == nil) ? 0 : int(ecLevel);
         let sc = (scale   == nil) ? 4 : int(scale);
-        iter (v from 1 to 11) {
-            if (_VC[(v-1)*4*6 + ec*6] >= String.Length(text) + 4) {
-                return (4*v + 17 + 8) * sc;
-            }
-        }
-        return -1;
+        let v  = QRCode._version(String.Length(text), ec);
+        if (v < 0) return -1;
+        return (4*v + 17 + 8) * sc;
     }
 
     // SVG string - uses horizontal run-length encoding for compact output.

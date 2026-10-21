@@ -2,8 +2,9 @@
 // Version: 1.0
 //
 // Encodes and decodes raw DEFLATE streams plus the zlib (RFC 1950) and gzip
-// (RFC 1952) framings around them. The encoder is dynamic-Huffman with a
-// hash-chain match finder; the decoder is table-driven.
+// (RFC 1952) framings around them. The encoder has a hash-chain match finder
+// and codes each block with dynamic or fixed Huffman codes, whichever is
+// smaller; the decoder is table-driven.
 //
 // Exported classes:
 //   Inflate - Raw / Zlib / Gzip / Auto / LastError
@@ -24,8 +25,9 @@
 // interpreter. Scalars therefore travel in the state arrays (S, P) rather than
 // as parameters, and no kernel calls another.
 //
-// Block bytes are SIGNED when indexed (b[i] gives -1 for 0xFF), so every read
-// of input or output masks with & 255.
+// Every block indexed here has 1-byte elements: `_asBlock` normalises the
+// input and each output buffer is created that way. A read gives 0..255 and a
+// store keeps the low byte, so byte reads and writes carry no mask.
 //
 // Limits: a decoded stream is capped at INFLATE_MAX_OUT unless the caller
 // passes an expected size - a decoder must not inherit decompression bombs
@@ -43,7 +45,11 @@ const C_ORDER  = 118;    // 19 code-length code order
 const C_LSYMOF = 137;    // 259: length 0..258 -> length-symbol index 0..28
 const C_DSMALL = 396;    // 257: distance 0..256 -> distance symbol
 const C_DLARGE = 653;    // 256: (distance-1)>>7 -> distance symbol
-const C_SIZE   = 909;
+const C_FLENL  = 909;    // 288 fixed literal/length code lengths
+const C_FCODEL = 1197;   // 288 fixed literal/length codes (bit-reversed, as _huffCodes stores them)
+const C_FLEND  = 1485;   // 30  fixed distance code lengths
+const C_FCODED = 1515;   // 30  fixed distance codes
+const C_SIZE   = 1545;
 
 // Layout of the work array W.
 const W_LCOUNT = 0;      // 16
@@ -89,7 +95,10 @@ const P_NTOK  = 7;
 const P_HLIT  = 8;
 const P_HDIST = 9;
 const P_FINAL = 10;
-const P_SIZE  = 11;
+const P_FIXED = 11;      // 1: code the block with the fixed codes (BTYPE=01)
+const P_DYNBITS = 12;    // bits of the block with the dynamic codes, extra bits left out
+const P_FIXBITS = 13;    // the same with the fixed codes
+const P_SIZE  = 14;
 
 // Layout of the bit-reader state array S.
 const S_BUF = 0;         // bit accumulator
@@ -132,6 +141,12 @@ fn _inflateConsts(): array {
         while (j < 29 && c[C_DBASE + j + 1] <= d) { j = j + 1; }
         c[C_DLARGE + k] = j;
     }
+
+    // Fixed (RFC 1951 3.2.6) codes for the encoder.
+    iter (i from 0 to 288) { c[C_FLENL + i] = i < 144 ? 8 : (i < 256 ? 9 : (i < 280 ? 7 : 8)); }
+    iter (i from 0 to 30) { c[C_FLEND + i] = 5; }
+    _huffCodes(c, C_FLENL, C_FCODEL, 288);
+    _huffCodes(c, C_FLEND, C_FCODED, 30);
     _deflateConsts = c;
     return c;
 }
@@ -148,7 +163,7 @@ fn _bits(src: block, sLen: int, S: [int], need: int): int {
     let pos: int = S[S_POS];
     while (cnt < need) {
         if (pos >= sLen) { S[S_ERR] = -1; cnt = cnt + 8; }
-        else { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+        else { buf = buf | (src[pos] << cnt); pos = pos + 1; cnt = cnt + 8; }
     }
     let v: int = buf & ((1 << need) - 1);
     S[S_BUF] = (buf >> need) & 0x7FFFFFFFFFFFFF;
@@ -247,7 +262,7 @@ fn _inflateFast(src: block, sLen: int, dst: block, dCap: int,
     let out: int = S[S_OUT];
 
     while (true) {
-        while (cnt < 24 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+        while (cnt < 24 && pos < sLen) { buf = buf | (src[pos] << cnt); pos = pos + 1; cnt = cnt + 8; }
 
         let e: int = W[W_LTAB + (buf & 511)];
         let sym: int = 0;
@@ -265,7 +280,7 @@ fn _inflateFast(src: block, sLen: int, dst: block, dCap: int,
             let code: int = 0; let first: int = 0; let index: int = 0; let l: int = 1;
             sym = -1;
             while (l <= 15) {
-                while (cnt < 1 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+                while (cnt < 1 && pos < sLen) { buf = buf | (src[pos] << cnt); pos = pos + 1; cnt = cnt + 8; }
                 if (cnt < 1) { S[S_OUT] = out; return -1; }
                 code = code | (buf & 1); buf = buf >> 1; cnt = cnt - 1;
                 let cl: int = W[W_LCOUNT + l];
@@ -286,12 +301,12 @@ fn _inflateFast(src: block, sLen: int, dst: block, dCap: int,
             let li: int = sym - 257;
             if (li >= 29) { S[S_OUT] = out; return -2; }
             let lex: int = C[C_LEXTRA + li];
-            while (cnt < lex && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+            while (cnt < lex && pos < sLen) { buf = buf | (src[pos] << cnt); pos = pos + 1; cnt = cnt + 8; }
             let length: int = C[C_LBASE + li] + (buf & ((1 << lex) - 1));
             buf = buf >> lex;
             cnt = cnt - lex;
 
-            while (cnt < 24 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+            while (cnt < 24 && pos < sLen) { buf = buf | (src[pos] << cnt); pos = pos + 1; cnt = cnt + 8; }
             let de: int = W[W_DTAB + (buf & 511)];
             let dsym: int = 0;
             if (de != 0) {
@@ -304,7 +319,7 @@ fn _inflateFast(src: block, sLen: int, dst: block, dCap: int,
                 let dcode: int = 0; let dfirst: int = 0; let dindex: int = 0; let dl: int = 1;
                 dsym = -1;
                 while (dl <= 15) {
-                    while (cnt < 1 && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+                    while (cnt < 1 && pos < sLen) { buf = buf | (src[pos] << cnt); pos = pos + 1; cnt = cnt + 8; }
                     if (cnt < 1) { S[S_OUT] = out; return -1; }
                     dcode = dcode | (buf & 1); buf = buf >> 1; cnt = cnt - 1;
                     let dc: int = W[W_DCOUNT + dl];
@@ -316,7 +331,7 @@ fn _inflateFast(src: block, sLen: int, dst: block, dCap: int,
             if (dsym >= 30) { S[S_OUT] = out; return -2; }
 
             let dex: int = C[C_DEXTRA + dsym];
-            while (cnt < dex && pos < sLen) { buf = buf | ((src[pos] & 255) << cnt); pos = pos + 1; cnt = cnt + 8; }
+            while (cnt < dex && pos < sLen) { buf = buf | (src[pos] << cnt); pos = pos + 1; cnt = cnt + 8; }
             let dist: int = C[C_DBASE + dsym] + (buf & ((1 << dex) - 1));
             buf = buf >> dex;
             cnt = cnt - dex;
@@ -325,19 +340,10 @@ fn _inflateFast(src: block, sLen: int, dst: block, dCap: int,
             if (out + length > dCap) { S[S_BUF] = buf; S[S_CNT] = cnt; S[S_POS] = pos; S[S_OUT] = out; return -3; }
             let from2: int = out - dist;
             let k: int = 0;
-            while (k < length) { dst[out + k] = dst[from2 + k] & 255; k = k + 1; }
+            while (k < length) { dst[out + k] = dst[from2 + k]; k = k + 1; }
             out = out + length;
         }
     }
-}
-
-// Stored-block payload copy. A kernel rather than a loop in the driver: the
-// driver allocates and branches, so it is not JIT-eligible, and an
-// incompressible stream is nothing but this copy.
-fn _copyStored(src: block, sp: int, dst: block, dp: int, n: int): int {
-    let i: int = 0;
-    while (i < n) { dst[dp + i] = src[sp + i] & 255; i = i + 1; }
-    return 0;
 }
 
 // Fill W[W_LENS..] with the fixed (RFC 1951 3.2.6) code lengths.
@@ -400,15 +406,17 @@ fn _fixedDist(W: [int]): int {
 }
 
 global _lastErr = 0;
+global _lastEnd = 0;     // input offset just past the stream the last decode read
 
-// One decode attempt into a buffer of exactly `cap` bytes. nil on failure,
-// with _lastErr set (-3 means the output buffer was too small).
-fn _inflateOnce(src: block, sLen: int, cap: int): block {
+// One decode attempt, from src[start], into a buffer of exactly `cap` bytes.
+// nil on failure, with _lastErr set (-3 means the output buffer was too small).
+fn _inflateOnce(src: block, start: int, sLen: int, cap: int): block {
     _lastErr = 0;
     let dst = Buffer.Create(cap, 1);
     let C = _inflateConsts();
     let W: [int] = Array.Create(W_SIZE, Type.Int);
     let S: [int] = Array.Create(S_SIZE, Type.Int);
+    S[S_POS] = start;
 
     let done = false;
     while (!done) {
@@ -417,17 +425,18 @@ fn _inflateOnce(src: block, sLen: int, cap: int): block {
         if (S[S_ERR] != 0) { _lastErr = -1; return nil; }
 
         if (btype == 0) {
+            // Whole bytes still in the accumulator belong to this block.
+            let p = S[S_POS] - (S[S_CNT] >> 3);
             S[S_BUF] = 0; S[S_CNT] = 0;
-            let p = S[S_POS];
             if (p + 4 > sLen) { _lastErr = -1; return nil; }
-            let ln = (src[p] & 255) | ((src[p + 1] & 255) << 8);
-            let nl = (src[p + 2] & 255) | ((src[p + 3] & 255) << 8);
+            let ln = src[p] | (src[p + 1] << 8);
+            let nl = src[p + 2] | (src[p + 3] << 8);
             if ((ln ^ 0xFFFF) != nl) { _lastErr = -2; return nil; }
             p = p + 4;
             if (p + ln > sLen) { _lastErr = -1; return nil; }
             let o = S[S_OUT];
             if (o + ln > cap) { _lastErr = -3; return nil; }
-            _copyStored(src, p, dst, o, ln);
+            Buffer.Copy(src, p, dst, o, ln);
             S[S_OUT] = o + ln;
             S[S_POS] = p + ln;
         } else if (btype == 1 || btype == 2) {
@@ -447,6 +456,7 @@ fn _inflateOnce(src: block, sLen: int, cap: int): block {
         }
         if (final == 1) { done = true; }
     }
+    _lastEnd = S[S_POS] - (S[S_CNT] >> 3);
     return Buffer.Slice(dst, 0, S[S_OUT]);
 }
 
@@ -466,117 +476,26 @@ fn _asBlock(x): block {
     return Buffer.FromString(s);
 }
 
-// ---------------------------------------------------------------------------
-//  Encoder
-// ---------------------------------------------------------------------------
+// The raw DEFLATE stream starting at src[start] -> block, or nil on
+// malformed input; _lastEnd is left just past the stream.
+fn _inflateFrom(src: block, start: int, expected): block {
+    let sLen = len(src);
+    if (sLen <= start) return nil;
 
-// One fixed-Huffman DEFLATE block covering src[0..n).
-//
-// Deliberately a single leaf function: the JIT bails on a call whose callee has
-// no native code yet, so the whole compressor - match search, Huffman emission
-// and bit packing - is inlined here. `head`/`prev` are the hash chains, sized
-// 32768 and n respectively. Returns bytes written to dst, or negative on
-// overflow.
-//
-// Huffman codes go out most-significant-bit first (so each is bit-reversed
-// before packing), while extra bits go out least-significant-bit first.
-fn _deflateFixed(src: block, n: int, dst: block, dCap: int,
-                  head: [int], prev: [int], C: [int], maxChain: int): int {
-    let bitbuf: int = 0;
-    let bitcnt: int = 0;
-    let outp: int = 0;
+    // A known size needs no growth; otherwise start at a modest multiple of
+    // the input and retry on overflow, since the ratio is unknowable up
+    // front and a wrong guess must not truncate the result.
+    let exp = (expected == nil || expected <= 0) ? 0 : expected;
+    var cap = exp > 0 ? exp : ((sLen - start) * 4 + 1024);
+    if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
 
-    // final=1, btype=01 (fixed) - three bits, LSB first.
-    bitbuf = bitbuf | (1 << bitcnt); bitcnt = bitcnt + 1;
-    bitbuf = bitbuf | (1 << bitcnt); bitcnt = bitcnt + 1;
-    bitcnt = bitcnt + 1;
-
-    let i: int = 0;
-    while (i < n) {
-        let mlen: int = 0;
-        let mdist: int = 0;
-
-        if (i + 3 <= n) {
-            let h: int = (((src[i] & 255) << 10) ^ ((src[i + 1] & 255) << 5) ^ (src[i + 2] & 255)) & 32767;
-            let cand: int = head[h] - 1;
-            head[h] = i + 1;
-            prev[i] = cand + 1;
-
-            let tries: int = 0;
-            let best: int = 0;
-            let bestd: int = 0;
-            while (cand >= 0 && tries < maxChain && i - cand <= 32768) {
-                let k: int = 0;
-                let lim: int = n - i;
-                if (lim > 258) { lim = 258; }
-                while (k < lim && (src[cand + k] & 255) == (src[i + k] & 255)) { k = k + 1; }
-                if (k > best) { best = k; bestd = i - cand; if (k >= 258) { cand = -1; } }
-                if (cand >= 0) { cand = prev[cand] - 1; tries = tries + 1; }
-            }
-            if (best >= 3) { mlen = best; mdist = bestd; }
-        }
-
-        if (mlen >= 3) {
-            let lsym: int = C[C_LSYMOF + mlen];
-            let code: int = 257 + lsym;
-            // literal/length code: 256..279 -> 7 bits base 0, 280..287 -> 8 bits base 0xC0
-            let cbits: int = 0;
-            let cval: int = 0;
-            if (code < 280) { cbits = 7; cval = code - 256; }
-            else            { cbits = 8; cval = 192 + (code - 280); }
-            let r: int = 0; let b: int = 0;
-            while (b < cbits) { r = (r << 1) | ((cval >> b) & 1); b = b + 1; }
-            bitbuf = bitbuf | (r << bitcnt); bitcnt = bitcnt + cbits;
-            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-
-            let lex: int = C[C_LEXTRA + lsym];
-            if (lex > 0) {
-                bitbuf = bitbuf | ((mlen - C[C_LBASE + lsym]) << bitcnt); bitcnt = bitcnt + lex;
-                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-            }
-
-            let dsym: int = mdist <= 256 ? C[C_DSMALL + mdist] : C[C_DLARGE + ((mdist - 1) >> 7)];
-            let dr: int = 0; let db: int = 0;
-            while (db < 5) { dr = (dr << 1) | ((dsym >> db) & 1); db = db + 1; }
-            bitbuf = bitbuf | (dr << bitcnt); bitcnt = bitcnt + 5;
-            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-
-            let dex: int = C[C_DEXTRA + dsym];
-            if (dex > 0) {
-                bitbuf = bitbuf | ((mdist - C[C_DBASE + dsym]) << bitcnt); bitcnt = bitcnt + dex;
-                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-            }
-
-            // Insert the covered positions into the chains so later matches see them.
-            let q: int = 1;
-            while (q < mlen) {
-                if (i + q + 3 <= n) {
-                    let h2: int = (((src[i + q] & 255) << 10) ^ ((src[i + q + 1] & 255) << 5) ^ (src[i + q + 2] & 255)) & 32767;
-                    prev[i + q] = head[h2];
-                    head[h2] = i + q + 1;
-                }
-                q = q + 1;
-            }
-            i = i + mlen;
-        } else {
-            let lit: int = src[i] & 255;
-            let cbits2: int = 0;
-            let cval2: int = 0;
-            if (lit < 144) { cbits2 = 8; cval2 = 48 + lit; }
-            else           { cbits2 = 9; cval2 = 400 + (lit - 144); }
-            let r2: int = 0; let b2: int = 0;
-            while (b2 < cbits2) { r2 = (r2 << 1) | ((cval2 >> b2) & 1); b2 = b2 + 1; }
-            bitbuf = bitbuf | (r2 << bitcnt); bitcnt = bitcnt + cbits2;
-            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-            i = i + 1;
-        }
+    while (true) {
+        let got = _inflateOnce(src, start, sLen, cap);
+        if (got != nil) return got;
+        if (_lastErr != -3 || exp > 0 || cap >= INFLATE_MAX_OUT) return nil;
+        cap = cap * 4;
+        if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
     }
-
-    // end-of-block: symbol 256 -> 7 bits, value 0
-    bitcnt = bitcnt + 7;
-    while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-    if (bitcnt > 0) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; }
-    return outp;
 }
 
 class Inflate {
@@ -586,23 +505,7 @@ class Inflate {
     fn static Raw(input, expected?): block {
         let src = _asBlock(input);
         if (src == nil) return nil;
-        let sLen = len(src);
-        if (sLen == 0) return nil;
-
-        // A known size needs no growth; otherwise start at a modest multiple of
-        // the input and retry on overflow, since the ratio is unknowable up
-        // front and a wrong guess must not truncate the result.
-        let exp = (expected == nil || expected <= 0) ? 0 : expected;
-        let cap = exp > 0 ? exp : (sLen * 4 + 1024);
-        if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
-
-        while (true) {
-            let got = _inflateOnce(src, sLen, cap);
-            if (got != nil) return got;
-            if (_lastErr != -3 || exp > 0 || cap >= INFLATE_MAX_OUT) return nil;
-            cap = cap * 4;
-            if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
-        }
+        return _inflateFrom(src, 0, expected);
     }
 
     // Reason the last decode returned nil: -1 truncated input, -2 malformed
@@ -610,53 +513,69 @@ class Inflate {
     fn static LastError(): int { return _lastErr; }
 
     // zlib (RFC 1950) container: 2-byte header, deflate stream, Adler-32.
+    // Bytes after the Adler-32 are ignored.
     fn static Zlib(input, expected?): block {
         let src = _asBlock(input);
         if (src == nil || len(src) < 6) return nil;
-        let cmf = src[0] & 255;
-        let flg = src[1] & 255;
+        let cmf = src[0];
+        let flg = src[1];
         if ((cmf & 15) != 8) return nil;                       // not deflate
         if (((cmf << 8) + flg) % 31 != 0) return nil;          // header check
         if ((flg & 32) != 0) return nil;                       // preset dictionary
-        let body = Buffer.Slice(src, 2, len(src) - 6);
-        let out = Inflate.Raw(body, expected);
+        let out = _inflateFrom(src, 2, expected);
         if (out == nil) return nil;
-        let p = len(src) - 4;
-        let want = ((src[p] & 255) << 24) | ((src[p+1] & 255) << 16) | ((src[p+2] & 255) << 8) | (src[p+3] & 255);
-        if (Hash.Adler32(out) != want) return nil;
+        let p = _lastEnd;
+        if (p + 4 > len(src)) { _lastErr = -1; return nil; }
+        let want = (src[p] << 24) | (src[p+1] << 16) | (src[p+2] << 8) | src[p+3];
+        if (Hash.Adler32(out) != want) { _lastErr = -2; return nil; }
         return out;
     }
 
-    // gzip (RFC 1952) container.
+    // gzip (RFC 1952) container. Several members one after another decode to
+    // their contents concatenated; bytes after the last member that do not
+    // start another one are ignored.
     fn static Gzip(input, expected?): block {
         let src = _asBlock(input);
         if (src == nil || len(src) < 18) return nil;
-        if ((src[0] & 255) != 31 || (src[1] & 255) != 139 || (src[2] & 255) != 8) return nil;
-        let flg = src[3] & 255;
-        let p = 10;
-        if ((flg & 4) != 0) {                                   // FEXTRA
-            if (p + 2 > len(src)) return nil;
-            p = p + 2 + ((src[p] & 255) | ((src[p+1] & 255) << 8));
+        let n = len(src);
+        var all = nil;
+        var at = 0;
+        while (at + 18 <= n && src[at] == 31 && src[at + 1] == 139) {
+            if (src[at + 2] != 8) return nil;
+            let flg = src[at + 3];
+            var p = at + 10;
+            if ((flg & 4) != 0) {                                   // FEXTRA
+                if (p + 2 > n) return nil;
+                p = p + 2 + (src[p] | (src[p+1] << 8));
+            }
+            if ((flg & 8) != 0)  { while (p < n && src[p] != 0) { p = p + 1; } p = p + 1; }
+            if ((flg & 16) != 0) { while (p < n && src[p] != 0) { p = p + 1; } p = p + 1; }
+            if ((flg & 2) != 0)  { p = p + 2; }                     // FHCRC
+            if (p >= n - 8) return nil;
+            let out = _inflateFrom(src, p, expected);
+            if (out == nil) return nil;
+            let q = _lastEnd;
+            if (q + 8 > n) { _lastErr = -1; return nil; }
+            let want = src[q] | (src[q+1] << 8) | (src[q+2] << 16) | (src[q+3] << 24);
+            if ((u32)Hash.Crc32(out) != (u32)want) { _lastErr = -2; return nil; }
+            if (all == nil) {
+                all = out;
+            } else {
+                if (len(all) + len(out) > INFLATE_MAX_OUT) { _lastErr = -3; return nil; }
+                Buffer.Append(all, out);
+            }
+            at = q + 8;
         }
-        if ((flg & 8) != 0)  { while (p < len(src) && src[p] != 0) { p = p + 1; } p = p + 1; }
-        if ((flg & 16) != 0) { while (p < len(src) && src[p] != 0) { p = p + 1; } p = p + 1; }
-        if ((flg & 2) != 0)  { p = p + 2; }                     // FHCRC
-        if (p >= len(src) - 8) return nil;
-        let body = Buffer.Slice(src, p, len(src) - 8 - p);
-        let out = Inflate.Raw(body, expected);
-        if (out == nil) return nil;
-        let q = len(src) - 8;
-        let want = (src[q] & 255) | ((src[q+1] & 255) << 8) | ((src[q+2] & 255) << 16) | ((src[q+3] & 255) << 24);
-        if ((Hash.Crc32(out) & 0xFFFFFFFF) != (want & 0xFFFFFFFF)) return nil;
-        return out;
+        if (all == nil) return nil;
+        return all;
     }
 
     // Sniff the container and decode accordingly.
     fn static Auto(input, expected?): block {
         let src = _asBlock(input);
         if (src == nil || len(src) < 2) return nil;
-        if ((src[0] & 255) == 31 && (src[1] & 255) == 139) { return Inflate.Gzip(src, expected); }
-        if ((src[0] & 15) == 8 && (((src[0] & 255) << 8) + (src[1] & 255)) % 31 == 0) {
+        if (src[0] == 31 && src[1] == 139) { return Inflate.Gzip(src, expected); }
+        if ((src[0] & 15) == 8 && ((src[0] << 8) + src[1]) % 31 == 0) {
             let z = Inflate.Zlib(src, expected);
             if (z != nil) return z;
         }
@@ -667,17 +586,22 @@ class Inflate {
 
 class Deflate {
 
-    // Raw DEFLATE stream for `src`, dynamic-Huffman coded. `effort` caps the
-    // hash-chain walk per position (default 32); higher compresses a little
-    // better and costs proportionally more time. Input is processed in chunks
-    // so the token buffers stay bounded; each chunk becomes one block and, for
-    // simplicity, matches never reach across a chunk boundary.
+    // Raw DEFLATE stream for `src`. `effort` caps the hash-chain walk per
+    // position (default 32); higher compresses a little better and costs
+    // proportionally more time. Input is processed in chunks so the token
+    // buffers stay bounded; each chunk becomes one block, dynamic- or
+    // fixed-Huffman coded, whichever is smaller, and, for simplicity, matches
+    // never reach across a chunk boundary.
     // Falls back to stored blocks whenever compressing does not pay.
     fn static Raw(input, effort?): block {
         let src = _asBlock(input);
         if (src == nil) return nil;
         let n = len(src);
-        if (n == 0) return Deflate.Stored(src);
+        if (n == 0) {
+            let empty = Buffer.Create(2, 1);
+            empty[0] = 3;                    // final fixed block holding only end-of-block
+            return empty;
+        }
         let chain = (effort == nil || effort <= 0) ? 32 : effort;
 
         let chunkMax = 262144;
@@ -730,7 +654,9 @@ class Deflate {
             _huffCodes(E, E_CLLEN, E_CLCODE, 19);
 
             P[P_NTOK] = ntok; P[P_HLIT] = hlit; P[P_HDIST] = hdist; P[P_FINAL] = isFinal;
-            if (_emitDynamic(dst, tl, tv, C, E, P) != 0) { failed = true; }
+            _blockBits(E, P);
+            P[P_FIXED] = (P[P_FIXBITS] <= P[P_DYNBITS]) ? 1 : 0;
+            if (_emitBlock(dst, tl, tv, C, E, P) != 0) { failed = true; }
             off = off + chunk;
         }
 
@@ -738,9 +664,9 @@ class Deflate {
             // Flush any partial byte.
             if (P[P_CNT] > 0) {
                 if (P[P_OUT] >= cap) { failed = true; }
-                else { dst[P[P_OUT]] = P[P_BUF] & 255; P[P_OUT] = P[P_OUT] + 1; }
+                else { dst[P[P_OUT]] = P[P_BUF]; P[P_OUT] = P[P_OUT] + 1; }
             }
-            if (!failed && P[P_OUT] < n) { return Buffer.Slice(dst, 0, P[P_OUT]); }
+            if (!failed && P[P_OUT] < n + 5 * ((n + 65534) / 65535)) { return Buffer.Slice(dst, 0, P[P_OUT]); }
         }
         return Deflate.Stored(src);
     }
@@ -760,11 +686,11 @@ class Deflate {
             if (chunk > 65535) { chunk = 65535; }
             let final = (off + chunk >= n) ? 1 : 0;
             dst[p] = final; p = p + 1;                      // BFINAL, BTYPE=00
-            dst[p] = chunk & 255; p = p + 1;
-            dst[p] = (chunk >> 8) & 255; p = p + 1;
-            dst[p] = (chunk ^ 0xFFFF) & 255; p = p + 1;
-            dst[p] = ((chunk ^ 0xFFFF) >> 8) & 255; p = p + 1;
-            if (chunk > 0) { _copyStored(src, off, dst, p, chunk); p = p + chunk; }
+            dst[p] = chunk; p = p + 1;
+            dst[p] = chunk >> 8; p = p + 1;
+            dst[p] = chunk ^ 0xFFFF; p = p + 1;
+            dst[p] = (chunk ^ 0xFFFF) >> 8; p = p + 1;
+            if (chunk > 0) { Buffer.Copy(src, off, dst, p, chunk); p = p + chunk; }
             off = off + chunk;
             first = false;
         }
@@ -778,11 +704,11 @@ class Deflate {
         if (body == nil) return nil;
         let out = Buffer.Create(len(body) + 6, 1);
         out[0] = 120; out[1] = 156;                          // CM=8, CINFO=7, FCHECK
-        _copyStored(body, 0, out, 2, len(body));
+        Buffer.Copy(body, 0, out, 2, len(body));
         let ad = Hash.Adler32(src);
         let p = len(body) + 2;
-        out[p] = (ad >> 24) & 255; out[p+1] = (ad >> 16) & 255;
-        out[p+2] = (ad >> 8) & 255; out[p+3] = ad & 255;
+        out[p] = ad >> 24; out[p+1] = ad >> 16;
+        out[p+2] = ad >> 8; out[p+3] = ad;
         return out;
     }
 
@@ -795,14 +721,14 @@ class Deflate {
         out[0] = 31; out[1] = 139; out[2] = 8; out[3] = 0;
         out[4] = 0; out[5] = 0; out[6] = 0; out[7] = 0;       // MTIME 0
         out[8] = 0; out[9] = 255;                             // XFL, OS unknown
-        _copyStored(body, 0, out, 10, len(body));
+        Buffer.Copy(body, 0, out, 10, len(body));
         let p = len(body) + 10;
-        let crc = Hash.Crc32(src) & 0xFFFFFFFF;
-        out[p] = crc & 255; out[p+1] = (crc >> 8) & 255;
-        out[p+2] = (crc >> 16) & 255; out[p+3] = (crc >> 24) & 255;
-        let sz = len(src) & 0xFFFFFFFF;
-        out[p+4] = sz & 255; out[p+5] = (sz >> 8) & 255;
-        out[p+6] = (sz >> 16) & 255; out[p+7] = (sz >> 24) & 255;
+        let crc = (u32)Hash.Crc32(src);
+        out[p] = crc; out[p+1] = crc >> 8;
+        out[p+2] = crc >> 16; out[p+3] = crc >> 24;
+        let sz = (u32)len(src);
+        out[p+4] = sz; out[p+5] = sz >> 8;
+        out[p+6] = sz >> 16; out[p+7] = sz >> 24;
         return out;
     }
 }
@@ -915,30 +841,34 @@ fn _lzTokens(src: block, head: [int], prev: [int],
     let base: int = P[P_BASE];
     let n: int = P[P_N];
     let maxChain: int = P[P_CHAIN];
-    iter (i from 0 to 32768) { head[i] = 0; }
-    iter (i from 0 to 288) { E[E_FREQL + i] = 0; }
-    iter (i from 0 to 30) { E[E_FREQD + i] = 0; }
+    Array.Fill(head, 0, 0, 32768);
+    Array.Fill(E, 0, E_FREQL, E_FREQL + 288);
+    Array.Fill(E, 0, E_FREQD, E_FREQD + 30);
 
     let ntok: int = 0;
     let i: int = 0;
     while (i < n) {
         let mlen: int = 0;
         let mdist: int = 0;
+        let h: int = 0;
         if (i + 3 <= n) {
-            let h: int = (((src[base + i] & 255) << 10) ^ ((src[base + i + 1] & 255) << 5) ^ (src[base + i + 2] & 255)) & 32767;
+            h = ((src[base + i] << 10) ^ (src[base + i + 1] << 5) ^ src[base + i + 2]) & 32767;
             let cand: int = head[h] - 1;
             head[h] = i + 1;
             prev[i] = cand + 1;
             let tries: int = 0;
             let best: int = 0;
             let bestd: int = 0;
+            let lim: int = n - i;
+            if (lim > 258) { lim = 258; }
             while (cand >= 0 && tries < maxChain && i - cand <= 32768) {
-                let k: int = 0;
-                let lim: int = n - i;
-                if (lim > 258) { lim = 258; }
-                while (k < lim && (src[base + cand + k] & 255) == (src[base + i + k] & 255)) { k = k + 1; }
-                if (k > best) { best = k; bestd = i - cand; }
-                if (best >= 258) { cand = -1; }
+                // A candidate that differs at position best cannot beat it.
+                if (src[base + cand + best] == src[base + i + best]) {
+                    let k: int = 0;
+                    while (k < lim && src[base + cand + k] == src[base + i + k]) { k = k + 1; }
+                    if (k > best) { best = k; bestd = i - cand; }
+                }
+                if (best >= lim) { cand = -1; }
                 else { cand = prev[cand] - 1; tries = tries + 1; }
             }
             if (best >= 3) { mlen = best; mdist = bestd; }
@@ -950,18 +880,18 @@ fn _lzTokens(src: block, head: [int], prev: [int],
             E[E_FREQL + 257 + ls] = E[E_FREQL + 257 + ls] + 1;
             let ds: int = mdist <= 256 ? C[C_DSMALL + mdist] : C[C_DLARGE + ((mdist - 1) >> 7)];
             E[E_FREQD + ds] = E[E_FREQD + ds] + 1;
+            // The hash shifts five bits per byte, so the next position's hash
+            // rolls from this one: its first byte falls off the top.
             let q: int = 1;
-            while (q < mlen) {
-                if (i + q + 3 <= n) {
-                    let h2: int = (((src[base + i + q] & 255) << 10) ^ ((src[base + i + q + 1] & 255) << 5) ^ (src[base + i + q + 2] & 255)) & 32767;
-                    prev[i + q] = head[h2];
-                    head[h2] = i + q + 1;
-                }
+            while (q < mlen && i + q + 3 <= n) {
+                h = ((h << 5) ^ src[base + i + q + 2]) & 32767;
+                prev[i + q] = head[h];
+                head[h] = i + q + 1;
                 q = q + 1;
             }
             i = i + mlen;
         } else {
-            let lit: int = src[base + i] & 255;
+            let lit: int = src[base + i];
             tl[ntok] = 0; tv[ntok] = lit; ntok = ntok + 1;
             E[E_FREQL + lit] = E[E_FREQL + lit] + 1;
             i = i + 1;
@@ -971,11 +901,41 @@ fn _lzTokens(src: block, head: [int], prev: [int],
     return ntok;
 }
 
-// Emit one dynamic-Huffman block: header, both code-length tables (sent
-// uncompressed - the optional run-length coding buys a few hundred bytes per
-// block and is not worth the complexity here), then the tokens.
+// Bits of the block P describes with the dynamic codes in E, header as
+// _emitBlock writes it, into P[P_DYNBITS], and with the fixed codes into
+// P[P_FIXBITS]. Extra bits are left out: both codings spend the same on them.
+fn _blockBits(E: [int], P: [int]): int {
+    let hlit: int = P[P_HLIT];
+    let hdist: int = P[P_HDIST];
+    let dyn: int = 3 + 14 + 19 * 3;
+    let fix: int = 3;
+    iter (k from 0 to hlit) {
+        let f: int = E[E_FREQL + k];
+        let l: int = E[E_LENL + k];
+        dyn = dyn + E[E_CLLEN + l] + f * l;
+        let fl: int = 8;
+        if (k >= 144 && k < 256) { fl = 9; }
+        else if (k >= 256 && k < 280) { fl = 7; }
+        fix = fix + f * fl;
+    }
+    iter (k from 0 to hdist) {
+        let f: int = E[E_FREQD + k];
+        let l: int = E[E_LEND + k];
+        dyn = dyn + E[E_CLLEN + l] + f * l;
+        fix = fix + f * 5;
+    }
+    P[P_DYNBITS] = dyn;
+    P[P_FIXBITS] = fix;
+    return 0;
+}
+
+// Emit one Huffman block: for a dynamic block the header and both code-length
+// tables of the codes in E (sent uncompressed - the optional run-length coding
+// buys a few hundred bytes per block and is not worth the complexity here),
+// for a fixed one (P[P_FIXED]) just the block type and the codes in C; then
+// the tokens.
 // P = [bitbuf, bitcnt, outp]; returns 0 or -1 on output overflow.
-fn _emitDynamic(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]): int {
+fn _emitBlock(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]): int {
     let dCap: int = P[P_CAP];
     let ntok: int = P[P_NTOK];
     let hlit: int = P[P_HLIT];
@@ -985,67 +945,83 @@ fn _emitDynamic(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]):
     let bitcnt: int = P[P_CNT];
     let outp: int = P[P_OUT];
 
+    // Token codes: K[kLenL + sym], K[kCodeL + sym], K[kLenD + d], K[kCodeD + d].
+    let K: [int] = E;
+    let kLenL: int = E_LENL;
+    let kCodeL: int = E_CODEL;
+    let kLenD: int = E_LEND;
+    let kCodeD: int = E_CODED;
+
     bitbuf = bitbuf | (isFinal << bitcnt); bitcnt = bitcnt + 1;
-    bitbuf = bitbuf | (2 << bitcnt); bitcnt = bitcnt + 2;          // BTYPE=10
-    bitbuf = bitbuf | ((hlit - 257) << bitcnt); bitcnt = bitcnt + 5;
-    bitbuf = bitbuf | ((hdist - 1) << bitcnt); bitcnt = bitcnt + 5;
-    bitbuf = bitbuf | (15 << bitcnt); bitcnt = bitcnt + 4;          // HCLEN-4 = 15 -> 19 codes
-    while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+    if (P[P_FIXED] == 1) {
+        bitbuf = bitbuf | (1 << bitcnt); bitcnt = bitcnt + 2;      // BTYPE=01
+        K = C;
+        kLenL = C_FLENL;
+        kCodeL = C_FCODEL;
+        kLenD = C_FLEND;
+        kCodeD = C_FCODED;
+    } else {
+        bitbuf = bitbuf | (2 << bitcnt); bitcnt = bitcnt + 2;      // BTYPE=10
+        bitbuf = bitbuf | ((hlit - 257) << bitcnt); bitcnt = bitcnt + 5;
+        bitbuf = bitbuf | ((hdist - 1) << bitcnt); bitcnt = bitcnt + 5;
+        bitbuf = bitbuf | (15 << bitcnt); bitcnt = bitcnt + 4;      // HCLEN-4 = 15 -> 19 codes
+        while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
 
-    let i: int = 0;
-    while (i < 19) {
-        bitbuf = bitbuf | (E[E_CLLEN + C[C_ORDER + i]] << bitcnt); bitcnt = bitcnt + 3;
-        while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-        i = i + 1;
-    }
+        let i: int = 0;
+        while (i < 19) {
+            bitbuf = bitbuf | (E[E_CLLEN + C[C_ORDER + i]] << bitcnt); bitcnt = bitcnt + 3;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            i = i + 1;
+        }
 
-    // The two alphabets' lengths, each as one code-length symbol.
-    let j: int = 0;
-    while (j < hlit + hdist) {
-        let v: int = j < hlit ? E[E_LENL + j] : E[E_LEND + (j - hlit)];
-        let cl: int = E[E_CLLEN + v];
-        let cc: int = E[E_CLCODE + v];
-        bitbuf = bitbuf | (cc << bitcnt); bitcnt = bitcnt + cl;
-        while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
-        j = j + 1;
+        // The two alphabets' lengths, each as one code-length symbol.
+        let j: int = 0;
+        while (j < hlit + hdist) {
+            let v: int = j < hlit ? E[E_LENL + j] : E[E_LEND + (j - hlit)];
+            let cl: int = E[E_CLLEN + v];
+            let cc: int = E[E_CLCODE + v];
+            bitbuf = bitbuf | (cc << bitcnt); bitcnt = bitcnt + cl;
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            j = j + 1;
+        }
     }
 
     let t: int = 0;
     while (t < ntok) {
         if (tl[t] == 0) {
             let lit: int = tv[t];
-            let l1: int = E[E_LENL + lit]; let c1: int = E[E_CODEL + lit];
+            let l1: int = K[kLenL + lit]; let c1: int = K[kCodeL + lit];
             bitbuf = bitbuf | (c1 << bitcnt); bitcnt = bitcnt + l1;
-            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
         } else {
             let mlen: int = tl[t]; let mdist: int = tv[t];
             let ls: int = C[C_LSYMOF + mlen];
             let sym: int = 257 + ls;
-            let l2: int = E[E_LENL + sym]; let c2: int = E[E_CODEL + sym];
+            let l2: int = K[kLenL + sym]; let c2: int = K[kCodeL + sym];
             bitbuf = bitbuf | (c2 << bitcnt); bitcnt = bitcnt + l2;
-            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
             let lex: int = C[C_LEXTRA + ls];
             if (lex > 0) {
                 bitbuf = bitbuf | ((mlen - C[C_LBASE + ls]) << bitcnt); bitcnt = bitcnt + lex;
-                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
             }
             let ds: int = mdist <= 256 ? C[C_DSMALL + mdist] : C[C_DLARGE + ((mdist - 1) >> 7)];
-            let l3: int = E[E_LEND + ds]; let c3: int = E[E_CODED + ds];
+            let l3: int = K[kLenD + ds]; let c3: int = K[kCodeD + ds];
             bitbuf = bitbuf | (c3 << bitcnt); bitcnt = bitcnt + l3;
-            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+            while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
             let dex: int = C[C_DEXTRA + ds];
             if (dex > 0) {
                 bitbuf = bitbuf | ((mdist - C[C_DBASE + ds]) << bitcnt); bitcnt = bitcnt + dex;
-                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+                while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
             }
         }
         t = t + 1;
     }
 
     // end-of-block symbol 256
-    let le: int = E[E_LENL + 256]; let ce: int = E[E_CODEL + 256];
+    let le: int = K[kLenL + 256]; let ce: int = K[kCodeL + 256];
     bitbuf = bitbuf | (ce << bitcnt); bitcnt = bitcnt + le;
-    while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf & 255; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
+    while (bitcnt >= 8) { if (outp >= dCap) { return -1; } dst[outp] = bitbuf; outp = outp + 1; bitbuf = bitbuf >> 8; bitcnt = bitcnt - 8; }
 
     P[P_BUF] = bitbuf; P[P_CNT] = bitcnt; P[P_OUT] = outp;
     return 0;

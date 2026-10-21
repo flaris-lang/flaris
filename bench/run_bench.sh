@@ -2,10 +2,11 @@
 # Integer-kernel benchmarks: recursive fib, sieve of Eratosthenes, Collatz.
 # These are tight arithmetic and call-heavy loops with no library work, so they
 # measure the VM dispatch loop itself rather than Flaris's C builtins - see
-# run_bench_realworld.sh and run_bench_io.sh for the other halves of the picture.
+# run_bench_realworld.sh, run_bench_io.sh and run_bench_scenarios.sh for the
+# rest of the picture.
 #
-# Writes a dated snapshot to results/ and then hands off to the real-world
-# runner, which appends its sections to the same file.
+# Writes a dated snapshot to results/ and then hands off to the other runners,
+# which append their sections to the same file.
 #
 # Runtimes are discovered on PATH; override any of them by environment, e.g.
 #   FLARISVM=../flarisvm LUA=~/src/lua-5.4.7/src/lua ./run_bench.sh
@@ -329,6 +330,11 @@ if [[ -x "$BENCH_ROOT/run_bench_io.sh" ]]; then
     echo ""
     BENCH_REPORT="$REPORT" BENCH_APPEND=1 "$BENCH_ROOT/run_bench_io.sh" \
         || warn "I/O benchmarks failed"
+fi
+if [[ -x "$BENCH_ROOT/run_bench_scenarios.sh" ]]; then
+    echo ""
+    BENCH_REPORT="$REPORT" BENCH_APPEND=1 "$BENCH_ROOT/run_bench_scenarios.sh" \
+        || warn "scenario benchmarks failed"
 fi
 
 cat >> "$REPORT" <<'METHOD'

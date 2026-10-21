@@ -1,0 +1,1358 @@
+// PgWire.fls - PostgreSQL client in pure Flaris: the frontend/backend protocol 3.0.
+// Version: 1.0
+//
+// Talks to PostgreSQL (and CockroachDB, Neon, Supabase, RDS, ...) over a
+// Stream socket: no libpq, no plugin, no --unsafe, and every wait parks only
+// the calling fiber. Startup with SCRAM-SHA-256 (RFC 5802/7677), MD5 or
+// cleartext passwords; TLS through SSLRequest; the simple query protocol for
+// SQL without parameters (several statements at once) and the extended
+// protocol for parameters, which travel apart from the SQL and are never
+// spliced into it; text results decoded by type; errors with their SQLSTATE;
+// notices; transactions that nest through savepoints; LISTEN/NOTIFY; COPY in
+// and out; query cancel; a connection pool.
+//
+// The method names follow libs/Postgres.fls, so a program can switch by
+// changing the import and the Connect call. Two differences: a failed query
+// raises PgError instead of returning { error }, and numeric comes back as
+// a string, so no digit is lost.
+//
+// Not covered: channel binding (SCRAM-SHA-256-PLUS), GSSAPI/SSPI/Kerberos,
+// client certificates, Unix-domain sockets, binary result format, pipelining
+// several queries per round trip, and the replication protocol.
+//
+// Usage:
+//   import { PgWire, PgError } from library("PgWire", "1.0");
+//
+//   let db = PgWire.Connect("postgresql://app:secret@localhost:5432/shop");
+//   let rows = db.Query("SELECT id, name FROM users WHERE active = $1", [true]);
+//   foreach (r in rows) { Console.WriteLine(r.id, " ", r.name); }
+//   let n = db.Exec("UPDATE users SET seen = now() WHERE id = $1", [42]);
+//   db.Transaction(fn() {
+//       db.Exec("INSERT INTO audit(msg) VALUES ($1)", ["paid"]);
+//       db.Exec("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [10, 7]);
+//   });
+//   db.Close();
+//
+// Connecting:
+//   PgWire.Connect(conn) -> PgWire     raises PgError
+//   conn is a URI (postgresql://user:password@host:port/db?sslmode=require),
+//   libpq keywords ("host=db port=5432 dbname=shop user=app password=x"), or
+//   an object { host, port, user, password, database, sslmode, ... }. What is
+//   missing comes from PGHOST, PGPORT, PGUSER, PGPASSWORD and PGDATABASE, then
+//   localhost:5432, user postgres, database = user.
+//   Options (object keys; in a URI or keyword string the libpq names in
+//   brackets):
+//     sslmode          "disable", "prefer" (default: TLS when the server offers
+//                      it), "require" (TLS or fail) - neither checks the
+//                      certificate, as libpq does not - or "verify-full"
+//                      (TLS with the certificate and host name checked)
+//     timeoutMs        how long each wait on the server may take, default 30000;
+//                      a query that runs longer raises PgError "timeout", the
+//                      connection is closed and the server asked to cancel it
+//     connectTimeoutMs how long connecting may take [connect_timeout, seconds]
+//     applicationName  shown in pg_stat_activity [application_name], default "flaris"
+//     onNotice         fn(notice) for NOTICE/WARNING messages, as an object of
+//                      the fields below
+//
+// Queries (sql uses $1, $2, ... for params; params is an array):
+//   Query(sql, params?)        -> array of row objects keyed by column name
+//   QueryOne(sql, params?)     -> the first row or nil
+//   QueryValue(sql, params?)   -> the first column of the first row, or nil
+//   ScalarInt / ScalarString(sql, params?)  -> that value as int / string
+//   QueryMap(sql, keyField, params?)        -> rows keyed by one column
+//   Exec(sql, params?)         -> rows affected
+//   ExecMany(sql, paramsList)  -> rows affected by running sql once per params
+//   Execute(sql, params?)      -> { rows, rowCount, command, fields: [{ name, type }] }
+//   SimpleQuery(sql)           -> one such result per statement in sql
+//   QueryParams, QueryOneParams, QueryValueParams, ScalarIntParams,
+//   ScalarStringParams and ExecParams are the same calls, as Postgres.fls names them.
+//   Without params the simple protocol runs the text as is, so several
+//   statements may be sent at once (Query returns the rows of the last one).
+//   A param may be nil (NULL), a bool, int, float, string, block (bytea, sent
+//   as binary) or an array/object (sent as JSON text, for json and jsonb).
+//
+// Values by column type:
+//   bool -> bool; int2, int4, int8, oid -> int; float4, float8 -> float
+//   (NaN and Infinity included); numeric, money -> string; text, varchar,
+//   char, name, uuid, date, time, timestamp(tz), interval, inet -> string;
+//   bytea -> block; json, jsonb -> the parsed value; arrays of bool, the
+//   integers, the floats, text and varchar -> arrays; NULL -> nil; anything
+//   else -> its text.
+//
+// Errors raise PgError: Error is the server's message, SqlState its code
+// ("23505"), Severity, Detail, Hint, Constraint and Fields (every field the
+// server sent: severity, code, message, detail, hint, position, where, schema,
+// table, column, dataType, constraint, file, line, routine). Kind is "server"
+// for a failed statement - the connection stays usable - or "connect", "tls",
+// "auth", "timeout", "closed" or "protocol" when the connection is gone.
+//
+// Transactions:
+//   Transaction(f) -> bool    BEGIN, f(), COMMIT. f returning false rolls back
+//                             (and returns false); f raising rolls back and the
+//                             exception goes on unchanged. Inside another
+//                             transaction it uses a SAVEPOINT, so they nest.
+//                             f may take the connection as its argument.
+//   Begin() Commit() Rollback()   TransactionStatus() -> "idle" | "transaction" | "failed"
+//
+// LISTEN/NOTIFY:
+//   Listen(channel)  Unlisten(channel?)  Notify(channel, payload?)
+//   WaitNotification(timeoutMs?) -> { channel, payload, pid } | nil after timeoutMs
+//   Notifications() -> every notification that has arrived, and clears them
+//   WaitNotification holds the connection while it waits, so listen on a
+//   connection of its own.
+//
+// COPY:
+//   CopyIn(sql, data) -> rows    "COPY t FROM STDIN" fed from a string or block
+//                                in the COPY format of sql, or from an array
+//                                of row arrays (text format, NULL for nil)
+//   CopyOut(sql) -> string       "COPY t TO STDOUT"
+//
+// Other:
+//   Cancel()                    asks the server to stop this connection's query
+//   ServerParameter(name)       e.g. "server_version", "TimeZone"
+//   ProcessId()  IsConnected()  IsEncrypted()  Close()
+//   PgScram.ClientFirst/ClientFinal/Verify   the SCRAM steps, for tests
+//
+// Pool:
+//   let pool = new PgPool(conn, 8);
+//   let n = pool.Use(fn(db) { return db.ScalarInt("SELECT count(*) FROM t"); });
+//   pool.Acquire(timeoutMs?) / pool.Release(db) / pool.Stats() / pool.Close()
+//
+// One PgWire may be shared by several fibers: their statements queue and run
+// one at a time. Use a pool for statements that should run side by side.
+
+import { Kdf, Digest } from library("CryptoKit", "1.0");
+import { Util } from library("Util", "1.0");
+
+const _DEFAULT_PORT = 5432;
+const _DEFAULT_TIMEOUT_MS = 30000;
+const _MAX_MESSAGE = 1073741824;
+const _PROTOCOL_3 = 196608;
+const _SSL_REQUEST = 80877103;
+const _CANCEL_REQUEST = 80877102;
+
+class PgError : Exception {
+    let Kind: string = "server";   // server | connect | tls | auth | timeout | closed | protocol
+    let SqlState: string = "";     // the five-character SQLSTATE, e.g. "23505"
+    let Severity: string = "";     // ERROR, FATAL, PANIC
+    let Detail = nil;
+    let Hint = nil;
+    let Constraint = nil;
+    let Fields = nil;              // every field the server sent
+}
+
+fn _pgErr(kind: string, msg: string) {
+    let e = new PgError((kind == "server") ? Exception.RuntimeError : Exception.IOError, msg);
+    e.Kind = kind;
+    return e;
+}
+
+// ---- codec --------------------------------------------------------------------
+
+fn _putI32(b: block, off: int, v: int): int {
+    Buffer.WriteU32At(b, off, v, true);
+    return off + 4;
+}
+
+fn _putI16(b: block, off: int, v: int): int {
+    Buffer.WriteU16At(b, off, v, true);
+    return off + 2;
+}
+
+// s and its NUL terminator at off; returns the offset after it.
+fn _putCStr(b: block, off: int, s: string): int {
+    let n: int = String.Length(s);
+    if (n > 0) { Buffer.CopyStringAt(b, off, s, n); }
+    b[off + n] = 0;
+    return off + n + 1;
+}
+
+// A frontend message: type byte, length, payload. type 0 = a startup-style
+// message without the type byte.
+fn _message(type: int, payload: block): block {
+    let n: int = len(payload);
+    let head: int = (type == 0) ? 4 : 5;
+    let b: block = Buffer.Create(head + n, 1);
+    var o: int = 0;
+    if (type != 0) { b[0] = type; o = 1; }
+    _putI32(b, o, n + 4);
+    if (n > 0) { Buffer.Copy(payload, 0, b, head, n); }
+    return b;
+}
+
+// A message whose payload is one NUL-terminated string (Query, PasswordMessage).
+fn _textMessage(type: int, s: string): block {
+    let n: int = String.Length(s);
+    let b: block = Buffer.Create(6 + n, 1);
+    b[0] = type;
+    _putI32(b, 1, n + 5);
+    _putCStr(b, 5, s);
+    return b;
+}
+
+fn _cstrAt(b: block, off: int): string {
+    let end: int = Buffer.IndexOf(b, 0, off);
+    if (end < 0) { return Buffer.ToString(b, off, len(b) - off); }
+    if (end == off) { return ""; }
+    return Buffer.ToString(b, off, end - off);
+}
+
+fn _nibble(c: int): int {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// bytea in hex format ("\x0aff...") to its bytes; nil when malformed.
+fn _hexBytes(s: string): block|nil {
+    let n: int = String.Length(s);
+    if (n < 2 || (n % 2) != 0) { return nil; }
+    let out: block = Buffer.Create((n - 2) / 2, 1);
+    var i: int = 2;
+    var o: int = 0;
+    while (i < n) {
+        let hi: int = _nibble(Char.Code(String.CharAt(s, i)));
+        let lo: int = _nibble(Char.Code(String.CharAt(s, i + 1)));
+        if (hi < 0 || lo < 0) { return nil; }
+        out[o] = hi * 16 + lo;
+        o += 1;
+        i += 2;
+    }
+    return out;
+}
+
+// bytea in the old escape format (\\ and \ooo octal).
+fn _escapedBytes(s: string): block {
+    let src = Buffer.FromString(s);
+    let n = len(src);
+    let out = Buffer.Create(n, 1);
+    var o = 0;
+    var i = 0;
+    while (i < n) {
+        let c = src[i];
+        if (c == 92 && i + 1 < n && src[i + 1] == 92) { out[o] = 92; i += 2; }
+        else if (c == 92 && i + 3 < n) { out[o] = (src[i + 1] - 48) * 64 + (src[i + 2] - 48) * 8 + (src[i + 3] - 48); i += 4; }
+        else { out[o] = c; i += 1; }
+        o += 1;
+    }
+    return Buffer.Slice(out, 0, o);
+}
+
+fn _float(s: string) {
+    let f = Convert.ParseFloat(s);
+    if (f != nil) { return f; }
+    if (s == "Infinity") { return Math.Infinity; }
+    if (s == "-Infinity") { return -Math.Infinity; }
+    if (s == "NaN") { return Math.NaN; }
+    return s;
+}
+
+// Array element types this library decodes, by array type oid.
+fn _elemOid(oid: int): int {
+    if (oid == 1007) { return 23; }      // int4[]
+    if (oid == 1016) { return 20; }      // int8[]
+    if (oid == 1005) { return 21; }      // int2[]
+    if (oid == 1009) { return 25; }      // text[]
+    if (oid == 1015) { return 1043; }    // varchar[]
+    if (oid == 1000) { return 16; }      // bool[]
+    if (oid == 1021) { return 700; }     // float4[]
+    if (oid == 1022) { return 701; }     // float8[]
+    if (oid == 1231) { return 1700; }    // numeric[]
+    if (oid == 2951) { return 2950; }    // uuid[]
+    return 0;
+}
+
+// A column value from its text form.
+fn _decode(oid: int, s: string) {
+    if (oid == 23 || oid == 20 || oid == 21 || oid == 26) { return Convert.ParseInt(s) ?? s; }
+    if (oid == 16) { return s == "t"; }
+    if (oid == 701 || oid == 700) { return _float(s); }
+    if (oid == 17) {
+        if (String.StartsWith(s, "\\x")) { return _hexBytes(s) ?? Buffer.FromString(s); }
+        return _escapedBytes(s);
+    }
+    if (oid == 114 || oid == 3802) { return Json.Parse(s); }
+    let el = _elemOid(oid);
+    if (el != 0) { return _parseArray(s, el); }
+    return s;
+}
+
+// An array literal ({1,2,NULL}, {"a b",c}, {{1,2},{3,4}}) to nested arrays.
+fn _parseArray(s: string, el: int) {
+    let n = String.Length(s);
+    let start = String.IndexOf(s, "{");
+    if (start < 0) { return s; }
+    let stack = [[]];
+    var i = start + 1;
+    while (i < n) {
+        let c = String.CharAt(s, i);
+        if (c == '{') {
+            Array.Append(stack, []);
+            i += 1;
+            continue;
+        }
+        if (c == '}') {
+            if (len(stack) == 1) { return stack[0]; }
+            let done = stack[len(stack) - 1];
+            Array.RemoveAt(stack, len(stack) - 1);
+            Array.Append(stack[len(stack) - 1], done);
+            i += 1;
+            continue;
+        }
+        if (c == ',') { i += 1; continue; }
+        var text = "";
+        var quoted = false;
+        if (c == '"') {
+            quoted = true;
+            i += 1;
+            while (i < n && String.CharAt(s, i) != '"') {
+                if (String.CharAt(s, i) == '\\' && i + 1 < n) { i += 1; }
+                text += String.Substr(s, i, 1);
+                i += 1;
+            }
+            i += 1;
+        } else {
+            let end = String.IndexOfAnyFrom(s, ",}", i);
+            text = String.Substr(s, i, ((end < 0) ? n : end) - i);
+            i = (end < 0) ? n : end;
+        }
+        let top = stack[len(stack) - 1];
+        if (!quoted && text == "NULL") { Array.Append(top, nil); }
+        else { Array.Append(top, _decode(el, text)); }
+    }
+    return stack[0];
+}
+
+// A parameter's wire bytes: [format, text-or-block]; nil for NULL.
+fn _param(v) {
+    if (v == nil) { return nil; }
+    if (Type.IsString(v)) { return v; }
+    if (Type.IsInt(v)) { return str(v); }
+    if (Type.IsBool(v)) { return v ? "true" : "false"; }
+    if (Type.IsFloat(v)) {
+        if (Math.IsNaN(v)) { return "NaN"; }
+        if (!Math.IsFinite(v)) { return (v > 0.0) ? "Infinity" : "-Infinity"; }
+        return Json.Stringify(v);
+    }
+    if (Type.IsBlock(v)) { return v; }
+    if (Type.IsArray(v) || Type.IsObject(v)) { return Json.Stringify(v); }
+    if (Type.IsChar(v)) { return str(v); }
+    throw(Exception.InvalidArguments, "PgWire: a " + Type.Name(v) + " cannot be a query parameter");
+}
+
+// Parse + Bind + Describe + Execute + Sync for the unnamed statement.
+fn _extended(sql: string, params): block {
+    let np = (params == nil) ? 0 : len(params);
+    let vals = [];
+    var total = 0;
+    var anyBin = false;
+    iter (i from 0 to np) {
+        let p = _param(params[i]);
+        Array.Append(vals, p);
+        if (p == nil) { continue; }
+        if (Type.IsBlock(p)) { anyBin = true; total += len(p); }
+        else { total += String.Length(p); }
+    }
+    let sl = String.Length(sql);
+    let parseLen = 4 + 1 + sl + 1 + 2 + 4 * np;
+    let fmtCount = anyBin ? np : 0;
+    let bindLen = 4 + 1 + 1 + 2 + 2 * fmtCount + 2 + 4 * np + total + 2;
+    let size = (1 + parseLen) + (1 + bindLen) + 7 + 10 + 5;
+    let b = Buffer.Create(size, 1);
+    b[0] = 80;                                   // 'P'
+    var o = _putI32(b, 1, parseLen);
+    b[o] = 0;
+    o = _putCStr(b, o + 1, sql);
+    o = _putI16(b, o, np);
+    iter (i from 0 to np) { o = _putI32(b, o, (vals[i] != nil && Type.IsBlock(vals[i])) ? 17 : 0); }
+    b[o] = 66;                                   // 'B'
+    o = _putI32(b, o + 1, bindLen);
+    b[o] = 0;
+    b[o + 1] = 0;
+    o = _putI16(b, o + 2, fmtCount);
+    if (anyBin) {
+        iter (i from 0 to np) { o = _putI16(b, o, (vals[i] != nil && Type.IsBlock(vals[i])) ? 1 : 0); }
+    }
+    o = _putI16(b, o, np);
+    iter (i from 0 to np) {
+        let v = vals[i];
+        if (v == nil) { o = _putI32(b, o, -1); continue; }
+        if (Type.IsBlock(v)) {
+            o = _putI32(b, o, len(v));
+            if (len(v) > 0) { Buffer.Copy(v, 0, b, o, len(v)); }
+            o += len(v);
+        } else {
+            let n = String.Length(v);
+            o = _putI32(b, o, n);
+            if (n > 0) { Buffer.CopyStringAt(b, o, v, n); }
+            o += n;
+        }
+    }
+    o = _putI16(b, o, 0);
+    b[o] = 68;                                   // 'D' portal
+    o = _putI32(b, o + 1, 6);
+    b[o] = 80;
+    b[o + 1] = 0;
+    o += 2;
+    b[o] = 69;                                   // 'E'
+    o = _putI32(b, o + 1, 9);
+    b[o] = 0;
+    o = _putI32(b, o + 1, 0);
+    b[o] = 83;                                   // 'S'
+    _putI32(b, o + 1, 4);
+    return b;
+}
+
+// "INSERT 0 3" -> 3, "SELECT 5" -> 5, "CREATE TABLE" -> 0.
+fn _tagCount(tag: string): int {
+    let sp = String.LastIndexOf(tag, " ");
+    if (sp < 0) { return 0; }
+    return Convert.ParseInt(String.Substr(tag, sp + 1)) ?? 0;
+}
+
+fn _tagCommand(tag: string): string {
+    let sp = String.IndexOf(tag, " ");
+    return (sp < 0) ? tag : String.Substr(tag, 0, sp);
+}
+
+const _FIELD_NAMES = { S: "severity", V: "severityCode", C: "code", M: "message", D: "detail", H: "hint",
+                       P: "position", p: "internalPosition", q: "internalQuery", W: "where", s: "schema",
+                       t: "table", c: "column", d: "dataType", n: "constraint", F: "file", L: "line", R: "routine" };
+
+// The fields of an ErrorResponse or NoticeResponse body.
+fn _errorFields(b: block) {
+    let out = {};
+    var off = 0;
+    let n = len(b);
+    while (off < n && b[off] != 0) {
+        let code = Buffer.ToString(b, off, 1);
+        let v = _cstrAt(b, off + 1);
+        out[Object.TryGet(_FIELD_NAMES, code, code)] = v;
+        off += 2 + String.Length(v);
+    }
+    return out;
+}
+
+fn _serverError(b: block) {
+    let f = _errorFields(b);
+    let e = _pgErr("server", f.message ?? "unknown error");
+    e.SqlState = f.code ?? "";
+    e.Severity = f.severityCode ?? (f.severity ?? "");
+    e.Detail = f.detail;
+    e.Hint = f.hint;
+    e.Constraint = f.constraint;
+    e.Fields = f;
+    return e;
+}
+
+// COPY text format for one value.
+fn _copyText(v): string {
+    if (v == nil) { return "\\N"; }
+    let p = _param(v);
+    let s = Type.IsBlock(p) ? "\\x" + Util.BinToHex(p) : p;
+    if (String.IndexOfAnyFrom(s, "\\\t\n\r", 0) < 0) { return s; }
+    return String.Replace(String.Replace(String.Replace(String.Replace(s, "\\", "\\\\"), "\t", "\\t"), "\n", "\\n"), "\r", "\\r");
+}
+
+fn _quoteIdent(s: string): string {
+    return "\"" + String.Replace(s, "\"", "\"\"") + "\"";
+}
+
+fn _pctDecode(s: string): string {
+    if (!String.Contains(s, "%")) { return s; }
+    let b = Buffer.FromString(s);
+    let n = len(b);
+    let out = Buffer.Create(n, 1);
+    var o = 0;
+    var i = 0;
+    while (i < n) {
+        let c = b[i];
+        if (c == 37 && i + 2 < n) {
+            let h = Convert.ParseRadix(Buffer.ToString(b, i + 1, 2), 16);
+            if (h != nil) { out[o] = h; o += 1; i += 3; continue; }
+        }
+        out[o] = c;
+        o += 1;
+        i += 1;
+    }
+    return Buffer.ToString(out, 0, o);
+}
+
+// libpq "key=value key='quoted value'" pairs into o.
+fn _parseKeywords(s: string, o) {
+    let n = String.Length(s);
+    var i = 0;
+    while (i < n) {
+        while (i < n && String.CharAt(s, i) == ' ') { i += 1; }
+        if (i >= n) { break; }
+        let eq = String.IndexOfFrom(s, "=", i);
+        if (eq < 0) { throw _pgErr("connect", "PgWire: malformed connection string near '" + String.Substr(s, i) + "'"); }
+        let key = String.Trim(String.Substr(s, i, eq - i));
+        i = eq + 1;
+        while (i < n && String.CharAt(s, i) == ' ') { i += 1; }
+        var val = "";
+        if (i < n && String.CharAt(s, i) == '\'') {
+            i += 1;
+            while (i < n && String.CharAt(s, i) != '\'') {
+                if (String.CharAt(s, i) == '\\' && i + 1 < n) { i += 1; }
+                val += String.Substr(s, i, 1);
+                i += 1;
+            }
+            i += 1;
+        } else {
+            let sp = String.IndexOfFrom(s, " ", i);
+            let end = (sp < 0) ? n : sp;
+            val = String.Substr(s, i, end - i);
+            i = end;
+        }
+        o[key] = val;
+    }
+}
+
+// Any accepted connection form to one options object with libpq defaults.
+fn _connOptions(conn) {
+    let o = {};
+    if (Type.IsObject(conn)) {
+        foreach (v, k in conn) { o[k] = v; }
+    } else if (Type.IsString(conn) && (String.StartsWith(conn, "postgresql://") || String.StartsWith(conn, "postgres://"))) {
+        var rest = String.Substr(conn, String.IndexOf(conn, "://") + 3);
+        let q = String.IndexOf(rest, "?");
+        if (q >= 0) {
+            foreach (pair in String.Split(String.Substr(rest, q + 1), "&")) {
+                let eq = String.IndexOf(pair, "=");
+                if (eq > 0) { o[String.Substr(pair, 0, eq)] = _pctDecode(String.Substr(pair, eq + 1)); }
+            }
+            rest = String.Substr(rest, 0, q);
+        }
+        let slash = String.IndexOf(rest, "/");
+        if (slash >= 0) {
+            let db = String.Substr(rest, slash + 1);
+            if (db != "") { o.dbname = _pctDecode(db); }
+            rest = String.Substr(rest, 0, slash);
+        }
+        let at = String.LastIndexOf(rest, "@");
+        if (at >= 0) {
+            let cred = String.Substr(rest, 0, at);
+            rest = String.Substr(rest, at + 1);
+            let colon = String.IndexOf(cred, ":");
+            if (colon < 0) { o.user = _pctDecode(cred); }
+            else {
+                o.user = _pctDecode(String.Substr(cred, 0, colon));
+                o.password = _pctDecode(String.Substr(cred, colon + 1));
+            }
+        }
+        if (String.StartsWith(rest, "[")) {
+            let close = String.IndexOf(rest, "]");
+            o.host = String.Substr(rest, 1, close - 1);
+            if (close + 2 < String.Length(rest)) { o.port = String.Substr(rest, close + 2); }
+        } else if (rest != "") {
+            let colon = String.LastIndexOf(rest, ":");
+            if (colon >= 0) { o.host = String.Substr(rest, 0, colon); o.port = String.Substr(rest, colon + 1); }
+            else { o.host = rest; }
+        }
+    } else if (Type.IsString(conn)) {
+        _parseKeywords(conn, o);
+    } else if (conn != nil) {
+        throw(Exception.InvalidArguments, "PgWire: a connection is a URI, a keyword string or an object");
+    }
+    let host = Object.TryGet(o, "host", nil) ?? Os.Getenv("PGHOST");
+    o.host = (host == nil || host == "") ? "localhost" : host;
+    let port = Object.TryGet(o, "port", nil) ?? Os.Getenv("PGPORT");
+    o.port = (port == nil || port == "") ? _DEFAULT_PORT : int(port);
+    let user = Object.TryGet(o, "user", nil) ?? Os.Getenv("PGUSER");
+    o.user = (user == nil || user == "") ? "postgres" : user;
+    if (Object.TryGet(o, "password", nil) == nil) { o.password = Os.Getenv("PGPASSWORD"); }
+    let db = Object.TryGet(o, "database", nil) ?? (Object.TryGet(o, "dbname", nil) ?? Os.Getenv("PGDATABASE"));
+    o.database = (db == nil || db == "") ? o.user : db;
+    if (Object.TryGet(o, "sslmode", nil) == nil) { o.sslmode = Os.Getenv("PGSSLMODE") ?? "prefer"; }
+    let ct = Object.TryGet(o, "connect_timeout", nil);
+    if (ct != nil && Object.TryGet(o, "connectTimeoutMs", nil) == nil) { o.connectTimeoutMs = int(ct) * 1000; }
+    let an = Object.TryGet(o, "application_name", nil);
+    if (an != nil && Object.TryGet(o, "applicationName", nil) == nil) { o.applicationName = an; }
+    if (Type.IsString(Object.TryGet(o, "timeoutMs", nil))) { o.timeoutMs = int(o.timeoutMs); }
+    return o;
+}
+
+// ---- SCRAM-SHA-256 ------------------------------------------------------------
+
+class PgScram {
+    // The client-first-message-bare: n=<user>,r=<nonce>.
+    fn static ClientFirstBare(user: string, nonce: string): string {
+        return "n=" + String.Replace(String.Replace(user, "=", "=3D"), ",", "=2C") + ",r=" + nonce;
+    }
+
+    // The client-first-message, without channel binding.
+    fn static ClientFirst(user: string, nonce: string): string {
+        return "n,," + PgScram.ClientFirstBare(user, nonce);
+    }
+
+    fn static NewNonce(): string {
+        return Util.Base64Encode(Crypto.RandomBytes(18));
+    }
+
+    // From the server-first-message to the client-final-message:
+    // { message, serverSignature } or { error }.
+    fn static ClientFinal(password: string, clientFirstBare: string, serverFirst: string, clientNonce: string) {
+        var r = nil;
+        var salt = nil;
+        var iters = 0;
+        foreach (part in String.Split(serverFirst, ",")) {
+            if (String.StartsWith(part, "r=")) { r = String.Substr(part, 2); }
+            else if (String.StartsWith(part, "s=")) { salt = Util.Base64DecodeBlock(String.Substr(part, 2)); }
+            else if (String.StartsWith(part, "i=")) { iters = Convert.ParseInt(String.Substr(part, 2)) ?? 0; }
+        }
+        if (r == nil || salt == nil || len(salt) == 0) { return { error: "malformed server-first-message" }; }
+        if (!String.StartsWith(r, clientNonce) || String.Length(r) <= String.Length(clientNonce)) {
+            return { error: "the server nonce does not extend the client nonce" };
+        }
+        if (iters < 1 || iters > 10000000) { return { error: "unreasonable iteration count " + str(iters) }; }
+        let salted = Kdf.Pbkdf2(password, salt, iters, 32);
+        let clientKey = Crypto.HmacSha256(salted, "Client Key", true);
+        let storedKey = Hash.Sha256(clientKey, true);
+        let withoutProof = "c=biws,r=" + r;
+        let authMessage = clientFirstBare + "," + serverFirst + "," + withoutProof;
+        let signature = Crypto.HmacSha256(storedKey, authMessage, true);
+        let proof = Buffer.Create(32, 1);
+        iter (i from 0 to 32) { proof[i] = clientKey[i] ^ signature[i]; }
+        let serverKey = Crypto.HmacSha256(salted, "Server Key", true);
+        let serverSignature = Crypto.HmacSha256(serverKey, authMessage, true);
+        return { message: withoutProof + ",p=" + Util.Base64Encode(proof), serverSignature: Util.Base64Encode(serverSignature) };
+    }
+
+    // True when the server-final-message proves the server knows the password.
+    fn static Verify(serverFinal: string, serverSignature: string): bool {
+        if (!String.StartsWith(serverFinal, "v=")) { return false; }
+        let v = String.Substr(serverFinal, 2);
+        let comma = String.IndexOf(v, ",");
+        return Crypto.ConstantTimeEquals((comma < 0) ? v : String.Substr(v, 0, comma), serverSignature);
+    }
+}
+
+// ---- the connection -----------------------------------------------------------
+
+class PgWire {
+    let _opts = nil;
+    let _sock = nil;
+    let _timeoutMs: int = _DEFAULT_TIMEOUT_MS;
+    let _closed: bool = false;
+    let _busy: bool = false;
+    let _waiters = [];
+    let _params = {};
+    let _pid: int = 0;
+    let _secret: int = 0;
+    let _tx: int = 73;               // the ReadyForQuery status byte: I, T or E
+    let _depth: int = 0;             // Transaction() nesting
+    let _notes = [];
+    let _onNotice = nil;
+    let _encrypted: bool = false;
+    let _mt: int = 0;                // the message _readMsg just read
+    let _mb = nil;
+
+    fn Constructor(opts) {
+        _opts = opts;
+        _timeoutMs = Object.TryGet(opts, "timeoutMs", nil) ?? _DEFAULT_TIMEOUT_MS;
+        _onNotice = Object.TryGet(opts, "onNotice", nil);
+    }
+
+    fn static Connect(conn) {
+        let db = new PgWire(_connOptions(conn));
+        db._open();
+        return db;
+    }
+
+    fn IsConnected(): bool { return _sock != nil && Stream.IsOpen(_sock); }
+    fn IsEncrypted(): bool { return _encrypted; }
+    fn ProcessId(): int { return _pid; }
+    fn ServerParameter(name: string) { return Object.TryGet(_params, name, nil); }
+
+    fn TransactionStatus(): string {
+        if (_tx == 84) { return "transaction"; }
+        if (_tx == 69) { return "failed"; }
+        return "idle";
+    }
+
+    fn Close() {
+        if (_sock != nil) {
+            if (!_busy) { Stream.WriteAll(_sock, _message(88, Buffer.Create(0, 1))); }
+            Stream.Close(_sock);
+            _sock = nil;
+        }
+        _closed = true;
+        return true;
+    }
+
+    fn Destructor() {
+        if (_sock != nil) { Stream.Close(_sock); }
+    }
+
+    // ---- queries ----
+
+    fn Execute(sql: string, params?) {
+        let results = this._run(sql, params);
+        if (len(results) == 0) { return { rows: [], rowCount: 0, command: "", fields: [] }; }
+        return results[len(results) - 1];
+    }
+
+    fn SimpleQuery(sql: string) { return this._run(sql, nil); }
+
+    fn Query(sql: string, params?) { return this.Execute(sql, params).rows; }
+    fn QueryParams(sql: string, params) { return this.Execute(sql, params).rows; }
+
+    fn QueryOne(sql: string, params?) {
+        let rows = this.Execute(sql, params).rows;
+        return (len(rows) == 0) ? nil : rows[0];
+    }
+    fn QueryOneParams(sql: string, params) { return this.QueryOne(sql, params); }
+
+    fn QueryValue(sql: string, params?) {
+        let r = this.Execute(sql, params);
+        if (len(r.rows) == 0 || len(r.fields) == 0) { return nil; }
+        return r.rows[0][r.fields[0].name];
+    }
+    fn QueryValueParams(sql: string, params) { return this.QueryValue(sql, params); }
+
+    fn ScalarInt(sql: string, params?) {
+        let v = this.QueryValue(sql, params);
+        if (v == nil) { return nil; }
+        if (Type.IsInt(v)) { return v; }
+        return Convert.TryParseInt(v);
+    }
+    fn ScalarIntParams(sql: string, params) { return this.ScalarInt(sql, params); }
+
+    fn ScalarString(sql: string, params?) {
+        let v = this.QueryValue(sql, params);
+        if (v == nil) { return nil; }
+        if (Type.IsString(v)) { return v; }
+        if (Type.IsBlock(v)) { return Buffer.ToString(v); }
+        if (Type.IsArray(v) || Type.IsObject(v)) { return Json.Stringify(v); }
+        return str(v);
+    }
+    fn ScalarStringParams(sql: string, params) { return this.ScalarString(sql, params); }
+
+    fn Exec(sql: string, params?): int { return this.Execute(sql, params).rowCount; }
+    fn ExecParams(sql: string, params): int { return this.Execute(sql, params).rowCount; }
+
+    fn ExecMany(sql: string, paramsList?): int {
+        if (paramsList == nil) { return this.Exec(sql); }
+        var total = 0;
+        foreach (p in paramsList) { total += this.Execute(sql, p).rowCount; }
+        return total;
+    }
+
+    fn QueryMap(sql: string, keyField: string, params?) {
+        let out = {};
+        foreach (row in this.Execute(sql, params).rows) {
+            let k = row[keyField];
+            if (k != nil) { out[str(k)] = row; }
+        }
+        return out;
+    }
+
+    // ---- transactions ----
+
+    fn Begin() { this._run("BEGIN", nil); return nil; }
+    fn Commit() { this._run("COMMIT", nil); return nil; }
+    fn Rollback() { this._run("ROLLBACK", nil); return nil; }
+
+    fn Transaction(f) {
+        let nested = _tx != 73;
+        let sp = "flaris_sp_" + str(_depth + 1);
+        this._run(nested ? "SAVEPOINT " + sp : "BEGIN", nil);
+        _depth += 1;
+        var r = nil;
+        try {
+            let info = VM.GetFunctionInfo(f);
+            r = (info != nil && info.Arity >= 1) ? f(this) : f();
+        } catch (e) {
+            _depth -= 1;
+            this._tryRun(nested ? "ROLLBACK TO SAVEPOINT " + sp + "; RELEASE SAVEPOINT " + sp : "ROLLBACK");
+            throw e;
+        }
+        _depth -= 1;
+        if (r == false) {
+            this._run(nested ? "ROLLBACK TO SAVEPOINT " + sp + "; RELEASE SAVEPOINT " + sp : "ROLLBACK", nil);
+            return false;
+        }
+        this._run(nested ? "RELEASE SAVEPOINT " + sp : "COMMIT", nil);
+        return true;
+    }
+
+    // A rollback while an exception is already on its way: its own failure
+    // must not replace that exception.
+    fn _tryRun(sql: string): bool {
+        try {
+            this._run(sql, nil);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // ---- LISTEN / NOTIFY ----
+
+    fn Listen(channel: string) { this._run("LISTEN " + _quoteIdent(channel), nil); return nil; }
+
+    fn Unlisten(channel?) {
+        this._run((channel == nil) ? "UNLISTEN *" : "UNLISTEN " + _quoteIdent(channel), nil);
+        return nil;
+    }
+
+    fn Notify(channel: string, payload?) {
+        this._run("SELECT pg_notify($1, $2)", [channel, payload ?? ""]);
+        return nil;
+    }
+
+    fn Notifications() {
+        let all = _notes;
+        _notes = [];
+        return all;
+    }
+
+    // The next notification, waiting up to timeoutMs (omitted: no limit); nil
+    // when none came in time.
+    fn WaitNotification(timeoutMs?) {
+        if (len(_notes) > 0) { return this._nextNote(); }
+        let limit = timeoutMs ?? -1;
+        let deadline = Time.Millis() + limit;
+        this._enter();
+        try {
+            while (len(_notes) == 0) {
+                let left = (limit < 0) ? -1 : deadline - Time.Millis();
+                if (limit >= 0 && left <= 0) { return nil; }
+                if (Stream.WaitReadable(_sock, (limit < 0) ? -1 : left) == nil) {
+                    if (Stream.LastError() == 1) { return nil; }
+                    this._lost();
+                }
+                let t = this._readMsg();
+                if (!this._async(t)) { this._protocol("unexpected message " + str(t) + " while idle"); }
+            }
+            return this._nextNote();
+        } finally {
+            this._leave();
+        }
+    }
+
+    fn _nextNote() {
+        let n = _notes[0];
+        Array.RemoveAt(_notes, 0);
+        return n;
+    }
+
+    // ---- COPY ----
+
+    fn CopyIn(sql: string, data): int {
+        this._enter();
+        try {
+            this._send(_textMessage(81, sql));
+            var sent = false;
+            var count = 0;
+            var err = nil;
+            while (true) {
+                let t = this._readMsg();
+                if (t == 71 && !sent) {                 // CopyInResponse
+                    sent = true;
+                    this._copyData(data);
+                    continue;
+                }
+                if (t == 67) { count = _tagCount(_cstrAt(_mb, 0)); continue; }
+                if (t == 69) { err = _serverError(_mb); continue; }
+                if (t == 90) { _tx = _mb[0]; break; }
+                if (!this._async(t)) { this._protocol("unexpected message " + str(t) + " during COPY"); }
+            }
+            if (err != nil) { throw err; }
+            if (!sent) { throw _pgErr("protocol", "PgWire: the statement is not COPY ... FROM STDIN"); }
+            return count;
+        } finally {
+            this._leave();
+        }
+    }
+
+    fn _copyData(data) {
+        var chunk = "";
+        if (Type.IsArray(data)) {
+            foreach (row in data) {
+                if (Type.IsArray(row)) {
+                    var first = true;
+                    foreach (v in row) {
+                        if (!first) { chunk += "\t"; }
+                        chunk += _copyText(v);
+                        first = false;
+                    }
+                } else {
+                    chunk += _copyText(row);
+                }
+                chunk += "\n";
+                if (String.Length(chunk) >= 65536) { this._send(_message(100, Buffer.FromString(chunk))); chunk = ""; }
+            }
+        } else if (Type.IsBlock(data)) {
+            var off = 0;
+            while (off < len(data)) {
+                let n = Math.Min(65536, len(data) - off);
+                this._send(_message(100, Buffer.Slice(data, off, n)));
+                off += n;
+            }
+        } else if (data != nil) {
+            chunk = Type.IsString(data) ? data : str(data);
+        }
+        if (String.Length(chunk) > 0) { this._send(_message(100, Buffer.FromString(chunk))); }
+        this._send(_message(99, Buffer.Create(0, 1)));
+    }
+
+    fn CopyOut(sql: string): string {
+        this._enter();
+        try {
+            this._send(_textMessage(81, sql));
+            var out = "";
+            var started = false;
+            var err = nil;
+            while (true) {
+                let t = this._readMsg();
+                if (t == 100) { out += Buffer.ToString(_mb); continue; }
+                if (t == 72) { started = true; continue; }
+                if (t == 99 || t == 67 || t == 84 || t == 68) { continue; }
+                if (t == 69) { err = _serverError(_mb); continue; }
+                if (t == 90) { _tx = _mb[0]; break; }
+                if (!this._async(t)) { this._protocol("unexpected message " + str(t) + " during COPY"); }
+            }
+            if (err != nil) { throw err; }
+            if (!started) { throw _pgErr("protocol", "PgWire: the statement is not COPY ... TO STDOUT"); }
+            return out;
+        } finally {
+            this._leave();
+        }
+    }
+
+    // ---- cancel ----
+
+    // Ask the server, on a connection of its own, to cancel what this one runs.
+    fn Cancel(): bool {
+        if (_pid == 0) { return false; }
+        let s = Fiber.Await(Stream.ConnectAsync("tcp", _opts.host, _opts.port, Math.Min(5000, _timeoutMs)));
+        if (s == nil) { return false; }
+        let b = Buffer.Create(16, 1);
+        _putI32(b, 0, 16);
+        _putI32(b, 4, _CANCEL_REQUEST);
+        _putI32(b, 8, _pid);
+        _putI32(b, 12, _secret);
+        let ok = Stream.WriteAll(s, b) == true;
+        Stream.Close(s);
+        return ok;
+    }
+
+    // ---- the round trip ----
+
+    // Results of sql: simple protocol without params, extended with them.
+    fn _run(sql: string, params) {
+        this._enter();
+        try {
+            if (params == nil) { this._send(_textMessage(81, sql)); }
+            else { this._send(_extended(sql, params)); }
+            return this._collect();
+        } finally {
+            this._leave();
+        }
+    }
+
+    // Read up to ReadyForQuery: one result per statement; an ErrorResponse
+    // is raised once the server is ready again.
+    fn _collect() {
+        let results = [];
+        var cur = nil;
+        var names = nil;
+        var oids = nil;
+        var err = nil;
+        while (true) {
+            let t = Stream.ReadU8(_sock);
+            if (t == nil) { this._lost(); }
+            if (t == 68) {                                   // DataRow, read in place
+                if (Stream.ReadI32(_sock, true) == nil) { this._lost(); }
+                let nf = Stream.ReadI16(_sock, true);
+                if (nf == nil) { this._lost(); }
+                if (names == nil || nf > len(names)) { this._protocol("a DataRow that does not fit its RowDescription"); }
+                let row = {};
+                iter (i from 0 to nf) {
+                    let fl = Stream.ReadI32(_sock, true);
+                    if (fl == nil) { this._lost(); }
+                    if (fl < 0) { row[names[i]] = nil; continue; }
+                    var v = "";
+                    if (fl > 0) {
+                        v = Stream.ReadString(_sock, fl);
+                        if (v == nil) { this._lost(); }
+                        while (String.Length(v) < fl) {
+                            let more = Stream.ReadString(_sock, fl - String.Length(v));
+                            if (more == nil) { this._lost(); }
+                            v += more;
+                        }
+                    }
+                    let oid = oids[i];
+                    row[names[i]] = (oid == 25 || oid == 1043) ? v : _decode(oid, v);
+                }
+                if (cur != nil) { Array.Append(cur.rows, row); }
+                continue;
+            }
+            this._readBody(t);
+            if (t == 84) {                                   // RowDescription
+                cur = this._rowDescription(_mb);
+                names = cur.names;
+                oids = cur.oids;
+                continue;
+            }
+            if (t == 67) {                                   // CommandComplete
+                let tag = _cstrAt(_mb, 0);
+                if (cur == nil) { cur = { rows: [], fields: [] }; }
+                Array.Append(results, { rows: cur.rows, rowCount: _tagCount(tag), command: _tagCommand(tag), fields: cur.fields });
+                cur = nil;
+                continue;
+            }
+            if (t == 90) { _tx = _mb[0]; break; }             // ReadyForQuery
+            if (t == 69) { err = _serverError(_mb); cur = nil; continue; }
+            if (t == 49 || t == 50 || t == 110 || t == 116 || t == 51) { continue; }
+            if (t == 73) {                                   // EmptyQueryResponse
+                Array.Append(results, { rows: [], rowCount: 0, command: "", fields: [] });
+                continue;
+            }
+            if (t == 71) {                                   // COPY FROM STDIN through Query
+                this._send(_textMessage(102, "use CopyIn for COPY FROM STDIN"));
+                continue;
+            }
+            if (t == 72 || t == 100 || t == 99) { continue; }  // COPY TO STDOUT through Query
+            if (!this._async(t)) { this._protocol("unexpected message type " + str(t)); }
+        }
+        if (err != nil) { throw err; }
+        return results;
+    }
+
+    fn _rowDescription(b: block) {
+        let nf = Buffer.ReadU16At(b, 0, true);
+        var off = 2;
+        let fields = [];
+        let names = [];
+        let oids = [];
+        iter (i from 0 to nf) {
+            let name = _cstrAt(b, off);
+            off += String.Length(name) + 1;
+            let oid = Buffer.ReadU32At(b, off + 6, true);
+            off += 18;
+            Array.Append(fields, { name: name, type: oid });
+            Array.Append(names, name);
+            Array.Append(oids, oid);
+        }
+        return { rows: [], fields: fields, names: names, oids: oids };
+    }
+
+    // NoticeResponse, NotificationResponse and ParameterStatus can arrive at
+    // any time; true when t was one of them.
+    fn _async(t: int): bool {
+        if (t == 78) {
+            if (_onNotice != nil) {
+                let f = _errorFields(_mb);
+                try { _onNotice(f); } catch (e) { Console.Error("PgWire: onNotice raised: " + e.Error); }
+            }
+            return true;
+        }
+        if (t == 65) {
+            let pid = Buffer.ReadU32At(_mb, 0, true);
+            let channel = _cstrAt(_mb, 4);
+            let payload = _cstrAt(_mb, 5 + String.Length(channel));
+            Array.Append(_notes, { channel: channel, payload: payload, pid: pid });
+            return true;
+        }
+        if (t == 83) {
+            let name = _cstrAt(_mb, 0);
+            _params[name] = _cstrAt(_mb, String.Length(name) + 1);
+            return true;
+        }
+        return false;
+    }
+
+    // One whole message into _mt and _mb; returns its type.
+    fn _readMsg(): int {
+        let t = Stream.ReadU8(_sock);
+        if (t == nil) { this._lost(); }
+        this._readBody(t);
+        return t;
+    }
+
+    fn _readBody(t: int) {
+        let n = Stream.ReadI32(_sock, true);
+        if (n == nil) { this._lost(); }
+        if (n < 4 || n > _MAX_MESSAGE) { this._protocol("bad message length " + str(n) + " for type " + str(t)); }
+        _mt = t;
+        if (n == 4) {
+            _mb = Buffer.Create(0, 1);
+            return;
+        }
+        let want = n - 4;
+        let b = Stream.ReadBytes(_sock, want);
+        if (b == nil) { this._lost(); }
+        while (len(b) < want) {
+            let more = Stream.ReadBytes(_sock, want - len(b));
+            if (more == nil) { this._lost(); }
+            Buffer.Append(b, more);
+        }
+        _mb = b;
+    }
+
+    fn _send(b: block) {
+        if (!Stream.WriteAll(_sock, b)) { this._lost(); }
+    }
+
+    fn _enter() {
+        if (_busy) {
+            let deadline = Time.Millis() + _timeoutMs;
+            let me = Fiber.Id();
+            while (_busy) {
+                let left = deadline - Time.Millis();
+                if (left <= 0) { throw _pgErr("timeout", "PgWire: another fiber held the connection for " + str(_timeoutMs) + " ms"); }
+                Array.Append(_waiters, me);
+                Fiber.Park(left);
+            }
+        }
+        if (_sock == nil) { throw _pgErr("closed", "PgWire: the connection is closed"); }
+        _busy = true;
+    }
+
+    fn _leave() {
+        _busy = false;
+        while (len(_waiters) > 0) {
+            let f = Fiber.FromId(_waiters[0]);
+            Array.RemoveAt(_waiters, 0);
+            if (f != nil && Fiber.Unpark(f)) { break; }
+        }
+    }
+
+    // The link failed mid-exchange: cancel what may still run, close, raise.
+    fn _lost() {
+        let code = Stream.LastError();
+        if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+        if (_closed) { throw _pgErr("closed", "PgWire: the connection is closed"); }
+        if (code == 1) {
+            this.Cancel();
+            throw _pgErr("timeout", "PgWire: no answer from the server within " + str(_timeoutMs) + " ms");
+        }
+        throw _pgErr("closed", "PgWire: the server closed the connection");
+    }
+
+    fn _protocol(msg: string) {
+        if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+        throw _pgErr("protocol", "PgWire: " + msg);
+    }
+
+    // ---- startup ----
+
+    fn _open() {
+        let host = _opts.host;
+        let port = _opts.port;
+        let connectMs = Object.TryGet(_opts, "connectTimeoutMs", nil) ?? _timeoutMs;
+        let mode = Object.TryGet(_opts, "sslmode", "prefer");
+        if (mode != "disable" && mode != "prefer" && mode != "require" && mode != "verify-full" && mode != "verify-ca" && mode != "allow") {
+            throw _pgErr("connect", "PgWire: unknown sslmode '" + str(mode) + "'");
+        }
+        let s = Fiber.Await(Stream.ConnectAsync("tcp", host, port, connectMs));
+        if (s == nil) {
+            let why = (Stream.LastError() == 1) ? "timed out" : "refused or unreachable";
+            throw _pgErr("connect", "PgWire: cannot connect to " + host + ":" + str(port) + " (" + why + ")");
+        }
+        Stream.SetNoDelay(s, true);
+        Stream.SetTimeout(s, connectMs);
+        _sock = s;
+        try {
+            if (mode != "disable" && mode != "allow") { this._ssl(mode, host, connectMs); }
+            this._startup();
+        } catch (e) {
+            if (_sock != nil) { Stream.Close(_sock); _sock = nil; }
+            throw e;
+        }
+        Stream.SetTimeout(_sock, _timeoutMs);
+    }
+
+    fn _ssl(mode: string, host: string, connectMs: int) {
+        let req = Buffer.Create(8, 1);
+        _putI32(req, 0, 8);
+        _putI32(req, 4, _SSL_REQUEST);
+        this._send(req);
+        let answer = Stream.ReadU8(_sock);
+        if (answer == nil) { this._lost(); }
+        if (answer == 83) {                                     // 'S'
+            let opts = { timeoutMs: connectMs };
+            if (mode == "verify-full" || mode == "verify-ca") { opts.sni = Object.TryGet(_opts, "sni", nil) ?? host; }
+            else { opts.insecure = true; }
+            let up = Stream.StartTls(_sock, opts);
+            if (up == nil) {
+                _sock = nil;
+                throw _pgErr("tls", "PgWire: TLS handshake failed: " + (Stream.TlsLastError() ?? "unknown"));
+            }
+            _sock = up;
+            _encrypted = true;
+            return;
+        }
+        if (answer != 78) { this._protocol("unexpected answer to SSLRequest: " + str(answer)); }
+        if (mode != "prefer") { throw _pgErr("tls", "PgWire: the server does not accept TLS (sslmode=" + mode + ")"); }
+    }
+
+    fn _startup() {
+        let user = _opts.user;
+        let parts = ["user", user, "database", _opts.database,
+                     "application_name", Object.TryGet(_opts, "applicationName", "flaris") ?? "flaris",
+                     "client_encoding", "UTF8"];
+        let extra = Object.TryGet(_opts, "options", nil);
+        if (extra != nil) { Array.Append(parts, "options"); Array.Append(parts, extra); }
+        var size = 4 + 4 + 1;
+        foreach (p in parts) { size += String.Length(p) + 1; }
+        let b = Buffer.Create(size, 1);
+        var o = _putI32(b, 0, size);
+        o = _putI32(b, o, _PROTOCOL_3);
+        foreach (p in parts) { o = _putCStr(b, o, p); }
+        b[o] = 0;
+        this._send(b);
+
+        let password = Object.TryGet(_opts, "password", nil);
+        var scram = nil;
+        while (true) {
+            let t = this._readMsg();
+            let mb = _mb;
+            if (t == 82) {                                       // Authentication*
+                let code = Buffer.ReadU32At(mb, 0, true);
+                if (code == 0) { continue; }
+                if (code != 12 && password == nil) { throw _pgErr("auth", "PgWire: the server wants a password for user '" + user + "' and none was given"); }
+                if (code == 3) { this._send(_textMessage(112, password)); continue; }
+                if (code == 5) {
+                    let inner = Digest.Md5(password + user);
+                    let salted = Buffer.Concat(Buffer.FromString(inner), Buffer.Slice(mb, 4, 4));
+                    this._send(_textMessage(112, "md5" + Digest.Md5(salted)));
+                    continue;
+                }
+                if (code == 10) {
+                    var offered = false;
+                    var off = 4;
+                    while (off < len(mb) && mb[off] != 0) {
+                        let m = _cstrAt(mb, off);
+                        if (m == "SCRAM-SHA-256") { offered = true; }
+                        off += String.Length(m) + 1;
+                    }
+                    if (!offered) { throw _pgErr("auth", "PgWire: the server offers no SASL mechanism this client speaks"); }
+                    let nonce = PgScram.NewNonce();
+                    let bare = PgScram.ClientFirstBare("", nonce);
+                    scram = { nonce: nonce, bare: bare, sig: nil };
+                    let first = "n,," + bare;
+                    let mech = "SCRAM-SHA-256";
+                    let p = Buffer.Create(String.Length(mech) + 1 + 4 + String.Length(first), 1);
+                    var po = _putCStr(p, 0, mech);
+                    po = _putI32(p, po, String.Length(first));
+                    Buffer.CopyStringAt(p, po, first, String.Length(first));
+                    this._send(_message(112, p));
+                    continue;
+                }
+                if (code == 11) {
+                    if (scram == nil) { this._protocol("SASL continue without SASL"); }
+                    let fin = PgScram.ClientFinal(password, scram.bare, Buffer.ToString(mb, 4, len(mb) - 4), scram.nonce);
+                    if (fin.error != nil) { throw _pgErr("auth", "PgWire: SCRAM: " + fin.error); }
+                    scram.sig = fin.serverSignature;
+                    this._send(_message(112, Buffer.FromString(fin.message)));
+                    continue;
+                }
+                if (code == 12) {
+                    if (scram == nil || scram.sig == nil) { this._protocol("SASL final without SASL"); }
+                    if (!PgScram.Verify(Buffer.ToString(mb, 4, len(mb) - 4), scram.sig)) {
+                        throw _pgErr("auth", "PgWire: the server could not prove it knows the password (SCRAM server signature mismatch)");
+                    }
+                    continue;
+                }
+                throw _pgErr("auth", "PgWire: unsupported authentication method " + str(code) + " (only password, MD5 and SCRAM-SHA-256)");
+            }
+            if (t == 75) { _pid = Buffer.ReadU32At(mb, 0, true); _secret = Buffer.ReadI32At(mb, 4, true); continue; }
+            if (t == 90) { _tx = mb[0]; return; }
+            if (t == 69) {
+                let e = _serverError(mb);
+                if (e.SqlState == "28P01" || e.SqlState == "28000") { e.Kind = "auth"; }
+                else { e.Kind = "connect"; }
+                throw e;
+            }
+            if (t == 118) { continue; }                          // NegotiateProtocolVersion
+            if (!this._async(t)) { this._protocol("unexpected message type " + str(t) + " during startup"); }
+        }
+    }
+}
+
+// A fixed number of connections shared by many fibers.
+class PgPool {
+    let _opts = nil;
+    let _size: int = 4;
+    let _idle = [];
+    let _open: int = 0;
+    let _waiters = [];
+    let _closed: bool = false;
+
+    fn Constructor(conn, size: int) {
+        if (size <= 0) { throw(Exception.InvalidArguments, "PgPool: size must be at least 1"); }
+        _opts = _connOptions(conn);
+        _size = size;
+    }
+
+    fn Acquire(timeoutMs?) {
+        let limit = timeoutMs ?? (Object.TryGet(_opts, "timeoutMs", nil) ?? _DEFAULT_TIMEOUT_MS);
+        let deadline = Time.Millis() + limit;
+        while (true) {
+            if (_closed) { throw _pgErr("closed", "PgPool: the pool is closed"); }
+            while (len(_idle) > 0) {
+                let db = _idle[len(_idle) - 1];
+                Array.RemoveAt(_idle, len(_idle) - 1);
+                if (db.IsConnected()) { return db; }
+                _open -= 1;
+            }
+            if (_open < _size) {
+                _open += 1;
+                try {
+                    return PgWire.Connect(_opts);
+                } catch (e) {
+                    _open -= 1;
+                    throw e;
+                }
+            }
+            let left = deadline - Time.Millis();
+            if (left <= 0) { throw _pgErr("timeout", "PgPool: no connection was free within " + str(limit) + " ms"); }
+            Array.Append(_waiters, Fiber.Id());
+            Fiber.Park(left);
+        }
+    }
+
+    // Give db back; one that failed, or is left inside a transaction, is closed.
+    fn Release(db) {
+        if (db == nil) { return; }
+        if (_closed || !db.IsConnected() || db.TransactionStatus() != "idle") {
+            db.Close();
+            _open -= 1;
+        } else {
+            Array.Append(_idle, db);
+        }
+        while (len(_waiters) > 0) {
+            let f = Fiber.FromId(_waiters[0]);
+            Array.RemoveAt(_waiters, 0);
+            if (f != nil && Fiber.Unpark(f)) { break; }
+        }
+    }
+
+    fn Use(f) {
+        let db = this.Acquire();
+        try {
+            return f(db);
+        } finally {
+            this.Release(db);
+        }
+    }
+
+    fn Stats() {
+        return { total: _open, available: len(_idle), inUse: _open - len(_idle), capacity: _size };
+    }
+
+    fn Close() {
+        _closed = true;
+        foreach (db in _idle) { db.Close(); }
+        _open -= len(_idle);
+        _idle = [];
+        return nil;
+    }
+}
+
+export { PgWire, PgError, PgScram, PgPool };

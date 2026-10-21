@@ -5,8 +5,6 @@
 //   DateTime - a point in time with timezone, backed by a Unix timestamp (seconds).
 //   Duration - a signed length of time in whole seconds.
 //
-// ⚠ DST transitions are NOT modelled - standard UTC offsets only.
-//
 // Usage:
 //   import { DateTime, Duration } from library("Datetime", "1.0");
 //
@@ -17,12 +15,12 @@
 //
 //   // Timezones
 //   let berlin = DateTime.NowIn("Europe/Berlin");
-//   Console.WriteLine(berlin.ToString());               // "2025-06-01 14:30:00 Europe/Berlin"
-//   Console.WriteLine(berlin.ToISO());                  // "2025-06-01T14:30:00+02:00"
+//   Console.WriteLine(berlin.ToString());               // "2025-01-15 14:30:00 Europe/Berlin"
+//   Console.WriteLine(berlin.ToISO());                  // "2025-01-15T14:30:00+01:00" (+02:00 in summer)
 //
 //   // Construct an exact moment
 //   let d = DateTime.Of(2025, 12, 31, 23, 59, 59, "UTC");
-//   Console.WriteLine(d.Ago());                         // "6 months ago"
+//   Console.WriteLine(d.Ago());                         // e.g. "293 days ago"
 //
 //   // Duration arithmetic
 //   let dur = Duration.FromHours(1).Add(Duration.FromMinutes(45));
@@ -35,7 +33,9 @@
 //   Duration.FromMilliseconds(n)   Duration.FromSeconds(n)
 //   Duration.FromMinutes(n)        Duration.FromHours(n)
 //   Duration.FromDays(n)           Duration.FromWeeks(n)
-//   Duration.Parse(s)              - "1h30m", "02:30:00", "90s", etc.; nil on error
+//   Duration.Parse(s)              - "1h30m", "2d4h", "90s" (whole numbers, units d h m s
+//                                    in that order, each at most once), "02:30:00" or
+//                                    "02:30" (HH:MM); a leading "-" negates; nil on error
 //   Duration.Between(a, b)         - b - a as a Duration
 //
 // Arithmetic (return new Duration):
@@ -43,14 +43,17 @@
 //   .Negate()      .Abs()
 //
 // Component access:
-//   .Days()  .Hours()  .Minutes()  .Seconds()   - component parts (not totals)
+//   .Days()  .Hours()              - whole days, whole hours (Hours() is not capped at 23)
+//   .Minutes()  .Seconds()         - the minute and second parts, 0-59
+//                                    (all four are non-negative, whatever the sign)
 //   .TotalSeconds()  .TotalMilliseconds()
 //   .TotalMinutes()  .TotalHours()  .TotalDays()  .TotalWeeks()
 //   .IsNegative()    .IsZero()
 //   .IsLongerThan(other)  .IsShorterThan(other)  .Equals(other)
 //
 // Formatting:
-//   .ToString()    - compact: "1h30m", "45s", "-2h"
+//   .ToString()    - compact, zero units left out: "1h30m", "45s", "-2h", "1d4h";
+//                    "0s" for zero. Duration.Parse reads it back
 //
 // ── DateTime ─────────────────────────────────────────────────────────────────
 //
@@ -64,8 +67,10 @@
 //   DateTime.FromUnix(ts)          - from Unix timestamp (seconds, UTC)
 //   DateTime.FromUnixIn(ts, tz)    - from Unix timestamp with timezone
 //   DateTime.FromMillis(ms)        - from millisecond timestamp
-//   DateTime.Parse(s, tz?)         - ISO 8601 string; a trailing "Z" or "+hh:mm" offset is applied
-//   DateTime.ParseFmt(s, fmt, tz?) - custom format string
+//   DateTime.Parse(s, tz?)         - ISO 8601 date-time, or a "YYYY-MM-DD" date read as
+//                                    midnight; a trailing "Z" or "+hh:mm" offset is applied,
+//                                    without one s is UTC; nil when s is not ISO 8601
+//   DateTime.ParseFmt(s, fmt, tz?) - strptime pattern (s is UTC); nil when s does not match
 //   DateTime.Min(a, b)  DateTime.Max(a, b)
 //
 // Component accessors (in local timezone):
@@ -78,8 +83,10 @@
 //   .YearUTC()  .MonthUTC()  .DayUTC()  .HourUTC()  .MinuteUTC()  .SecondUTC()
 //
 // Arithmetic (return new DateTime in same timezone):
-//   .AddSeconds(n)  .AddMinutes(n)  .AddHours(n)
+//   .AddSeconds(n)  .AddMinutes(n)  .AddHours(n)    - move the instant
 //   .AddDays(n)     .AddWeeks(n)    .AddMonths(n)  .AddYears(n)
+//                                   - move the wall clock: a day across a DST
+//                                     change lasts 23 or 25 hours
 //
 // Comparison:
 //   .IsBefore(other)   .IsAfter(other)
@@ -111,11 +118,12 @@
 //   .InZone(tz)          - same instant, different timezone label
 //   .ToUTC()  .ToLocal()
 //   .Timezone()          →  string
-//   .UtcOffset()         →  int (seconds)
+//   .UtcOffset()         →  int (minutes east of UTC at this instant)
 //   .FormatOffset()      →  "+02:00" style string
 //
 // Formatting:
-//   .Format(fmt)         - fmt: "short", "long", "date", "time", or strftime pattern
+//   .Format(fmt)         - fmt: "short" or "date" (YYYY-MM-DD), "long" (YYYY-MM-DD HH:MM:SS),
+//                          "time" (HH:MM:SS), or a strftime pattern
 //   .FormatUTC(fmt)      - same but always in UTC
 //   .ToISO()             →  "YYYY-MM-DDTHH:MM:SS±HH:MM"
 //   .ToString()          →  "YYYY-MM-DD HH:MM:SS TZ"
@@ -126,51 +134,441 @@
 //   .UnixMillis()        →  int
 //
 // Timezone registry:
-//   DateTime.Timezones()                       →  array of known TZ names
+//   DateTime.Timezones()                       →  array of the embedded table's names
+//                                                 and the registered ones
 //   DateTime.HasTimezone(tz)                   →  bool
-//   DateTime.RegisterTimezone(name, offsetMins) - add a custom timezone
+//   DateTime.RegisterTimezone(name, spec)      - add a timezone: spec is a fixed offset
+//                                                 in minutes or a POSIX TZ string such as
+//                                                 "CET-1CEST,M3.5.0,M10.5.0/3"; it takes
+//                                                 precedence over a zone of the same name
+//   DateTime.SetZoneInfoDir(dir)               - where TZif files are read from; nil or ""
+//                                                 uses the embedded table only
+//   DateTime.ZoneInfoDir()                     →  string ("" when TZif files are not read)
+//
+// ── Timezones ────────────────────────────────────────────────────────────────
+//
+// A timezone is "UTC", "local" (the system's zone), an IANA name such as
+// "Europe/Stockholm", or a registered name. The offset follows the zone's
+// rules at each instant, daylight saving time included.
+//
+// IANA zones come from the system's TZif files (RFC 8536, versions 1-4) under
+// $TZDIR or /usr/share/zoneinfo, read once per zone: the transitions they list,
+// then the POSIX TZ rule in their footer for later instants. Without those
+// files (Windows, minimal containers) an embedded table of the zones listed by
+// Timezones() applies, each zone's current rule extended to every year: EU,
+// US/Canada, south-east Australia and New Zealand DST, and fixed offsets.
+// "local" reads $TZ (a zone name, a TZif path or a POSIX TZ string) or else
+// /etc/localtime, and falls back to Time.TimeZoneOffsetMins.
+//
+// Wall time to instant (Of, AddDays, AddMonths, StartOfDay, ...): a wall time
+// that a forward change skips moves forward by the length of the gap (02:30 on
+// a spring-forward night is 03:30), and a wall time that a backward change
+// repeats is the earlier of its two instants.
 
-// Custom-registered timezones (added via DateTime.RegisterTimezone).
+// Zones added with DateTime.RegisterTimezone: name → zone.
 global _DT_TZ = {};
 
-// Built-in static timezone map: IANA name → UTC offset in minutes.
+// Zones in use, loaded on first use: name → zone.
+global _DT_ZONES = {};
+
+// TZif directory; nil until first use, "" when TZif files are not read.
+global _DT_ZONEDIR = nil;
+
+// Embedded zones for systems without TZif files: IANA name → POSIX TZ string,
+// the rule each zone follows now.
 global _DT_TZ_BUILTIN = {
-    "UTC": 0, "GMT": 0,
-    "Europe/London": 0, "Europe/Lisbon": 0, "Europe/Dublin": 0,
-    "Europe/Paris": 60, "Europe/Berlin": 60, "Europe/Rome": 60,
-    "Europe/Madrid": 60, "Europe/Amsterdam": 60, "Europe/Brussels": 60,
-    "Europe/Stockholm": 60, "Europe/Vienna": 60, "Europe/Warsaw": 60,
-    "Europe/Prague": 60, "Europe/Zurich": 60, "Europe/Copenhagen": 60,
-    "Europe/Helsinki": 120, "Europe/Athens": 120, "Europe/Bucharest": 120,
-    "Europe/Riga": 120, "Europe/Tallinn": 120, "Europe/Vilnius": 120,
-    "Europe/Moscow": 180, "Europe/Istanbul": 180, "Europe/Minsk": 180,
-    "Asia/Dubai": 240, "Asia/Muscat": 240,
-    "Asia/Karachi": 300, "Asia/Tashkent": 300,
-    "Asia/Colombo": 330,
-    "Asia/Dhaka": 360,
-    "Asia/Bangkok": 420, "Asia/Jakarta": 420, "Asia/Ho_Chi_Minh": 420,
-    "Asia/Singapore": 480, "Asia/Shanghai": 480, "Asia/Hong_Kong": 480,
-    "Asia/Taipei": 480, "Asia/Kuala_Lumpur": 480,
-    "Asia/Tokyo": 540, "Asia/Seoul": 540,
-    "Australia/Perth": 480,
-    "Australia/Darwin": 570, "Australia/Adelaide": 570,
-    "Australia/Sydney": 600, "Australia/Brisbane": 600, "Australia/Melbourne": 600,
-    "Pacific/Auckland": 720, "Pacific/Fiji": 720,
-    "Pacific/Honolulu": -600,
-    "America/Anchorage": -540,
-    "America/Los_Angeles": -480, "America/Vancouver": -480,
-    "America/Denver": -420, "America/Phoenix": -420,
-    "America/Chicago": -360, "America/Mexico_City": -360,
-    "America/New_York": -300, "America/Toronto": -300,
-    "America/Bogota": -300, "America/Lima": -300,
-    "America/Halifax": -240, "America/Caracas": -240,
-    "America/Sao_Paulo": -180, "America/Argentina/Buenos_Aires": -180,
-    "America/Montevideo": -180,
-    "Atlantic/Azores": -60,
-    "Africa/Casablanca": 0, "Africa/Lagos": 60,
-    "Africa/Johannesburg": 120,
-    "Africa/Nairobi": 180, "Africa/Addis_Ababa": 180
+    "UTC": "UTC0", "GMT": "GMT0",
+    "Europe/London": "GMT0BST,M3.5.0/1,M10.5.0",
+    "Europe/Lisbon": "WET0WEST,M3.5.0/1,M10.5.0",
+    "Europe/Dublin": "GMT0IST,M3.5.0/1,M10.5.0",
+    "Europe/Paris": "CET-1CEST,M3.5.0,M10.5.0/3",     "Europe/Berlin": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Rome": "CET-1CEST,M3.5.0,M10.5.0/3",      "Europe/Madrid": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Amsterdam": "CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Brussels": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Stockholm": "CET-1CEST,M3.5.0,M10.5.0/3", "Europe/Vienna": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Warsaw": "CET-1CEST,M3.5.0,M10.5.0/3",    "Europe/Prague": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Zurich": "CET-1CEST,M3.5.0,M10.5.0/3",    "Europe/Copenhagen": "CET-1CEST,M3.5.0,M10.5.0/3",
+    "Europe/Helsinki": "EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Athens": "EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Bucharest": "EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Riga": "EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Tallinn": "EET-2EEST,M3.5.0/3,M10.5.0/4", "Europe/Vilnius": "EET-2EEST,M3.5.0/3,M10.5.0/4",
+    "Europe/Moscow": "MSK-3", "Europe/Istanbul": "<+03>-3", "Europe/Minsk": "<+03>-3",
+    "Asia/Dubai": "<+04>-4", "Asia/Muscat": "<+04>-4", "Asia/Tehran": "<+0330>-3:30",
+    "Asia/Karachi": "PKT-5", "Asia/Tashkent": "<+05>-5",
+    "Asia/Kolkata": "IST-5:30", "Asia/Colombo": "<+0530>-5:30", "Asia/Kathmandu": "<+0545>-5:45",
+    "Asia/Dhaka": "<+06>-6",
+    "Asia/Bangkok": "<+07>-7", "Asia/Jakarta": "WIB-7", "Asia/Ho_Chi_Minh": "<+07>-7",
+    "Asia/Singapore": "<+08>-8", "Asia/Shanghai": "CST-8", "Asia/Hong_Kong": "HKT-8",
+    "Asia/Taipei": "CST-8", "Asia/Kuala_Lumpur": "<+08>-8",
+    "Asia/Tokyo": "JST-9", "Asia/Seoul": "KST-9",
+    "Australia/Perth": "AWST-8",
+    "Australia/Darwin": "ACST-9:30", "Australia/Adelaide": "ACST-9:30ACDT,M10.1.0,M4.1.0/3",
+    "Australia/Sydney": "AEST-10AEDT,M10.1.0,M4.1.0/3", "Australia/Melbourne": "AEST-10AEDT,M10.1.0,M4.1.0/3",
+    "Australia/Brisbane": "AEST-10",
+    "Pacific/Auckland": "NZST-12NZDT,M9.5.0,M4.1.0/3", "Pacific/Fiji": "<+12>-12",
+    "Pacific/Honolulu": "HST10",
+    "America/Anchorage": "AKST9AKDT,M3.2.0,M11.1.0",
+    "America/Los_Angeles": "PST8PDT,M3.2.0,M11.1.0", "America/Vancouver": "MST7",
+    "America/Denver": "MST7MDT,M3.2.0,M11.1.0", "America/Phoenix": "MST7",
+    "America/Chicago": "CST6CDT,M3.2.0,M11.1.0", "America/Mexico_City": "CST6",
+    "America/New_York": "EST5EDT,M3.2.0,M11.1.0", "America/Toronto": "EST5EDT,M3.2.0,M11.1.0",
+    "America/Bogota": "<-05>5", "America/Lima": "<-05>5",
+    "America/Halifax": "AST4ADT,M3.2.0,M11.1.0", "America/Caracas": "<-04>4",
+    "America/Sao_Paulo": "<-03>3", "America/Argentina/Buenos_Aires": "<-03>3",
+    "America/Montevideo": "<-03>3",
+    "Atlantic/Azores": "<-01>1<+00>,M3.5.0/0,M10.5.0/1",
+    "Africa/Casablanca": "<+00>0", "Africa/Lagos": "WAT-1",
+    "Africa/Johannesburg": "SAST-2",
+    "Africa/Nairobi": "EAT-3", "Africa/Addis_Ababa": "EAT-3"
 };
+
+// A zone is one [int]: its POSIX rule, a one-span cache of the last lookup,
+// then the transition instants (ascending) and the UTC offset each one starts.
+// Offsets are seconds east of UTC.
+const _Z_N     = 0;     // transition count n
+const _Z_OFF0  = 1;     // offset before the first transition
+const _Z_RULE  = 2;     // rule kind: 0 none, 1 standard time only, 2 with DST,
+                        // 3 the operating system's local offset
+const _Z_STD   = 3;     // rule's standard offset
+const _Z_DST   = 4;     // rule's DST offset
+const _Z_START = 5;     // DST start: date kind, a, b, c, time (see _dtRuleDay)
+const _Z_END   = 10;    // DST end, the same five slots
+const _Z_LO    = 15;    // cache: instants in [lo, hi) have offset _Z_COFF
+const _Z_HI    = 16;
+const _Z_COFF  = 17;
+const _Z_TRANS = 18;    // n instants, then their n offsets
+
+// Past every instant a zone describes, and still a small int.
+const _DT_FAR = 576460752303423488;
+
+// Days from 1970-01-01 to y-m-d, proleptic Gregorian.
+fn _dtDays(y: int, m: int, d: int): int {
+    let yy  = (m <= 2 ? y - 1 : y);
+    let era = (yy >= 0 ? yy : yy - 399) / 400;
+    let yoe = yy - era * 400;
+    let doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+
+// The year that day `days` (from 1970-01-01) falls in.
+fn _dtYearOf(days: int): int {
+    let z   = days + 719468;
+    let era = (z >= 0 ? z : z - 146096) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    return yoe + era * 400 + ((5 * doy + 2) / 153 >= 10 ? 1 : 0);
+}
+
+// The day (from 1970-01-01) a POSIX rule date names in year y. kind 0 is
+// Mm.w.d (a month, b week 1-5 where 5 is the last, c weekday 0 = Sunday),
+// kind 1 Jn (a 1-365, February 29 never counted), kind 2 n (a 0-365).
+fn _dtRuleDay(kind: int, a: int, b: int, c: int, y: int): int {
+    if (kind == 1) {
+        let leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+        return _dtDays(y, 1, 1) + a - 1 + (a >= 60 && leap ? 1 : 0);
+    }
+    if (kind == 2) { return _dtDays(y, 1, 1) + a; }
+    let first = _dtDays(y, a, 1);
+    var wd = (first + 4) % 7;
+    if (wd < 0) { wd = wd + 7; }
+    var day = first + (c - wd + 7) % 7 + (b - 1) * 7;
+    if (b == 5) {
+        let next = (a == 12 ? _dtDays(y + 1, 1, 1) : _dtDays(y, a + 1, 1));
+        while (day >= next) { day = day - 7; }
+    }
+    return day;
+}
+
+// Offset under zone z's rule at instant t. Caches the span around t that
+// shares it, clipped to t's year in standard time.
+fn _dtRuleOffset(z: [int], t: int): int {
+    if (z[_Z_RULE] == 3) { return Time.TimeZoneOffsetMins(t) * 60; }
+    let std = z[_Z_STD];
+    if (z[_Z_RULE] == 1) {
+        z[_Z_LO] = -_DT_FAR;
+        z[_Z_HI] = _DT_FAR;
+        z[_Z_COFF] = std;
+        return std;
+    }
+    let dst = z[_Z_DST];
+    var days = (t + std) / 86400;
+    if ((t + std) % 86400 < 0) { days = days - 1; }
+    let y = _dtYearOf(days);
+    var lo = _dtDays(y, 1, 1) * 86400 - std;
+    var hi = _dtDays(y + 1, 1, 1) * 86400 - std;
+    // The start is given in standard time, the end in DST.
+    let s = _dtRuleDay(z[_Z_START], z[_Z_START + 1], z[_Z_START + 2], z[_Z_START + 3], y) * 86400
+            + z[_Z_START + 4] - std;
+    let e = _dtRuleDay(z[_Z_END], z[_Z_END + 1], z[_Z_END + 2], z[_Z_END + 3], y) * 86400
+            + z[_Z_END + 4] - dst;
+    let inDst = (s < e ? t >= s && t < e : t < e || t >= s);
+    if (s <= t && s > lo) { lo = s; }
+    if (s > t && s < hi)  { hi = s; }
+    if (e <= t && e > lo) { lo = e; }
+    if (e > t && e < hi)  { hi = e; }
+    let off = (inDst ? dst : std);
+    z[_Z_LO] = lo;
+    z[_Z_HI] = hi;
+    z[_Z_COFF] = off;
+    return off;
+}
+
+// Offset of zone z at instant t: the transition list up to its last entry,
+// the rule after it.
+fn _dtOffsetAt(z: [int], t: int): int {
+    if (t >= z[_Z_LO] && t < z[_Z_HI]) { return z[_Z_COFF]; }
+    let n = z[_Z_N];
+    if (n > 0 && (t < z[_Z_TRANS + n - 1] || z[_Z_RULE] == 0)) {
+        var lo = 0;
+        var hi = n;
+        while (lo < hi) {
+            let mid = (lo + hi) >> 1;
+            if (z[_Z_TRANS + mid] <= t) { lo = mid + 1; } else { hi = mid; }
+        }
+        if (lo == 0) {
+            z[_Z_LO] = -_DT_FAR;
+            z[_Z_HI] = z[_Z_TRANS];
+            z[_Z_COFF] = z[_Z_OFF0];
+        } else {
+            z[_Z_LO] = z[_Z_TRANS + lo - 1];
+            z[_Z_HI] = (lo < n ? z[_Z_TRANS + lo] : _DT_FAR);
+            z[_Z_COFF] = z[_Z_TRANS + n + lo - 1];
+        }
+        return z[_Z_COFF];
+    }
+    let off = _dtRuleOffset(z, t);
+    // The rule's span may reach back past the last transition; that part
+    // belongs to the list.
+    if (n > 0 && z[_Z_LO] < z[_Z_TRANS + n - 1]) { z[_Z_LO] = z[_Z_TRANS + n - 1]; }
+    return off;
+}
+
+// The instant at which zone z's wall clock reads `local`; see
+// DateTime._LocalToUtc.
+fn _dtLocalToUtc(z: [int], local: int): int {
+    // Offsets a day either side bracket any change near `local`.
+    let before = _dtOffsetAt(z, local - 86400);
+    let after  = _dtOffsetAt(z, local + 86400);
+    let t = local - before;
+    if (before == after || _dtOffsetAt(z, t) == before) { return t; }
+    let t2 = local - after;
+    if (_dtOffsetAt(z, t2) == after) { return t2; }
+    return t;
+}
+
+// A zone with room for n transitions and an empty cache.
+fn _dtNewZone(n: int): [int] {
+    let z = Array.Create(_Z_TRANS + 2 * n, Type.Int);
+    z[_Z_N] = n;
+    return z;
+}
+
+// True when name can only name a file under the zone directory: parts of
+// letters, digits, '_', '+' and '-' joined by '/'.
+fn _dtZoneNameOk(name: string): bool {
+    let n = len(name);
+    var partLen = 0;
+    iter (i from 0 to n) {
+        let c = Char.Code(name[i]);
+        if (c == 47) {
+            if (partLen == 0) { return false; }
+            partLen = 0;
+        } else {
+            let ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                     || c == 95 || c == 43 || c == 45;
+            if (!ok) { return false; }
+            partLen += 1;
+        }
+    }
+    return partLen > 0;
+}
+
+// Reads a decimal number in [lo, hi] at p[0] into p[1], moving p[0] past it.
+fn _dtPosixNum(s: string, p: [int], lo: int, hi: int): bool {
+    let n = len(s);
+    let start = p[0];
+    var i = start;
+    var v = 0;
+    while (i < n && i - start < 3) {
+        let d = Char.Code(s[i]) - 48;
+        if (d < 0 || d > 9) { break; }
+        v = v * 10 + d;
+        i += 1;
+    }
+    if (i == start || v < lo || v > hi) { return false; }
+    p[0] = i;
+    p[1] = v;
+    return true;
+}
+
+// Reads [+|-]h[:mm[:ss]] at p[0] into p[1] as seconds; hours run to 167.
+fn _dtPosixTime(s: string, p: [int]): bool {
+    let n = len(s);
+    var sign = 1;
+    if (p[0] < n && (s[p[0]] == '+' || s[p[0]] == '-')) {
+        if (s[p[0]] == '-') { sign = -1; }
+        p[0] += 1;
+    }
+    if (!_dtPosixNum(s, p, 0, 167)) { return false; }
+    var total = p[1] * 3600;
+    if (p[0] < n && s[p[0]] == ':') {
+        p[0] += 1;
+        if (!_dtPosixNum(s, p, 0, 59)) { return false; }
+        total += p[1] * 60;
+        if (p[0] < n && s[p[0]] == ':') {
+            p[0] += 1;
+            if (!_dtPosixNum(s, p, 0, 59)) { return false; }
+            total += p[1];
+        }
+    }
+    p[1] = sign * total;
+    return true;
+}
+
+// Moves p[0] past a zone abbreviation: three or more letters, or <...>.
+fn _dtPosixName(s: string, p: [int]): bool {
+    let n = len(s);
+    var i = p[0];
+    if (i < n && s[i] == '<') {
+        let close = String.IndexOfAnyFrom(s, ">", i + 1);
+        if (close <= i + 1) { return false; }
+        p[0] = close + 1;
+        return true;
+    }
+    while (i < n) {
+        let c = Char.Code(s[i]);
+        if ((c < 65 || c > 90) && (c < 97 || c > 122)) { break; }
+        i += 1;
+    }
+    if (i - p[0] < 3) { return false; }
+    p[0] = i;
+    return true;
+}
+
+// Reads a rule date with its optional /time at p[0] into z[at .. at+4]
+// (kind, a, b, c, seconds after local midnight; 02:00 when not given).
+fn _dtPosixDate(s: string, p: [int], z: [int], at: int): bool {
+    let n = len(s);
+    if (p[0] >= n) { return false; }
+    let c = s[p[0]];
+    z[at + 2] = 0;
+    z[at + 3] = 0;
+    if (c == 'M') {
+        p[0] += 1;
+        if (!_dtPosixNum(s, p, 1, 12)) { return false; }
+        z[at + 1] = p[1];
+        if (p[0] >= n || s[p[0]] != '.') { return false; }
+        p[0] += 1;
+        if (!_dtPosixNum(s, p, 1, 5)) { return false; }
+        z[at + 2] = p[1];
+        if (p[0] >= n || s[p[0]] != '.') { return false; }
+        p[0] += 1;
+        if (!_dtPosixNum(s, p, 0, 6)) { return false; }
+        z[at + 3] = p[1];
+        z[at] = 0;
+    } else if (c == 'J') {
+        p[0] += 1;
+        if (!_dtPosixNum(s, p, 1, 365)) { return false; }
+        z[at + 1] = p[1];
+        z[at] = 1;
+    } else {
+        if (!_dtPosixNum(s, p, 0, 365)) { return false; }
+        z[at + 1] = p[1];
+        z[at] = 2;
+    }
+    z[at + 4] = 7200;
+    if (p[0] < n && s[p[0]] == '/') {
+        p[0] += 1;
+        if (!_dtPosixTime(s, p)) { return false; }
+        z[at + 4] = p[1];
+    }
+    return true;
+}
+
+// Reads POSIX TZ string s - std offset [dst [offset] [,start[/time],end[/time]]] -
+// into the rule slots of zone z; false when s is not one. POSIX writes offsets
+// west of UTC; the slots hold them east. A DST zone without dates takes the
+// US rule, as C libraries do.
+fn _dtParsePosix(s: string, z: [int]): bool {
+    var src = s;
+    var n = len(src);
+    let p = Array.Create(2, Type.Int);
+    if (!_dtPosixName(src, p) || !_dtPosixTime(src, p)) { return false; }
+    z[_Z_STD] = -p[1];
+    z[_Z_DST] = -p[1];
+    if (p[0] == n) {
+        z[_Z_RULE] = 1;
+        return true;
+    }
+    if (!_dtPosixName(src, p)) { return false; }
+    z[_Z_DST] = z[_Z_STD] + 3600;
+    if (p[0] < n && src[p[0]] != ',') {
+        if (!_dtPosixTime(src, p)) { return false; }
+        z[_Z_DST] = -p[1];
+    }
+    if (p[0] == n) {
+        src = src + ",M3.2.0,M11.1.0";
+        n = len(src);
+    }
+    if (src[p[0]] != ',') { return false; }
+    p[0] += 1;
+    if (!_dtPosixDate(src, p, z, _Z_START)) { return false; }
+    if (p[0] >= n || src[p[0]] != ',') { return false; }
+    p[0] += 1;
+    if (!_dtPosixDate(src, p, z, _Z_END) || p[0] != n) { return false; }
+    z[_Z_RULE] = 2;
+    return true;
+}
+
+// Bytes in the TZif data block whose header starts at h, for w-byte times.
+fn _dtTzifDataLen(b: block, h: int, w: int): int {
+    let isUt   = Buffer.ReadU32At(b, h + 20, true);
+    let isStd  = Buffer.ReadU32At(b, h + 24, true);
+    let leaps  = Buffer.ReadU32At(b, h + 28, true);
+    let times  = Buffer.ReadU32At(b, h + 32, true);
+    let types  = Buffer.ReadU32At(b, h + 36, true);
+    let chars  = Buffer.ReadU32At(b, h + 40, true);
+    return times * (w + 1) + types * 6 + chars + leaps * (w + 4) + isStd + isUt;
+}
+
+// The zone in TZif data b (RFC 8536), or nil when b is not TZif. A version 2+
+// file is read from its 64-bit block and footer rule, a version 1 file from
+// its 32-bit block alone.
+fn _dtParseTzif(b: block) {
+    let size = len(b);
+    let magic = 0x545A6966;     // "TZif"
+    if (size < 44 || Buffer.ReadU32At(b, 0, true) != magic) { return nil; }
+    var h = 0;
+    var w = 4;
+    if (Buffer.ReadU8At(b, 4) >= 0x32) {
+        h = 44 + _dtTzifDataLen(b, 0, 4);
+        if (h + 44 > size || Buffer.ReadU32At(b, h, true) != magic) { return nil; }
+        w = 8;
+    }
+    let n = Buffer.ReadU32At(b, h + 32, true);
+    let typeCount = Buffer.ReadU32At(b, h + 36, true);
+    let p = h + 44;
+    let end = p + _dtTzifDataLen(b, h, w);
+    if (typeCount == 0 || end > size) { return nil; }
+    let types = p + n * (w + 1);
+    let z = _dtNewZone(n);
+    // Before the first transition the first time type applies.
+    z[_Z_OFF0] = Buffer.ReadI32At(b, types, true);
+    iter (i from 0 to n) {
+        let k = Buffer.ReadU8At(b, p + n * w + i);
+        if (k >= typeCount) { return nil; }
+        z[_Z_TRANS + i] = (w == 8 ? Buffer.ReadU64At(b, p + 8 * i, true) : Buffer.ReadI32At(b, p + 4 * i, true));
+        z[_Z_TRANS + n + i] = Buffer.ReadI32At(b, types + 6 * k, true);
+    }
+    // The footer is the rule between newlines; an empty one leaves the last
+    // transition's offset in force.
+    if (w == 8 && end < size && Buffer.ReadU8At(b, end) == 10) {
+        let nl = Buffer.IndexOf(b, 10, end + 1);
+        if (nl > end + 1 && !_dtParsePosix(Buffer.ToString(b, end + 1, nl - end - 1), z)) {
+            z[_Z_RULE] = 0;
+        }
+    }
+    return z;
+}
 
 
 // ── Duration ─────────────────────────────────────────────────────────────────
@@ -223,16 +621,17 @@ class Duration {
 
     // ── Formatting ────────────────────────────────────────────────────────────
 
-    // "HH:MM:SS", leading minus for negative durations.
+    // "1d2h30m15s" with the zero units left out, "-" first when negative;
+    // "0s" for zero.
     fn ToString(): string {
-        let sign = (this._secs < 0 ? "-" : "");
-        let h = this.Hours();
-        let m = this.Minutes();
-        let s = this.Seconds();
-        return sign
-            + String.PadLeft(str(h), 2, "0") + ":"
-            + String.PadLeft(str(m), 2, "0") + ":"
-            + String.PadLeft(str(s), 2, "0");
+        if (this._secs == 0) { return "0s"; }
+        let a = Math.Abs(this._secs);
+        var out = (this._secs < 0 ? "-" : "");
+        if (a >= 86400)        { out = out + str(a / 86400) + "d"; }
+        if (a % 86400 >= 3600) { out = out + str((a % 86400) / 3600) + "h"; }
+        if (a % 3600 >= 60)    { out = out + str((a % 3600) / 60) + "m"; }
+        if (a % 60 > 0)        { out = out + str(a % 60) + "s"; }
+        return out;
     }
 
     // ── Static constructors ───────────────────────────────────────────────────
@@ -245,11 +644,18 @@ class Duration {
     fn static FromDays(n:number): instance         { return new Duration(n * 86400); }
     fn static FromWeeks(n:number): instance        { return new Duration(n * 604800); }
 
-    // Parse "HH:MM:SS" or "HH:MM" (with optional leading minus). Returns nil on failure.
+    // Parse "1h30m"-style text, "HH:MM:SS" or "HH:MM" (with optional leading
+    // minus). Returns nil on failure.
     fn static Parse(s:string): instance|nil {
         let src = String.Trim(s);
         let neg = String.StartsWith(src, "-");
         if (neg) { src = String.Substr(src, 1, len(src) - 1); }
+
+        if (String.IndexOf(src, ":") < 0) {
+            let secs = Duration._UnitSecs(src);
+            if (secs < 0) { return nil; }
+            return new Duration(neg ? -secs : secs);
+        }
 
         let parts = String.Split(src, ":");
         if (len(parts) < 2 || len(parts) > 3) { return nil; }
@@ -264,6 +670,42 @@ class Duration {
 
         let total = h * 3600 + m * 60 + sv;
         return new Duration(neg ? -total : total);
+    }
+
+    // Seconds named by "2d4h30m15s"-style text - whole numbers, each followed
+    // by d, h, m or s, the units in that order and each at most once - or -1
+    // when src is anything else.
+    fn static _UnitSecs(src:string): int {
+        let n = len(src);
+        if (n == 0) { return -1; }
+        var total = 0;
+        var rank = 0;
+        var i = 0;
+        while (i < n) {
+            let start = i;
+            var v = 0;
+            // At most 12 digits per amount, so the sum cannot overflow; a
+            // 13th digit then fails as a unit.
+            while (i < n && i - start < 12) {
+                let c = Char.Code(src[i]) - 48;
+                if (c < 0 || c > 9) { break; }
+                v = v * 10 + c;
+                i += 1;
+            }
+            if (i == start || i >= n) { return -1; }
+            let u = src[i];
+            var unit = 0;
+            var r = 0;
+            if (u == 'd')      { unit = 86400; r = 1; }
+            else if (u == 'h') { unit = 3600;  r = 2; }
+            else if (u == 'm') { unit = 60;    r = 3; }
+            else if (u == 's') { unit = 1;     r = 4; }
+            if (r <= rank) { return -1; }
+            rank = r;
+            total += v * unit;
+            i += 1;
+        }
+        return total;
     }
 
     // Duration between two DateTime values (b − a). May be negative.
@@ -382,15 +824,82 @@ class DateTime {
         return 31;
     }
 
-    // Resolve IANA timezone name to UTC offset in minutes.
-    fn static _TzOffset(tz): int {
-        if (tz == nil) { return 0; }
-        if (tz == "local") { return Time.TimeZoneOffsetMins(); }
-        let offset = _DT_TZ_BUILTIN[tz];
-        if (offset != nil) { return offset; }
-        let custom = _DT_TZ[tz];
-        if (custom != nil) { return custom; }
-        throw(1, "datetime: unknown timezone '" + tz + "'. Call DateTime.Timezones() for the list.");
+    // UTC offset of timezone tz at instant t, in seconds east. Raises for an
+    // unknown zone.
+    fn static _OffsetAt(tz, t:int): int {
+        if (tz == "UTC" || tz == nil) { return 0; }
+        var z = _DT_ZONES[tz];
+        if (z == nil) { z = DateTime._LoadZone(tz); }
+        return _dtOffsetAt(z, t);
+    }
+
+    // The instant at which tz's wall clock reads `local` (seconds since 1970
+    // read as UTC). A wall time in a gap moves forward by the gap; one that
+    // occurs twice is the earlier instant.
+    fn static _LocalToUtc(tz, local:int): int {
+        if (tz == "UTC" || tz == nil) { return local; }
+        var z = _DT_ZONES[tz];
+        if (z == nil) { z = DateTime._LoadZone(tz); }
+        return _dtLocalToUtc(z, local);
+    }
+
+    // Loads zone tz into _DT_ZONES: a registered zone, else the TZif file,
+    // else the embedded table. Raises for an unknown name.
+    fn static _LoadZone(tz) {
+        var z = _DT_TZ[tz];
+        if (z == nil && tz == "local") { z = DateTime._LocalZone(); }
+        if (z == nil && type(tz) == Type.String) { z = DateTime._NamedZone(tz); }
+        if (z == nil) {
+            throw(1, "datetime: unknown timezone '" + str(tz) + "'. Call DateTime.Timezones() for the list.");
+        }
+        _DT_ZONES[tz] = z;
+        return z;
+    }
+
+    // IANA zone `name` from its TZif file, else from the embedded table; nil
+    // when neither has it.
+    fn static _NamedZone(name:string) {
+        let dir = DateTime.ZoneInfoDir();
+        if (dir != "" && _dtZoneNameOk(name)) {
+            let b = File.ReadAllBytes(dir + "/" + name);
+            if (b != nil) {
+                let z = _dtParseTzif(b);
+                if (z != nil) { return z; }
+            }
+        }
+        let spec = _DT_TZ_BUILTIN[name];
+        return (spec == nil ? nil : DateTime._PosixZone(spec));
+    }
+
+    // The system zone: $TZ as a zone name, a TZif path or a POSIX TZ string,
+    // else /etc/localtime; else the operating system's offset per instant.
+    fn static _LocalZone() {
+        var tz = Os.GetEnv("TZ");
+        var z = nil;
+        if (tz != nil && String.StartsWith(tz, ":")) { tz = String.Substr(tz, 1, len(tz) - 1); }
+        if (tz == nil || tz == "") {
+            let b = File.ReadAllBytes("/etc/localtime");
+            if (b != nil) { z = _dtParseTzif(b); }
+        } else if (String.StartsWith(tz, "/")) {
+            let b = File.ReadAllBytes(tz);
+            if (b != nil) { z = _dtParseTzif(b); }
+        } else {
+            z = DateTime._NamedZone(tz);
+            if (z == nil) { z = DateTime._PosixZone(tz); }
+        }
+        if (z == nil) {
+            z = _dtNewZone(0);
+            z[_Z_RULE] = 3;
+        }
+        return z;
+    }
+
+    // A zone following POSIX TZ string s alone, or nil when s is not one.
+    fn static _PosixZone(s:string) {
+        let z = _dtNewZone(0);
+        if (!_dtParsePosix(s, z)) { return nil; }
+        z[_Z_OFF0] = z[_Z_STD];
+        return z;
     }
 
     // Format offset minutes as "+HH:MM" / "-HH:MM".
@@ -538,7 +1047,25 @@ class DateTime {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn _LocalTs(): int {
-        return this._ts + (DateTime._TzOffset(this._tz) * 60);
+        let tz = this._tz;
+        if (tz == "UTC") { return this._ts; }
+        var z = _DT_ZONES[tz];
+        if (z == nil) { z = DateTime._LoadZone(tz); }
+        return this._ts + _dtOffsetAt(z, this._ts);
+    }
+
+    // A DateTime whose wall clock is secs past this one's.
+    fn _AddWall(secs:int): instance {
+        let tz = this._tz;
+        return new DateTime(DateTime._LocalToUtc(tz, this._LocalTs() + secs), tz);
+    }
+
+    // This DateTime's local midnight, as a wall-clock timestamp.
+    fn _LocalDayStart(): int {
+        let local = this._LocalTs();
+        var sod = local % 86400;
+        if (sod < 0) { sod = sod + 86400; }
+        return local - sod;
     }
 
     // ── Component accessors (timezone-adjusted) ───────────────────────────────
@@ -645,8 +1172,14 @@ class DateTime {
     fn AddSeconds(n:number): instance { return new DateTime(this._ts + int(n), this._tz); }
     fn AddMinutes(n:number): instance { return new DateTime(this._ts + int(n * 60.0), this._tz); }
     fn AddHours(n:number): instance   { return new DateTime(this._ts + int(n * 3600.0), this._tz); }
-    fn AddDays(n:number): instance    { return new DateTime(this._ts + int(n * 86400.0), this._tz); }
-    fn AddWeeks(n:number): instance   { return new DateTime(this._ts + int(n * 604800.0), this._tz); }
+    fn AddDays(n:number): instance {
+        if (this._tz != "UTC") { return this._AddWall(int(n * 86400.0)); }
+        return new DateTime(this._ts + int(n * 86400.0), this._tz);
+    }
+    fn AddWeeks(n:number): instance {
+        if (this._tz != "UTC") { return this._AddWall(int(n * 604800.0)); }
+        return new DateTime(this._ts + int(n * 604800.0), this._tz);
+    }
     fn AddMilliseconds(n:number): instance {
         let totalMs = (this._ts * 1000) + this._ms + int(n);
         let dt = new DateTime(0, this._tz);
@@ -761,20 +1294,28 @@ class DateTime {
     // ── Boundary helpers ──────────────────────────────────────────────────────
 
     fn StartOfDay(): instance {
-        let local  = this._LocalTs();
-        let offset = Time.Hour(local) * 3600 + Time.Minute(local) * 60 + Time.Second(local);
-        return new DateTime(this._ts - offset, this._tz);
+        return new DateTime(DateTime._LocalToUtc(this._tz, this._LocalDayStart()), this._tz);
     }
 
-    fn EndOfDay(): instance    { return this.StartOfDay().AddSeconds(86399); }
+    // The second before the next local midnight: 23 or 25 hours after the
+    // start on a day with a DST change.
+    fn EndOfDay(): instance {
+        return new DateTime(DateTime._LocalToUtc(this._tz, this._LocalDayStart() + 86400) - 1, this._tz);
+    }
 
     fn StartOfWeek(): instance {
         let dow    = this.Weekday();
         let isoday = (dow == 0 ? 7 : dow);
-        return this.StartOfDay().AddDays(-(isoday - 1));
+        let local  = this._LocalDayStart() - (isoday - 1) * 86400;
+        return new DateTime(DateTime._LocalToUtc(this._tz, local), this._tz);
     }
 
-    fn EndOfWeek(): instance   { return this.StartOfWeek().AddDays(6).EndOfDay(); }
+    fn EndOfWeek(): instance {
+        let dow    = this.Weekday();
+        let isoday = (dow == 0 ? 7 : dow);
+        let local  = this._LocalDayStart() + (8 - isoday) * 86400;
+        return new DateTime(DateTime._LocalToUtc(this._tz, local) - 1, this._tz);
+    }
 
     fn StartOfMonth(): instance  { return DateTime.Of(this.Year(), this.Month(), 1, 0, 0, 0, this._tz); }
     fn EndOfMonth(): instance    { return DateTime.Of(this.Year(), this.Month(), this.DaysInMonth(), 23, 59, 59, this._tz); }
@@ -798,8 +1339,8 @@ class DateTime {
     fn ToUTC(): instance            { return new DateTime(this._ts, "UTC"); }
     fn ToLocal(): instance          { return new DateTime(this._ts, "local"); }
     fn Timezone(): string           { return this._tz; }
-    fn UtcOffset(): int             { return DateTime._TzOffset(this._tz); }
-    fn FormatOffset(): string       { return DateTime._FormatOffset(DateTime._TzOffset(this._tz)); }
+    fn UtcOffset(): int             { return DateTime._OffsetAt(this._tz, this._ts) / 60; }
+    fn FormatOffset(): string       { return DateTime._FormatOffset(this.UtcOffset()); }
 
     // ── Raw values ────────────────────────────────────────────────────────────
 
@@ -808,17 +1349,24 @@ class DateTime {
 
     // ── Formatting ────────────────────────────────────────────────────────────
 
-    fn Format(fmt:string): string    { return Time.Format(this._LocalTs(), fmt); }
-    fn FormatUTC(fmt:string): string { return Time.Format(this._ts, fmt); }
+    // Time.Format has no "date" alias; its "short" is the same YYYY-MM-DD.
+    fn Format(fmt:string): string    { return Time.Format(this._LocalTs(), (fmt == "date" ? "short" : fmt)); }
+    fn FormatUTC(fmt:string): string { return Time.Format(this._ts, (fmt == "date" ? "short" : fmt)); }
 
     // ISO 8601 with timezone offset: "2025-06-15T09:30:00+02:00"
+    // An offset with seconds (local mean time, before standard zones) ends
+    // in ":SS".
     fn ToISO(): string {
-        let off   = DateTime._TzOffset(this._tz);
-        let local = this._ts + off * 60;
-        if (local >= -62167219200 && local < 253402300800 && off > -6000 && off < 6000) {
-            return DateTime._StampText(local, 'T', off, true);
+        let tz    = this._tz;
+        let off   = (tz == "UTC" ? 0 : DateTime._OffsetAt(tz, this._ts));
+        let local = this._ts + off;
+        let mins  = off / 60;
+        if (local >= -62167219200 && local < 253402300800 && mins > -6000 && mins < 6000 && off % 60 == 0) {
+            return DateTime._StampText(local, 'T', mins, true);
         }
-        return Time.Format(local, "%Y-%m-%dT%H:%M:%S") + DateTime._FormatOffset(off);
+        let text = Time.Format(local, "%Y-%m-%dT%H:%M:%S") + DateTime._FormatOffset(mins);
+        if (off % 60 == 0) { return text; }
+        return text + ":" + String.PadLeft(str((off < 0 ? -off : off) % 60), 2, "0");
     }
 
     // "YYYY-MM-DD HH:MM:SS TZ"
@@ -854,17 +1402,25 @@ class DateTime {
         return dt;
     }
 
-    // Parse an ISO 8601 date-time. A trailing "Z" or "+hh:mm" / "+hhmm" / "+hh"
-    // offset is applied; a string without one is read as UTC.
-    fn static Parse(s:string, tz?:string): instance {
+    // Parse an ISO 8601 date-time, or a "YYYY-MM-DD" date as midnight. A
+    // trailing "Z" or "+hh:mm" / "+hhmm" / "+hh" offset is applied; a string
+    // without one is read as UTC. Returns nil when s is not ISO 8601.
+    fn static Parse(s:string, tz?:string): instance|nil {
+        if (s == nil) { return nil; }
         var ts = Time.Parse(s, "ISO");
-        if (ts != nil) { ts = ts - DateTime._IsoOffsetSecs(s); }
-        return new DateTime(ts, (tz == nil ? "UTC" : tz));
+        // Only a bare 10-character date takes the midnight path: a longer
+        // string the ISO pattern refused, such as "2024-02-27 10:00", stays an
+        // error instead of losing its time of day.
+        if (ts == nil && len(s) == 10) { ts = Time.Parse(s + "T00:00:00", "ISO"); }
+        if (ts == nil) { return nil; }
+        return new DateTime(ts - DateTime._IsoOffsetSecs(s), (tz == nil ? "UTC" : tz));
     }
 
-    // Parse with explicit strftime/named format.
-    fn static ParseFmt(s:string, fmt:string, tz?:string): instance {
+    // Parse with an explicit strptime pattern or named format. Returns nil
+    // when s does not match.
+    fn static ParseFmt(s:string, fmt:string, tz?:string): instance|nil {
         let ts = Time.Parse(s, fmt);
+        if (ts == nil) { return nil; }
         return new DateTime(ts, (tz == nil ? "UTC" : tz));
     }
 
@@ -877,8 +1433,10 @@ class DateTime {
                   String.PadLeft(str(hour),   2, "0") + ":" +
                   String.PadLeft(str(minute), 2, "0") + ":" +
                   String.PadLeft(str(second), 2, "0");
-        let ts = Time.Parse(iso, "ISO") - (DateTime._TzOffset(tzStr) * 60);
-        return new DateTime(ts, tzStr);
+        let local = Time.Parse(iso, "ISO");
+        // A date Time.Parse refuses gives the epoch.
+        if (local == nil) { return new DateTime(0, tzStr); }
+        return new DateTime(DateTime._LocalToUtc(tzStr, local), tzStr);
     }
 
     // ── Timezone registry ─────────────────────────────────────────────────────
@@ -891,9 +1449,10 @@ class DateTime {
     }
 
     fn static HasTimezone(tz:string): bool {
+        if (tz == "UTC" || _DT_ZONES[tz] != nil) { return true; }
         let found = false;
         try {
-            DateTime._TzOffset(tz);
+            DateTime._LoadZone(tz);
             found = true;
         } catch (e) {
             found = false;
@@ -901,8 +1460,35 @@ class DateTime {
         return found;
     }
 
-    fn static RegisterTimezone(name:string, offsetMins:int) {
-        _DT_TZ[name] = offsetMins;
+    // spec: a fixed offset in minutes east of UTC, or a POSIX TZ string.
+    fn static RegisterTimezone(name:string, spec:int|string) {
+        var z = nil;
+        if (type(spec) == Type.String) {
+            z = DateTime._PosixZone(spec);
+            if (z == nil) { throw(1, "datetime: not a POSIX TZ string: '" + spec + "'"); }
+        } else {
+            z = _dtNewZone(0);
+            z[_Z_RULE] = 1;
+            z[_Z_STD] = spec * 60;
+            z[_Z_OFF0] = spec * 60;
+        }
+        _DT_TZ[name] = z;
+        _DT_ZONES[name] = z;
+    }
+
+    // dir: a directory of TZif files, or nil / "" for the embedded table only.
+    // Zones already loaded are dropped, so later lookups read from dir.
+    fn static SetZoneInfoDir(dir) {
+        _DT_ZONEDIR = (dir == nil ? "" : dir);
+        _DT_ZONES = {};
+    }
+
+    fn static ZoneInfoDir(): string {
+        if (_DT_ZONEDIR == nil) {
+            let env = Os.GetEnv("TZDIR");
+            _DT_ZONEDIR = (env != nil && env != "" ? env : "/usr/share/zoneinfo");
+        }
+        return _DT_ZONEDIR;
     }
 }
 

@@ -1,0 +1,857 @@
+// test_pgwire.fls - Tests for PgWire.fls, the pure-Flaris PostgreSQL client.
+// Run: flarisvm tests/test_pgwire.fls --libs='./libs'
+//
+// SCRAM against the RFC 7677 test vector, every authentication exchange, the
+// SSLRequest answers, value decoding, split and malformed messages, errors,
+// timeouts with cancel, and the extended-protocol wire form all run against a
+// fake server on loopback and need nothing installed. The live part runs when
+// a PostgreSQL answers on 127.0.0.1:5432 with user postgres, password postgres
+// (PGWIRE_TEST_URL picks another, e.g. postgresql://u:p@host:5432/db) and is
+// skipped otherwise:
+//
+//   docker run -d --name flaris-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
+//
+// The live part creates only TEMP tables, listens on channels with a random
+// suffix, and leaves nothing behind. Run with --unsafe to bench the FFI
+// Postgres library too.
+
+import { PgWire, PgError, PgScram, PgPool } from library("PgWire", "1.0");
+import { Postgres } from library("Postgres", "1.0");
+import { Kdf, Digest } from library("CryptoKit", "1.0");
+import { Util } from library("Util", "1.0");
+import { Test } from library("Test", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn same(a, b): bool {
+    if ((Type.IsObject(a) || Type.IsArray(a)) && (Type.IsObject(b) || Type.IsArray(b))) {
+        return Json.Stringify(a, { sortKeys: true }) == Json.Stringify(b, { sortKeys: true });
+    }
+    if (Type.IsBlock(a) && Type.IsBlock(b)) { return Buffer.Equals(a, b); }
+    return a == b;
+}
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg);
+    }
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (!same(actual, expected)) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", Json.Stringify(expected), " got=", Json.Stringify(actual));
+    }
+}
+
+fn raised(f) {
+    try { f(); } catch (e) { return e; }
+    return nil;
+}
+
+fn kindOf(e) {
+    if (e == nil) { return "none"; }
+    if (e is PgError) { return e.Kind; }
+    return "other: " + e.Error;
+}
+
+// A block from ints, strings, blocks and arrays of them, nested any depth.
+fn bytes(parts) {
+    let out = Buffer.Create(0, 1);
+    appendBytes(out, parts);
+    return out;
+}
+
+fn appendBytes(out, p) {
+    if (Type.IsString(p) || Type.IsBlock(p)) { Buffer.Append(out, p); return; }
+    if (Type.IsArray(p)) {
+        foreach (x in p) { appendBytes(out, x); }
+        return;
+    }
+    let one = Buffer.Create(1, 1);
+    one[0] = p;
+    Buffer.Append(out, one);
+}
+
+fn be32(n) { return [(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+fn be16(n) { return [(n >> 8) & 255, n & 255]; }
+fn cstr(s) { return [s, 0]; }
+
+// ---- SCRAM ------------------------------------------------------------------
+
+fn test_scram() {
+    Console.WriteLine("== SCRAM-SHA-256 (RFC 7677 test vector) ==");
+    let nonce = "rOprNGfwEbeRWgbNEkqO";
+    checkEq(PgScram.ClientFirst("user", nonce), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO", "client-first-message");
+    let serverFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+    let fin = PgScram.ClientFinal("pencil", PgScram.ClientFirstBare("user", nonce), serverFirst, nonce);
+    checkEq(fin.message, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
+            "client-final-message with the proof");
+    checkEq(fin.serverSignature, "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", "expected server signature");
+    checkEq(PgScram.Verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", fin.serverSignature), true, "server-final verifies");
+    checkEq(PgScram.Verify("v=AAAATRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", fin.serverSignature), false, "a wrong server signature is refused");
+    checkEq(PgScram.Verify("e=invalid-proof", fin.serverSignature), false, "a server error is refused");
+    checkEq(PgScram.ClientFirstBare("a=b,c", "n"), "n=a=3Db=2Cc,r=n", "= and , in the user name are escaped");
+    check(PgScram.ClientFinal("pencil", "n=,r=abc", "r=xyz123,s=QSXCR+Q6sek8bf92,i=4096", "abc").error != nil, "a server nonce that does not extend ours is refused");
+    check(PgScram.ClientFinal("pencil", "n=,r=abc", "r=abcdef,i=4096", "abc").error != nil, "a missing salt is refused");
+    check(PgScram.ClientFinal("pencil", "n=,r=abc", "r=abcdef,s=QSXCR+Q6sek8bf92,i=0", "abc").error != nil, "a zero iteration count is refused");
+    let n1 = PgScram.NewNonce();
+    check(String.Length(n1) == 24 && n1 != PgScram.NewNonce() && !String.Contains(n1, ","), "nonces are random, printable and comma-free");
+}
+
+// ---- the fake server ----------------------------------------------------------
+
+// Every frontend message the fake server read: { type, body } (type "" for
+// the startup packet and other untyped ones).
+global _fe = [];
+global _cancels = [];
+
+fn listenLoopback() {
+    let ls = Stream.Listen("tcp", 0, 16, "127.0.0.1");
+    let addr = Stream.LocalAddr(ls);
+    return [ls, int(String.Substr(addr, String.LastIndexOf(addr, ":") + 1))];
+}
+
+fn readExact(c, n) {
+    var b = Buffer.Create(0, 1);
+    while (len(b) < n) {
+        let part = Stream.ReadBytes(c, n - len(b));
+        if (part == nil) { return nil; }
+        Buffer.Append(b, part);
+    }
+    return b;
+}
+
+fn readUntyped(c) {
+    if (Stream.WaitReadable(c, 2000) == nil) { return nil; }
+    let n = Stream.ReadI32(c, true);
+    if (n == nil) { return nil; }
+    let body = readExact(c, n - 4);
+    if (body == nil) { return nil; }
+    let m = { type: "", body: body };
+    Array.Append(_fe, m);
+    return m;
+}
+
+fn readTyped(c) {
+    if (Stream.WaitReadable(c, 2000) == nil) { return nil; }
+    let t = Stream.ReadU8(c);
+    if (t == nil) { return nil; }
+    let n = Stream.ReadI32(c, true);
+    if (n == nil) { return nil; }
+    let body = readExact(c, n - 4);
+    if (body == nil) { return nil; }
+    let m = { type: Buffer.ToString(bytes([t])), body: body };
+    Array.Append(_fe, m);
+    return m;
+}
+
+fn msg(type, parts) {
+    let body = bytes(parts);
+    return bytes([type, be32(len(body) + 4), body]);
+}
+
+fn authOk() { return msg("R", [be32(0)]); }
+fn ready(st) { return msg("Z", [st]); }
+fn complete(tag) { return msg("C", [cstr(tag)]); }
+fn rowDesc(cols) {
+    let parts = [be16(len(cols))];
+    foreach (c in cols) { Array.Append(parts, [cstr(c[0]), be32(0), be16(0), be32(c[1]), be16(65535), be32(0xFFFFFFFF), be16(0)]); }
+    return msg("T", parts);
+}
+fn dataRow(vals) {
+    let parts = [be16(len(vals))];
+    foreach (v in vals) {
+        if (v == nil) { Array.Append(parts, be32(0xFFFFFFFF)); }
+        else { Array.Append(parts, [be32(len(bytes([v]))), v]); }
+    }
+    return msg("D", parts);
+}
+fn errorResp(fields) {
+    let parts = [];
+    foreach (v, k in fields) { Array.Append(parts, [k, cstr(v)]); }
+    Array.Append(parts, 0);
+    return msg("E", parts);
+}
+fn noticeResp(text) { return msg("N", ["S", cstr("NOTICE"), "C", cstr("00000"), "M", cstr(text), 0]); }
+fn notification(pid, ch, payload) { return msg("A", [be32(pid), cstr(ch), cstr(payload)]); }
+
+const GREETING_PID = 4242;
+const GREETING_SECRET = 99;
+const FAKE_PASSWORD = "s3cret";
+
+fn greeting() {
+    return bytes([authOk(), msg("S", [cstr("server_version"), cstr("16.0-fake")]),
+                  msg("K", [be32(GREETING_PID), be32(GREETING_SECRET)]), ready("I")]);
+}
+
+// The server side of SCRAM-SHA-256: true when the client proved the password.
+fn scramServer(c, password: string, badSignature: bool): bool {
+    Stream.WriteAll(c, msg("R", [be32(10), cstr("SCRAM-SHA-256"), 0]));
+    let init = readTyped(c);
+    if (init == nil) { return false; }
+    let mechEnd = Buffer.IndexOf(init.body, 0, 0);
+    let first = Buffer.ToString(Buffer.Slice(init.body, mechEnd + 5, len(init.body) - mechEnd - 5));
+    let bare = String.Substr(first, 3);
+    let cnonce = String.Substr(bare, String.IndexOf(bare, ",r=") + 3);
+    let salt = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    let serverFirst = "r=" + cnonce + "fakeServerNonce,s=" + Util.Base64Encode(salt) + ",i=4096";
+    Stream.WriteAll(c, msg("R", [be32(11), serverFirst]));
+    let fin = readTyped(c);
+    if (fin == nil) { return false; }
+    let finalText = Buffer.ToString(fin.body);
+    let pAt = String.IndexOf(finalText, ",p=");
+    let withoutProof = String.Substr(finalText, 0, pAt);
+    let proof = Util.Base64DecodeBlock(String.Substr(finalText, pAt + 3));
+    let authMessage = bare + "," + serverFirst + "," + withoutProof;
+    let salted = Kdf.Pbkdf2(password, salt, 4096, 32);
+    let storedKey = Hash.Sha256(Crypto.HmacSha256(salted, "Client Key", true), true);
+    let clientSig = Crypto.HmacSha256(storedKey, authMessage, true);
+    let recovered = Buffer.Create(32, 1);
+    iter (i from 0 to 32) { recovered[i] = proof[i] ^ clientSig[i]; }
+    if (!String.StartsWith(withoutProof, "c=biws,r=" + cnonce) || !Buffer.Equals(Hash.Sha256(recovered, true), storedKey)) {
+        Stream.WriteAll(c, errorResp({ S: "FATAL", C: "28P01", M: "password authentication failed for user \"app\"" }));
+        return false;
+    }
+    let serverSig = Crypto.HmacSha256(Crypto.HmacSha256(salted, "Server Key", true), authMessage, true);
+    if (badSignature) { serverSig[0] = serverSig[0] ^ 1; }
+    Stream.WriteAll(c, msg("R", [be32(12), "v=" + Util.Base64Encode(serverSig)]));
+    return true;
+}
+
+// A scripted PostgreSQL. opts: ssl ("N", "S" or nil: no SSLRequest expected),
+// auth ("trust", "cleartext", "md5", "scram", "scram-badsig", "gss",
+// "reject"), steps. Each step reads frontend messages up to a Query, Sync
+// or Terminate, then sends: a block, an array of blocks written 15 ms apart,
+// "close", or { send, pause, split, close } (split: write in pieces of that
+// many bytes; close: hang up right after sending).
+// With cancel: true one more connection - a CancelRequest - is taken within
+// 1.5 s and recorded in _cancels.
+fn fakePg(opts): int {
+    let lp = listenLoopback();
+    let ls = lp[0];
+    Fiber.Run(fn() {
+        if (Stream.WaitReadable(ls, 3000) == nil) { Stream.Close(ls); return; }
+        let c = Stream.Accept(ls);
+        Stream.WaitReadable(c, 1);
+        if (Object.TryGet(opts, "cancel", false) != true) { Stream.Close(ls); }
+        else Fiber.Run(fn() {
+            let until = Time.Millis() + 1500;
+            while (Time.Millis() < until) {
+                if (Stream.WaitReadable(ls, 200) == nil) { continue; }
+                let x = Stream.Accept(ls);
+                if (x == nil) { continue; }
+                Stream.WaitReadable(x, 500);
+                let req = readExact(x, 16);
+                if (req != nil) { Array.Append(_cancels, Buffer.ToArray(req)); }
+                Stream.Close(x);
+                break;
+            }
+            Stream.Close(ls);
+        });
+        var start = readUntyped(c);
+        if (start != nil && Object.TryGet(opts, "ssl", nil) != nil) {
+            Stream.WriteAll(c, bytes([opts.ssl]));
+            if (opts.ssl == "S") {
+                c = Stream.AcceptTls(c, { pkcs12File: opts.p12, password: "pw", handshakeTimeoutMs: 2000 });
+                if (c == nil) { return; }
+            }
+            start = readUntyped(c);
+        }
+        if (start == nil) { Stream.Close(c); return; }
+        let auth = Object.TryGet(opts, "auth", "trust");
+        var ok = true;
+        if (auth == "cleartext" || auth == "md5") {
+            Stream.WriteAll(c, (auth == "md5") ? msg("R", [be32(5), "salt"]) : msg("R", [be32(3)]));
+            let pw = readTyped(c);
+            if (pw == nil) { Stream.Close(c); return; }
+        } else if (auth == "scram" || auth == "scram-badsig") {
+            ok = scramServer(c, FAKE_PASSWORD, auth == "scram-badsig");
+        } else if (auth == "gss") {
+            Stream.WriteAll(c, msg("R", [be32(7)]));
+            ok = false;
+        } else if (auth == "reject") {
+            Stream.WriteAll(c, errorResp({ S: "FATAL", V: "FATAL", C: "28P01", M: "password authentication failed for user \"app\"" }));
+            ok = false;
+        }
+        if (ok) { Stream.WriteAll(c, greeting()); }
+        else { Fiber.Sleep(100); Stream.Close(c); return; }
+        foreach (step in Object.TryGet(opts, "steps", [])) {
+            var done = false;
+            while (!done) {
+                let m = readTyped(c);
+                if (m == nil) { Stream.Close(c); return; }
+                done = m.type == "Q" || m.type == "S" || m.type == "X" || m.type == "c";
+            }
+            var out = step;
+            var pause = 0;
+            var split = 0;
+            var hangUp = false;
+            if (Type.IsObject(step)) {
+                out = step.send;
+                pause = step.pause ?? 0;
+                split = step.split ?? 0;
+                hangUp = step.close == true;
+            }
+            if (pause > 0) { Fiber.Sleep(pause); }
+            if (out == "close") { Stream.Close(c); return; }
+            if (out == nil) { continue; }
+            if (Type.IsArray(out)) {
+                foreach (piece in out) { Stream.WriteAll(c, piece); Fiber.Sleep(15); }
+            } else if (split > 0) {
+                var off = 0;
+                while (off < len(out)) {
+                    let n = Math.Min(split, len(out) - off);
+                    Stream.WriteAll(c, Buffer.Slice(out, off, n));
+                    off += n;
+                    Fiber.Sleep(1);
+                }
+            } else {
+                Stream.WriteAll(c, out);
+            }
+            if (hangUp) { Stream.Close(c); return; }
+        }
+        var trailing = 0;
+        while (readTyped(c) != nil) { trailing += 1; }
+        Stream.Close(c);
+    });
+    return lp[1];
+}
+
+fn connTo(port, extra) {
+    let o = { host: "127.0.0.1", port: port, user: "app", password: FAKE_PASSWORD, database: "shop", sslmode: "disable", timeoutMs: 1000 };
+    if (extra != nil) { foreach (v, k in extra) { o[k] = v; } }
+    return o;
+}
+
+fn feOf(type) { return Array.Where(_fe, fn(m) => m.type == type); }
+
+// The startup packet; a server from an earlier test may still add its
+// client's Terminate to _fe.
+fn startupBody() { return feOf("")[0].body; }
+
+fn startupPairs(body) {
+    let out = {};
+    var off = 4;
+    while (off < len(body) && body[off] != 0) {
+        let e = Buffer.IndexOf(body, 0, off);
+        let k = Buffer.ToString(Buffer.Slice(body, off, e - off));
+        let e2 = Buffer.IndexOf(body, 0, e + 1);
+        out[k] = Buffer.ToString(Buffer.Slice(body, e + 1, e2 - e - 1));
+        off = e2 + 1;
+    }
+    return out;
+}
+
+fn test_startup() {
+    Console.WriteLine("== fake server: startup and authentication ==");
+    _fe = [];
+    let db = PgWire.Connect(connTo(fakePg({ auth: "scram" }), nil));
+    let st = startupBody();
+    checkEq(Buffer.ReadU32At(st, 0, true), 196608, "protocol 3.0");
+    let pairs = startupPairs(st);
+    checkEq([pairs.user, pairs.database, pairs.application_name, pairs.client_encoding], ["app", "shop", "flaris", "UTF8"], "startup parameters");
+    checkEq(db.ProcessId(), GREETING_PID, "BackendKeyData");
+    checkEq(db.ServerParameter("server_version"), "16.0-fake", "ParameterStatus");
+    checkEq(db.TransactionStatus(), "idle", "ReadyForQuery status");
+    let init = feOf("p")[0].body;
+    checkEq(Buffer.ToString(Buffer.Slice(init, 0, 13)), "SCRAM-SHA-256", "SASLInitialResponse names the mechanism");
+    db.Close();
+    Fiber.Sleep(20);
+    checkEq(len(feOf("X")), 1, "Close sends Terminate");
+
+    _fe = [];
+    let c2 = PgWire.Connect(connTo(fakePg({ auth: "cleartext" }), nil));
+    checkEq(Buffer.ToString(feOf("p")[0].body), FAKE_PASSWORD + Buffer.ToString(bytes([0])), "cleartext password message");
+    c2.Close();
+
+    _fe = [];
+    let c3 = PgWire.Connect(connTo(fakePg({ auth: "md5" }), nil));
+    let want = "md5" + md5hex(bytes([md5hex(bytes([FAKE_PASSWORD, "app"])), "salt"]));
+    checkEq(Buffer.ToString(feOf("p")[0].body), want + Buffer.ToString(bytes([0])), "md5(md5(password + user) + salt)");
+    c3.Close();
+
+    checkEq(kindOf(raised(fn() { PgWire.Connect(connTo(fakePg({ auth: "scram" }), { password: "wrong" })); })), "auth", "SCRAM with a wrong password: auth");
+    let bad = raised(fn() { PgWire.Connect(connTo(fakePg({ auth: "scram-badsig" }), nil)); });
+    checkEq(kindOf(bad), "auth", "a server that cannot prove the password: auth");
+    check(bad != nil && String.Contains(bad.Error, "signature"), "named as a signature mismatch");
+    let rej = raised(fn() { PgWire.Connect(connTo(fakePg({ auth: "reject" }), nil)); });
+    checkEq([kindOf(rej), rej?.SqlState, rej?.Severity], ["auth", "28P01", "FATAL"], "an ErrorResponse at login: auth with SQLSTATE");
+    checkEq(kindOf(raised(fn() { PgWire.Connect(connTo(fakePg({ auth: "gss" }), nil)); })), "auth", "GSSAPI: unsupported, auth");
+    checkEq(kindOf(raised(fn() { PgWire.Connect(connTo(fakePg({ auth: "cleartext" }), { password: nil })); })), "auth", "a password requested but none given");
+
+    _fe = [];
+    let c4 = PgWire.Connect(connTo(fakePg({ ssl: "N" }), { sslmode: "prefer" }));
+    checkEq(Buffer.ReadU32At(startupBody(), 0, true), 80877103, "prefer sends SSLRequest first");
+    checkEq(c4.IsEncrypted(), false, "and goes on in the clear after N");
+    c4.Close();
+    let e5 = raised(fn() { PgWire.Connect(connTo(fakePg({ ssl: "N" }), { sslmode: "require" })); });
+    checkEq(kindOf(e5), "tls", "require and a server without TLS: tls");
+    checkEq(kindOf(raised(fn() { PgWire.Connect(connTo(1, { sslmode: "sometimes" })); })), "connect", "an unknown sslmode");
+    let lp = listenLoopback();
+    Stream.Close(lp[0]);
+    checkEq(kindOf(raised(fn() { PgWire.Connect(connTo(lp[1], nil)); })), "connect", "nobody listening: connect");
+}
+
+fn md5hex(b) { return Digest.Md5(b); }
+
+fn test_connection_strings() {
+    Console.WriteLine("== connection strings ==");
+    _fe = [];
+    let p1 = fakePg({});
+    let a = PgWire.Connect("host=127.0.0.1 port=" + str(p1) + " user=kw dbname='my db' password=x sslmode=disable application_name=tool");
+    let pa = startupPairs(startupBody());
+    checkEq([pa.user, pa.database, pa.application_name], ["kw", "my db", "tool"], "libpq keywords, a quoted value");
+    a.Close();
+    _fe = [];
+    let p2 = fakePg({});
+    let b = PgWire.Connect("postgresql://u%40x:p%3Aw@127.0.0.1:" + str(p2) + "/data?sslmode=disable&application_name=uri");
+    let pb = startupPairs(startupBody());
+    checkEq([pb.user, pb.database, pb.application_name], ["u@x", "data", "uri"], "URI with percent-encoded user and query options");
+    b.Close();
+    _fe = [];
+    let p3 = fakePg({});
+    let c = PgWire.Connect({ host: "127.0.0.1", port: p3, user: "obj", sslmode: "disable" });
+    checkEq(startupPairs(startupBody()).database, "obj", "the database defaults to the user");
+    c.Close();
+}
+
+const OID_ROWS = [["b", 16], ["i2", 21], ["i4", 23], ["i8", 20], ["f4", 700], ["f8", 701], ["num", 1700], ["txt", 25],
+                  ["vc", 1043], ["by", 17], ["byesc", 17], ["js", 114], ["jsb", 3802], ["ia", 1007], ["ta", 1009],
+                  ["nul", 23], ["ts", 1114], ["uuid", 2950], ["inf", 701], ["nan", 701], ["other", 600]];
+
+fn typesReply() {
+    return bytes([rowDesc(OID_ROWS),
+                  dataRow(["t", "-32768", "2147483647", "-9223372036854775808", "1.5", "0.1", "12345678901234567890.123456789",
+                           "räksmörgås", "", "\\x00ff0a0d", "a\\\\b\\001", "{\"a\":[1,true,null]}", "[1,2]", "{{1,2},{3,NULL}}",
+                           "{\"a b\",\"c\\\"d\",NULL,\"NULL\",e}", nil, "2026-10-21 12:34:56.789", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+                           "-Infinity", "NaN", "(1,2)"]),
+                  complete("SELECT 1"), ready("I")]);
+}
+
+fn checkTypes(row, label) {
+    checkEq([row.b, row.i2, row.i4, row.i8], [true, -32768, 2147483647, -9223372036854775807 - 1], label + ": bool and integers");
+    checkEq([row.f4, row.f8], [1.5, 0.1], label + ": floats");
+    checkEq(row.num, "12345678901234567890.123456789", label + ": numeric keeps every digit as text");
+    checkEq([row.txt, row.vc], ["räksmörgås", ""], label + ": text, empty varchar");
+    checkEq(Buffer.ToArray(row.by), [0, 255, 10, 13], label + ": bytea hex to a block");
+    checkEq(Buffer.ToArray(row.byesc), [97, 92, 98, 1], label + ": bytea escape format");
+    checkEq([row.js, row.jsb], [{ a: [1, true, nil] }, [1, 2]], label + ": json and jsonb parsed");
+    checkEq(row.ia, [[1, 2], [3, nil]], label + ": int4[][] with NULL");
+    checkEq(row.ta, ["a b", "c\"d", nil, "NULL", "e"], label + ": text[] with quotes, NULL and \"NULL\"");
+    checkEq([row.nul, Object.HasKey(row, "nul")], [nil, true], label + ": NULL is nil, the column is there");
+    checkEq([row.ts, row.uuid, row.other], ["2026-10-21 12:34:56.789", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "(1,2)"], label + ": text forms");
+    check(row.inf < -1e308 && Math.IsNaN(row.nan), label + ": -Infinity and NaN");
+}
+
+fn test_results() {
+    Console.WriteLine("== fake server: results ==");
+    _fe = [];
+    let notices = [];
+    let multi = bytes([rowDesc([["x", 23]]), dataRow(["1"]), complete("SELECT 1"),
+                       complete("INSERT 0 3"), noticeResp("relation exists, skipping"), msg("I", []),
+                       notification(77, "jobs", "new"), msg("S", [cstr("TimeZone"), cstr("UTC")]),
+                       rowDesc([["y", 25]]), dataRow(["a"]), dataRow([nil]), complete("SELECT 2"), ready("I")]);
+    let p = fakePg({ steps: [typesReply(), { send: typesReply(), split: 7 }, multi, bytes([complete("UPDATE 5"), ready("I")])] });
+    let db = PgWire.Connect(connTo(p, { onNotice: fn(n) { Array.Append(notices, n); } }));
+    checkTypes(db.QueryOne("SELECT types"), "whole");
+    checkTypes(db.QueryOne("SELECT types"), "split in 7-byte pieces");
+    let rs = db.SimpleQuery("SELECT 1; INSERT ...; ; SELECT y");
+    checkEq(len(rs), 4, "one result per statement, the empty one included");
+    checkEq([rs[0].command, rs[0].rowCount, rs[0].rows], ["SELECT", 1, [{ x: 1 }]], "first result");
+    checkEq([rs[1].command, rs[1].rowCount], ["INSERT", 3], "INSERT count");
+    checkEq(rs[2].command, "", "the empty statement");
+    checkEq(rs[3].rows, [{ y: "a" }, { y: nil }], "last result");
+    checkEq(rs[3].fields, [{ name: "y", type: 25 }], "field names and type oids");
+    checkEq(notices[0]?.message, "relation exists, skipping", "the notice went to onNotice");
+    checkEq(db.ServerParameter("TimeZone"), "UTC", "ParameterStatus between results");
+    checkEq(db.Notifications(), [{ channel: "jobs", payload: "new", pid: 77 }], "a notification during a query is kept");
+    checkEq(db.Exec("UPDATE t SET x = 1"), 5, "Exec returns the row count");
+    checkEq(Buffer.ToString(feOf("Q")[3].body), "UPDATE t SET x = 1" + Buffer.ToString(bytes([0])), "simple Query on the wire");
+    db.Close();
+}
+
+fn test_extended_wire() {
+    Console.WriteLine("== fake server: parameters on the wire ==");
+    _fe = [];
+    let reply = bytes([msg("1", []), msg("2", []), rowDesc([["n", 23]]), dataRow(["43"]), complete("SELECT 1"), ready("I")]);
+    let p = fakePg({ steps: [reply, bytes([msg("1", []), msg("2", []), msg("n", []), complete("INSERT 0 1"), ready("I")])] });
+    let db = PgWire.Connect(connTo(p, nil));
+    let raw = bytes([0, 1, 255]);
+    checkEq(db.QueryValue("SELECT $1::int + 1, $2, $3, $4, $5", [42, nil, raw, "it's", { k: [1] }]), 43, "a parameterized query");
+    let parse = feOf("P")[0].body;
+    checkEq(Buffer.ToString(Buffer.Slice(parse, 0, 1)), Buffer.ToString(bytes([0])), "the unnamed statement");
+    let sqlEnd = Buffer.IndexOf(parse, 0, 1);
+    checkEq(Buffer.ToString(Buffer.Slice(parse, 1, sqlEnd - 1)), "SELECT $1::int + 1, $2, $3, $4, $5", "the SQL travels without the values");
+    checkEq(Buffer.ToArray(Buffer.Slice(parse, sqlEnd + 1, 22)), [0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0],
+            "five parameter types: unknown except bytea");
+    let bind = feOf("B")[0].body;
+    checkEq(Buffer.ToArray(bind), Buffer.ToArray(bytes([0, 0, be16(5), be16(0), be16(0), be16(1), be16(0), be16(0), be16(5),
+                                                         be32(2), "42", be32(0xFFFFFFFF), be32(3), raw, be32(4), "it's",
+                                                         be32(9), "{\"k\":[1]}", be16(0)])),
+            "Bind: binary format for the block, -1 for NULL, text for the rest");
+    checkEq([len(feOf("D")), len(feOf("E")), len(feOf("S"))], [1, 1, 1], "Describe, Execute and Sync follow");
+    checkEq(db.Exec("INSERT INTO t VALUES ($1)", [1.0 / 3.0]), 1, "a statement without rows");
+    let bind2 = feOf("B")[1].body;
+    check(String.Contains(Buffer.ToString(bind2), "0.3333333333333333"), "a float keeps its precision");
+    db.Close();
+}
+
+fn test_errors() {
+    Console.WriteLine("== fake server: errors ==");
+    let err = errorResp({ S: "ERROR", V: "ERROR", C: "23505", M: "duplicate key value violates unique constraint \"t_pkey\"",
+                          D: "Key (id)=(1) already exists.", H: "Pick another id.", s: "public", t: "t", n: "t_pkey",
+                          F: "nbtinsert.c", L: "666", R: "_bt_check_unique" });
+    let p = fakePg({ steps: [bytes([err, ready("I")]), bytes([rowDesc([["ok", 16]]), dataRow(["t"]), complete("SELECT 1"), ready("I")]),
+                             bytes([msg("1", []), err, ready("E")]), bytes([complete("ROLLBACK"), ready("I")])] });
+    let db = PgWire.Connect(connTo(p, nil));
+    let e = raised(fn() { db.Exec("INSERT INTO t VALUES (1)"); });
+    check(e is PgError, "a failed statement raises PgError");
+    checkEq([e?.Kind, e?.SqlState, e?.Severity], ["server", "23505", "ERROR"], "kind, SQLSTATE, severity");
+    checkEq(e?.Error, "duplicate key value violates unique constraint \"t_pkey\"", "the server message");
+    checkEq([e?.Detail, e?.Hint, e?.Constraint], ["Key (id)=(1) already exists.", "Pick another id.", "t_pkey"], "detail, hint, constraint");
+    checkEq([e?.Fields?.table, e?.Fields?.schema, e?.Fields?.routine], ["t", "public", "_bt_check_unique"], "every other field");
+    checkEq(db.QueryValue("SELECT true"), true, "the connection is still usable");
+    let e2 = raised(fn() { db.Exec("INSERT INTO t VALUES ($1)", [1]); });
+    checkEq(e2?.SqlState, "23505", "an extended-protocol error");
+    checkEq(db.TransactionStatus(), "failed", "inside a failed transaction");
+    db.Rollback();
+    checkEq(db.TransactionStatus(), "idle", "ROLLBACK leaves it");
+    db.Close();
+    checkEq(kindOf(raised(fn() { db.Query("SELECT 1"); })), "closed", "a closed connection refuses");
+}
+
+fn test_failures() {
+    Console.WriteLine("== fake server: timeouts and broken messages ==");
+    _cancels = [];
+    let p = fakePg({ cancel: true, steps: [{ pause: 700, send: nil }] });
+    let db = PgWire.Connect(connTo(p, { timeoutMs: 250 }));
+    let t0 = Time.Millis();
+    let e = raised(fn() { db.Query("SELECT pg_sleep(10)"); });
+    checkEq(kindOf(e), "timeout", "no answer: timeout");
+    check(Time.Millis() - t0 < 700, "after timeoutMs");
+    checkEq(db.IsConnected(), false, "the connection is given up");
+    Fiber.Sleep(100);
+    checkEq(len(_cancels), 1, "a CancelRequest went out on its own connection");
+    if (len(_cancels) == 1) {
+        let cr = bytes([_cancels[0]]);
+        checkEq([Buffer.ReadU32At(cr, 0, true), Buffer.ReadU32At(cr, 4, true), Buffer.ReadU32At(cr, 8, true), Buffer.ReadU32At(cr, 12, true)],
+                [16, 80877102, GREETING_PID, GREETING_SECRET], "CancelRequest with the backend key");
+    }
+
+    let cases = [[bytes(["Z", be32(2)]), "protocol", "a length below 4"],
+                 [bytes([msg("x", ["?"]), ready("I")]), "protocol", "an unknown message type"],
+                 [bytes(["T", be32(100), be16(1)]), "closed", "a message cut off by a hang-up"],
+                 [bytes([rowDesc([["a", 23]]), "D", be32(20), be16(1), be32(10), "abc"]), "closed", "a row cut off by a hang-up"]];
+    foreach (cs in cases) {
+        let pp = fakePg({ steps: [{ send: cs[0], close: true }] });
+        let c = PgWire.Connect(connTo(pp, { timeoutMs: 600 }));
+        checkEq(kindOf(raised(fn() { c.Query("SELECT 1"); })), cs[1], cs[2]);
+        checkEq(c.IsConnected(), false, cs[2] + ": connection dropped");
+    }
+}
+
+fn test_sharing() {
+    Console.WriteLine("== fake server: one connection, several fibers ==");
+    let one = fn(v) { return bytes([rowDesc([["v", 23]]), dataRow([v]), complete("SELECT 1"), ready("I")]); };
+    let p = fakePg({ steps: [{ pause: 60, send: one("1") }, one("2"), { pause: 30, send: one("3") }, one("4")] });
+    let db = PgWire.Connect(connTo(p, nil));
+    let got = Fiber.AwaitAll([
+        Fiber.New(fn() { return [db.QueryValue("SELECT 1"), db.QueryValue("SELECT 2")]; }),
+        Fiber.New(fn() { return [db.QueryValue("SELECT 3"), db.QueryValue("SELECT 4")]; })
+    ]);
+    let all = Array.Concat(got[0], got[1]);
+    checkEq(Array.Sort(all), [1, 2, 3, 4], "each fiber got its own answers");
+    db.Close();
+}
+
+// ---- TLS ----------------------------------------------------------------------
+
+// A self-signed certificate for localhost as a PKCS#12 bundle (password
+// "pw"), or nil when openssl is missing or this build cannot serve TLS.
+fn tlsFixture() {
+    if (!Stream.TlsServerAvailable() || Os.Which("openssl") == nil) { return nil; }
+    let dir = Path.Combine(Os.TempDir(), "flaris-pgwire-tls-" + str(Os.Pid()));
+    Directory.Create(dir);
+    let f = { dir: dir, key: Path.Combine(dir, "key.pem"), cert: Path.Combine(dir, "cert.pem"), p12: Path.Combine(dir, "server.p12") };
+    let req = Os.RunEx("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", f.key, "-out", f.cert, "-days", "2", "-nodes",
+                                   "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"]);
+    let p12 = (req != nil && req.Exit == 0) ? Os.RunEx("openssl", ["pkcs12", "-export", "-out", f.p12, "-inkey", f.key, "-in", f.cert, "-passout", "pass:pw"]) : nil;
+    if (p12 == nil || p12.Exit != 0) { tlsCleanup(f); return nil; }
+    return f;
+}
+
+fn tlsCleanup(f) {
+    foreach (p in [f.key, f.cert, f.p12]) { if (File.Exists(p)) { File.Delete(p); } }
+    Directory.Delete(f.dir);
+}
+
+fn test_tls() {
+    Console.WriteLine("== fake server: TLS ==");
+    let f = tlsFixture();
+    if (f == nil) { Console.WriteLine("  skipped: no openssl, or no TLS server in this build"); return; }
+    let one = bytes([rowDesc([["v", 25]]), dataRow(["over tls"]), complete("SELECT 1"), ready("I")]);
+    _fe = [];
+    let db = PgWire.Connect(connTo(fakePg({ ssl: "S", p12: f.p12, auth: "scram", steps: [one] }), { sslmode: "require", timeoutMs: 2000 }));
+    checkEq(db.IsEncrypted(), true, "SSLRequest answered S: StartTls");
+    checkEq(db.QueryValue("SELECT 'over tls'"), "over tls", "SCRAM and a query through TLS");
+    db.Close();
+    let p2 = PgWire.Connect(connTo(fakePg({ ssl: "S", p12: f.p12, steps: [one] }), { sslmode: "prefer", timeoutMs: 2000 }));
+    checkEq(p2.IsEncrypted(), true, "prefer takes TLS when offered");
+    p2.Close();
+    let strict = raised(fn() { PgWire.Connect(connTo(fakePg({ ssl: "S", p12: f.p12 }), { sslmode: "verify-full", timeoutMs: 2000 })); });
+    checkEq(kindOf(strict), "tls", "verify-full refuses a self-signed certificate");
+    tlsCleanup(f);
+}
+
+// ---- live -------------------------------------------------------------------
+
+fn liveUrl() {
+    let url = Os.Getenv("PGWIRE_TEST_URL") ?? "postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable";
+    if (!Net.IsReachable("127.0.0.1", 5432, 300) && Os.Getenv("PGWIRE_TEST_URL") == nil) { return nil; }
+    try {
+        let db = PgWire.Connect(url);
+        db.Close();
+    } catch (e) {
+        Console.WriteLine("  live server not usable: ", e.Error);
+        return nil;
+    }
+    return url;
+}
+
+fn test_live(url) {
+    if (url == nil) {
+        Console.WriteLine("== live: skipped (no PostgreSQL to log in to) ==");
+        return;
+    }
+    Console.WriteLine("== live ==");
+    let db = PgWire.Connect(url);
+    check(db.ProcessId() > 0, "connected with SCRAM-SHA-256");
+    check(String.Length(db.ServerParameter("server_version") ?? "") > 0, "server_version reported");
+    checkEq(db.ScalarString("SELECT current_setting('application_name')"), "flaris", "application_name");
+    let wrong = raised(fn() { PgWire.Connect(String.Replace(url, ":postgres@", ":wrong-password@")); });
+    checkEq([kindOf(wrong), wrong?.SqlState], ["auth", "28P01"], "a wrong password: auth, 28P01");
+    let tlsOnly = raised(fn() { PgWire.Connect(String.Replace(url, "sslmode=disable", "sslmode=require")); });
+    check(kindOf(tlsOnly) == "tls" || tlsOnly == nil, "sslmode=require: tls error when the server has no TLS");
+
+    db.Exec("CREATE TEMP TABLE pw_items (id serial PRIMARY KEY, name text NOT NULL UNIQUE, qty int, price numeric(10,2), " +
+            "ok boolean, data bytea, meta jsonb, tags text[], seen timestamptz DEFAULT now())");
+    checkEq(db.Exec("INSERT INTO pw_items (name, qty, price, ok, data, meta, tags) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    ["widget", 3, "9.99", true, bytes([0, 1, 2]), { color: "red", sizes: [1, 2] }, "{a,\"b c\"}"]), 1, "INSERT with seven parameters");
+    let row = db.QueryOne("SELECT * FROM pw_items WHERE name = $1", ["widget"]);
+    checkEq([row?.id, row?.name, row?.qty, row?.price, row?.ok], [1, "widget", 3, "9.99", true], "values read back typed");
+    checkEq(Buffer.ToArray(row?.data ?? bytes([9])), [0, 1, 2], "bytea read back");
+    checkEq(row?.meta, { color: "red", sizes: [1, 2] }, "jsonb read back parsed");
+    checkEq(row?.tags, ["a", "b c"], "text[] read back");
+    check(String.StartsWith(row?.seen ?? "", "20"), "timestamptz as text: " + str(row?.seen));
+
+    // NULLs, both ways.
+    db.Exec("INSERT INTO pw_items (name, qty, price, ok, data, meta) VALUES ($1, $2, $3, $4, $5, $6)", ["empty", nil, nil, nil, nil, nil]);
+    let nulls = db.QueryOne("SELECT qty, price, ok, data, meta, tags FROM pw_items WHERE name = 'empty'");
+    checkEq(nulls, { qty: nil, price: nil, ok: nil, data: nil, meta: nil, tags: nil }, "NULL parameters and NULL columns");
+    checkEq(db.QueryValue("SELECT $1::text IS NULL", [nil]), true, "a nil parameter is NULL");
+
+    // bytea: all 256 byte values, both directions.
+    let all = Buffer.Create(256, 1);
+    iter (i from 0 to 256) { all[i] = i; }
+    db.Exec("UPDATE pw_items SET data = $1 WHERE name = 'widget'", [all]);
+    check(Buffer.Equals(db.QueryValue("SELECT data FROM pw_items WHERE name = 'widget'"), all), "every byte value round-trips through bytea");
+    checkEq(db.QueryValue("SELECT length($1::bytea)", [all]), 256, "a block parameter arrives as 256 bytes");
+    let text = "räksmörgås ✓ 🐱 'quote' \"dq\" back\\slash $1 ; DROP TABLE pw_items; --";
+    checkEq(db.QueryValue("SELECT $1::text", [text]), text, "a hostile string stays a value");
+    checkEq(db.ScalarInt("SELECT count(*) FROM pw_items"), 2, "and the table is still there");
+    let types = db.QueryOne("SELECT 1::int2 AS a, 2147483647::int4 AS b, 9223372036854775807::int8 AS c, 1.25::float4 AS d, " +
+                            "1e308::float8 AS e, 'NaN'::float8 AS f, 'Infinity'::float8 AS g, 0.1::float8 AS h, " +
+                            "12345678901234567890.5::numeric AS i, '2026-10-21'::date AS j, '12:30'::time AS k, " +
+                            "'1 day 2 hours'::interval AS l, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid AS m, " +
+                            "ARRAY[[1,2],[3,4]] AS n, ARRAY[1.5,NULL]::float8[] AS o, ARRAY[true,false] AS p, " +
+                            "'{\"x\": 1}'::json AS q, ''::text AS r, 'x'::char(3) AS s");
+    checkEq([types?.a, types?.b, types?.c, types?.d, types?.e, types?.h], [1, 2147483647, 9223372036854775807, 1.25, 1e308, 0.1], "integers and floats");
+    check(Math.IsNaN(types?.f ?? 0.0) && types?.g > 1e308, "NaN and Infinity");
+    checkEq([types?.i, types?.j, types?.k, types?.l, types?.m], ["12345678901234567890.5", "2026-10-21", "12:30:00", "1 day 02:00:00", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"], "text forms");
+    checkEq([types?.n, types?.o, types?.p, types?.q, types?.r, types?.s], [[[1, 2], [3, 4]], [1.5, nil], [true, false], { x: 1 }, "", "x  "], "arrays, json, empty and padded text");
+    checkEq(db.QueryValue("SELECT $1::float8", [0.1 + 0.2]), 0.30000000000000004, "a float parameter keeps every digit");
+    checkEq(db.QueryValue("SELECT $1::bool", [false]), false, "a bool parameter");
+    checkEq(db.QueryValue("SELECT $1::int8", [-9223372036854775807 - 1]), -9223372036854775807 - 1, "the smallest int8");
+
+    // Errors.
+    let dup = raised(fn() { db.Exec("INSERT INTO pw_items (name) VALUES ($1)", ["widget"]); });
+    checkEq([dup?.SqlState, dup?.Constraint, dup?.Fields?.table], ["23505", "pw_items_name_key", "pw_items"], "unique violation with its constraint");
+    check(String.Contains(dup?.Detail ?? "", "already exists"), "and its detail");
+    checkEq(raised(fn() { db.Query("SELECT 1/0"); })?.SqlState, "22012", "division by zero");
+    let syn = raised(fn() { db.Query("SELEC 1"); });
+    checkEq([syn?.SqlState, syn?.Fields?.position], ["42601", "1"], "syntax error with its position");
+    checkEq(raised(fn() { db.Query("SELECT $1::int", ["abc"]); })?.SqlState, "22P02", "a bad parameter value");
+    checkEq(db.ScalarInt("SELECT 7"), 7, "the connection goes on after errors");
+    let notices = [];
+    let nd = PgWire.Connect({ host: "127.0.0.1", port: 5432, user: "postgres", password: "postgres", database: "postgres",
+                              sslmode: "disable", onNotice: fn(n) { Array.Append(notices, n.message); } });
+    nd.Exec("DO $$ BEGIN RAISE NOTICE 'hello from plpgsql'; END $$");
+    checkEq(notices, ["hello from plpgsql"], "RAISE NOTICE reaches onNotice");
+    nd.Close();
+
+    // Transactions.
+    checkEq(db.Transaction(fn(tx) { tx.Exec("INSERT INTO pw_items (name) VALUES ('t1')"); }), true, "Transaction commits");
+    checkEq(db.ScalarInt("SELECT count(*) FROM pw_items WHERE name = 't1'"), 1, "the commit is visible");
+    let thrown = raised(fn() {
+        db.Transaction(fn() {
+            db.Exec("INSERT INTO pw_items (name) VALUES ('t2')");
+            throw new PgError(Exception.InvalidState, "application gave up");
+        });
+    });
+    check(thrown is PgError && thrown.Error == "application gave up", "the original exception comes out of Transaction");
+    checkEq(db.ScalarInt("SELECT count(*) FROM pw_items WHERE name = 't2'"), 0, "and the transaction was rolled back");
+    checkEq(db.Transaction(fn() { db.Exec("INSERT INTO pw_items (name) VALUES ('t3')"); return false; }), false, "returning false rolls back");
+    checkEq(db.ScalarInt("SELECT count(*) FROM pw_items WHERE name = 't3'"), 0, "nothing of it left");
+    db.Transaction(fn() {
+        db.Exec("INSERT INTO pw_items (name) VALUES ('outer')");
+        let inner = raised(fn() {
+            db.Transaction(fn() {
+                db.Exec("INSERT INTO pw_items (name) VALUES ('inner')");
+                db.Exec("INSERT INTO pw_items (name) VALUES ('outer')");
+            });
+        });
+        checkEq(inner?.SqlState, "23505", "the inner failure surfaces");
+        checkEq(db.TransactionStatus(), "transaction", "the outer transaction survives through its savepoint");
+        db.Exec("INSERT INTO pw_items (name) VALUES ('after')");
+    });
+    checkEq(Array.Select(db.Query("SELECT name FROM pw_items WHERE name IN ('outer', 'inner', 'after') ORDER BY name"), fn(r) => r.name),
+            ["after", "outer"], "a nested transaction rolled back alone");
+    db.Begin();
+    raised(fn() { db.Query("SELECT 1/0"); });
+    checkEq(db.TransactionStatus(), "failed", "an error inside BEGIN leaves the transaction failed");
+    db.Rollback();
+    checkEq(db.TransactionStatus(), "idle", "ROLLBACK");
+
+    // LISTEN / NOTIFY between two connections.
+    let ch = "flaris_pw_" + Util.BinToHex(Crypto.RandomBytes(4));
+    let listener = PgWire.Connect(url);
+    listener.Listen(ch);
+    let t0 = Time.Millis();
+    checkEq(listener.WaitNotification(150), nil, "WaitNotification times out with nil");
+    check(Time.Millis() - t0 < 500, "promptly");
+    Fiber.Run(fn() { Fiber.Sleep(50); db.Notify(ch, "first"); db.Notify(ch, "second"); });
+    let n1 = listener.WaitNotification(3000);
+    checkEq([n1?.channel, n1?.payload], [ch, "first"], "a notification from another connection");
+    checkEq(listener.WaitNotification(3000)?.payload, "second", "and the next");
+    db.Notify(ch, "during query");
+    listener.QueryValue("SELECT pg_sleep(0.05)");
+    checkEq(Array.Select(listener.Notifications(), fn(n) => n.payload), ["during query"], "notifications that arrive during a query are kept");
+    listener.Unlisten(ch);
+    listener.Close();
+
+    // COPY.
+    db.Exec("CREATE TEMP TABLE pw_copy (id int, label text, note text)");
+    checkEq(db.CopyIn("COPY pw_copy FROM STDIN", [[1, "tab\there", nil], [2, "new\nline", "back\\slash"], [3, "plain", ""]]), 3, "COPY FROM STDIN, 3 rows");
+    checkEq(db.Query("SELECT label, note FROM pw_copy ORDER BY id"),
+            [{ label: "tab\there", note: nil }, { label: "new\nline", note: "back\\slash" }, { label: "plain", note: "" }], "special characters survive COPY");
+    checkEq(db.CopyIn("COPY pw_copy (id, label) FROM STDIN WITH (FORMAT csv)", "4,csv\n5,\"quoted, comma\"\n"), 2, "COPY with CSV text");
+    let out = db.CopyOut("COPY (SELECT id, label FROM pw_copy WHERE id >= 4 ORDER BY id) TO STDOUT WITH (FORMAT csv)");
+    checkEq(out, "4,csv\n5,\"quoted, comma\"\n", "COPY TO STDOUT");
+    checkEq(raised(fn() { db.CopyIn("COPY pw_copy FROM STDIN", "not-a-number\tx\ty\n"); })?.SqlState, "22P02", "a bad COPY row raises");
+
+    // Cancel, statement timeout and the fiber that keeps running.
+    let ticks = [0];
+    Fiber.Run(fn() { iter (i from 0 to 40) { ticks[0] += 1; Fiber.Sleep(5); } });
+    let t1 = Time.Millis();
+    db.QueryValue("SELECT pg_sleep(0.2)");
+    check(Time.Millis() - t1 >= 180 && ticks[0] >= 20, "other fibers ran during pg_sleep: " + str(ticks[0]));
+    Fiber.Run(fn() { Fiber.Sleep(100); db.Cancel(); });
+    let cancelled = raised(fn() { db.QueryValue("SELECT pg_sleep(5)"); });
+    checkEq(cancelled?.SqlState, "57014", "Cancel stops a running query");
+    let slow = PgWire.Connect(url + (String.Contains(url, "?") ? "&" : "?") + "timeoutMs=300");
+    let t2 = Time.Millis();
+    checkEq(kindOf(raised(fn() { slow.QueryValue("SELECT pg_sleep(3)"); })), "timeout", "timeoutMs: a slow query raises");
+    check(Time.Millis() - t2 < 1500, "after about timeoutMs");
+    Fiber.Sleep(100);
+    checkEq(db.ScalarInt("SELECT count(*) FROM pg_stat_activity WHERE query = 'SELECT pg_sleep(3)' AND state = 'active'"), 0, "the timed-out query was cancelled on the server");
+
+    // Many rows, ExecMany, QueryMap, pools.
+    let big = db.Query("SELECT g AS id, 'row ' || g AS label FROM generate_series(1, 5000) g");
+    checkEq([len(big), big[0].id, big[4999].label], [5000, 1, "row 5000"], "5000 rows");
+    checkEq(db.ExecMany("INSERT INTO pw_copy (id, label) VALUES ($1, $2)", [[10, "a"], [11, "b"], [12, "c"]]), 3, "ExecMany");
+    let m = db.QueryMap("SELECT id, label FROM pw_copy WHERE id >= 10", "id");
+    checkEq([m["10"]?.label, m["12"]?.label], ["a", "c"], "QueryMap");
+    let pool = new PgPool(url, 3);
+    let fibers = [];
+    iter (k from 0 to 6) {
+        Array.Append(fibers, Fiber.New(fn() { return pool.Use(fn(c) { return c.ScalarInt("SELECT $1::int * 2 FROM pg_sleep(0.02)", [k]); }); }));
+    }
+    checkEq(Fiber.AwaitAll(fibers), [0, 2, 4, 6, 8, 10], "six fibers through a pool of three");
+    check(pool.Stats().inUse == 0 && pool.Stats().total <= 3, "connections back: " + Json.Stringify(pool.Stats()));
+    pool.Close();
+
+    db.Close();
+    checkEq(db.IsConnected(), false, "closed");
+}
+
+// ---- benchmarks -------------------------------------------------------------
+
+fn run_benchmarks(url) {
+    Console.WriteLine("");
+    Console.WriteLine("== benchmarks ==");
+    Test.Bench("SCRAM: client-final (PBKDF2, 4096 rounds)", fn() {
+        _sink += String.Length(PgScram.ClientFinal("pencil", "n=user,r=rOprNGfwEbeRWgbNEkqO",
+            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", "rOprNGfwEbeRWgbNEkqO").message);
+    }, 50);
+    let rows = [];
+    iter (i from 0 to 1000) { Array.Append(rows, dataRow([str(i), "label " + str(i), "t", nil])); }
+    let reply = bytes([rowDesc([["id", 23], ["label", 25], ["ok", 16], ["n", 23]]), rows, complete("SELECT 1000"), ready("I")]);
+    let steps = [];
+    iter (i from 0 to 23) { Array.Append(steps, reply); }
+    let fake = PgWire.Connect(connTo(fakePg({ steps: steps }), nil));
+    Test.Bench("fake server: 1000 rows x 4 columns", fn() { _sink += len(fake.Query("SELECT rows")); }, 20);
+    fake.Close();
+    if (url == nil) { return; }
+
+    let db = PgWire.Connect(url);
+    let us1 = Test.Bench("PgWire: SELECT 1 round trip", fn() { _sink += db.ScalarInt("SELECT 1"); }, 1000);
+    let us2 = Test.Bench("PgWire: SELECT $1 with a parameter", fn() { _sink += db.ScalarInt("SELECT $1::int", [5]); }, 1000);
+    let us3 = Test.Bench("PgWire: 10k rows x 3 columns", fn() {
+        _sink += len(db.Query("SELECT g AS id, 'name ' || g AS name, g * 1.5 AS score FROM generate_series(1, 10000) g"));
+    }, 5);
+    Console.WriteLine("  PgWire: ", int(1000000.0 / us1), " simple queries/s, ", int(1000000.0 / us2), " parameterized/s, ",
+                      int(10000.0 * 1000000.0 / us3), " rows/s");
+    db.Close();
+
+    let ffi = nil;
+    try { ffi = Postgres.Connect("host=127.0.0.1 port=5432 dbname=postgres user=postgres password=postgres gssencmode=disable"); }
+    catch (e) { ffi = nil; }
+    if (ffi == nil) {
+        Console.WriteLine("  FFI Postgres: skipped (needs --unsafe and pg_ffi)");
+        return;
+    }
+    let f1 = Test.Bench("FFI Postgres: SELECT 1 round trip", fn() { _sink += ffi.ScalarInt("SELECT 1"); }, 1000);
+    let f2 = Test.Bench("FFI Postgres: SELECT $1 with a parameter", fn() { _sink += ffi.ScalarIntParams("SELECT $1::int", [5]); }, 1000);
+    let f3 = Test.Bench("FFI Postgres: 10k rows x 3 columns", fn() {
+        _sink += len(ffi.Query("SELECT g AS id, 'name ' || g AS name, g * 1.5 AS score FROM generate_series(1, 10000) g"));
+    }, 5);
+    Console.WriteLine("  FFI Postgres: ", int(1000000.0 / f1), " simple queries/s, ", int(1000000.0 / f2), " parameterized/s, ",
+                      int(10000.0 * 1000000.0 / f3), " rows/s");
+    ffi.Close();
+}
+
+fn async Main() {
+    Console.WriteLine("=== PgWire tests ===");
+    test_scram();
+    test_startup();
+    test_connection_strings();
+    test_results();
+    test_extended_wire();
+    test_errors();
+    test_failures();
+    test_sharing();
+    test_tls();
+    let url = liveUrl();
+    test_live(url);
+    run_benchmarks(url);
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: ", testsRun, "  failed: ", testsFailed);
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

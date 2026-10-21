@@ -1,0 +1,788 @@
+// test_resp.fls - Tests for Resp.fls, the pure-Flaris Redis client.
+// Run: flarisvm tests/test_resp.fls --libs='./libs'
+//
+// The wire format, the failure paths, RESP3, Pub/Sub and the fiber sharing
+// run against fake servers on loopback and need nothing installed. The live
+// part runs when a Redis answers on 127.0.0.1:6379 (RESP_TEST_HOST and
+// RESP_TEST_PORT pick another one) and is skipped otherwise:
+//
+//   docker run -d --name flaris-redis -p 6379:6379 redis:7-alpine
+//
+// The live part only touches keys under "flaris:resp:test:", the database
+// index 13 and a temporary ACL user "flaris-resp-test", and removes all of
+// them at the end. Run with --unsafe to bench the FFI Redis library too.
+
+import { Resp, RespError, RespPool } from library("Resp", "1.0");
+import { Redis } from library("Redis", "1.0");
+import { Test } from library("Test", "1.0");
+
+const PFX = "flaris:resp:test:";
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg);
+    }
+}
+
+// Equal values; objects and arrays by content.
+fn same(a, b): bool {
+    if ((Type.IsObject(a) || Type.IsArray(a)) && (Type.IsObject(b) || Type.IsArray(b))) {
+        return Json.Stringify(a, { sortKeys: true }) == Json.Stringify(b, { sortKeys: true });
+    }
+    return a == b;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun += 1;
+    if (!same(actual, expected)) {
+        testsFailed += 1;
+        Console.WriteLine("FAIL: ", msg, " expected=", Json.Stringify(expected), " got=", Json.Stringify(actual));
+    }
+}
+
+// The exception f raises, or nil.
+fn raised(f) {
+    try { f(); } catch (e) { return e; }
+    return nil;
+}
+
+fn kindOf(e) {
+    if (e == nil) { return "none"; }
+    if (e is RespError) { return e.Kind; }
+    return "other: " + e.Error;
+}
+
+fn bytesOf(arr) {
+    let b = Buffer.Create(len(arr), 1);
+    Buffer.FromArray(b, arr);
+    return b;
+}
+
+// ---- wire format ------------------------------------------------------------
+
+fn test_encode() {
+    Console.WriteLine("== encode ==");
+    checkEq(Resp.Encode("SET", "k", "v"), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n", "SET as an array of bulk strings");
+    checkEq(Resp.Encode(["GET", "k"]), "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "argument array form");
+    checkEq(Resp.Encode("PING"), "*1\r\n$4\r\nPING\r\n", "single word");
+    checkEq(Resp.Encode("INCRBY", "n", -42), "*3\r\n$6\r\nINCRBY\r\n$1\r\nn\r\n$3\r\n-42\r\n", "int argument");
+    checkEq(Resp.Encode("X", 0.1 + 0.2), "*2\r\n$1\r\nX\r\n$19\r\n0.30000000000000004\r\n", "float keeps every digit");
+    checkEq(Resp.Encode("X", Math.Infinity, -Math.Infinity), "*3\r\n$1\r\nX\r\n$3\r\ninf\r\n$4\r\n-inf\r\n", "infinities as Redis spells them");
+    checkEq(Resp.Encode("X", true, false), "*3\r\n$1\r\nX\r\n$1\r\n1\r\n$1\r\n0\r\n", "bools as 1 and 0");
+    checkEq(Resp.Encode("DEL", ["a", "b"], "c"), "*4\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n", "an array argument spreads");
+    checkEq(Resp.Encode("HSET", "h", { f: 1 }), "*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\n1\r\n", "an object argument spreads into pairs");
+    let bin = bytesOf([0, 13, 10, 36, 255]);
+    let e = Resp.Encode("SET", "b", bin);
+    checkEq(String.Length(e), 31, "a block goes out byte for byte");
+    check(String.EndsWith(e, "$5\r\n" + Buffer.ToString(bin) + "\r\n"), "block with NUL, CR, LF and $ inside a bulk string");
+    checkEq(Resp.Encode("SET", "k", "a\r\nb"), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\na\r\nb\r\n", "CRLF in a value is length-prefixed, not escaped");
+    checkEq(kindOf(raised(fn() { Resp.Encode("SET", ["k", nil]); })), "other: Resp: nil cannot be sent as an argument", "nil inside an array raises");
+    check(raised(fn() { Resp.Encode("X", Math.NaN); }) != nil, "NaN raises");
+}
+
+fn test_decode() {
+    Console.WriteLine("== decode ==");
+    checkEq(Resp.Decode("+OK\r\n"), ["OK"], "simple string");
+    checkEq(Resp.Decode(":42\r\n:-7\r\n:0\r\n"), [42, -7, 0], "integers");
+    checkEq(Resp.Decode(":9223372036854775807\r\n"), [9223372036854775807], "largest integer");
+    checkEq(Resp.Decode("$5\r\nhello\r\n$0\r\n\r\n$-1\r\n"), ["hello", "", nil], "bulk, empty bulk, nil bulk");
+    checkEq(Resp.Decode("$7\r\na\r\nb\r\nc\r\n"), ["a\r\nb\r\nc"], "CRLF inside a bulk string");
+    checkEq(Resp.Decode("*3\r\n:1\r\n$1\r\na\r\n*1\r\n+x\r\n*-1\r\n*0\r\n"), [[1, "a", ["x"]], nil, []], "nested, nil and empty arrays");
+    let errs = Resp.Decode("-WRONGTYPE Operation against a key\r\n");
+    check(errs[0] is RespError, "an error reply decodes to a RespError");
+    checkEq(errs[0].Prefix, "WRONGTYPE", "error prefix");
+    checkEq(errs[0].Error, "WRONGTYPE Operation against a key", "error text");
+    checkEq(errs[0].Kind, "server", "error kind");
+
+    checkEq(Resp.Decode("_\r\n#t\r\n#f\r\n"), [nil, true, false], "RESP3 null and booleans");
+    checkEq(Resp.Decode(",3.25\r\n,-1e3\r\n"), [3.25, -1000.0], "RESP3 doubles");
+    let inf = Resp.Decode(",inf\r\n,-inf\r\n,nan\r\n");
+    check(inf[0] > 1e308 && inf[1] < -1e308 && Math.IsNaN(inf[2]), "RESP3 inf, -inf and nan");
+    checkEq(Resp.Decode("(3492890328409238509324850943850943825024385\r\n"), ["3492890328409238509324850943850943825024385"], "RESP3 big number as text");
+    checkEq(Resp.Decode("=15\r\ntxt:Some string\r\n"), ["Some string"], "RESP3 verbatim string loses its format prefix");
+    checkEq(Resp.Decode("%2\r\n+first\r\n:1\r\n$6\r\nsecond\r\n*1\r\n:2\r\n"), [{ first: 1, second: [2] }], "RESP3 map to object");
+    checkEq(Resp.Decode("%1\r\n:7\r\n+seven\r\n"), [{ "7": "seven" }], "RESP3 map with a number key");
+    checkEq(Resp.Decode("~3\r\n+a\r\n+b\r\n+c\r\n"), [["a", "b", "c"]], "RESP3 set to array");
+    checkEq(Resp.Decode("|1\r\n+key-popularity\r\n%1\r\n$1\r\na\r\n,0.19\r\n:5\r\n"), [5], "RESP3 attribute is skipped");
+    checkEq(Resp.Decode(">3\r\n$7\r\nmessage\r\n$2\r\nch\r\n$2\r\nhi\r\n"), [["message", "ch", "hi"]], "RESP3 push");
+    let be = Resp.Decode("!21\r\nSYNTAX invalid syntax\r\n");
+    check(be[0] is RespError && be[0].Prefix == "SYNTAX", "RESP3 bulk error");
+
+    let bin = Resp.Decode("$3\r\nabc\r\n*1\r\n$2\r\nxy\r\n", { binary: true });
+    check(Type.IsBlock(bin[0]) && len(bin[0]) == 3 && bin[0][2] == 99, "binary: bulk strings as blocks");
+    check(Type.IsBlock(bin[1][0]), "binary: inside arrays too");
+    let raw = Buffer.Concat(Buffer.FromString("$4\r\n"), Buffer.Concat(bytesOf([0, 255, 13, 10]), Buffer.FromString("\r\n")));
+    let rb = Resp.Decode(raw, { binary: true });
+    check(len(rb[0]) == 4 && rb[0][0] == 0 && rb[0][1] == 255 && rb[0][3] == 10, "NUL and high bytes survive in a block");
+    let rs = Resp.Decode(raw);
+    checkEq(String.Length(rs[0]), 4, "NUL and high bytes survive in a string");
+
+    checkEq(kindOf(raised(fn() { Resp.Decode("?what\r\n"); })), "protocol", "unknown type byte");
+    checkEq(kindOf(raised(fn() { Resp.Decode("$abc\r\n"); })), "protocol", "non-numeric bulk length");
+    checkEq(kindOf(raised(fn() { Resp.Decode("$-5\r\n"); })), "protocol", "negative bulk length");
+    checkEq(kindOf(raised(fn() { Resp.Decode("$3\r\nabcX\r\n"); })), "protocol", "bulk not followed by CRLF");
+    checkEq(kindOf(raised(fn() { Resp.Decode(":12a\r\n"); })), "protocol", "bad integer");
+    checkEq(kindOf(raised(fn() { Resp.Decode("*x\r\n"); })), "protocol", "bad array length");
+    checkEq(kindOf(raised(fn() { Resp.Decode("$5\r\nab"); })), "protocol", "truncated bulk");
+    checkEq(kindOf(raised(fn() { Resp.Decode("*2\r\n:1\r\n"); })), "protocol", "truncated array");
+    checkEq(Resp.Decode(""), [], "nothing to decode");
+}
+
+// ---- fake servers -----------------------------------------------------------
+
+// Every command the fake servers read, each as an array of strings.
+global _cmds = [];
+
+fn listenLoopback() {
+    let ls = Stream.Listen("tcp", 0, 16, "127.0.0.1");
+    let addr = Stream.LocalAddr(ls);
+    return [ls, int(String.Substr(addr, String.LastIndexOf(addr, ":") + 1))];
+}
+
+// One RESP command from a client, or nil when it sends nothing in time.
+fn readCommand(c) {
+    if (Stream.WaitReadable(c, 2000) == nil) { return nil; }
+    let head = Stream.ReadLine(c);
+    if (head == nil || !String.StartsWith(head, "*")) { return nil; }
+    let n = int(String.Substr(head, 1));
+    let parts = [];
+    iter (i from 0 to n) {
+        let lenLine = Stream.ReadLine(c);
+        if (lenLine == nil) { return nil; }
+        let m = int(String.Substr(lenLine, 1));
+        var s = "";
+        while (String.Length(s) < m) {
+            let more = Stream.ReadString(c, m - String.Length(s));
+            if (more == nil) { return nil; }
+            s += more;
+        }
+        Stream.ReadLine(c);
+        Array.Append(parts, s);
+    }
+    return parts;
+}
+
+// A scripted Redis. For each entry it reads one command (kept in _cmds), then
+// answers: a string is sent as is ("" sends nothing); an array of strings is
+// sent as separate writes 20 ms apart, a reply split across TCP segments;
+// { send, pause, read } waits pause ms first and with read: false skips the
+// read; a send of "close" hangs up; "next" drops this client and serves the
+// next connection.
+fn fakeRedis(script): int {
+    let lp = listenLoopback();
+    let ls = lp[0];
+    Fiber.Run(fn() {
+        if (Stream.WaitReadable(ls, 3000) != nil) {
+            let c = Stream.Accept(ls);
+            Stream.WaitReadable(c, 1);
+            foreach (step in script) {
+                if (c == nil) { break; }
+                if (step == "next") {
+                    Stream.Close(c);
+                    c = nil;
+                    if (Stream.WaitReadable(ls, 3000) == nil) { break; }
+                    c = Stream.Accept(ls);
+                    continue;
+                }
+                var out = step;
+                var read = true;
+                var pause = 0;
+                if (Type.IsObject(step)) {
+                    out = step.send ?? "";
+                    read = step.read ?? true;
+                    pause = step.pause ?? 0;
+                }
+                if (read) {
+                    let cmd = readCommand(c);
+                    if (cmd == nil) { break; }
+                    Array.Append(_cmds, cmd);
+                }
+                if (pause > 0) { Fiber.Sleep(pause); }
+                if (out == "close") { Stream.Close(c); c = nil; break; }
+                if (Type.IsArray(out)) {
+                    foreach (piece in out) { Stream.WriteAll(c, piece); Fiber.Sleep(20); }
+                } else if (out != "") {
+                    Stream.WriteAll(c, out);
+                }
+            }
+            if (c != nil) { Fiber.Sleep(50); Stream.Close(c); }
+        }
+        Stream.Close(ls);
+    });
+    return lp[1];
+}
+
+fn lastCmd() { return (len(_cmds) == 0) ? nil : _cmds[len(_cmds) - 1]; }
+
+const FAST = { timeoutMs: 400 };
+
+fn test_fake_commands() {
+    Console.WriteLine("== fake server: commands ==");
+    _cmds = [];
+    let p = fakeRedis(["+OK\r\n", "$-1\r\n", ["$1", "3\r\nhel", "lo, wor", "ld!\r\n"], ":3\r\n",
+                       ["*3\r\n:1", "\r\n$2\r\nab\r", "\n*-1\r\n"], "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                       "+PONG\r\n"]);
+    let r = Resp.Connect("127.0.0.1", p, FAST);
+    checkEq(r.Set("k", "v", { ex: 10, nx: true }), true, "Set with options returns true on OK");
+    checkEq(lastCmd(), ["SET", "k", "v", "EX", "10", "NX"], "SET EX NX on the wire");
+    checkEq(r.Set("k", "v", { px: 1500, xx: true }), false, "Set refused by XX returns false");
+    checkEq(lastCmd(), ["SET", "k", "v", "PX", "1500", "XX"], "SET PX XX on the wire");
+    checkEq(r.Get("k"), "hello, world!", "a bulk reply split across four segments");
+    checkEq(r.Del(["a", "b", "c"]), 3, "Del of several keys");
+    checkEq(lastCmd(), ["DEL", "a", "b", "c"], "DEL with every key");
+    checkEq(r.Command("X"), [1, "ab", nil], "an array reply split inside its CRLFs");
+    let e = raised(fn() { r.LPush("k", "x"); });
+    checkEq(kindOf(e), "server", "an error reply raises");
+    checkEq(e?.Prefix, "WRONGTYPE", "the error prefix");
+    checkEq(r.Ping(), "PONG", "the connection is usable after an error reply");
+    r.Close();
+}
+
+fn test_fake_binary() {
+    Console.WriteLine("== fake server: binary ==");
+    _cmds = [];
+    let payload = bytesOf([0, 1, 13, 10, 0, 255, 36, 42, 13]);
+    let wire = Buffer.ToString(payload);
+    let p = fakeRedis(["+OK\r\n", "$9\r\n" + wire + "\r\n", "$9\r\n" + wire + "\r\n"]);
+    let r = Resp.Connect("127.0.0.1", p, FAST);
+    r.Set("bin", payload);
+    checkEq(String.Length(lastCmd()[2]), 9, "the server read all 9 bytes of the block");
+    check(lastCmd()[2] == wire, "the block arrived byte for byte");
+    let s = r.Get("bin");
+    checkEq(String.Length(s), 9, "Get: binary value as a string keeps its length");
+    let b = r.GetBytes("bin");
+    check(Type.IsBlock(b) && Buffer.Equals(b, payload), "GetBytes: the same bytes as a block");
+    r.Close();
+}
+
+fn test_fake_pipeline() {
+    Console.WriteLine("== fake server: pipeline and transaction ==");
+    _cmds = [];
+    let p = fakeRedis(["", "", "", ["+OK\r\n:", "2\r\n$1\r", "\n2\r\n-ERR no\r", "\n"],
+                       "+OK\r\n", "+QUEUED\r\n", "+QUEUED\r\n", "*2\r\n:1\r\n-ERR inner\r\n",
+                       "+OK\r\n", "+QUEUED\r\n", "-ERR unknown command 'BAD'\r\n", "-EXECABORT Transaction discarded because of previous errors.\r\n",
+                       "+OK\r\n", "+QUEUED\r\n", "*-1\r\n"]);
+    let r = Resp.Connect("127.0.0.1", p, FAST);
+    let res = r.Pipeline([["SET", "a", 1], ["INCR", "a"], ["GET", "a"], ["BAD"]]);
+    checkEq(len(res), 4, "four replies");
+    checkEq(Array.Slice(res, 0, 3), ["OK", 2, "2"], "pipeline replies in order, split anywhere");
+    check(res[3] is RespError && res[3].Error == "ERR no", "a pipeline error comes back in place");
+    checkEq(len(_cmds), 4, "the server read all four commands");
+
+    let tx = r.Transaction([["INCR", "a"], ["LPUSH", "a", "x"]]);
+    checkEq(tx[0], 1, "transaction: first result");
+    check(tx[1] is RespError, "transaction: a command that failed while running is in place");
+    checkEq(_cmds[4], ["MULTI"], "MULTI first");
+    checkEq(_cmds[7], ["EXEC"], "EXEC last");
+
+    let ex = raised(fn() { r.Transaction([["INCR", "a"], ["BAD"]]); });
+    checkEq(ex?.Prefix, "EXECABORT", "a command refused while queueing aborts the transaction");
+    check(ex != nil && String.Contains(ex.Error, "unknown command"), "the refusal is named in the message");
+    checkEq(r.Transaction([["SET", "w", 1]]), nil, "a WATCH abort returns nil");
+    r.Close();
+}
+
+fn test_fake_failures() {
+    Console.WriteLine("== fake server: failures ==");
+    let lp = listenLoopback();
+    Stream.Close(lp[0]);
+    let refused = raised(fn() { Resp.Connect("127.0.0.1", lp[1], FAST); });
+    checkEq(kindOf(refused), "connect", "nobody listening: connect");
+
+    _cmds = [];
+    let p1 = fakeRedis([{ pause: 250 }, "next", "+PONG\r\n"]);
+    let r1 = Resp.Connect("127.0.0.1", p1, { timeoutMs: 200 });
+    let t0 = Time.Millis();
+    let e1 = raised(fn() { r1.Get("k"); });
+    let waited = Time.Millis() - t0;
+    checkEq(kindOf(e1), "timeout", "a silent server: timeout");
+    check(waited >= 150 && waited < 1000, "the timeout took about timeoutMs: " + str(waited));
+    checkEq(r1.IsConnected(), false, "the connection is dropped after a timeout");
+    checkEq(r1.Ping(), "PONG", "the next command connects again");
+    r1.Close();
+
+    let p2 = fakeRedis([["$10\r\nhal"], { read: false, send: "close" }]);
+    let r2 = Resp.Connect("127.0.0.1", p2, FAST);
+    checkEq(kindOf(raised(fn() { r2.Get("k"); })), "closed", "the server hung up mid-reply: closed");
+    r2.Close();
+
+    let p3 = fakeRedis(["?garbage\r\n"]);
+    let r3 = Resp.Connect("127.0.0.1", p3, FAST);
+    checkEq(kindOf(raised(fn() { r3.Get("k"); })), "protocol", "a malformed reply: protocol");
+    checkEq(r3.IsConnected(), false, "the connection is dropped after a protocol error");
+    r3.Close();
+
+    let p4 = fakeRedis(["$3\r\nabcde\r\n"]);
+    let r4 = Resp.Connect("127.0.0.1", p4, FAST);
+    checkEq(kindOf(raised(fn() { r4.Get("k"); })), "protocol", "a bulk longer than announced: protocol");
+    r4.Close();
+
+    _cmds = [];
+    let p5 = fakeRedis(["-WRONGPASS invalid username-password pair or user is disabled.\r\n"]);
+    let e5 = raised(fn() { Resp.Connect("127.0.0.1", p5, { timeoutMs: 400, user: "u", password: "nope" }); });
+    checkEq(kindOf(e5), "auth", "a refused login: auth");
+    checkEq(_cmds[0], ["AUTH", "u", "nope"], "AUTH with user and password");
+
+    let p6 = fakeRedis(["-NOPROTO unsupported protocol version\r\n"]);
+    checkEq(kindOf(raised(fn() { Resp.Connect("127.0.0.1", p6, { timeoutMs: 400, resp3: true }); })), "protocol", "no RESP3: protocol");
+
+    let r7 = Resp.Connect("127.0.0.1", fakeRedis([]), FAST);
+    r7.Close();
+    checkEq(kindOf(raised(fn() { r7.Ping(); })), "closed", "a closed client stays closed");
+}
+
+fn test_fake_handshake() {
+    Console.WriteLine("== fake server: handshake ==");
+    _cmds = [];
+    let p = fakeRedis(["+OK\r\n", "+OK\r\n", "+OK\r\n", "+PONG\r\n"]);
+    let r = Resp.ConnectUrl("redis://alice:p%40ss@127.0.0.1:" + str(p) + "/3", { timeoutMs: 400, name: "worker-1" });
+    checkEq(_cmds[0], ["AUTH", "alice", "p@ss"], "URL credentials, percent-decoded");
+    checkEq(_cmds[1], ["CLIENT", "SETNAME", "worker-1"], "CLIENT SETNAME");
+    checkEq(_cmds[2], ["SELECT", "3"], "URL database");
+    checkEq(r.Ping(), "PONG", "commands after the handshake");
+    r.Close();
+
+    _cmds = [];
+    let hello = "%3\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$5\r\n7.4.0\r\n$5\r\nproto\r\n:3\r\n";
+    let pushed = [];
+    let p2 = fakeRedis([hello, ">3\r\n$10\r\ninvalidate\r\n*1\r\n$1\r\nk\r\n$1\r\nx\r\n%1\r\n$1\r\na\r\n$1\r\n1\r\n", "~2\r\n$1\r\nx\r\n$1\r\ny\r\n"]);
+    let r2 = Resp.Connect("127.0.0.1", p2, { timeoutMs: 400, resp3: true, password: "pw", onPush: fn(m) { Array.Append(pushed, m); } });
+    checkEq(_cmds[0], ["HELLO", "3", "AUTH", "default", "pw"], "HELLO 3 with AUTH for the default user");
+    checkEq(r2.ServerInfo()?.version, "7.4.0", "the HELLO map is kept");
+    checkEq(r2.IsResp3(), true, "RESP3 is on");
+    checkEq(r2.HGetAll("h"), { a: "1" }, "a map reply is an object");
+    checkEq(len(pushed), 1, "a push ahead of the reply went to onPush");
+    checkEq(pushed[0]?.[0], "invalidate", "the push message");
+    checkEq(r2.SMembers("s"), ["x", "y"], "a set reply is an array");
+    r2.Close();
+}
+
+fn test_fake_blocking() {
+    Console.WriteLine("== fake server: waits park one fiber ==");
+    _cmds = [];
+    let p = fakeRedis([{ pause: 450, send: "*2\r\n$4\r\njobs\r\n$3\r\none\r\n" }, "*-1\r\n"]);
+    let r = Resp.Connect("127.0.0.1", p, { timeoutMs: 300 });
+    let ticks = [0];
+    Fiber.Run(fn() { iter (i from 0 to 40) { ticks[0] += 1; Fiber.Sleep(10); } });
+    let got = r.BLPop(["jobs"], 2);
+    checkEq(got, ["jobs", "one"], "BLPop waited past timeoutMs for its reply");
+    checkEq(_cmds[0], ["BLPOP", "jobs", "2"], "BLPOP with its timeout");
+    check(ticks[0] >= 30, "other fibers ran while BLPop waited: " + str(ticks[0]));
+    checkEq(r.BRPop("jobs", 0.1), nil, "BRPop timing out returns nil");
+    r.Close();
+
+}
+
+fn test_fake_sharing() {
+    Console.WriteLine("== fake server: one client, several fibers ==");
+    _cmds = [];
+    let p = fakeRedis([[":1", "\r\n"], [":2", "\r\n"], [":3", "\r\n"], [":4", "\r\n"]]);
+    let r = Resp.Connect("127.0.0.1", p, FAST);
+    let results = Fiber.AwaitAll([
+        Fiber.New(fn() { return [r.Incr("a"), r.Incr("a")]; }),
+        Fiber.New(fn() { return [r.Incr("b"), r.Incr("b")]; })
+    ]);
+    let all = Array.Concat(results[0], results[1]);
+    checkEq(Array.Sort(all), [1, 2, 3, 4], "each reply reached the fiber that asked");
+    checkEq(len(_cmds), 4, "four commands, none interleaved");
+    r.Close();
+}
+
+fn test_fake_pubsub() {
+    Console.WriteLine("== fake server: pub/sub ==");
+    _cmds = [];
+    let msg = fn(ch, data) { return "*3\r\n$7\r\nmessage\r\n$" + str(String.Length(ch)) + "\r\n" + ch + "\r\n$" + str(String.Length(data)) + "\r\n" + data + "\r\n"; };
+    let p = fakeRedis([
+        // SUBSCRIBE a b: a message for a arrives between the two confirmations
+        ["*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n" + msg("a", "early"), "*3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n"],
+        { read: false, send: ["", msg("b", "hi") + "*4\r\n$8\r\npmes", "sage\r\n$2\r\nc*\r\n$2\r\ncx\r\n$5\r\nhello\r\n"] },
+        // PSUBSCRIBE
+        "*3\r\n$10\r\npsubscribe\r\n$2\r\nc*\r\n:3\r\n",
+        { read: false, pause: 250, send: [msg("a", "one"), msg("a", "two"), msg("a", "stop")] },
+        // UNSUBSCRIBE (all), PUNSUBSCRIBE (all)
+        "*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:2\r\n*3\r\n$11\r\nunsubscribe\r\n$1\r\nb\r\n:1\r\n",
+        "*3\r\n$12\r\npunsubscribe\r\n$2\r\nc*\r\n:0\r\n"
+    ]);
+    let sub = Resp.ConnectSubscriber("127.0.0.1", p, { timeoutMs: 400 });
+    checkEq(sub.Subscribe(["a", "b"]), 2, "two channels confirmed");
+    checkEq(_cmds[0], ["SUBSCRIBE", "a", "b"], "SUBSCRIBE on the wire");
+    let m1 = sub.Receive(500);
+    checkEq([m1?.kind, m1?.channel, m1?.data], ["message", "a", "early"], "a message that came before the last confirmation is kept");
+    let m2 = sub.Receive(500);
+    checkEq([m2?.channel, m2?.data], ["b", "hi"], "next message");
+    let m3 = sub.Receive(500);
+    checkEq([m3?.kind, m3?.pattern, m3?.channel, m3?.data], ["pmessage", "c*", "cx", "hello"], "a pattern message split mid-word");
+    checkEq(sub.SubscribePattern("c*"), 3, "pattern confirmed");
+    let t0 = Time.Millis();
+    checkEq(sub.Receive(100), nil, "Receive times out with nil");
+    check(Time.Millis() - t0 < 400, "the timeout was the one asked for");
+    let seen = [];
+    sub.Listen(fn(m) { Array.Append(seen, m.data); return m.data != "stop"; });
+    checkEq(seen, ["one", "two", "stop"], "Listen until the callback says stop");
+    checkEq(sub.Unsubscribe(), 1, "UNSUBSCRIBE without names drops every channel");
+    checkEq(sub.UnsubscribePattern(), 0, "and the patterns");
+    checkEq(sub.Count(), 0, "nothing subscribed");
+    sub.Listen(fn(_m) { return true; });
+    check(true, "Listen returns at once with nothing subscribed");
+    sub.Close();
+
+    // Close from another fiber ends a waiting Receive.
+    let p2 = fakeRedis(["*3\r\n$9\r\nsubscribe\r\n$1\r\nz\r\n:1\r\n", { read: false, pause: 300 }]);
+    let sub2 = Resp.ConnectSubscriber("127.0.0.1", p2, { timeoutMs: 400 });
+    sub2.Subscribe("z");
+    Fiber.Run(fn() { Fiber.Sleep(50); sub2.Close(); });
+    let t1 = Time.Millis();
+    checkEq(sub2.Receive(), nil, "Close ends a Receive that waits for ever");
+    check(Time.Millis() - t1 < 500, "promptly");
+}
+
+fn test_fake_pool() {
+    Console.WriteLine("== fake server: pool ==");
+    let p = fakeRedis([{ read: false, pause: 300 }]);
+    let pool = new RespPool("127.0.0.1", p, FAST, 1);
+    let a = pool.Acquire();
+    checkEq(pool.Stats(), { idle: 0, inUse: 1, size: 1 }, "one in use");
+    let t0 = Time.Millis();
+    checkEq(kindOf(raised(fn() { pool.Acquire(80); })), "timeout", "a full pool times out");
+    check(Time.Millis() - t0 < 400, "after the time asked for");
+    let waiter = Fiber.New(fn() { return pool.Acquire(1000); });
+    Fiber.Run(fn() { Fiber.Sleep(30); pool.Release(a); });
+    let b = Fiber.Await(waiter);
+    check(b == a, "a waiting Acquire gets the released connection");
+    pool.Release(b);
+    checkEq(pool.Stats().idle, 1, "back in the pool");
+    pool.Close();
+    checkEq(kindOf(raised(fn() { pool.Acquire(); })), "closed", "a closed pool refuses");
+}
+
+// ---- TLS ----------------------------------------------------------------------
+
+// A self-signed certificate for localhost as a PKCS#12 bundle (password
+// "pw"), or nil when openssl is missing or this build cannot serve TLS.
+fn tlsFixture() {
+    if (!Stream.TlsServerAvailable() || Os.Which("openssl") == nil) { return nil; }
+    let dir = Path.Combine(Os.TempDir(), "flaris-resp-tls-" + str(Os.Pid()));
+    Directory.Create(dir);
+    let f = { dir: dir, key: Path.Combine(dir, "key.pem"), cert: Path.Combine(dir, "cert.pem"), p12: Path.Combine(dir, "server.p12") };
+    let req = Os.RunEx("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", f.key, "-out", f.cert, "-days", "2", "-nodes",
+                                   "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"]);
+    let p12 = (req != nil && req.Exit == 0) ? Os.RunEx("openssl", ["pkcs12", "-export", "-out", f.p12, "-inkey", f.key, "-in", f.cert, "-passout", "pass:pw"]) : nil;
+    if (p12 == nil || p12.Exit != 0) { tlsCleanup(f); return nil; }
+    return f;
+}
+
+fn tlsCleanup(f) {
+    foreach (p in [f.key, f.cert, f.p12]) { if (File.Exists(p)) { File.Delete(p); } }
+    Directory.Delete(f.dir);
+}
+
+fn test_tls() {
+    Console.WriteLine("== fake server: TLS ==");
+    let f = tlsFixture();
+    if (f == nil) { Console.WriteLine("  skipped: no openssl, or no TLS server in this build"); return; }
+    _cmds = [];
+    let lp = listenLoopback();
+    let ls = lp[0];
+    Fiber.Run(fn() {
+        iter (k from 0 to 2) {
+            if (Stream.WaitReadable(ls, 3000) == nil) { break; }
+            let c = Stream.Accept(ls);
+            let t = Stream.AcceptTls(c, { pkcs12File: f.p12, password: "pw", handshakeTimeoutMs: 2000 });
+            if (t == nil) { continue; }
+            let cmd = readCommand(t);
+            if (cmd != nil) { Array.Append(_cmds, cmd); Stream.WriteAll(t, "+PONG\r\n"); }
+            Fiber.Sleep(30);
+            Stream.Close(t);
+        }
+        Stream.Close(ls);
+    });
+    checkEq(kindOf(raised(fn() { Resp.Connect("127.0.0.1", lp[1], { tls: true, timeoutMs: 2000 }); })), "tls", "a self-signed certificate is refused by default");
+    let r = Resp.ConnectUrl("rediss://127.0.0.1:" + str(lp[1]), { insecure: true, timeoutMs: 2000 });
+    checkEq(r.Ping(), "PONG", "PING over TLS (rediss://, insecure)");
+    checkEq(_cmds, [["PING"]], "the server read the command through TLS");
+    r.Close();
+    tlsCleanup(f);
+}
+
+// ---- live -------------------------------------------------------------------
+
+fn liveTarget() {
+    let host = Os.Getenv("RESP_TEST_HOST") ?? "127.0.0.1";
+    let port = int(Os.Getenv("RESP_TEST_PORT") ?? "6379");
+    if (!Net.IsReachable(host, port, 300)) {
+        Console.WriteLine("== live: skipped (no Redis on " + host + ":" + str(port) + ") ==");
+        return nil;
+    }
+    return { host: host, port: port };
+}
+
+fn cleanup(r) {
+    var cursor = 0;
+    while (true) {
+        let s = r.Scan(cursor, PFX + "*", 500);
+        if (len(s.keys) > 0) { r.Del(s.keys); }
+        cursor = s.cursor;
+        if (cursor == 0) { break; }
+    }
+}
+
+fn test_live(t) {
+    if (t == nil) { return; }
+    Console.WriteLine("== live ==");
+    let r = Resp.Connect(t.host, t.port, { timeoutMs: 5000 });
+    cleanup(r);
+    checkEq(r.Ping(), "PONG", "PING");
+    checkEq(r.Echo("hi"), "hi", "ECHO");
+    checkEq(r.Set(PFX + "s", "value"), true, "SET");
+    checkEq(r.Get(PFX + "s"), "value", "GET");
+    checkEq(r.Get(PFX + "missing"), nil, "GET of a missing key");
+    checkEq(r.Set(PFX + "s", "other", { nx: true }), false, "SET NX on an existing key");
+    checkEq(r.Set(PFX + "s", "new", { xx: true, get: true }), "value", "SET XX GET returns the old value");
+    checkEq(r.Set(PFX + "ttl", "x", { ex: 100 }), true, "SET EX");
+    let ttl = r.Ttl(PFX + "ttl");
+    check(ttl > 90 && ttl <= 100, "TTL after EX: " + str(ttl));
+    checkEq(r.Set(PFX + "pttl", "x", { px: 50000 }), true, "SET PX");
+    check(r.PTtl(PFX + "pttl") > 40000, "PTTL after PX");
+    checkEq(r.Persist(PFX + "pttl"), true, "PERSIST");
+    checkEq(r.Ttl(PFX + "pttl"), -1, "no TTL after PERSIST");
+    checkEq(r.Expire(PFX + "pttl", 30), true, "EXPIRE");
+    checkEq(r.Exists([PFX + "s", PFX + "ttl", PFX + "missing"]), 2, "EXISTS counts");
+    checkEq(r.Incr(PFX + "n"), 1, "INCR");
+    checkEq(r.IncrBy(PFX + "n", 41), 42, "INCRBY");
+    checkEq(r.Decr(PFX + "n"), 41, "DECR");
+    checkEq(r.Command("INCRBYFLOAT", PFX + "f", 0.1 + 0.2), "0.30000000000000004", "INCRBYFLOAT with a full-precision float");
+    checkEq(r.Append(PFX + "s", "!"), 4, "APPEND");
+    checkEq(r.StrLen(PFX + "s"), 4, "STRLEN");
+    checkEq(r.KeyType(PFX + "s"), "string", "TYPE");
+    let pairs = {};
+    pairs[PFX + "m1"] = "a";
+    pairs[PFX + "m2"] = "b";
+    checkEq(r.MSet(pairs), "OK", "MSET from an object");
+    checkEq(r.MGet([PFX + "m1", PFX + "m2", PFX + "missing"]), ["a", "b", nil], "MGET");
+    checkEq(r.Rename(PFX + "m2", PFX + "m3"), "OK", "RENAME");
+
+    // Binary safety: every byte value, CR, LF and NUL included.
+    let all = Buffer.Create(256, 1);
+    iter (i from 0 to 256) { all[i] = i; }
+    r.Set(PFX + "bin", all);
+    let back = r.GetBytes(PFX + "bin");
+    check(Type.IsBlock(back) && Buffer.Equals(back, all), "all 256 byte values round-trip as a block");
+    checkEq(String.Length(r.Get(PFX + "bin")), 256, "and as a string of 256 bytes");
+    r.Set(PFX + "crlf", "line1\r\nline2\r\n$3\r\n*1\r\n");
+    checkEq(r.Get(PFX + "crlf"), "line1\r\nline2\r\n$3\r\n*1\r\n", "RESP framing inside a value");
+    let big = String.Repeat("0123456789", 100000);
+    r.Set(PFX + "big", big);
+    checkEq(String.Length(r.Get(PFX + "big")), 1000000, "a 1 MB value");
+
+    // Hashes, lists, sets.
+    checkEq(r.HSet(PFX + "h", { name: "Ada", born: 1815 }), 2, "HSET from an object");
+    checkEq(r.HSet(PFX + "h", "lang", "en"), 1, "HSET one field");
+    checkEq(r.HGet(PFX + "h", "name"), "Ada", "HGET");
+    checkEq(r.HGetAll(PFX + "h"), { name: "Ada", born: "1815", lang: "en" }, "HGETALL as an object");
+    checkEq(r.HExists(PFX + "h", "born"), true, "HEXISTS");
+    checkEq(r.HIncrBy(PFX + "h", "born", 1), 1816, "HINCRBY");
+    checkEq(r.HLen(PFX + "h"), 3, "HLEN");
+    checkEq(r.HDel(PFX + "h", ["lang", "nope"]), 1, "HDEL");
+    checkEq(Array.Sort(r.HKeys(PFX + "h")), ["born", "name"], "HKEYS");
+    checkEq(r.RPush(PFX + "l", ["a", "b", "c"]), 3, "RPUSH several");
+    checkEq(r.LPush(PFX + "l", "z"), 4, "LPUSH one");
+    checkEq(r.LRange(PFX + "l", 0, -1), ["z", "a", "b", "c"], "LRANGE");
+    checkEq(r.LPop(PFX + "l"), "z", "LPOP");
+    checkEq(r.RPop(PFX + "l"), "c", "RPOP");
+    checkEq(r.LLen(PFX + "l"), 2, "LLEN");
+    checkEq(r.SAdd(PFX + "set", ["x", "y", "x"]), 2, "SADD counts new members");
+    checkEq(Array.Sort(r.SMembers(PFX + "set")), ["x", "y"], "SMEMBERS");
+    checkEq(r.SIsMember(PFX + "set", "y"), true, "SISMEMBER");
+    checkEq(r.SRem(PFX + "set", "y"), 1, "SREM");
+    checkEq(r.SCard(PFX + "set"), 1, "SCARD");
+    let wt = raised(fn() { r.LPush(PFX + "s", "x"); });
+    checkEq(wt?.Prefix, "WRONGTYPE", "a server error raises with its prefix");
+    checkEq(r.Get(PFX + "s"), "new!", "and the connection goes on");
+
+    // BLPOP: one fiber waits, another pushes, a third keeps ticking.
+    let pusher = Resp.Connect(t.host, t.port);
+    let ticks = [0];
+    Fiber.Run(fn() { iter (i from 0 to 30) { ticks[0] += 1; Fiber.Sleep(5); } });
+    Fiber.Run(fn() { Fiber.Sleep(100); pusher.RPush(PFX + "q", "job-1"); });
+    let t0 = Time.Millis();
+    checkEq(r.BLPop([PFX + "q"], 3), [PFX + "q", "job-1"], "BLPOP gets the job pushed while it waits");
+    let waited = Time.Millis() - t0;
+    check(waited >= 80 && waited < 1500, "BLPOP waited for the push: " + str(waited) + " ms");
+    check(ticks[0] >= 10, "other fibers ran during BLPOP: " + str(ticks[0]));
+    checkEq(r.BRPop(PFX + "q", 0.2), nil, "BRPOP times out with nil");
+    pusher.Close();
+
+    // Pipeline and transactions.
+    let cmds = [];
+    iter (i from 0 to 100) { Array.Append(cmds, ["SET", PFX + "p" + str(i), i]); }
+    let pr = r.Pipeline(cmds);
+    checkEq(len(pr), 100, "100 pipelined replies");
+    checkEq(Array.Count(pr, fn(x) => x == "OK"), 100, "all OK");
+    let mixed = r.Pipeline([["INCR", PFX + "p7"], ["LPUSH", PFX + "p7", "x"], ["GET", PFX + "p7"]]);
+    checkEq(mixed[0], 8, "pipeline: INCR");
+    check(mixed[1] is RespError && mixed[1].Prefix == "WRONGTYPE", "pipeline: an error in place");
+    checkEq(mixed[2], "8", "pipeline: later replies are still in order");
+    checkEq(r.Transaction([["INCR", PFX + "tx"], ["INCR", PFX + "tx"], ["GET", PFX + "tx"]]), [1, 2, "2"], "MULTI/EXEC");
+    let other = Resp.Connect(t.host, t.port);
+    r.Command("WATCH", PFX + "tx");
+    other.Set(PFX + "tx", "changed");
+    checkEq(r.Transaction([["SET", PFX + "tx", "mine"]]), nil, "WATCH: a change from another client aborts EXEC");
+    checkEq(r.Get(PFX + "tx"), "changed", "and nothing was written");
+    let ea = raised(fn() { r.Transaction([["SET", PFX + "tx"]]); });
+    checkEq(ea?.Prefix, "EXECABORT", "a malformed command aborts the transaction");
+
+    // Pub/Sub through the real server.
+    let sub = r.Subscriber();
+    checkEq(sub.Subscribe([PFX + "news", PFX + "alerts"]), 2, "SUBSCRIBE two channels");
+    checkEq(sub.SubscribePattern(PFX + "ev.*"), 3, "PSUBSCRIBE");
+    checkEq(other.Publish(PFX + "news", "hello"), 1, "PUBLISH reaches one subscriber");
+    let m = sub.Receive(2000);
+    checkEq([m?.kind, m?.channel, m?.data], ["message", PFX + "news", "hello"], "the message arrives");
+    other.Publish(PFX + "ev.login", "ada");
+    let pm = sub.Receive(2000);
+    checkEq([pm?.kind, pm?.pattern, pm?.channel, pm?.data], ["pmessage", PFX + "ev.*", PFX + "ev.login", "ada"], "the pattern message");
+    let binMsg = bytesOf([0, 13, 10, 255]);
+    other.Publish(PFX + "alerts", binMsg);
+    checkEq(String.Length(sub.Receive(2000)?.data ?? ""), 4, "a binary message keeps its bytes");
+    let got = [];
+    Fiber.Run(fn() {
+        Fiber.Sleep(20);
+        other.Publish(PFX + "news", "a");
+        other.Publish(PFX + "alerts", "b");
+        other.Publish(PFX + "news", "end");
+    });
+    sub.Listen(fn(msg) { Array.Append(got, msg.data); return msg.data != "end"; });
+    checkEq(got, ["a", "b", "end"], "Listen in publish order");
+    checkEq(sub.Unsubscribe([PFX + "news"]), 2, "UNSUBSCRIBE one");
+    checkEq(other.Publish(PFX + "news", "lost"), 0, "nobody listens there any more");
+    sub.Close();
+    var receivers = 1;
+    iter (i from 0 to 50) {
+        receivers = other.Publish(PFX + "alerts", "x");
+        if (receivers == 0) { break; }
+        Fiber.Sleep(10);
+    }
+    checkEq(receivers, 0, "the subscriber connection is gone after Close");
+
+    // RESP3.
+    let r3 = Resp.Connect(t.host, t.port, { resp3: true });
+    checkEq(r3.ServerInfo()?.proto, 3, "HELLO 3");
+    checkEq(r3.HGetAll(PFX + "h"), { name: "Ada", born: "1816" }, "RESP3 HGETALL is a map");
+    checkEq(r3.Command("ZADD", PFX + "z", 1.5, "a"), 1, "ZADD");
+    checkEq(r3.Command("ZSCORE", PFX + "z", "a"), 1.5, "RESP3 double");
+    checkEq(r3.Command("HGETALL", PFX + "missing"), {}, "an empty map");
+    checkEq(r3.Get(PFX + "missing"), nil, "RESP3 null");
+    let sub3 = r3.Subscriber();
+    sub3.Subscribe(PFX + "r3");
+    other.Publish(PFX + "r3", "push");
+    checkEq(sub3.Receive(2000)?.data, "push", "RESP3 subscriber gets push frames");
+    sub3.Close();
+    r3.Close();
+
+    // SELECT, CLIENT SETNAME, ACL login.
+    let r13 = Resp.Connect(t.host, t.port, { db: 13, name: "flaris-resp-test" });
+    r13.Set(PFX + "db13", "here");
+    checkEq(r.Get(PFX + "db13"), nil, "SELECT 13: the key is not in db 0");
+    checkEq(r13.Command("CLIENT", "GETNAME"), "flaris-resp-test", "CLIENT SETNAME on connect");
+    r13.Del(PFX + "db13");
+    r13.Close();
+    let aclOk = raised(fn() { r.Command("ACL", "SETUSER", "flaris-resp-test", "reset", "on", ">s3cret", "~" + PFX + "*", "+@all"); }) == nil;
+    if (aclOk) {
+        let ru = Resp.Connect(t.host, t.port, { user: "flaris-resp-test", password: "s3cret" });
+        checkEq(ru.Command("ACL", "WHOAMI"), "flaris-resp-test", "AUTH as an ACL user");
+        checkEq(ru.Get(PFX + "s"), "new!", "the ACL user reads its keys");
+        checkEq(raised(fn() { ru.Get("flaris:not-allowed"); })?.Prefix, "NOPERM", "and nothing else");
+        ru.Close();
+        let ru3 = Resp.Connect(t.host, t.port, { user: "flaris-resp-test", password: "s3cret", resp3: true });
+        checkEq(ru3.Command("ACL", "WHOAMI"), "flaris-resp-test", "HELLO 3 AUTH as an ACL user");
+        ru3.Close();
+        checkEq(kindOf(raised(fn() { Resp.Connect(t.host, t.port, { user: "flaris-resp-test", password: "wrong" }); })), "auth", "a wrong password: auth");
+        checkEq(kindOf(raised(fn() { Resp.Connect(t.host, t.port, { user: "flaris-resp-test", password: "wrong", resp3: true }); })), "auth", "a wrong password with HELLO: auth");
+        r.Command("ACL", "DELUSER", "flaris-resp-test");
+    }
+
+    // Pool shared by fibers.
+    let pool = new RespPool(t.host, t.port, nil, 3);
+    let fibers = [];
+    iter (k from 0 to 6) {
+        Array.Append(fibers, Fiber.New(fn() {
+            var n = 0;
+            iter (j from 0 to 20) { n = pool.Use(fn(c) { return c.Incr(PFX + "pool"); }); }
+            return n;
+        }));
+    }
+    Fiber.AwaitAll(fibers);
+    checkEq(r.Get(PFX + "pool"), "120", "six fibers through a pool of three");
+    check(pool.Stats().inUse == 0 && pool.Stats().idle <= 3, "every connection back: " + Json.Stringify(pool.Stats()));
+    pool.Close();
+
+    cleanup(r);
+    checkEq(len(r.Keys(PFX + "*")), 0, "every test key removed");
+    other.Close();
+    r.Close();
+}
+
+// ---- benchmarks -------------------------------------------------------------
+
+fn run_benchmarks(t) {
+    Console.WriteLine("");
+    Console.WriteLine("== benchmarks ==");
+    Test.Bench("Encode: SET key value", fn() { _sink += String.Length(Resp.Encode("SET", "user:1000", "some value")); }, 20000);
+    let reply = "*100\r\n" + String.Repeat("$5\r\nhello\r\n", 100);
+    Test.Bench("Decode: array of 100 bulk strings", fn() { _sink += len(Resp.Decode(reply)[0]); }, 500);
+    let map = "%3\r\n$4\r\nname\r\n$3\r\nAda\r\n$4\r\nborn\r\n:1815\r\n$4\r\nlang\r\n$2\r\nen\r\n";
+    Test.Bench("Decode: RESP3 map of 3", fn() { _sink += len(Resp.Decode(map)); }, 5000);
+    if (t == nil) { return; }
+
+    let r = Resp.Connect(t.host, t.port);
+    r.Set(PFX + "bench", "benchvalue");
+    let us1 = Test.Bench("Resp: GET round trip", fn() { _sink += String.Length(r.Get(PFX + "bench")); }, 2000);
+    let us2 = Test.Bench("Resp: SET round trip", fn() { r.Set(PFX + "bench", "benchvalue"); }, 2000);
+    let batch = [];
+    iter (i from 0 to 100) { Array.Append(batch, ["SET", PFX + "bench" + str(i), "v"]); }
+    let us3 = Test.Bench("Resp: pipeline of 100 SET", fn() { _sink += len(r.Pipeline(batch)); }, 100);
+    Console.WriteLine("  Resp: ", int(1000000.0 / us1), " GET/s, ", int(1000000.0 / us2), " SET/s, ",
+                      int(100000000.0 / us3), " pipelined SET/s");
+
+    let ffi = nil;
+    try { ffi = Redis.Connect(t.host, t.port); } catch (e) { ffi = nil; }
+    if (ffi == nil) {
+        Console.WriteLine("  FFI Redis: skipped (needs --unsafe and redis_ffi)");
+    } else {
+        let f1 = Test.Bench("FFI Redis: GET round trip", fn() { _sink += String.Length(ffi.Get(PFX + "bench")); }, 2000);
+        let f2 = Test.Bench("FFI Redis: SET round trip", fn() { ffi.Set(PFX + "bench", "benchvalue"); }, 2000);
+        Console.WriteLine("  FFI Redis: ", int(1000000.0 / f1), " GET/s, ", int(1000000.0 / f2), " SET/s");
+        ffi.Close();
+    }
+    cleanup(r);
+    r.Close();
+}
+
+fn async Main() {
+    Console.WriteLine("=== Resp tests ===");
+    test_encode();
+    test_decode();
+    test_fake_commands();
+    test_fake_binary();
+    test_fake_pipeline();
+    test_fake_failures();
+    test_fake_handshake();
+    test_fake_blocking();
+    test_fake_sharing();
+    test_fake_pubsub();
+    test_fake_pool();
+    test_tls();
+    let live = liveTarget();
+    test_live(live);
+    run_benchmarks(live);
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: ", testsRun, "  failed: ", testsFailed);
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

@@ -57,6 +57,15 @@ resolve_tool() {   # resolve_tool <VARNAME> <candidate...>
     return 1
 }
 
+# The newest versioned CPython on PATH. A bare `python3` is often an old system
+# interpreter that sits ahead of the current one on PATH (macOS ships 3.9 in
+# /usr/bin), and CPython has sped up enough since then to change the
+# comparison. Free-threaded builds (python3.14t) are left out: they trade
+# single-thread speed for parallelism this suite does not measure.
+newest_python() {
+    compgen -c python3. 2>/dev/null | grep -E '^python3\.[0-9]+$' | sort -u -t. -k2,2n | tail -1
+}
+
 # The C# lane builds with `dotnet publish <file>.cs`, which needs SDK 10's
 # file-based apps; an older SDK would need a csproj per benchmark, so it drops
 # the lane rather than carrying a second build path for it.
@@ -77,7 +86,7 @@ resolve_all_tools() {
     resolve_tool GO       go                    || true
     resolve_tool NIM      nim                   || true
     resolve_tool DOTNET   dotnet                || true
-    resolve_tool PYTHON   python3 python        || true
+    resolve_tool PYTHON   $(newest_python) python3 python || true
     resolve_tool LUA      lua lua5.4 lua5.3     || true
     resolve_tool LUAJIT   luajit                || true
     resolve_tool LUAU     luau                  || true

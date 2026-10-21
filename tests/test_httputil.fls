@@ -40,6 +40,48 @@ fn test_url() {
     pkEq("ipv6 path", v6.path, "/a");
 
     pkEq("empty url -> nil", HttpUtil.ParseUrl(""), nil);
+
+    // Userinfo is split off the authority: the host is what follows the '@'.
+    let cred = HttpUtil.ParseUrl("http://user:pw@example.com:8080/x");
+    pkEq("userinfo host",     cred.host, "example.com");
+    pkEq("userinfo port",     cred.port, 8080);
+    pkEq("userinfo user",     cred.user, "user");
+    pkEq("userinfo password", cred.password, "pw");
+    pkEq("userinfo path",     cred.path, "/x");
+    let userOnly = HttpUtil.ParseUrl("https://alice@example.com/");
+    pkEq("user without password: host", userOnly.host, "example.com");
+    pkEq("user without password: user", userOnly.user, "alice");
+    pkEq("user without password: password nil", userOnly.password, nil);
+    pkEq("no userinfo: user nil", u.user, nil);
+    pkEq("'@' in the path is not userinfo", HttpUtil.ParseUrl("http://example.com/a@b").host, "example.com");
+}
+
+// RFC 3986 section 5.4: the normal and abnormal examples against its base.
+fn test_resolve() {
+    let base = "http://a/b/c/d;p?q";
+    let cases = [
+        ["g:h", "g:h"],                   ["g", "http://a/b/c/g"],
+        ["./g", "http://a/b/c/g"],        ["g/", "http://a/b/c/g/"],
+        ["/g", "http://a/g"],             ["//g", "http://g"],
+        ["?y", "http://a/b/c/d;p?y"],     ["g?y", "http://a/b/c/g?y"],
+        ["#s", "http://a/b/c/d;p?q#s"],   ["g;x?y#s", "http://a/b/c/g;x?y#s"],
+        ["", "http://a/b/c/d;p?q"],       [".", "http://a/b/c/"],
+        ["..", "http://a/b/"],            ["../g", "http://a/b/g"],
+        ["../..", "http://a/"],           ["../../g", "http://a/g"],
+        ["../../../g", "http://a/g"],     ["/./g", "http://a/g"],
+        ["/../g", "http://a/g"],          ["g.", "http://a/b/c/g."],
+        ["..g", "http://a/b/c/..g"],      ["./g/.", "http://a/b/c/g/"],
+        ["g/../h", "http://a/b/c/h"],     ["g;x=1/../y", "http://a/b/c/y"],
+        ["g?y/../x", "http://a/b/c/g?y/../x"], ["g#s/../x", "http://a/b/c/g#s/../x"]
+    ];
+    foreach (c in cases) {
+        pkEq("resolve '" + c[0] + "'", HttpUtil.ResolveUrl(base, c[0]), c[1]);
+    }
+    pkEq("resolve against a base without a path", HttpUtil.ResolveUrl("http://h", "x"), "http://h/x");
+    pkEq("protocol-relative keeps the base scheme",
+         HttpUtil.ResolveUrl("https://h:8443/a/b", "//cdn.example/y"), "https://cdn.example/y");
+    pkEq("absolute reference replaces the base",
+         HttpUtil.ResolveUrl("http://h/a", "https://other.example/z?k=1"), "https://other.example/z?k=1");
 }
 
 fn test_codecs() {
@@ -154,6 +196,7 @@ fn test_stream_reads() {
 
 fn Main() {
     test_url();
+    test_resolve();
     test_codecs();
     test_query();
     test_headers();

@@ -20,7 +20,7 @@ fn check(cond, msg) {
 fn same(a: block, b: block): bool {
     if (a == nil || b == nil) return false;
     if (len(a) != len(b)) return false;
-    for (let i = 0; i < len(a); i += 1) { if ((a[i] & 255) != (b[i] & 255)) return false; }
+    for (let i = 0; i < len(a); i += 1) { if ((u8)a[i] != (u8)b[i]) return false; }
     return true;
 }
 
@@ -31,8 +31,8 @@ fn mk(n: int, mode: int): block {
     for (let i = 0; i < n; i += 1) {
         if (mode == 0) { b[i] = 65; }
         else if (mode == 1) { b[i] = 32 + (i % 64); }
-        else if (mode == 2) { x = x ^ ((x << 13) & 0xFFFFFFFF); x = x ^ (x >> 17); x = x ^ ((x << 5) & 0xFFFFFFFF); b[i] = x & 255; }
-        else { b[i] = (i * i) & 255; }
+        else if (mode == 2) { x = x ^ (u32)(x << 13); x = x ^ (x >> 17); x = x ^ (u32)(x << 5); b[i] = (u8)x; }
+        else { b[i] = (u8)(i * i); }
     }
     return b;
 }
@@ -88,6 +88,35 @@ fn test_reference_vectors() {
     }
 }
 
+// Container and block-boundary cases, with reference streams from Python's
+// zlib: a stored block right after a Huffman block (what a sync flush emits),
+// a gzip file of two members, and a zlib stream followed by unrelated bytes.
+fn test_stream_boundaries() {
+    let sync = Util.HexToBin("ca48cdc9c957c8402701000000ffff2bcf2fca4951402201");
+    let got = Inflate.Raw(sync, 0);
+    check(got != nil && str(got) == "hello hello hello helloworld world world", "stored block after a Huffman block");
+
+    let two = Util.HexToBin("1f8b08000000000002ff4bcb2c2a2e51c84dcd4d4a2de20200a7f4850a0d0000001f8b08000000000002ff2b4e4dcecf4b51c84dcd4d4a2de2020036184b0e0e000000");
+    let g = Inflate.Gzip(two, 0);
+    check(g != nil && str(g) == "first member\nsecond member\n", "multi-member gzip decodes every member");
+    check(same(Inflate.Auto(two, 0), Buffer.FromString("first member\nsecond member\n")), "multi-member gzip via Auto");
+
+    let a = mk(5000, 1);
+    let b = mk(7000, 3);
+    let both = Buffer.Concat(Deflate.Gzip(a, 32), Deflate.Gzip(b, 32));
+    check(same(Inflate.Gzip(both, 0), Buffer.Concat(a, b)), "own gzip members concatenated");
+    let bad = Buffer.Concat(Deflate.Gzip(a, 32), Deflate.Gzip(b, 32));
+    bad[len(bad) - 6] = (u8)(bad[len(bad) - 6] + 1);
+    check(Inflate.Gzip(bad, 0) == nil, "bad CRC in a later member -> nil");
+    check(same(Inflate.Gzip(Buffer.Concat(Deflate.Gzip(a, 32), Buffer.FromString("\n\n")), 0), a), "bytes after the last member ignored");
+
+    let tz = Util.HexToBin("78daabcac94c522848acccc94f4c51c8482d4a05003b2e0680545241494c494e474a554e4b");
+    let t = Inflate.Zlib(tz, 0);
+    check(t != nil && str(t) == "zlib payload here", "zlib stream followed by other bytes");
+    let own = Buffer.Concat(Deflate.Zlib(b, 32), Buffer.FromString("more data after the stream"));
+    check(same(Inflate.Zlib(own, 0), b), "own zlib stream followed by other bytes");
+}
+
 // Our encoder's output must be decodable by the reference decoder shape, and
 // must not be pathologically worse than a general-purpose one.
 fn test_compression_quality() {
@@ -127,7 +156,7 @@ fn test_malformed() {
 
     // A corrupted zlib checksum must be rejected.
     let bad = Buffer.Slice(z, 0, len(z));
-    bad[len(bad) - 1] = (bad[len(bad) - 1] + 1) & 255;
+    bad[len(bad) - 1] = (u8)(bad[len(bad) - 1] + 1);
     check(Inflate.Zlib(bad, len(src)) == nil, "bad Adler-32 -> nil");
 }
 
@@ -193,6 +222,37 @@ fn test_small_repeated() {
     check(Fiber.Await(f) == 0, "small streams in a fresh fiber");
 }
 
+// Small inputs get a fixed-Huffman block when it beats both a dynamic and a
+// stored one. The reference stream is zlib's fixed-Huffman (Z_FIXED) output
+// for the same JSON.
+fn test_fixed_blocks() {
+    let json = Buffer.FromString("{\"id\":12345,\"name\":\"Alice Example\",\"email\":\"alice@example.com\",\"active\":true,\"roles\":[\"admin\",\"user\"]}");
+    let raw = Deflate.Raw(json, 32);
+    check(len(raw) < len(json), "small JSON compresses");
+    check((raw[0] & 7) == 3, "small JSON is one final fixed block");
+    check(same(Inflate.Raw(raw, 0), json), "fixed block round-trips");
+    check(same(Inflate.Zlib(Deflate.Zlib(json, 32), 0), json), "fixed block in zlib round-trips");
+    check(same(Inflate.Gzip(Deflate.Gzip(json, 32), 0), json), "fixed block in gzip round-trips");
+    let ref = Util.HexToBin("7801ab56ca4c51b23234323631d551ca4bcc4d55b25272ccc94c4e5570ad48cc2dc84955d2514acd4dcccc018a2782c41d5221e27ac9f9b940b9c4e492cc32a0a692a2d2541da5a2fc9cd46225ab68a5c494dccc3ca07469716a91526c2d006a862112");
+    check(same(Inflate.Zlib(ref, 0), json), "zlib fixed-Huffman stream decodes");
+
+    let none = Buffer.Create(0, 1);
+    let e = Deflate.Raw(none, 32);
+    check(len(e) == 2 && same(Inflate.Raw(e, 0), none), "empty input is one fixed block");
+    check(same(Inflate.Zlib(Deflate.Zlib(none, 32), 0), none), "empty zlib round-trips");
+    check(same(Inflate.Gzip(Deflate.Gzip(none, 32), 0), none), "empty gzip round-trips");
+
+    let text = wordsText(20000, 3);
+    let tz = Deflate.Raw(text, 32);
+    check((tz[0] & 7) == 5, "larger text is one final dynamic block");
+    check(same(Inflate.Raw(tz, 0), text), "larger text round-trips");
+    foreach (n in [1, 2, 10, 30, 60, 100, 200, 400, 700, 1500]) {
+        let w = wordsText(n, n);
+        check(len(Deflate.Raw(w, 32)) <= n + 5, "words n=" + str(n) + " never above stored size");
+        roundtrip("words n=" + str(n), w);
+    }
+}
+
 fn test_benchmarks() {
     Console.WriteLine("=== Deflate benchmarks ===");
     // Realistic English-ish text is the interesting case: it is the one that
@@ -223,10 +283,12 @@ fn Main() {
     Console.WriteLine("=== Deflate tests ===");
     test_sizes();
     test_reference_vectors();
+    test_stream_boundaries();
     test_compression_quality();
     test_block_types();
     test_malformed();
     test_small_repeated();
+    test_fixed_blocks();
     test_benchmarks();
     Console.WriteLine("");
     Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));

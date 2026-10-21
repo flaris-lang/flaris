@@ -5,15 +5,25 @@
 // scheduler, so client and server need two processes). The server answers the
 // httpbin.org endpoints the checks use - /get, /headers, /post, /put, /patch,
 // /delete, /anything, /status/<code>, /redirect/<n> and /json, plus
-// /delay/<ms> - on an ephemeral port. When openssl can make a self-signed
-// certificate it serves the same endpoints over https on a second port. It
-// prints "PORT=<n>" (and "TLSPORT=<n>") and stops when the test closes its
-// stdin.
+// /delay/<ms>, /peer (the client address it sees, which names the
+// connection), /trickle, /ndjson, /sse and /blob/<n> for the streaming
+// checks, and /limited (429 with Retry-After every other time) - on an
+// ephemeral port, and again on a second port where an
+// idle connection is closed after 100 ms. When openssl can make a self-signed
+// certificate it serves the same endpoints over https on a third port. It
+// prints "PORT=<n>", "IDLEPORT=<n>" (and "TLSPORT=<n>") and stops when the
+// test closes its stdin.
+//
+// The proxy checks start the file a third time with "proxy": a forward proxy
+// that passes absolute-form requests on to the server and opens CONNECT
+// tunnels to it. Names ending in .invalid stand for the server, so the proxy
+// is what makes them reachable. It prints "PROXYPORT=<n>", reports what it
+// saw at its own /seen, and stops when its stdin closes.
 //
 // Run: flarisvm tests/test_http.fls --libs=./libs
 
 import { HttpServer } from library("HttpServer", "1.0");
-import { Http, Status, ContentType } from library("Http", "1.0");
+import { Http, Status, ContentType, HttpUnsupportedError } from library("Http", "1.0");
 import { HttpUtil } from library("HttpUtil", "1.0");
 
 const TLS_PASSWORD = "testpass";
@@ -22,6 +32,7 @@ global testsRun    = 0;
 global testsFailed = 0;
 
 global base    = "";    // http://127.0.0.1:<port>
+global idleBase = "";   // the same, closing idle connections after 100 ms
 global tlsBase = nil;   // https://127.0.0.1:<port>, nil without a certificate
 global tmpDir  = "";    // certificate, wgetrc and wget downloads
 global server  = nil;   // the server child: { Pid, Stdin, Stdout, Stderr }
@@ -82,6 +93,16 @@ fn sendHeaders(req, res) { res.Json({ headers: echo(req).headers }); }
 fn sendStatus(req, res)  { res.Text("", Convert.ParseInt(req.Param("code")) ?? 400); }
 fn sendJson(_req, res)   { res.Json({ slideshow: { title: "Sample Slide Show", slides: 2 } }); }
 
+// /bytes: the request body exactly as it arrived, one number per byte.
+fn sendBytes(req, res) {
+    let out = [];
+    let b = req.body;
+    if (b != nil) {
+        iter (i from 0 to len(b)) { Array.Append(out, Buffer.ReadU8At(b, i)); }
+    }
+    res.Json({ bytes: out, contentType: req.Header("content-type", "") });
+}
+
 // /redirect/<n>: n hops of 302, the last one landing on /get.
 fn sendRedirect(req, res) {
     let n = Convert.ParseInt(req.Param("n")) ?? 1;
@@ -94,10 +115,52 @@ fn sendDelayed(req, res) {
     res.Json(echo(req));
 }
 
+// /trickle: ten chunks of one byte, 20 ms apart.
+fn sendTrickle(_req, res) {
+    res.StartChunked("text/plain");
+    iter (i from 0 to 10) {
+        Fiber.Sleep(20);
+        if (!res.WriteChunk("x")) { break; }
+    }
+    res.EndChunked();
+}
+
+// /ndjson: NDJSON lines, one split across two chunks.
+fn sendNdjson(_req, res) {
+    res.StartChunked("application/x-ndjson");
+    res.WriteChunk("{\"a\":1}\n{\"b\":");
+    res.WriteChunk("22}\n\nnot json\n");
+    res.EndChunked();
+}
+
+// /sse: two events, the second after a pause.
+fn sendSse(_req, res) {
+    res.StartChunked("text/event-stream");
+    res.WriteChunk(": hello\nid: 1\ndata: one\n\n");
+    Fiber.Sleep(20);
+    res.WriteChunk("event: up\ndata: two\ndata: 2\n\n");
+    res.EndChunked();
+}
+
+// /limited: every other request is refused with 429 and Retry-After: 0.
+global limitedCalls = 0;
+
+fn sendLimited(_req, res) {
+    limitedCalls += 1;
+    if (limitedCalls % 2 == 1) { res.Header("Retry-After", "0").Text("slow down", 429); }
+    else { res.Text("ok"); }
+}
+
+// /blob/<n>: n bytes with a Content-Length.
+fn sendBlob(req, res) {
+    res.Text(String.Repeat("z", Convert.ParseInt(req.Param("n")) ?? 0));
+}
+
 fn addRoutes(srv) {
     srv.Get("/get", sendEcho);              // HEAD /get is answered by the same route
     srv.Get("/headers", sendHeaders);
     srv.Post("/post", sendEcho);
+    srv.Post("/bytes", sendBytes);
     srv.Put("/put", sendEcho);
     srv.Patch("/patch", sendEcho);
     srv.Delete("/delete", sendEcho);
@@ -109,12 +172,21 @@ fn addRoutes(srv) {
     srv.Get("/redirect/:n", sendRedirect);
     srv.Get("/json", sendJson);
     srv.Get("/delay/:ms", sendDelayed);
+    srv.Get("/peer", fn(req, res) { res.Json({ peer: req.peer }); });
+    srv.Get("/trickle", sendTrickle);
+    srv.Get("/ndjson", sendNdjson);
+    srv.Post("/ndjson", sendNdjson);
+    srv.Get("/sse", sendSse);
+    srv.Get("/blob/:n", sendBlob);
+    srv.Get("/limited", sendLimited);
     return srv;
 }
 
 fn async serve(p12) {
     let plain = addRoutes(new HttpServer({ port: 0, host: "127.0.0.1" }));
     Console.WriteLine("PORT=" + str(plain.ListenAsync()));
+    let brief = addRoutes(new HttpServer({ port: 0, host: "127.0.0.1", idleTimeoutMs: 100 }));
+    Console.WriteLine("IDLEPORT=" + str(brief.ListenAsync()));
 
     let secure = nil;
     if (p12 != nil) {
@@ -133,7 +205,138 @@ fn async serve(p12) {
     var line = await Stream.ReadLineAsync(stdin);
     while (line != nil) { line = await Stream.ReadLineAsync(stdin); }
     plain.Stop(1000);
+    brief.Stop(1000);
     if (secure != nil) { secure.Stop(1000); }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Proxy half
+// --------------------------------------------------------
+
+global proxySeen     = [];      // "<request line> | <Proxy-Authorization or ->"
+global proxyTunnels  = 0;       // CONNECT tunnels opened
+global proxyForwards = 0;       // client connections that carried forwarded requests
+global proxyRunning  = true;
+
+// A request or response head: the first line, the header lines, and the
+// Proxy-Authorization and Content-Length found among them.
+fn readHead(c) {
+    let first = Fiber.Await(Stream.ReadLineAsync(c, 10000));
+    if (first == nil) { return nil; }
+    let lines = [];
+    var auth = nil;
+    var length = 0;
+    var h = Fiber.Await(Stream.ReadLineAsync(c, 10000));
+    while (h != nil && len(h) > 0) {
+        Array.Append(lines, h);
+        let lh = String.ToLower(h);
+        if (String.StartsWith(lh, "proxy-authorization:")) { auth = String.Trim(String.Substr(h, 20)); }
+        if (String.StartsWith(lh, "content-length:")) { length = Convert.ParseInt(String.Trim(String.Substr(h, 15))) ?? 0; }
+        h = Fiber.Await(Stream.ReadLineAsync(c, 10000));
+    }
+    return { first: first, lines: lines, auth: auth, length: length };
+}
+
+fn readBody(c, n: int): string {
+    if (n <= 0) { return ""; }
+    let b = Fiber.Await(Stream.ReadAsync(c, n, 10000));
+    return b == nil ? "" : Buffer.ToString(b);
+}
+
+// Copy a to b until a ends, then close both.
+fn pipe(a, b) {
+    while (Stream.WaitReadable(a, 10000) == true) {
+        let d = Stream.ReadBytes(a, 65536);
+        if (d == nil) { break; }
+        if (Fiber.Await(Stream.WriteAsync(b, d)) == nil) { break; }
+    }
+    Stream.Close(a);
+    Stream.Close(b);
+    return 0;
+}
+
+fn proxyPort(host: string, port: int, ports, tunnel: bool): int {
+    if (String.EndsWith(host, ".invalid")) { return tunnel ? ports.tls : ports.plain; }
+    return port;
+}
+
+fn proxyConnection(c, ports) {
+    var up = nil;
+    while (true) {
+        let head = readHead(c);
+        if (head == nil) { break; }
+        let parts = String.Split(head.first, " ");
+        if (parts[1] == "/seen") {
+            let seen = Json.Stringify({ seen: proxySeen, tunnels: proxyTunnels, forwards: proxyForwards });
+            Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 200 OK\r\nContent-Length: " + str(len(seen)) + "\r\n\r\n" + seen));
+            continue;
+        }
+        Array.Append(proxySeen, head.first + " | " + (head.auth ?? "-"));
+        if (head.auth == "Basic ZGVueTp4") {     // deny:x
+            Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+            break;
+        }
+        if (parts[0] == "CONNECT") {
+            let colon = String.LastIndexOf(parts[1], ":");
+            let host = String.Left(parts[1], colon);
+            let port = Convert.ParseInt(String.Substr(parts[1], colon + 1)) ?? 443;
+            let o = Fiber.Await(Stream.ConnectAsync("tcp", "127.0.0.1", proxyPort(host, port, ports, true), 5000));
+            if (o == nil) {
+                Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"));
+                break;
+            }
+            proxyTunnels += 1;
+            Fiber.Await(Stream.WriteAsync(c, "HTTP/1.1 200 Connection established\r\n\r\n"));
+            Fiber.Run(fn() { pipe(o, c); });
+            pipe(c, o);
+            return 0;
+        }
+        // An absolute-form request goes on in origin form, over one
+        // connection to the server for as long as the client keeps its own.
+        let u = HttpUtil.ParseUrl(parts[1]);
+        if (up == nil) {
+            up = Fiber.Await(Stream.ConnectAsync("tcp", "127.0.0.1", proxyPort(u.host, u.port, ports, false), 5000));
+            if (up == nil) { break; }
+            proxyForwards += 1;
+        }
+        var out = parts[0] + " " + u.path + (len(u.query) > 0 ? "?" + u.query : "") + " " + parts[2] + "\r\n";
+        foreach (h in head.lines) {
+            if (!String.StartsWith(String.ToLower(h), "proxy-")) { out += h + "\r\n"; }
+        }
+        Fiber.Await(Stream.WriteAsync(up, out + "\r\n" + readBody(c, head.length)));
+        let res = readHead(up);
+        if (res == nil) { break; }
+        var back = res.first + "\r\n";
+        foreach (h in res.lines) { back += h + "\r\n"; }
+        Fiber.Await(Stream.WriteAsync(c, back + "\r\n" + readBody(up, res.length)));
+    }
+    Stream.Close(c);
+    if (up != nil) { Stream.Close(up); }
+    return 0;
+}
+
+fn async proxyAccept(l, ports) {
+    while (proxyRunning) {
+        if (Stream.WaitReadable(l, 200) == true) {
+            let c = Stream.Accept(l);
+            if (c != nil) { Fiber.Run(fn() { proxyConnection(c, ports); }); }
+        }
+    }
+    return 0;
+}
+
+fn async proxyMain(plainPort: int, tlsPort: int) {
+    let l = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(l);
+    Console.WriteLine("PROXYPORT=" + String.Substr(a, String.LastIndexOf(a, ":") + 1));
+    Scheduler.Schedule(proxyAccept(l, { plain: plainPort, tls: tlsPort }));
+    let stdin = Stream.Stdin();
+    var line = await Stream.ReadLineAsync(stdin);
+    while (line != nil) { line = await Stream.ReadLineAsync(stdin); }
+    proxyRunning = false;
+    Fiber.Sleep(300);
+    Stream.Close(l);
     return 0;
 }
 
@@ -171,16 +374,19 @@ fn async startServer(): bool {
     if (server == nil) { return false; }
 
     var port = 0;
+    var idlePort = 0;
     var tlsPort = (p12 == nil) ? 0 : -1;
     let deadline = Time.Millis() + 10000;
-    while ((port == 0 || tlsPort < 0) && Time.Millis() < deadline) {
+    while ((port == 0 || idlePort == 0 || tlsPort < 0) && Time.Millis() < deadline) {
         let line = await Stream.ReadLineAsync(server.Stdout, deadline - Time.Millis());
         if (line == nil) { break; }
-        if (String.StartsWith(line, "PORT="))    { port    = Convert.ParseInt(String.Substr(line, 5)) ?? 0; }
-        if (String.StartsWith(line, "TLSPORT=")) { tlsPort = Convert.ParseInt(String.Substr(line, 8)) ?? 0; }
+        if (String.StartsWith(line, "PORT="))     { port     = Convert.ParseInt(String.Substr(line, 5)) ?? 0; }
+        if (String.StartsWith(line, "IDLEPORT=")) { idlePort = Convert.ParseInt(String.Substr(line, 9)) ?? 0; }
+        if (String.StartsWith(line, "TLSPORT="))  { tlsPort  = Convert.ParseInt(String.Substr(line, 8)) ?? 0; }
     }
-    if (port <= 0) { return false; }
+    if (port <= 0 || idlePort <= 0) { return false; }
     base = "http://127.0.0.1:" + str(port);
+    idleBase = "http://127.0.0.1:" + str(idlePort);
     if (tlsPort > 0) { tlsBase = "https://127.0.0.1:" + str(tlsPort); }
     return true;
 }
@@ -334,6 +540,53 @@ fn test_post() {
             checkEq(json.json.name,  "flaris", "post: body.name echoed");
             checkEq(json.json.value, 42,       "post: body.value echoed");
         }
+    }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Binary body: a block goes out as its bytes
+// --------------------------------------------------------
+
+fn test_block_body() {
+    Console.WriteLine("== Block body ==");
+
+    let b = Buffer.Create(5, 1);
+    b[0] = 0; b[1] = 1; b[2] = 255; b[3] = 65; b[4] = 0;
+    let res = Http.Request("POST", base + "/bytes", b, ContentType.Binary);
+    checkEq(statusOf(res), Status.OK, "block body: status 200");
+    if (res != nil) {
+        let j = Json.Parse(res.body);
+        checkEq(Json.Stringify(j.bytes), "[0,1,255,65,0]", "block body: every byte arrives, NULs included");
+        checkEq(j.contentType, ContentType.Binary, "block body: content type sent");
+    }
+
+    let r2 = Http.Post(base + "/bytes", Buffer.FromString("hello"));
+    if (r2 != nil) {
+        checkEq(Json.Stringify(Json.Parse(r2.body).bytes), "[104,101,108,108,111]",
+                "block body via Post: the bytes, not the text \"[block]\"");
+    } else {
+        check(false, "block body via Post: response");
+    }
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Credentials in a URL
+// --------------------------------------------------------
+
+fn test_url_credentials() {
+    Console.WriteLine("== URL credentials ==");
+
+    // user:pw@ is not part of the host: the request reaches the server, and
+    // neither the connect nor the Host header sees the credentials.
+    let hostPort = String.Substr(base, String.Length("http://"));
+    let res = Http.Get("http://user:pw@" + hostPort + "/headers");
+    checkEq(statusOf(res), Status.OK, "userinfo url: request reaches the server");
+    if (res != nil) {
+        let h = Json.Parse(res.body).headers;
+        checkEq(h["Host"], hostPort, "userinfo url: Host header carries no credentials");
+        check(h["Authorization"] == nil, "userinfo url: credentials are not sent");
     }
     return 0;
 }
@@ -749,6 +1002,314 @@ fn async test_async_concurrent() {
 }
 
 // --------------------------------------------------------
+//  Connection reuse
+// --------------------------------------------------------
+
+fn peerOf(res) {
+    if (res == nil || res.status != Status.OK) { return "-"; }
+    return Json.Parse(res.body).peer;
+}
+
+fn async test_pool() {
+    Console.WriteLine("== Connection reuse ==");
+    Http.CloseIdle();
+
+    let first = peerOf(Http.Get(base + "/peer"));
+    var same = 0;
+    iter (i from 0 to 20) {
+        if (peerOf(Http.Get(base + "/peer")) == first) { same += 1; }
+    }
+    checkEq(same, 20, "sequential GETs share one connection");
+    checkEq(peerOf(await Http.GetAsync(base + "/peer")), first, "an async GET takes the same pooled connection");
+    let p = Http.Post(base + "/post", Json.Stringify({ n: 1 }));
+    checkEq(statusOf(p), Status.OK, "POST on a pooled connection");
+    checkEq(peerOf(Http.Get(base + "/peer")), first, "... and the connection stays in step");
+    checkEq(statusOf(Http.Get(base + "/redirect/2")), Status.OK, "a redirect chain reuses its connection");
+    checkEq(peerOf(Http.Get(base + "/peer")), first, "... and hands it back");
+
+    // A server that closes idle connections: the request goes out again.
+    let a = peerOf(Http.Get(idleBase + "/peer"));
+    Fiber.Sleep(200);
+    let b = Http.Get(idleBase + "/peer");
+    checkEq(statusOf(b), Status.OK, "a GET on a connection the server closed is sent again");
+    check(peerOf(b) != a && a != "-", "... on a fresh connection");
+
+    if (tlsBase != nil) {
+        let opts = { insecure: true };
+        let t1 = peerOf(Http.Request("GET", tlsBase + "/peer", nil, nil, nil, opts));
+        let t2 = peerOf(Http.Request("GET", tlsBase + "/peer", nil, nil, nil, { insecure: true }));
+        let t3 = peerOf(await Http.RequestAsync("GET", tlsBase + "/peer", nil, nil, nil, opts));
+        check(t1 != "-" && t1 == t2 && t2 == t3, "https requests with equal options share a connection");
+        let t4 = peerOf(Http.Request("GET", tlsBase + "/peer", nil, nil, nil, { insecure: true, timeoutMs: 20000 }));
+        check(t4 != "-" && t4 != t1, "other options get a connection of their own");
+    }
+    Http.CloseIdle();
+    checkEq(Http.PoolStats().idle, 0, "CloseIdle empties the pool");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Deadline
+// --------------------------------------------------------
+
+fn async test_deadline() {
+    Console.WriteLine("== Deadline ==");
+    Http.CloseIdle();
+
+    var t0 = Time.Millis();
+    let late = Http.Request("GET", base + "/delay/1000", nil, nil, nil, { deadlineMs: 100 });
+    var took = Time.Millis() - t0;
+    check(late == nil, "a response slower than deadlineMs gives nil");
+    check(took < 800, "... once the deadline passes (" + str(took) + " ms)");
+
+    t0 = Time.Millis();
+    let lateAsync = await Http.RequestAsync("GET", base + "/delay/1000", nil, nil, nil, { deadlineMs: 100 });
+    took = Time.Millis() - t0;
+    check(lateAsync == nil && took < 800, "the same for an async request");
+
+    let viaTransport = Http.Request("GET", base + "/delay/1000", nil, nil, nil, Http.Transport({ deadlineMs: 100 }));
+    check(viaTransport == nil, "a transport's deadlineMs");
+
+    // Each chunk arrives well within the read timeout; the whole body does not
+    // arrive within the deadline.
+    checkEq(bodyOf(Http.Get(base + "/trickle")), "xxxxxxxxxx", "a slow chunked body completes without a deadline");
+    t0 = Time.Millis();
+    let cut = Http.Request("GET", base + "/trickle", nil, nil, nil, { deadlineMs: 80 });
+    took = Time.Millis() - t0;
+    check(cut == nil && took < 180, "the deadline ends a body that keeps trickling (" + str(took) + " ms)");
+
+    // A request that meets its deadline leaves the connection with the
+    // transport's own read timeout for the next request.
+    let first = peerOf(Http.Request("GET", base + "/peer", nil, nil, nil, { deadlineMs: 100 }));
+    checkEq(statusOf(Http.Get(base + "/delay/200")), Status.OK, "a later request may take longer than an earlier deadline");
+    checkEq(peerOf(Http.Get(base + "/peer")), first, "... on the same connection");
+    Http.CloseIdle();
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Streaming responses
+// --------------------------------------------------------
+
+global streamed = [];
+
+fn readLines(st) {
+    let out = [];
+    var line = st.Line();
+    while (line != nil) { Array.Append(out, line); line = st.Line(); }
+    st.Close();
+    return String.Join(out, "|");
+}
+
+fn readEvents(st) {
+    let out = [];
+    var ev = st.Event();
+    while (ev != nil) { Array.Append(out, ev.event + "=" + ev.data + "#" + ev.id); ev = st.Event(); }
+    st.Close();
+    return String.Join(out, "|");
+}
+
+fn test_streaming() {
+    Console.WriteLine("== Streaming ==");
+    Http.CloseIdle();
+
+    streamed = [];
+    let sp = Http.StreamPost(base + "/ndjson", "{}", fn(line) { Array.Append(streamed, line); });
+    checkEq(sp, Status.OK, "StreamPost status");
+    checkEq(String.Join(streamed, "|"), "{\"a\":1}|{\"b\":22}", "StreamPost: the JSON lines, one split across chunks");
+
+    let st = Http.Open("GET", base + "/ndjson");
+    checkEq(st?.status, Status.OK, "Open status");
+    checkEq(readLines(st), "{\"a\":1}|{\"b\":22}||not json", "Open + Line");
+
+    checkEq(readEvents(Http.Open("GET", base + "/sse")), "message=one#1|up=two\n2#1", "Open + Event");
+
+    let blob = Http.Open("GET", base + "/blob/300000");
+    var total = 0;
+    var pieces = 0;
+    var c = blob.Chunk();
+    while (c != nil) { total += len(c); pieces += 1; c = blob.Chunk(); }
+    checkEq(total, 300000, "Chunk: every byte of a Content-Length body");
+    check(pieces > 1, "... in pieces of at most 64 KB");
+    check(blob.IsDone() && blob.Error() == nil, "... done without error");
+
+    checkEq(len(bodyOf(Http.Request("GET", base + "/blob/1000", nil, nil, nil, { maxBodyBytes: 1000 }))), 1000,
+            "maxBodyBytes: a body that fits");
+    check(Http.Request("GET", base + "/blob/5000", nil, nil, nil, { maxBodyBytes: 1000 }) == nil,
+          "maxBodyBytes: a larger body fails the request");
+    check(Http.Request("GET", base + "/ndjson", nil, nil, nil, { maxBodyBytes: 10 }) == nil,
+          "maxBodyBytes: a chunked body past it fails too");
+
+    let seen = [];
+    let r = Http.Sse(base + "/sse", fn(ev) { Array.Append(seen, ev.data); return ev.event != "up"; });
+    checkEq(String.Join(seen, ","), "one,two\n2", "Http.Sse delivers each event until onEvent returns false");
+    checkEq(r.lastEventId, "1", "... and the id to resume from");
+
+    if (tlsBase != nil) {
+        let opts = { insecure: true };
+        streamed = [];
+        let tsp = Http.StreamPost(tlsBase + "/ndjson", "{}", fn(line) { Array.Append(streamed, line); }, nil,
+                                  { insecure: true, readTimeoutMs: 0 });
+        checkEq(tsp, Status.OK, "StreamPost over https");
+        checkEq(len(streamed), 2, "... the JSON lines");
+        checkEq(readLines(Http.Open("GET", tlsBase + "/ndjson", nil, nil, nil, opts)), "{\"a\":1}|{\"b\":22}||not json",
+                "Open + Line over https");
+        checkEq(readEvents(Http.Open("GET", tlsBase + "/sse", nil, nil, nil, opts)), "message=one#1|up=two\n2#1",
+                "Open + Event over https");
+    }
+    Http.CloseIdle();
+    return 0;
+}
+
+fn async test_streaming_async() {
+    Console.WriteLine("== Streaming async ==");
+    let st = await Http.OpenAsync("GET", base + "/ndjson");
+    checkEq(readLines(st), "{\"a\":1}|{\"b\":22}||not json", "OpenAsync + Line");
+    if (tlsBase != nil) {
+        let es = await Http.OpenAsync("GET", tlsBase + "/sse", nil, nil, nil, { insecure: true });
+        checkEq(readEvents(es), "message=one#1|up=two\n2#1", "OpenAsync + Event over https");
+    }
+    Http.CloseIdle();
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Retry-After
+// --------------------------------------------------------
+
+fn test_retry_after() {
+    Console.WriteLine("== Retry-After ==");
+    var refused = Http.Get(base + "/limited");
+    if (statusOf(refused) == Status.OK) { refused = Http.Get(base + "/limited"); }
+    checkEq(statusOf(refused), 429, "the refusal");
+    checkEq(Http.RetryAfterMs(refused), 0, "... carries Retry-After: 0");
+    checkEq(statusOf(Http.Get(base + "/limited")), Status.OK, "the next one is let through");
+    let t0 = Time.Millis();
+    let r = Http.Retry(fn() { return Http.Get(base + "/limited"); }, { attempts: 3, delayMs: 2000 });
+    checkEq(statusOf(r), Status.OK, "Http.Retry gets past a refusal");
+    check(Time.Millis() - t0 < 1500, "... waiting what Retry-After asked, not delayMs");
+    return 0;
+}
+
+// --------------------------------------------------------
+//  Proxies
+// --------------------------------------------------------
+
+global proxy = nil;         // the proxy child
+global proxyUrl = "";
+
+fn async startProxy(): bool {
+    let plainPort = String.Substr(base, String.LastIndexOf(base, ":") + 1);
+    let tlsPort = tlsBase == nil ? "0" : String.Substr(tlsBase, String.LastIndexOf(tlsBase, ":") + 1);
+    proxy = Os.Spawn(vmPath(), ["--libs=./libs", "tests/test_http.fls", "proxy", plainPort, tlsPort]);
+    if (proxy == nil) { return false; }
+    let line = await Stream.ReadLineAsync(proxy.Stdout, 10000);
+    if (line == nil || !String.StartsWith(line, "PROXYPORT=")) { return false; }
+    proxyUrl = "http://127.0.0.1:" + String.Substr(line, 10);
+    return true;
+}
+
+fn async stopProxy() {
+    if (proxy == nil) { return 0; }
+    Stream.Close(proxy.Stdin);
+    let w = await Os.WaitAsync(proxy.Pid, 5000);
+    if (w == nil || w.Alive) {
+        Os.KillChild(proxy.Pid, 9);
+        await Os.WaitAsync(proxy.Pid);
+    }
+    Stream.Close(proxy.Stdout);
+    Stream.Close(proxy.Stderr);
+    proxy = nil;
+    return 0;
+}
+
+// What the proxy has seen: { seen: [lines], tunnels, forwards }.
+fn proxyLog() {
+    let r = Http.Request("GET", proxyUrl + "/seen", nil, nil, nil, { proxy: false, keepAlive: false });
+    return r == nil ? { seen: [], tunnels: -1, forwards: -1 } : Json.Parse(r.body);
+}
+
+fn sawLine(prefix: string): bool {
+    foreach (l in proxyLog().seen) {
+        if (String.StartsWith(l, prefix)) { return true; }
+    }
+    return false;
+}
+
+fn async test_proxy() {
+    Console.WriteLine("== Proxy ==");
+    foreach (v in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"]) { Os.UnsetEnv(v); }
+    if (!(await startProxy())) {
+        check(false, "proxy child reports its port");
+        return 0;
+    }
+    Http.CloseIdle();
+    let px = { proxy: proxyUrl };
+
+    let r1 = Http.Request("GET", base + "/peer", nil, nil, nil, px);
+    let r2 = Http.Request("GET", base + "/peer", nil, nil, nil, px);
+    checkEq(statusOf(r1), Status.OK, "http through an explicit proxy");
+    check(sawLine("GET " + base + "/peer HTTP/1.1 | -"), "... sent in absolute form");
+    checkEq(peerOf(r2), peerOf(r1), "... and the proxy connection is pooled");
+    checkEq(proxyLog().forwards, 1, "... one connection to the proxy for both");
+
+    let authed = Http.Request("GET", base + "/get", nil, nil, nil,
+                              { proxy: "http://user:p%40ss@" + String.Substr(proxyUrl, 7) });
+    checkEq(statusOf(authed), Status.OK, "a proxy URL with credentials");
+    check(sawLine("GET " + base + "/get HTTP/1.1 | Basic dXNlcjpwQHNz"), "... sends them as Proxy-Authorization");
+    let denied = Http.Request("GET", base + "/get", nil, nil, nil, { proxy: "http://deny:x@" + String.Substr(proxyUrl, 7) });
+    checkEq(statusOf(denied), 407, "the proxy's own refusal comes back as the response");
+
+    let direct = Http.Request("GET", base + "/peer", nil, nil, nil, { proxy: proxyUrl, noProxy: "localhost, 127.0.0.1" });
+    checkEq(statusOf(direct), Status.OK, "noProxy sends a request direct");
+
+    var threw = false;
+    try { Http.Request("GET", base + "/get", nil, nil, nil, { proxy: "socks5://127.0.0.1:1" }); }
+    catch (e) { threw = e is HttpUnsupportedError; }
+    check(threw, "a proxy that is not http:// raises HttpUnsupportedError");
+
+    if (tlsBase != nil) {
+        let tpx = { proxy: proxyUrl, insecure: true };
+        let t1 = Http.Request("GET", tlsBase + "/peer", nil, nil, nil, tpx);
+        let t2 = Http.Request("GET", tlsBase + "/peer", nil, nil, nil, tpx);
+        checkEq(statusOf(t1), Status.OK, "https through a CONNECT tunnel");
+        check(sawLine("CONNECT " + String.Substr(tlsBase, 8) + " HTTP/1.1"), "... the proxy saw CONNECT host:port");
+        checkEq(peerOf(t2), peerOf(t1), "... and the tunnel is pooled");
+        checkEq(proxyLog().tunnels, 1, "... one tunnel for both");
+        let ta = await Http.RequestAsync("GET", tlsBase + "/peer", nil, nil, nil, { proxy: proxyUrl, insecure: true, timeoutMs: 9000 });
+        checkEq(statusOf(ta), Status.OK, "an async request through a tunnel");
+        checkEq(Http.Request("GET", tlsBase + "/get", nil, nil, nil,
+                             { proxy: "http://deny:x@" + String.Substr(proxyUrl, 7), insecure: true }), nil,
+                "a refused CONNECT gives nil");
+    }
+
+    // From the environment: never for this machine, not for no_proxy hosts.
+    Os.SetEnv("http_proxy", proxyUrl);
+    let e1 = Http.Get("http://flaris-proxy-test.invalid/get");
+    checkEq(statusOf(e1), Status.OK, "http_proxy from the environment");
+    check(sawLine("GET http://flaris-proxy-test.invalid/get HTTP/1.1"), "... the proxy carried it");
+    let before = proxyLog().forwards;
+    checkEq(statusOf(Http.Get(base + "/get")), Status.OK, "a loopback host goes direct");
+    checkEq(proxyLog().forwards, before, "... without the proxy");
+    Os.SetEnv("no_proxy", "example.org, .invalid");
+    check(Http.Get("http://flaris-proxy-test.invalid/get") == nil, "no_proxy names the host: direct, and it does not resolve");
+    Os.UnsetEnv("no_proxy");
+    check(Http.Request("GET", "http://flaris-proxy-test.invalid/get", nil, nil, nil, { proxy: false }) == nil,
+          "proxy: false ignores the environment");
+    Os.UnsetEnv("http_proxy");
+    if (tlsBase != nil) {
+        Os.SetEnv("https_proxy", proxyUrl);
+        let e2 = Http.Request("GET", "https://flaris-proxy-test.invalid/get", nil, nil, nil, { insecure: true });
+        checkEq(statusOf(e2), Status.OK, "https_proxy from the environment");
+        check(sawLine("CONNECT flaris-proxy-test.invalid:443 HTTP/1.1"), "... through a tunnel to the named host");
+        Os.UnsetEnv("https_proxy");
+    }
+    Http.CloseIdle();
+    await stopProxy();
+    return 0;
+}
+
+// --------------------------------------------------------
 //  Main
 // --------------------------------------------------------
 
@@ -756,6 +1317,9 @@ fn async Main() {
     let args = Os.Args();
     if (len(args) > 0 && args[0] == "serve") {
         return await serve(len(args) > 1 ? args[1] : nil);
+    }
+    if (len(args) > 2 && args[0] == "proxy") {
+        return await proxyMain(Convert.ParseInt(args[1]) ?? 0, Convert.ParseInt(args[2]) ?? 0);
     }
 
     Console.WriteLine("=== Http.fls test suite ===");
@@ -768,6 +1332,8 @@ fn async Main() {
         test_get();
         test_get_headers();
         test_post();
+        test_block_body();
+        test_url_credentials();
         test_put();
         test_patch();
         test_query_method();
@@ -781,6 +1347,12 @@ fn async Main() {
         test_wget();
         await test_async();
         await test_async_concurrent();
+        await test_pool();
+        await test_deadline();
+        test_streaming();
+        await test_streaming_async();
+        test_retry_after();
+        await test_proxy();
     } else {
         check(false, "local server did not report its port");
     }

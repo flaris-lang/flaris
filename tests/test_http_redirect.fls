@@ -36,6 +36,7 @@ fn field(resp, key: string): string {
 
 fn report(req, res) {
     res.Json({
+        path:   req.path,
         auth:   req.Header("authorization")       ?? "-",
         cookie: req.Header("cookie")              ?? "-",
         proxy:  req.Header("proxy-authorization") ?? "-",
@@ -55,6 +56,12 @@ fn async serve() {
     // Same host and port, so the caller never leaves the origin it trusted.
     home.Get("/same",   fn(_req, res) { res.Redirect("/landed"); });
     home.Get("/landed", fn(req, res) { report(req, res); });
+    // Relative Location values resolve against the URL that sent them.
+    home.Get("/dir/rel",  fn(_req, res) { res.Redirect("next?k=1"); });
+    home.Get("/dir/next", fn(req, res)  { report(req, res); });
+    home.Get("/dir/sub/up", fn(_req, res) { res.Redirect("../../landed"); });
+    home.Get("/proto", fn(_req, res) { res.Redirect("//127.0.0.1:" + str(foreignPort) + "/land"); });
+    home.Get("/mailto", fn(_req, res) { res.Redirect("mailto:someone@example.com"); });
     Console.WriteLine("PORT=" + str(home.ListenAsync()));
 
     let stdin = Stream.Stdin();
@@ -129,6 +136,23 @@ fn runChecks(base: string) {
     check(field(cross, "proxy")  == "-", "cross-origin: Proxy-Authorization dropped");
     check(field(cross, "trace")  == "keep-me",
           "cross-origin: ordinary header still sent - only credentials are dropped");
+
+    // RFC 3986 resolution of the Location header.
+    check(field(Http.Get(base + "/dir/rel"), "path") == "/dir/next",
+          "relative Location merges with the current directory");
+    check(field(Http.Get(base + "/dir/sub/up"), "path") == "/landed",
+          "'../' segments in a Location are resolved");
+    let proto = Http.Get(base + "/proto", creds);
+    check(field(proto, "path") == "/land", "protocol-relative Location reaches the other host");
+    check(field(proto, "auth") == "-", "protocol-relative Location to another origin drops credentials");
+    check(Http.Get(base + "/mailto") == nil, "a Location with a non-http scheme is not followed");
+    return 0;
+}
+
+// The async engine resolves Location the same way.
+fn async runAsyncChecks(base: string) {
+    let rel = await Http.GetAsync(base + "/dir/rel");
+    check(field(rel, "path") == "/dir/next", "async: relative Location merges with the current directory");
     return 0;
 }
 
@@ -143,6 +167,7 @@ fn async Main() {
     let port = await startServer();
     if (port > 0) {
         runChecks("http://127.0.0.1:" + str(port));
+        await runAsyncChecks("http://127.0.0.1:" + str(port));
     } else {
         check(false, "server did not report a port");
     }

@@ -16,6 +16,7 @@
 // cannot terminate TLS.
 
 import { Https, Status } from library("Https", "1.0");
+import { Http } from library("Http", "1.0");
 import { HttpServer } from library("HttpServer", "1.0");
 
 const SCRIPT   = "tests/test_https_builtin.fls";
@@ -44,6 +45,7 @@ fn async serve(dir: string) {
     });
     srv.Get("/", fn(_req, res) { res.Json({ current_user_url: "https://127.0.0.1/user", ok: true }); });
     srv.Post("/post", fn(req, res) { res.Json({ json: req.Json() }); });
+    srv.Get("/peer", fn(req, res) { res.Json({ peer: req.peer }); });
     srv.ListenAsync();
     Console.WriteLine("TLS_READY ", srv.Port());
 
@@ -111,6 +113,27 @@ fn async runChecks(dir: string, port: int) {
     let p = Https.PostInsecure(base + "/post", { name: "Linux", n: 3 });
     let pj = p == nil ? nil : Json.Parse(p.body);
     check(pj != nil && pj.json != nil && pj.json.name == "Linux" && pj.json.n == 3, "POST object body round-trips as JSON");
+
+    // Keep-alive: the insecure calls share one pooled TLS connection, sync and async alike.
+    let peers = [];
+    iter (i from 0 to 3) {
+        let pr = Https.GetInsecure(base + "/peer");
+        Array.Append(peers, pr == nil ? "-" : Json.Parse(pr.body).peer);
+    }
+    let ap = await Https.GetInsecureAsync(base + "/peer");
+    Array.Append(peers, ap == nil ? "-" : Json.Parse(ap.body).peer);
+    check(peers[0] != "-" && peers[0] == peers[1] && peers[1] == peers[2] && peers[2] == peers[3],
+          "sequential requests reuse one TLS connection");
+    check(Https.Get(base + "/peer") == nil, "a verified request does not take the insecure connection");
+
+    // Streaming responses over TLS.
+    let st = Http.Open("GET", base + "/", nil, nil, nil, { insecure: true });
+    let sj = st == nil ? nil : Json.Parse(st.ReadAll());
+    check(sj != nil && sj.ok == true, "Http.Open reads a TLS response body as it arrives");
+    let lines = [];
+    let sp = Http.StreamPost(base + "/post", "{\"n\":1}", fn(line) { Array.Append(lines, line); }, nil,
+                             { insecure: true });
+    check(sp == Status.OK && len(lines) == 1 && String.Contains(lines[0], "\"n\":1"), "Http.StreamPost over https");
 
     // Async transport round-trip (io-pool offload): ConnectAsync -> WriteAsync ->
     // ReadLineAsync -> ReadAsync to EOF.
