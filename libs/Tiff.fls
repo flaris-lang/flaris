@@ -1,0 +1,1470 @@
+// =============================================================================
+// Tiff.fls - TIFF encoder / decoder for Flaris.
+// Version: 1.0
+//
+// A TIFF 6.0 codec written in Flaris. LZW and PackBits are implemented here;
+// Deflate strips go through Inflate.Zlib / Deflate.Zlib from Deflate.fls.
+//
+// Pixels are exchanged exactly as Png.fls does it: a `block` of 32-bit
+// `0xAARRGGBB` words, one word per pixel, row-major, stride == width, straight
+// (not premultiplied) alpha. A decoded image can therefore go straight into a
+// Graphics canvas, and anything Png.Decode returns can be handed to Tiff.Encode.
+//
+// Usage:
+//   import { Tiff } from library("Tiff", "1.0");
+//
+//   let img = Tiff.Load("scan.tif");             // { Width, Height, Pixels }
+//   if (img == nil) { Console.WriteLine(Tiff.LastError()); }
+//
+//   Tiff.Save("out.tif", img.Pixels, img.Width, img.Height);
+//   Tiff.Save("small.tif", px, w, h, { compression: Tiff.COMPRESSION_DEFLATE });
+//
+//   // Multi-page files
+//   let n = Tiff.PageCount(bytes);
+//   let p2 = Tiff.Decode(bytes, { page: 1 });
+//   Tiff.SavePages("book.tif", [img, p2]);       // pages are { Width, Height, Pixels }
+//
+// Decode support:
+//   Byte order: both (II and MM). Classic TIFF and BigTIFF.
+//   Layout:     strips or tiles, chunky or planar (PlanarConfiguration 1 / 2),
+//               either FillOrder.
+//   Compression: none (1), LZW (5), Adobe Deflate (8 and the old 32946),
+//               PackBits (32773). Horizontal predictor (2) at 8 and 16 bits.
+//   Photometric: WhiteIsZero (0) and BlackIsZero (1) grayscale at 1/2/4/8/16
+//               bits, RGB (2) at 8/16 bits, palette (3) at 1/2/4/8 bits,
+//               CMYK (5, InkSet 1) at 8/16 bits.
+//   Alpha:      the first ExtraSample, when it is marked associated (1) or
+//               unassociated (2). Associated alpha is un-premultiplied. An
+//               extra sample marked unspecified (0) is not treated as alpha.
+//   16-bit samples are reduced to their high byte. Output is always 32-bit ARGB.
+//   Orientation is not applied: pixels come back in stored order.
+//
+//   Not decoded (Decode returns nil, LastError says why): JPEG, CCITT fax,
+//   JBIG, LZMA, ZSTD and WebP compression; YCbCr, CIELab and other photometric
+//   interpretations; signed and floating-point samples; the floating-point
+//   predictor (3).
+//
+// Encode support:
+//   32-bit ARGB in, 8-bit RGB out - RGBA with unassociated alpha (ExtraSamples
+//   = 2) when any pixel is not fully opaque, plain RGB otherwise. Little-endian,
+//   chunky, strips of about 64 KiB, 72 dpi. Options:
+//
+//     compression  Tiff.COMPRESSION_LZW (default), COMPRESSION_DEFLATE,
+//                  COMPRESSION_PACKBITS or COMPRESSION_NONE.
+//     predictor    true/false - horizontal differencing before LZW or Deflate.
+//                  On by default for those two; ignored for the others.
+//
+//   LZW is the default because practically every TIFF reader handles it.
+//   Deflate makes smaller files and is read by libtiff (so most open-source
+//   software), macOS and Windows, but older or minimal readers may lack it.
+//
+// Errors:
+//   Nothing here raises on bad input. Decode, Info and the encoders return nil
+//   (Save and SavePages return false) and Tiff.LastError() gives the reason as
+//   a string; it is nil after a call that succeeded.
+//
+// Limits:
+//   Images are bounded to 16384 pixels per side, matching the `Gfx` surface cap.
+//
+// Constants:  Tiff.MAX_DIM  Tiff.COMPRESSION_NONE  Tiff.COMPRESSION_LZW
+//             Tiff.COMPRESSION_DEFLATE  Tiff.COMPRESSION_PACKBITS
+// =============================================================================
+
+import { Inflate, Deflate } from library("Deflate", "1.0");
+
+global _tiffErr = nil;
+
+// =============================================================================
+// Hot loops
+//
+// Every per-byte loop is a top-level typed leaf function so it compiles
+// natively: a JIT-compiled function takes at most 8 non-float arguments and
+// must not call script functions, so no kernel calls another. Blocks indexed
+// here have 1-byte elements unless noted (pixel blocks are 4-byte words, the
+// LZW decode table 8-byte entries); a byte read gives 0..255 and a byte store
+// keeps the low 8 bits, so the loops carry no masks.
+// =============================================================================
+
+// LZW decode table entry for code c (8-byte elements):
+//   bits 0-11 prefix code, 12-19 last byte, 20-27 first byte, 28+ length.
+// Codes 0-255 are the fixed single-byte strings; the caller fills them once.
+fn _tiffLzwTable(): block {
+    let tab = Buffer.Create(4096, 8);
+    var i = 0;
+    while (i < 256) {
+        tab[i] = 4095 | (i << 12) | (i << 20) | (1 << 28);
+        i += 1;
+    }
+    return tab;
+}
+
+// TIFF LZW (spec section 13): MSB-first codes of 9-12 bits, Clear = 256,
+// EndOfInformation = 257, and the code width grows one code early - after
+// entry 2^n - 2 is added rather than 2^n - 1. Decodes src[sOff, sOff+sLen)
+// into dst[dOff, dOff+dLen); returns the bytes written, which is short of dLen
+// when the stream ends early, or -1 on a corrupt stream.
+fn _tiffLzwDecode(src: block, sOff: int, sLen: int, dst: block,
+                  dOff: int, dLen: int, tab: block): int {
+    let end = sOff + sLen;
+    let oEnd = dOff + dLen;
+    var ip = sOff;
+    var op = dOff;
+    var acc = 0;
+    var nb = 0;
+    var width = 9;
+    var next = 258;
+    var old = -1;
+
+    while (op < oEnd) {
+        while (nb < width && ip < end) {
+            acc = (acc << 8) | src[ip];
+            ip += 1;
+            nb += 8;
+        }
+        if (nb < width) { break; }
+        nb -= width;
+        let code = (acc >> nb) & ((1 << width) - 1);
+        acc = acc & ((1 << nb) - 1);
+
+        if (code == 257) { break; }
+        if (code == 256) {
+            width = 9;
+            next = 258;
+            old = -1;
+            continue;
+        }
+        if (old < 0) {
+            if (code > 255) { return -1; }
+            dst[op] = code;
+            op += 1;
+            old = code;
+            continue;
+        }
+        if (code > next) { return -1; }
+
+        // New entry: old's string plus the first byte of this code's string -
+        // or of old's own string when this code is the entry being defined
+        // (the KwKwK case). Adding it first lets both cases emit alike.
+        if (next < 4096) {
+            let eo = tab[old];
+            var first = (eo >> 20) & 255;
+            if (code < next) { first = (tab[code] >> 20) & 255; }
+            tab[next] = old | (first << 12) | (eo & (255 << 20)) | (((eo >> 28) + 1) << 28);
+            next += 1;
+            if (next >= (1 << width) - 1 && width < 12) { width += 1; }
+        }
+
+        // Emit the string back to front by walking the prefix chain.
+        var e = tab[code];
+        let slen = e >> 28;
+        var p = op + slen - 1;
+        var c = code;
+        while (true) {
+            if (p < oEnd) { dst[p] = (e >> 12) & 255; }
+            if (c < 256) { break; }
+            c = e & 4095;
+            e = tab[c];
+            p -= 1;
+        }
+        op += slen;
+        old = code;
+    }
+    if (op > oEnd) { op = oEnd; }
+    return op - dOff;
+}
+
+// LZW-encode src[sOff, sOff+sLen) into dst[0, dCap). Returns the byte count,
+// or -1 if dst is too small. keys/vals are an 8192-slot open-addressing table
+// (4-byte keys stored +1 so 0 is empty, 2-byte codes) mapping (prefix, byte)
+// to a code; it is cleared here on entry and at every table reset.
+fn _tiffLzwEncode(src: block, sOff: int, sLen: int, dst: block, dCap: int,
+                  keys: block, vals: block): int {
+    var op = 0;
+    var acc = 256;            // Clear, the first code of every strip
+    var nb = 9;
+    var width = 9;
+    var next = 258;
+    Buffer.Fill(keys, 0);
+
+    let end = sOff + sLen;
+    var ip = sOff;
+    var ent = src[ip];
+    ip += 1;
+    while (ip < end) {
+        let c = src[ip];
+        ip += 1;
+        let key = ((ent << 8) | c) + 1;
+        // Multiplicative hash. Codes are handed out consecutively, so an
+        // XOR-shaped hash like (c << 5) ^ ent packs the keys into one dense
+        // run that linear probing then crawls through - 40x slower here.
+        var h = ((key * 2654435761) >> 19) & 8191;
+        var hit = -1;
+        while (keys[h] != 0) {
+            if (keys[h] == key) {
+                hit = vals[h];
+                break;
+            }
+            h = (h + 1) & 8191;
+        }
+        if (hit >= 0) {
+            ent = hit;
+            continue;
+        }
+
+        acc = (acc << width) | ent;
+        nb += width;
+        while (nb >= 8) {
+            nb -= 8;
+            if (op >= dCap) { return -1; }
+            dst[op] = acc >> nb;
+            op += 1;
+        }
+        acc = acc & ((1 << nb) - 1);
+
+        keys[h] = key;
+        vals[h] = next;
+        next += 1;
+        ent = c;
+        if (next == 4094) {
+            // Table full: Clear at the current width, then start over.
+            acc = (acc << width) | 256;
+            nb += width;
+            while (nb >= 8) {
+                nb -= 8;
+                if (op >= dCap) { return -1; }
+                dst[op] = acc >> nb;
+                op += 1;
+            }
+            acc = acc & ((1 << nb) - 1);
+            Buffer.Fill(keys, 0);
+            next = 258;
+            width = 9;
+        } else if (next > (1 << width) - 1) {
+            width += 1;
+        }
+    }
+
+    // The last string. The decoder adds a table entry when it reads it, so
+    // EndOfInformation goes out at the width that entry implies.
+    acc = (acc << width) | ent;
+    nb += width;
+    next += 1;
+    if (next == 4094) {
+        acc = (acc << width) | 256;
+        nb += width;
+        width = 9;
+    } else if (next > (1 << width) - 1) {
+        width += 1;
+    }
+    acc = (acc << width) | 257;
+    nb += width;
+    while (nb >= 8) {
+        nb -= 8;
+        if (op >= dCap) { return -1; }
+        dst[op] = acc >> nb;
+        op += 1;
+    }
+    if (nb > 0) {
+        if (op >= dCap) { return -1; }
+        dst[op] = acc << (8 - nb);
+        op += 1;
+    }
+    return op;
+}
+
+// PackBits: a header byte n, then n+1 literal bytes (n < 128) or one byte
+// repeated 257-n times (n > 128); 128 is a no-op. Returns bytes written, or
+// -1 when a literal run is cut off by the end of the input.
+fn _tiffPackBitsDecode(src: block, sOff: int, sLen: int, dst: block,
+                       dOff: int, dLen: int): int {
+    let end = sOff + sLen;
+    let oEnd = dOff + dLen;
+    var ip = sOff;
+    var op = dOff;
+    while (ip < end && op < oEnd) {
+        let n = src[ip];
+        ip += 1;
+        if (n < 128) {
+            let k = n + 1;
+            if (ip + k > end) { return -1; }
+            var take = k;
+            if (op + take > oEnd) { take = oEnd - op; }
+            Buffer.Copy(src, ip, dst, op, take);
+            ip += k;
+            op += take;
+        } else if (n > 128) {
+            if (ip >= end) { return -1; }
+            let v = src[ip];
+            ip += 1;
+            var k = 257 - n;
+            if (op + k > oEnd) { k = oEnd - op; }
+            while (k > 0) {
+                dst[op] = v;
+                op += 1;
+                k -= 1;
+            }
+        }
+    }
+    return op - dOff;
+}
+
+// PackBits-encode `rows` rows of rowBytes bytes from src[sOff..] into dst;
+// returns the byte count. Each row is packed on its own, as TIFF requires.
+// Runs of three or more become a repeat; everything else goes out as literals.
+// dst needs rows * (rowBytes + rowBytes / 128 + 1) bytes.
+fn _tiffPackBitsEncode(src: block, sOff: int, rowBytes: int, rows: int,
+                       dst: block): int {
+    var op = 0;
+    var r = 0;
+    while (r < rows) {
+        var i = sOff + r * rowBytes;
+        let end = i + rowBytes;
+        while (i < end) {
+            let v = src[i];
+            var run = 1;
+            while (i + run < end && run < 128 && src[i + run] == v) { run += 1; }
+            if (run >= 3) {
+                dst[op] = 257 - run;
+                dst[op + 1] = v;
+                op += 2;
+                i += run;
+            } else {
+                let start = i;
+                var lit = 0;
+                while (i < end && lit < 128) {
+                    if (i + 2 < end && src[i] == src[i + 1] && src[i] == src[i + 2]) { break; }
+                    i += 1;
+                    lit += 1;
+                }
+                dst[op] = lit - 1;
+                Buffer.Copy(src, start, dst, op + 1, lit);
+                op += lit + 1;
+            }
+        }
+        r += 1;
+    }
+    return op;
+}
+
+// Undo horizontal differencing on `rows` rows of 8-bit samples starting at
+// off; `stride` is the samples per pixel in the row.
+fn _tiffUnpredict8(b: block, off: int, rows: int, rowBytes: int, stride: int): int {
+    var y = 0;
+    while (y < rows) {
+        let base = off + y * rowBytes;
+        var i = base + stride;
+        let end = base + rowBytes;
+        while (i < end) {
+            b[i] = b[i] + b[i - stride];
+            i += 1;
+        }
+        y += 1;
+    }
+    return 0;
+}
+
+// The same for 16-bit samples, which are summed as 16-bit values in the
+// file's byte order (be = 1 for big-endian).
+fn _tiffUnpredict16(b: block, off: int, rows: int, rowBytes: int, stride: int,
+                    be: int): int {
+    let step = stride * 2;
+    var y = 0;
+    while (y < rows) {
+        let base = off + y * rowBytes;
+        var i = base + step;
+        let end = base + (rowBytes & (0 - 2));
+        while (i < end) {
+            if (be != 0) {
+                let v = ((b[i] << 8) | b[i + 1]) + ((b[i - step] << 8) | b[i - step + 1]);
+                b[i] = v >> 8;
+                b[i + 1] = v;
+            } else {
+                let v = (b[i] | (b[i + 1] << 8)) + (b[i - step] | (b[i - step + 1] << 8));
+                b[i] = v;
+                b[i + 1] = v >> 8;
+            }
+            i += 2;
+        }
+        y += 1;
+    }
+    return 0;
+}
+
+// Horizontal differencing for the encoder, in place, back to front per row.
+fn _tiffPredict8(s: block, rows: int, rowBytes: int, stride: int): int {
+    var y = 0;
+    while (y < rows) {
+        let base = y * rowBytes;
+        var i = base + rowBytes - 1;
+        let stop = base + stride;
+        while (i >= stop) {
+            s[i] = s[i] - s[i - stride];
+            i -= 1;
+        }
+        y += 1;
+    }
+    return 0;
+}
+
+// Keep the high byte of each of n 16-bit samples (hi = 0 big-endian, 1 little).
+fn _tiffNarrow16(raw: block, s8: block, n: int, hi: int): int {
+    var i = 0;
+    var j = hi;
+    while (i < n) {
+        s8[i] = raw[j];
+        i += 1;
+        j += 2;
+    }
+    return 0;
+}
+
+// Unpack 1/2/4-bit chunky rows to one byte per sample. P = [w, h, spp, bd,
+// rowBytes, scale]; with scale set, samples are stretched to 0..255.
+fn _tiffUnpackBits(raw: block, s8: block, P: [int]): int {
+    let w = P[0];
+    let h = P[1];
+    let spp = P[2];
+    let bd = P[3];
+    let rowBytes = P[4];
+    let scale = P[5];
+    let maxv = (1 << bd) - 1;
+    let per = w * spp;
+    var o = 0;
+    var y = 0;
+    while (y < h) {
+        let base = y * rowBytes;
+        var k = 0;
+        while (k < per) {
+            let bit = k * bd;
+            var v = (raw[base + (bit >> 3)] >> (8 - bd - (bit & 7))) & maxv;
+            if (scale != 0) { v = (v * 255) / maxv; }
+            s8[o] = v;
+            o += 1;
+            k += 1;
+        }
+        y += 1;
+    }
+    return 0;
+}
+
+// Interleave one plane of a planar image into chunky 8-bit samples.
+// P = [w, h, spp, bd, rowBytes, planeOff, plane, hi, scale].
+fn _tiffPlane(raw: block, s8: block, P: [int]): int {
+    let w = P[0];
+    let h = P[1];
+    let spp = P[2];
+    let bd = P[3];
+    let rowBytes = P[4];
+    let planeOff = P[5];
+    let hi = P[7];
+    let scale = P[8];
+    let maxv = (1 << bd) - 1;
+    var o = P[6];
+    var y = 0;
+    while (y < h) {
+        let base = planeOff + y * rowBytes;
+        var x = 0;
+        while (x < w) {
+            var v = 0;
+            if (bd == 8) {
+                v = raw[base + x];
+            } else if (bd == 16) {
+                v = raw[base + x * 2 + hi];
+            } else {
+                let bit = x * bd;
+                v = (raw[base + (bit >> 3)] >> (8 - bd - (bit & 7))) & maxv;
+                if (scale != 0) { v = (v * 255) / maxv; }
+            }
+            s8[o] = v;
+            o += spp;
+            x += 1;
+        }
+        y += 1;
+    }
+    return 0;
+}
+
+// The expanders turn n pixels of 8-bit chunky samples (spp per pixel) into
+// ARGB words. aIdx is the alpha sample's index, or -1; assoc = 1 when the
+// colour is premultiplied by it.
+
+fn _tiffRgbToArgb(s: block, out: block, n: int, spp: int, aIdx: int, assoc: int): int {
+    var i = 0;
+    var o = 0;
+    while (i < n) {
+        var r = s[o];
+        var g = s[o + 1];
+        var b = s[o + 2];
+        var a = 255;
+        if (aIdx >= 0) {
+            a = s[o + aIdx];
+            if (assoc != 0 && a < 255) {
+                if (a == 0) {
+                    r = 0; g = 0; b = 0;
+                } else {
+                    r = (r * 255 + (a >> 1)) / a; if (r > 255) { r = 255; }
+                    g = (g * 255 + (a >> 1)) / a; if (g > 255) { g = 255; }
+                    b = (b * 255 + (a >> 1)) / a; if (b > 255) { b = 255; }
+                }
+            }
+        }
+        out[i] = (a << 24) | (r << 16) | (g << 8) | b;
+        i += 1;
+        o += spp;
+    }
+    return 0;
+}
+
+fn _tiffGrayToArgb(s: block, out: block, n: int, spp: int, aIdx: int, assoc: int,
+                   invert: int): int {
+    var i = 0;
+    var o = 0;
+    while (i < n) {
+        var g = s[o];
+        if (invert != 0) { g = 255 - g; }
+        var a = 255;
+        if (aIdx >= 0) {
+            a = s[o + aIdx];
+            if (assoc != 0 && a < 255) {
+                if (a == 0) { g = 0; }
+                else { g = (g * 255 + (a >> 1)) / a; if (g > 255) { g = 255; } }
+            }
+        }
+        out[i] = (a << 24) | (g << 16) | (g << 8) | g;
+        i += 1;
+        o += spp;
+    }
+    return 0;
+}
+
+fn _tiffPalToArgb(s: block, out: block, n: int, spp: int, lut: block): int {
+    var i = 0;
+    var o = 0;
+    while (i < n) {
+        out[i] = lut[s[o]];
+        i += 1;
+        o += spp;
+    }
+    return 0;
+}
+
+// Naive CMYK -> RGB with no colour profile, truncating exactly as libtiff's
+// RGBA interface does so the two agree pixel for pixel.
+fn _tiffCmykToArgb(s: block, out: block, n: int, spp: int, aIdx: int): int {
+    var i = 0;
+    var o = 0;
+    while (i < n) {
+        let k = 255 - s[o + 3];
+        let r = ((255 - s[o]) * k) / 255;
+        let g = ((255 - s[o + 1]) * k) / 255;
+        let b = ((255 - s[o + 2]) * k) / 255;
+        var a = 255;
+        if (aIdx >= 0) { a = s[o + aIdx]; }
+        out[i] = (a << 24) | (r << 16) | (g << 8) | b;
+        i += 1;
+        o += spp;
+    }
+    return 0;
+}
+
+// Reverse the bit order of each of the first n bytes (FillOrder 2 data).
+fn _tiffReverseBits(b: block, n: int): int {
+    var i = 0;
+    while (i < n) {
+        var v = b[i];
+        v = ((v & 0xF0) >> 4) | ((v & 0x0F) << 4);
+        v = ((v & 0xCC) >> 2) | ((v & 0x33) << 2);
+        v = ((v & 0xAA) >> 1) | ((v & 0x55) << 1);
+        b[i] = v;
+        i += 1;
+    }
+    return 0;
+}
+
+// 1 if any of the n ARGB words is not fully opaque.
+fn _tiffHasAlpha(px: block, n: int): int {
+    var i = 0;
+    while (i < n) {
+        if ((px[i] >> 24) != 255) { return 1; }
+        i += 1;
+    }
+    return 0;
+}
+
+// ARGB words -> RGB or RGBA bytes.
+fn _tiffFromArgb(px: block, s: block, n: int, spp: int): int {
+    var i = 0;
+    var o = 0;
+    while (i < n) {
+        let v = px[i];
+        s[o] = v >> 16;
+        s[o + 1] = v >> 8;
+        s[o + 2] = v;
+        if (spp == 4) { s[o + 3] = v >> 24; }
+        i += 1;
+        o += spp;
+    }
+    return 0;
+}
+
+class Tiff {
+
+    // ----------------------------------------------------------------
+    // Constants
+    // ----------------------------------------------------------------
+
+    const MAX_DIM = 16384;
+
+    const COMPRESSION_NONE     = 1;
+    const COMPRESSION_LZW      = 5;
+    const COMPRESSION_DEFLATE  = 8;
+    const COMPRESSION_PACKBITS = 32773;
+
+    // Decoded sample data is capped below the VM's 2 GiB allocation limit,
+    // so an oversized image fails cleanly instead of raising.
+    const MAX_RAW = 1073741824;
+
+    // ----------------------------------------------------------------
+    // Public API
+    // ----------------------------------------------------------------
+
+    // Why the last Decode / Info / Encode returned nil, or nil after success.
+    fn static LastError() : string|nil {
+        return _tiffErr;
+    }
+
+    // True when `bytes` starts with a TIFF or BigTIFF header.
+    fn static IsTiff(bytes) : bool {
+        if (bytes == nil || Type.Of(bytes) != Type.Block || len(bytes) < 8) { return false; }
+        let b0 = (u8)bytes[0];
+        let b1 = (u8)bytes[1];
+        if (b0 == 0x49 && b1 == 0x49) {
+            return (u8)bytes[3] == 0 && ((u8)bytes[2] == 42 || (u8)bytes[2] == 43);
+        }
+        if (b0 == 0x4D && b1 == 0x4D) {
+            return (u8)bytes[2] == 0 && ((u8)bytes[3] == 42 || (u8)bytes[3] == 43);
+        }
+        return false;
+    }
+
+    // Decode(bytes:block, opts?:object) -> { Width, Height, Pixels } or nil.
+    // `opts.page` picks a page of a multi-page file (0-based, default 0).
+    fn static Decode(bytes, opts?:object) : object|nil {
+        let page = Tiff._pageOpt(opts);
+        if (page < 0) { return nil; }
+        let d = Tiff._parse(bytes, page);
+        if (d == nil) { return nil; }
+        if (!Tiff._validate(d)) { return nil; }
+        let raw = Tiff._readData(bytes, d);
+        if (raw == nil) { return nil; }
+        let px = Tiff._toArgb(raw, d);
+        if (px == nil) { return nil; }
+        _tiffErr = nil;
+        return { Width: d.w, Height: d.h, Pixels: px };
+    }
+
+    // Load(path:string, opts?:object) -> { Width, Height, Pixels } or nil.
+    fn static Load(path:string, opts?:object) : object|nil {
+        let bytes = File.ReadAllBytes(path);
+        if (bytes == nil) { return Tiff._fail("cannot read " + path); }
+        return Tiff.Decode(bytes, opts);
+    }
+
+    // Number of pages (IFDs) in the file; 0 when it is not a readable TIFF.
+    fn static PageCount(bytes) : int {
+        let hdr = Tiff._header(bytes);
+        if (hdr == nil) { return 0; }
+        let n = len(bytes);
+        let seen = {};
+        var ifd = hdr.ifd;
+        var count = 0;
+        while (ifd > 0 && ifd < n) {
+            let key = str(ifd);
+            if (seen[key] != nil) { break; }
+            seen[key] = true;
+            let next = Tiff._nextIfd(bytes, ifd, hdr.be, hdr.big, n);
+            if (next < 0) { break; }
+            count += 1;
+            ifd = next;
+        }
+        return count;
+    }
+
+    // Info(bytes, opts?) -> the header fields of one page, without decoding
+    // pixels: { Width, Height, BitsPerSample, SamplesPerPixel, Photometric,
+    // Compression, Predictor, Planar, Tiled, Pages, BigTiff, BigEndian,
+    // Supported } - Supported is false (and LastError says why) when Decode
+    // would refuse the page.
+    fn static Info(bytes, opts?:object) : object|nil {
+        let page = Tiff._pageOpt(opts);
+        if (page < 0) { return nil; }
+        let d = Tiff._parse(bytes, page);
+        if (d == nil) { return nil; }
+        let ok = Tiff._validate(d);
+        if (ok) { _tiffErr = nil; }
+        return {
+            Width: d.w, Height: d.h, BitsPerSample: d.bd, SamplesPerPixel: d.spp,
+            Photometric: d.ph, Compression: d.comp, Predictor: d.pred,
+            Planar: d.planar == 2, Tiled: d.tiled, Pages: Tiff.PageCount(bytes),
+            BigTiff: d.big, BigEndian: d.be, Supported: ok
+        };
+    }
+
+    // Encode(pixels:block, w:int, h:int, opts?:object) -> TIFF bytes or nil.
+    // `pixels` holds w*h 32-bit 0xAARRGGBB words. See the header for opts.
+    fn static Encode(pixels, w, h, opts?:object) : block|nil {
+        return Tiff.EncodePages([{ Width: w, Height: h, Pixels: pixels }], opts);
+    }
+
+    // EncodePages(pages:array, opts?) -> one multi-page TIFF, or nil. Each
+    // page is an object { Width, Height, Pixels } - the shape Decode returns.
+    fn static EncodePages(pages, opts?:object) : block|nil {
+        _tiffErr = nil;
+        if (pages == nil || Type.Of(pages) != Type.Array || len(pages) == 0) {
+            return Tiff._fail("no pages to encode");
+        }
+
+        var comp = COMPRESSION_LZW;
+        var pred = true;
+        if (opts != nil) {
+            if (opts.compression != nil) { comp = opts.compression; }
+            if (opts.predictor != nil) { pred = opts.predictor == true; }
+        }
+        if (comp != COMPRESSION_NONE && comp != COMPRESSION_LZW &&
+            comp != COMPRESSION_DEFLATE && comp != COMPRESSION_PACKBITS) {
+            return Tiff._fail("cannot encode with compression " + str(comp));
+        }
+        let usePred = pred && (comp == COMPRESSION_LZW || comp == COMPRESSION_DEFLATE);
+
+        let enc = [];
+        var i = 0;
+        while (i < len(pages)) {
+            let e = Tiff._encodePage(pages[i], i, comp, usePred);
+            if (e == nil) { return nil; }
+            Array.Append(enc, e);
+            i += 1;
+        }
+        return Tiff._assemble(enc, comp, usePred);
+    }
+
+    // Save(path, pixels, w, h, opts?) -> bool
+    fn static Save(path:string, pixels, w, h, opts?:object) : bool {
+        let bytes = Tiff.Encode(pixels, w, h, opts);
+        if (bytes == nil) { return false; }
+        if (!File.WriteAllBytes(path, bytes)) {
+            _tiffErr = "cannot write " + path;
+            return false;
+        }
+        return true;
+    }
+
+    // SavePages(path, pages, opts?) -> bool
+    fn static SavePages(path:string, pages, opts?:object) : bool {
+        let bytes = Tiff.EncodePages(pages, opts);
+        if (bytes == nil) { return false; }
+        if (!File.WriteAllBytes(path, bytes)) {
+            _tiffErr = "cannot write " + path;
+            return false;
+        }
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Structure: header and IFDs
+    // ----------------------------------------------------------------
+
+    fn static _fail(msg:string) {
+        _tiffErr = msg;
+        return nil;
+    }
+
+    fn static _pageOpt(opts) : int {
+        if (opts == nil || opts.page == nil) { return 0; }
+        if (Type.Of(opts.page) != Type.Int || opts.page < 0) {
+            _tiffErr = "page must be a non-negative int";
+            return -1;
+        }
+        return opts.page;
+    }
+
+    // { be, big, ifd } for a TIFF/BigTIFF header, else nil.
+    fn static _header(bytes) : object|nil {
+        if (!Tiff.IsTiff(bytes)) { return nil; }
+        let be = (u8)bytes[0] == 0x4D;
+        let magic = Buffer.ReadU16At(bytes, 2, be);
+        if (magic == 42) {
+            return { be: be, big: false, ifd: Buffer.ReadU32At(bytes, 4, be) };
+        }
+        // BigTIFF: offset size 8, a reserved 0, then an 8-byte IFD offset.
+        if (len(bytes) < 16 || Buffer.ReadU16At(bytes, 4, be) != 8 ||
+            Buffer.ReadU16At(bytes, 6, be) != 0) { return nil; }
+        return { be: be, big: true, ifd: Buffer.ReadU64At(bytes, 8, be) };
+    }
+
+    // Offset of the IFD after the one at `off` (0 = none), or -1 if the IFD
+    // runs past the end of the file.
+    fn static _nextIfd(bytes:block, off:int, be:bool, big:bool, n:int) : int {
+        if (big) {
+            if (off + 8 > n) { return -1; }
+            let cnt = Buffer.ReadU64At(bytes, off, be);
+            if (cnt < 0 || cnt > n) { return -1; }
+            let at = off + 8 + cnt * 20;
+            if (at + 8 > n) { return -1; }
+            return Buffer.ReadU64At(bytes, at, be);
+        }
+        if (off + 2 > n) { return -1; }
+        let at = off + 2 + Buffer.ReadU16At(bytes, off, be) * 12;
+        if (at + 4 > n) { return -1; }
+        return Buffer.ReadU32At(bytes, at, be);
+    }
+
+    // The integer values of the IFD entry at `e`, or nil for a type that does
+    // not hold integers (rationals, floats) or values outside the file.
+    fn static _vals(bytes:block, e:int, be:bool, big:bool, n:int) {
+        let typ = Buffer.ReadU16At(bytes, e + 2, be);
+        var sz = 0;
+        if (typ == 1 || typ == 2 || typ == 6 || typ == 7) { sz = 1; }
+        else if (typ == 3 || typ == 8) { sz = 2; }
+        else if (typ == 4 || typ == 9 || typ == 13) { sz = 4; }
+        else if (typ == 16 || typ == 17 || typ == 18) { sz = 8; }
+        else { return nil; }
+
+        var cnt = 0;
+        var at = 0;
+        if (big) {
+            cnt = Buffer.ReadU64At(bytes, e + 4, be);
+            if (cnt <= 0 || cnt > n) { return nil; }
+            at = e + 12;
+            if (cnt * sz > 8) { at = Buffer.ReadU64At(bytes, e + 12, be); }
+        } else {
+            cnt = Buffer.ReadU32At(bytes, e + 4, be);
+            if (cnt <= 0 || cnt > n) { return nil; }
+            at = e + 8;
+            if (cnt * sz > 4) { at = Buffer.ReadU32At(bytes, e + 8, be); }
+        }
+        if (at < 0 || at + cnt * sz > n) { return nil; }
+
+        let out:[int] = Array.Create(cnt, Type.Int);
+        var i = 0;
+        if (sz == 1) {
+            while (i < cnt) { out[i] = (u8)bytes[at + i]; i += 1; }
+        } else if (sz == 2) {
+            while (i < cnt) { out[i] = Buffer.ReadU16At(bytes, at + i * 2, be); i += 1; }
+        } else if (sz == 4) {
+            while (i < cnt) { out[i] = Buffer.ReadU32At(bytes, at + i * 4, be); i += 1; }
+        } else {
+            while (i < cnt) { out[i] = Buffer.ReadU64At(bytes, at + i * 8, be); i += 1; }
+        }
+        return out;
+    }
+
+    // Read the tags of page `page` into a descriptor. Validation is separate
+    // (_validate), so Info can report on pages Decode would refuse.
+    fn static _parse(bytes, page:int) : object|nil {
+        _tiffErr = nil;
+        let hdr = Tiff._header(bytes);
+        if (hdr == nil) { return Tiff._fail("not a TIFF file"); }
+        let n = len(bytes);
+        let be = hdr.be;
+        let big = hdr.big;
+
+        let seen = {};
+        var ifd = hdr.ifd;
+        var p = 0;
+        while (true) {
+            if (ifd <= 0 || ifd >= n) {
+                if (p == 0) { return Tiff._fail("first IFD is outside the file"); }
+                return Tiff._fail("no page " + str(page) + " (the file has " + str(p) + ")");
+            }
+            let key = str(ifd);
+            if (seen[key] != nil) { return Tiff._fail("IFD chain loops back on itself"); }
+            seen[key] = true;
+            if (p == page) { break; }
+            ifd = Tiff._nextIfd(bytes, ifd, be, big, n);
+            p += 1;
+        }
+
+        var cnt = 0;
+        var first = 0;
+        var esz = 12;
+        if (big) {
+            if (ifd + 8 > n) { return Tiff._fail("IFD is truncated"); }
+            cnt = Buffer.ReadU64At(bytes, ifd, be);
+            first = ifd + 8;
+            esz = 20;
+        } else {
+            if (ifd + 2 > n) { return Tiff._fail("IFD is truncated"); }
+            cnt = Buffer.ReadU16At(bytes, ifd, be);
+            first = ifd + 2;
+        }
+        if (cnt <= 0 || cnt > n || first + cnt * esz > n) { return Tiff._fail("IFD is truncated"); }
+
+        let d = {
+            be: be, big: big, w: 0, h: 0, bps: nil, bd: 0, spp: 1, comp: 1,
+            ph: -1, rps: 0, offs: nil, cnts: nil, planar: 1, pred: 1, cmap: nil,
+            tiled: false, tw: 0, tl: 0, toffs: nil, tcnts: nil, extra: nil,
+            sfmt: nil, ink: 1, fill: 1, aIdx: -1, assoc: false
+        };
+
+        var i = 0;
+        while (i < cnt) {
+            let e = first + i * esz;
+            let tag = Buffer.ReadU16At(bytes, e, be);
+            if (tag == 256 || tag == 257 || tag == 258 || tag == 259 || tag == 262 ||
+                tag == 266 || tag == 273 || tag == 277 || tag == 278 || tag == 279 || tag == 284 ||
+                tag == 317 || tag == 320 || tag == 322 || tag == 323 || tag == 324 ||
+                tag == 325 || tag == 332 || tag == 338 || tag == 339) {
+                let v = Tiff._vals(bytes, e, be, big, n);
+                if (v != nil) {
+                    if (tag == 256)      { d.w = v[0]; }
+                    else if (tag == 257) { d.h = v[0]; }
+                    else if (tag == 258) { d.bps = v; }
+                    else if (tag == 259) { d.comp = v[0]; }
+                    else if (tag == 262) { d.ph = v[0]; }
+                    else if (tag == 266) { d.fill = v[0]; }
+                    else if (tag == 273) { d.offs = v; }
+                    else if (tag == 277) { d.spp = v[0]; }
+                    else if (tag == 278) { d.rps = v[0]; }
+                    else if (tag == 279) { d.cnts = v; }
+                    else if (tag == 284) { d.planar = v[0]; }
+                    else if (tag == 317) { d.pred = v[0]; }
+                    else if (tag == 320) { d.cmap = v; }
+                    else if (tag == 322) { d.tw = v[0]; }
+                    else if (tag == 323) { d.tl = v[0]; }
+                    else if (tag == 324) { d.toffs = v; }
+                    else if (tag == 325) { d.tcnts = v; }
+                    else if (tag == 332) { d.ink = v[0]; }
+                    else if (tag == 338) { d.extra = v; }
+                    else if (tag == 339) { d.sfmt = v; }
+                }
+            }
+            i += 1;
+        }
+
+        if (d.bps != nil) { d.bd = d.bps[0]; } else { d.bd = 1; }
+        // PhotometricInterpretation is required, but writers omit it; guess
+        // as libtiff does.
+        if (d.ph < 0) { d.ph = d.spp >= 3 ? 2 : 1; }
+        if (d.tw > 0 && d.tl > 0 && d.toffs != nil) {
+            d.tiled = true;
+            d.offs = d.toffs;
+            d.cnts = d.tcnts;
+        }
+        return d;
+    }
+
+    // Can this page be decoded? Sets LastError and returns false if not.
+    fn static _validate(d:object) : bool {
+        let w = d.w;
+        let h = d.h;
+        if (w <= 0 || h <= 0) { Tiff._fail("image has no width or height"); return false; }
+        if (w > MAX_DIM || h > MAX_DIM) {
+            Tiff._fail("image is " + str(w) + "x" + str(h) + "; the limit is " + str(MAX_DIM) + " per side");
+            return false;
+        }
+
+        let c = d.comp;
+        if (c != 1 && c != 5 && c != 8 && c != 32946 && c != 32773) {
+            var name = "";
+            if (c == 2 || c == 3 || c == 4 || c == 32771) { name = " (CCITT fax)"; }
+            else if (c == 6 || c == 7) { name = " (JPEG)"; }
+            else if (c == 34661) { name = " (JBIG)"; }
+            else if (c == 34712) { name = " (JPEG 2000)"; }
+            else if (c == 34925) { name = " (LZMA)"; }
+            else if (c == 50000) { name = " (ZSTD)"; }
+            else if (c == 50001) { name = " (WebP)"; }
+            Tiff._fail("unsupported compression " + str(c) + name);
+            return false;
+        }
+
+        let spp = d.spp;
+        let bd = d.bd;
+        if (spp < 1 || spp > 16) { Tiff._fail("bad SamplesPerPixel " + str(spp)); return false; }
+        if (d.bps != nil) {
+            var k = 1;
+            while (k < len(d.bps)) {
+                if (d.bps[k] != bd) { Tiff._fail("mixed bit depths per sample are not supported"); return false; }
+                k += 1;
+            }
+        }
+        if (d.sfmt != nil) {
+            var k = 0;
+            while (k < len(d.sfmt)) {
+                let f = d.sfmt[k];
+                if (f != 1 && f != 4) {
+                    var kind = "signed";
+                    if (f == 3) { kind = "floating-point"; }
+                    Tiff._fail(kind + " samples are not supported");
+                    return false;
+                }
+                k += 1;
+            }
+        }
+
+        let ph = d.ph;
+        var colour = 0;
+        var okBd = false;
+        if (ph == 0 || ph == 1) {
+            colour = 1;
+            okBd = bd == 1 || bd == 2 || bd == 4 || bd == 8 || bd == 16;
+        } else if (ph == 2) {
+            colour = 3;
+            okBd = bd == 8 || bd == 16;
+        } else if (ph == 3) {
+            colour = 1;
+            okBd = bd == 1 || bd == 2 || bd == 4 || bd == 8;
+        } else if (ph == 5) {
+            if (d.ink != 1) { Tiff._fail("separated image is not CMYK (InkSet " + str(d.ink) + ")"); return false; }
+            colour = 4;
+            okBd = bd == 8 || bd == 16;
+        } else {
+            var name = "";
+            if (ph == 4) { name = " (transparency mask)"; }
+            else if (ph == 6) { name = " (YCbCr)"; }
+            else if (ph == 8 || ph == 9 || ph == 10) { name = " (CIELab)"; }
+            else if (ph == 32844 || ph == 32845) { name = " (LogLuv)"; }
+            Tiff._fail("unsupported photometric interpretation " + str(ph) + name);
+            return false;
+        }
+        if (spp < colour) { Tiff._fail("too few samples per pixel for the photometric interpretation"); return false; }
+        if (!okBd) { Tiff._fail(str(bd) + "-bit samples are not supported for photometric " + str(ph)); return false; }
+
+        if (spp > colour && d.extra != nil && (d.extra[0] == 1 || d.extra[0] == 2)) {
+            d.aIdx = colour;
+            d.assoc = d.extra[0] == 1;
+        }
+
+        if (d.planar != 1 && d.planar != 2) { Tiff._fail("bad PlanarConfiguration " + str(d.planar)); return false; }
+        if (d.pred != 1 && d.pred != 2) {
+            if (d.pred == 3) { Tiff._fail("the floating-point predictor is not supported"); }
+            else { Tiff._fail("bad Predictor " + str(d.pred)); }
+            return false;
+        }
+        if (d.pred == 2 && bd != 8 && bd != 16) {
+            Tiff._fail("horizontal predictor needs 8- or 16-bit samples");
+            return false;
+        }
+
+        if (ph == 3) {
+            if (d.cmap == nil || len(d.cmap) < 3 * (1 << bd)) { Tiff._fail("palette image without a full ColorMap"); return false; }
+        }
+        if (d.offs == nil) { Tiff._fail("no image data (StripOffsets missing)"); return false; }
+        if (d.cnts == nil && d.comp != 1) { Tiff._fail("StripByteCounts missing"); return false; }
+
+        var planes = 1;
+        var pspp = spp;
+        if (d.planar == 2) { planes = spp; pspp = 1; }
+        let rowBytes = (w * pspp * bd + 7) / 8;
+        if (rowBytes * h * planes > MAX_RAW) { Tiff._fail("image data is too large to decode"); return false; }
+        if (d.tiled && ((d.tw * pspp * bd) & 7) != 0) {
+            Tiff._fail("tile width is not a whole number of bytes");
+            return false;
+        }
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Decode: strips and tiles to raw sample data
+    // ----------------------------------------------------------------
+
+    // Decompress every strip or tile of the page into one block of sample
+    // rows: chunky rows, or for planar images one plane after another.
+    fn static _readData(bytes:block, d:object) : block|nil {
+        let w = d.w;
+        let h = d.h;
+        let bd = d.bd;
+        var planes = 1;
+        var pspp = d.spp;
+        if (d.planar == 2) { planes = d.spp; pspp = 1; }
+        let rowBytes = (w * pspp * bd + 7) / 8;
+        let planeBytes = rowBytes * h;
+
+        let raw = Buffer.Create(planeBytes * planes, 1);
+        if (raw == nil) { return Tiff._fail("out of memory"); }
+        var tab:block = nil;
+        if (d.comp == 5) { tab = _tiffLzwTable(); }
+        let be = d.be ? 1 : 0;
+        let offs = d.offs;
+        let cnts = d.cnts;
+
+        if (!d.tiled) {
+            var rps = d.rps;
+            if (rps <= 0 || rps > h) { rps = h; }
+            let per = (h + rps - 1) / rps;
+            let need = per * planes;
+            if (len(offs) < need || (cnts != nil && len(cnts) < need)) {
+                return Tiff._fail("strip table has fewer entries than the image needs");
+            }
+            var pl = 0;
+            while (pl < planes) {
+                var s = 0;
+                while (s < per) {
+                    let idx = pl * per + s;
+                    let y0 = s * rps;
+                    var rows = rps;
+                    if (y0 + rows > h) { rows = h - y0; }
+                    let dLen = rows * rowBytes;
+                    var cnt = dLen;
+                    if (cnts != nil) { cnt = cnts[idx]; }
+                    if (!Tiff._unpack(bytes, offs[idx], cnt, raw, pl * planeBytes + y0 * rowBytes, dLen, d, tab)) {
+                        return Tiff._fail("strip " + str(idx) + " is corrupt or truncated");
+                    }
+                    s += 1;
+                }
+                if (d.pred == 2) {
+                    if (bd == 8) { _tiffUnpredict8(raw, pl * planeBytes, h, rowBytes, pspp); }
+                    else { _tiffUnpredict16(raw, pl * planeBytes, h, rowBytes, pspp, be); }
+                }
+                pl += 1;
+            }
+            return raw;
+        }
+
+        let tw = d.tw;
+        let tl = d.tl;
+        let across = (w + tw - 1) / tw;
+        let down = (h + tl - 1) / tl;
+        let tileRow = (tw * pspp * bd) / 8;
+        let tileBytes = tileRow * tl;
+        let need = across * down * planes;
+        if (len(offs) < need || (cnts != nil && len(cnts) < need)) {
+            return Tiff._fail("tile table has fewer entries than the image needs");
+        }
+        if (tileBytes > MAX_RAW) { return Tiff._fail("tiles are too large to decode"); }
+        let tile = Buffer.Create(tileBytes, 1);
+        var pl = 0;
+        while (pl < planes) {
+            var ty = 0;
+            while (ty < down) {
+                var rows = tl;
+                if (ty * tl + rows > h) { rows = h - ty * tl; }
+                var tx = 0;
+                while (tx < across) {
+                    let idx = (pl * down + ty) * across + tx;
+                    var cnt = tileBytes;
+                    if (cnts != nil) { cnt = cnts[idx]; }
+                    if (!Tiff._unpack(bytes, offs[idx], cnt, tile, 0, tileBytes, d, tab)) {
+                        return Tiff._fail("tile " + str(idx) + " is corrupt or truncated");
+                    }
+                    if (d.pred == 2) {
+                        if (bd == 8) { _tiffUnpredict8(tile, 0, tl, tileRow, pspp); }
+                        else { _tiffUnpredict16(tile, 0, tl, tileRow, pspp, be); }
+                    }
+                    let col = tx * tileRow;
+                    var take = tileRow;
+                    if (col + take > rowBytes) { take = rowBytes - col; }
+                    var r = 0;
+                    while (r < rows) {
+                        Buffer.Copy(tile, r * tileRow, raw, pl * planeBytes + (ty * tl + r) * rowBytes + col, take);
+                        r += 1;
+                    }
+                    tx += 1;
+                }
+                ty += 1;
+            }
+            pl += 1;
+        }
+        return raw;
+    }
+
+    // Decompress one strip or tile into dst[dOff, dOff+dLen). False unless
+    // it yields at least dLen bytes. A byte count past the end of the file is
+    // clamped, so a truncated file fails on the length check, not a raise.
+    // FillOrder 2 reverses the bits of the stored bytes, compressed or not,
+    // so they are flipped back (in a copy) before anything reads them.
+    fn static _unpack(bytes:block, off:int, cnt:int, dst:block, dOff:int, dLen:int,
+                      d:object, tab) : bool {
+        let n = len(bytes);
+        if (off < 0 || off >= n || cnt <= 0) { return false; }
+        if (cnt > n - off) { cnt = n - off; }
+        let comp = d.comp;
+        var src = bytes;
+        if (d.fill == 2) {
+            src = Buffer.Slice(bytes, off, cnt);
+            _tiffReverseBits(src, cnt);
+            off = 0;
+        }
+        if (comp == 1) {
+            if (cnt < dLen) { return false; }
+            Buffer.Copy(src, off, dst, dOff, dLen);
+            return true;
+        }
+        if (comp == 5) {
+            return _tiffLzwDecode(src, off, cnt, dst, dOff, dLen, tab) == dLen;
+        }
+        if (comp == 32773) {
+            return _tiffPackBitsDecode(src, off, cnt, dst, dOff, dLen) == dLen;
+        }
+        let z = Inflate.Zlib(Buffer.Slice(src, off, cnt), dLen);
+        if (z == nil || len(z) != dLen) { return false; }
+        Buffer.Copy(z, 0, dst, dOff, dLen);
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Decode: raw samples to ARGB
+    // ----------------------------------------------------------------
+
+    fn static _toArgb(raw:block, d:object) : block|nil {
+        let w = d.w;
+        let h = d.h;
+        let np = w * h;
+        let spp = d.spp;
+        let bd = d.bd;
+        let hi = d.be ? 0 : 1;
+        let scale = d.ph == 3 ? 0 : 1;
+
+        // Normalise to one byte per sample, chunky. 8-bit chunky data already
+        // is that, row padding included (there is none at 8 bits).
+        var s8 = raw;
+        if (d.planar == 2 && spp > 1) {
+            s8 = Buffer.Create(np * spp, 1);
+            let rowBytes = (w * bd + 7) / 8;
+            let P:[int] = [w, h, spp, bd, rowBytes, 0, 0, hi, scale];
+            var pl = 0;
+            while (pl < spp) {
+                P[5] = pl * rowBytes * h;
+                P[6] = pl;
+                _tiffPlane(raw, s8, P);
+                pl += 1;
+            }
+        } else if (bd == 16) {
+            s8 = Buffer.Create(np * spp, 1);
+            _tiffNarrow16(raw, s8, np * spp, hi);
+        } else if (bd < 8) {
+            s8 = Buffer.Create(np * spp, 1);
+            let P:[int] = [w, h, spp, bd, (w * spp * bd + 7) / 8, scale];
+            _tiffUnpackBits(raw, s8, P);
+        }
+        if (s8 == nil) { return Tiff._fail("out of memory"); }
+
+        let out = Buffer.Create(np, 4);
+        if (out == nil) { return Tiff._fail("out of memory"); }
+        let assoc = d.assoc ? 1 : 0;
+        let ph = d.ph;
+        if (ph == 0 || ph == 1) {
+            _tiffGrayToArgb(s8, out, np, spp, d.aIdx, assoc, ph == 0 ? 1 : 0);
+        } else if (ph == 2) {
+            _tiffRgbToArgb(s8, out, np, spp, d.aIdx, assoc);
+        } else if (ph == 3) {
+            _tiffPalToArgb(s8, out, np, spp, Tiff._palette(d.cmap, bd));
+        } else {
+            _tiffCmykToArgb(s8, out, np, spp, d.aIdx);
+        }
+        return out;
+    }
+
+    // 256-entry ARGB lookup from a ColorMap: all reds, then greens, then blues,
+    // 16 bits each. Some writers store 8-bit values instead; libtiff detects
+    // that by no entry exceeding 255, and so does this.
+    fn static _palette(cmap:array, bd:int) : block {
+        let n = 1 << bd;
+        var shift = 0;
+        var i = 0;
+        while (i < 3 * n) {
+            if (cmap[i] > 255) { shift = 8; }
+            i += 1;
+        }
+        let lut:block = Buffer.Create(256, 4);
+        i = 0;
+        while (i < 256) {
+            var idx = i;
+            if (idx >= n) { idx = 0; }
+            let r = (cmap[idx] >> shift) & 255;
+            let g = (cmap[n + idx] >> shift) & 255;
+            let b = (cmap[2 * n + idx] >> shift) & 255;
+            lut[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
+            i += 1;
+        }
+        return lut;
+    }
+
+    // ----------------------------------------------------------------
+    // Encode
+    // ----------------------------------------------------------------
+
+    // Compress one page into strips: { w, h, spp, rps, strips:[block] }.
+    fn static _encodePage(pg, index:int, comp:int, usePred:bool) : object|nil {
+        let tag = "page " + str(index);
+        if (pg == nil || Type.Of(pg) != Type.Object) { return Tiff._fail(tag + " is not an object"); }
+        let px = pg.Pixels;
+        let w = pg.Width;
+        let h = pg.Height;
+        if (Type.Of(w) != Type.Int || Type.Of(h) != Type.Int || w <= 0 || h <= 0) {
+            return Tiff._fail(tag + ": width and height must be positive ints");
+        }
+        if (w > MAX_DIM || h > MAX_DIM) { return Tiff._fail(tag + ": larger than " + str(MAX_DIM) + " per side"); }
+        if (px == nil || Type.Of(px) != Type.Block || len(px) < w * h) {
+            return Tiff._fail(tag + ": Pixels must be a block of at least w*h ARGB words");
+        }
+
+        let np = w * h;
+        var spp = 3;
+        if (_tiffHasAlpha(px, np) != 0) { spp = 4; }
+        let rowBytes = w * spp;
+        let s = Buffer.Create(np * spp, 1);
+        if (s == nil) { return Tiff._fail("out of memory"); }
+        _tiffFromArgb(px, s, np, spp);
+        if (usePred) { _tiffPredict8(s, h, rowBytes, spp); }
+
+        var rps = 65536 / rowBytes;
+        if (rps < 1) { rps = 1; }
+        if (rps > h) { rps = h; }
+        let maxStrip = rps * rowBytes;
+
+        var scratch:block = nil;
+        var keys:block = nil;
+        var vals:block = nil;
+        var cap = 0;
+        if (comp == COMPRESSION_LZW) {
+            cap = maxStrip + maxStrip / 2 + 64;
+            keys = Buffer.Create(8192, 4);
+            vals = Buffer.Create(8192, 2);
+        } else if (comp == COMPRESSION_PACKBITS) {
+            cap = rps * (rowBytes + rowBytes / 128 + 1);
+        }
+        if (cap > 0) { scratch = Buffer.Create(cap, 1); }
+
+        let strips = [];
+        var y0 = 0;
+        while (y0 < h) {
+            var rows = rps;
+            if (y0 + rows > h) { rows = h - y0; }
+            let off = y0 * rowBytes;
+            let sl = rows * rowBytes;
+            var blk:block = nil;
+            if (comp == COMPRESSION_NONE) {
+                blk = Buffer.Slice(s, off, sl);
+            } else if (comp == COMPRESSION_LZW) {
+                let k = _tiffLzwEncode(s, off, sl, scratch, cap, keys, vals);
+                if (k <= 0) { return Tiff._fail("LZW output overflowed"); }
+                blk = Buffer.Slice(scratch, 0, k);
+            } else if (comp == COMPRESSION_PACKBITS) {
+                let k = _tiffPackBitsEncode(s, off, rowBytes, rows, scratch);
+                blk = Buffer.Slice(scratch, 0, k);
+            } else {
+                blk = Deflate.Zlib(Buffer.Slice(s, off, sl), 6);
+            }
+            if (blk == nil) { return Tiff._fail("compression failed"); }
+            Array.Append(strips, blk);
+            y0 += rows;
+        }
+        return { w: w, h: h, spp: spp, rps: rps, strips: strips };
+    }
+
+    // Lay the pages out as header, then per page: IFD, its out-of-line
+    // values, strip data. Everything starts on an even offset.
+    fn static _assemble(enc:array, comp:int, usePred:bool) : block|nil {
+        var at = 8;
+        let ifdAt:[int] = Array.Create(len(enc), Type.Int);
+        let stripAt = [];
+        var i = 0;
+        while (i < len(enc)) {
+            let e = enc[i];
+            let ns = len(e.strips);
+            let nTags = Tiff._tagCount(e.spp, usePred);
+            ifdAt[i] = at;
+            at += 2 + nTags * 12 + 4;
+            at += 2 * e.spp + 16;                    // BitsPerSample, X/YResolution
+            if (ns > 1) { at += 8 * ns; }            // StripOffsets, StripByteCounts
+            let so:[int] = Array.Create(ns, Type.Int);
+            var k = 0;
+            while (k < ns) {
+                at += at & 1;
+                so[k] = at;
+                at += len(e.strips[k]);
+                k += 1;
+            }
+            Array.Append(stripAt, so);
+            at += at & 1;
+            i += 1;
+        }
+        if (at > 4294967295) { return Tiff._fail("file would exceed 4 GiB"); }
+
+        let out = Buffer.Create(at, 1);
+        if (out == nil) { return Tiff._fail("out of memory"); }
+        out[0] = 0x49;
+        out[1] = 0x49;
+        Buffer.WriteU16At(out, 2, 42);
+        Buffer.WriteU32At(out, 4, ifdAt[0]);
+
+        i = 0;
+        while (i < len(enc)) {
+            let e = enc[i];
+            let ns = len(e.strips);
+            let so = stripAt[i];
+            let spp = e.spp;
+            let nTags = Tiff._tagCount(spp, usePred);
+
+            var p = ifdAt[i];
+            let vals = p + 2 + nTags * 12 + 4;
+            let bpsAt = vals;
+            let xresAt = bpsAt + 2 * spp;
+            let yresAt = xresAt + 8;
+            let soAt = yresAt + 8;
+            let sbAt = soAt + 4 * ns;
+
+            Buffer.WriteU16At(out, p, nTags);
+            p += 2;
+            p = Tiff._entry(out, p, 256, 4, 1, e.w);                 // ImageWidth
+            p = Tiff._entry(out, p, 257, 4, 1, e.h);                 // ImageLength
+            p = Tiff._entry(out, p, 258, 3, spp, bpsAt);             // BitsPerSample
+            p = Tiff._entry(out, p, 259, 3, 1, comp);                // Compression
+            p = Tiff._entry(out, p, 262, 3, 1, 2);                   // Photometric: RGB
+            p = Tiff._entry(out, p, 273, 4, ns, ns > 1 ? soAt : so[0]);   // StripOffsets
+            p = Tiff._entry(out, p, 277, 3, 1, spp);                 // SamplesPerPixel
+            p = Tiff._entry(out, p, 278, 4, 1, e.rps);               // RowsPerStrip
+            p = Tiff._entry(out, p, 279, 4, ns, ns > 1 ? sbAt : len(e.strips[0]));  // StripByteCounts
+            p = Tiff._entry(out, p, 282, 5, 1, xresAt);              // XResolution
+            p = Tiff._entry(out, p, 283, 5, 1, yresAt);              // YResolution
+            p = Tiff._entry(out, p, 284, 3, 1, 1);                   // PlanarConfiguration: chunky
+            p = Tiff._entry(out, p, 296, 3, 1, 2);                   // ResolutionUnit: inch
+            if (usePred) { p = Tiff._entry(out, p, 317, 3, 1, 2); }  // Predictor: horizontal
+            if (spp == 4) { p = Tiff._entry(out, p, 338, 3, 1, 2); } // ExtraSamples: unassociated alpha
+            var next = 0;
+            if (i + 1 < len(enc)) { next = ifdAt[i + 1]; }
+            Buffer.WriteU32At(out, p, next);
+
+            var k = 0;
+            while (k < spp) { Buffer.WriteU16At(out, bpsAt + 2 * k, 8); k += 1; }
+            Buffer.WriteU32At(out, xresAt, 72);
+            Buffer.WriteU32At(out, xresAt + 4, 1);
+            Buffer.WriteU32At(out, yresAt, 72);
+            Buffer.WriteU32At(out, yresAt + 4, 1);
+            k = 0;
+            while (k < ns) {
+                let blk = e.strips[k];
+                if (ns > 1) {
+                    Buffer.WriteU32At(out, soAt + 4 * k, so[k]);
+                    Buffer.WriteU32At(out, sbAt + 4 * k, len(blk));
+                }
+                Buffer.Copy(blk, 0, out, so[k], len(blk));
+                k += 1;
+            }
+            i += 1;
+        }
+        return out;
+    }
+
+    // Entries _assemble writes per page: 13 baseline tags, plus Predictor and
+    // ExtraSamples when they apply.
+    fn static _tagCount(spp:int, usePred:bool) : int {
+        var n = 13;
+        if (usePred) { n += 1; }
+        if (spp == 4) { n += 1; }
+        return n;
+    }
+
+    // One 12-byte IFD entry, little-endian. A single SHORT sits in the first
+    // two bytes of the value field; anything else here is a LONG or an offset.
+    fn static _entry(out:block, p:int, tag:int, typ:int, cnt:int, v:int) : int {
+        Buffer.WriteU16At(out, p, tag);
+        Buffer.WriteU16At(out, p + 2, typ);
+        Buffer.WriteU32At(out, p + 4, cnt);
+        if (typ == 3 && cnt == 1) { Buffer.WriteU16At(out, p + 8, v); }
+        else { Buffer.WriteU32At(out, p + 8, v); }
+        return p + 12;
+    }
+}
+
+export { Tiff };

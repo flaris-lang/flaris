@@ -859,17 +859,10 @@ obj.key = val;  // sets a property (statement)
 
 ```js
 let user = nil;
-user.name;    // nil (safe)
-user.items;   // nil (safe)
-```
-
-**Null-conditional access.** `obj?.prop` and `arr?.[i]` yield `nil` instead of
-raising when `obj` or `arr` is `nil`, and the rest of the chain is skipped:
-
-```js
-let city = user?.address.city;        // nil when user is nil
-let first = cfg?.items?.[0] ?? "none"; // "none" when cfg or items is nil
-conn?.Close();                        // no call when conn is nil
+user.name;            // nil (safe)
+user.items[0];        // nil (safe): the whole chain yields nil
+user.Save();          // nil (safe): a call on nil yields nil; its arguments still run
+let city = user.address.city ?? "none"; // "none" when any link is nil
 ```
 
 ## Indexing
@@ -958,7 +951,7 @@ Note:
 | Level | Operators | Associativity |
 | ------- | ----------- |--------------- |
 | 1 | Literals, variables, `()` | - |
-| 2 | `()` call, `[]` index, `.` member, `?.` / `?.[]` null-conditional | Left |
+| 2 | `()` call, `[]` index, `.` member | Left |
 | 3 | `^^` (power) | Right |
 | 4 | `+` `-` `!` `~` `++` `--` `await` `new` `guard` (prefix) | Right |
 | 5 | `*` `/` `%` `&` `\|` `^` `<<` `>>` `>>>` | Left |
@@ -1042,7 +1035,7 @@ for (let i = 0; ; i += 1) {   // no condition - step and break inside the body
 
 ## Foreach
 
-Iterates arrays, objects, strings, and collections. Any other value, `nil` included, raises `Exception.InvalidArguments`.
+Iterates arrays, objects, strings, and collections. A `nil` iterable runs the body zero times, like an empty one; any other value raises `Exception.InvalidArguments`.
 
 ```js
 foreach (item in [1, 2, 3]) {
@@ -1548,7 +1541,7 @@ Type annotations are **completely optional** - all existing code works without t
 
 ### Parameters
 
-A typed parameter is required: leaving it out is a compile error. Append `?` to a parameter name to make it optional. An untyped (or `any`) parameter is always optional. The VM passes `nil` for every omitted trailing argument:
+A typed parameter is required: leaving it out is a compile error. Append `?` to a parameter name to make it optional. An untyped (or `any`) parameter is always optional. The VM passes `nil` for every omitted trailing argument. A `nil` passed to a required `int`, `float`, `char` or `bool` parameter arrives as that type's zero (`0`, `0.0`, `'\0'`, `false`): scalars are not nullable, every other type holds `nil` as a value, and `x: int|nil` receives the `nil` itself:
 
 ```js
 fn add(a: int, b: int) { return a + b; }

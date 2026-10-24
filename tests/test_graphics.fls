@@ -3,10 +3,11 @@
 //
 // All checks are deterministic, headless pixel-readback assertions: draw with
 // the stateful style context, then verify exact 0xAARRGGBB values with
-// GetPixel. The PNG round-trip writes to the system temp dir and deletes the
-// file afterwards.
+// GetPixel. The PNG and TIFF round-trips write to the system temp dir and
+// delete their files afterwards.
 
 import { Graphics } from library("Graphics", "1.0");
+import { Tiff } from library("Tiff", "1.0");
 
 global testsRun    = 0;
 global testsFailed = 0;
@@ -707,6 +708,78 @@ fn test_png_roundtrip() {
 }
 
 // ============================================================
+// TIFF round-trip (Save by extension / FromFile by signature / ToBlock("tiff"))
+// ============================================================
+
+fn test_tiff_roundtrip() {
+    Console.WriteLine("-- tiff round-trip");
+
+    let path = Path.Combine(Os.TempDir(), "_flaris_gfx_test_" + str(Time.Millis()) + ".tif");
+
+    let g = new Graphics(20, 12);
+    g.Clear(BLUE);
+    g.Pixel(3, 4, RED);
+    g.Pixel(19, 11, GREEN);
+    g.Filter(fn(_p) { return 0x80112233; }, 7, 2, 1, 1);
+
+    check(g.Save(path) == true, "Save .tif returns true");
+    let bytes = File.ReadAllBytes(path);
+    check(Tiff.IsTiff(bytes), ".tif path writes TIFF, not PNG");
+
+    let loaded = Graphics.FromFile(path);
+    check(loaded != nil, "FromFile loads the TIFF");
+    if (loaded != nil) {
+        checkEq(loaded.Width(),  20, "TIFF loaded width");
+        checkEq(loaded.Height(), 12, "TIFF loaded height");
+        checkEq(loaded.GetPixel(7, 2), 0x80112233, "TIFF semi-transparent pixel");
+        let bad = 0;
+        iter (y from 0 to 12) {
+            iter (x from 0 to 20) {
+                if (loaded.GetPixel(x, y) != g.GetPixel(x, y)) bad += 1;
+            }
+        }
+        checkEq(bad, 0, "every pixel identical after TIFF reload");
+    }
+
+    // Upper-case extension, and options handed through to the encoder.
+    let upper = path + ".TIFF";
+    check(g.Save(upper, { compression: Tiff.COMPRESSION_DEFLATE }) == true, "Save .TIFF with options");
+    let info = Tiff.Info(File.ReadAllBytes(upper));
+    check(info != nil && info.Compression == Tiff.COMPRESSION_DEFLATE, "Save passes opts to Tiff");
+    let img = Graphics.LoadImage(upper);
+    check(img != nil && img.GetPixel(3, 4) == RED, "LoadImage reads the Deflate TIFF");
+    File.Delete(upper);
+
+    // In memory.
+    let blk = g.ToBlock("tiff");
+    check(blk != nil && Tiff.IsTiff(blk), "ToBlock(\"tiff\") gives TIFF bytes");
+    let dec = Tiff.Decode(blk);
+    check(dec != nil && dec.Width == 20 && dec.Pixels[4 * 20 + 3] == RED, "ToBlock TIFF decodes");
+    let png = g.ToBlock();
+    check(png != nil && (u8)png[0] == 0x89 && (u8)png[1] == 0x50, "ToBlock() is still PNG");
+    check(g.ToBlock("png") != nil && !Tiff.IsTiff(g.ToBlock("png")), "ToBlock(\"png\") is PNG");
+    check(g.ToBlock("bmp") == nil, "ToBlock of an unknown format -> nil");
+
+    // A TIFF named .png is still read as TIFF: files are told apart by content.
+    let misnamed = path + ".png";
+    File.WriteAllBytes(misnamed, blk);
+    let m = Graphics.FromFile(misnamed);
+    check(m != nil && m.GetPixel(19, 11) == GREEN, "FromFile sniffs TIFF content behind a .png name");
+    File.Delete(misnamed);
+
+    // DrawImage composites a TIFF source.
+    let canvas = new Graphics(30, 30);
+    canvas.Clear(BLACK);
+    canvas.DrawImageNearest(path, 5, 5, 20, 12);
+    checkEq(canvas.GetPixel(5, 5), BLUE, "DrawImageNearest from a TIFF file");
+    checkEq(canvas.GetPixel(8, 9), RED,  "DrawImageNearest TIFF marker");
+    checkEq(canvas.GetPixel(4, 4), BLACK, "DrawImageNearest TIFF outside dest untouched");
+
+    check(g.Save(Path.Combine(path + "_nodir", "x.tif")) == nil, "Save .tif to bad path -> nil");
+    File.Delete(path);
+}
+
+// ============================================================
 // DrawImage (file-based blit with scaling)
 // ============================================================
 
@@ -930,6 +1003,7 @@ fn Main() {
     test_filters();
     test_transforms();
     test_png_roundtrip();
+    test_tiff_roundtrip();
     test_draw_image();
     test_filter_offload();
     test_arena();

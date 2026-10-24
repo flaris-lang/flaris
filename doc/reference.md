@@ -630,7 +630,7 @@ These are the actual types values carry at runtime.
 | `char` | Single Unicode codepoint (unsigned 32-bit). |
 | `int` | Signed 64-bit integer. Values within ±2⁶⁰ are tagged immediates (no allocation); larger values are heap-allocated. Full int64 range supported. |
 | `float` | 64-bit IEEE-754 double-precision. |
-| `string` | Immutable UTF-8 byte sequence. |
+| `string` | UTF-8 byte sequence. Every `String` function and operator returns a new string; `s[i] = ch` writes in place (see the **Mutability** row under String). |
 
 #### Composite Types
 
@@ -733,7 +733,7 @@ a method/property access on `5`). Mixed int + float operations always yield
 | Property | Value |
 |----------|-------|
 | **Encoding** | UTF-8 |
-| **Mutability** | Every `String` function and operator returns a new string; only `s[i] = ch` writes in place, and that write is seen through every variable holding the same string (a literal is copied first, never modified). A string used as an object or map key is fixed: the map keeps a copy when something else still holds the string, and a key read back with `Object.Keys` refuses `s[i] = ch` with `Exception.ConstAssign` |
+| **Mutability** | Every `String` function and operator returns a new string; only `s[i] = ch` writes in place, and that write is seen through every variable holding the same string (a literal is copied first, never modified). A string used as an object or map key becomes read-only: from then on `s[i] = ch` on it raises `Exception.ConstAssign`, through any variable that holds it and for a key read back with `Object.Keys` |
 | **Indexing** | Byte-level (`s[i]` returns the byte as a `char`; `s[i] = v` stores one byte: the low byte of an int or char - a bool or float converts as `int()` does - and `0` for any other value) |
 | **Max size** | 256 MB |
 
@@ -874,6 +874,7 @@ Rules:
 - Optional parameters must trail all required ones.
 - Omitted arguments always arrive as `nil` - use `??` to substitute a default inside the function body.
 - Type checking still applies for arguments that *are* provided.
+- A `nil` argument to a *required* parameter typed `int`, `float`, `char` or `bool` arrives as that type's zero: `0`, `0.0`, `'\0'`, `false`. Scalars are not nullable; a parameter of any other type holds `nil` as a value. Declare the parameter `x: int|nil`, or make it optional (`x?: int`), to receive the `nil` itself.
 
 ```js
 fn greet(name?: string) {
@@ -960,9 +961,10 @@ object, instance, ...) or a type that names it (`int|nil`); any array fits an
 array type; anything else must be of the annotated type. A misfit raises
 `TypeMismatch` (22) - `Variable 'n' must be int, got string` or
 `Return value of 'Parse' must be int, got string` - and the variable keeps its
-old value. A value whose type is known is never checked at run time, and a
-variable a cast has retyped is not checked at all. A function that holds such
-a check runs in the interpreter rather than the JIT.
+old value. A value whose type is known needs no run-time check, except that a
+known `int` bound for a `float` slot, or a known `char` for an `int` slot, is
+converted on the way in - a literal by the compiler. A variable a cast has
+retyped is not checked at all. JIT-compiled code makes the same check.
 
 ---
 
@@ -1549,11 +1551,11 @@ Exposed as **static members of the `Exception` class** (`Exception.RuntimeError`
 | `Exception.FieldUndeclared` | `24` | Write to an instance field not declared with `let`/`var` (see *Sealed instance fields*) |
 | `Exception.ModuleDenied` | `25` | A built-in module the embedding host withheld. Distinct from `UnsafeOperation`: no runtime switch enables it and only the host can change it (see the Embedding guide §10) |
 | `Exception.Cancelled` | `26` | `Fiber.Cancel` unwinding the fiber. **Not catchable** - see the note below |
-| `Exception.Interrupted` | `27` | The embedding host stopped the script. **Not catchable** - see the note below |
+| `Exception.Interrupted` | `27` | Reserved for an embedding host stopping a script. Nothing raises it today |
 
 **Design notes:**
 
-- `Cancelled` (26) and `Interrupted` (27) are the two *uncatchable* codes. They run every enclosing `finally` on their way out, so a fiber still closes its files and releases its locks, but no `catch` clause is offered the value and the fiber always ends. The constants exist so an `await`-side handler, which *does* see them, can tell a cancellation from a failure - never so that the fiber being stopped can refuse.
+- `Cancelled` (26) is *uncatchable*, and `Interrupted` (27) is reserved for the same treatment. A cancellation runs every enclosing `finally` on its way out, so a fiber still closes its files and releases its locks, but no `catch` clause is offered the value and the fiber always ends. The constants exist so an `await`-side handler, which *does* see them, can tell a cancellation from a failure - never so that the fiber being stopped can refuse.
 
 - Exceptions 16, 20 indicate corrupted or hostile bytecode - treated as hard failures.
 - `OutOfMemory` (8) and `ExecOutOfMemory` (17) are separate to enable more precise diagnostics.
@@ -1568,7 +1570,7 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | Level | Category | Operators | Associativity |
 |-------|----------|-----------|---------------|
 | 1 | Primary | literals, identifiers, `(...)` | N/A |
-| 2 | Postfix | `obj.prop` `obj?.prop` `arr[i]` `arr?.[i]` `fn(...)` `x++` `x--` | Left |
+| 2 | Postfix | `obj.prop` `arr[i]` `fn(...)` `x++` `x--` | Left |
 | 3 | Power | `^^` | Right |
 | 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` `weak()` | Right |
 | 5 | Multiplicative & Bitwise | `*` `/` `%` `<<` `>>` `>>>` `&` `\|` `^` | Left |
@@ -1583,11 +1585,13 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 
 **Key rules:**
 
-- `?.` and `?.[i]` are the null-conditional forms of `.` and `[i]`: when the
-  object is `nil` the whole postfix chain evaluates to `nil` instead of raising,
-  so `user?.address.city` is `nil` for a `nil` user and `cfg?.items?.[0] ?? 3`
-  falls through to `3`. A call on such a member (`obj?.method()`) is skipped the
-  same way.
+- `.`, `[i]` and a call are nil-safe: a `nil` object yields `nil` through the
+  whole postfix chain, so `user.address.city` is `nil` for a `nil` user and
+  `cfg.items[0] ?? 3` falls through to `3`. A call on `nil` - a method on a
+  `nil` receiver, or a `nil` value called directly - yields `nil` too, with its
+  arguments still evaluated; the direct form prints a warning. A `foreach`
+  over `nil` runs its body zero times. `guard(x)` raises instead where a
+  `nil` is an error.
 - `a[i]`, `s[i]` and `blk[i]` take an `int` index. A negative index counts from
   the end (`a[-1]` is the last element, `a[-len]` the first); an index before
   the start or at/after the end raises `Exception.OutOfBounds`. String indexing
@@ -1668,10 +1672,9 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
   - `array`/`array` and `block`/`block` compare **lexicographically** for
     ordering (first differing element decides; a prefix is "less"), and
     element-by-element for equality. `!=` is the negation of `==`.
-  - `object`/`object` and `exception`/`exception` compare equal when they hold
-    the same keys mapping to equal values (order-independent).
-  - `instance`/`instance` compare **structurally** (same class, field-by-field);
-    `class`/`class` compare by **identity**.
+  - `object`/`object`, `exception`/`exception`, `instance`/`instance` and
+    `class`/`class` compare by **identity**: two separately built objects with
+    the same keys and values are not equal.
   - Mixed numeric kinds compare by value across `int`/`float`/`char`/`bool`
     (`'A' == 65` is `true`; `1 == 1.0` is `true`). Two values of otherwise
     unrelated types are never equal.
@@ -1784,7 +1787,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | Method | Called when | Notes |
 | --- | --- | --- |
 | `Constructor(...)` | `new ClassName(...)` | Optional. Return value is ignored; `new` always returns the instance. |
-| `Destructor()` | Last reference to the instance is released | Optional. `this` is the dying instance. Exceptions are swallowed. Not inherited. **Not run for instances still alive at process exit** - teardown tears down the fiber that would execute it, so release anything that must be cleaned up (or do it explicitly) before returning from `Main`. **Do not let `this` escape** (store it in a global, array, or another object's field): the instance is already being freed, so a captured reference dangles - copy out the field values you need instead. |
+| `Destructor()` | Last reference to the instance is released | Optional. `this` is the dying instance. Exceptions are swallowed. Not inherited. **Not run for instances still alive at process exit** - teardown tears down the fiber that would execute it, so release anything that must be cleaned up (or do it explicitly) before returning from `Main`. **Do not let `this` escape** (store it in a global, array, or another object's field): the instance then stays alive, and its destructor runs again when that reference is released - copy out the field values you need instead. |
 
 ### Float Approximation Thresholds
 
@@ -2239,6 +2242,11 @@ when they are 8 bytes wide. `buf[i] = v` stores the low `size` bytes of `v`, so
 `-1` reads back as `255` from a byte buffer. For signed elements read with
 `ReadI8At` / `ReadI16At` / `ReadI32At`. Unlike the `Read*At` family, an
 out-of-range subscript raises `Exception.OutOfBounds` instead of returning `0`.
+
+A `const` block can be read but not written: `buf[i] = v` and every function that
+writes it (`Write*At`, `Fill`, `Fill16`/`32`/`64`, `FillRange`, `FillPattern`,
+`CopyStringAt`, `CopyWithin`, `Reverse`, `Swap16`/`32`/`64`, `Append`, `Reserve`,
+`ChangeToString`, and `Copy` into it) raise `Exception.ConstAssign`.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
@@ -3406,7 +3414,7 @@ Unsafe raw memory access. Requires `--unsafe` flag. `ptr` = `int\|string\|block\
 | **Free** | `Free(addr:int) - nil` | Release a region returned by `Alloc`; `Free(0)` does nothing. Any other address - a block's backing store, a `Pin`ned region, an interior pointer - raises `Forbidden/Invalid memory-access` and is left untouched. | ✓ `--unsafe` |
 | **IsLittleEndian** | `IsLittleEndian() - bool` | `true` if host is little-endian. | — |
 | **Pin** | `Pin(addr:int, size:int) - int` | Register an externally-owned region (e.g. an FFI buffer) so the peek/poke guards accept it; returns `addr`. `0` for `addr <= 0`, a `size` that is not below the 2 GiB per-allocation cap, or a span that wraps around. Does not allocate or take ownership; the caller vouches for the memory (a pinned span nothing backs is a wild read). **Must be paired with `Unpin`** — a region left pinned at exit is reported as a leaked block region (and fails under `--mem`). | ✓ `--unsafe` |
-| **Process** | `Process(addr:int, len:int, elemSize:int, fn:function) - bool` | In-place map: for each of `len` elements of `elemSize` (1/2/4/8) bytes at `addr`, calls `fn(value:int, index:int)` and stores the integer it returns back, truncated to the element width. `false` on a bad size or length, an unregistered span, or a builtin `fn` that cannot take two arguments; `nil` if `fn` raised. At most 16 MB per call. | — |
+| **Process** | `Process(addr:int, len:int, elemSize:int, fn:function) - bool` | In-place map: for each of `len` elements of `elemSize` (1/2/4/8) bytes at `addr`, calls `fn(value:int, index:int)` and stores the integer it returns back, truncated to the element width. `false` on a bad size or length or an unregistered span; a `fn` that cannot take `(value, index)` raises `InvalidArguments`, as any call does; `nil` if `fn` raised. At most 16 MB per call. | — |
 | **ProcessCallback** | `ProcessCallback(fn, address:int, start:int, len:int, cb)` | Processes a raw memory range with your worker function `fn(address, start, len)` (which reads/writes it via `Memory.Read*`/`Write*`), then calls `cb(address, result)` when finished. Runs on another CPU core when `fn` is simple enough (only `Memory.Read*`/`Write*` on that address, plain number math, no calls or allocations) — otherwise runs normally, same result. **Don't allocate or free memory while the job is running.** | ✓ `--unsafe` |
 | **ProcessEvent** | `ProcessEvent(fn, address:int, start:int, len:int, eventId:int)` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ `--unsafe` |
 | **Read8** | `Read8(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 1 byte at ptr+offset. | ✓ `--unsafe` |
@@ -4453,7 +4461,7 @@ Virtual machine introspection and control.
 | **GetModuleInfo** | `GetModuleInfo(name:string) - object\|nil` | Return an object describing a built-in module. `Members` array contains `{Name, Signature}` per function; `Constants` array contains `{Name, Type, Value}` per constant. Returns `nil` if the module name is not found. | — |
 | **GetStartTimeMs** | `GetStartTimeMs() - int` | VM start time in milliseconds since epoch. | — |
 | **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the VM halts regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
-| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache), `StringPoolChunks`/`StringPoolBytes` (chunks the string pool currently holds and their size) and `StringPoolFree` (string bodies parked in the pool for reuse). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
+| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc, by every VM in the process together), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache), `StringPoolChunks`/`StringPoolBytes` (chunks the string pool currently holds and their size) and `StringPoolFree` (string bodies parked in the pool for reuse). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
 | **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a non-function handler returns `false`. | — |
 | **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §11. | — |
 | **PatchFunction** | `PatchFunction(original:fn, replacement:fn) - bool` | Replace function at runtime. Requires running unsafe-mode `--unsafe`. The replacement may be a Flaris-function, a builtin-function or a FFI-function. Pass `nil` as replacement to remove the patch. Caveats: call sites the compiler inlined (trivial single-`return` functions) and calls made from inside JIT-compiled functions bypass the patch; self-recursive calls inside the original body also keep calling the original. | — |
@@ -5006,36 +5014,29 @@ Type annotations on locals (`let sum: int = 0`) are enforced by the analyzer and
 
 ---
 
-### Type your function parameters for faster calls
+### Typed parameters and call cost
 
-Flaris supports two styles: quick untyped scripts and fully typed code. The style you choose affects call performance.
+Flaris supports two styles: quick untyped scripts and fully typed code. Typing changes what a call costs and what the compiler can do with the function.
 
-When a function is called, the VM validates each argument's type against the declared parameter type. For untyped parameters the check still runs - it just accepts anything. For performance-critical functions that are called many times, this overhead adds up.
+A call to a function with typed parameters checks every argument against its declared type: one test per argument, on every call, in the interpreter and at the entry to native code. A function without typed parameters skips that loop, so the check itself is not where typing pays off. A `nil` argument to a parameter typed `int`, `float`, `char` or `bool` arrives as the type's zero, so the body never sees a value outside its declaration.
 
 ```js
-// Untyped - runtime validates each argument on every call
+// Untyped - the call checks only the argument count
 fn fib(n) {
     if (n < 2) return n;
     return fib(n - 1) + fib(n - 2);
 }
 
-// Typed - compiler verifies types statically; runtime skips the check entirely
+// Typed - the call checks n; the compiler knows n is an int in the body
 fn fib(n: int): int {
     if (n < 2) return n;
     return fib(n - 1) + fib(n - 2);
 }
 ```
 
-When the compiler can prove at the call site that every argument's type matches the declared parameter type, it emits a call that skips the run-time argument check completely - saving roughly 10 cycles per call.
+Typing pays off in the body: the compiler fuses `int` and `float` arithmetic and comparisons, calls array methods on a `[int]` directly, and the JIT compiles only functions whose parameters are all typed (see [JIT eligibility](#jit-eligibility)). The gain is proportional to how hot the body is; a function called once gains nothing measurable.
 
-| Style | Validation |
-| --- | --- |
-| Untyped params | At runtime, every call |
-| Typed params + typed arguments | Skipped - done at compile time |
-
-The gain is proportional to call frequency. A function called 100 million times saves ~300 ms on M-series hardware when typed. A function called once saves nothing measurable.
-
-**Guideline:** write untyped for glue code, one-off scripts, and prototypes. Add type annotations to any function that sits on a hot call path.
+**Guideline:** write untyped for glue code, one-off scripts, and prototypes. Add type annotations to any function that sits on a hot path.
 
 ---
 
@@ -5214,7 +5215,7 @@ What runs natively inside a JIT function:
 | Calls to stdlib builtins marked in the `JIT` column of R8 | See the column legend below |
 | `x == nil` / `x != nil` | A parameter not declared `T\|nil` folds to a constant - a native call always has all arguments present and typed; any other string, block, instance, array or object value is compared with nil directly |
 | `a ?? b` | Tests for `nil` only - `false` and `0` are values. When `a` cannot be nil in native code - an optional parameter (a native call has every argument present), a parameter not declared `T\|nil`, a scalar - it is the result and `b` is not evaluated. A `T\|nil` value picks between two values of the same kind read in place: variables, fields, literals, `nil`, or another `??`. A right side that allocates (a call, a concatenation) keeps the function interpreted |
-| `T\|nil` parameters, returns and locals (`string\|nil`, `block\|nil`, `instance\|nil`) | A nullable value may be compared, stored, returned, concatenated, passed to a builtin or to a `T\|nil` parameter. Indexing and `foreach` need it narrowed first (`if (s == nil) { return 0; }`), because interpreted code yields `nil` or raises there |
+| `T\|nil` parameters, returns and locals (`string\|nil`, `block\|nil`, `instance\|nil`) | A nullable value may be compared, stored, returned, concatenated, passed to a builtin or to a `T\|nil` parameter. Indexing and `foreach` need it narrowed first (`if (s == nil) { return 0; }`), because interpreted code yields `nil` there, or runs the loop zero times |
 | `nil` literals | Stored into an object-typed local or field, returned from an object-returning function, compared, or passed to a builtin or a `T\|nil` parameter |
 | String literals | Read-only uses share the literal: comparisons, concatenation, arguments to a builtin that neither keeps nor returns them, and a local that is only read. A literal passed to a script function, stored in a field, returned, or given to a builtin that may keep or return it is a fresh copy, as in interpreted code. A local holding a literal must not be written through (`s[i] = c`), returned, stored or passed to a script function |
 | A builtin with an `any` result, stored into an annotated local (`let n: int = Json.FastSelect(p, j);`) or returned from a typed function | The value gets the same run-time check as in interpreted code - error code 22 with the same message, `int` converted for a `float` target, `nil` refused for a scalar - and the function stops at a mismatch. Targets: `int`, `float`, `bool`, `char`, `string`, `block` |
@@ -5847,7 +5848,7 @@ differ - so copy it from this column rather than deriving it.
 | 2014 | `duplicate-case` | `DUPLICATE_CASE` | Repeated `case` value, or a `case Class:` after a case for the same class or one of its bases - only the first match runs |
 | 2015 | `override-mismatch` | `OVERRIDE_MISMATCH` | An override takes a different number of parameters than the method it replaces |
 | 2016 | `class-shadows-module` | `CLASS_SHADOWS_MODULE` | A non-static method is named after a built-in namespace *and* the class calls that namespace - the call resolves to the method and yields `nil` |
-| 2017 | `nil-argument` | `NIL_ARGUMENT` | A literal `nil` passed to a parameter of a user-declared function whose annotated type does not include nil - the VM passes it through, so this is a warning; declare the parameter `T\|nil` to accept it. Only the literal is reported (a variable holding nil may be a `let x = nil;` awaiting its store), and builtins are nil-safe and never reported |
+| 2017 | `nil-argument` | `NIL_ARGUMENT` | A literal `nil` passed to a required parameter of a user-declared function typed `int`, `float`, `char` or `bool` - the VM passes the type's zero (`0`, `0.0`, `'\0'`, `false`), so this is a warning; declare the parameter `T\|nil` to receive the `nil`. Only the literal is reported (a variable holding nil may be a `let x = nil;` awaiting its store); a parameter of any other type holds `nil` as a value, and builtins are nil-safe, so neither is reported |
 | 2018 | `mismatched-compare` | `MISMATCHED_COMPARE` | `==`, `!=` or an ordering between values that can never be equal: the numeric types (int, float, char, bool) compare with each other by value, `nil` with `nil`, and every other type only with its own kind - so `"5" == 5` is always false and `"5" != 5` always true. Only reported when both operand types are known; a comparison with `nil` is left to the nil rules |
 | 2019 | `self-assign` | `SELF_ASSIGN` | `x = x`, or the same member chain on both sides (`this.a = this.a`); compound stores (`x += x`) are not reported |
 | 2020 | `self-compare` | `SELF_COMPARE` | A name compared with itself (`x == x`, `x < x`) - the result is fixed. A float operand is not reported, because `f != f` is the NaN test |

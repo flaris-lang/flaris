@@ -1,0 +1,143 @@
+// mkraw.fls - sample data for make_fixtures.sh, written to the current
+// directory. The formulas are the ones tests/test_tiff.fls checks against.
+//
+// Raw files feed libtiff's raw2tiff / ppm2tiff. The 2- and 4-bit and palette
+// images are built here as uncompressed TIFFs instead, because libtiff's tools
+// cannot produce those depths; make_fixtures.sh then recompresses them with
+// tiffcp so the stored streams still come from libtiff.
+
+fn R(x:int, _y:int):int { return (x * 7) & 255; }
+fn G(_x:int, y:int):int { return (y * 11) & 255; }
+fn B(x:int, y:int):int { return (x * y + 13) & 255; }
+fn A(x:int, y:int):int { return ((x + y * 3) * 5) & 255; }
+fn Gray(x:int, y:int):int { return (x * 5 + y * 3) & 255; }
+fn Lo(x:int, y:int, s:int):int { return (x * 13 + y * 7 + s * 3) & 255; }
+
+fn entry(b:block, p:int, tag:int, typ:int, cnt:int, v:int):int {
+    Buffer.WriteU16At(b, p, tag);
+    Buffer.WriteU16At(b, p + 2, typ);
+    Buffer.WriteU32At(b, p + 4, cnt);
+    if (typ == 3 && cnt == 1) { Buffer.WriteU16At(b, p + 8, v); } else { Buffer.WriteU32At(b, p + 8, v); }
+    return p + 12;
+}
+
+// One uncompressed strip of bd-bit samples, one per pixel, MSB first.
+// ph = 1 grayscale or 3 palette; for a palette, cmapBits is 16 (the spec) or
+// 8 (the off-spec 8-bit ColorMap some writers produce).
+fn tiff(path:string, bd:int, ph:int, cmapBits:int, sample) {
+    let w = 37; let h = 23;
+    let rowBytes = (w * bd + 7) / 8;
+    let data = rowBytes * h;
+    let n = 1 << bd;
+    let ncm = ph == 3 ? 3 * n : 0;
+    let nTags = ph == 3 ? 10 : 9;
+    let cmAt = 8 + 2 + nTags * 12 + 4;
+    let dataAt = cmAt + ncm * 2;
+    let b = Buffer.Create(dataAt + data, 1);
+    b[0] = 0x49; b[1] = 0x49;
+    Buffer.WriteU16At(b, 2, 42);
+    Buffer.WriteU32At(b, 4, 8);
+    Buffer.WriteU16At(b, 8, nTags);
+    var p = 10;
+    p = entry(b, p, 256, 3, 1, w);
+    p = entry(b, p, 257, 3, 1, h);
+    p = entry(b, p, 258, 3, 1, bd);
+    p = entry(b, p, 259, 3, 1, 1);
+    p = entry(b, p, 262, 3, 1, ph);
+    p = entry(b, p, 273, 4, 1, dataAt);
+    p = entry(b, p, 277, 3, 1, 1);
+    p = entry(b, p, 278, 3, 1, h);
+    p = entry(b, p, 279, 4, 1, data);
+    if (ph == 3) { p = entry(b, p, 320, 3, ncm, cmAt); }
+    Buffer.WriteU32At(b, p, 0);
+    let mul = cmapBits == 16 ? 257 : 1;
+    iter (i from 0 to ncm / 3) {
+        Buffer.WriteU16At(b, cmAt + i * 2, PalR(i, n) * mul);
+        Buffer.WriteU16At(b, cmAt + (n + i) * 2, PalG(i, n) * mul);
+        Buffer.WriteU16At(b, cmAt + (2 * n + i) * 2, PalB(i, n) * mul);
+    }
+    iter (y from 0 to h) {
+        iter (x from 0 to w) {
+            let bit = x * bd;
+            let o = dataAt + y * rowBytes + (bit >> 3);
+            b[o] = b[o] | ((sample(x, y) & (n - 1)) << (8 - bd - (bit & 7)));
+        }
+    }
+    File.WriteAllBytes(path, b);
+    return 0;
+}
+
+// Palette colours for an n-entry ColorMap, as 8-bit values.
+fn PalR(i:int, n:int):int { return i * 255 / (n - 1); }
+fn PalG(i:int, n:int):int { return (n - 1 - i) * 255 / (n - 1); }
+fn PalB(i:int, n:int):int { return ((i * 5) % n) * 255 / (n - 1); }
+
+fn Main(): int {
+    let W = 37; let H = 23;
+    let rgb = Buffer.Create(W * H * 3, 1);
+    let rgba = Buffer.Create(W * H * 4, 1);
+    let premul = Buffer.Create(W * H * 4, 1);
+    let gray = Buffer.Create(W * H, 1);
+    let gray16 = Buffer.Create(W * H * 2, 1);     // little-endian, as raw2tiff reads it
+    let rgb16 = Buffer.Create(W * H * 6, 1);
+    let cmyk = Buffer.Create(W * H * 4, 1);
+    iter (y from 0 to H) {
+        iter (x from 0 to W) {
+            let i = y * W + x;
+            let a = A(x, y);
+            rgb[i * 3] = R(x, y); rgb[i * 3 + 1] = G(x, y); rgb[i * 3 + 2] = B(x, y);
+            rgba[i * 4] = R(x, y); rgba[i * 4 + 1] = G(x, y); rgba[i * 4 + 2] = B(x, y); rgba[i * 4 + 3] = a;
+            premul[i * 4]     = (R(x, y) * a + 127) / 255;
+            premul[i * 4 + 1] = (G(x, y) * a + 127) / 255;
+            premul[i * 4 + 2] = (B(x, y) * a + 127) / 255;
+            premul[i * 4 + 3] = a;
+            gray[i] = Gray(x, y);
+            gray16[i * 2] = Lo(x, y, 0); gray16[i * 2 + 1] = Gray(x, y);
+            rgb16[i * 6] = Lo(x, y, 0);     rgb16[i * 6 + 1] = R(x, y);
+            rgb16[i * 6 + 2] = Lo(x, y, 1); rgb16[i * 6 + 3] = G(x, y);
+            rgb16[i * 6 + 4] = Lo(x, y, 2); rgb16[i * 6 + 5] = B(x, y);
+            cmyk[i * 4] = R(x, y); cmyk[i * 4 + 1] = G(x, y);
+            cmyk[i * 4 + 2] = (x * y) & 255; cmyk[i * 4 + 3] = ((x + y) * 4) & 255;
+        }
+    }
+    File.WriteAllBytes("rgb8.raw", rgb);
+    File.WriteAllBytes("rgba8.raw", rgba);
+    File.WriteAllBytes("rgba8_premul.raw", premul);
+    File.WriteAllBytes("gray8.raw", gray);
+    File.WriteAllBytes("gray16le.raw", gray16);
+    File.WriteAllBytes("rgb16le.raw", rgb16);
+    File.WriteAllBytes("cmyk8.raw", cmyk);
+
+    // PBM (P4): 1 = black, rows padded to a byte.
+    let rb = (W + 7) / 8;
+    let pbm = Buffer.Create(rb * H, 1);
+    iter (y from 0 to H) {
+        iter (x from 0 to W) {
+            if ((((x / 3) + (y / 2)) & 1) == 1) {
+                pbm[y * rb + (x >> 3)] = pbm[y * rb + (x >> 3)] | (128 >> (x & 7));
+            }
+        }
+    }
+    File.WriteAllBytes("bits.pbm", Buffer.Concat(Buffer.FromString("P4\n" + str(W) + " " + str(H) + "\n"), pbm));
+
+    // Busy enough that its LZW stream needs more than 4094 codes, so it
+    // contains 12-bit codes and a table reset.
+    let BW = 64; let BH = 40;
+    let big = Buffer.Create(BW * BH * 3, 1);
+    iter (y from 0 to BH) {
+        iter (x from 0 to BW) {
+            let i = (y * BW + x) * 3;
+            big[i] = (x * y) & 255;
+            big[i + 1] = ((x ^ y) * 3) & 255;
+            big[i + 2] = ((x * x + y * y) >> 3) & 255;
+        }
+    }
+    File.WriteAllBytes("big8.raw", big);
+
+    tiff("gray4.tif", 4, 1, 16, fn(x, y) { return x + y; });
+    tiff("gray2_none.tif", 2, 1, 16, fn(x, y) { return x ^ y; });
+    tiff("pal4.tif", 4, 3, 16, fn(x, y) { return x * 3 + y; });
+    tiff("pal8.tif", 8, 3, 16, fn(x, y) { return x * 3 + y * 5; });
+    tiff("pal8_cmap8_none.tif", 8, 3, 8, fn(x, y) { return x * 3 + y * 5; });
+    return 0;
+}

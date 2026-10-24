@@ -3,8 +3,8 @@
 // Version: 1.0
 //
 // A complete software rasteriser written in Flaris: shapes, text, image
-// compositing and PNG output, with a stateful style context so you set stroke,
-// fill and thickness once instead of passing them to every call.
+// compositing and PNG/TIFF input and output, with a stateful style context so
+// you set stroke, fill and thickness once instead of passing them to every call.
 //
 // Usage:
 //   import { Graphics } from library("Graphics", "1.0");
@@ -20,7 +20,7 @@
 //
 //   let photo = Graphics.FromFile("photo.png");
 //   photo.GrayscaleAll();
-//   photo.Save("gray.png");
+//   photo.Save("gray.tif");           // TIFF by extension, PNG otherwise
 //
 // Colour format: 0xAARRGGBB. Fully opaque is 0xFF______. A fill of 0 means "no
 // fill" - outline only. Anything drawn with an alpha below 255 is composited
@@ -32,6 +32,9 @@
 // Construction:
 //   new Graphics(width, height)      Graphics.Create(width, height)
 //   Graphics.FromFile(path)          Graphics.LoadImage(path)     -> instance|nil
+//
+//   Files are recognised by content, not name: PNG and TIFF (see Png.fls and
+//   Tiff.fls for the variants each decodes). A multi-page TIFF loads page 0.
 //
 // Style:
 //   SetStroke(argb)   SetFill(argb)   SetThickness(n)
@@ -67,7 +70,11 @@
 //   FilterCallback(fn,x,y,w,h,cb)     FilterEvent(fn,x,y,w,h,eventId)
 //
 // Output:
-//   Save(path) -> bool                ToBlock() -> block of PNG bytes
+//   Save(path, opts?) -> bool         ToBlock(format?, opts?) -> block
+//
+//   Save writes TIFF when the path ends in .tif or .tiff, PNG otherwise.
+//   ToBlock gives PNG bytes, or TIFF for format "tiff". `opts` goes to the
+//   encoder: { filter } for Png, { compression, predictor } for Tiff.
 //
 // Notes:
 //   - Both DrawImage and DrawImageNearest currently resample with
@@ -82,6 +89,7 @@
 // =============================================================================
 
 import { Png } from library("Png", "1.0");
+import { Tiff } from library("Tiff", "1.0");
 
 class Raster {
 
@@ -1918,7 +1926,7 @@ class Graphics {
     }
 
     fn static FromFile(file:string) : instance|nil {
-        let img = Png.Load(file);
+        let img = Graphics._decodeFile(file);
         if (img == nil) return nil;
         let gi = new Graphics(img.Width, img.Height);
         if (gi._s == nil) return nil;
@@ -2274,14 +2282,28 @@ class Graphics {
         }
         return gi;
     }
-    // Returns true on success, nil on failure (a missing directory, say) - it
-    // never raises.
-    fn Save(path:string) {
-        if (Png.Save(path, this._pixels(), _width, _height, nil)) { return true; }
+    // TIFF when the path ends in .tif or .tiff, PNG otherwise. Returns true on
+    // success, nil on failure (a missing directory, say) - it never raises.
+    fn Save(path:string, opts?:object) {
+        let lower = path.ToLower();
+        if (String.EndsWith(lower, ".tif") || String.EndsWith(lower, ".tiff")) {
+            if (Tiff.Save(path, this._pixels(), _width, _height, opts)) { return true; }
+            return nil;
+        }
+        if (Png.Save(path, this._pixels(), _width, _height, opts)) { return true; }
         return nil;
     }
-    fn ToBlock() {
-        return Png.Encode(this._pixels(), _width, _height, nil);
+
+    // PNG bytes, or TIFF bytes when format is "tiff" (or "tif"); nil for any
+    // other format.
+    fn ToBlock(format?:string, opts?:object) {
+        if (format == nil || format.ToLower() == "png") {
+            return Png.Encode(this._pixels(), _width, _height, opts);
+        }
+        if (format.ToLower() == "tiff" || format.ToLower() == "tif") {
+            return Tiff.Encode(this._pixels(), _width, _height, opts);
+        }
+        return nil;
     }
     fn Resize(w:int, h:int) {
         let out = _r().Resize(_s, w, h);
@@ -2419,15 +2441,24 @@ class Graphics {
     // Internals
     // ----------------------------------------------------------------
 
-    // This canvas's pixels as a standalone block, for the PNG encoder.
+    // Decode a PNG or TIFF file, told apart by signature:
+    // { Width, Height, Pixels } or nil.
+    fn static _decodeFile(file:string) : object|nil {
+        let bytes = File.ReadAllBytes(file);
+        if (bytes == nil) return nil;
+        if (Tiff.IsTiff(bytes)) return Tiff.Decode(bytes);
+        return Png.Decode(bytes);
+    }
+
+    // This canvas's pixels as a standalone block, for the image encoders.
     fn _pixels() : block {
         _r().Flush();
         return Buffer.Slice(_r().Arena(), _s.off, _width * _height);
     }
 
-    // Load a PNG, scale it to w x h if needed, and composite it at (x, y).
+    // Load a PNG or TIFF, scale it to w x h if needed, and composite it at (x, y).
     fn _drawFile(file:string, x:int, y:int, w:int, h:int) {
-        let img = Png.Load(file);
+        let img = Graphics._decodeFile(file);
         if (img == nil) return;
         let tmp = _newSurface(img.Width, img.Height);
         if (tmp == nil) return;

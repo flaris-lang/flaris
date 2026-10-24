@@ -106,7 +106,7 @@ and call control)
 **Hardware** — `I2c`, `Spi` (chips on Linux I2C and SPI buses, through i2c-tools
 and spi-tools)
 
-**Media** — `Graphics`, `Audio`, `QRCode`, `Png`, `Pdf`
+**Media** — `Graphics`, `Audio`, `QRCode`, `Png`, `Tiff`, `Pdf`
 
 **AI** — `AI` (Ollama client)
 
