@@ -17,7 +17,7 @@
 //   sha256sum plugin.so     (Linux)
 //   shasum -a 256 plugin.dylib  (macOS)
 
-#include "../vm/ffi_object.h"
+#include "../ffi/ffi_object.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

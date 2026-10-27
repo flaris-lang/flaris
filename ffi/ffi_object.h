@@ -1,5 +1,5 @@
-#ifndef FLARIS_VM_FFI_OBJECT_H
-#define FLARIS_VM_FFI_OBJECT_H
+#ifndef FLARIS_FFI_OBJECT_H
+#define FLARIS_FFI_OBJECT_H
 
 #include <stdint.h>
 
@@ -34,11 +34,19 @@
  *     FLARIS_PLUGIN_ABI()
  *
  * It exports flaris_abi_version(), which the runtime checks at Ffi.Load. A
- * plugin reporting a version the runtime does not know is refused; a plugin
- * exporting nothing is currently loaded with a warning, since it cannot be
- * told apart from a shared library that is not a plugin at all.
+ * plugin reporting a version NEWER than the runtime knows is refused - it may
+ * use a struct member the runtime cannot see. An OLDER version is accepted:
+ * revisions only append, so an old plugin's fields all still mean what they
+ * meant. A plugin exporting nothing is loaded with a warning, since it cannot
+ * be told apart from a shared library that is not a plugin at all.
+ *
+ * History
+ *   1  initial
+ *   2  FFIVAL_POINTER (opaque handles). Appended to the enum, and its union
+ *      member fits inside the existing `table` member, so sizeof(FfiObject) is
+ *      unchanged and v1 plugins need no rebuild.
  */
-#define FLARIS_FFI_ABI_VERSION 1u
+#define FLARIS_FFI_ABI_VERSION 2u
 
 #if defined(_WIN32)
 #  define FFI_EXPORT __declspec(dllexport)
@@ -65,6 +73,7 @@ typedef enum
     FFIVAL_BLOCK,
     FFIVAL_FUNC,
     FFIVAL_TABLE,
+    FFIVAL_POINTER,
 } FfiObjectType;
 
 typedef struct FfiObject FfiObject;
@@ -143,6 +152,18 @@ struct FfiObject
             uint32_t ncols;
             uint32_t nrows;
         } table;
+
+        /* Opaque handle: a pointer the PLUGIN owns for as long as it likes and
+         * the VM never dereferences, frees or lets script arithmetic reach -
+         * a sqlite3*, a connection, a decoder context. `tag` is a plugin-chosen
+         * type id carried alongside, so a plugin handed the wrong kind of handle
+         * can reject it instead of casting blind; the VM only copies it. Pick
+         * any nonzero constant per handle type. Compare with FFI_PTR_IS. */
+        struct
+        {
+            void *addr;
+            uint32_t tag;
+        } pointer;
     };
 };
 
@@ -164,6 +185,7 @@ struct FfiKV
 #define IS_BLOCK(v) ((v).type == FFIVAL_BLOCK)
 #define IS_FUNC(v) ((v).type == FFIVAL_FUNC)
 #define IS_TABLE(v) ((v).type == FFIVAL_TABLE)
+#define IS_POINTER(v) ((v).type == FFIVAL_POINTER)
 #define IS_NUMBER(v) (IS_INT(v) || IS_FLOAT(v))
 
 /* ── Value accessors (take FfiObject by value) ─────────────────────────────── */
@@ -192,6 +214,12 @@ struct FfiKV
 #define FFI_TBL_COLS(v) ((v).table.ncols)
 #define FFI_TBL_NAME(v, c) ((v).table.col_names[c])
 #define FFI_TBL_CELL(v, r, c) ((v).table.cells[(uint64_t)(r) * (v).table.ncols + (c)])
+/* Opaque handles. FFI_PTR_IS is the check to make before casting AS_POINTER to
+ * your own type: script cannot forge a pointer, but it can pass one handle
+ * where another was meant. */
+#define AS_POINTER(v) ((v).pointer.addr)
+#define FFI_PTR_TAG(v) ((v).pointer.tag)
+#define FFI_PTR_IS(v, t) (IS_POINTER(v) && (v).pointer.tag == (uint32_t)(t) && (v).pointer.addr)
 
 /* ── Version helper: pack maj.min.patch.build into 0xMMmmppbb ───────────────── */
 #define FLARIS_VERSION(maj, min, pat, bld)        \
@@ -231,6 +259,18 @@ static inline FfiObject ffi_char(int64_t codepoint)
     FfiObject v = {0};
     v.type = FFIVAL_CHAR;
     v.ival = codepoint;
+    return v;
+}
+/* An opaque handle for script to hold and hand back. The VM copies the pointer
+ * and never dereferences or frees it - the plugin owns the lifetime and must
+ * provide a close/free entry point. `tag` identifies the handle type; use a
+ * nonzero constant per type so FFI_PTR_IS can reject a mismatched handle. */
+static inline FfiObject ffi_pointer(void *addr, uint32_t tag)
+{
+    FfiObject v = {0};
+    v.type = FFIVAL_POINTER;
+    v.pointer.addr = addr;
+    v.pointer.tag = tag;
     return v;
 }
 static inline FfiObject ffi_func(FFIFunc f)
@@ -364,4 +404,4 @@ static inline FfiObject *ffi_object_get(const FfiObject *o, const char *key)
             return ffi_nil();            \
     } while (0)
 
-#endif // FLARIS_VM_FFI_OBJECT_H
+#endif // FLARIS_FFI_OBJECT_H
