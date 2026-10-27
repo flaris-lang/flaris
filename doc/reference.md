@@ -40,6 +40,8 @@ The Flaris VM binary is `flarisvm`.
 | `flarisvm --exec <file.flx> [options]` | Execute compiled bytecode |
 | `flarisvm --exec - [options]` | Execute bytecode from **stdin** |
 | `flarisvm --disasm <file.flx>` | Disassemble bytecode (debug view) |
+| `flarisvm --disasm <file.flx> --list` | List the file's functions by the name that selects one: `add`, `Point.len`, a lambda as its parent and the constant index its disassembly shows (`makeAdder/0`). Arity, size and - with `-g` - the first source line |
+| `flarisvm --disasm <file.flx> <function>` | Disassemble only that function; exits 1 when the file has no function by that name. Both forms read the main module, not a bundle's dependencies |
 | `flarisvm --eval '<code>' [options]` | Run code directly from string |
 | `flarisvm --sha256 <file.flx>` | Print the whole-file SHA-256 (identical to `sha256sum`) - the value to pin via `library(file, version, hash)` |
 | `flarisvm --sig-info <file.flx>` | Print the embedded signature status, machine-readable: `unsigned`, or `signed\|<trusted\|valid\|invalid>\|<pubkey-hex>\|<signer>` (see *Package signing*) |
@@ -570,18 +572,20 @@ runtime, a `\0` or `\x00` **in a string literal is a compile error** - put
 binary data in a `Buffer`. String literals are capped at 64 KB of content.
 
 **Interpolated strings.** `$"..."` compiles to a `String.Format` call: each
-hole `{expr}`, `{expr,alignment}`, `{expr:spec}` or `{expr,alignment:spec}`
-becomes a positional placeholder with the same alignment and spec (the spec
-grammar is `String.Format`'s: `X4`, `D3`, `F2`, `,-10`, ...). `{{` and `}}` are
+hole `{expr}` becomes a positional placeholder. `{{` and `}}` are
 literal braces. A hole may hold any expression - calls, indexing, nested
-`"..."`, `'c'` and `$"..."` literals, even newlines - but it ends at the first
-top-level `,` or `:`, so parenthesize a ternary: `{(a ? b : c)}`. At most 15
+`"..."`, `'c'` and `$"..."` literals, ternaries, even newlines - but it is one
+expression, so a comma at its top level is an error; commas inside parentheses,
+as in `{f(a, b)}`, are fine. At most 15
 holes per literal (one call argument each). A literal with no holes is an
-ordinary string. `$"""..."""` is not supported.
+ordinary string. For alignment and format specs, call `String.Format` directly.
+`$"""..."""` is not supported.
 
 ```js
 let n = 255; let f = 3.14159;
-$"n={n} hex={n:X4} f={f:F2} [{n,6}] {{literal}}"   // "n=255 hex=00FF f=3.14 [   255] {literal}"
+$"n={n} hex={n:X4}..."          // not valid: no spec in a hole
+$"{n} {f} {{literal}}"         // "255 3.14159 {literal}"
+String.Format("{0:X4}", n)     // "00FF" - specs live in String.Format
 ```
 
 **Char literals.** `'...'` holds exactly one Unicode code point: a raw UTF-8
@@ -593,11 +597,11 @@ compile errors.
 
 **Keywords.** `fn` `async` `static` `inline` `let` `var` `const` `global`
 `if` `else` `for` `foreach` `iter` `from` `to` `while` `do` `switch` `case`
-`default` `break` `continue` `return` `yield` `await` `guard` `weak` `nil` `true`
+`default` `break` `continue` `return` `yield` `await` `guard` `nil` `true`
 `false` `class` `this` `super` `new` `enum` `import` `export` `library` `as`
-`try` `catch` `finally` `throw` `breakpoint`. The words `and` `or` `in` `is`
+`try` `catch` `finally` `throw` `breakpoint`. The words `in` `is`
 are operators. (`var` is an alias for `let`.) Every keyword, plus the operator
-words `and` `or` `in` `is`, can be used as a property name after `.` and as
+words `in` `is`, can be used as a property name after `.` and as
 an object-literal key (`o.default`, `o.class = 1`, `{ class: 1, default: 2,
 in: 3 }`). A smaller set of *contextual keywords* - `as` `default` `do`
 `from` `global` `inline` `iter` `library` `static` `to` - can also name a
@@ -1468,11 +1472,11 @@ guard(expr)   // Raises Exception.GuardCheck if expr evaluates to nil
 ### Weak handle
 
 ```js
-this.parent = weak(expr);   // a handle on expr that does not keep it alive
+this.parent = Weak.Create(expr);   // a handle on expr that does not keep it alive
 ```
 
-`weak(expr)` is `Weak.Create(expr)` in expression form: the same prefix
-position and precedence as `guard`. Read the value back with `Weak.Get`, which
+`Weak.Create(expr)` returns a handle that does not keep its target alive. Read
+the value back with `Weak.Get`, which
 yields `nil` once the target is gone - see the `Weak` module.
 
 ---
@@ -1572,13 +1576,13 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 | 1 | Primary | literals, identifiers, `(...)` | N/A |
 | 2 | Postfix | `obj.prop` `arr[i]` `fn(...)` `x++` `x--` | Left |
 | 3 | Power | `^^` | Right |
-| 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` `weak()` | Right |
+| 4 | Prefix Unary | `+x` `-x` `!x` `~x` `++x` `--x` `await` `new` `guard()` | Right |
 | 5 | Multiplicative & Bitwise | `*` `/` `%` `<<` `>>` `>>>` `&` `\|` `^` | Left |
 | 6 | Additive | `+` `-` | Left |
 | 7 | Comparison | `<` `<=` `>` `>=` | Left |
 | 8 | Equality | `==` `!=` `≈` `in` `is` | Left |
-| 9 | Logical AND | `&&` `and` | Left |
-| 10 | Logical OR | `\|\|` `or` | Left |
+| 9 | Logical AND | `&&` | Left |
+| 10 | Logical OR | `\|\|` | Left |
 | 11 | Null Coalescing | `??` | Left |
 | 12 | Conditional | `? :` | Right |
 | 13 | Assignment | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` `>>>=` `??=` `^^=` | Right |
@@ -1641,7 +1645,7 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
   elements, object properties and interpolated string parts. `[f(), g()]`
   calls `f` before `g`; `k in c` evaluates `k` first. Only `&&`, `||`, `??`
   and `?:` skip an operand, as described below.
-- `&&` binds tighter than `||` - `a || b && c` means `a || (b && c)`. `and`/`or` are tokenizer aliases with identical precedence.
+- `&&` binds tighter than `||` - `a || b && c` means `a || (b && c)`.
 - `&&` / `||` short-circuit and always yield a **bool**: `a && b` is `false` when `a` is falsy (and `b` is not evaluated), otherwise the truthiness of `b`; `a || b` is `true` when `a` is truthy (and `b` is not evaluated), otherwise the truthiness of `b`. (`nil` and `0` are falsy.) For a fallback value use `??`, which yields an operand: `port ?? 8080`.
 - Shifts operate on `int64` and mask the shift count to `& 63`, so a count `>= 64` wraps into range. `<<` is a logical left shift; `>>` is an **arithmetic** right shift (the sign bit is replicated), so `-8 >> 1` = -4. `>>>` is a **logical** right shift of the same 64 bits (zero bits shift in), so `-8 >>> 1` = 9223372036854775804 and `-1 >>> 60` = 15; unlike JavaScript there is no 32-bit truncation.
 - `??` (null coalescing) is lower than all arithmetic - `x + y ?? z` means `(x + y) ?? z`.
@@ -1766,7 +1770,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 |-------|-------|-------------|
 | Single block allocation | 2 GiB | Maximum size of a single block allocation |
 | Total block allocations | 64 GiB | Total cap across all active block allocations |
-| `Memory.Process()` input | 16 MB | Max bytes per call |
+| `Memory.Process()` input | 1 GiB | Max span per call: 128 Mi elements at up to 8 bytes each |
 
 ### Collections
 
@@ -2804,7 +2808,7 @@ Runtime introspection and assertion tools. Available in all builds; overhead is 
 | ---------- | ----------- | ------------- | --- |
 | **Assert** | `Assert(left:any, right:any, ?message:any) - bool` | Verify `left == right`. On mismatch prints both values (plus optional `message`) and a stack trace, then **ends the program** - not a catchable raise. Inside a host application it raises instead, so the host keeps running. Returns `true` when it holds. | — |
 | **AssertTrue** | `AssertTrue(condition:any, ?message:any) - bool` | Verify `condition` is truthy. On failure prints it (plus optional `message`) and a stack trace, then **ends the program**. Inside a host application it raises instead, so the host keeps running. Returns `true` when it holds. | — |
-| **GuardAddress** | `GuardAddress(addr:int)` | Installs an allocator watchpoint that traps when `addr` is touched. Requires `--unsafe`. | — |
+| **GuardAddress** | `GuardAddress(addr:int)` | Installs an allocator watchpoint that traps when `addr` is touched. Requires `--unsafe`. An editor arms the same watch with a data breakpoint at an address (see *Editor Debugging*). | — |
 | **Here** | `Here(?label:string)` | Prints the current file, line, and function name to stdout (with an optional `label`). | — |
 | **Pool** | `Pool()` | Prints allocator statistics and a per-slab dump. Requires `--unsafe` (the dump shows heap addresses). | — |
 | **Refs** | `Refs(value:any) - int` | Returns `value`'s external reference count (`-1` for tagged immediates, which have none). | — |
@@ -3379,13 +3383,14 @@ pair forms no reference cycle - see *Reference cycles are never collected*.
   resolves until then.
 - A handle on a static value (a class, a module) always resolves.
 
-`weak(v)` is the keyword form of `Create`.
+`Weak.Create(v)` is the one way to make a handle; the former `weak(v)` keyword
+is gone.
 
 ```flaris
 class Node {
     let child = nil;    // owned
     let parent = nil;   // observed
-    fn Adopt(c) { this.child = c; c.parent = weak(this); }
+    fn Adopt(c) { this.child = c; c.parent = Weak.Create(this); }
     fn Up() { return Weak.Get(this.parent); }   // nil once the parent is gone
 }
 ```
@@ -3414,7 +3419,7 @@ Unsafe raw memory access. Requires `--unsafe` flag. `ptr` = `int\|string\|block\
 | **Free** | `Free(addr:int) - nil` | Release a region returned by `Alloc`; `Free(0)` does nothing. Any other address - a block's backing store, a `Pin`ned region, an interior pointer - raises `Forbidden/Invalid memory-access` and is left untouched. | ✓ `--unsafe` |
 | **IsLittleEndian** | `IsLittleEndian() - bool` | `true` if host is little-endian. | — |
 | **Pin** | `Pin(addr:int, size:int) - int` | Register an externally-owned region (e.g. an FFI buffer) so the peek/poke guards accept it; returns `addr`. `0` for `addr <= 0`, a `size` that is not below the 2 GiB per-allocation cap, or a span that wraps around. Does not allocate or take ownership; the caller vouches for the memory (a pinned span nothing backs is a wild read). **Must be paired with `Unpin`** — a region left pinned at exit is reported as a leaked block region (and fails under `--mem`). | ✓ `--unsafe` |
-| **Process** | `Process(addr:int, len:int, elemSize:int, fn:function) - bool` | In-place map: for each of `len` elements of `elemSize` (1/2/4/8) bytes at `addr`, calls `fn(value:int, index:int)` and stores the integer it returns back, truncated to the element width. `false` on a bad size or length or an unregistered span; a `fn` that cannot take `(value, index)` raises `InvalidArguments`, as any call does; `nil` if `fn` raised. At most 16 MB per call. | — |
+| **Process** | `Process(addr:int, len:int, elemSize:int, fn:function) - bool` | In-place map: for each of `len` elements of `elemSize` (1/2/4/8) bytes at `addr`, calls `fn(value:int, index:int)` and stores the integer it returns back, truncated to the element width. `false` on a bad size or length or an unregistered span; a `fn` that cannot take `(value, index)` raises `InvalidArguments`, as any call does; `nil` if `fn` raised. At most 128 Mi elements per call (a 1 GiB span with 8-byte elements). | — |
 | **ProcessCallback** | `ProcessCallback(fn, address:int, start:int, len:int, cb)` | Processes a raw memory range with your worker function `fn(address, start, len)` (which reads/writes it via `Memory.Read*`/`Write*`), then calls `cb(address, result)` when finished. Runs on another CPU core when `fn` is simple enough (only `Memory.Read*`/`Write*` on that address, plain number math, no calls or allocations) — otherwise runs normally, same result. **Don't allocate or free memory while the job is running.** | ✓ `--unsafe` |
 | **ProcessEvent** | `ProcessEvent(fn, address:int, start:int, len:int, eventId:int)` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ `--unsafe` |
 | **Read8** | `Read8(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 1 byte at ptr+offset. | ✓ `--unsafe` |
@@ -4318,7 +4323,7 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **Empty** | `Empty - string` | Property: the empty string constant `""`. Not a function. | — |
 | **EndsWith** | `EndsWith(s:string, suffix:string) - bool` | `true` if `s` ends with `suffix`. | ✓ |
 | **EqualsIgnoreCase** | `EqualsIgnoreCase(a:string, b:string) - bool` | Case-insensitive equality. ASCII only (`A-Z` folds to `a-z`) and locale-independent, matching `ToLower`/`ToUpper`; non-ASCII bytes compare exactly, so `"Å"` and `"å"` are **not** equal. | ✓ |
-| **Format** | `Format(fmt:string, ...args) - string` | C#-style positional formatting: `{0}`, `{1,width}` (negative width = left-align), `{0:X4}`/`{0:x}` hex, `{0:D3}` zero-padded decimal, `{0:F2}` or `{0:.2f}` fixed-point (ints included: `{0:F2}` of `5` is `"5.00"`). `{{` and `}}` emit literal braces. The template is used **literally** - a source literal's escapes are already expanded by the compiler, so `fmt` is never unescaped again and a `\t` in e.g. a Windows path survives. `:X`/`:x`/`:D`/`:d` require an int and yield `nil` otherwise; `:F` on a non-number falls back to the value's default rendering. A plain `{0}` renders every value exactly as `str()` does. Returns `nil` on a malformed template, including an unknown spec letter such as `{0:N}`. At least 1 arg required. Interpolated `$"...{x:X4}..."` literals compile to this call. | — |
+| **Format** | `Format(fmt:string, ...args) - string` | C#-style positional formatting: `{0}`, `{1,width}` (negative width = left-align), `{0:X4}`/`{0:x}` hex, `{0:D3}` zero-padded decimal, `{0:F2}` or `{0:.2f}` fixed-point (ints included: `{0:F2}` of `5` is `"5.00"`). `{{` and `}}` emit literal braces. The template is used **literally** - a source literal's escapes are already expanded by the compiler, so `fmt` is never unescaped again and a `\t` in e.g. a Windows path survives. `:X`/`:x`/`:D`/`:d` require an int and yield `nil` otherwise; `:F` on a non-number falls back to the value's default rendering. A plain `{0}` renders every value exactly as `str()` does. Returns `nil` on a malformed template, including an unknown spec letter such as `{0:N}`. At least 1 arg required. Interpolated `$"...{x}..."` literals compile to this call; a spec such as `{x:X4}` in a hole is not valid source - pass the spec to `Format` directly. | — |
 | **FormatArray** | `FormatArray(fmt:string, values:array) - string` | Like `Format`, but placeholder indices `{0}`, `{1}`, … refer to elements of `values`. Identical grammar and rendering - both share one engine. Returns `nil` on a malformed template or out-of-range index. | ✓ owned¹ |
 | **IndexOf** | `IndexOf(s:string, sub:str\|char) - int` | Byte index of first occurrence of `sub`, or `-1`. A char matches its UTF-8 bytes: `IndexOf("aeiou", c)`. | ✓ |
 | **IndexOfAnyFrom** | `IndexOfAnyFrom(s:string, charset:string, start:int) - int` | Byte index of the first byte of `s` (starting from `start`) that appears anywhere in `charset`, or `-1`. One linear scan with a constant-time membership test - efficient for finding the first of several possible delimiter characters. | ✓ |
@@ -4675,8 +4680,9 @@ call stacks and their own scheduling state - so the editor's thread picker
 becomes a fiber picker.
 
 Supported requests: `initialize`, `launch`, `setBreakpoints`,
-`configurationDone`, `threads`, `stackTrace`, `scopes`, `variables`, `evaluate`,
-`disassemble`, `continue`, `next`, `stepIn`, `stepOut`, `pause`, `disconnect`.
+`dataBreakpointInfo`, `setDataBreakpoints`, `configurationDone`, `threads`,
+`stackTrace`, `scopes`, `variables`, `evaluate`, `disassemble`, `continue`,
+`next`, `stepIn`, `stepOut`, `pause`, `disconnect`.
 
 `evaluate` resolves the same paths the prompt's `p` does (`order.items[0]`), not
 arbitrary expressions, and reports a failure rather than inventing a value.
@@ -4704,6 +4710,17 @@ invented addresses, and the client indexes rows by address.
 Open it by right-clicking a frame in the Call Stack and choosing **Open
 Disassembly View**. Its step buttons step by source line: instruction-granularity
 stepping is not offered, because the debugger's hook is on line events.
+
+**Data breakpoint at an address.** **Add Data Breakpoint at Address** in the
+editor's Breakpoints view (VS Code 1.90 or later) arms the `Debug.GuardAddress`
+watch: enter `0xA000`, or the decimal value a pointer variable shows, and the
+program stops with reason *data breakpoint* when a `Memory.Read*`/`Write*` or a
+block element access starts at exactly that address - before an access the
+address does not allow raises. The VM watches one address: a second data
+breakpoint is reported unverified. It stays armed until removed in the editor
+(without an editor it fires once), and setting it replaces an address the program
+armed itself. Only addresses can be watched; a variable offers no
+"Break on Value Change".
 
 Because `--dap` implies `--debug`, the JIT is disabled for the session and the
 program stops at the start of `Main` before the first line runs.

@@ -126,8 +126,14 @@ generate_code | flarisvm -       # generate and run on the fly
 **Disassemble bytecode** (debug):
 
 ```sh
-flarisvm --disasm script.flx
+flarisvm --disasm script.flx               # everything
+flarisvm --disasm script.flx --list        # the functions, by name
+flarisvm --disasm script.flx Point.len     # just one of them
 ```
+
+A lambda has no name of its own, so `--list` names it after the function it sits
+in and its constant index - `makeAdder/0` is the lambda held in constant 0 of
+`makeAdder`.
 
 **Check JIT eligibility** - compile without running and print, per function, whether it runs as native code and (if not) why:
 
@@ -305,7 +311,6 @@ Flaris source files are UTF-8 encoded and must not contain NUL bytes. Identifier
 | `import` / `export` / `as` | Modules |
 | `try` / `catch` / `finally` / `throw` | Exceptions |
 | `guard` | Assert non-nil (throws if nil) |
-| `weak` | Handle that does not keep its target alive |
 | `enum` | Define enumeration |
 | `breakpoint` | Debug pause |
 | `in` | Membership test / foreach iterator |
@@ -356,7 +361,7 @@ let json = """
     { "ok": true }
     """;                 // raw multi-line: closer's indentation stripped, no final newline
 let n = 42;
-$"n = {n}, hex = {n:X4}" // interpolated: holes take String.Format specs
+$"{n} items"              // interpolated: each {expr} hole becomes an argument
 ```
 
 Escape sequences: `\n`, `\r`, `\t`, `\b`, `\f`, `\a`, `\v`, `\"`, `\'`, `\\`,
@@ -812,12 +817,11 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 
 - `x is C` tests for an instance of class `C`, subclasses included; with any other right side it compares identity (`x is nil`). It is not a type test: use `Type.IsInt(x)`, `Type.IsString(x)` and the other `Type.Is*` functions for that
 
-**Logical:** `&&` `||` `!`  - aliases: `and` `or`
+**Logical:** `&&` `||` `!`
 
 - Short-circuiting: `x && y` only evaluates `y` if `x` is truthy
 - Falsy: `nil`, `false`, `0`, `0.0`, `""`, `'\0'`, empty arrays/objects; everything else is truthy
 - `x && y` and `x || y` always yield a bool, as in C#: `x && y` is `true` when both are truthy, `x || y` when either is. For a fallback value use `??`: `port ?? 8080`
-- `and` / `or` are exact tokenizer aliases - identical precedence and behaviour to `&&` / `||`
 
 **Increment / Decrement:** `++` `--` (prefix or postfix)
 
@@ -914,15 +918,15 @@ let addr = guard(user.address);  // throws if nil
 
 Use `guard` when a nil value means something has gone wrong. For optional values, just use `??` or check directly.
 
-### `weak`
+### `Weak.Create`
 
-`weak(expr)` returns a handle on `expr` that does not keep it alive. Read it back with `Weak.Get`, which yields `nil` once the target is gone. It is the way to hold a back-reference without forming a reference cycle:
+`Weak.Create(expr)` returns a handle on `expr` that does not keep it alive. Read it back with `Weak.Get`, which yields `nil` once the target is gone. It is the way to hold a back-reference without forming a reference cycle:
 
 ```js
 class Node {
     let child = nil;                 // owned
     let parent = nil;                // observed
-    fn Adopt(c) { this.child = c; c.parent = weak(this); }
+    fn Adopt(c) { this.child = c; c.parent = Weak.Create(this); }
     fn Up() { return Weak.Get(this.parent); }
 }
 ```
@@ -2815,6 +2819,9 @@ Two things are worth knowing because they have no equivalent in most debuggers:
   can read the stack of any parked fiber while the program is stopped.
 - **Right-click a frame in the Call Stack → Open Disassembly View** to see the
   bytecode around it.
+- **Add Data Breakpoint at Address** in the Breakpoints view stops the program
+  when that memory address is read or written - `Debug.GuardAddress`, armed from
+  the editor.
 
 Breakpoints can be added and removed while the program runs, and the pause button
 interrupts it at the next source line. A `launch.json` is only needed to change
@@ -2977,6 +2984,9 @@ Debug.Assert(result, 42);
 Debug.GuardAddress(data);   // any read/write to this address triggers a pause
 process(data);
 ```
+
+In VS Code, a data breakpoint at the address arms the same watch and stops in the
+editor, with the stack and locals of the access.
 
 **`Debug.Here` - quick location tracing:**
 
