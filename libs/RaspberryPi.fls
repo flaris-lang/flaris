@@ -1,0 +1,287 @@
+// RaspberryPi.fls - the Raspberry Pi board itself for Flaris.
+// Version: 1.0
+//
+// Which Pi this is, how it is doing, what its 40-pin header carries and what
+// is switched on. For the lines and buses themselves use Gpio, I2c and Spi -
+// this library tells you their names on a Pi. Every model with the 40-pin
+// header is covered: Pi 3, Pi 4, Pi 5, Zero 2 W and the 400/500 keyboards
+// (64-bit Raspberry Pi OS).
+//
+// Usage:
+//   import { RaspberryPi } from library("RaspberryPi", "1.0");
+//
+//   let pi = new RaspberryPi();
+//   Console.WriteLine(pi.Model());                 // Raspberry Pi 5 Model B Rev 1.1
+//   Console.WriteLine(pi.Temperature());           // 49.05 (degrees C)
+//   if (pi.Throttled()["underVoltageOccurred"]) { Console.WriteLine("the power supply is too weak"); }
+//   Console.WriteLine(pi.Line(11));                // "GPIO17": header pin 11 for Gpio
+//   foreach (c in pi.Check()) {
+//       if (!c["ok"]) { Console.WriteLine(c["item"], ": ", c["fix"]); }
+//   }
+//
+// The header is the same on every model: I2C bus 1 on pins 3 and 5, SPI bus 0
+// on pins 19, 21, 23, 24 (CE0) and 26 (CE1), the UART on pins 8 (TX) and 10
+// (RX). Pinout() lists all 40 pins and Line(pin) turns a pin number into the
+// line name Gpio takes; power and ground pins have none.
+//
+// Pi 4 and Pi 5 differ in what this library hides: the header UART is
+// /dev/ttyAMA0 on a Pi 5, where /dev/serial0 is the separate debug connector,
+// and /dev/serial0 on the others (SerialPort() picks it); only the Pi 5 has a
+// fan connector (FanRpm()); switching the UART on takes a different
+// config.txt line (Check() names it).
+//
+// Nothing here raises. A value that cannot be read - not a Pi, a file that is
+// missing, a tool that is not installed - is nil.
+//
+// How it finds out. From files the kernel provides (/proc/device-tree,
+// /proc/cpuinfo, /sys/class/thermal, /sys/class/hwmon, /dev) and from
+// vcgencmd for the firmware's throttling flags. Any other source - a board
+// simulated for tests, a Pi reached over the network - is passed as
+// opts.backend: any object with
+//   Read(path) -> string|nil      Exists(path) -> bool      List(dir) -> [string]|nil
+//   Tool(name) -> path|nil        Run(path, args) -> { Exit, Stdout }|nil
+//
+// Exported:
+//   RaspberryPi - new RaspberryPi(opts?)     opts: { backend }
+//                 board  : IsPi / Model / Revision / Serial / IsPi5
+//                 health : Temperature / Throttled / FanRpm
+//                 header : Pinout / Line / SerialPort
+//                 setup  : Check
+
+// The 40-pin header: [pin, name, what the pin is known for].
+const _HEADER = [
+    [1, "3V3", "power"],            [2, "5V", "power"],
+    [3, "GPIO2", "I2C1 SDA"],       [4, "5V", "power"],
+    [5, "GPIO3", "I2C1 SCL"],       [6, "GND", "ground"],
+    [7, "GPIO4", "GPCLK0, 1-Wire"], [8, "GPIO14", "UART TX"],
+    [9, "GND", "ground"],           [10, "GPIO15", "UART RX"],
+    [11, "GPIO17", ""],             [12, "GPIO18", "PCM CLK, PWM0"],
+    [13, "GPIO27", ""],             [14, "GND", "ground"],
+    [15, "GPIO22", ""],             [16, "GPIO23", ""],
+    [17, "3V3", "power"],           [18, "GPIO24", ""],
+    [19, "GPIO10", "SPI0 MOSI"],    [20, "GND", "ground"],
+    [21, "GPIO9", "SPI0 MISO"],     [22, "GPIO25", ""],
+    [23, "GPIO11", "SPI0 SCLK"],    [24, "GPIO8", "SPI0 CE0"],
+    [25, "GND", "ground"],          [26, "GPIO7", "SPI0 CE1"],
+    [27, "GPIO0", "HAT EEPROM SDA"], [28, "GPIO1", "HAT EEPROM SCL"],
+    [29, "GPIO5", ""],              [30, "GND", "ground"],
+    [31, "GPIO6", ""],              [32, "GPIO12", "PWM0"],
+    [33, "GPIO13", "PWM1"],         [34, "GND", "ground"],
+    [35, "GPIO19", "PCM FS, SPI1 MISO"], [36, "GPIO16", "SPI1 CE2"],
+    [37, "GPIO26", ""],             [38, "GPIO20", "PCM DIN, SPI1 MOSI"],
+    [39, "GND", "ground"],          [40, "GPIO21", "PCM DOUT, SPI1 SCLK"]
+];
+
+// vcgencmd get_throttled: bit -> the name it gets in Throttled().
+const _THROTTLE_BITS = [[0, "underVoltage"], [1, "frequencyCapped"], [2, "throttled"], [3, "softTempLimit"],
+                        [16, "underVoltageOccurred"], [17, "frequencyCappedOccurred"],
+                        [18, "throttledOccurred"], [19, "softTempLimitOccurred"]];
+
+// The default backend: this machine's files and tools.
+class _Board {
+    fn Read(path: string) {
+        if (!File.Exists(path)) { return nil; }
+        return File.ReadText(path);
+    }
+    // File.Exists is for regular files only; the interfaces are device nodes.
+    fn Exists(path: string): bool { return File.Stat(path) != nil; }
+    fn List(dir: string) {
+        if (!Directory.Exists(dir)) { return nil; }
+        return Directory.List(dir);
+    }
+    // Tools in /usr/sbin (i2c-tools) are not on a normal user's PATH on Debian.
+    fn Tool(name: string) {
+        let p = Os.Which(name);
+        if (p == nil && File.Exists("/usr/sbin/" + name)) { p = "/usr/sbin/" + name; }
+        return p;
+    }
+    fn Run(path: string, args) { return Os.RunEx(path, args, { Stdin: "", Timeout: 2000 }); }
+}
+
+class RaspberryPi {
+    let _b = nil;
+
+    fn Constructor(opts?) {
+        let backend = (opts != nil && "backend" in opts) ? opts["backend"] : nil;
+        this._b = (backend != nil) ? backend : new _Board();
+    }
+
+    // -- board -------------------------------------------------------------
+
+    // "Raspberry Pi 5 Model B Rev 1.1", or nil on anything that is not a Pi.
+    fn Model() {
+        let m = this._text("/proc/device-tree/model");
+        if (m == nil || !String.StartsWith(m, "Raspberry Pi")) { return nil; }
+        return m;
+    }
+
+    fn IsPi(): bool { return this.Model() != nil; }
+
+    fn IsPi5(): bool {
+        let m = this.Model();
+        return m != nil && (String.StartsWith(m, "Raspberry Pi 5") || String.StartsWith(m, "Raspberry Pi 500"));
+    }
+
+    // The board's revision code from /proc/cpuinfo ("d04171"), or nil.
+    fn Revision() { return this.IsPi() ? this._cpuinfo("Revision") : nil; }
+
+    // The board's serial number ("42e5e94d1994aab2"), or nil.
+    fn Serial() {
+        if (!this.IsPi()) { return nil; }
+        let s = this._text("/proc/device-tree/serial-number");
+        return s != nil ? s : this._cpuinfo("Serial");
+    }
+
+    // -- health ------------------------------------------------------------
+
+    // The SoC's temperature in degrees C, or nil.
+    fn Temperature() {
+        let t = this._text("/sys/class/thermal/thermal_zone0/temp");
+        let milli = t != nil ? Convert.ParseInt(t) : nil;
+        return milli != nil ? float(milli) / 1000.0 : nil;
+    }
+
+    // The firmware's throttling flags: what is happening now (underVoltage,
+    // frequencyCapped, throttled, softTempLimit) and what has happened since
+    // boot (the same names + "Occurred"), plus the raw value. nil without vcgencmd.
+    fn Throttled() {
+        let tool = this._b.Tool("vcgencmd");
+        if (tool == nil) { return nil; }
+        let r = this._b.Run(tool, ["get_throttled"]);
+        if (r == nil || r.Exit != 0) { return nil; }
+        let out = String.Trim(r.Stdout);
+        if (!String.StartsWith(out, "throttled=0x")) { return nil; }
+        let raw = Convert.ParseInt(String.Substr(out, 10));
+        if (raw == nil) { return nil; }
+        let flags = { raw: raw };
+        foreach (b in _THROTTLE_BITS) { flags[b[1]] = ((raw >> b[0]) & 1) == 1; }
+        return flags;
+    }
+
+    // The fan's speed in rpm, or nil when there is no fan connector (only the Pi 5 has one) or no fan.
+    fn FanRpm() {
+        let dirs = this._b.List("/sys/class/hwmon");
+        if (dirs == nil) { return nil; }
+        foreach (d in dirs) {
+            let base = "/sys/class/hwmon/" + Path.GetFileName(d);
+            if (this._text(base + "/name") == "pwmfan") {
+                let rpm = this._text(base + "/fan1_input");
+                return rpm != nil ? Convert.ParseInt(rpm) : nil;
+            }
+        }
+        return nil;
+    }
+
+    // -- header ------------------------------------------------------------
+
+    // All 40 pins: { pin, name, use }, name being the Gpio line name for a GPIO pin.
+    fn Pinout(): [object] {
+        let out: [object] = [];
+        foreach (p in _HEADER) { Array.Append(out, { pin: p[0], name: p[1], use: p[2] }); }
+        return out;
+    }
+
+    // The Gpio line name of header pin 1-40 ("GPIO17" for pin 11), or nil for power and ground.
+    fn Line(pin) {
+        if (Type.Of(pin) != Type.Int || pin < 1 || pin > 40) { return nil; }
+        let name = _HEADER[pin - 1][1];
+        return String.StartsWith(name, "GPIO") ? name : nil;
+    }
+
+    // The device of the header UART (pins 8 and 10) for Stream.OpenSerial, or nil when it is not switched on.
+    fn SerialPort() {
+        if (!this.IsPi()) { return nil; }
+        let dev = this.IsPi5() ? "/dev/ttyAMA0" : "/dev/serial0";
+        return this._b.Exists(dev) ? dev : nil;
+    }
+
+    // -- setup -------------------------------------------------------------
+
+    // What the header's interfaces need, one { item, ok, detail, fix } each;
+    // fix is what to do when ok is false. config.txt changes take a reboot.
+    fn Check(): [object] {
+        let out: [object] = [];
+        let cfg = "/boot/firmware/config.txt";
+        let model = this.Model();
+        RaspberryPi._add(out, "board", model != nil, model != nil ? model : "not a Raspberry Pi",
+                         "run this on a Raspberry Pi");
+        if (model == nil) { return out; }
+
+        let groups = this._groups();
+        RaspberryPi._tool(out, this._b, "gpio tools", "gpioget", "sudo apt install gpiod");
+        RaspberryPi._group(out, groups, "gpio");
+
+        RaspberryPi._add(out, "i2c", this._b.Exists("/dev/i2c-1"), "/dev/i2c-1 (pins 3 and 5)",
+                         "add dtparam=i2c_arm=on to " + cfg + " and reboot");
+        RaspberryPi._tool(out, this._b, "i2c tools", "i2ctransfer", "sudo apt install i2c-tools");
+        RaspberryPi._group(out, groups, "i2c");
+
+        RaspberryPi._add(out, "spi", this._b.Exists("/dev/spidev0.0"), "/dev/spidev0.0 and 0.1 (pins 19, 21, 23, 24, 26)",
+                         "add dtparam=spi=on to " + cfg + " and reboot");
+        RaspberryPi._tool(out, this._b, "spi tools", "spi-pipe", "sudo apt install spi-tools");
+        RaspberryPi._group(out, groups, "spi");
+
+        let port = this.SerialPort();
+        let uartFix = this.IsPi5() ? "add dtoverlay=uart0-pi5 under [pi5] in " + cfg + " and reboot"
+                                   : "add enable_uart=1 to " + cfg + " and reboot";
+        RaspberryPi._add(out, "uart", port != nil, port != nil ? port + " (pins 8 and 10)" : "the header UART is off", uartFix);
+        RaspberryPi._group(out, groups, "dialout");
+
+        let t = this.Throttled();
+        if (t != nil) {
+            let weak = t["underVoltage"] || t["underVoltageOccurred"];
+            RaspberryPi._add(out, "power", !weak, weak ? "under-voltage since boot" : "no under-voltage since boot",
+                             this.IsPi5() ? "use a 5 V 5 A supply (the official 27 W one)" : "use the official power supply");
+        }
+        return out;
+    }
+
+    // -- internals ---------------------------------------------------------
+
+    // A device-tree or sysfs text file up to its first NUL (device-tree strings end in one), trimmed.
+    fn _text(path: string) {
+        let s = this._b.Read(path);
+        if (s == nil) { return nil; }
+        iter (i from 0 to len(s)) {
+            if ((int)s[i] == 0) { return String.Trim(String.Substr(s, 0, i)); }
+        }
+        return String.Trim(s);
+    }
+
+    fn _cpuinfo(key: string) {
+        let s = this._b.Read("/proc/cpuinfo");
+        if (s == nil) { return nil; }
+        foreach (ln in String.SplitLines(s)) {
+            let at = String.IndexOf(ln, ":");
+            if (at > 0 && String.Trim(String.Substr(ln, 0, at)) == key) { return String.Trim(String.Substr(ln, at + 1)); }
+        }
+        return nil;
+    }
+
+    // The groups this user is in, or nil when that cannot be told.
+    fn _groups() {
+        let id = this._b.Tool("id");
+        if (id == nil) { return nil; }
+        let r = this._b.Run(id, ["-nG"]);
+        if (r == nil || r.Exit != 0) { return nil; }
+        return String.Fields(String.Trim(r.Stdout));
+    }
+
+    fn static _add(out: [object], item: string, ok: bool, detail: string, fix: string) {
+        Array.Append(out, { item: item, ok: ok, detail: detail, fix: ok ? "" : fix });
+    }
+
+    fn static _tool(out: [object], b, item: string, tool: string, fix: string) {
+        let p = b.Tool(tool);
+        RaspberryPi._add(out, item, p != nil, p != nil ? p : tool + " not found", fix);
+    }
+
+    fn static _group(out: [object], groups, g: string) {
+        if (groups == nil) { return; }
+        let ok = Array.IndexOf(groups, g) >= 0;
+        RaspberryPi._add(out, g + " group", ok, ok ? "this user is in " + g : "this user is not in " + g,
+                         "sudo usermod -aG " + g + " $USER, then log in again");
+    }
+}
+
+export { RaspberryPi };

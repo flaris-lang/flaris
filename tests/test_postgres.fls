@@ -135,8 +135,26 @@ fn test_live_server() {
     check(db.ScalarIntParams("SELECT COUNT(*) FROM _pg_test_pool WHERE name = $1", ["tx-throw"]) == 0,
           "  and the insert was rolled back");
 
+    // A block, array or object has no text form for libpq: refused, rather
+    // than stored as a silent NULL.
+    check(db.ExecParams("INSERT INTO _pg_test_pool(name) VALUES ($1)", [[1, 2]]) == -1, "an array parameter is refused");
+    let qo = db.QueryParams("SELECT $1::text AS v", [{ a: 1 }]);
+    check(qo != nil && ("error" in qo), "an object parameter is an error, not NULL");
+
+    // A COMMIT that fails - a deferred foreign key - committed nothing.
+    db.Exec("DROP TABLE IF EXISTS _pg_tx_child");
+    db.Exec("DROP TABLE IF EXISTS _pg_tx_parent");
+    db.Exec("CREATE TABLE _pg_tx_parent (id INT PRIMARY KEY)");
+    db.Exec("CREATE TABLE _pg_tx_child (pid INT REFERENCES _pg_tx_parent(id) DEFERRABLE INITIALLY DEFERRED)");
+    let fk = db.Transaction(fn() { return db.Exec("INSERT INTO _pg_tx_child VALUES (99)") == 1; });
+    check(fk == false, "Transaction whose COMMIT fails returns false");
+    check(db.ScalarInt("SELECT COUNT(*) FROM _pg_tx_child") == 0, "  and the row is not there");
+    db.Exec("DROP TABLE _pg_tx_child");
+    db.Exec("DROP TABLE _pg_tx_parent");
+
     db.Exec("DROP TABLE IF EXISTS _pg_test_pool");
-    db.Close();
+    check(db.Close() == true, "Close returns true");
+    check(db.Close() == false, "a second Close is refused, not a use-after-free");
     return 0;
 }
 

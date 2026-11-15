@@ -107,6 +107,37 @@ fn checkReassembly() {
     return 0;
 }
 
+// Strings from the caller that would end an AT argument or the command line
+// early, and so run a second command, are refused before anything is sent -
+// a closed Modem shows that: a refused call never reaches the port.
+fn checkInjection() {
+    section("command injection");
+    let m = new Modem(nil);
+    let usage = fn(r) => r.errorKind == "usage";
+    assert("Dial refuses a ';' that would end the command", usage(m.Dial("112;+CFUN=0")));
+    assert("Dial refuses a CR", usage(m.Dial("112\rAT+CFUN=0")));
+    assert("Ussd refuses a quote", usage(m.Ussd("*100#\";+CFUN=0;\"")));
+    assert("SetServiceCentre refuses non-digits", usage(m.SetServiceCentre("+4670\";+CFUN=0")));
+    assert("SetApn refuses a quote in the password",
+           usage(m.SetApn("internet", { user: "u", password: "p\",\"x\";+CFUN=0" })));
+    assert("SetApn refuses a CR in the user", usage(m.SetApn("internet", { user: "u\rAT+CFUN=0" })));
+    let puk = m.UnlockPuk("12345678", "12\";+C");
+    assert("UnlockPuk refuses a non-digit PIN", usage(puk) && String.Contains(puk.error, "digits only"));
+    assert("SelectOperator refuses a string tech", usage(m.SelectOperator("24001", "7;+CFUN=0")));
+    assert("Dial still takes an ordinary number", _dialOk("+46701234567,,*1#"));
+    m.Close();
+    return 0;
+}
+
+// The dial check is private to the library; its effect on a valid number is
+// that the call is not refused as usage.
+fn _dialOk(n: string): bool {
+    let m = new Modem(nil);
+    let r = m.Dial(n);
+    m.Close();
+    return r.errorKind != "usage";
+}
+
 fn async Main() {
     if (Os.Which("python3") == nil) {
         Console.WriteLine("SKIP: python3 not available to run tests/fake_modem.py");
@@ -237,6 +268,52 @@ fn runChecks(port: string): int {
     assert("  and so does the one after that",
            after2["ok"] && after2["lines"][0] == "EG25-G");
 
+    // A reply that arrives after its command timed out must not become the
+    // next command's answer: every later command would be off by one.
+    let late = at.Send("AT+LATE", 200);
+    assert("a late command times out", !late["ok"] && late["errorKind"] == "timeout");
+    let afterLate = at.Send("AT+CGMM", 3000);
+    assert("  and the next command gets its own reply, not the late one",
+           afterLate["ok"] && len(afterLate["lines"]) == 1 && afterLate["lines"][0] == "EG25-G");
+
+    // An unsolicited NO CARRIER (a call hung up) does not end another command.
+    let hang = at.Send("AT+HANGUP", 2000);
+    assert("NO CARRIER mid-command is not the command's answer",
+           hang["ok"] && len(hang["lines"]) == 1 && hang["lines"][0] == "+HANG: 1");
+    let afterHang = at.Send("AT+CGMI", 2000);
+    assert("  and the stream stays aligned", afterHang["ok"] && afterHang["lines"][0] == "Quectel");
+
+    // Poll on one fiber while a command runs on another: Poll must not read
+    // the command's reply as a stray line and throw it away.
+    let polling = at.PollAsync(1500);
+    Fiber.Sleep(20);
+    let during = at.Send("AT+CSQ", 1000);
+    assert("a command alongside Poll gets its reply", during["ok"] && len(during["lines"]) == 1);
+    polling.Await();
+
+    // A command queued behind another and cancelled while it waits leaves the
+    // queue; the port is not left waiting on a fiber that is gone.
+    let holder = at.SendAsync("AT+SLOW", 3000);
+    Fiber.Sleep(10);
+    let queued = at.SendAsync("AT+CGMM", 3000);
+    Fiber.Sleep(10);
+    Fiber.Cancel(queued.Handle());
+    holder.Await();
+    assert("a command cancelled while queued does not wedge the port", at.Send("AT+CGMI", 2000)["ok"]);
+
+    // Operator() switches the +COPS format to numeric and back. A second
+    // Operator() that gets a command in between switches it back to names, and
+    // the first reads "Telia" where it wants the MCC/MNC. The fake answers
+    // AT+COPS=3,2 slowly, so the second call queues while the first is inside.
+    let opBox = { a: nil };
+    let opA = Fiber.New(fn() { opBox["a"] = m.Operator(); return 0; });
+    Fiber.Resume(opA, true);
+    Fiber.Sleep(40);                             // opA is in its slow AT+COPS=3,2
+    let opB = m.Operator();
+    if (!Fiber.IsDone(opA)) { Fiber.Await(opA); }
+    assert("Operator() on two fibers: neither is interleaved",
+           opBox["a"]["mcc"] == "240" && opBox["a"]["mnc"] == "01" && opB["mcc"] == "240");
+
     // PollAsync answers the URC count.
     let pp = at.PollAsync(50);
     assert("PollAsync answers a count", type(pp.Await()) == Type.Int);
@@ -260,6 +337,16 @@ fn runChecks(port: string): int {
     assert("  and is dispatched afterwards", urcSeen == 1);
 
     checkReassembly();
+    checkInjection();
+
+    // ---- stored messages ---------------------------------------------------
+    section("Stored messages");
+    let listed = m.ListMessages("all");
+    assert("an alphanumeric sender is decoded as text",
+           listed["ok"] && len(listed["messages"]) == 1 && listed["messages"][0]["sender"] == "Telia");
+    let del = m.DeleteMessages("sent");
+    assert("DeleteMessages(\"sent\") deletes the sent message only", del["ok"] && del["deleted"] == 1);
+    assert("  and the received one is still there", len(m.ListMessages("all")["messages"]) == 1);
 
     // ---- releasing the port ------------------------------------------------
     section("Close and re-open");

@@ -415,6 +415,18 @@ fn test_transaction_helper(db) {
     checkEq("  and its class", caught is TxTestError, true);
     checkEq("thrown-out row absent", db.ScalarInt("SELECT COUNT(*) FROM users WHERE name = 'TxHThrow'"), 0);
 
+    // A commit that fails - here a deferred foreign key checked at RELEASE -
+    // committed nothing, and Transaction says so.
+    db.Exec("PRAGMA foreign_keys = ON");
+    db.Exec("CREATE TABLE tx_parent (id INTEGER PRIMARY KEY)");
+    db.Exec("CREATE TABLE tx_child (pid INTEGER REFERENCES tx_parent(id) DEFERRABLE INITIALLY DEFERRED)");
+    let fk = db.Transaction(fn() { return db.Exec("INSERT INTO tx_child (pid) VALUES (99)") == 1; });
+    checkEq("Transaction whose commit fails returns false", fk, false);
+    checkEq("  and the row is not there", db.ScalarInt("SELECT COUNT(*) FROM tx_child"), 0);
+    db.Exec("DROP TABLE tx_child");
+    db.Exec("DROP TABLE tx_parent");
+    db.Exec("PRAGMA foreign_keys = OFF");
+
     // Clean up
     db.Exec("DELETE FROM users WHERE name LIKE 'TxH%'");
 }
@@ -493,6 +505,8 @@ fn test_close(db) {
 
     let ok = db.Close();
     checkEq("Close() returns true", ok, true);
+    // The handle is gone: a second Close is refused, not a use-after-free.
+    checkEq("a second Close() returns false", db.Close(), false);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────

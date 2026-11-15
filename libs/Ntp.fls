@@ -1,0 +1,218 @@
+// Ntp.fls - SNTP/NTP client (RFC 4330 / RFC 5905) for Flaris.
+// Version: 1.0
+//
+// One round trip over UDP: send a 48-byte client packet, read the server's
+// 48-byte reply, and reduce it to the two numbers that matter - the clock
+// offset (how far the server's clock is ahead of the local one) and the
+// round-trip time. Pure Flaris, sandbox-safe (Stream.Connect with "udp").
+//
+// Usage:
+//   import { Ntp } from library("Ntp", "1.0");
+//
+//   let r = Ntp.Query();                          // pool.ntp.org:123, 5 s timeout
+//   let r = Ntp.Query("time.cloudflare.com");
+//   let r = Ntp.Query("192.168.1.10", { port: 123, timeoutMs: 1000, version: 4 });
+//   if (r == nil) { Console.WriteLine("no answer"); return 1; }
+//   Console.WriteLine(r.offset);                  // seconds, server ahead is positive
+//   Console.WriteLine(r.rtt);                     // seconds
+//   Console.WriteLine(r.serverTime);              // estimated server Unix time now
+//   Console.WriteLine(r.stratum + " " + r.leap);  // 0 = unsynchronized
+//
+//   let now = Ntp.Now("pool.ntp.org");            // float Unix time, or nil
+//
+// Query returns nil on any failure (DNS, timeout, short reply) - check for
+// nil; a successful result is an object:
+//   ok:true, server, port, leap, version, mode, stratum, poll, precision,
+//   rootDelay, rootDispersion (seconds), referenceId, referenceTime,
+//   originateTime, receiveTime, transmitTime (Unix floats),
+//   localSend, localRecv, offset, rtt, serverTime
+//
+// offset = ((t1 - t0) + (t2 - t3)) / 2   with t0 = client send, t1 = server
+// receive, t2 = server transmit, t3 = client receive (all Unix seconds);
+// rtt = (t3 - t0) - (t2 - t1). serverTime = t3 + offset.
+//
+// The packet layer is public so it can be tested without a network:
+//   let req = Ntp.BuildRequest();                 // 48-byte block, VN=4 client
+//   let o   = Ntp.ParseResponse(replyBlock, t0, t3);
+//   Ntp.UnixToNtp(x) / Ntp.NtpToUnix(secs, frac)   // NTP 1900 epoch <-> Unix
+//
+// Notes: NTP timestamps count from 1900, so 2^32 s wraps in 2036 (the era
+// problem) - ignored here, as every SNTP client does. Setting the system
+// clock from the answer is deliberately not offered (needs privileges);
+// use Datetime to carry the offset. Broadcast mode (5) is reported but not
+// listened for.
+
+class Ntp {
+
+    // Seconds between the NTP epoch (1900-01-01) and the Unix epoch.
+    const _EPOCH = 2208988800;
+
+    // =========================================================================
+    // Packet layer (public, no I/O)
+    // =========================================================================
+
+    // Byte i of a packet given as block or string (both index to a byte value).
+    fn static _b(data, i:int): int {
+        if (type(data) == Type.String) { return int(data[i]); }
+        return data[i];
+    }
+
+    // Big-endian unsigned 32-bit at offset.
+    fn static _u32(data, off:int): int {
+        return (Ntp._b(data, off) << 24) | (Ntp._b(data, off + 1) << 16)
+             | (Ntp._b(data, off + 2) << 8) | Ntp._b(data, off + 3);
+    }
+
+    // Signed 8-bit (poll, precision).
+    fn static _i8(data, off:int): int {
+        let v = Ntp._b(data, off);
+        return (v > 127) ? v - 256 : v;
+    }
+
+    fn static _w32(b:block, off:int, v:int) {
+        b[off]     = (v >> 24) & 0xFF;
+        b[off + 1] = (v >> 16) & 0xFF;
+        b[off + 2] = (v >> 8) & 0xFF;
+        b[off + 3] = v & 0xFF;
+    }
+
+    // Unix seconds (float) -> NTP { secs, frac } (1900 epoch, big-endian fields).
+    fn static UnixToNtp(unix:float) {
+        let secs:int = int(unix) + Ntp._EPOCH;
+        var frac:int = int((unix - float(int(unix))) * 4294967296.0);
+        if (frac < 0) { frac = 0; }
+        if (frac > 4294967295) { frac = 4294967295; }
+        return { secs: secs, frac: frac };
+    }
+
+    // NTP { secs, frac } fields -> Unix seconds (float).
+    fn static NtpToUnix(secs:int, frac:int): float {
+        return float(secs) - float(Ntp._EPOCH) + float(frac) / 4294967296.0;
+    }
+
+    // The 64-bit NTP timestamp at `off` as Unix seconds.
+    fn static _tsAt(data, off:int): float {
+        return Ntp.NtpToUnix(Ntp._u32(data, off), Ntp._u32(data, off + 4));
+    }
+
+    fn static _setTs(b:block, off:int, unix:float) {
+        let t = Ntp.UnixToNtp(unix);
+        Ntp._w32(b, off, t.secs);
+        Ntp._w32(b, off + 4, t.frac);
+    }
+
+    // A 48-byte client request, version 4 (LI=0, mode=3), transmit timestamp
+    // set to now. Some servers only answer when originate/transmit is filled.
+    fn static BuildRequest(version?:int): block {
+        let vn:int = (version != nil) ? version : 4;
+        let b = Buffer.Create(48, 1);
+        b[0] = ((vn & 7) << 3) | 3;          // LI=0, VN, mode=3 (client)
+        Ntp._setTs(b, 40, Time.NowMillis() / 1000.0);
+        return b;
+    }
+
+    // Parse a server reply (block or string, at least 48 bytes) against the
+    // client's own send/receive times t0/t3 (Unix seconds). Returns the
+    // result object (without server/port), or nil for a short/garbage packet.
+    fn static ParseResponse(data, t0:float, t3:float) {
+        if (data == nil || len(data) < 48) { return nil; }
+        let b0:int = Ntp._b(data, 0);
+        let li:int    = (b0 >> 6) & 3;
+        let vn:int    = (b0 >> 3) & 7;
+        let mode:int  = b0 & 7;
+        let stratum:int = Ntp._b(data, 1);
+        // reference id: printable ASCII as text (NUL is padding), else hex
+        var rid = "";
+        var hex = "";
+        var printable = true;
+        iter (i from 12 to 16) {
+            let c:int = Ntp._b(data, i);
+            if (c == 0) { continue; }              // NUL padding
+            if (c >= 32 && c < 127) { rid += Convert.ToChar(c); }
+            else { printable = false; }
+            hex += String.PadLeft(Convert.ToRadixString(c, 16), 2, "0");
+        }
+        if (!printable || len(rid) == 0) { rid = "0x" + hex; }
+        let t1:float = Ntp._tsAt(data, 32);   // server receive
+        let t2:float = Ntp._tsAt(data, 40);   // server transmit
+        let offset:float = ((t1 - t0) + (t2 - t3)) / 2.0;
+        var rtt:float    = (t3 - t0) - (t2 - t1);
+        if (rtt < 0.0) { rtt = 0.0; }   // sub-millisecond (localhost) trips can compute slightly negative
+        return {
+            ok: true,
+            leap: li, version: vn, mode: mode,
+            stratum: stratum,
+            poll: Ntp._i8(data, 2),
+            precision: Ntp._i8(data, 3),
+            rootDelay: float(Ntp._u32(data, 4)) / 65536.0,
+            rootDispersion: float(Ntp._u32(data, 8)) / 65536.0,
+            referenceId: rid,
+            referenceTime: Ntp._tsAt(data, 16),
+            originateTime: Ntp._tsAt(data, 24),
+            receiveTime: t1,
+            transmitTime: t2,
+            localSend: t0,
+            localRecv: t3,
+            offset: offset,
+            rtt: rtt,
+            serverTime: t3 + offset,
+        };
+    }
+
+    // =========================================================================
+    // Query
+    // =========================================================================
+
+    // One SNTP round trip. host defaults to pool.ntp.org; opts: { port: 123,
+    // timeoutMs: 5000, version: 4 }. Returns the ParseResponse object plus
+    // server/port, or nil when the server does not answer in time or its
+    // reply is not a usable answer (see _answers).
+    fn static Query(host?:string, opts?) {
+        let h:string  = (host != nil) ? host : "pool.ntp.org";
+        let port:int  = (opts != nil && opts.port != nil) ? opts.port : 123;
+        let tmo:int   = (opts != nil && opts.timeoutMs != nil) ? opts.timeoutMs : 5000;
+        let vn:int    = (opts != nil && opts.version != nil) ? opts.version : 4;
+        let s = Stream.Connect("udp", h, port, tmo);
+        if (s == nil) { return nil; }
+        let req = Ntp.BuildRequest(vn);
+        let t0:float = Ntp._tsAt(req, 40);        // what we put on the wire
+        let sent = Stream.WriteBytes(s, req, 48);
+        var resp = nil;
+        if (sent == 48) { resp = Stream.ReadBytes(s, 48); }
+        Stream.Close(s);
+        if (resp == nil || len(resp) < 48) { return nil; }
+        let t3:float = Time.NowMillis() / 1000.0;
+        if (!Ntp._answers(resp, req)) { return nil; }
+        let o = Ntp.ParseResponse(resp, t0, t3);
+        if (o == nil) { return nil; }
+        o.server = h;
+        o.port = port;
+        return o;
+    }
+
+    // Whether `resp` is a usable answer to `req` (RFC 4330 section 5): from a
+    // server (mode 4), synchronised (leap 3 means not), not a kiss-o'-death
+    // (stratum 0) or out of range, carrying a transmit time, and echoing our
+    // own transmit timestamp - which is what ties it to this request rather
+    // than to a stray or spoofed packet.
+    fn static _answers(resp, req): bool {
+        let b0:int = Ntp._b(resp, 0);
+        if ((b0 & 7) != 4 || ((b0 >> 6) & 3) == 3) { return false; }
+        let stratum:int = Ntp._b(resp, 1) & 255;
+        if (stratum == 0 || stratum > 15) { return false; }
+        var tx = 0;
+        iter (i from 0 to 8) {
+            tx = tx | Ntp._b(resp, 40 + i);
+            if (Ntp._b(resp, 24 + i) != Ntp._b(req, 40 + i)) { return false; }
+        }
+        return tx != 0;
+    }
+
+    // The estimated current server time as Unix seconds (float), or nil.
+    fn static Now(host?:string, opts?) {
+        let r = Ntp.Query(host, opts);
+        return (r != nil) ? r.serverTime : nil;
+    }
+}
+
+export { Ntp };

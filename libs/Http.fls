@@ -86,7 +86,11 @@
 //                supplies, only the gaps between its calls are bounded.
 //   maxBodyBytes - the largest response body accepted, after decompression
 //                as well; a larger one fails the request (nil) and closes
-//                its connection. Default: no limit
+//                its connection. Default 64 MiB for Request and the verbs,
+//                none for Open (a stream holds only a chunk at a time);
+//                0 for no limit
+// A response head of more than 1000 lines fails the request (nil), and so
+// does a gzip or deflate body that does not decode.
 //   keepAlive  - false sends the request on a connection of its own
 //   proxy      - "http://[user:password@]host:port", or false for none; by
 //                default http_proxy / https_proxy from the environment
@@ -212,6 +216,9 @@ global _K_CENC:string = "content-encoding";
 global _K_TE:string   = "transfer-encoding";
 global _K_CL:string   = "content-length";
 global _K_KA:string   = "keep-alive";
+
+const HTTP_MAX_BODY  = 67108864;   // default maxBodyBytes of a buffered response: 64 MiB
+const HTTP_MAX_LINES = 1000;       // status and header lines in one response head
 
 // --------------------------------------------------------
 //  Pluggable transport
@@ -401,6 +408,16 @@ class Http {
     // http -> https hop on the same host does lose them - that is the correct
     // reading, since the two are different origins and the first leg was
     // already in the clear.
+    // A copy of a caller's headers without the named ones (lower case).
+    fn static _without(userHeaders, names) {
+        if (userHeaders == nil) { return nil; }
+        let out = { };
+        foreach (val, key in userHeaders) {
+            if (!Array.Contains(names, String.ToLower(key))) { out[key] = val; }
+        }
+        return out;
+    }
+
     fn static _stripCredentials(userHeaders) {
         if (userHeaders == nil) { return nil; }
         let out = { };
@@ -452,7 +469,13 @@ class Http {
             }
         }
 
-        var req = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\n";
+        // A Host or Content-Type the caller set replaces the automatic one -
+        // two of either is a request a server may read either way. Framing
+        // (Content-Length) is always computed here: a wrong one from a caller
+        // would desynchronise the connection.
+        let userHost = userHeaders != nil && Http._hasHeader(userHeaders, "host");
+        let userCT = userHeaders != nil && Http._hasHeader(userHeaders, "content-type");
+        var req = method + " " + path + " HTTP/1.1\r\n" + (userHost ? "" : "Host: " + host + "\r\n");
         if (close && (userHeaders == nil || !Http._hasHeader(userHeaders, "connection"))) {
             req = req + "Connection: close\r\n";
         }
@@ -465,6 +488,8 @@ class Http {
         }
         if (userHeaders != nil) {
             foreach (val, key in userHeaders) {
+                let lk = String.ToLower(key);
+                if (lk == "content-length" || lk == "transfer-encoding") { continue; }
                 req = req + key + ": " + Convert.ToString(val) + "\r\n";
             }
         }
@@ -472,9 +497,9 @@ class Http {
         // empty: an empty body is not the same as no body, and a protocol like
         // Connect sends a zero-length message that still has to be typed.
         let bodyLen:int = (body == nil) ? 0 : len(body);
-        if (bodyLen > 0 || contentType != nil) {
-            req = req + "Content-Type: " + (contentType ?? ContentType.Binary)
-                + "\r\nContent-Length: " + Convert.ToString(bodyLen) + "\r\n";
+        if (bodyLen > 0 || contentType != nil || userCT) {
+            if (!userCT) { req = req + "Content-Type: " + (contentType ?? ContentType.Binary) + "\r\n"; }
+            req = req + "Content-Length: " + Convert.ToString(bodyLen) + "\r\n";
         }
         if (bodyLen == 0) { return req + "\r\n"; }
         // A block is bytes: `req + body` would render it as the text "[block]".
@@ -494,21 +519,23 @@ class Http {
     // Undo Content-Encoding. Only gzip/deflate are decoded - they are what this
     // client asks for. A body in an encoding we never requested is handed back
     // untouched rather than silently mangled: the caller can still read the
-    // header and deal with it.
-    fn static _decodeBody(hdrs, body) {
+    // header and deal with it. nil when a gzip/deflate body does not decode or
+    // decodes past `cap` (0: Inflate's own 256 MiB cap).
+    fn static _decodeBody(hdrs, body, cap: int) {
         if (body == nil || len(body) == 0) { return body; }
         let ce = (hdrs == nil) ? nil : hdrs[_K_CENC];
         if (ce == nil) { return body; }
         let enc:string = String.ToLower(String.Trim(ce));
+        let max = cap > 0 ? cap : nil;
         if (enc == "gzip" || enc == "x-gzip") {
-            let out = Inflate.Gzip(body);
-            return (out == nil) ? body : Buffer.ToString(out);
+            let out = Inflate.Gzip(body, nil, max);
+            return (out == nil) ? nil : Buffer.ToString(out);
         }
         if (enc == "deflate") {
             // "deflate" on the wire is usually zlib-wrapped, but raw deflate is
             // common enough that Auto is the safe reader.
-            let out = Inflate.Auto(body);
-            return (out == nil) ? body : Buffer.ToString(out);
+            let out = Inflate.Auto(body, nil, max);
+            return (out == nil) ? nil : Buffer.ToString(out);
         }
         return body;
     }
@@ -577,16 +604,20 @@ class Http {
         return 0;
     }
 
-    // Close the idle connections whose time is up, for every key.
+    // Close the idle connections whose time is up, for every key, and drop
+    // the keys left empty - a client that talks to many hosts once would
+    // otherwise keep one entry per host for good.
     fn static _sweep(now: int) {
         _httpIdleSwept = now;
-        foreach (list in Object.Values(_httpIdle)) {
+        foreach (key in Object.Keys(_httpIdle)) {
+            let list = _httpIdle[key];
             while (len(list) > 0 && list[0].until <= now) {
                 let old = list[0];
                 Array.RemoveAt(list, 0);
                 _httpIdleCount -= 1;
                 Stream.Close(old.s);
             }
+            if (len(list) == 0) { Object.Delete(_httpIdle, key); }
         }
         return 0;
     }
@@ -921,13 +952,17 @@ class Http {
     }
 
     // Status line and header block. Interim 1xx responses, and empty lines
-    // before a status line, are read past. nil when the connection ends first
-    // or the status line is malformed; x.quiet then tells whether the
+    // before a status line, are read past. nil when the connection ends first,
+    // the status line is malformed or the head runs past HTTP_MAX_LINES lines
+    // (interim responses included); x.quiet then tells whether the
     // connection ended before a single response byte.
     fn static _head(x) {
         x.quiet = false;
         var any = false;
+        var lines = 0;
         while (true) {
+            lines += 1;
+            if (lines > HTTP_MAX_LINES) { return nil; }
             let statusLine = Http._line(x);
             if (statusLine == nil) {
                 let why = x.b ? Stream.LastError() : 0;
@@ -953,6 +988,8 @@ class Http {
                     hdrs[k] = v;
                     if (k == "set-cookie") { Array.Append(setCookies, String.Trim(v)); }
                 }
+                lines += 1;
+                if (lines > HTTP_MAX_LINES) { return nil; }
                 line = Http._line(x);
             }
             if (line == nil) { x.cut = true; }
@@ -1123,9 +1160,10 @@ class Http {
         // One deadline for the whole request: every hop, retry, wait and byte.
         let dms = (transport == nil) ? nil : transport.deadlineMs;
         let dl: int = (dms != nil && dms > 0) ? Time.Millis() + dms : 0;
-        // The largest body accepted, decompressed or not; 0 for any.
+        // The largest body accepted, decompressed or not; 0 for any. A buffered
+        // response has a default: it is all held in memory. A stream does not.
         let mbb = (transport == nil) ? nil : transport.maxBodyBytes;
-        let cap: int = (mbb != nil && mbb > 0) ? mbb : 0;
+        let cap: int = (mbb == nil) ? (open ? 0 : HTTP_MAX_BODY) : (mbb > 0 ? mbb : 0);
 
         // A caller's "Connection: close" keeps this request out of the pool.
         var close = false;
@@ -1190,13 +1228,17 @@ class Http {
                             (st == 303 || ((st == 301 || st == 302) && curMethod != "GET"))) {
                             curMethod = "GET";
                             curBody   = nil;
+                            // The body is gone, and so are the headers that
+                            // described it.
+                            contentType = nil;
+                            curHeaders = Http._without(curHeaders, ["content-type", "content-length", "content-encoding"]);
                         }
                     } else if (open) {
                         response = new HttpStream(x, h, curUrl);
                         x = nil;
                     } else {
                         let raw = Http._body(x);
-                        let decoded = (raw == nil) ? nil : Http._decodeBody(h.headers, raw);
+                        let decoded = (raw == nil) ? nil : Http._decodeBody(h.headers, raw, cap);
                         if (decoded != nil && (cap == 0 || len(decoded) <= cap)) {
                             response = {
                                 status:     st,
@@ -1326,7 +1368,7 @@ class Http {
     }
 
     // --------------------------------------------------------
-    //  Http.Curl(url, options) - shells out to curl(1)
+    //  Http.Curl(url, options) - runs curl(1)
     //
     //  options (all optional):
     //    method   : string  - HTTP method (default "GET")
@@ -1371,35 +1413,39 @@ class Http {
             if ("headers"  in options) { headers  = options["headers"];  }
         }
 
-        let cmd = "curl -s -w '\\n%{http_code}'";
-        cmd = cmd + " -X " + Http._shq(method);
-        // Forced to an integer: a string from options would otherwise reach the
-        // shell unquoted.
-        cmd = cmd + " --max-time " + Convert.ToString(int(timeout));
-        if (follow)   { cmd = cmd + " -L"; }
-        if (insecure) { cmd = cmd + " -k"; }
+        // Run directly, with no shell, and read stdout alone: what a child process writes on stderr
+        // must not reach the body or the status line.
+        let args = ["-s", "-w", "\\n%{http_code}", "-X", Convert.ToString(method),
+                    "--max-time", Convert.ToString(int(timeout))];
+        if (follow)   { Array.Append(args, "-L"); }
+        if (insecure) { Array.Append(args, "-k"); }
 
         if (headers != nil) {
             foreach (val, key in headers) {
-                cmd = cmd + " -H " + Http._shq(key + ": " + Convert.ToString(val));
+                Array.Append(args, "-H");
+                Array.Append(args, key + ": " + Convert.ToString(val));
             }
         }
 
+        // --data-raw, not -d: -d reads "@path" as "send this local file".
         if (body != nil && len(body) > 0) {
-            cmd = cmd + " -d " + Http._shq(body);
+            Array.Append(args, "--data-raw");
+            Array.Append(args, Convert.ToString(body));
         }
 
         if (output != nil) {
-            cmd = cmd + " -o " + Http._shq(output);
+            Array.Append(args, "-o");
+            Array.Append(args, Convert.ToString(output));
         }
 
-        // --url rather than a bare positional: shell quoting keeps the shell out
-        // of it, but curl's own parser still reads a leading "-" as an option,
+        // --url rather than a bare positional: curl reads a leading "-" as an option,
         // so a URL of "-o/etc/cron.d/x" would become one.
-        cmd = cmd + " --url " + Http._shq(url);
+        Array.Append(args, "--url");
+        Array.Append(args, url);
 
-        let raw = Os.Execute(cmd);
-        if (raw == nil) { return nil; }
+        let run = Os.RunEx("curl", args);
+        if (run == nil) { return nil; }
+        let raw = run.Stdout;
 
         // Last line is the status code written by -w '%{http_code}'
         let lines = String.SplitLines(raw);
@@ -1436,8 +1482,9 @@ class Http {
             cmd = cmd + " -O " + Http._shq(dest);
         }
 
-        // wget expects URL as a positional argument (no --url flag).
-        cmd = cmd + " " + Http._shq(url) + " 2>&1";
+        // wget takes the URL as a positional argument (no --url flag); "--"
+        // ends the options, so a URL starting with "-" is not read as one.
+        cmd = cmd + " -- " + Http._shq(url) + " 2>&1";
 
         let raw = Os.Execute(cmd);
         if (raw == nil) { return nil; }
@@ -1716,7 +1763,7 @@ class HttpStream
     let _sse       = nil;    // Event: the parser, and the events it has ready
     let _events    = nil;
     let _next      = 0;
-    let _err       = nil;
+    let _err: string|nil = nil;
     let _total     = 0;      // body bytes handed out
 
     fn Constructor(x, head, url: string) {

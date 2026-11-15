@@ -53,6 +53,16 @@ fn async socketPair() {
     return [c, s];
 }
 
+// An RTU frame from its bytes, with the CRC appended low byte first.
+fn rtuAnswer(vals: array) {
+    let b = Buffer.Create(len(vals) + 2, 1);
+    iter (i from 0 to len(vals)) { b[i] = vals[i]; }
+    let crc = Modbus.Crc16(Buffer.Slice(b, 0, len(vals)));
+    b[len(vals)] = crc & 255;
+    b[len(vals) + 1] = crc >> 8;
+    return b;
+}
+
 // What the error raised by f is: [Kind, Code, is ModbusTimeout], or nil.
 fn failure(f) {
     try { f(); } catch (e) {
@@ -277,6 +287,20 @@ fn async test_rtu_client_frames() {
     e[3] = ec & 255; e[4] = ec >> 8;
     await Stream.WriteAsync(p[1], e);
     checkEq(await exc, ["exception", 2, false], "RTU exception answer");
+
+    // A late answer: request A times out, B goes out, and only then does A's
+    // answer arrive. RTU has no transaction id, so B must not take it.
+    let late = (fn async () { return failure(fn() { c.ReadHoldingRegisters(0, 1); }); })();
+    Scheduler.Schedule(late);
+    await Stream.ReadAsync(p[1], 8, 1000);
+    checkEq(await late, ["timeout", 0, true], "A times out");
+    let next = (fn async () { return c.ReadHoldingRegisters(0, 1); })();
+    Scheduler.Schedule(next);
+    Fiber.Sleep(50);
+    await Stream.WriteAsync(p[1], rtuAnswer([1, 3, 2, 0, 7]));    // A's answer, late
+    await Stream.ReadAsync(p[1], 8, 1000);                        // B's request
+    await Stream.WriteAsync(p[1], rtuAnswer([1, 3, 2, 0, 9]));    // B's answer
+    checkEq(await next, [9], "B gets its own answer, not A's late one");
 
     // Silence: a timeout.
     let t0 = Time.Millis();

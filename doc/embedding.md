@@ -75,9 +75,9 @@ cc host.c flaris-lib/lib/libflaris.a -Iflaris-lib/include -o host \
 ```
 
 **Linking the shared library instead.** The shared library exports exactly what
-this document describes - the `Flaris*` functions listed in section 17, plus
-`flarisHostOptionsDefaults` - and nothing else; the VM's internals are hidden, so
-no future release can break you by moving one. On Windows, add `-DFLARIS_DLL`
+this document describes - the `Flaris*` functions listed in section 17 - and
+nothing else (`flarisHostOptionsDefaults` is defined in `flaris.h` itself); the
+VM's internals are hidden, so no future release can break you by moving one. On Windows, add `-DFLARIS_DLL`
 when you build against `flaris.dll`, so the declarations become `dllimport`:
 
 ```bash
@@ -220,6 +220,29 @@ function and runs only if you call it.
 > Bytecode is portable across platforms and machines: a `.flx` built on one
 > target runs on any other.
 
+A script that calls your own modules (section 9) needs a compiler that knows
+them, which `flarisvm` does not. Compile it from a build tool of your own that
+registers the same modules, with `FlarisHostCompile`, which writes the `.flx`
+without running it:
+
+```c
+/* the build tool: the device's modules, then compile and sign */
+FlarisHostCompile(tool, "rules.fls", "rules.flx", "release.sk");
+/* the device: the same modules, its trust list, signed code only */
+FlarisHostLoadProgram(device, "rules.flx");
+```
+
+- **The tool only needs the module table.** Nothing is called while compiling,
+  so the functions behind the names may be stubs, but the names, argument types
+  and result types must be the device's.
+- **The last argument signs it**: a keyfile path or 128 hex digits, as
+  `--sign` takes. `NULL` writes it unsigned; a key that does not parse returns
+  `FLARIS_ERR_ARGS`.
+- **No `export` list needed**, unlike `--compile`: it compiles the way the load
+  functions do.
+- `FLARIS_ERR_COMPILE` when the source cannot be read or does not compile, or
+  the `.flx` cannot be written. Not in a runtime-only build.
+
 ---
 
 ## 4. Lifecycle
@@ -288,6 +311,14 @@ if (FlarisHostCreate(&opt, &host) != FLARIS_OK) {
 The options are read once, at create. They hold for the host's whole life and
 end with it.
 
+Start from `flarisHostOptionsDefaults`: besides the defaults it sets `size` to
+the struct size of the `flaris.h` you compiled with, so a later library knows
+which fields you have and gives the ones you lack their defaults. A zeroed
+struct (`size` 0) is read as the 1.1.0 struct. Built against a newer
+`flaris.h` than the library, your host is refused with `FLARIS_ERR_INIT` if it
+sets a field the library does not know, rather than having that setting
+ignored.
+
 ### Switches
 
 Every switch is tri-state: `FLARIS_DEFAULT` (which is `0`, so a zeroed struct is
@@ -296,13 +327,13 @@ rejected rather than read as a default.
 
 | Switch | Default | What it does |
 |--------|---------|--------------|
-| `installSignals` | on | Installs the VM's handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1` and `SIGUSR2` (and ignores `SIGPIPE`), so a script can receive them through `VM.OnSignal`. A signal no script handler has claimed ends the process at once with exit code 128 + signal number, nothing torn down. Off leaves your handlers alone. The VM installs no `SIGSEGV` handler either way — a fault inside it reaches *you*. |
+| `installSignals` | on | Installs the VM's handlers for `SIGINT`, `SIGTERM`, `SIGHUP`, `SIGUSR1` and `SIGUSR2` (and ignores `SIGPIPE`; on Windows, a console control handler), so a script can receive them through `VM.OnSignal`. A signal no script handler has claimed ends the process at once with exit code 128 + signal number, nothing torn down. Off leaves your handlers alone. The VM installs no `SIGSEGV` handler either way — a fault inside it reaches *you*. |
 | `startIoPool` | on | Starts the I/O worker threads. Off keeps your process single-threaded; I/O still completes, inline on the host's thread. |
 | `jit` | on | Native code generation. |
 | `optimizations` | on | Constant folding and peephole passes. |
 | `debugInfo` | off | Keeps source line numbers, so stack traces report real lines instead of line 0. Function and file names are kept either way. |
 | `signatureChecks` | on | Verifies a `.flx` fingerprint when one is pinned. |
-| `requireSigned` | off | Refuses `.flx` not signed by a trusted key. |
+| `requireSigned` | off (on with `trustedKeys`) | Refuses `.flx` not signed by a trusted key. |
 | `verbose` | off | Emits the VM's own progress chatter at `FLARIS_LOG_INFO`. |
 | `colors` | auto | ANSI colour in diagnostics: on when stderr is a terminal and `NO_COLOR` is unset. Irrelevant once you set an output handler. |
 
@@ -332,15 +363,43 @@ born with its creator's capabilities and may only narrow from there.
 > imports only; the `flarisvm` command grants `IMPORT_REMOTE` itself, because it
 > runs what the user chose to run.
 
+### Trusted keys
+
+Whose code a host loads is a list, set with `opt.trustedKeys` and
+`opt.trustedKeyCount`: each entry is an Ed25519 public key as 64 hex digits,
+the form `flarisvm --sig-info app.flx` prints for a file you signed with
+`flarisvm --compile app.fls app.flx --sign=<keyfile>`.
+
+```c
+static const char *const keys[] = {
+    "<your release key: the 64 hex digits --sig-info prints>",
+};
+opt.trustedKeys = keys;
+opt.trustedKeyCount = 1;
+```
+
+- **The list is the whole trust set.** The official Flaris key built into the
+  library and every `trusted_keys` file are ignored, so a `.flx` runs only when
+  a key you named signed it. Ship the standard libraries signed with your own
+  key, or put the Flaris key in the list.
+- **`requireSigned` turns on with it**, so an unsigned `.flx` is refused as well.
+  Setting `requireSigned = FLARIS_OFF` yourself goes back to warning instead of
+  refusing; a tampered or stripped signature is refused either way.
+- **A key that is not exactly 64 hex digits makes `FlarisHostCreate` fail**,
+  as an out-of-range limit does.
+- **Borrowed**: the array and its strings must outlive the host.
+
 ### Limits
 
 | Limit | Default | Range |
 |-------|---------|-------|
-| `stackSize` | 1024 | 64–65535 value-stack slots |
+| `stackSize` | 1024 | 64–65535 value-stack slots, call frames' locals included |
 | `maxSlabs` | 1024 | object-pool ceiling |
+| `maxAlloc` | 64 GB | bytes the VM holds on the heap, the object pool aside |
 | `maxFibers` | 256 | power of two, 2–1024 |
 | `maxFrames` | 64 | 8–1024 call frames per fiber |
 | `ioThreads` | 0 | 0 scales to the CPU count; ≤ 16 |
+| `maxCheckpoints` | 0 (no bound) | checkpoints one call may run; needs `jit` off |
 | `libsPath` | none | Where `import` looks, `;`-separated. **Borrowed** — must outlive the host. |
 
 Every limit reads `0` as "keep the default", so you set only what you care
@@ -348,13 +407,43 @@ about. An out-of-range value makes `FlarisHostCreate` **fail** with
 `FLARIS_ERR_INIT` rather than being quietly clamped, and nothing is started when
 it does.
 
-`maxSlabs` is the host's memory ceiling: a script that allocates past it gets
-`Exception.OutOfMemory`, which it may catch and which otherwise reaches you as an
-ordinary raise (section 12). `maxFrames` bounds recursion: a call frame carries
-the locals array, so it costs about a kilobyte. A fiber makes its frames as it
-first calls that deep and keeps them for its next calls, so one that stays a few
-calls deep holds a few kilobytes, and only a fiber that reaches the limit holds
-all 64. Exceeding it raises a catchable stack exception.
+`maxSlabs` bounds how many values a script holds at once, and `maxAlloc` how
+many bytes the VM holds besides: the contents of strings, arrays and buffers,
+property tables, fibers, streams and compiled code, counted for this host alone.
+A script that allocates past either gets `Exception.OutOfMemory`, which it may
+catch and which otherwise reaches you as an ordinary raise (section 12). Single
+values stay capped as well: a string at 256 MB, any one allocation at 2 GiB. One
+thing to size for: what an I/O read hands a script is counted when the script
+takes it, so one read can pass the ceiling by its own size before the next
+allocation is refused. `maxFrames` bounds recursion: a fiber allocates its frame records with its
+value stack, 56 bytes each on a 64-bit build (3.5 KB for the default 64). A
+frame's parameters and locals live on the value stack, so a deep recursion can
+run out of `stackSize` first. Exceeding either raises a catchable stack
+exception.
+
+`maxCheckpoints` bounds **time**, as a count rather than a clock: the loop
+back-edges and calls one call into the host may pass. Everything the call runs
+spends it — callbacks a builtin
+makes, fibers the script starts, detached ones too — and every
+`FlarisFunctionCall`, `FlarisFiberStep` and load starts with all of it again. A
+call made from inside one of your host functions shares its caller's.
+
+- **Spent, the script is stopped** with `Exception.Interrupted`, each fiber at
+  its next checkpoint: every enclosing `finally` runs, no `catch` is offered
+  it, and a call stopped this way returns `FLARIS_ERR_RAISED`. Code that
+  finishes without reaching another checkpoint finishes. The host is usable
+  afterwards.
+- **A script that does not wait stops at the same point** on every machine for
+  the same input, so a test can find what it needs and you can set the limit
+  with a margin.
+- **It needs `jit = FLARIS_OFF`**, since native code passes no checkpoint;
+  `FlarisHostCreate` fails otherwise.
+- **It counts the script, not the wait.** Time spent parked in a sleep or on
+  I/O costs nothing; bound that with `FlarisFiberStep`'s `maxWaitMs` (section 7).
+  A single builtin doing a lot of work, such as sorting a huge array, counts as
+  one call, and the size of its input is what bounds how much it has to work on.
+- **A `finally` that never ends is not bounded:** the stop does not interrupt
+  the cleanup it starts.
 
 ### Host modules and the rest
 
@@ -410,7 +499,9 @@ FlarisHostLoadScript(host, "fn Bonus(score: int): int { return score + 25; }\n",
 
 The replacement is for the host. A function the first script defined that calls
 `Bonus` keeps calling the version it was loaded with, so patch a function
-together with its callers.
+together with its callers. A replaced function is not freed with the replacement:
+what a script defined may stay in memory until the host is destroyed, so a host
+that reloads scripts without end should start a new host now and then.
 
 The flip side is that two scripts which both declare `config`, or both define
 `Init`, overwrite each other. Load into one host only scripts written to share a
@@ -922,6 +1013,11 @@ FLARIS_T_BLOCK   FLARIS_T_ANY
 They are bit flags, so `FLARIS_T_INT | FLARIS_T_FLOAT` accepts either. `0` in a
 slot means the same as `FLARIS_T_ANY`.
 
+The compiler checks a call against these types where it can see an argument's
+type; at run time nothing does, so a value of another type can reach your
+function. The readers give it `0` or `NULL`, as they give `nil`, which every
+typed slot admits - test the type first where it matters.
+
 `required` is how many arguments must be supplied and `optional` how many more
 may be. A function declaring `2, 1` accepts two or three; check `argc` yourself
 to see which you got. The maximum is six (`FLARIS_MAX_HOST_ARGS`).
@@ -979,7 +1075,8 @@ interpreted.
 - **Compiled scripts become yours.** A `.flx` containing calls into your module
   runs only in a host that registers those exact names. That is the intended
   shape: these are your application's scripts, compiled when your host loads
-  them, not artifacts meant to run under a plain `flarisvm`.
+  them or ahead of time with `FlarisHostCompile` (section 3), not artifacts
+  meant to run under a plain `flarisvm`.
 - **No `unsafe` needed.** Unlike the FFI plugin path, a native module works
   with the default configuration.
 
@@ -1015,13 +1112,29 @@ for the script (`Array.Map`, `Memory.Process`, ...) too.
 
 The constants are `FLARIS_MOD_` plus the module name in upper case:
 `FLARIS_MOD_FILE`, `FLARIS_MOD_NET`, `FLARIS_MOD_OS`, `FLARIS_MOD_JSON` and so
-on, one for each of the 32 built-in modules. They are positional, so recompile
-against the header you ship with.
+on, one for each built-in module except `Weak`, which has no constant of its own.
+They are positional, so recompile against the header you ship with.
+
+Which module to deny for which resource:
+
+| To withhold | Deny | What goes with it |
+|-------------|------|-------------------|
+| Files | `FLARIS_MOD_FILE`, `FLARIS_MOD_DIRECTORY`, `FLARIS_MOD_FILEWATCH` | `Stream.Open` with a path, `Stream.SendFile` and `Stream.OpenSerial` need `File` too. `Path` is name arithmetic, except `Path.TempFile`, which creates an empty file, and `Path.GetFullPath` / `GetCurrentDir`, which report where the process is: deny `FLARIS_MOD_PATH` when that matters |
+| The network | `FLARIS_MOD_NET` | `Stream.Connect`, `ConnectAsync`, `ConnectTls`, `ConnectTlsAsync` and `Stream.Listen` need `Net` too |
+| Processes and the environment | `FLARIS_MOD_OS` | |
+| Native code and raw memory | `FLARIS_MOD_FFI`, `FLARIS_MOD_MEMORY` | off by default as capabilities as well (section 5) |
+
+`Stream` itself is the plumbing: reads and writes on a stream the script already
+holds, in-memory streams over a block, pipes and the standard streams. A stream
+opened by name needs the module that owns what the name stands for, so the mask
+above leaves no way to a file or a socket through `Stream`, and a host can allow
+sockets without files or the other way round. Deny `FLARIS_MOD_STREAM` as well
+to take stream I/O away altogether.
 
 TLS is not separately gated. A client speaking `https://` is doing what `Net`
-and `Stream` are for; if a script should not reach the network, deny those
-modules. What does need its own gate is a script's ability to **load more code**,
-which is what the `FLARIS_CAP_IMPORT_*` capabilities in section 5 are for.
+is for; if a script should not reach the network, deny that module. What does
+need its own gate is a script's ability to **load more code**, which is what the
+`FLARIS_CAP_IMPORT_*` capabilities in section 5 are for.
 
 ### What this is, and what it is not
 
@@ -1033,12 +1146,14 @@ The unit is the **whole module**. Denying `FLARIS_MOD_OS` removes `Os.Execute`
 and `Os.Spawn`, and also `Os.Args` and `Os.Arch`, which only report the
 environment. It errs towards denying more.
 
-And it bounds **capability, not consumption**. `maxFrames` bounds how deep a
-script can recurse and `maxSlabs` how much it can allocate (section 5), but
-nothing bounds how long a call runs: a script with every module denied can still
-loop forever, the VM has no timeout of its own, and there is currently no way to
-stop a running call from another thread. If you are running code you do not
-trust at all, run its host in a process you can kill.
+Consumption is bounded separately (section 5): `maxFrames` bounds how deep a
+script can recurse, `maxSlabs` how many values it can hold, `maxAlloc` how many
+bytes, and `maxCheckpoints`
+how long a call runs, with the JIT off. Without `maxCheckpoints` a script with
+every module denied can still loop forever, and there is no way to stop a
+running call from another thread. Work inside your own host functions, and a
+`finally` that never ends, are outside all three: if you are running code you do
+not trust at all, run its host in a process you can kill.
 
 ---
 
@@ -1146,13 +1261,21 @@ decision to stop is not a decision that your application should stop:
 
 Two things are outside that guarantee, and both are yours to control:
 
-- **Allocator exhaustion is fatal only as a last resort.** When the object pool
-  hits `opt.maxSlabs`, the allocation raises `Exception.OutOfMemory` out of a
-  small reserve kept for exactly that, so the script (and your call) sees an
-  ordinary raise, and it is told again if it exhausts the pool again. Only when
-  the system itself refuses memory does the VM report and exit — there is no
-  memory left to build an exception in. Size `maxSlabs` for your workload; the
-  default ceiling is 1024 slabs.
+- **Allocator exhaustion is fatal only when the system refuses memory.** When
+  the object pool hits `opt.maxSlabs`, the allocation raises
+  `Exception.OutOfMemory` out of one more slab that only the raise may use, so
+  the script (and your call) sees an ordinary raise, and it is told again if it
+  exhausts the pool again. A script that catches it and keeps allocating until
+  that last slab is full as well is stopped like a spent budget: every enclosing
+  `finally` runs, no `catch` is offered the `OutOfMemory`, and your call returns
+  `FLARIS_ERR_RAISED`. Each such stop lets the pool grow one slab past the
+  ceiling. An allocation that would pass `opt.maxAlloc` is refused the same
+  way, as an ordinary `Exception.OutOfMemory`. Building that exception is never
+  refused, and neither is the rest of what the call that reached the ceiling
+  builds, so that one call can pass it by that much; an array, map or buffer the
+  script keeps does not grow past it. When the system itself refuses memory, the VM reports and exits —
+  there is no memory left to build an exception in. Size `maxSlabs` and
+  `maxAlloc` for your workload; the defaults are 1024 slabs and 64 GB.
 - **The signal handlers are opt-out.** With `installSignals` left on, a
   `SIGINT`, `SIGTERM` or `SIGHUP` that no script handler has claimed ends the
   process immediately (exit code 128 + signal number) with nothing torn down. Set
@@ -1279,8 +1402,7 @@ acts on the calling thread and its host.
 ## 14. Embedding from C#
 
 `libflaris` is a plain C shared library that exports 45 functions, all prefixed
-`Flaris`, and one constant, `flarisHostOptionsDefaults` — no other public
-surface. That makes it a direct P/Invoke target — no C++ name mangling, no
+`Flaris` — no other public surface. That makes it a direct P/Invoke target — no C++ name mangling, no
 wrapper layer, no generated glue.
 
 Everything in this guide works from C#, including native modules whose functions
@@ -1359,10 +1481,12 @@ public unsafe struct FlarisNative
 }                                                                    // 56 bytes
 ```
 
-`FlarisHostOptions` is 112 bytes and `FlarisModule` 24, and neither needs
+`FlarisHostOptions` is 144 bytes and `FlarisModule` 24, and neither needs
 attributes beyond `LayoutKind.Sequential` — every field is an `int`, `uint`,
 `ushort`, `ulong` or pointer, in declaration order, and the natural alignment C#
-gives them is the C layout.
+gives them is the C layout. Set the first field, `size`, to
+`(uint)sizeof(FlarisHostOptions)` of your declaration, as
+`flarisHostOptionsDefaults` does in C.
 
 ### Registering a module of C# functions
 
@@ -1612,20 +1736,23 @@ fibers meanwhile; a plain function or a load that waits returns
 only while a later call waits or a fiber is stepped (section 7). For parallelism,
 start a second host on a second thread.
 
-**A running call cannot be stopped.** There is currently no way to interrupt a
-call from another thread, and the VM has no timeout of its own: a script that
-loops forever holds the calling thread for good. A wait can be bounded — start
-the call with `FlarisFunctionCallAsync` and step it with your own deadline
-(section 7) — but a loop inside a function compiled to native code still runs to
-its end before the step returns. Recursion depth (`maxFrames`)
-and memory (`maxSlabs`) are bounded per host; time is not. Code you do not trust
-at all belongs in a process you can kill.
+**A running call cannot be stopped from outside.** There is no way to interrupt
+a call from another thread. With the JIT off, `maxCheckpoints` (section 5) stops
+a script that runs too long from inside; without it a script that loops forever
+holds the calling thread for good. A wait can be bounded — start the call with
+`FlarisFunctionCallAsync` and step it with your own deadline (section 7) — but a
+loop inside a function compiled to native code still runs to its end before the
+step returns. Recursion depth (`maxFrames`), values held (`maxSlabs`), heap bytes
+(`maxAlloc`) and, with the
+JIT off, running time (`maxCheckpoints`) are bounded per host. Code you do not
+trust at all belongs in a process you can kill.
 
 **A native module is bound to the host that registers it.** Section 9 covers
 this in full: a `.flx` containing calls into your module runs only in a host
 that registers those exact names, and the standalone `flarisvm --compile` cannot
 compile a script that calls one, because it does not know your module. Compile
-such scripts from your own host, at load.
+such scripts from your own host: at load, or ahead of time with
+`FlarisHostCompile`.
 
 **A malformed `.flx` is refused, not survived halfway.** The bytecode reader
 abandons the whole load on the first inconsistency — `FlarisHostLoadProgram`
@@ -1650,7 +1777,7 @@ Everything below is declared in `flaris.h`.
 |----------|-------------|
 | `int FlarisHostCreate(const FlarisHostOptions *options, FlarisHost **outHost)` | Start a host on this thread. `NULL` options means defaults. `FLARIS_ERR_INIT` when an option is rejected, `FLARIS_ERR_BUSY` when the thread already has a host, `FLARIS_ERR_ARGS` / `REGISTERED` / `COLLISION` for a bad module table. Nothing is left running on failure. |
 | `int FlarisHostDestroy(FlarisHost *host)` | Tear it down; every value and function handle it gave out dies. `FLARIS_ERR_BUSY` from inside one of its own calls, `FLARIS_ERR_WRONG_THREAD` from another thread. |
-| `const FlarisHostOptions flarisHostOptionsDefaults` | Every field `FLARIS_DEFAULT` / 0: the behaviour the `flarisvm` command runs with. |
+| `const FlarisHostOptions flarisHostOptionsDefaults` | Every field `FLARIS_DEFAULT` / 0: the behaviour the `flarisvm` command runs with; `size` set for your `flaris.h`. Defined in the header itself. |
 | `FlarisHostOptions.output` / `.outputUserData` | Where script output (`FLARIS_OUTPUT`) and diagnostics (`FLARIS_LOG_*`) go; `NULL` is stdout and stderr as the `flarisvm` command writes them. |
 | `void FlarisSetArgs(int argc, char **argv)` | Make argv visible to `Os.Args`. Borrows `argv`; one for the whole process. |
 
@@ -1661,6 +1788,7 @@ Everything below is declared in `flaris.h`.
 | `int FlarisHostLoadProgram(host, const char *path)` | Load a `.flx` and run its top level. |
 | `int FlarisHostLoadSource(host, const char *path)` | The same, compiling a `.fls`. Not in a runtime-only build. |
 | `int FlarisHostLoadScript(host, const char *source, const char *name)` | The same, from memory. `name` labels diagnostics; `NULL` means `"<host>"`. Not in a runtime-only build. |
+| `int FlarisHostCompile(host, const char *srcPath, const char *outPath, const char *signKey)` | Compile a `.fls` against the host's modules into a `.flx` without running it; `signKey` (keyfile or 128 hex, `NULL` unsigned) signs it. Not in a runtime-only build. |
 
 All three land in the host's one global scope and return `FLARIS_OK`,
 `FLARIS_ERR_COMPILE`, `FLARIS_ERR_RAISED` or `FLARIS_ERR_SUSPENDED`.
@@ -1685,7 +1813,8 @@ All three land in the host's one global scope and return `FLARIS_OK`,
 
 `FlarisHostOptions.deniedModules` (`FLARIS_MOD_*`, 0 allows everything) and
 `.grantCaps` / `.denyCaps` (`FLARIS_CAP_*`, deny applied after grant) — sections
-5 and 10.
+5 and 10. `.trustedKeys` / `.trustedKeyCount` (64-hex public keys, the whole
+trust set) — section 5.
 
 ### Native modules
 

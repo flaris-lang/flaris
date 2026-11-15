@@ -16,10 +16,10 @@ every time it spins a script up.
 | ---- | ---------: | -------------: |
 | Flaris (C host) | 30 | 30.0 |
 | Lua 5.5 | 33 | 33.0 |
-| QuickJS | 51 | 51.0 |
-| Duktape 2.7 | 120 | 120.0 |
-| Wren 0.4 | 272 | 272.0 |
-| Janet | 659 | 659.0 |
+| QuickJS | 55 | 55.0 |
+| Duktape 2.7 | 122 | 122.0 |
+| Wren 0.4 | 278 | 278.0 |
+| Janet | 686 | 686.0 |
 
 ## 2. Calling a script function
 
@@ -28,10 +28,10 @@ hook pays. The no-engine row is the same function in C, called directly.
 
 | Host | total (ms) | per call (ns) |
 | ---- | ---------: | ------------: |
-| no engine (C call) | 1 | 1.0 |
-| QuickJS | 9 | 9.0 |
-| Wren 0.4 | 13 | 13.0 |
-| Flaris (C host) | 14 | 14.0 |
-| Lua 5.5 | 16 | 16.0 |
-| Duktape 2.7 | 56 | 56.0 |
-| Janet | 63 | 63.0 |
+| no engine (C call) | 0 | <1 |
+| QuickJS | 10 | 10.0 |
+| Wren 0.4 | 14 | 14.0 |
+| Flaris (C host) | 16 | 16.0 |
+| Lua 5.5 | 17 | 17.0 |
+| Duktape 2.7 | 57 | 57.0 |
+| Janet | 65 | 65.0 |

@@ -10,7 +10,7 @@
 //   SMTP_TEST_PORT      its port                                  (default 1025)
 //   SMTP_TEST_USER      login name                                (default alice)
 //   SMTP_TEST_PASSWORD  password                                  (default secret)
-//   SMTP_TEST_TLS       "auto", "none", "starttls" or "implicit"  (default auto)
+//   SMTP_TEST_TLS       "auto", "none", "starttls" or "implicit"  (default none)
 //   SMTP_TEST_API       a Mailpit API base URL, e.g. http://127.0.0.1:8025;
 //                       when set, every sent message is read back and checked
 //
@@ -521,6 +521,14 @@ fn test_fake_servers() {
     let r14 = new SmtpClient("127.0.0.1", p14, { tls: "none", user: "u", password: "p", timeoutMs: 1000 }).Connect();
     checkEq(r14.errorKind, "auth", "credentials given but no AUTH offered: auth");
 
+    // tls "auto" with credentials and no STARTTLS on offer: the password is
+    // not sent over the plain link, by any mechanism.
+    _received = [];
+    let p14b = fakeServer(["220 fake.test", EHLO_OK, "235 ok", "221 bye"]);
+    let r14b = new SmtpClient("127.0.0.1", p14b, { tls: "auto", user: "u", password: "p", timeoutMs: 1000 }).Connect();
+    checkEq(r14b.errorKind, "tls", "auto + credentials + no STARTTLS: tls");
+    checkEq(lastReceived("AUTH"), nil, "no AUTH command was sent");
+
     let p15 = fakeServer(["220 fake.test", "250 fake.test", "221 bye"]);
     let c15 = new SmtpClient("127.0.0.1", p15, { tls: "none", timeoutMs: 1000 });
     checkEq(c15.Connect().ok, true, "no credentials, no AUTH: fine");
@@ -655,6 +663,10 @@ fn test_dkim() {
     checkEq(Dkim.CanonicalBody("Hi.\r\n\r\nWe lost the game.  Are you hungry yet?  \r\n\r\nJoe.\r\n\r\n\r\n", "relaxed"),
             "Hi.\r\n\r\nWe lost the game. Are you hungry yet?\r\n\r\nJoe.\r\n", "relaxed body canonicalization");
     checkEq(Dkim.CanonicalBody("\r\n\r\n", "relaxed"), "", "an empty body canonicalizes to nothing");
+    // RFC 6376 3.4.5's own example: a leading run of whitespace is one space,
+    // not nothing - real verifiers reject a body hash made without it.
+    checkEq(Dkim.CanonicalBody(" C \r\nD \t E\r\n\r\n\r\n", "relaxed"), " C\r\nD E\r\n",
+            "relaxed body: RFC 6376 3.4.5 example");
     checkEq(Dkim.CanonicalBody("x", "simple"), "x\r\n", "simple body gets its final CRLF");
     let bodyStart = String.IndexOf(RFC8463_MESSAGE, "\r\n\r\n") + 4;
     let bh = Util.Base64Encode(_sha256Block(Dkim.CanonicalBody(String.Substr(RFC8463_MESSAGE, bodyStart), "relaxed")));
@@ -776,6 +788,19 @@ fn async test_session_features() {
     let r4 = c4.Send(MSG);
     checkEq(r4.errorKind, "closed", "a second hang-up is reported as closed");
 
+    // The link goes after the whole message was sent: it may already be
+    // queued, so it is reported as unknown and not sent a second time.
+    _received = [];
+    let p4b = fakeServer(["220 fake.test", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as R1",
+                          "250 ok", "250 ok", "354 go", "close",
+                          "next", "220 again", EHLO_OK, "250 ok", "250 ok", "354 go", "250 queued as R3", "221 bye"]);
+    let c4b = new SmtpClient("127.0.0.1", p4b, { tls: "none", timeoutMs: 1000 });
+    c4b.Send(MSG);
+    let r4b = c4b.Send(MSG);
+    checkEq(r4b.errorKind, "unknown", "no reply after the body: unknown");
+    checkEq(countReceived("DATA"), 2, "the message was not sent again");
+    c4b.Close();
+
     // DKIM through the client: the signature header travels in DATA.
     _received = [];
     let signer = new Dkim({ domain: "x.test", selector: "s1", key: RFC8463_SEED, publicKey: RFC8463_PUBLIC });
@@ -809,7 +834,9 @@ fn test_live() {
     let port = int(Os.Getenv("SMTP_TEST_PORT") ?? "1025");
     let user = Os.Getenv("SMTP_TEST_USER") ?? "alice";
     let password = Os.Getenv("SMTP_TEST_PASSWORD") ?? "secret";
-    let tls = Os.Getenv("SMTP_TEST_TLS") ?? "auto";
+    // Mailpit offers no STARTTLS by default, and "auto" refuses to log in
+    // over a plain link.
+    let tls = Os.Getenv("SMTP_TEST_TLS") ?? "none";
     let api = Os.Getenv("SMTP_TEST_API");
     if (api != nil && api == "") { api = nil; }
     if (api != nil) { Http.Delete(api + "/api/v1/messages"); }

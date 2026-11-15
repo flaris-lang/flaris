@@ -138,7 +138,12 @@
 //   Envelope.Seal(plain, key)                         -> block | nil
 //   Envelope.Open(sealed, key)                        -> block | nil
 //   Envelope.SealWithPassword(plain, password, opts?) -> block | nil
-//   Envelope.OpenWithPassword(sealed, password)       -> block | nil
+//   Envelope.OpenWithPassword(sealed, password, opts?) -> block | nil
+//     The blob names its own Argon2 cost, so a forged one could ask for 1 GiB
+//     and 255 passes per call. opts { maxMemKiB, maxIterations } bound what is
+//     accepted (default 262144 KiB = 256 MiB and 12, four times the seal
+//     defaults); a blob over either opens as nil. Raise them to open blobs
+//     sealed with a higher cost.
 //   Envelope.DeriveKey(password, salt, opts?)         -> block (32) | nil
 //
 //   Crypto.Encrypt hands back cipher, nonce and tag as three values. Seal packs
@@ -460,7 +465,10 @@ class Kdf {
     }
 
     // HKDF-Expand: OKM = T(1) | T(2) | ...  with T(i) = HMAC(PRK, T(i-1) | info | i).
-    fn static HkdfExpand(prk, info, length: int, hash?): block {
+    fn static HkdfExpand(prk, info, length, hash?): block {
+        // Untyped on purpose: a typed method parameter raises on a wrong type
+        // before this body runs, and the contract here is nil.
+        if (Type.Of(length) != Type.Int) { return nil; }
         let id = _hashId(hash, HASH_SHA256);
         if (id == 0 || !_isBytes(prk) || len(prk) == 0) { return nil; }
         let hlen = _hashLen(id);
@@ -493,7 +501,8 @@ class Kdf {
         return okm;
     }
 
-    fn static Hkdf(ikm, salt, info, length: int, hash?): block {
+    fn static Hkdf(ikm, salt, info, length, hash?): block {
+        if (Type.Of(length) != Type.Int) { return nil; }
         let prk = Kdf.HkdfExtract(salt, ikm, hash);
         if (prk == nil) { return nil; }
         return Kdf.HkdfExpand(prk, info, length, hash);
@@ -501,7 +510,8 @@ class Kdf {
 
     // PBKDF2: DK = T(1) | T(2) | ...  with T(i) = U1 ^ U2 ^ ... ^ Uc,
     // U1 = HMAC(P, S | INT32BE(i)), Uj = HMAC(P, Uj-1).
-    fn static Pbkdf2(password, salt, iterations: int, length: int, hash?): block {
+    fn static Pbkdf2(password, salt, iterations, length, hash?): block {
+        if (Type.Of(iterations) != Type.Int || Type.Of(length) != Type.Int) { return nil; }
         let id = _hashId(hash, HASH_SHA256);
         if (id == 0 || !_isBytes(password) || !_isBytes(salt)) { return nil; }
         if (iterations < 1 || length < 1) { return nil; }
@@ -545,7 +555,8 @@ class Kdf {
 class Otp {
 
     // HOTP(K, C): dynamic truncation of HMAC(K, C as 8-byte big-endian).
-    fn static Hotp(secret, counter: int, digits?, hash?): string {
+    fn static Hotp(secret, counter, digits?, hash?): string {
+        if (Type.Of(counter) != Type.Int) { return nil; }
         let id = _hashId(hash, HASH_SHA1);
         let d = (digits == nil) ? 6 : digits;
         if (id == 0 || Type.Of(d) != Type.Int || d < 6 || d > 8) { return nil; }
@@ -807,14 +818,19 @@ class Envelope {
         return out;
     }
 
-    fn static OpenWithPassword(sealed, password): block {
+    fn static OpenWithPassword(sealed, password, opts?): block {
         let b = _toBlock(sealed);
         if (b == nil || !_isBytes(password)) { return nil; }
+        // The cost comes from the blob, which may be forged: bound it before
+        // spending it.
+        let maxM = _optInt(opts == nil ? nil : opts.maxMemKiB, ARGON_DEFAULT_MEM * 4);
+        let maxT = _optInt(opts == nil ? nil : opts.maxIterations, ARGON_DEFAULT_ITER * 4);
+        if (maxM == nil || maxT == nil) { return nil; }
         let hdr = 1 + 4 + 1 + ARGON_SALT_BYTES;
         if (len(b) < hdr + NONCE_BYTES + TAG_BYTES + 1 || b[0] != ENVELOPE_V2) { return nil; }
         let m = Buffer.ReadU32At(b, 1, true);
         let t = (u8)b[5];
-        if (m < ARGON_MIN_MEM || m > ARGON_MAX_MEM || t < 1) { return nil; }
+        if (m < ARGON_MIN_MEM || m > ARGON_MAX_MEM || m > maxM || t < 1 || t > maxT) { return nil; }
         let salt = Buffer.Slice(b, 6, ARGON_SALT_BYTES);
         let key = _hexToBlock(Crypto.Argon2(password, salt, t, m));
         if (key == nil) { return nil; }
@@ -1237,7 +1253,7 @@ class Digest {
     let _native = nil;      // Hash.Begin state for SHA-1/256/512; nil for the script algorithms
     let _h = nil;           // [int] state words (4/8 for MD5/SHA-384, 50 lane halves for Keccak)
     let _w = nil;           // [int] message schedule scratch (Keccak: unused)
-    let _buf = nil;         // block(_blockSize): bytes not yet compressed
+    let _buf: block|nil = nil;         // block(_blockSize): bytes not yet compressed
     let _bufLen = 0;
     let _total = 0;         // bytes hashed so far (a 64-bit byte count; see Final)
     let _result = nil;      // block: cached raw digest once Final ran

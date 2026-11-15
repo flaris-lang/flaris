@@ -48,6 +48,27 @@ fn buildServer() {
             if (m.Opcode == Ws.OpcodeBinary()) { ws.SendBinary(m.Payload); }
         }
     });
+    // A ping, then silence longer than the 5 s mid-frame wait, then a message.
+    srv.Get("/ws-pingidle", fn(req, res) {
+        let ws = Ws.Accept(res.Hijack(), req.headers);
+        if (ws == nil) { return; }
+        ws.Ping(nil);
+        Fiber.Sleep(6000);
+        ws.SendText("late");
+        Fiber.Sleep(200);
+        ws.Close(1000, "");
+    });
+    // A frame with RSV1 set: a protocol error the client must fail on.
+    srv.Get("/ws-badframe", fn(req, res) {
+        let sock = res.Hijack();
+        let ws = Ws.Accept(sock, req.headers);
+        if (ws == nil) { return; }
+        let bad = Buffer.Create(4, 1);
+        bad[0] = 0xC1; bad[1] = 0x02; bad[2] = 104; bad[3] = 105;
+        Stream.WriteAll(sock, bad);
+        Fiber.Sleep(500);
+        if (Stream.IsOpen(sock)) { Stream.Close(sock); }
+    });
     // The same echo with a 64-byte message limit; records how it closed.
     srv.Get("/ws-small", fn(req, res) {
         let sock = res.Hijack();
@@ -150,6 +171,26 @@ fn test_ping() {
     check(sawPong, "the server answered the ping with a pong");
     checkEq(text, "echo:after-ping", "the echo still arrives after a ping exchange");
     ws.Close(1000, "");
+    return 0;
+}
+
+fn test_idle_and_protocol_errors() {
+    Console.WriteLine("== idle connections, protocol errors ==");
+    // Between frames a connection may stay quiet: the 5 s wait is for a frame
+    // that has started, not for the next one. This takes about 6 s.
+    let ws = WebSocket.Connect("127.0.0.1", gPort, "/ws-pingidle", nil, false);
+    var got = nil;
+    try { got = ws.Receive(); } catch (_e) { got = nil; }
+    checkEq((got == nil) ? nil : got.Text, "late", "Receive waits out a quiet connection after a ping");
+    if (ws.IsOpen()) { ws.Close(1000, ""); }
+
+    // A malformed frame fails the connection, so nothing more is read out of step.
+    let wb = WebSocket.Connect("127.0.0.1", gPort, "/ws-badframe", nil, false);
+    var threw = false;
+    try { wb.Receive(); } catch (_e) { threw = true; }
+    check(threw, "a frame with RSV bits raises");
+    checkEq(wb.IsOpen(), false, "... and the connection is closed");
+    checkEq(wb.CloseCode(), 1002, "... with 1002, protocol error");
     return 0;
 }
 
@@ -257,6 +298,7 @@ fn Main() {
     test_payload_sizes();
     test_ping();
     test_refusals();
+    test_idle_and_protocol_errors();
     test_message_limit();
     test_abrupt_disconnect();
 

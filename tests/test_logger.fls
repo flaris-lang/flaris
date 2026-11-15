@@ -726,9 +726,16 @@ fn test_json_output() {
     log.Info("hello", { userId: 42, ok: true });
     log.Error("boom", { code: 500 });
     log.InfoWith("metric", { latencyMs: 12 });
+    log.Info("real", { level: "FATAL", msg: "forged" });
 
     let lines = String.Split(String.Trim(File.ReadText(path)), "\n");
-    checkEq(len(lines), 3, "JSON: one object per log call");
+    checkEq(len(lines), 4, "JSON: one object per log call");
+
+    // Caller fields cannot overwrite the record's own level and msg.
+    let e3 = Json.Parse(lines[3]);
+    checkEq(e3.level, "INFO", "JSON: a field named level does not forge the level");
+    checkEq(e3.msg, "real", "JSON: a field named msg does not replace the message");
+    checkEq(e3["fields.level"], "FATAL", "JSON: the colliding field is kept under fields.");
 
     let e0 = Json.Parse(lines[0]);
     checkEq(e0.level, "INFO", "JSON level");
@@ -746,6 +753,29 @@ fn test_json_output() {
     checkEq(e2.latencyMs, 12, "JSON InfoWith carries fields structurally");
 
     File.Delete(path);
+}
+
+fn test_console_and_reopen() {
+    Console.WriteLine("== console sink, reopen after a failed rotation ==");
+    let lc = new Logger();
+    var threw = false;
+    try { lc.SetOutput("console"); } catch (_e) { threw = true; }
+    check(!threw, "SetOutput(\"console\"), the documented default, is accepted");
+
+    // The rotation's reopen fails while the directory is gone; once it is
+    // back, records reach the file again instead of being dropped for good.
+    let dir = Directory.CreateTemp("flaris_logger_reopen");
+    let path = dir + "/app.log";
+    let log = new Logger();
+    log.SetOutput("file", path);
+    log.SetRotation(50, 2);
+    Directory.DeleteAll(dir);
+    log.Info(String.Repeat("x", 60));
+    Directory.Ensure(dir);
+    log.Info("after");
+    check(File.Exists(path) && String.Contains(File.ReadText(path) ?? "", "after"),
+          "logging resumes once the file can be opened again");
+    Directory.DeleteAll(dir);
 }
 
 fn test_rotation() {
@@ -1085,6 +1115,7 @@ fn async Main() {
     test_format_fields();
     test_json_output();
     test_rotation();
+    test_console_and_reopen();
     test_line_forgery();
     test_forgery_via_prefix();
     test_ordinary_text_untouched();

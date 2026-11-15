@@ -31,13 +31,14 @@
 //   Promise.Resolved(value)         - already-resolved promise
 //   Promise.Rejected(reason)        - already-rejected promise
 //   Promise.Canceled(reason)
-//   Promise.From(value)             - wraps value if not already a Promise
+//   Promise.From(value)             - wraps value; a Promise is returned as is
 //   Promise.Run(workFn)             - run workFn in a fiber; returns Promise.
 //                                     workFn gets the promise's id from
 //                                     Promise.ReceiveId() and settles it with
 //                                     Promise.Notify(id, value) or
 //                                     Promise.Fail(id, reason); its return
-//                                     value is not used
+//                                     value is not used, and an exception it
+//                                     throws rejects the promise
 //   Promise.Delay(ms, value?)       - resolves after ms milliseconds
 //   Promise.RejectAfter(ms, reason)
 //
@@ -48,7 +49,8 @@
 //   IsPending()  IsResolved()  IsRejected()  IsCanceled()  IsSettled()
 //   State()  →  string    Value()  →  any    Id()  →  int
 //
-// Chaining (returns new Promise):
+// Chaining (returns new Promise; a handler that returns a Promise settles the
+// new one the way that Promise settles):
 //   Then(onFulfilled)               - called when resolved
 //   Catch(onRejected)               - called when rejected
 //   ThenCatch(onFulfilled, onRejected)
@@ -60,7 +62,8 @@
 //                                     rethrows that exception (class, Code and
 //                                     message intact), any other reason throws
 //                                     code 1 with the reason as its message
-//   AwaitResult()                   →  { ok:bool, value, reason }  - never throws
+//   AwaitResult()                   →  { ok:bool, state, value, reason }  - never throws;
+//                                     reason is nil when resolved
 //   TryAwait(defaultValue)          - returns defaultValue on rejection/cancel
 //
 // Timeout / cancellation:
@@ -76,8 +79,8 @@
 //   Promise.All(promises)           →  array of values; throws if any rejects
 //   Promise.Race(promises)          →  first settled value
 //   Promise.Any(promises)           →  first resolved value; throws if all reject
-//   Promise.AllSettled(promises)    →  array of { ok, value, reason }
-//   Promise.FirstSettled(promises)  →  { ok, value, reason }
+//   Promise.AllSettled(promises)    →  array of { ok, state, value, reason }
+//   Promise.FirstSettled(promises)  →  { ok, state, value, reason }
 //
 // Closures:
 //   Lambdas passed to Then/Catch/Finally/Run capture enclosing locals as any
@@ -144,7 +147,7 @@ class Promise {
     let _handlers = nil; 
     let _state: string = "pending"; 
     let _value = nil; 
-    let _waiters = nil;
+    let _waiters = [];
     let _timers = nil;
     let id = 0;
 
@@ -212,7 +215,13 @@ class Promise {
         let state = this._state;
         let value = this._value;
 
-        foreach (h in this._handlers) {
+        // Taken before running any: a handler that waits lets other fibers in,
+        // and a Then attached meanwhile dispatches again - over the same list,
+        // had it still been here, running every handler a second time.
+        let handlers = this._handlers;
+        this._handlers = [];
+
+        foreach (h in handlers) {
 
             if (state == "resolved") {
                 if (h.onFulfilled != nil) {
@@ -228,7 +237,7 @@ class Promise {
                             }
                         }
 
-                        h.next.Resolve(result);
+                        Promise._Adopt(h.next, result);
                     } catch (e) {
                         h.next.Reject(e);
                     }
@@ -257,7 +266,7 @@ class Promise {
                             }
                         }
 
-                        h.next.Resolve(result);
+                        Promise._Adopt(h.next, result);
                     } catch (e) {
                         h.next.Reject(e);
                     }
@@ -275,7 +284,6 @@ class Promise {
             }
         }
 
-        this._handlers = [];
         Object.Delete(_pr_store, str(this.id));
 
         let waiters = this._waiters;
@@ -284,6 +292,15 @@ class Promise {
         let timers = this._timers;
         this._timers = [];
         foreach (t in timers) { Fiber.Unpark(Fiber.FromId(t)); }
+    }
+
+    // A handler that returns a promise settles `next` the way that promise
+    // settles, not with the promise object as a value.
+    fn static _Adopt(next:instance, result) {
+        if (!(result is Promise)) { next.Resolve(result); return; }
+        let src = result;
+        let dst = next;
+        src.Finally(fn() { dst._PropagateTo(dst, src._state, src._value); });
     }
 
     // ── Chaining ──────────────────────────────────────────────────────────────
@@ -411,11 +428,14 @@ class Promise {
 
     fn AwaitResult(): object {
         this._Wait();
-        return {
-            ok: this._state == "resolved",
-            state: this._state,
-            value: this._value
-        };
+        return this._Result();
+    }
+
+    // { ok, state, value, reason }: reason is the rejection or cancel reason
+    // (nil when resolved); value keeps the settled value either way.
+    fn _Result(): object {
+        let ok = this._state == "resolved";
+        return { ok: ok, state: this._state, value: this._value, reason: ok ? nil : this._value };
     }
 
     fn TryAwait(defaultValue) {
@@ -476,6 +496,7 @@ class Promise {
     }
 
     fn static From(value): instance {
+        if (value is Promise) { return value; }
         return Promise.Resolved(value);
     }
 
@@ -549,9 +570,7 @@ class Promise {
     fn static FirstSettled(promises:array): object {
         while (true) {
             foreach (p in promises) {
-                if (p._state != "pending") {
-                    return { state: p._state, value: p._value };
-                }
+                if (p._state != "pending") { return p._Result(); }
             }
             Promise._WaitAny(promises);
         }
@@ -561,9 +580,7 @@ class Promise {
         foreach (p in promises) { p._Wait(); }
 
         let results = [];
-        foreach (p in promises) {
-            Array.Append(results, { state: p._state, value: p._value });
-        }
+        foreach (p in promises) { Array.Append(results, p._Result()); }
         return results;
     }
 
@@ -587,9 +604,14 @@ class Promise {
 
     // ── Static: fiber-based work helpers ──────────────────────────────────────
 
+    // A worker that throws rejects its promise. Left to itself the exception
+    // would end the whole program, and the promise would never settle.
     fn static Run(workFn:fn): instance {
         let p = new Promise();
-        let fid = Fiber.Run(workFn);
+        let pid = p.id;
+        let fid = Fiber.Run(fn() {
+            try { workFn(); } catch (e) { Promise.Fail(pid, e); }
+        });
         Fiber.SendMessage(Fiber.FromId(fid), p.id);
         return p;
     }

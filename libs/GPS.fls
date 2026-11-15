@@ -1,0 +1,748 @@
+// GPS.fls - NMEA 0183 parser and serial GPS device for Flaris.
+// Version: 1.0
+//
+// Two layers, deliberately separate:
+//
+//   GPS  - pure parsing. Sentence string in, structured object out. No I/O,
+//          no state, safe to call from anywhere. Checksum verification,
+//          coordinate and time conversion, the common sentence types.
+//
+//   Gps  - owns a stream (a serial port from Stream.OpenSerial, or any stream
+//          handed to it). Buffers bytes, splits NMEA lines even when a line
+//          arrives in several reads, parses each one and dispatches it to
+//          OnSentence / OnFix handlers. Keeps the most recent position fix.
+//
+// Usage:
+//   import { GPS, Gps } from library("GPS", "1.0");
+//
+//   // Parse one sentence (checksum verified by default):
+//   let fix = GPS.Parse("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47");
+//   Console.WriteLine(fix.lat);          // 48.1173  (decimal degrees, N/E positive)
+//   Console.WriteLine(fix.lon);          // 11.5166667
+//
+//   // Read a receiver on a serial port:
+//   let gps = GPS.Open("/dev/ttyUSB0");              // 9600 baud 8N1, the NMEA default
+//   let gps = GPS.Open("/dev/ttyUSB0", 115200);
+//   if (!gps.IsOpen()) { Console.WriteLine(gps.Error()); return 1; }
+//
+//   gps.OnFix(fn(f) { Console.WriteLine(f.lat + "," + f.lon); });
+//   gps.OnSentence(fn(s) { Console.WriteLine(s.type); });
+//   while (true) { gps.Poll(1000); }                 // dispatch whatever arrived
+//
+//   let fix = gps.NextFix(5000);                     // block for the next valid fix
+//   let s   = gps.ReadSentence(1000);                // next sentence of any type
+//   gps.Close();
+//
+//   // Or wrap a stream somebody else owns (a pty in a test, a log file):
+//   let g = GPS.Attach(Stream.Open("hike.nmea", "r"));
+//   while (g.Poll(100) > 0) { }
+//
+// Sentences:
+//   GGA  - fix data: time, position, fix quality, satellites, HDOP, altitude,
+//          geoid separation, DGPS age/station
+//   RMC  - recommended minimum: time, status (A/V), position, speed, course,
+//          date, magnetic variation, mode. Carries the date, so RMC is what
+//          gives a full UTC timestamp.
+//   GSA  - dilution of precision: mode, fix type (1/2/3), satellite PRNs, PDOP/HDOP/VDOP
+//   GSV  - satellites in view: message counters plus {prn, elevation, azimuth, snr} per satellite
+//   VTG  - track made good: true/magnetic course, speed in knots and km/h
+//   GLL  - geographic position: lat/lon, time, status, mode
+//   ZDA  - UTC time and date, local zone offset
+//
+//   Any talker prefix is accepted (GP GPS, GL GLONASS, GA Galileo, GB BeiDou,
+//   GQ QZSS, GN mixed); the talker is reported in `talker` and the sentence
+//   kind in `type`, so the same handler serves every constellation. Sentences
+//   starting with '!' (AIS) and proprietary ones ($P..., e.g. $PMTK) parse
+//   too - proprietary ones come back as a generic object with the whole head
+//   in `type` and the raw fields in `fields`. Unknown standard sentences also
+//   come back generic, so nothing is ever silently dropped.
+//
+// Every parsed object carries:
+//   talker    - two-letter talker ("GP"), "" for proprietary
+//   type      - sentence type ("GGA"), or the full head for proprietary
+//   raw       - the sentence as received (trailing CR/LF stripped)
+//   checksum  - the two hex digits after '*' (when the sentence had one)
+//   fields    - the raw comma-split fields, head included at [0]
+// plus the type-specific fields below. Empty NMEA fields become nil.
+//
+// Field reference per type (o = parsed object):
+//   GGA: time(sod) lat lon fixQuality sats hdop altitude geoidSep dgpsAge dgpsStation
+//   RMC: time(sod) status lat lon speedKnots speedKmh course date timestamp iso
+//        magVar mode
+//   GSA: mode fixType sats[] pdop hdop vdop
+//   GSV: totalMsgs msgNum satsInView sats[{prn,elevation,azimuth,snr}]
+//   VTG: courseTrue courseMag speedKnots speedKmh mode
+//   GLL: lat lon time(sod) status mode
+//   ZDA: time(sod) date timestamp iso localZoneHours localZoneMins
+//
+//   time      - float seconds since midnight UTC (hhmmss.ss), nil when absent
+//   date      - "YYYY-MM-DD" (NMEA ddmmyy is read as 20yy), nil when absent
+//   timestamp - Unix seconds UTC, present when both date and time are known
+//   iso       - Time.Format(timestamp, "iso"), same instant as a string
+//
+// Checksums: the XOR of all bytes between '$'/'!' and '*' is compared against
+// the two hex digits after the '*'. A mismatching checksum makes Parse return
+// nil - pass { verifyChecksum: false } to accept the sentence anyway (some
+// devices ship with checksums disabled, and some get them wrong). A sentence
+// without a '*' is parsed as-is. GPS.Validate(sentence) is the standalone
+// check, GPS.Checksum(body) / GPS.ChecksumHex(body) compute one.
+//
+// Coordinates: NMEA writes latitude as ddmm.mmmm and longitude as dddmm.mmmm
+// with a separate N/S/E/W field. GPS.ParseCoord("4807.038", "N") converts to
+// signed decimal degrees (48.1173); S and W are negative. Knots and km/h:
+// GPS.KnotsToKmh / GPS.KmhToKnots (1 knot = 1.852 km/h exactly).
+//
+// Geo math on decimal degrees (spherical earth, R = 6371000 m; nil in, nil
+// out): GPS.Distance(lat1, lon1, lat2, lon2, unit?) - haversine, unit "m"
+// (default) / "km" / "mi" / "nmi"; GPS.Bearing(lat1, lon1, lat2, lon2) -
+// initial bearing 0-360; GPS.Destination(lat, lon, bearing, distM) and
+// GPS.Midpoint(lat1, lon1, lat2, lon2) -> { lat, lon }; GPS.ToDMS(dec, axis?)
+// and GPS.FromDMS(deg, min, sec, dir) convert decimal degrees to/from
+// degrees-minutes-seconds with a hemisphere letter.
+//
+// The Gps fix: LastFix() returns the most recent position, merged from
+// GGA/RMC/GLL (a GGA with fix quality > 0, or an RMC/GLL with status "A").
+// It accumulates: fields a later sentence does not carry keep their earlier
+// value. RMC/ZDA supply the date GGA lacks, so a GGA-only stream still gets a
+// timestamp once any date-bearing sentence has been seen. The fix carries
+// lat lon altitude geoidSep fixQuality satsVisible hdop speedKnots speedKmh
+// course status time date timestamp iso source (which sentence produced it).
+//
+// Reading: like the Modem library, Gps does not use Stream.ReadLine on a port -
+// a serial line routinely arrives in two reads and ReadLine discards the first
+// half - so bytes are pulled in bulk and split here, keeping a partial tail
+// for the next read. Poll(timeoutMs) pumps the stream until the deadline and
+// returns how many valid sentences were dispatched (0 on timeout); NextFix /
+// ReadSentence park the calling fiber (never the OS thread) until one arrives
+// or the deadline passes. Nothing here raises: a port that cannot be opened
+// gives a closed instance - IsOpen() false, Error() saying why - and Poll on
+// it answers 0.
+//
+// Testing without hardware: tests/fake_gps.py emits NMEA sentences on a
+// pseudo-terminal, and Stream.OpenSerial cannot tell it from a real receiver.
+// tests/test_gps.fls starts it and drives the library against it, including a
+// sentence split across two writes. No GPS, no --unsafe.
+//
+//   flarisvm tests/test_gps.fls --libs=./libs
+//
+// Binary protocols (u-blox UBX, SiRF, RTCM) are out of scope: this library
+// speaks NMEA 0183 text only.
+
+class GPS {
+
+    // =========================================================================
+    // Checksum
+    // =========================================================================
+
+    // XOR of every byte of `body` (the part between '$' and '*').
+    fn static Checksum(body:string): int {
+        var x:int = 0;
+        iter (i from 0 to len(body)) { x = x ^ int(body[i]); }
+        return x & 0xFF;
+    }
+
+    // The checksum as two uppercase hex digits ("47"), ready to append after '*'.
+    fn static ChecksumHex(body:string): string {
+        return String.ToUpper(String.PadLeft(Convert.ToRadixString(GPS.Checksum(body), 16), 2, "0"));
+    }
+
+    // True when the sentence is well-formed and its checksum matches. A
+    // sentence with no '*' is not verifiable and returns false.
+    fn static Validate(sentence:string): bool {
+        if (sentence == nil) return false;
+        let s = String.Trim(sentence);
+        let n:int = len(s);
+        if (n < 5) return false;
+        let b0 = s[0];
+        if (b0 != 36 && b0 != 33) return false;          // '$' or '!'
+        let star:int = String.IndexOfFrom(s, "*", 1);
+        if (star < 0 || star + 3 != n) return false;      // exactly 2 hex digits after '*'
+        return GPS.ChecksumHex(String.Substr(s, 1, star - 1))
+               == String.ToUpper(String.Substr(s, star + 1, 2));
+    }
+
+    // =========================================================================
+    // Field helpers
+    // =========================================================================
+
+    // fields[i], or "" when the sentence is short.
+    fn static _at(f:array, i:int): string { return (i < len(f)) ? f[i] : ""; }
+
+    // Float value of a field; empty or unparseable -> nil.
+    fn static _f(s:string) {
+        if (s == nil || len(s) == 0) return nil;
+        return Convert.ParseFloat(s);
+    }
+
+    // Int value of a field; empty or unparseable -> nil.
+    fn static _i(s:string) {
+        if (s == nil || len(s) == 0) return nil;
+        return Convert.ParseInt(s);
+    }
+
+    // Non-empty string field, else nil.
+    fn static _s(s:string) { return (s != nil && len(s) > 0) ? s : nil; }
+
+    // =========================================================================
+    // Conversions
+    // =========================================================================
+
+    // NMEA coordinate: "4807.038" with hemi "N" -> 48.1173 decimal degrees.
+    // S and W come back negative. Minutes >= 60 or a bad hemisphere -> nil.
+    fn static ParseCoord(v:string, hemi:string) {
+        let f = GPS._f(v);
+        if (f == nil || f < 0.0) return nil;
+        let deg:int = int(f / 100.0);
+        let minutes:float = f - float(deg) * 100.0;
+        if (minutes >= 60.0) return nil;
+        var d:float = float(deg) + minutes / 60.0;
+        if (hemi != nil && len(hemi) > 0) {
+            let h = String.ToUpper(hemi);
+            if (h == "S" || h == "W") { d = -d; }
+            else if (h != "N" && h != "E") { return nil; }
+        }
+        return d;
+    }
+
+    fn static KnotsToKmh(knots) { return knots * 1.852; }   // nil in, nil out
+    fn static KmhToKnots(kmh)   { return kmh / 1.852; }
+
+    // =========================================================================
+    // Geo math (decimal degrees in, on a spherical earth R = 6371000 m)
+    // =========================================================================
+
+    const _R = 6371000.0;   // mean earth radius, meters
+
+    // nil coordinates in -> nil out.
+    fn static _geoOk(a, b, c, d): bool {
+        return a != nil && b != nil && c != nil && d != nil;
+    }
+
+    fn static _normLon(lon:float): float {
+        return lon - 360.0 * float(Math.Floor((lon + 180.0) / 360.0));
+    }
+
+    // Great-circle distance between two points (haversine). unit: "m"
+    // (default), "km", "mi" (statute miles) or "nmi" (nautical miles).
+    fn static Distance(lat1, lon1, lat2, lon2, unit?:string) {
+        if (!GPS._geoOk(lat1, lon1, lat2, lon2)) { return nil; }
+        let p1:float = Math.Rad(lat1);
+        let p2:float = Math.Rad(lat2);
+        let dp:float = Math.Rad(lat2 - lat1);
+        let dl:float = Math.Rad(lon2 - lon1);
+        let s1:float = Math.Sin(dp / 2.0);
+        let s2:float = Math.Sin(dl / 2.0);
+        let a:float  = s1 * s1 + Math.Cos(p1) * Math.Cos(p2) * s2 * s2;
+        let d:float  = GPS._R * 2.0 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1.0 - a));
+        let u = (unit != nil) ? unit : "m";
+        if (u == "m")   { return d; }
+        if (u == "km")  { return d / 1000.0; }
+        if (u == "mi")  { return d * 0.000621371192; }
+        if (u == "nmi") { return d / 1852.0; }
+        throw(1, "GPS: unknown distance unit '" + str(unit) + "'");
+    }
+
+    // Initial bearing from point 1 to point 2, degrees clockwise from north,
+    // in [0, 360).
+    fn static Bearing(lat1, lon1, lat2, lon2) {
+        if (!GPS._geoOk(lat1, lon1, lat2, lon2)) { return nil; }
+        let p1:float = Math.Rad(lat1);
+        let p2:float = Math.Rad(lat2);
+        let dl:float = Math.Rad(lon2 - lon1);
+        let y:float  = Math.Sin(dl) * Math.Cos(p2);
+        let x:float  = Math.Cos(p1) * Math.Sin(p2) - Math.Sin(p1) * Math.Cos(p2) * Math.Cos(dl);
+        var b:float  = Math.Deg(Math.Atan2(y, x));
+        if (b < 0.0) { b += 360.0; }
+        return b;
+    }
+
+    // The point reached from (lat, lon) by travelling distM meters on the
+    // given initial bearing. Returns { lat, lon } in decimal degrees.
+    fn static Destination(lat, lon, bearingDeg, distM) {
+        if (lat == nil || lon == nil || bearingDeg == nil || distM == nil) { return nil; }
+        let d:float  = distM / GPS._R;                 // angular distance
+        let th:float = Math.Rad(bearingDeg);
+        let p1:float = Math.Rad(lat);
+        let l1:float = Math.Rad(lon);
+        let sp:float = Math.Sin(p1) * Math.Cos(d) + Math.Cos(p1) * Math.Sin(d) * Math.Cos(th);
+        if (sp > 1.0)  { sp = 1.0; }
+        if (sp < -1.0) { sp = -1.0; }
+        let p2:float = Math.Asin(sp);
+        let l2:float = l1 + Math.Atan2(Math.Sin(th) * Math.Sin(d) * Math.Cos(p1),
+                                       Math.Cos(d) - Math.Sin(p1) * Math.Sin(p2));
+        return { lat: Math.Deg(p2), lon: GPS._normLon(Math.Deg(l2)) };
+    }
+
+    // Midpoint of the great-circle path between two points: { lat, lon }.
+    fn static Midpoint(lat1, lon1, lat2, lon2) {
+        if (!GPS._geoOk(lat1, lon1, lat2, lon2)) { return nil; }
+        let p1:float = Math.Rad(lat1);
+        let p2:float = Math.Rad(lat2);
+        let l1:float = Math.Rad(lon1);
+        let dl:float = Math.Rad(lon2 - lon1);
+        let bx:float = Math.Cos(p2) * Math.Cos(dl);
+        let by:float = Math.Cos(p2) * Math.Sin(dl);
+        let pm:float = Math.Atan2(Math.Sin(p1) + Math.Sin(p2),
+                                  Math.Sqrt((Math.Cos(p1) + bx) * (Math.Cos(p1) + bx) + by * by));
+        let lm:float = l1 + Math.Atan2(by, Math.Cos(p1) + bx);
+        return { lat: Math.Deg(pm), lon: GPS._normLon(Math.Deg(lm)) };
+    }
+
+    // Decimal degrees -> { deg, min, sec, dir }. axis "lat" (default) gives
+    // N/S, "lon" gives E/W; dir follows the sign of dec.
+    fn static ToDMS(dec, axis?:string) {
+        if (dec == nil) { return nil; }
+        let a = (axis != nil) ? axis : "lat";
+        var dir = (a == "lon") ? "E" : "N";
+        var v = dec;
+        if (v < 0.0) { v = -v; dir = (a == "lon") ? "W" : "S"; }
+        let deg:int = int(v);
+        var rem:float = (v - float(deg)) * 60.0;
+        let mn:int = int(rem);
+        let sec:float = (rem - float(mn)) * 60.0;
+        return { deg: deg, min: mn, sec: sec, dir: dir };
+    }
+
+    // Inverse of ToDMS: FromDMS(48, 7, 2.28, "N") -> 48.1173. dir S/W negative.
+    fn static FromDMS(deg, min, sec, dir) {
+        if (deg == nil || min == nil || sec == nil || dir == nil) { return nil; }
+        var d:float = float(deg) + float(min) / 60.0 + float(sec) / 3600.0;
+        let h = String.ToUpper(dir);
+        if (h == "S" || h == "W") { d = -d; }
+        else if (h != "N" && h != "E") { throw(1, "GPS: bad hemisphere '" + str(dir) + "'"); }
+        return d;
+    }
+
+    // "hhmmss.ss" -> seconds since midnight. Out-of-range -> nil.
+    fn static _tod(t:string) {
+        if (t == nil || len(t) < 6) return nil;
+        let h = Convert.ParseInt(String.Substr(t, 0, 2));
+        let m = Convert.ParseInt(String.Substr(t, 2, 2));
+        let s = Convert.ParseFloat(String.Substr(t, 4));
+        if (h == nil || m == nil || s == nil) return nil;
+        if (h > 23 || m > 59 || s < 0.0 || s >= 60.0) return nil;
+        return float(h) * 3600.0 + float(m) * 60.0 + s;
+    }
+
+    // "ddmmyy" -> "YYYY-MM-DD". Two-digit years roll over at 80: 80-99 is
+    // 19xx, 00-79 is 20xx, so a 1994 receiver and a 2024 one both come out
+    // right. Invalid -> nil.
+    fn static _date(ddmmyy:string) {
+        if (ddmmyy == nil || len(ddmmyy) < 6) return nil;
+        let d = Convert.ParseInt(String.Substr(ddmmyy, 0, 2));
+        let m = Convert.ParseInt(String.Substr(ddmmyy, 2, 2));
+        let y = Convert.ParseInt(String.Substr(ddmmyy, 4, 2));
+        if (d == nil || m == nil || y == nil) return nil;
+        if (d < 1 || d > 31 || m < 1 || m > 12) return nil;
+        let yy:int = (y >= 80) ? 1900 + y : 2000 + y;
+        return str(yy) + "-" + String.PadLeft(str(m), 2, "0") + "-" + String.PadLeft(str(d), 2, "0");
+    }
+
+    // "YYYY-MM-DD" plus seconds-of-day -> Unix seconds UTC (nil on a bad date).
+    fn static _timestamp(date:string, tod:float): int|nil {
+        let secs:int = int(tod);
+        let h:int = secs / 3600;
+        let m:int = (secs % 3600) / 60;
+        let s:int = secs % 60;
+        let iso = date + "T" + String.PadLeft(str(h), 2, "0") + ":"
+                + String.PadLeft(str(m), 2, "0") + ":" + String.PadLeft(str(s), 2, "0");
+        return Time.Parse(iso);          // default ISO pattern, UTC
+    }
+
+    // =========================================================================
+    // Parse
+    // =========================================================================
+
+    // Parse one NMEA sentence. Returns the sentence object, or nil when the
+    // sentence is malformed or its checksum fails (opts.verifyChecksum,
+    // default true, controls the checksum test; a sentence without '*' is
+    // always accepted).
+    fn static Parse(sentence:string, opts?) {
+        if (sentence == nil) return nil;
+        let verify:bool = !(opts != nil && ("verifyChecksum" in opts) && opts["verifyChecksum"] == false);
+        let s = String.Trim(sentence);
+        let n:int = len(s);
+        if (n < 4) return nil;
+        let b0 = s[0];
+        if (b0 != 36 && b0 != 33) return nil;              // must start with '$' or '!'
+        var body:string = "";
+        var sum = nil;
+        let star:int = String.IndexOfFrom(s, "*", 1);
+        if (star >= 0) {
+            if (star + 3 != n) return nil;                  // junk after the checksum
+            if (verify && !GPS.Validate(s)) return nil;
+            body = String.Substr(s, 1, star - 1);
+            sum = String.ToUpper(String.Substr(s, star + 1, 2));
+        } else {
+            body = String.Substr(s, 1);
+        }
+        let fields = String.Split(body, ",");
+        let head:string = fields[0];
+        if (len(head) < 3) return nil;
+        var talker:string = String.Left(head, 2);
+        var type:string   = String.Substr(head, 2);
+        if (int(head[0]) == 80 || int(head[0]) == 112) {    // 'P'/'p': proprietary
+            talker = "";
+            type = head;
+        }
+        let o = { talker: talker, type: type, raw: s, fields: fields };
+        if (sum != nil) { o.checksum = sum; }
+        if (type == "GGA") return GPS._gga(o, fields);
+        if (type == "RMC") return GPS._rmc(o, fields);
+        if (type == "GSA") return GPS._gsa(o, fields);
+        if (type == "GSV") return GPS._gsv(o, fields);
+        if (type == "VTG") return GPS._vtg(o, fields);
+        if (type == "GLL") return GPS._gll(o, fields);
+        if (type == "ZDA") return GPS._zda(o, fields);
+        return o;                                           // generic / unknown / proprietary
+    }
+
+    // Attach date/timestamp/iso to a sentence object from its time and date fields.
+    fn static _stamp(o, date) {
+        if (o.time != nil && date != nil) {
+            let ts = GPS._timestamp(date, o.time);
+            if (ts != nil) {
+                o.timestamp = ts;
+                o.iso = Time.Format(ts, "iso");
+            }
+        }
+    }
+
+    // $--GGA: time, lat, NS, lon, EW, quality, sats, hdop, alt, M, geoid, M, age, station
+    fn static _gga(o, f:array) {
+        o.time       = GPS._tod(GPS._at(f, 1));
+        o.lat        = GPS.ParseCoord(GPS._at(f, 2), GPS._at(f, 3));
+        o.lon        = GPS.ParseCoord(GPS._at(f, 4), GPS._at(f, 5));
+        o.fixQuality = GPS._i(GPS._at(f, 6)) ?? 0;
+        o.sats       = GPS._i(GPS._at(f, 7));
+        o.hdop       = GPS._f(GPS._at(f, 8));
+        o.altitude   = GPS._f(GPS._at(f, 9));
+        o.geoidSep   = GPS._f(GPS._at(f, 11));
+        o.dgpsAge    = GPS._f(GPS._at(f, 13));
+        o.dgpsStation = GPS._i(GPS._at(f, 14));
+        return o;
+    }
+
+    // $--RMC: time, status, lat, NS, lon, EW, knots, course, date, magVar, E/W, mode
+    fn static _rmc(o, f:array) {
+        o.time       = GPS._tod(GPS._at(f, 1));
+        o.status     = GPS._s(GPS._at(f, 2));
+        o.lat        = GPS.ParseCoord(GPS._at(f, 3), GPS._at(f, 4));
+        o.lon        = GPS.ParseCoord(GPS._at(f, 5), GPS._at(f, 6));
+        o.speedKnots = GPS._f(GPS._at(f, 7));
+        o.speedKmh   = GPS.KnotsToKmh(o.speedKnots);
+        o.course     = GPS._f(GPS._at(f, 8));
+        o.date       = GPS._date(GPS._at(f, 9));
+        var mv       = GPS._f(GPS._at(f, 10));
+        if (mv != nil && String.ToUpper(GPS._at(f, 11)) == "W") { mv = -mv; }
+        o.magVar     = mv;
+        o.mode       = GPS._s(GPS._at(f, 12));
+        GPS._stamp(o, o.date);
+        return o;
+    }
+
+    // $--GSA: mode, fixType, 12x PRN, pdop, hdop, vdop
+    fn static _gsa(o, f:array) {
+        o.mode    = GPS._s(GPS._at(f, 1));
+        o.fixType = GPS._i(GPS._at(f, 2));
+        let sats  = [];
+        iter (i from 3 to 15) {
+            let p = GPS._at(f, i);
+            if (len(p) > 0) {
+                let pi = Convert.ParseInt(p);
+                Array.Append(sats, (pi != nil) ? pi : p);
+            }
+        }
+        o.sats = sats;
+        o.pdop = GPS._f(GPS._at(f, 15));
+        o.hdop = GPS._f(GPS._at(f, 16));
+        o.vdop = GPS._f(GPS._at(f, 17));
+        return o;
+    }
+
+    // $--GSV: totalMsgs, msgNum, satsInView, then groups of prn, elev, azim, snr
+    fn static _gsv(o, f:array) {
+        o.totalMsgs  = GPS._i(GPS._at(f, 1));
+        o.msgNum     = GPS._i(GPS._at(f, 2));
+        o.satsInView = GPS._i(GPS._at(f, 3));
+        let sats = [];
+        var i:int = 4;
+        // Whole groups only: NMEA 4.10 ends the sentence with a signal id,
+        // a lone field that is not a satellite.
+        while (i + 3 < len(f)) {
+            let prn = GPS._i(GPS._at(f, i));
+            let sat = {
+                prn:       (prn != nil) ? prn : GPS._s(GPS._at(f, i)),
+                elevation: GPS._f(GPS._at(f, i + 1)),
+                azimuth:   GPS._f(GPS._at(f, i + 2)),
+                snr:       GPS._f(GPS._at(f, i + 3)),
+            };
+            Array.Append(sats, sat);
+            i += 4;
+        }
+        o.sats = sats;
+        return o;
+    }
+
+    // $--VTG: courseTrue, T, courseMag, M, knots, N, kmh, K, mode
+    fn static _vtg(o, f:array) {
+        o.courseTrue = GPS._f(GPS._at(f, 1));
+        o.courseMag  = GPS._f(GPS._at(f, 3));
+        o.speedKnots = GPS._f(GPS._at(f, 5));
+        o.speedKmh   = GPS._f(GPS._at(f, 7));
+        o.mode       = GPS._s(GPS._at(f, 9));
+        return o;
+    }
+
+    // $--GLL: lat, NS, lon, EW, time, status, mode
+    fn static _gll(o, f:array) {
+        o.lat    = GPS.ParseCoord(GPS._at(f, 1), GPS._at(f, 2));
+        o.lon    = GPS.ParseCoord(GPS._at(f, 3), GPS._at(f, 4));
+        o.time   = GPS._tod(GPS._at(f, 5));
+        o.status = GPS._s(GPS._at(f, 6));
+        o.mode   = GPS._s(GPS._at(f, 7));
+        return o;
+    }
+
+    // $--ZDA: time, day, month, year, localZoneHours, localZoneMinutes
+    fn static _zda(o, f:array) {
+        o.time = GPS._tod(GPS._at(f, 1));
+        let d  = GPS._i(GPS._at(f, 2));
+        let m  = GPS._i(GPS._at(f, 3));
+        let y  = GPS._i(GPS._at(f, 4));
+        if (d != nil && m != nil && y != nil && d >= 1 && d <= 31 && m >= 1 && m <= 12) {
+            o.date = str(y) + "-" + String.PadLeft(str(m), 2, "0") + "-" + String.PadLeft(str(d), 2, "0");
+            GPS._stamp(o, o.date);
+        }
+        o.localZoneHours = GPS._i(GPS._at(f, 5));
+        o.localZoneMins  = GPS._i(GPS._at(f, 6));
+        return o;
+    }
+
+    // =========================================================================
+    // Device factories
+    // =========================================================================
+
+    // Open a serial port and return the Gps device holding it. baud defaults
+    // to 9600 (the NMEA default); opts: { format: "8N1", flow: "none" } passed
+    // to Stream.OpenSerial. Never raises: a port that cannot be opened comes
+    // back closed - IsOpen() false, Error() saying why.
+    fn static Open(port:string, baud?:int, opts?): Gps {
+        return new Gps(port, baud, opts);
+    }
+
+    // Wrap a stream somebody else owns; Close() will not close it.
+    fn static Attach(stream): Gps {
+        return new Gps(stream);
+    }
+}
+
+// A GPS receiver (or any NMEA source) on a stream. See the header comment.
+class Gps {
+
+    let _s: stream|nil = nil;   // the stream, nil on a parser-only handle
+    let _port   = "";       // port path, "<stream>" for Attach
+    let _own    = false;    // true when Close() must close the stream
+    let _buf    = "";       // bytes read but not yet split into lines
+    let _lines  = [];      // complete lines waiting to be parsed
+    let _gone   = false;    // the stream vanished mid-session
+    let _err: string|nil = nil;      // why the port is not open, for Error()
+    let _onSentence = nil;  // fn(sentenceObject)
+    let _onFix  = nil;      // fn(fixObject)
+    let _fix    = nil;      // most recent position fix (merged)
+    let _fixSeq = 0;        // bumped on every fix update
+    let _sentSeq = 0;       // bumped on every dispatched sentence
+    let _lastSentence = nil;
+    let _lastDate = nil;    // last date seen (RMC/ZDA), for GGA timestamps
+
+    // source: nil (parser-only handle - _ingest works, Poll answers 0), a port
+    // path string (opened with baud, default 9600), or a stream to attach.
+    fn Constructor(source?, baud?:int, opts?) {
+        this._lines = [];
+        if (source == nil) { return; }
+        if (type(source) == Type.String) {
+            let b:int  = (baud != nil) ? baud : 9600;
+            let fmt    = (opts != nil && opts.format != nil) ? opts.format : "8N1";
+            let flow   = (opts != nil && opts.flow   != nil) ? opts.flow   : "none";
+            var s = nil;
+            try { s = Stream.OpenSerial(source, b, fmt, flow); }
+            catch (e) { this._err = "cannot open port: " + e.Error; return; }
+            if (s == nil) { this._err = "cannot open port"; return; }
+            this._s = s;
+            this._port = source;
+            this._own = true;
+        } else if (type(source) == Type.Stream) {
+            this._s = source;
+            this._port = "<stream>";
+            this._own = false;
+        } else {
+            this._err = "source must be a port path, a stream, or nil";
+        }
+    }
+
+    fn IsOpen(): bool { return this._s != nil && !this._gone; }
+    fn Port(): string { return this._port; }
+
+    // Why the stream is not usable, or nil while it is.
+    fn Error() {
+        if (this._gone) { return "stream went away"; }
+        return this._err;
+    }
+
+    // fn(sentenceObject) for every valid sentence; fn(fixObject) for every
+    // valid position update (GGA quality>0, RMC/GLL status "A").
+    fn OnSentence(handler: fn): int { this._onSentence = handler; return 0; }
+    fn OnFix(handler: fn): int      { this._onFix = handler; return 0; }
+
+    fn LastFix() { return this._fix; }
+
+    fn Close() {
+        if (this._own && this._s != nil) { Stream.Close(this._s); }
+        this._s = nil;
+    }
+
+    // -- reading --------------------------------------------------------------
+    //
+    // Stream.ReadLine cannot be used here: on a serial port a line routinely
+    // arrives in two reads and ReadLine discards the first half. Bytes are
+    // pulled in bulk and split into lines here, keeping a partial tail for
+    // the next read.
+
+    fn _pump(waitMs:int): bool {
+        if (this._s == nil) { return false; }
+        if (Stream.WaitReadable(this._s, waitMs) == nil) { return false; }
+        let b = Stream.ReadBytes(this._s, 4096);
+        if (b == nil) {
+            if (!Stream.IsOpen(this._s)) { this._gone = true; }
+            return false;
+        }
+        let chunk = Buffer.ToString(b);
+        if (len(chunk) == 0) { return false; }
+        return this._ingest(chunk) >= 0;    // always true; the buffer is kept either way
+    }
+
+    // Move every complete line (LF-terminated, CR stripped) out of the buffer.
+    fn _split() {
+        var at:int = String.IndexOfAnyFrom(this._buf, "\n", 0);
+        while (at >= 0) {
+            var line = String.Left(this._buf, at);
+            this._buf = String.Substr(this._buf, at + 1);
+            if (String.EndsWith(line, "\r")) { line = String.Left(line, len(line) - 1); }
+            Array.Append(this._lines, line);
+            at = String.IndexOfAnyFrom(this._buf, "\n", 0);
+        }
+    }
+
+    // Feed raw bytes (used by _pump, and directly in tests) and dispatch every
+    // complete line. Returns the number of valid sentences parsed.
+    fn _ingest(chunk:string): int {
+        this._buf = this._buf + chunk;
+        this._split();
+        // A sentence is at most 82 bytes. Input with no line feed at all - a
+        // wrong baud rate, a receiver speaking a binary protocol - would
+        // otherwise grow the buffer without end.
+        if (len(this._buf) > 4096) { this._buf = ""; }
+        return this._dispatch();
+    }
+
+    fn _dispatch(): int {
+        var n:int = 0;
+        while (len(this._lines) > 0) {
+            let line = this._lines[0];
+            Array.RemoveAt(this._lines, 0);
+            let obj = GPS.Parse(line);
+            if (obj == nil) { continue; }        // bad checksum, not a sentence
+            n += 1;
+            this._sentSeq += 1;
+            this._lastSentence = obj;
+            this._handle(obj);
+            if (this._onSentence != nil) { this._onSentence(obj); }
+        }
+        return n;
+    }
+
+    // Fold a sentence into the running fix. Returns true when it was a valid
+    // position update.
+    fn _handle(o) {
+        if (o.type == "RMC" || o.type == "ZDA") {
+            if (o.date != nil) { this._lastDate = o.date; }
+        }
+        var pos:bool = false;
+        if (o.type == "GGA" && o.fixQuality > 0 && o.lat != nil) { pos = true; }
+        if (o.type == "RMC" && o.status == "A" && o.lat != nil)  { pos = true; }
+        if (o.type == "GLL" && o.status == "A" && o.lat != nil)  { pos = true; }
+        if (!pos) { return; }
+        if (this._fix == nil) { this._fix = {}; }
+        let f = this._fix;
+        let keys = ["lat", "lon", "altitude", "geoidSep", "fixQuality", "hdop",
+                    "speedKnots", "speedKmh", "course", "status", "time",
+                    "date", "timestamp", "iso"];
+        foreach (k in keys) { if (o[k] != nil) { f[k] = o[k]; } }
+        if (o.type == "GGA" && o.sats != nil) { f.satsVisible = o.sats; }
+        // A sentence with a time but no date of its own (GGA, GLL) dates the
+        // fix from the last RMC or ZDA - every time, or the timestamp would
+        // stay at the first fix while `time` moved on.
+        if (o.timestamp == nil && o.time != nil && this._lastDate != nil) {
+            let ts = GPS._timestamp(this._lastDate, o.time);
+            if (ts != nil) {
+                f.timestamp = ts;
+                f.iso = Time.Format(ts, "iso");
+            }
+        }
+        f.source = o.type;
+        f.raw = o.raw;
+        this._fixSeq += 1;
+        if (this._onFix != nil) { this._onFix(f); }
+    }
+
+    // -- public reading API ---------------------------------------------------
+
+    // Pump the stream until the deadline; returns how many valid sentences
+    // were dispatched (0 on timeout or a closed stream). Parks the calling
+    // fiber while waiting, never the OS thread.
+    fn Poll(timeoutMs:int): int {
+        if (this._s == nil || this._gone) { return 0; }
+        let deadline:int = Time.Millis() + timeoutMs;
+        var n:int = 0;
+        while (true) {
+            n += this._dispatch();
+            if (len(this._lines) > 0) { continue; }
+            let left:int = deadline - Time.Millis();
+            if (left <= 0) { break; }
+            if (!this._pump(left > 250 ? 250 : left)) { break; }
+        }
+        return n;
+    }
+
+    // Wait up to timeoutMs for the next valid sentence of any type.
+    fn ReadSentence(timeoutMs:int) {
+        if (this._s == nil || this._gone) { return nil; }
+        let before:int = this._sentSeq;
+        let deadline:int = Time.Millis() + timeoutMs;
+        while (true) {
+            let left:int = deadline - Time.Millis();
+            if (left < 0) { left = 0; }
+            // Short slices: Poll runs to its deadline, and a receiver that
+            // talks every 100-200 ms would otherwise hold this for the whole wait.
+            this.Poll(left > 50 ? 50 : left);
+            if (this._sentSeq != before) { return this._lastSentence; }
+            if (Time.Millis() >= deadline || this._gone) { return nil; }
+        }
+    }
+
+    // Wait up to timeoutMs for the next valid position fix.
+    fn NextFix(timeoutMs:int) {
+        if (this._s == nil || this._gone) { return nil; }
+        let before:int = this._fixSeq;
+        let deadline:int = Time.Millis() + timeoutMs;
+        while (true) {
+            let left:int = deadline - Time.Millis();
+            if (left < 0) { left = 0; }
+            this.Poll(left > 50 ? 50 : left);       // short slices, see ReadSentence
+            if (this._fixSeq != before) { return this._fix; }
+            if (Time.Millis() >= deadline || this._gone) { return nil; }
+        }
+    }
+}
+
+export { GPS, Gps };

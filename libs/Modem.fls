@@ -492,6 +492,10 @@ fn _parseDeliver(hex: string): object {
     if (p + 1 > n) { return { ok: false, error: "truncated at SCA" }; }
 
     let first = Buffer.ReadU8At(raw, p); p = p + 1;
+    // TP-MTI 0 is SMS-DELIVER. Storage also holds the messages this modem
+    // sent or has yet to send (SMS-SUBMIT, MTI 1), which have a different
+    // layout and decode as garbage if taken for received ones.
+    if ((first & 3) != 0) { return { ok: false, error: "not an SMS-DELIVER" }; }
     let udhi  = (first & 64) != 0;
 
     // Originating address: length is in *digits*, so the octet count rounds up.
@@ -501,9 +505,14 @@ fn _parseDeliver(hex: string): object {
     let oaType = Buffer.ReadU8At(raw, p); p = p + 1;
     let oaOct  = (oaDigits + 1) / 2;
     if (p + oaOct > n) { return { ok: false, error: "truncated in OA" }; }
-    let oaHex  = String.ToUpper(Util.BinToHex(Buffer.Slice(raw, p, oaOct)));
+    let oaRaw  = Buffer.Slice(raw, p, oaOct);
+    let oaHex  = String.ToUpper(Util.BinToHex(oaRaw));
     p = p + oaOct;
-    let sender = _decodeAddress(oaHex, oaType, oaDigits);
+    // Type of number 5 (0x50 under the 0x70 mask) is alphanumeric: a name
+    // such as "Telia" packed as 7-bit text, its length counted in semi-octets.
+    let sender = ((oaType & 112) == 80)
+        ? _gsmFromSeptets(_gsm7Unpack(oaRaw, (oaDigits * 4) / 7, 0))
+        : _decodeAddress(oaHex, oaType, oaDigits);
 
     if (p + 2 > n) { return { ok: false, error: "truncated at PID/DCS" }; }
     p = p + 1;                                   // TP-PID
@@ -665,6 +674,17 @@ fn _isTerminator(line: string): bool {
         || String.StartsWith(line, "+CMS ERROR:");
 }
 
+// The call results. They end a dial or an answer; arriving during any other
+// command they are unsolicited - the far end hung up - and not its answer.
+fn _isCallResult(line: string): bool {
+    return line == "NO CARRIER" || line == "BUSY" || line == "NO ANSWER" || line == "NO DIALTONE";
+}
+
+fn _isCallCmd(cmd: string): bool {
+    let u = String.ToUpper(cmd);
+    return String.StartsWith(u, "ATD") || u == "ATA" || String.StartsWith(u, "ATO");
+}
+
 // -- port-level serialization -------------------------------------------
 //
 // AT._acquire()/_release() below already serialize multiple Send() calls
@@ -789,13 +809,13 @@ class Pending {
 }
 
 class AT {
-    let _s      = nil;
+    let _s: stream|nil = nil;
     let _owned  = false;      // true when Open() made the stream and must close it
     let _buf    = "";         // bytes read but not yet split into lines
-    let _lines  = nil;        // complete lines waiting to be consumed
+    let _lines  = [];        // complete lines waiting to be consumed
     let _urcs   = nil;        // [prefix, handler] pairs
     let _trace  = nil;
-    let _queue  = nil;        // FIFO of fiber ids waiting for the port
+    let _queue  = [];        // FIFO of fiber ids waiting for the port
     let _port   = "";
     let _gone   = false;      // the port vanished (USB re-enumeration)
     let _pending = nil;       // URCs seen mid-command, dispatched after it ends
@@ -807,6 +827,8 @@ class AT {
     let _resync = false;      // a command was abandoned; the stream is suspect
     let _resyncUntil = 0;     // ... and its reply was owed until this time
     let _sentCmd = false;     // the command in flight reached the wire
+    let _holder = nil;        // fiber id holding the port, nil when free
+    let _depth  = 0;          // how many times _holder has taken it (Exclusive + Send)
 
     fn Constructor(stream, port: string, owned: bool) {
         this._s     = stream;
@@ -937,17 +959,18 @@ class AT {
     fn _pump(waitMs: int): bool {
         if (this._s == nil) { return false; }
         if (Stream.WaitReadable(this._s, waitMs) == nil) { return false; }
-        let b = Stream.ReadAll(this._s, 4096, 1);
+        let b = Stream.ReadBytes(this._s, 4096);
         if (b == nil) {
             // A hard error on a port that is no longer open means the device
             // went away - a modem reset re-enumerates USB and takes the tty
             // with it. That is a different outcome from a timeout.
-            if (!Stream.IsOpen(this._s)) { this._gone = true; }
+            if (!Stream.IsOpen(this._s)) { this._vanished(); }
             return false;
         }
         let chunk = Buffer.ToString(b);
         if (len(chunk) == 0) { return false; }
-        if (this._trace != nil) { this._trace("rx", chunk); }
+        // A modem with echo on sends the command back, PIN included.
+        if (this._trace != nil) { this._trace("rx", _redact(chunk)); }
         this._buf = this._buf + chunk;
         this._split();
         return true;
@@ -1051,12 +1074,31 @@ class AT {
     // background - there is one scheduler and a hidden reader fiber would race
     // the command path - so an application that wants unsolicited notifications
     // calls this from its idle loop.
+    //
+    // It reads only while holding the port, in slices of at most 100 ms, so a
+    // command on another fiber gets the port between slices - and its reply
+    // is read by that command, not swallowed here as a stray line. A line that
+    // is not a notification is dropped: with no command in flight it can only
+    // be the late reply of one that timed out.
     fn Poll(ms: int): int {
         let deadline = Time.Millis() + (ms < 0 ? 0 : ms);
         var n = 0;
         while (true) {
-            let line = this._nextLine(deadline);
-            if (line == nil) { break; }
+            let now = Time.Millis();
+            if (now >= deadline && len(this._lines) == 0) { break; }
+            let slice = (deadline - now > 100) ? now + 100 : deadline;
+            var line = nil;
+            this._acquire();
+            try {
+                line = this._nextLine(slice);
+            } finally {
+                this._release();
+            }
+            if (line == nil) {
+                if (this._gone || this._s == nil) { break; }
+                continue;
+            }
+            // Outside the port: a handler may issue commands of its own.
             if (this._dispatchUrc(line)) { n = n + 1; }
         }
         return n;
@@ -1065,19 +1107,55 @@ class AT {
     // -- the port is single-user -------------------------------------------
     //
     // A modem answers one command at a time, so two fibers issuing commands
-    // would interleave their replies beyond repair. There is no Mutex builtin,
-    // and a plain busy flag is not safe: the scheduler can deschedule between
-    // testing it and setting it. A FIFO of fiber ids has no such window -
-    // Array.Append is one operation - and it keeps the order fair.
+    // would interleave their replies beyond repair. A FIFO of fiber ids keeps
+    // the order fair. The holder may take it again (Exclusive around Sends),
+    // and a fiber cancelled or failing while it waits leaves the queue - left
+    // there, every later command would wait behind a fiber that is gone.
     fn _acquire(): int {
         let me = Fiber.Id();
+        if (this._holder == me) { this._depth = this._depth + 1; return 0; }
         Array.Append(this._queue, me);
-        while (this._queue[0] != me) { Fiber.Sleep(2); }
+        var got = false;
+        try {
+            while (this._queue[0] != me) { Fiber.Sleep(2); }
+            got = true;
+        } finally {
+            if (!got) {
+                let i = Array.IndexOf(this._queue, me);
+                if (i >= 0) { Array.RemoveAt(this._queue, i); }
+            }
+        }
+        this._holder = me;
+        this._depth = 1;
         return 0;
     }
 
     fn _release(): int {
+        if (this._depth > 1) { this._depth = this._depth - 1; return 0; }
+        this._holder = nil;
+        this._depth = 0;
         if (len(this._queue) > 0) { Array.RemoveAt(this._queue, 0); }
+        return 0;
+    }
+
+    // Run f with the port held, so a method that needs several commands in a
+    // row - set a format, read, set it back - is not interleaved with another
+    // fiber's. Commands inside f take the port again, which the holder may.
+    fn Exclusive(f: fn) {
+        this._acquire();
+        try { return f(); }
+        finally { this._release(); }
+    }
+
+    // The device vanished: the stream is closed and the port path given up, so
+    // a new instance - the device back under the same name - can take it
+    // instead of finding it "busy" for the rest of the process.
+    fn _vanished(): int {
+        this._gone = true;
+        if (this._s != nil && this._owned) { Stream.Close(this._s); }
+        if (this._owned) { this._s = nil; }   // so Close() does not close it twice
+        _portRelease(this._port, this._portTok);
+        this._portTok = nil;
         return 0;
     }
 
@@ -1100,9 +1178,35 @@ class AT {
     // that lands in this window is gone. That is the right trade - a URC that
     // may actually be a fragment of a stale reply is not worth keeping - but
     // it is a reason to cancel commands sparingly rather than routinely.
+    // A command that timed out after reaching the wire is owed a reply just as
+    // an abandoned one is: it may still come, and the next command must not
+    // take it for its own. A few seconds more is all it is waited for.
+    fn _afterTimeout(r): int {
+        if (r != nil && r.errorKind == "timeout" && this._sentCmd) {
+            this._resync = true;
+            this._resyncUntil = Time.Millis() + 5000;
+        }
+        return 0;
+    }
+
     fn _resyncPort(): bool {
         this._resync = false;
         if (this._s == nil) { return false; }
+
+        // A late reply that landed while nothing was reading is in the OS
+        // buffer, not in _lines: read what is there now, and stop at its end.
+        this._buf = "";
+        this._lines = [];
+        while (this._pump(1)) {
+            foreach (line in this._lines) {
+                if (_isTerminator(line)) {
+                    this._buf = "";
+                    this._lines = [];
+                    return true;
+                }
+            }
+            this._lines = [];
+        }
 
         // What is owed is one reply, and a reply ends in a terminator - OK,
         // ERROR, +CME/+CMS ERROR. Discarding up to and including that line is
@@ -1173,6 +1277,7 @@ class AT {
             this._inCmd = true;
             this._cmdPrefix = AT._replyPrefix(cmd);
             r = this._exchange(cmd, timeoutMs, nil);
+            this._afterTimeout(r);
             done = true;
         } finally {
             // An unwind here means this command never read its reply, so the
@@ -1202,6 +1307,7 @@ class AT {
             this._inCmd = true;
             this._cmdPrefix = AT._replyPrefix(cmd);
             r = this._exchange(cmd, timeoutMs, payload);
+            this._afterTimeout(r);
             done = true;
         } finally {
             if (!done && this._sentCmd) { this._resync = true; }
@@ -1290,7 +1396,7 @@ class AT {
 
         if (this._trace != nil) { this._trace("tx", _redact(cmd)); }
         if (!Stream.WriteString(this._s, cmd + "\r")) {
-            if (!Stream.IsOpen(this._s)) { this._gone = true; return this._fail("port", "port went away"); }
+            if (!Stream.IsOpen(this._s)) { this._vanished(); return this._fail("port", "port went away"); }
             return this._fail("port", "write failed");
         }
         this._sentCmd = true;
@@ -1316,6 +1422,7 @@ class AT {
             // Echo of our own command, when ATE0 has not taken effect.
             if (line == cmd) { continue; }
             if (this._dispatchUrc(line)) { continue; }
+            if (_isCallResult(line) && !_isCallCmd(cmd)) { continue; }
             if (_isTerminator(line)) {
                 if (line == "OK") {
                     return { ok: true, lines: out, error: nil, errorKind: nil,
@@ -1569,6 +1676,28 @@ fn _dotted(s: string): string {
     return s;
 }
 
+// A caller's string bound for a quoted AT argument. A quote would end the
+// string early and the rest would be read as more arguments; a CR or LF ends
+// the command line, so the rest would run as a command of its own; Ctrl-Z and
+// ESC end or cancel a text prompt.
+fn _quotable(s): bool {
+    if (s == nil) return true;
+    if (!Type.IsString(s)) return Type.IsInt(s);
+    return String.IndexOfAnyFrom(s, "\"\r\n\u{1A}\u{1B}", 0) < 0;
+}
+
+// A dial string goes out unquoted, so only dialling characters may appear in
+// it: digits, * # +, the DTMF letters A-D, and the pause and wait modifiers.
+fn _dialable(s: string): bool {
+    if (s == nil || len(s) == 0) return false;
+    var i = 0;
+    while (i < len(s)) {
+        if (String.IndexOf("0123456789*#+ABCDabcdPpWw,", String.Substr(s, i, 1)) < 0) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
 fn _allDigits(s: string): bool {
     if (s == nil || len(s) == 0) return false;
     var i = 0;
@@ -1617,7 +1746,7 @@ const _PARTS_TTL_MS = 86400000;
 const _PARTS_MAX_PENDING = 32;
 
 class Modem {
-    let _at   = nil;
+    let _at: instance|nil = nil;
     let _ref  = 0;        // rolling concatenation reference
     let _onMsg = nil;
     let _parts = nil;     // partial multipart messages, keyed "sender|ref|total"
@@ -1743,7 +1872,7 @@ class Modem {
             // "+CME ERROR: SIM not inserted" is a state, not a malfunction.
             let e = String.ToLower(r.cme ?? r.error ?? "");
             if (String.Contains(e, "not inserted") || String.Contains(e, "absent")
-                || String.Contains(e, "10")) {
+                || e == "10") {   // numeric CMEE: 10 is "SIM not inserted"; "100" is not
                 return { ok: true, state: "absent", pinRetries: nil, pukRetries: nil, error: nil };
             }
             return { ok: false, state: "unknown", pinRetries: nil, pukRetries: nil,
@@ -1887,6 +2016,10 @@ class Modem {
             return { ok: false, state: "unknown", retriesLeft: nil,
                      error: "a new PIN is 4 to 8 digits", errorKind: "usage" };
         }
+        if (!_allDigits(puk) || !_allDigits(newPin)) {
+            return { ok: false, state: "unknown", retriesLeft: nil,
+                     error: "a PUK and a PIN are digits only", errorKind: "usage" };
+        }
         let st = this.SimStatus();
         if (st.state != "puk" && st.state != "puk2") {
             return { ok: false, state: st.state, retriesLeft: st.pukRetries,
@@ -1968,7 +2101,15 @@ class Modem {
     // The serving operator. Asked in numeric form as well, because the long
     // alphanumeric name is not present on every network and the MCC/MNC always
     // is - that pair is what identifies the operator unambiguously.
+    // The four commands switch the +COPS format and back, so they run with the
+    // port held: another fiber's Operator() in between would read a name in
+    // the wrong format.
     fn Operator(): object {
+        let self = this;
+        return this._at.Exclusive(fn() { return self._operator(); });
+    }
+
+    fn _operator(): object {
         this._at.Send("AT+COPS=3,0", 5000);
         let r = this._at.Send("AT+COPS?", 30000);
         if (!r.ok) { return { ok: false, name: nil, mcc: nil, mnc: nil,
@@ -2174,6 +2315,10 @@ class Modem {
         if (number == nil || len(number) < 4) {
             return { ok: false, error: "a service centre number is required", errorKind: "usage" };
         }
+        if (!_allDigits(String.StartsWith(number, "+") ? String.Substr(number, 1) : number)) {
+            return { ok: false, error: "a service centre number is digits, with an optional leading +",
+                     errorKind: "usage" };
+        }
         let toa = String.StartsWith(number, "+") ? ",145" : ",129";
         let r = this._at.Send("AT+CSCA=\"" + number + "\"" + toa, 5000);
         return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
@@ -2232,14 +2377,39 @@ class Modem {
             cmd = "AT+CMGD=" + str(index);
         }
         else if (scope == "read")   { cmd = "AT+CMGD=1,1"; }
-        else if (scope == "sent")   { cmd = "AT+CMGD=1,2"; }
-        else if (scope == "unsent") { cmd = "AT+CMGD=1,3"; }
-        else if (scope == "inbox")  { cmd = "AT+CMGD=1,4"; }
         else if (scope == "all")    { cmd = "AT+CMGD=1,4"; }
+        // 27.005's delete flags are cumulative - 2 is read AND sent, 3 adds
+        // unsent, 4 is everything - so "sent", "unsent" and "inbox" have none
+        // of their own: those messages are listed and deleted one by one.
+        else if (scope == "sent")   { return this._deleteByStat([3]); }
+        else if (scope == "unsent") { return this._deleteByStat([2]); }
+        else if (scope == "inbox")  { return this._deleteByStat([0, 1]); }
         else { return { ok: false, error: "scope must be index/read/sent/unsent/inbox/all",
                         errorKind: "usage" }; }
         let r = this._at.Send(cmd, 25000);
         return { ok: r.ok, error: r.ok ? nil : (r.cme ?? r.error), errorKind: r.errorKind };
+    }
+
+    // Delete the stored messages whose 27.005 status is in `stats` (0 unread,
+    // 1 read, 2 unsent, 3 sent), with the port held from list to last delete.
+    fn _deleteByStat(stats: array): object {
+        let at = this._at;
+        return at.Exclusive(fn() {
+            at.Send("AT+CMGF=0", 3000);
+            let r = at.Send("AT+CMGL=4", 30000);
+            if (!r.ok) { return { ok: false, deleted: 0, error: r.cme ?? r.error, errorKind: r.errorKind }; }
+            var deleted = 0;
+            foreach (l in r.lines) {
+                let h = _payload(l, "+CMGL");
+                if (h == nil) { continue; }
+                let a = _splitArgs(h);
+                if (len(a) < 2 || !Array.Contains(stats, _toInt(a[1]))) { continue; }
+                let d = at.Send("AT+CMGD=" + str(_toInt(a[0])), 25000);
+                if (!d.ok) { return { ok: false, deleted: deleted, error: d.cme ?? d.error, errorKind: d.errorKind }; }
+                deleted += 1;
+            }
+            return { ok: true, deleted: deleted, error: nil };
+        });
     }
 
     // Reassemble concatenated messages before handing them up. Parts belong
@@ -2599,6 +2769,9 @@ class Modem {
         if (mccmnc == nil || len(mccmnc) < 5 || !_allDigits(mccmnc)) {
             return { ok: false, error: "operator must be a numeric MCC+MNC", errorKind: "usage" };
         }
+        if (tech != nil && type(tech) != Type.Int) {
+            return { ok: false, error: "tech must be an integer access technology", errorKind: "usage" };
+        }
         var cmd = "AT+COPS=1,2,\"" + mccmnc + "\"";
         if (tech != nil) { cmd = cmd + "," + str(tech); }
         let r = this._at.Send(cmd, 60000);
@@ -2755,10 +2928,13 @@ class Modem {
         if (ptype != "IP" && ptype != "IPV6" && ptype != "IPV4V6") {
             return { ok: false, error: "type must be IP, IPV6 or IPV4V6", errorKind: "usage" };
         }
-        // The APN goes inside a quoted string, so a quote in it would end that
-        // string early and the rest would be read as further arguments.
-        if (String.Contains(apn, "\"")) {
-            return { ok: false, error: "an APN cannot contain a quote", errorKind: "usage" };
+        // The APN and the credentials go inside quoted strings; see _quotable.
+        if (!_quotable(apn)) {
+            return { ok: false, error: "an APN cannot contain a quote or a control character", errorKind: "usage" };
+        }
+        if (!_quotable(user) || !_quotable(pass)) {
+            return { ok: false, error: "user and password cannot contain a quote or a control character",
+                     errorKind: "usage" };
         }
 
         // Every argument is validated before anything is written. Checking the
@@ -3001,6 +3177,10 @@ class Modem {
             return { ok: false, text: nil, status: nil,
                      error: "a USSD code is required", errorKind: "usage" };
         }
+        if (!_quotable(code)) {
+            return { ok: false, text: nil, status: nil,
+                     error: "a USSD code cannot contain a quote or a control character", errorKind: "usage" };
+        }
         let budget = (timeoutMs == nil) ? 30000 : timeoutMs;
         this._ussd = nil;
         // DCS 15 asks for the GSM 7-bit alphabet, which is what the decoder
@@ -3072,6 +3252,9 @@ class Modem {
     fn Dial(number: string): object {
         if (number == nil || len(number) == 0) {
             return { ok: false, error: "a number is required", errorKind: "usage" };
+        }
+        if (!_dialable(number)) {
+            return { ok: false, error: "a number may hold only 0-9 * # + A-D P W and ,", errorKind: "usage" };
         }
         // The trailing ";" is what makes it a voice call rather than a data one.
         let r = this._at.Send("ATD" + number + ";", 60000);

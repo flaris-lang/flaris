@@ -67,7 +67,7 @@
 //   Ping() Echo(s) Get(k) GetBytes(k) Set(k, v, opts?) MGet(keys) MSet(obj)
 //   Del(keys) Exists(keys) Incr(k) IncrBy(k, n) Decr(k) Append(k, v) StrLen(k)
 //   Expire(k, sec) PExpire(k, ms) Ttl(k) PTtl(k) Persist(k) KeyType(k) Rename(k, k2)
-//   Keys(pattern) Scan(cursor, match?, count?) -> { cursor, keys }
+//   Keys(pattern) Scan(cursor, pattern?, count?) -> { cursor, keys }
 //   HGet(k, f) HSet(k, field|obj, v?) HGetAll(k) -> object HDel(k, fields)
 //   HExists(k, f) HIncrBy(k, f, n) HKeys(k) HLen(k)
 //   LPush(k, vals) RPush(k, vals) LPop(k) RPop(k) LRange(k, start, stop) LLen(k)
@@ -250,7 +250,7 @@ class Resp {
     let _host: string = "";
     let _port: int = _DEFAULT_PORT;
     let _opts = nil;
-    let _sock = nil;
+    let _sock: stream|nil = nil;
     let _timeoutMs: int = _DEFAULT_TIMEOUT_MS;
     let _binary: bool = false;
     let _resp3: bool = false;
@@ -260,6 +260,8 @@ class Resp {
     let _pushed: bool = false;      // the reply just read was a RESP3 push
     let _onPush = nil;
     let _hello = nil;
+    let _owed: bool = false;        // a command is on the wire whose reply is not read yet
+    let _db = nil;                  // the database Select chose; re-selected on reconnect
 
     fn Constructor(host: string, port: int, opts) {
         _host = host;
@@ -390,6 +392,7 @@ class Resp {
             this._send(text);
             let out = [];
             iter (i from 0 to len(cmds)) { Array.Append(out, this._top(_binary)); }
+            _owed = false;
             return out;
         } finally {
             this._leave();
@@ -411,6 +414,7 @@ class Resp {
                 if (firstErr == nil && q is RespError) { firstErr = q; }
             }
             let res = this._top(_binary);
+            _owed = false;
             if (res is RespError) {
                 if (firstErr != nil) { res.Error = res.Error + " (" + firstErr.Error + ")"; }
                 throw res;
@@ -423,7 +427,13 @@ class Resp {
 
     fn Ping() { return this._run(["PING"], false); }
     fn Echo(s) { return this._run(["ECHO", _argText(s)], _binary); }
-    fn Select(db: int) { return this._run(["SELECT", str(db)], false); }
+    // Remembered, so a reconnect selects the same database again instead of
+    // silently going back to the one in opts.
+    fn Select(db: int) {
+        let r = this._run(["SELECT", str(db)], false);
+        _db = db;
+        return r;
+    }
     fn DbSize() { return this._run(["DBSIZE"], false); }
 
     fn Get(key) { return this._run(["GET", _argText(key)], _binary); }
@@ -465,9 +475,9 @@ class Resp {
     fn Rename(key, newKey) { return this._run(["RENAME", _argText(key), _argText(newKey)], false); }
     fn Keys(pattern) { return this._run(["KEYS", _argText(pattern)], false); }
 
-    fn Scan(cursor, match?, count?) {
+    fn Scan(cursor, pattern?, count?) {
         let parts = ["SCAN", _argText(cursor)];
-        if (match != nil) { Array.Append(parts, "MATCH"); Array.Append(parts, _argText(match)); }
+        if (pattern != nil) { Array.Append(parts, "MATCH"); Array.Append(parts, _argText(pattern)); }
         if (count != nil) { Array.Append(parts, "COUNT"); Array.Append(parts, _argText(count)); }
         let r = this._run(parts, false);
         return { cursor: int(r[0]), keys: r[1] };
@@ -514,6 +524,7 @@ class Resp {
         try {
             this._send(_encode(parts));
             let v = this._top(bin);
+            _owed = false;
             if (v is RespError) { throw v; }
             return v;
         } finally {
@@ -529,6 +540,7 @@ class Resp {
             Stream.SetTimeout(_sock, (secs <= 0.0) ? 0 : int(secs * 1000.0) + _timeoutMs);
             this._send(_encode(parts));
             let v = this._top(_binary);
+            _owed = false;
             if (_sock != nil) { Stream.SetTimeout(_sock, _timeoutMs); }
             if (v is RespError) { throw v; }
             return v;
@@ -558,7 +570,13 @@ class Resp {
         }
     }
 
+    // An exchange left before its last reply was read - an onPush handler
+    // that raised, a fiber cancelled while it waited - leaves that reply on the
+    // socket, and the next command would read it as its own. The connection
+    // is closed instead; the next command reconnects.
     fn _leave() {
+        if (_owed && _sock != nil) { Stream.Close(_sock); _sock = nil; }
+        _owed = false;
         _busy = false;
         while (len(_waiters) > 0) {
             let f = Fiber.FromId(_waiters[0]);
@@ -568,6 +586,7 @@ class Resp {
     }
 
     fn _send(text: string) {
+        _owed = true;
         if (!Stream.WriteAll(_sock, text)) { this._lost(); }
     }
 
@@ -707,7 +726,7 @@ class Resp {
     fn _handshake() {
         let user = Object.TryGet(_opts, "user", nil);
         let password = Object.TryGet(_opts, "password", nil);
-        let db = Object.TryGet(_opts, "db", nil);
+        let db = (_db != nil) ? _db : Object.TryGet(_opts, "db", nil);
         let name = Object.TryGet(_opts, "name", nil);
         let cmds = [];
         let kinds = [];
@@ -752,6 +771,7 @@ class Resp {
                 failure.Error = "Resp: " + kinds[i] + " failed: " + v.Error;
             }
         }
+        _owed = false;
         if (failure != nil) { throw failure; }
     }
 

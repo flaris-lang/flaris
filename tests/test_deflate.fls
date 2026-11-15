@@ -160,6 +160,24 @@ fn test_malformed() {
     check(Inflate.Zlib(bad, len(src)) == nil, "bad Adler-32 -> nil");
 }
 
+// maxBytes replaces the 256 MiB cap, for every container and across gzip members.
+fn test_maxbytes() {
+    let src = mk(100000, 0);
+    let z = Deflate.Zlib(src);
+    check(Inflate.Zlib(z, nil, 99999) == nil && Inflate.LastError() == -3, "maxBytes below the size -> nil, -3");
+    check(same(Inflate.Zlib(z, nil, 100000), src), "maxBytes equal to the size -> decodes");
+    check(Inflate.Raw(Deflate.Raw(src), 0, 5000) == nil, "Raw honours maxBytes");
+    check(Inflate.Auto(z, nil, 5000) == nil, "Auto honours maxBytes");
+    // Two gzip members of 100000 each: one alone fits, both together do not.
+    let g = Deflate.Gzip(src);
+    let two = Buffer.Concat(g, g);
+    check(Inflate.Gzip(two, nil, 150000) == nil && Inflate.LastError() == -3, "gzip members share one cap");
+    let both = Inflate.Gzip(two, nil, 200000);
+    check(both != nil && len(both) == 200000, "gzip members within the cap -> decoded");
+    // `expected` never exceeds the cap in force.
+    check(Inflate.Zlib(z, 100000, 5000) == nil, "expected above maxBytes is clamped");
+}
+
 global SMALL_WORDS = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
                       "and", "runs", "far", "away", "from", "home", "again"];
 
@@ -287,6 +305,7 @@ fn Main() {
     test_compression_quality();
     test_block_types();
     test_malformed();
+    test_maxbytes();
     test_small_repeated();
     test_fixed_blocks();
     test_benchmarks();

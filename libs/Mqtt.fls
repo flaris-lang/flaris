@@ -48,6 +48,10 @@
 //     onMessage         fn(msg) for messages no subscription handler took
 //     onConnectionLost  fn(reason) when the link drops (before any reconnect)
 //     maxPacketBytes    larger incoming packets close the link, default 16 MB
+//     maxQueued         messages waiting for Receive, and handler calls waiting
+//                       for the handler, default 10000 each; past it a new
+//                       message is dropped (still acknowledged) and counted
+//                       in Dropped()
 //
 // Publishing:
 //   Publish(topic, payload, opts?) -> true     opts: { qos: 0|1|2, retain: bool }
@@ -72,7 +76,8 @@
 //
 // State:
 //   IsConnected()  SessionPresent()  ClientId()  Pending() -> messages waiting
-//   for Receive  OnMessage(fn) sets the handler for messages no other takes.
+//   for Receive  Dropped() -> messages dropped by a full queue (maxQueued)
+//   OnMessage(fn) sets the handler for messages no other takes.
 //   Connect() again after a lost link (without reconnect) opens a new one.
 //
 // Closing:
@@ -382,7 +387,7 @@ class MqttSession {
     let reconnect: bool = false;
     let maxPacket: int = 16777216;
 
-    let sock = nil;
+    let sock: stream|nil = nil;
     let connected: bool = false;
     let closing: bool = false;
     let running: bool = false;     // a reader fiber is in ReadLoop
@@ -405,6 +410,8 @@ class MqttSession {
     let onLost = nil;
     let jobs = [];             // [handler, msg] for the dispatcher
     let dispatcher: int = 0;
+    let maxQueued: int = 10000;    // per queue: inbox, and jobs
+    let dropped: int = 0;
 
     let ptype: int = 0;        // the packet _readPacket just read
     let pflags: int = 0;
@@ -423,6 +430,7 @@ class MqttSession {
         this.binary = Object.TryGet(opts, "binary", false) == true;
         this.reconnect = Object.TryGet(opts, "reconnect", false) == true;
         this.maxPacket = Object.TryGet(opts, "maxPacketBytes", 16777216) ?? 16777216;
+        this.maxQueued = Object.TryGet(opts, "maxQueued", 10000) ?? 10000;
         this.onMessage = Object.TryGet(opts, "onMessage", nil);
         this.onLost = Object.TryGet(opts, "onConnectionLost", nil);
     }
@@ -475,6 +483,10 @@ class MqttSession {
             throw _mqttErr("refused", "Mqtt: connection refused: " + _connackText(code), code);
         }
         sessionPresent = (pbody[0] & 1) == 1;
+        // A new session restarts the broker's packet ids: a QoS 2 id still
+        // remembered from the old one would make its next message look like a
+        // duplicate and be acknowledged but dropped.
+        if (!sessionPresent) { qos2In = {}; }
         connected = true;
     }
 
@@ -718,12 +730,12 @@ class MqttSession {
         var handled = false;
         foreach (s in subs) {
             if (s.handler != nil && _matches(s.filter, msg.topic)) {
-                Array.Append(jobs, [s.handler, msg]);
+                this._queue(jobs, [s.handler, msg]);
                 handled = true;
             }
         }
         if (!handled && onMessage != nil) {
-            Array.Append(jobs, [onMessage, msg]);
+            this._queue(jobs, [onMessage, msg]);
             handled = true;
         }
         if (handled) {
@@ -731,8 +743,16 @@ class MqttSession {
             _wake(dispatcher);
             return;
         }
-        Array.Append(inbox, msg);
+        this._queue(inbox, msg);
         _wake(receiver);
+    }
+
+    // A full queue drops the new message and counts it. Waiting for room
+    // instead would stall the reader, and with it the acknowledgement a
+    // handler publishing at QoS 1 or 2 is waiting for.
+    fn _queue(q, item) {
+        if (len(q) >= maxQueued) { dropped += 1; return; }
+        Array.Append(q, item);
     }
 
     fn _startDispatcher() {
@@ -848,7 +868,7 @@ class MqttSession {
 }
 
 class MqttClient {
-    let _s = nil;
+    let _s: MqttSession|nil = nil;
 
     fn Constructor(host: string, port?: int, opts?) {
         let o = opts ?? {};
@@ -873,6 +893,7 @@ class MqttClient {
     fn ClientId(): string { return _s.clientId; }
     // Messages waiting for Receive.
     fn Pending(): int { return len(_s.inbox); }
+    fn Dropped(): int { return _s.dropped; }
 
     fn Publish(topic: string, payload, opts?) {
         if (!_validTopic(topic)) { throw(Exception.InvalidArguments, "Mqtt: not a valid topic to publish to: '" + topic + "'"); }

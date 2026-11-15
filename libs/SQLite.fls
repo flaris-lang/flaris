@@ -352,20 +352,25 @@ class SQLite {
     // Runs f() inside a SAVEPOINT: outside a transaction that begins one and its
     // RELEASE commits; inside one (Begin() or an outer Transaction) it nests.
     // ROLLBACK TO undoes f's work on a throw (rethrown) or a false return.
+    // A RELEASE that fails (SQLITE_BUSY, a deferred foreign key) committed
+    // nothing: f's work is rolled back and the result is false.
     fn Transaction(f: fn): bool {
-        this.Exec("SAVEPOINT flaris_tx");
+        if (this.Exec("SAVEPOINT flaris_tx") == -1) { return false; }
         try {
             let ok = f();
             if (ok == false) {
                 this._rollbackSavepoint();
                 return false;
             }
-            this.Exec("RELEASE flaris_tx");
-            return true;
         } catch (e) {
             this._rollbackSavepoint();
             throw e;
         }
+        if (this.Exec("RELEASE flaris_tx") == -1) {
+            this._rollbackSavepoint();
+            return false;
+        }
+        return true;
     }
 
     // ROLLBACK TO keeps the savepoint open; RELEASE then pops it (and ends the
@@ -382,8 +387,12 @@ class SQLite {
     }
 
     // db.Close() - bool
+    // The handle is cleared, so a second Close, or any call after it, reaches
+    // the plugin as 0 - which it refuses - rather than as a freed pointer.
     fn Close(): bool {
-        return this._sq_close(this._db);
+        let ok = this._sq_close(this._db);
+        this._db = 0;
+        return ok;
     }
 }
 

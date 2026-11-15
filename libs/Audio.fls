@@ -25,8 +25,8 @@
 //       or another encoding (ADPCM, A-law, mu-law, ...)
 //   WriteWav(path, signal, sampleRate)        →  bool  - 16-bit PCM mono
 //
-// A `[float]` result is a flat float array: storing an int into it stores a float,
-// storing a non-number raises. ApplyEnvelope/FadeIn/FadeOut keep the layout of `signal`.
+// A `[float]` result stores an int as a float and raises on a non-number.
+// ApplyEnvelope/FadeIn/FadeOut keep the element type of `signal`.
 //
 // Envelope:
 //   ADSR(n, sampleRate, attack, decay, sustain, release)  →  [float]
@@ -334,19 +334,21 @@ class Audio : Signals {
         return this.ApplyWindow(signal, envelope);
     }
 
+    // Slice, not Subset: Subset raises on an empty array (count must be > 0).
     fn FadeIn(signal:array, samples:int) : array {
-        let out = Array.Subset(signal, 0, len(signal));
+        let out = Array.Slice(signal, 0);
         let n   = int(Math.Min(samples, len(out)));
-        if (n == 0) return out;
+        if (n <= 0) return out;
         _aud_fadein_kernel(out, n);
         return out;
     }
 
     // FadeOut: use (i+1)/n so the last sample reaches exactly 0.
     fn FadeOut(signal:array, samples:int) : array {
-        let out   = Array.Subset(signal, 0, len(signal));
+        let out   = Array.Slice(signal, 0);
         let total = len(out);
         let n     = int(Math.Min(samples, total));
+        if (n <= 0) return out;
         let start = total - n;
         _aud_fadeout_kernel(out, start, n);
         return out;
@@ -512,11 +514,15 @@ class Audio : Signals {
         return out;
     }
 
+    // The range is clamped to the signal, so a start past the end or a zero
+    // length gives an empty signal instead of raising.
     fn Trim(signal:array, start:int, length:int) : array {
-        let n   = len(signal);
-        let end = start + length;
-        if (end > n) end = n;
-        return Array.Subset(signal, start, end - start);
+        let n = len(signal);
+        var s = (start < 0) ? 0 : start;
+        if (s > n) s = n;
+        var e = s + ((length < 0) ? 0 : length);
+        if (e > n) e = n;
+        return Array.Slice(signal, s, e);
     }
 
     fn Repeat(signal:array, times:int) : array {

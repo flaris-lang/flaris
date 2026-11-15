@@ -297,6 +297,9 @@ class BinaryWriter
     // every byte.
     fn WriteString(s:string) {
         let n:int = len(s);
+        // The prefix is 16 bits: a longer string would be written with a
+        // wrapped length and every later read would be out of step.
+        if (n > 65535) { throw(1, "BinaryWriter.WriteString: " + str(n) + " bytes is over 65535; use WriteString32"); }
         if (_csum_on) { WriteU16(n); _writeStr(s, n); return; }
         let p:int = _pos;
         if (p + 2 + n > _cap) { _grow(2 + n); }
@@ -382,7 +385,9 @@ class BinaryWriter
     fn WriteVarUInt(v:int) {
         while (true) {
             let b:int = v & 0x7F;
-            v = v >> 7;
+            // Logical shift: an arithmetic one keeps a negative value negative
+            // forever, and the loop never ends.
+            v = v >>> 7;
             if (v != 0) { _wb(b | 0x80); }
             else        { _wb(b); break; }
         }
@@ -612,9 +617,13 @@ class BinaryReader
     }
 
     fn ReadStringFixed(n:int):string {
-        if (n == 0) { return ""; }
         let p:int = _pos;
-        if (p + n > _len) { n = _len - p; }
+        // A length read from the data is hostile until checked: a negative one
+        // reads nothing, and the comparison is written so a huge one cannot
+        // overflow past the check.
+        if (n <= 0) { return ""; }
+        if (n > _len - p) { n = _len - p; }
+        if (n <= 0) { return ""; }
         _pos = p + n;
         if (_csum_on) { _csumRange(p, n); }
         return Buffer.ToString(_buf, p, n);
@@ -627,7 +636,8 @@ class BinaryReader
 
     fn ReadBytes(n:int):block {
         let p:int = _pos;
-        if (p + n > _len) { n = _len - p; }
+        if (n < 0) { n = 0; }
+        if (n > _len - p) { n = _len - p; }
         _pos = p + n;
         if (_csum_on) { _csumRange(p, n); }
         return Buffer.Slice(_buf, p, n);
@@ -679,14 +689,15 @@ class BinaryReader
             result = result | ((b & 0x7F) << shift);
             if ((b & 0x80) == 0) { break; }
             shift += 7;
-            if (shift >= 63) { break; }
+            // A 64-bit value takes up to ten bytes; the tenth carries bit 63.
+            if (shift > 63) { break; }
         }
         return result;
     }
 
     fn ReadVarInt():int {
         let u:int = ReadVarUInt();
-        return (u >> 1) ^ -(u & 1);
+        return (u >>> 1) ^ -(u & 1);
     }
 
     // ---- bit-level reads ----
@@ -780,6 +791,7 @@ class BinaryStreamWriter
     fn WriteString(s:string) {
         let buf:block = Buffer.FromString(s);
         let n:int     = len(buf);
+        if (n > 65535) { throw(1, "BinaryStreamWriter.WriteString: " + str(n) + " bytes is over 65535"); }
         Stream.WriteU16(_s, n, _be);
         Stream.WriteBytes(_s, buf, n);
     }
@@ -830,11 +842,11 @@ class BinaryStreamReader
         _be = (bigEndian == true);
     }
 
-    fn ReadU8():int  { return Stream.ReadU8(_s); }
-    fn ReadU16():int { return Stream.ReadU16(_s, _be); }
-    fn ReadU32():int { return Stream.ReadU32(_s, _be); }
-    fn ReadU64():int { return Stream.ReadU64(_s, _be); }
-    fn ReadI64():int { return Stream.ReadU64(_s, _be); }
+    fn ReadU8():int|nil { return Stream.ReadU8(_s); }
+    fn ReadU16():int|nil { return Stream.ReadU16(_s, _be); }
+    fn ReadU32():int|nil { return Stream.ReadU32(_s, _be); }
+    fn ReadU64():int|nil { return Stream.ReadU64(_s, _be); }
+    fn ReadI64():int|nil { return Stream.ReadU64(_s, _be); }
 
     // The signed and derived reads pass nil through at the end of the stream.
     fn ReadI8():int|nil {

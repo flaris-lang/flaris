@@ -366,6 +366,28 @@ fn test_handlers() {
     check(true, "Disconnect releases the handler that holds the client");
 }
 
+fn test_queue_limit() {
+    Console.WriteLine("== fake broker: maxQueued ==");
+    _pkts = [];
+    let four = [publish("q", "1", 0, 0, 0), publish("q", "2", 0, 0, 0), publish("q", "3", 0, 0, 0), publish("q", "4", 0, 0, 0)];
+    let p = fakeBroker([bytes(CONNACK_OK), { read: false, send: four }, { read: false, pause: 200, send: four }, "drain"]);
+    let c = Mqtt.Connect("127.0.0.1", p, { timeoutMs: 500, keepAlive: 0, maxQueued: 2 });
+    let deadline = Time.Millis() + 1500;
+    while (c.Dropped() < 2 && Time.Millis() < deadline) { Fiber.Sleep(10); }
+    checkEq([c.Pending(), c.Dropped()], [2, 2], "Receive's queue keeps two and drops the rest");
+    checkEq([c.Receive(100).payload, c.Receive(100).payload], ["1", "2"], "the oldest are kept, in order");
+
+    // The second four go to a handler that holds on to the first: two wait
+    // behind it, the last one drops.
+    let seen = [];
+    c.OnMessage(fn(m) { Array.Append(seen, m.payload); if (len(seen) == 1) { Fiber.Sleep(300); } });
+    deadline = Time.Millis() + 2000;
+    while (len(seen) < 3 && Time.Millis() < deadline) { Fiber.Sleep(10); }
+    Fiber.Sleep(50);
+    checkEq([seen, c.Dropped()], [["1", "2", "3"], 3], "the handler's queue keeps two behind the running call");
+    c.Disconnect();
+}
+
 fn test_keepalive() {
     Console.WriteLine("== fake broker: keep-alive ==");
     _pkts = [];
@@ -427,6 +449,29 @@ fn test_unsubscribe_and_errors() {
     check(raised(fn() { c.Subscribe("a/#/b"); }) != nil, "a misplaced # raises");
     check(raised(fn() { c.Publish("t", "x", { qos: 3 }); }) != nil, "QoS 3 raises");
     c.Disconnect();
+}
+
+// A QoS 2 id remembered from a session the broker did not keep must not make
+// the new session's message with that id look like a duplicate.
+fn test_qos2_new_session() {
+    Console.WriteLine("== fake broker: QoS 2 across a new session ==");
+    _pkts = [];
+    let p = fakeBroker([bytes(CONNACK_OK),
+                        { read: false, send: publish("q2/a", "old", 2, 9, 0) },
+                        { send: "close" },                 // takes the PUBREC, hangs up before PUBREL
+                        "next",
+                        bytes(CONNACK_OK),                 // the second CONNECT: no session kept
+                        { read: false, send: publish("q2/a", "fresh", 2, 9, 0) },
+                        "drain"]);
+    let c = Mqtt.Connect("127.0.0.1", p, FAST);
+    checkEq(c.Receive(1000).payload, "old", "the first QoS 2 message");
+    let t0 = Time.Millis();
+    while (c.IsConnected() && Time.Millis() - t0 < 1000) { Fiber.Sleep(10); }
+    checkEq(c.Connect().sessionPresent, false, "reconnected without a session");
+    let m = c.Receive(1000);
+    checkEq((m == nil) ? nil : m.payload, "fresh", "the same packet id on a new session is a new message");
+    c.Disconnect();
+    Fiber.Sleep(30);
 }
 
 fn test_reconnect() {
@@ -798,10 +843,12 @@ fn async Main() {
     test_publish_flows();
     test_inbound();
     test_handlers();
+    test_queue_limit();
     test_keepalive();
     test_malformed();
     test_unsubscribe_and_errors();
     test_reconnect();
+    test_qos2_new_session();
     test_v5();
     test_dropped_client();
     test_tls();

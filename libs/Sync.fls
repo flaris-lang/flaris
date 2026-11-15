@@ -1,0 +1,577 @@
+// Sync.fls - fiber synchronization primitives for Flaris: Mutex, Semaphore,
+// RWLock and Channel.
+// Version: 1.0
+//
+// Flaris fibers are cooperative - a fiber runs until it parks, awaits or does
+// I/O - so these primitives need no atomics: a check-and-set between two
+// yields is atomic by construction. Waiters park with Fiber.Park and are
+// woken in FIFO order with Fiber.Unpark, so handoff is fair (no barging past
+// a queued waiter) and a woken fiber re-checks its condition in a loop,
+// because Park can also return early (a message, a cancel).
+//
+// Usage:
+//   import { Mutex, Semaphore, RWLock, Channel } from library("Sync", "1.0");
+//
+//   let m = new Mutex();
+//   m.Lock();            // parks the calling fiber until the lock is free
+//   try { ... } finally { m.Unlock(); }
+//   m.With(fn() { ... });           // Lock + try/finally Unlock around fn
+//   let ok = m.Lock(200);           // at most 200 ms; false on timeout
+//   let ok = m.TryLock();           // never waits
+//
+//   let s = new Semaphore(3);       // 3 permits
+//   s.Acquire();  ...  s.Release();
+//   s.With(fn() { ... });
+//
+//   let rw = new RWLock();
+//   rw.LockRead();  ...  rw.UnlockRead();
+//   rw.LockWrite(); ...  rw.UnlockWrite();   // rw.Unlock() picks by what you hold
+//
+//   let ch = new Channel(10);       // buffered, capacity 10; new Channel() is unbuffered
+//   ch.Send(value);                 // parks when full (unbuffered: until a receiver takes it)
+//   let v = ch.Recv();              // parks when empty; nil on Close or timeout
+//   ch.TrySend(v); ch.TryRecv();    // never wait
+//   ch.Close();                     // wakes all waiters: Send -> false, Recv -> nil once drained
+//
+// Timeouts: Lock/Acquire/Send/Recv take an optional timeoutMs. nil or omitted
+// waits forever; 0 tries once and returns immediately on contention. A timed-
+// out waiter removes itself from the queue and reports failure (false / nil);
+// it never consumes a permit or a value that was handed to it.
+//
+// Unlock/Release without holding reports false rather than raising - a
+// programming error, but a clear false beats a crash in a fiber you did not
+// write. Channel.Send on a closed channel returns false; Recv on a closed,
+// drained channel returns nil (so `while ((v = ch.Recv()) != nil)` is the
+// drain loop; use Recv(timeoutMs) when nil must mean "timed out").
+//
+// API:
+//   Mutex:    Lock(timeoutMs?) TryLock() Unlock() IsLocked() With(fn)
+//   Semaphore: Acquire(timeoutMs?) TryAcquire() Release() Count() Max() With(fn)
+//   RWLock:   LockRead(timeoutMs?) LockWrite(timeoutMs?) TryLockRead() TryLockWrite()
+//             UnlockRead() UnlockWrite() Unlock() Readers() WriterActive()
+//   Channel:  Send(v, timeoutMs?) Recv(timeoutMs?) TrySend(v) TryRecv()
+//             Len() IsClosed() Close() Capacity()
+//
+// All of them are safe to share between fibers of one VM; nothing here touches
+// the OS thread, so a blocked fiber never stops the others.
+
+class Mutex {
+
+    let _owner = nil;    // fiber id holding the lock; nil when free
+    let _queue = [];    // fiber ids waiting, FIFO
+
+    fn Constructor() {
+        this._queue = [];
+    }
+
+    // Invariant: _owner == nil implies the queue is empty. Unlock only frees
+    // the lock when nobody is queued; otherwise it hands ownership to the
+    // head waiter, so the fast path below is race-free under the cooperative
+    // scheduler (no yield between the check and the set).
+    // A wait that ends any way but with the lock - a timeout, or Fiber.Cancel
+    // (which runs `finally`) - leaves the queue, and passes the lock on if it
+    // was handed over in the meantime. Otherwise Unlock would give it to a
+    // fiber that is gone, and it would stay locked for good.
+    fn Lock(timeoutMs?:int): bool {
+        let me = Fiber.Id();
+        if (this._owner == nil) { this._owner = me; return true; }
+        Array.Append(this._queue, me);
+        let deadline:int = (timeoutMs != nil) ? Time.Millis() + timeoutMs : 0;
+        var got = false;
+        try {
+            while (this._owner != me) {
+                if (deadline > 0) {
+                    let left:int = deadline - Time.Millis();
+                    if (left <= 0) { return false; }
+                    Fiber.Park(left);
+                } else {
+                    Fiber.Park();
+                }
+            }
+            got = true;
+            return true;
+        } finally {
+            if (!got) {
+                this._drop(me);
+                if (this._owner == me) { this._handOn(); }
+            }
+        }
+    }
+
+    fn TryLock(): bool {
+        let me = Fiber.Id();
+        if (this._owner == nil) { this._owner = me; return true; }
+        return false;
+    }
+
+    fn Unlock(): bool {
+        let me = Fiber.Id();
+        if (this._owner != me) { return false; }
+        this._handOn();
+        return true;
+    }
+
+    fn _handOn() {
+        if (len(this._queue) > 0) {
+            let h = this._queue[0];
+            Array.RemoveAt(this._queue, 0);
+            this._owner = h;                        // ownership passes; still locked
+            Fiber.Unpark(Fiber.FromId(h));
+        } else {
+            this._owner = nil;
+        }
+    }
+
+    fn IsLocked(): bool { return this._owner != nil; }
+
+    // Run fn while holding the lock; Unlock runs even when fn throws.
+    fn With(fn_:fn) {
+        if (!this.Lock()) { throw(1, "Sync.Mutex: With() could not lock"); }
+        try { return fn_(); }
+        finally { this.Unlock(); }
+    }
+
+    fn _drop(me:int) {
+        let i:int = Array.IndexOf(this._queue, me);
+        if (i >= 0) { Array.RemoveAt(this._queue, i); }
+    }
+}
+
+class Semaphore {
+
+    let _max = 0;
+    let _count = 0;      // free permits
+    let _queue = [];    // fiber ids waiting
+    let _granted = nil;  // fiber ids a permit was handed to (permit reserved, count not decremented)
+
+    fn Constructor(max:int, initial?:int) {
+        this._max = max;
+        this._count = (initial != nil) ? initial : max;
+        this._queue = [];
+        this._granted = [];
+    }
+
+    // Invariant: _count > 0 implies the queue is empty, because Release hands
+    // a permit straight to the head waiter instead of incrementing _count.
+    fn Acquire(timeoutMs?:int): bool {
+        let me = Fiber.Id();
+        if (len(this._queue) == 0 && this._count > 0) { this._count -= 1; return true; }
+        Array.Append(this._queue, me);
+        let deadline:int = (timeoutMs != nil) ? Time.Millis() + timeoutMs : 0;
+        var got = false;
+        try {
+            while (!Array.Contains(this._granted, me)) {
+                if (deadline > 0) {
+                    let left:int = deadline - Time.Millis();
+                    if (left <= 0) { return false; }
+                    Fiber.Park(left);
+                } else {
+                    Fiber.Park();
+                }
+            }
+            let i:int = Array.IndexOf(this._granted, me);
+            Array.RemoveAt(this._granted, i);
+            got = true;
+            return true;
+        } finally {
+            // Timed out or cancelled: leave the queue, and pass on a permit
+            // that was handed over meanwhile rather than lose it.
+            if (!got) {
+                this._drop(me);
+                let g:int = Array.IndexOf(this._granted, me);
+                if (g >= 0) { Array.RemoveAt(this._granted, g); this.Release(); }
+            }
+        }
+    }
+
+    fn TryAcquire(): bool {
+        if (len(this._queue) == 0 && this._count > 0) { this._count -= 1; return true; }
+        return false;
+    }
+
+    fn Release(): bool {
+        if (len(this._queue) > 0) {
+            let h = this._queue[0];
+            Array.RemoveAt(this._queue, 0);
+            Array.Append(this._granted, h);
+            Fiber.Unpark(Fiber.FromId(h));
+            return true;
+        }
+        if (this._count >= this._max) { return false; }   // over-release
+        this._count += 1;
+        return true;
+    }
+
+    fn Count(): int { return this._count; }
+    fn Max(): int   { return this._max; }
+
+    fn With(fn_:fn) {
+        if (!this.Acquire()) { throw(1, "Sync.Semaphore: With() could not acquire"); }
+        try { return fn_(); }
+        finally { this.Release(); }
+    }
+
+    fn _drop(me:int) {
+        let i:int = Array.IndexOf(this._queue, me);
+        if (i >= 0) { Array.RemoveAt(this._queue, i); }
+    }
+}
+
+class RWLock {
+
+    let _readers = [];      // fiber ids holding the read lock
+    let _writer = nil;       // fiber id holding the write lock, nil when free
+    let _queue = nil;        // { id:int, writer:bool } entries, FIFO
+    let _granted = nil;      // fiber ids a lock was handed to
+
+    fn Constructor() {
+        this._readers = [];
+        this._queue = [];
+        this._granted = [];
+    }
+
+    // Fair FIFO: a fast path is only taken when nobody is queued, so a queued
+    // writer is never overtaken by a barging reader (and vice versa).
+    fn LockRead(timeoutMs?:int): bool {
+        let me = Fiber.Id();
+        if (this._writer == nil && len(this._queue) == 0) {
+            Array.Append(this._readers, me);
+            return true;
+        }
+        Array.Append(this._queue, { id: me, writer: false });
+        return this._wait(me, timeoutMs);
+    }
+
+    fn LockWrite(timeoutMs?:int): bool {
+        let me = Fiber.Id();
+        if (this._writer == nil && len(this._readers) == 0 && len(this._queue) == 0) {
+            this._writer = me;
+            return true;
+        }
+        Array.Append(this._queue, { id: me, writer: true });
+        return this._wait(me, timeoutMs);
+    }
+
+    fn TryLockRead(): bool {
+        let me = Fiber.Id();
+        if (this._writer == nil && len(this._queue) == 0) {
+            Array.Append(this._readers, me);
+            return true;
+        }
+        return false;
+    }
+
+    fn TryLockWrite(): bool {
+        let me = Fiber.Id();
+        if (this._writer == nil && len(this._readers) == 0 && len(this._queue) == 0) {
+            this._writer = me;
+            return true;
+        }
+        return false;
+    }
+
+    fn UnlockRead(): bool {
+        let me = Fiber.Id();
+        let i:int = Array.IndexOf(this._readers, me);
+        if (i < 0) { return false; }
+        Array.RemoveAt(this._readers, i);
+        if (len(this._readers) == 0) { this._pump(); }
+        return true;
+    }
+
+    fn UnlockWrite(): bool {
+        let me = Fiber.Id();
+        if (this._writer != me) { return false; }
+        this._writer = nil;
+        this._pump();
+        return true;
+    }
+
+    // Releases whichever lock the caller holds.
+    fn Unlock(): bool {
+        let me = Fiber.Id();
+        if (this._writer == me) { return this.UnlockWrite(); }
+        return this.UnlockRead();
+    }
+
+    fn Readers(): int      { return len(this._readers); }
+    fn WriterActive(): bool { return this._writer != nil; }
+
+    fn WithRead(fn_:fn) {
+        if (!this.LockRead()) { throw(1, "Sync.RWLock: WithRead() could not lock"); }
+        try { return fn_(); }
+        finally { this.UnlockRead(); }
+    }
+
+    fn WithWrite(fn_:fn) {
+        if (!this.LockWrite()) { throw(1, "Sync.RWLock: WithWrite() could not lock"); }
+        try { return fn_(); }
+        finally { this.UnlockWrite(); }
+    }
+
+    fn _wait(me:int, timeoutMs?:int): bool {
+        let deadline:int = (timeoutMs != nil) ? Time.Millis() + timeoutMs : 0;
+        var got = false;
+        try {
+            while (!Array.Contains(this._granted, me)) {
+                if (deadline > 0) {
+                    let left:int = deadline - Time.Millis();
+                    if (left <= 0) { return false; }
+                    Fiber.Park(left);
+                } else {
+                    Fiber.Park();
+                }
+            }
+            let i:int = Array.IndexOf(this._granted, me);
+            Array.RemoveAt(this._granted, i);
+            got = true;
+            return true;
+        } finally {
+            if (!got) { this._abandon(me); }
+        }
+    }
+
+    // A waiter that timed out or was cancelled: out of the queue, any lock
+    // handed to it meanwhile given back, and the queue run again - a writer
+    // leaving can let the readers queued behind it go.
+    fn _abandon(me:int) {
+        this._drop(me);
+        let g:int = Array.IndexOf(this._granted, me);
+        if (g >= 0) {
+            Array.RemoveAt(this._granted, g);
+            if (this._writer == me) { this._writer = nil; }
+            let r:int = Array.IndexOf(this._readers, me);
+            if (r >= 0) { Array.RemoveAt(this._readers, r); }
+        }
+        this._pump();
+    }
+
+    // Hand the lock to the queued waiters that can run now: one writer, or a
+    // run of consecutive readers at the head.
+    fn _pump() {
+        while (len(this._queue) > 0) {
+            let h = this._queue[0];
+            if (h.writer) {
+                if (this._writer != nil || len(this._readers) > 0) { return; }
+                Array.RemoveAt(this._queue, 0);
+                this._writer = h.id;
+                Array.Append(this._granted, h.id);
+                Fiber.Unpark(Fiber.FromId(h.id));
+            } else {
+                if (this._writer != nil) { return; }
+                Array.RemoveAt(this._queue, 0);
+                Array.Append(this._readers, h.id);
+                Array.Append(this._granted, h.id);
+                Fiber.Unpark(Fiber.FromId(h.id));
+            }
+        }
+    }
+
+    fn _drop(me:int) {
+        iter (i from 0 to len(this._queue)) {
+            if (this._queue[i].id == me) { Array.RemoveAt(this._queue, i); return; }
+        }
+    }
+}
+
+class Channel {
+
+    let _cap = 0;            // buffer capacity; 0 = unbuffered (rendezvous)
+    let _buf = nil;          // buffered values
+    let _sendQ = [];        // { id:int, value:any } of parked senders
+    let _recvQ = nil;        // fiber ids of parked receivers, FIFO
+    let _sendGranted = nil;  // sender ids whose value was taken
+    let _recvGranted = nil;  // receiver ids a value was handed to
+    let _recvValue = nil;    // str(id) -> handed-off value
+    let _closed = false;
+
+    fn Constructor(capacity?:int) {
+        this._cap = (capacity != nil) ? capacity : 0;
+        this._buf = [];
+        this._sendQ = [];
+        this._recvQ = [];
+        this._sendGranted = [];
+        this._recvGranted = [];
+        this._recvValue = {};
+    }
+
+    // Returns false when the channel is closed or the timeout passes.
+    fn Send(v, timeoutMs?:int): bool {
+        if (this._closed) { return false; }
+        let me = Fiber.Id();
+        // Direct handoff to the head receiver, if any.
+        if (len(this._recvQ) > 0) {
+            let r = this._recvQ[0];
+            Array.RemoveAt(this._recvQ, 0);
+            this._recvValue[str(r)] = v;
+            Array.Append(this._recvGranted, r);
+            Fiber.Unpark(Fiber.FromId(r));
+            return true;
+        }
+        if (len(this._buf) < this._cap) { Array.Append(this._buf, v); return true; }
+        Array.Append(this._sendQ, { id: me, value: v });
+        let deadline:int = (timeoutMs != nil) ? Time.Millis() + timeoutMs : 0;
+        var done = false;
+        try {
+            while (!Array.Contains(this._sendGranted, me)) {
+                if (this._closed) { return false; }
+                if (deadline > 0) {
+                    let left:int = deadline - Time.Millis();
+                    if (left <= 0) { return false; }
+                    Fiber.Park(left);
+                } else {
+                    Fiber.Park();
+                }
+            }
+            done = true;
+            return true;
+        } finally {
+            // Taken or not, the sender leaves both lists: a value that was
+            // taken was delivered, one that was not is withdrawn.
+            this._dropSend(me);
+            let i:int = Array.IndexOf(this._sendGranted, me);
+            if (i >= 0) { Array.RemoveAt(this._sendGranted, i); }
+        }
+    }
+
+    // A handed-off value, then the oldest buffered one, or nil when the
+    // channel is closed and drained (or the timeout passed). The handoff comes
+    // first: it was sent before anything that went to the buffer after it.
+    fn Recv(timeoutMs?:int) {
+        let me = Fiber.Id();
+        let deadline:int = (timeoutMs != nil) ? Time.Millis() + timeoutMs : 0;
+        try {
+            return this._recvLoop(me, deadline);
+        } finally {
+            // Timed out or cancelled while a value was being handed over: it
+            // goes to the next receiver, or back to the front of the buffer,
+            // rather than disappear with this fiber.
+            this._dropRecv(me);
+            let g:int = Array.IndexOf(this._recvGranted, me);
+            if (g >= 0) {
+                Array.RemoveAt(this._recvGranted, g);
+                let v = this._recvValue[str(me)];
+                Object.Delete(this._recvValue, str(me));
+                this._giveBack(v);
+            }
+        }
+    }
+
+    fn _giveBack(v) {
+        if (len(this._recvQ) > 0) {
+            let r = this._recvQ[0];
+            Array.RemoveAt(this._recvQ, 0);
+            this._recvValue[str(r)] = v;
+            Array.Append(this._recvGranted, r);
+            Fiber.Unpark(Fiber.FromId(r));
+        } else {
+            Array.InsertAt(this._buf, 0, v);
+        }
+    }
+
+    fn _recvLoop(me:int, deadline:int) {
+        while (true) {
+            if (Array.Contains(this._recvGranted, me)) {
+                let i:int = Array.IndexOf(this._recvGranted, me);
+                Array.RemoveAt(this._recvGranted, i);
+                let v = this._recvValue[str(me)];
+                Object.Delete(this._recvValue, str(me));
+                return v;
+            }
+            if (len(this._buf) > 0) {
+                let v = this._buf[0];
+                Array.RemoveAt(this._buf, 0);
+                // A parked sender's value moves into the freed slot.
+                if (len(this._sendQ) > 0) {
+                    let s = this._sendQ[0];
+                    Array.RemoveAt(this._sendQ, 0);
+                    Array.Append(this._buf, s.value);
+                    Array.Append(this._sendGranted, s.id);
+                    Fiber.Unpark(Fiber.FromId(s.id));
+                }
+                return v;
+            }
+            // Unbuffered handoff: a parked sender with an empty buffer (cap 0)
+            // hands its value over directly. (sendQ non-empty with room in buf
+            // cannot happen - Send only parks when the buffer is full.)
+            if (len(this._sendQ) > 0) {
+                let s = this._sendQ[0];
+                Array.RemoveAt(this._sendQ, 0);
+                Array.Append(this._sendGranted, s.id);
+                Fiber.Unpark(Fiber.FromId(s.id));
+                return s.value;
+            }
+            if (this._closed) { return nil; }
+            if (Array.IndexOf(this._recvQ, me) < 0) { Array.Append(this._recvQ, me); }
+            if (deadline > 0) {
+                let left:int = deadline - Time.Millis();
+                if (left <= 0) { return nil; }
+                Fiber.Park(left);
+            } else {
+                Fiber.Park();
+            }
+        }
+    }
+
+    fn TrySend(v): bool {
+        if (this._closed) { return false; }
+        if (len(this._recvQ) > 0) {
+            let r = this._recvQ[0];
+            Array.RemoveAt(this._recvQ, 0);
+            this._recvValue[str(r)] = v;
+            Array.Append(this._recvGranted, r);
+            Fiber.Unpark(Fiber.FromId(r));
+            return true;
+        }
+        if (len(this._buf) < this._cap) { Array.Append(this._buf, v); return true; }
+        return false;
+    }
+
+    fn TryRecv() {
+        if (len(this._buf) > 0) {
+            let v = this._buf[0];
+            Array.RemoveAt(this._buf, 0);
+            if (len(this._sendQ) > 0) {
+                let s = this._sendQ[0];
+                Array.RemoveAt(this._sendQ, 0);
+                Array.Append(this._buf, s.value);
+                Array.Append(this._sendGranted, s.id);
+                Fiber.Unpark(Fiber.FromId(s.id));
+            }
+            return v;
+        }
+        // Unbuffered: a parked sender hands its value over directly.
+        if (len(this._sendQ) > 0) {
+            let s = this._sendQ[0];
+            Array.RemoveAt(this._sendQ, 0);
+            Array.Append(this._sendGranted, s.id);
+            Fiber.Unpark(Fiber.FromId(s.id));
+            return s.value;
+        }
+        return nil;
+    }
+
+    fn Close() {
+        if (this._closed) { return; }
+        this._closed = true;
+        foreach (s in this._sendQ) { Fiber.Unpark(Fiber.FromId(s.id)); }
+        foreach (r in this._recvQ) { Fiber.Unpark(Fiber.FromId(r)); }
+    }
+
+    fn Len(): int      { return len(this._buf); }
+    fn IsClosed(): bool { return this._closed; }
+    fn Capacity(): int  { return this._cap; }
+
+    fn _dropSend(me:int) {
+        iter (i from 0 to len(this._sendQ)) {
+            if (this._sendQ[i].id == me) { Array.RemoveAt(this._sendQ, i); return; }
+        }
+    }
+
+    fn _dropRecv(me:int) {
+        let i:int = Array.IndexOf(this._recvQ, me);
+        if (i >= 0) { Array.RemoveAt(this._recvQ, i); }
+    }
+}
+
+export { Mutex, Semaphore, RWLock, Channel };

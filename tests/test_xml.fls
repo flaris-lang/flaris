@@ -417,6 +417,18 @@ fn Main() {
 
     let te = Test.Suite("XML.Parse - edge cases");
 
+    te.it("nesting past maxDepth is an error, and the deepest tree allowed walks", fn() {
+        let deep = fn(d) { return String.Repeat("<a>", d) + "x" + String.Repeat("</a>", d); };
+        te.eq(XML.Parse(deep(XML.MAX_DEPTH + 1)), nil);
+        te.eq(XML.Parse(deep(4), { maxDepth: 3 }), nil);
+        te.eq(XML.Parse(deep(4), { maxDepth: 4 }).tag, "a");
+        let n = XML.Parse(deep(XML.MAX_DEPTH));
+        te.eq(XML.Text(n), "x");
+        te.eq(len(XML.Build(n)), len(deep(XML.MAX_DEPTH)));
+        te.eq(len(XML.FindAll(n, "a")), XML.MAX_DEPTH);
+        te.ok(len(XML.Pretty(n, " ")) > 0);
+    });
+
     te.it("comment or PI right before a closing tag", fn() {
         let a = XML.Parse("<root><a/><!-- c --></root>");
         te.eq(a.text, "");
@@ -503,7 +515,9 @@ fn Main() {
         te.eq(n.attrs.c, "");
         te.eq(n.attrs.d, true);
         te.eq(n.attrs.e, "<A");
-        te.eq(XML.Parse("<x a=\"open").attrs.a, "open");
+        // Cut off inside an attribute: the element never closes, so it is not
+        // a document (Parse is nil on error, as its header says).
+        te.isNil(XML.Parse("<x a=\"open"));
     });
 
     te.it("CDATA keeps entities and can be the root", fn() {
@@ -513,10 +527,18 @@ fn Main() {
         te.eq(r.text, "raw");
     });
 
-    te.it("unclosed elements end at the end of input", fn() {
-        let n = XML.Parse("<a><b>text");
-        te.eq(n.tag, "a");
-        te.eq(n.children[0].text, "text");
+    te.it("a document cut short or with a mismatched end tag is nil", fn() {
+        te.isNil(XML.Parse("<a><b>text"));
+        te.isNil(XML.Parse("<a><b></c></a>"));
+    });
+
+    te.it("a byte-order mark is skipped", fn() {
+        te.eq(XML.Parse("\u{FEFF}<root>x</root>").text, "x");
+    });
+
+    te.it("whitespace after a comment inside text is kept", fn() {
+        te.eq(XML.Parse("<a>foo<!--c--> bar</a>").text, "foo bar");
+        te.eq(XML.Parse("<a>foo<?pi x?> bar</a>").text, "foo bar");
     });
 
     te.it("multibyte names, values and text", fn() {

@@ -478,7 +478,14 @@ fn _algIs(d, alg: string): bool {
 // took a PEM key as its secret would accept tokens anyone holding that
 // public key can make.
 fn _hmacSecretOk(secret): bool {
-    return Type.IsString(secret) && !String.Contains(secret, "-----BEGIN");
+    return Type.IsString(secret) && len(secret) > 0 && !String.Contains(secret, "-----BEGIN");
+}
+
+// A time claim must be a number. A string would compare as "not expired"
+// forever, and an object would raise out of the comparison.
+fn _isTime(v): bool {
+    let t = type(v);
+    return t == Type.Int || t == Type.Float;
 }
 
 class Jwt {
@@ -582,6 +589,10 @@ class Jwt {
         let requireIat        = (opts != nil && opts.requireIat != nil)        ? opts.requireIat        : false;
         let maxIatSkew        = (opts != nil && opts.maxIatSkew != nil)        ? opts.maxIatSkew        : 0;
         let allowNoTimeClaims = (opts != nil && opts.allowNoTimeClaims != nil) ? opts.allowNoTimeClaims : true;
+
+        if (payload.exp != nil && !_isTime(payload.exp)) return false;
+        if (payload.nbf != nil && !_isTime(payload.nbf)) return false;
+        if (payload.iat != nil && !_isTime(payload.iat)) return false;
 
         if (payload.exp == nil) {
             if (requireExp) return false;
@@ -899,7 +910,9 @@ class Jwt {
     // Verifies the token first; returns nil if the token is invalid.
     // The payload is re-encoded as-is except the exp claim is updated.
     fn static Refresh(token:string, secret:string, newExpSeconds:int) : string|nil {
-        let verified = Jwt.VerifyHS256(token, secret);
+        // Signature and claims: renewing an expired token would let a stolen
+        // one live forever.
+        let verified = Jwt.VerifyHS256WithClaims(token, secret);
         if (!verified) return nil;
         let decoded = Jwt.Decode(token);
         if (decoded == nil) return nil;

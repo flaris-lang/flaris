@@ -65,8 +65,11 @@
 //
 // Limits:
 //   Images are bounded to 16384 pixels per side, matching the `Gfx` surface cap.
+//   Decode, Load and Info also refuse a page of more than `maxPixels` pixels,
+//   default Tiff.MAX_PIXELS (64 M), before allocating anything for it:
+//     Tiff.Decode(bytes, { maxPixels: 16384 * 16384 })
 //
-// Constants:  Tiff.MAX_DIM  Tiff.COMPRESSION_NONE  Tiff.COMPRESSION_LZW
+// Constants:  Tiff.MAX_DIM  Tiff.MAX_PIXELS  Tiff.COMPRESSION_NONE  Tiff.COMPRESSION_LZW
 //             Tiff.COMPRESSION_DEFLATE  Tiff.COMPRESSION_PACKBITS
 // =============================================================================
 
@@ -614,6 +617,7 @@ class Tiff {
     // ----------------------------------------------------------------
 
     const MAX_DIM = 16384;
+    const MAX_PIXELS = 67108864;    // default maxPixels for Decode/Load/Info
 
     const COMPRESSION_NONE     = 1;
     const COMPRESSION_LZW      = 5;
@@ -654,7 +658,7 @@ class Tiff {
         if (page < 0) { return nil; }
         let d = Tiff._parse(bytes, page);
         if (d == nil) { return nil; }
-        if (!Tiff._validate(d)) { return nil; }
+        if (!Tiff._validate(d, opts)) { return nil; }
         let raw = Tiff._readData(bytes, d);
         if (raw == nil) { return nil; }
         let px = Tiff._toArgb(raw, d);
@@ -700,7 +704,7 @@ class Tiff {
         if (page < 0) { return nil; }
         let d = Tiff._parse(bytes, page);
         if (d == nil) { return nil; }
-        let ok = Tiff._validate(d);
+        let ok = Tiff._validate(d, opts);
         if (ok) { _tiffErr = nil; }
         return {
             Width: d.w, Height: d.h, BitsPerSample: d.bd, SamplesPerPixel: d.spp,
@@ -954,12 +958,17 @@ class Tiff {
     }
 
     // Can this page be decoded? Sets LastError and returns false if not.
-    fn static _validate(d:object) : bool {
+    fn static _validate(d:object, opts) : bool {
         let w = d.w;
         let h = d.h;
         if (w <= 0 || h <= 0) { Tiff._fail("image has no width or height"); return false; }
         if (w > MAX_DIM || h > MAX_DIM) {
             Tiff._fail("image is " + str(w) + "x" + str(h) + "; the limit is " + str(MAX_DIM) + " per side");
+            return false;
+        }
+        let maxPx = (opts != nil && opts.maxPixels != nil) ? opts.maxPixels : MAX_PIXELS;
+        if (w * h > maxPx) {
+            Tiff._fail("image is " + str(w) + "x" + str(h) + "; the limit is " + str(maxPx) + " pixels (maxPixels)");
             return false;
         }
 
@@ -1122,6 +1131,11 @@ class Tiff {
 
         let tw = d.tw;
         let tl = d.tl;
+        // Sides come from the file. Bounded first, so the byte count below
+        // cannot overflow into a negative that slips past MAX_RAW.
+        if (tw <= 0 || tl <= 0 || tw > 65536 || tl > 65536) {
+            return Tiff._fail("tile size " + str(tw) + "x" + str(tl) + " is out of range");
+        }
         let across = (w + tw - 1) / tw;
         let down = (h + tl - 1) / tl;
         let tileRow = (tw * pspp * bd) / 8;

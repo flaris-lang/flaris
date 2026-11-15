@@ -24,21 +24,22 @@
 // nils is indistinguishable from that and also scans the array.
 
 
-global _b64Std   = nil;   // 64-byte alphabet block, standard +/ 
-global _b64Url   = nil;   // 64-byte alphabet block, url-safe -_
-global _b64Val   = nil;   // 256-byte value table, 255 = not in the alphabet
-global _b32Std   = nil;   // 32-byte alphabet block
-global _b32Val   = nil;   // 256-byte value table, 255 = invalid
-global _hexLower = nil;   // 16-byte alphabet block
-global _hexUpper = nil;
-global _hexVal   = nil;   // 256-byte nibble table, 255 = not a hex digit
-global _hex16Lo  = nil;   // 256 x u16: byte -> its two lowercase hex chars
-global _hex16Up  = nil;   // 256 x u16: byte -> its two uppercase hex chars
+global _b64Std: block   = nil;   // 64-byte alphabet block, standard +/
+global _b64Url: block   = nil;   // 64-byte alphabet block, url-safe -_
+global _b64Val: block   = nil;   // 256-byte value table, 255 = not in the alphabet
+global _b32Std: block   = nil;   // 32-byte alphabet block
+global _b32Val: block   = nil;   // 256-byte value table, 255 = invalid
+global _hexLower: block = nil;   // 16-byte alphabet block
+global _hexUpper: block = nil;
+global _hexVal: block   = nil;   // 256-byte nibble table, 255 = not a hex digit
+global _hex16Lo: block  = nil;   // 256 x u16: byte -> its two lowercase hex chars
+global _hex16Up: block  = nil;   // 256 x u16: byte -> its two uppercase hex chars
 
-// Build the lookup tables once. Every encoder and decoder calls this first;
-// after the first call it is a single nil test.
-fn _tables() {
-    if (_b64Std != nil) { return; }
+// Build the lookup tables; called once when the module loads. A user of a
+// table copies it to a local and tests that for nil, which keeps the
+// encoders and decoders JIT-compiled.
+fn _tables(): bool {
+    if (_b64Std != nil) { return true; }
 
     let std = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -91,7 +92,11 @@ fn _tables() {
         _hex16Lo[b] = (Buffer.ReadU8At(_hexLower, hi) << hiShift) | (Buffer.ReadU8At(_hexLower, lo) << loShift);
         _hex16Up[b] = (Buffer.ReadU8At(_hexUpper, hi) << hiShift) | (Buffer.ReadU8At(_hexUpper, lo) << loShift);
     }
+    return true;
 }
+
+// The tables exist from module load on: a global initializer runs then.
+global _tablesReady: bool = _tables();
 
 // Normalise an encoder input to a byte-sized block, or nil if it is neither a
 // string nor a block. A block whose elements are wider than one byte is
@@ -180,6 +185,9 @@ fn _b64Canonical(s: string, n: int, val: block): bool {
 // Decode src[0..n) into out, returning the byte count or -1 on an invalid
 // character. Missing trailing padding is synthesised from n % 4. Typed leaf.
 fn _b64DecInto(src: string, n: int, val: block, out: block): int {
+    // One character past a multiple of four is no Base64 at all ("QUJDR"):
+    // it cannot carry a whole byte, so padding cannot make it whole.
+    if (n % 4 == 1) { return -1; }
     let o = 0;
     let pad = (4 - (n % 4)) % 4;
     let padded = n + pad;
@@ -215,14 +223,15 @@ fn _b64DecInto(src: string, n: int, val: block, out: block): int {
 // Decode Base64/base64url into a fresh block, or nil on an invalid character
 // (or, under strict, a non-canonical encoding).
 fn _b64Decode(input: string, strict: bool): block {
-    _tables();
+    let val = _b64Val;
+    if (val == nil) { return nil; }
     let n = len(input);
     if (n == 0) { return Buffer.FromString(""); }
-    if (strict && !_b64Canonical(input, n, _b64Val)) { return nil; }
+    if (strict && !_b64Canonical(input, n, val)) { return nil; }
 
     let cap = ((n + 3) / 4) * 3;
     let out = Buffer.Create(cap, 1);
-    let o = _b64DecInto(input, n, _b64Val, out);
+    let o = _b64DecInto(input, n, val, out);
     if (o < 0) { return nil; }
     if (o == 0) { return Buffer.FromString(""); }
     let res = Buffer.Slice(out, 0, o);
@@ -295,7 +304,8 @@ fn _b32DecInto(src: string, n: int, val: block, out: block): int {
 // Decode Base32 into a fresh block, or nil on an invalid character or a symbol
 // count no byte count can produce. Padding is optional and lowercase accepted.
 fn _b32Decode(input: string, strict: bool): block {
-    _tables();
+    let val = _b32Val;
+    if (val == nil) { return nil; }
     let n = len(input);
 
     if (strict) {
@@ -309,7 +319,7 @@ fn _b32Decode(input: string, strict: bool): block {
         if (pads > 0 && (clen + pads) % 8 != 0) { return nil; }
         let crem = clen % 8;
         if (crem != 0) {
-            let lv = Buffer.ReadU8At(_b32Val, (u8)input[clen - 1]);
+            let lv = Buffer.ReadU8At(val, (u8)input[clen - 1]);
             if (lv == 255) { return nil; }
             // Unused low bits of the final symbol, by remainder.
             let unused = 3;
@@ -328,7 +338,7 @@ fn _b32Decode(input: string, strict: bool): block {
     if (rem == 1 || rem == 3 || rem == 6) { return nil; }
 
     let out = Buffer.Create((n * 5) / 8 + 1, 1);
-    let o = _b32DecInto(input, n, _b32Val, out);
+    let o = _b32DecInto(input, n, val, out);
     if (o < 0) { return nil; }
     if (o == 0) { return Buffer.FromString(""); }
     let res = Buffer.Slice(out, 0, o);
@@ -726,13 +736,13 @@ class Util {
     // Base64Encode(string|block) -> string | nil
     // Standard RFC 4648 Base64: the +/ alphabet with '=' padding.
     fn static Base64Encode(input): string {
-        _tables();
+        let table = _b64Std;
         let src = _asBytes(input);
-        if (src == nil) { return nil; }
+        if (src == nil || table == nil) { return nil; }
         let n = len(src);
         if (n == 0) { return ""; }
         let out = Buffer.Create(4 * ((n + 2) / 3), 1);
-        let o = _b64EncInto(src, n, _b64Std, true, out);
+        let o = _b64EncInto(src, n, table, true, out);
         let res = Buffer.ToString(out);
         return res;
     }
@@ -741,9 +751,9 @@ class Util {
     // RFC 4648 base64url: the -_ alphabet and no padding - the JWT and
     // URL/filename-safe form.
     fn static Base64UrlEncode(input): string {
-        _tables();
+        let table = _b64Url;
         let src = _asBytes(input);
-        if (src == nil) { return nil; }
+        if (src == nil || table == nil) { return nil; }
         let n = len(src);
         if (n == 0) { return ""; }
         // Unpadded length, so the buffer is exact and needs no slicing.
@@ -751,7 +761,7 @@ class Util {
         let outLen = 4 * (n / 3);
         if (rem == 1) { outLen += 2; } else if (rem == 2) { outLen += 3; }
         let out = Buffer.Create(outLen, 1);
-        let o = _b64EncInto(src, n, _b64Url, false, out);
+        let o = _b64EncInto(src, n, table, false, out);
         let res = Buffer.ToString(out);
         return res;
     }
@@ -775,13 +785,13 @@ class Util {
     // Base32Encode(string|block) -> string | nil
     // RFC 4648 Base32 with '=' padding: 5 input bytes -> 8 output symbols.
     fn static Base32Encode(input): string {
-        _tables();
+        let table = _b32Std;
         let src = _asBytes(input);
-        if (src == nil) { return nil; }
+        if (src == nil || table == nil) { return nil; }
         let n = len(src);
         if (n == 0) { return ""; }
         let out = Buffer.Create(8 * ((n + 4) / 5), 1);
-        let o = _b32EncInto(src, n, _b32Std, out);
+        let o = _b32EncInto(src, n, table, out);
         let res = Buffer.ToString(out);
         return res;
     }
@@ -802,12 +812,12 @@ class Util {
     // AscToHex(string[, upper]) -> string
     // Hex-encode each byte of the input, lowercase unless upper is true.
     fn static AscToHex(input: string, upper?): string {
-        _tables();
         let src = Buffer.FromString(input);
         let n = len(src);
         if (n == 0) { return ""; }
         let table = _hex16Lo;
         if (upper == true) { table = _hex16Up; }
+        if (table == nil) { return nil; }
         let out = Buffer.Create(n, 2);
         let o = _hexEncInto(src, n, table, out);
         let res = Buffer.ToString(out);
@@ -826,13 +836,13 @@ class Util {
     // BinToHex(block) -> string
     // Lowercase hex dump of a block's exact bytes - NUL-safe, unlike AscToHex.
     fn static BinToHex(input: block): string {
-        _tables();
+        let table = _hex16Lo;
         let src = _asBytes(input);
-        if (src == nil) { return nil; }
+        if (src == nil || table == nil) { return nil; }
         let n = len(src);
         if (n == 0) { return ""; }
         let out = Buffer.Create(n, 2);
-        let o = _hexEncInto(src, n, _hex16Lo, out);
+        let o = _hexEncInto(src, n, table, out);
         let res = Buffer.ToString(out);
         return res;
     }
@@ -841,12 +851,13 @@ class Util {
     // Decode a hex string into raw bytes. nil on odd length or a non-hex
     // character. Inverse of BinToHex.
     fn static HexToBin(input: string): block {
-        _tables();
+        let val = _hexVal;
+        if (val == nil) { return nil; }
         let n = len(input);
         if (n % 2 != 0) { return nil; }
         if (n == 0) { return Buffer.FromString(""); }
         let out = Buffer.Create(n / 2, 1);
-        let o = _hexDecInto(input, n, _hexVal, out);
+        let o = _hexDecInto(input, n, val, out);
         if (o < 0) { return nil; }
         return out;
     }
@@ -859,8 +870,9 @@ class Util {
         if (b == nil) { return nil; }
         Buffer.WriteU8At(b, 6, (Buffer.ReadU8At(b, 6) & 15) | 64);    // version 4
         Buffer.WriteU8At(b, 8, (Buffer.ReadU8At(b, 8) & 63) | 128);   // variant 10xx
-        _tables();
-        return _uuidFormat(b, _hexLower);
+        let hex = _hexLower;
+        if (hex == nil) { return nil; }
+        return _uuidFormat(b, hex);
     }
 
     // Uuid7() -> string
@@ -878,8 +890,9 @@ class Util {
         Buffer.WriteU8At(b, 5, ms);
         Buffer.WriteU8At(b, 6, 112 | (Buffer.ReadU8At(b, 6) & 15));   // version 7
         Buffer.WriteU8At(b, 8, 128 | (Buffer.ReadU8At(b, 8) & 63));   // variant 10xx
-        _tables();
-        return _uuidFormat(b, _hexLower);
+        let hex = _hexLower;
+        if (hex == nil) { return nil; }
+        return _uuidFormat(b, hex);
     }
 
     // Nanoid([len]) -> string | nil
@@ -904,15 +917,17 @@ class Util {
     // UuidIsValid(string) -> bool
     // True for a canonical 8-4-4-4-12 hex UUID, any version or variant.
     fn static UuidIsValid(s: string): bool {
-        _tables();
-        return _uuidParse(s, _hexVal) != nil;
+        let val = _hexVal;
+        if (val == nil) { return false; }
+        return _uuidParse(s, val) != nil;
     }
 
     // UuidToBytes(string) -> block(16) | nil
     // Parse a canonical UUID into its 16 raw bytes. Inverse of UuidFromBytes.
     fn static UuidToBytes(s: string): block {
-        _tables();
-        return _uuidParse(s, _hexVal);
+        let val = _hexVal;
+        if (val == nil) { return nil; }
+        return _uuidParse(s, val);
     }
 
     // UuidFromBytes(block) -> string | nil
@@ -921,8 +936,9 @@ class Util {
     fn static UuidFromBytes(b: block): string {
         let src = _asBytes(b);
         if (src == nil || len(src) != 16) { return nil; }
-        _tables();
-        return _uuidFormat(src, _hexLower);
+        let hex = _hexLower;
+        if (hex == nil) { return nil; }
+        return _uuidFormat(src, hex);
     }
 
     // Compare(a, b) -> -1 | 0 | 1

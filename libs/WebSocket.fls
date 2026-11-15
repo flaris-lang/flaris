@@ -19,8 +19,8 @@
 //   if (ws == nil) { Console.WriteLine("connection failed"); }
 //
 //   ws.SendText("hello");
-//   let msg = ws.Receive();       // { opcode, data, isBinary }
-//   Console.WriteLine(msg.data);  // "hello" (echo server)
+//   let msg = ws.Receive();       // { Opcode, Payload, Text, ... }
+//   Console.WriteLine(msg.Text);  // "hello" (echo server)
 //
 //   ws.Ping();
 //   ws.Close(1000, "bye");
@@ -39,7 +39,9 @@
 //   SendJson(value)      →  bool  - Json.Stringify(value) then SendText
 //
 // Receiving:
-//   Receive()            →  { opcode:int, data:string|block, isBinary:bool } or nil
+//   Receive()            →  { Fin, Opcode, Payload:block, Length, Masked, Text, Json,
+//                            CloseCode, CloseReason } - waits as long as it takes;
+//                            pings are answered on the way
 //   ReceiveText()        →  string or nil  - expects text frame
 //   ReceiveJson()        →  parsed object or nil
 //   ReceiveWhenReady(timeoutMs?)     →  message or nil on timeout - suspends
@@ -65,6 +67,7 @@
 //   Ws.OpcodePong()  Ws.OpcodeClose()   Ws.OpcodeCont()
 
 import { Util } from library("Util", "1.0");
+import { HttpUtil } from library("HttpUtil", "1.0");
 
 // Frame opcodes (RFC 6455 5.2), as the Ws.Opcode*() accessors return them.
 const WS_OP_CONT   = 0x0;
@@ -310,7 +313,7 @@ class WebSocketClient {
     let sock = nil; 
     let closeCode = 0; 
     let closeReason: string = nil; 
-    let closed = nil; 
+    let closed: bool = false; 
     let maskOut = true;      // clients mask outgoing frames; servers must not
     let requireMask = false; // servers must refuse an unmasked client frame
     let maxMessageBytes:int = WS_MAX_MESSAGE_BYTES;
@@ -567,16 +570,35 @@ class WebSocketClient {
         return out;
     }
 
+    // RFC 6455 7.1.7: a malformed frame fails the connection. Its payload is
+    // still on the socket, so carrying on would read payload bytes as the next
+    // frame header.
+    fn _protocolError(reason: string) {
+        if (Stream.IsOpen(this.sock) && !this.closed) { this.Close(1002, "protocol error"); }
+        if (Stream.IsOpen(this.sock)) { Stream.Close(this.sock); }
+        this.closed      = true;
+        this.closeCode   = 1002;
+        this.closeReason = reason;
+        throw(Exception.RuntimeError, reason);
+    }
+
+    // The peer stopped mid-frame: nothing more can be read in step.
+    fn _readFailed(what: string) {
+        if (Stream.IsOpen(this.sock)) { Stream.Close(this.sock); }
+        this.closed = true;
+        throw(Exception.IOError, "Failed to read " + what);
+    }
+
     fn ReadFrame(): object {
         if (this.closed) {
             throw(Exception.InvalidState, "WebSocket already closed");
         }
 
+        // Between frames a connection may be idle as long as the application
+        // likes; only once a frame has begun does WS_READ_WAIT_MS apply.
+        if (Stream.WaitReadable(this.sock, -1) != true) { this._readFailed("WebSocket frame header"); }
         let head = this._readExact(2);
-        if (head == nil) {
-            this.closed = true;
-            throw(Exception.IOError, "Failed to read WebSocket frame header");
-        }
+        if (head == nil) { this._readFailed("WebSocket frame header"); }
 
         let hv = Buffer.ReadU16At(head, 0, true);
         let b0 = hv >> 8;
@@ -588,9 +610,7 @@ class WebSocketClient {
         let masked = (b1 & 0x80) != 0;
         let len7 = b1 & 0x7F;
 
-        if (rsv != 0) {
-            throw(Exception.RuntimeError, "RSV bits set but extensions not supported");
-        }
+        if (rsv != 0) { this._protocolError("RSV bits set but extensions not supported"); }
 
         let payloadLen = 0;
 
@@ -598,19 +618,15 @@ class WebSocketClient {
             payloadLen = len7;
         } else if (len7 == 126) {
             let ext2 = this._readExact(2);
-            if (ext2 == nil) {
-                throw(Exception.IOError, "Failed to read extended payload length");
-            }
+            if (ext2 == nil) { this._readFailed("extended payload length"); }
             payloadLen = Buffer.ReadU16At(ext2, 0, true);
         } else {
             let ext8 = this._readExact(8);
-            if (ext8 == nil) {
-                throw(Exception.IOError, "Failed to read extended payload length");
-            }
+            if (ext8 == nil) { this._readFailed("extended payload length"); }
             payloadLen = Ws.ReadU64BE(ext8, 0);
         }
 
-        if (opcode >= WS_OP_CLOSE && payloadLen > 125) { Ws.ValidateControlPayload(opcode, payloadLen); }
+        if (opcode >= WS_OP_CLOSE && payloadLen > 125) { this._protocolError("Control frame payload too large"); }
 
         // A 64-bit length with the top bit set reads as negative.
         if (payloadLen < 0 || payloadLen > this.maxMessageBytes) {
@@ -624,13 +640,13 @@ class WebSocketClient {
         }
 
         if ((opcode == WS_OP_CLOSE || opcode == WS_OP_PING || opcode == WS_OP_PONG) && !fin) {
-            throw(Exception.RuntimeError, "Fragmented control frames not allowed");
+            this._protocolError("Fragmented control frames not allowed");
         }
 
         // RFC 6455 5.1: every frame a client sends must be masked. A server
         // that accepts an unmasked one has to fail the connection.
         if (this.requireMask && !masked) {
-            throw(Exception.RuntimeError, "Unmasked frame from client");
+            this._protocolError("Unmasked frame from client");
         }
 
         var payload = nil;
@@ -638,29 +654,23 @@ class WebSocketClient {
             // A small frame's key and payload come in one read; the copy out
             // costs less than a second read would.
             let both = this._readExact(4 + payloadLen);
-            if (both == nil) {
-                throw(Exception.IOError, "Failed to read frame payload");
-            }
+            if (both == nil) { this._readFailed("frame payload"); }
             Ws.XorWordInPlace(both, 4, Buffer.ReadU32At(both, 0), payloadLen);
             payload = Buffer.Slice(both, 4, payloadLen);
         } else {
             var m: int = 0;
             if (masked) {
                 let maskKey = this._readExact(4);
-                if (maskKey == nil) {
-                    throw(Exception.IOError, "Failed to read masking key");
-                }
+                if (maskKey == nil) { this._readFailed("masking key"); }
                 m = Buffer.ReadU32At(maskKey, 0);
             }
             payload = this._readExact(payloadLen);
-            if (payload == nil) {
-                throw(Exception.IOError, "Failed to read frame payload");
-            }
+            if (payload == nil) { this._readFailed("frame payload"); }
             if (masked && payloadLen > 0) { Ws.XorWordInPlace(payload, 0, m, payloadLen); }
         }
 
         if (!fin) {
-            throw(Exception.RuntimeError, "Fragmented WebSocket frames not supported yet");
+            this._protocolError("Fragmented WebSocket frames not supported yet");
         }
 
         let frame = {
@@ -680,9 +690,7 @@ class WebSocketClient {
         }
 
         if (opcode == WS_OP_CLOSE) {
-            if (payloadLen == 1) {
-                throw(Exception.RuntimeError, "Invalid close frame payload length");
-            }
+            if (payloadLen == 1) { this._protocolError("Invalid close frame payload length"); }
 
             if (payloadLen >= 2) {
                 frame.CloseCode = Ws.ReadU16BE(payload, 0);
@@ -699,7 +707,19 @@ class WebSocketClient {
     }
 
     fn Receive(): object {
+        return this._receiveUntil(0);
+    }
+
+    // One message, answering pings on the way. deadline is a Time.Millis()
+    // value, 0 for none; nil comes back when it passes first. A ping does not
+    // restart the wait: the deadline is the caller's, not per frame.
+    fn _receiveUntil(deadline: int): object {
         while (true) {
+            if (deadline > 0) {
+                let left: int = deadline - Time.Millis();
+                if (left <= 0) { return nil; }
+                if (Stream.WaitReadable(this.sock, left) != true) { return nil; }
+            }
             let frame = this.ReadFrame();
 
             if (frame.Opcode == WS_OP_PING) {
@@ -742,8 +762,7 @@ class WebSocketClient {
         if (this.closed) {
             throw(Exception.InvalidState, "WebSocket already closed");
         }
-        let ready = Stream.WaitReadable(this.sock, timeoutMs ?? -1);
-        if (ready != true) { return nil; }      // timed out
+        let deadline: int = (timeoutMs != nil && timeoutMs > 0) ? Time.Millis() + timeoutMs : 0;
 
         // A peer that vanishes mid-frame, and a peer that sends something
         // malformed, both end the connection - RFC 6455 says to fail it either
@@ -753,7 +772,7 @@ class WebSocketClient {
         // on the connection: CloseCode() is 1006 (abnormal closure) and
         // CloseReason() carries the detail.
         try {
-            return this.Receive();
+            return this._receiveUntil(deadline);
         } catch (e) {
             this.closed      = true;
             this.closeCode   = (this.closeCode != 0) ? this.closeCode : 1006;
@@ -802,26 +821,18 @@ class WebSocket {
     }
 
     // Connect from a "ws://host[:port]/path" or "wss://..." URL.
+    // The URL goes through HttpUtil.ParseUrl, so "ws://[::1]:8080/x" and
+    // userinfo work as they do for Http; a missing or unreadable port is the
+    // scheme's default.
     fn static ConnectUrl(url: string, headers?): instance {
-        let lower  = String.ToLower(url);
-        let secure = false;
-        let rest   = nil;
-        if (String.StartsWith(lower, "wss://"))     { secure = true;  rest = String.Substr(url, 6); }
-        else if (String.StartsWith(lower, "ws://")) { secure = false; rest = String.Substr(url, 5); }
-        else { throw(Exception.RuntimeError, "WebSocket URL must start with ws:// or wss://"); }
-
-        let slash     = String.IndexOf(rest, "/");
-        let authority = (slash < 0) ? rest : String.Left(rest, slash);
-        let path      = (slash < 0) ? "/"  : String.Substr(rest, slash);
-
-        let host  = authority;
-        let port  = secure ? 443 : 80;
-        let colon = String.IndexOf(authority, ":");
-        if (colon >= 0) {
-            host = String.Left(authority, colon);
-            port = Convert.ParseInt(String.Substr(authority, colon + 1));
+        let u = HttpUtil.ParseUrl(url);
+        if (u == nil || (u.scheme != "ws" && u.scheme != "wss") || !String.Contains(url, "://")) {
+            throw(Exception.RuntimeError, "WebSocket URL must start with ws:// or wss://");
         }
-        return WebSocketClient.Connect(host, port, path, headers ?? nil, secure);
+        let secure = u.scheme == "wss";
+        let port = (u.port > 0) ? u.port : (secure ? 443 : 80);
+        let path = (u.query != nil && u.query != "") ? u.path + "?" + u.query : u.path;
+        return WebSocketClient.Connect(u.host, port, path, headers ?? nil, secure);
     }
 }
 

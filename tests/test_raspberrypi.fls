@@ -1,0 +1,261 @@
+// test_raspberrypi.fls - Tests for RaspberryPi.fls against simulated boards, and live on a Pi
+// Run: flarisvm tests/test_raspberrypi.fls --libs=./libs
+//
+// Every board here but the last is a SimBoard given through opts.backend: a
+// Pi 5 and a Pi 4 built from what those boards really expose (device-tree
+// strings end in a NUL), another board's device tree, and none at all. The
+// live part runs only on a Raspberry Pi and checks what any healthy one reports.
+
+import { RaspberryPi } from library("RaspberryPi", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, "  expected=", expected, "  got=", actual);
+    }
+    return 0;
+}
+
+// s followed by the NUL a device-tree string ends in.
+fn dt(s: string): string {
+    let bytes = Buffer.ToArray(Buffer.FromString(s));
+    Array.Append(bytes, 0);
+    let b = Buffer.Create(len(bytes), 1);
+    Buffer.FromArray(b, bytes);
+    return Buffer.ToString(b);
+}
+
+// files: path -> contents (a device node is any entry); tools: names on PATH.
+class SimBoard {
+    let files     = nil;
+    let tools     = nil;
+    let throttled = "throttled=0x0";
+    let groups    = "pi adm dialout gpio i2c spi";
+
+    fn Constructor(files, tools) {
+        this.files = files;
+        this.tools = tools;
+    }
+
+    fn Read(path: string) { return (path in this.files) ? this.files[path] : nil; }
+    fn Exists(path: string): bool { return path in this.files; }
+
+    fn List(dir: string) {
+        let out = [];
+        foreach (k in Object.Keys(this.files)) {
+            if (!String.StartsWith(k, dir + "/")) { continue; }
+            let name = String.Split(String.Substr(k, len(dir) + 1), "/")[0];
+            if (Array.IndexOf(out, name) < 0) { Array.Append(out, name); }
+        }
+        return len(out) > 0 ? out : nil;
+    }
+
+    fn Tool(name: string) { return Array.IndexOf(this.tools, name) >= 0 ? "/usr/bin/" + name : nil; }
+
+    fn Run(path: string, _args) {
+        if (String.EndsWith(path, "vcgencmd")) { return { Exit: 0, Stdout: this.throttled + "\n" }; }
+        if (String.EndsWith(path, "id")) { return { Exit: 0, Stdout: this.groups + "\n" }; }
+        return nil;
+    }
+}
+
+fn pi5Board() {
+    return new SimBoard({
+        "/proc/device-tree/model": dt("Raspberry Pi 5 Model B Rev 1.1"),
+        "/proc/device-tree/serial-number": dt("42e5e94d1994aab2"),
+        "/proc/cpuinfo": "processor\t: 0\nBogoMIPS\t: 108.00\n\nRevision\t: d04171\nSerial\t\t: 42e5e94d1994aab2\nModel\t\t: Raspberry Pi 5 Model B Rev 1.1\n",
+        "/sys/class/thermal/thermal_zone0/temp": "49050\n",
+        "/sys/class/hwmon/hwmon0/name": "cpu_thermal\n",
+        "/sys/class/hwmon/hwmon1/name": "rp1_adc\n",
+        "/sys/class/hwmon/hwmon2/name": "pwmfan\n",
+        "/sys/class/hwmon/hwmon2/fan1_input": "3122\n",
+        "/dev/i2c-1": "", "/dev/spidev0.0": "", "/dev/ttyAMA0": "", "/dev/serial0": ""
+    }, ["gpioget", "i2ctransfer", "spi-pipe", "vcgencmd", "id"]);
+}
+
+fn pi4Board() {
+    let b = new SimBoard({
+        "/proc/device-tree/model": dt("Raspberry Pi 4 Model B Rev 1.5"),
+        "/proc/cpuinfo": "processor\t: 0\n\nRevision\t: d03115\nSerial\t\t: 10000000a1b2c3d4\nModel\t\t: Raspberry Pi 4 Model B Rev 1.5\n",
+        "/sys/class/thermal/thermal_zone0/temp": "61234\n",
+        "/sys/class/hwmon/hwmon0/name": "cpu_thermal\n",
+        "/sys/class/hwmon/hwmon1/name": "rpi_volt\n",
+        "/dev/i2c-1": "", "/dev/serial0": ""
+    }, ["gpioget", "vcgencmd", "id"]);
+    b.throttled = "throttled=0x50005";
+    b.groups = "pi adm dialout i2c";
+    return b;
+}
+
+fn item(list, name: string) {
+    foreach (c in list) { if (c["item"] == name) { return c; } }
+    return nil;
+}
+
+fn simTests() {
+    Console.WriteLine("[ a Raspberry Pi 5 ]");
+    let p5 = new RaspberryPi({ backend: pi5Board() });
+    checkEq(p5.Model(), "Raspberry Pi 5 Model B Rev 1.1", "Model without the device tree's NUL");
+    check(p5.IsPi() && p5.IsPi5(), "IsPi and IsPi5");
+    checkEq(p5.Revision(), "d04171", "Revision from /proc/cpuinfo");
+    checkEq(p5.Serial(), "42e5e94d1994aab2", "Serial from the device tree");
+    checkEq(p5.Temperature(), 49.05, "Temperature in degrees C");
+    checkEq(p5.FanRpm(), 3122, "FanRpm finds pwmfan by name, not by number");
+    checkEq(p5.SerialPort(), "/dev/ttyAMA0", "the header UART is ttyAMA0, not serial0");
+    let t5 = p5.Throttled();
+    check(t5 != nil && t5["raw"] == 0 && !t5["underVoltage"] && !t5["underVoltageOccurred"], "Throttled: all clear");
+    let c5 = p5.Check();
+    foreach (c in c5) { check(c["ok"] && c["fix"] == "", "Check: " + c["item"] + " is ok on a fully set up Pi 5"); }
+    checkEq(len(c5), 12, "Check has twelve items with id and vcgencmd present");
+
+    let off5 = pi5Board();
+    Object.Delete(off5.files, "/dev/ttyAMA0");
+    let o5 = new RaspberryPi({ backend: off5 });
+    checkEq(o5.SerialPort(), nil, "with UART0 off a Pi 5 has no header port, though serial0 exists");
+    check(String.Contains(item(o5.Check(), "uart")["fix"], "dtoverlay=uart0-pi5"), "  and Check names the Pi 5 overlay");
+
+    Console.WriteLine("[ a Raspberry Pi 4 ]");
+    let p4 = new RaspberryPi({ backend: pi4Board() });
+    checkEq(p4.Model(), "Raspberry Pi 4 Model B Rev 1.5", "Model");
+    check(p4.IsPi() && !p4.IsPi5(), "a Pi but not a Pi 5");
+    checkEq(p4.Serial(), "10000000a1b2c3d4", "Serial falls back to /proc/cpuinfo");
+    checkEq(p4.Temperature(), 61.234, "Temperature");
+    checkEq(p4.FanRpm(), nil, "no fan connector");
+    checkEq(p4.SerialPort(), "/dev/serial0", "the header UART is serial0");
+    let t4 = p4.Throttled();
+    check(t4["underVoltage"] && t4["throttled"] && !t4["frequencyCapped"], "Throttled: under-voltage and throttled now");
+    check(t4["underVoltageOccurred"] && t4["throttledOccurred"] && !t4["softTempLimitOccurred"], "  and since boot");
+    checkEq(t4["raw"], 0x50005, "  raw keeps the value");
+    let c4 = p4.Check();
+    check(item(c4, "i2c")["ok"], "Check: i2c is on");
+    check(!item(c4, "spi")["ok"] && String.Contains(item(c4, "spi")["fix"], "dtparam=spi=on"), "Check: spi is off, with the config line");
+    check(!item(c4, "spi tools")["ok"] && String.Contains(item(c4, "spi tools")["fix"], "spi-tools"), "Check: spi-tools missing");
+    check(!item(c4, "gpio group")["ok"] && String.Contains(item(c4, "gpio group")["fix"], "usermod -aG gpio"), "Check: not in the gpio group");
+    check(!item(c4, "power")["ok"] && String.Contains(item(c4, "power")["detail"], "under-voltage"), "Check: power reports the under-voltage");
+    check(item(c4, "uart")["ok"], "Check: uart is on");
+
+    let off4 = pi4Board();
+    Object.Delete(off4.files, "/dev/serial0");
+    check(String.Contains(item(new RaspberryPi({ backend: off4 }).Check(), "uart")["fix"], "enable_uart=1"),
+          "Check names enable_uart=1 for a Pi 4");
+
+    Console.WriteLine("[ not a Raspberry Pi ]");
+    let other = new RaspberryPi({ backend: new SimBoard({ "/proc/device-tree/model": dt("Orange Pi 5"),
+                                                          "/sys/class/thermal/thermal_zone0/temp": "40000\n" }, ["vcgencmd"]) });
+    check(other.Model() == nil && !other.IsPi() && !other.IsPi5(), "another board's device tree is not a Pi");
+    check(other.Revision() == nil && other.Serial() == nil && other.SerialPort() == nil, "  and has no Pi revision, serial or port");
+    checkEq(other.Temperature(), 40.0, "Temperature still reads the thermal zone");
+    let co = other.Check();
+    check(len(co) == 1 && !co[0]["ok"] && co[0]["item"] == "board", "Check stops at the board");
+
+    let none = new RaspberryPi({ backend: new SimBoard({}, []) });
+    check(none.Model() == nil && none.Temperature() == nil && none.FanRpm() == nil && none.Throttled() == nil,
+          "with nothing to read everything is nil");
+
+    let bad = pi5Board();
+    bad.throttled = "not what vcgencmd says";
+    checkEq(new RaspberryPi({ backend: bad }).Throttled(), nil, "Throttled: unexpected output is nil");
+    let noId = pi5Board();
+    noId.tools = ["gpioget", "vcgencmd"];
+    checkEq(item(new RaspberryPi({ backend: noId }).Check(), "gpio group"), nil, "Check: without id no group items");
+
+    Console.WriteLine("[ header ]");
+    let pins = p5.Pinout();
+    checkEq(len(pins), 40, "Pinout has 40 pins");
+    var ordered = true;
+    var gpios = 0;
+    var grounds = 0;
+    let names = [];
+    iter (i from 0 to 40) {
+        if (pins[i]["pin"] != i + 1) { ordered = false; }
+        let n = pins[i]["name"];
+        if (String.StartsWith(n, "GPIO")) { gpios += 1; if (Array.IndexOf(names, n) < 0) { Array.Append(names, n); } }
+        if (n == "GND") { grounds += 1; }
+    }
+    check(ordered, "pins are 1 to 40 in order");
+    checkEq(gpios, 28, "28 GPIO pins");
+    checkEq(len(names), 28, "  each a different line, GPIO0 to GPIO27");
+    checkEq(grounds, 8, "8 ground pins");
+    check(pins[2]["name"] == "GPIO2" && pins[2]["use"] == "I2C1 SDA", "pin 3 is GPIO2, I2C1 SDA");
+    check(pins[18]["name"] == "GPIO10" && pins[18]["use"] == "SPI0 MOSI", "pin 19 is GPIO10, SPI0 MOSI");
+    checkEq(p5.Line(11), "GPIO17", "Line(11) is GPIO17");
+    checkEq(p5.Line(40), "GPIO21", "Line(40) is GPIO21");
+    check(p5.Line(1) == nil && p5.Line(6) == nil, "power and ground pins have no line");
+    check(p5.Line(0) == nil && p5.Line(41) == nil && p5.Line("11") == nil && p5.Line(nil) == nil, "Line refuses what is not a pin");
+}
+
+fn liveTests() {
+    Console.WriteLine("[ live: this Raspberry Pi ]");
+    let pi = new RaspberryPi();
+    check(pi.IsPi(), "the board reports a Raspberry Pi model: " + str(pi.Model()));
+    check(pi.Revision() != nil && len(pi.Revision()) >= 4, "a revision code");
+    check(pi.Serial() != nil && len(pi.Serial()) >= 8, "a serial number");
+    let t = pi.Temperature();
+    check(t != nil && t > 0.0 && t < 110.0, "a plausible temperature: " + str(t));
+    if (pi.IsPi5()) {
+        check(pi.FanRpm() != nil, "a Pi 5 reports its fan connector");
+    }
+    let c = pi.Check();
+    check(len(c) >= 10 && item(c, "board")["ok"], "Check covers the interfaces");
+    foreach (x in c) {
+        if (!x["ok"]) { Console.WriteLine("  (not set up here: " + x["item"] + " - " + x["fix"] + ")"); }
+    }
+}
+
+fn Main() {
+    simTests();
+    if (File.Stat("/proc/device-tree/model") != nil && new RaspberryPi().IsPi()) {
+        liveTests();
+    } else {
+        Console.WriteLine("[ live part skipped: not a Raspberry Pi ]");
+    }
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + str(testsRun - testsFailed) + "/" + str(testsRun) + " passed");
+
+    // ===================================================================
+    // Benchmarks - over a simulated Pi 5 (no file or process access)
+    // ===================================================================
+    Console.WriteLine("");
+    benchSep();
+    Console.WriteLine("Benchmarks");
+    benchSep();
+    let p5 = new RaspberryPi({ backend: pi5Board() });
+    bench("Model", fn() { _sink = _sink + len(p5.Model()); }, 20000);
+    bench("Temperature", fn() { _sink = _sink + (int)p5.Temperature(); }, 20000);
+    bench("Line(11)", fn() { _sink = _sink + len(p5.Line(11)); }, 20000);
+    bench("Check (12 items)", fn() { _sink = _sink + len(p5.Check()); }, 2000);
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

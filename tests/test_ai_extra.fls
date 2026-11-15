@@ -111,6 +111,52 @@ fn test_reply_timeout() {
     Stream.Close(srv);
 }
 
+// A server that answers once with `reply`, then hangs up.
+fn oneShotServer(reply: string): int {
+    let srv = Stream.Listen("tcp", 0, 16, "127.0.0.1");
+    let a: string = Stream.LocalAddr(srv);
+    Fiber.Run(fn() {
+        if (Stream.WaitReadable(srv, 3000) != nil) {
+            let c = Stream.Accept(srv);
+            Stream.WaitReadable(c, 2000);
+            Stream.ReadBytes(c, 65536);
+            Stream.WriteAll(c, reply);
+            Fiber.Sleep(50);
+            Stream.Close(c);
+        }
+        Stream.Close(srv);
+    });
+    return Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10)) ?? 0;
+}
+
+fn test_streams_and_system() {
+    Console.WriteLine("-- streams, System()");
+    // An Ollama error line ends the stream with that error, not nil tokens.
+    let body = "{\"error\":\"model 'nope' not found\"}\n";
+    let port = oneShotServer("HTTP/1.1 404 Not Found\r\nContent-Type: application/x-ndjson\r\nContent-Length: "
+                             + str(len(body)) + "\r\nConnection: close\r\n\r\n" + body);
+    let c = AI.Client("http://127.0.0.1:" + str(port));
+    let tokens = [];
+    let r = c.ChatStream("nope", [{ role: "user", content: "hi" }], fn(t) { Array.Append(tokens, t); }, { timeoutMs: 2000 });
+    check(r != nil && !r.ok && String.Contains(str(r.error), "not found"), "an error line is reported as the error");
+    checkEq(len(tokens), 0, "... and no nil token reaches the callback");
+
+    // timeoutMs bounds a stream that never answers.
+    let silent = Stream.Listen("tcp", 0, 16, "127.0.0.1");
+    let sa: string = Stream.LocalAddr(silent);
+    let sc = AI.Client("http://127.0.0.1:" + String.Substr(sa, String.LastIndexOf(sa, ":") + 1, 10));
+    let t0 = Time.Millis();
+    sc.GenerateStream("m", "hi", fn(_t) { return 0; }, { timeoutMs: 300 });
+    check(Time.Millis() - t0 < 5000, "timeoutMs ends a silent stream");
+    Stream.Close(silent);
+
+    // System() after other messages still goes first.
+    let conv = AI.Conversation("m");
+    conv._messages = [{ role: "user", content: "earlier" }];
+    conv.System("be brief");
+    checkEq(conv._messages[0].role, "system", "System() prepends");
+}
+
 fn test_benchmarks() {
     Console.WriteLine("=== AI helper benchmarks ===");
     let iters = 20000;
@@ -132,6 +178,7 @@ fn Main() {
     test_image_file();
     test_model_options();
     test_reply_timeout();
+    test_streams_and_system();
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

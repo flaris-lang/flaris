@@ -76,7 +76,7 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 
 ## The libraries
 
-53 libraries, all pure Flaris unless noted:
+64 libraries, all pure Flaris unless noted:
 
 **Data & formats** — `CSV`, `XML`, `BinaryIO`, `BitConverter`, `Config`,
 `Template`, `Lexer`
@@ -97,14 +97,20 @@ sealed blobs, streaming MD5/SHA-1/SHA-256/SHA-384/SHA-512/SHA-3/Keccak-256/SHAKE
 **Data stores** — `SQLite`, `Postgres`, `Redis`
 
 **System & tooling** — `Argparse`, `Process`, `Logger`, `Profiler`, `Datetime`,
-`Promise`, `Signals`, `ConsoleMenu`, `Test`, `Util`
+`Promise`, `Signals`, `Sync` (Mutex/Semaphore/RWLock/Channel for fibers),
+`Ntp` (SNTP client: clock offset and round-trip over UDP), `ConsoleMenu`,
+`Test`, `Util`
 
 **Serial & cellular** — `Modem` (AT transport plus 3GPP 27.007/27.005: SIM and
 PIN, signal, registration, operator scan, SMS in PDU mode, data contexts, USSD
-and call control)
+and call control), `GPS` (NMEA 0183 parser and serial receiver: GGA/RMC/GSA/
+GSV/VTG/GLL/ZDA with checksum verification, decimal-degree conversion and fix
+tracking over `Stream.OpenSerial`)
 
 **Hardware** — `I2c`, `Spi` (chips on Linux I2C and SPI buses, through i2c-tools
-and spi-tools)
+and spi-tools), `Gpio` (GPIO lines on Linux: read, drive and watch for edges, through
+libgpiod's tools), `RaspberryPi` (the board: model, temperature, throttling,
+fan, the 40-pin header and a setup check, Pi 3 to Pi 5)
 
 **Media** — `Graphics`, `Audio`, `QRCode`, `Png`, `Tiff`, `Pdf`
 

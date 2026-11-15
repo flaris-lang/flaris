@@ -1,0 +1,382 @@
+// test_sync.fls - Test suite for Sync.fls (Mutex, Semaphore, RWLock, Channel)
+// Run: flarisvm tests/test_sync.fls --libs='./libs'
+
+import { Mutex, Semaphore, RWLock, Channel } from library("Sync", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+// shared state for the contention tests (globals are read/written live)
+global counter = 0;
+global cur = 0;
+global maxSeen = 0;
+global withRan = false;
+global writerQueued = false;
+global writerGot = false;
+global sent = false;
+global recvResult = "unset";
+
+fn chk(label:string, cond:bool) {
+    if (cond) { passed += 1; }
+    else { failed += 1; Console.WriteLine("[FAIL] " + label); }
+}
+
+fn chkEq(label:string, got, expected) {
+    if (got == expected) { passed += 1; }
+    else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label + " - expected: " + str(expected) + "  got: " + str(got));
+    }
+}
+
+// ============================================================
+// Mutex
+// ============================================================
+
+fn testMutex() {
+    Console.WriteLine("--- Mutex ---");
+    let m = new Mutex();
+    chk("unlocked at start", !m.IsLocked());
+    chk("Lock succeeds", m.Lock());
+    chk("IsLocked", m.IsLocked());
+    chk("TryLock fails while held", !m.TryLock());
+    chk("Unlock by holder", m.Unlock());
+    chk("unlocked after Unlock", !m.IsLocked());
+    chk("Unlock by non-holder returns false", !m.Unlock());
+
+    // mutual exclusion under contention: 8 fibers x 200 increments, all
+    // started detached so they actually overlap
+    counter = 0;
+    let ids = [];
+    iter (i from 0 to 8) {
+        Array.Append(ids, Fiber.Run(fn() {
+            iter (j from 0 to 200) {
+                m.Lock();
+                counter = counter + 1;
+                m.Unlock();
+            }
+        }));
+    }
+    foreach (id in ids) { Fiber.Await(Fiber.FromId(id)); }
+    chkEq("no lost updates under contention", counter, 8 * 200);
+
+    // Lock with timeout while held by main
+    m.Lock();
+    let r = Fiber.Await(Fiber.New(fn() { return m.Lock(60); }));
+    chkEq("Lock(60) times out while held", r, false);
+    m.Unlock();
+    let r2 = Fiber.Await(Fiber.New(fn() { let ok = m.Lock(500); m.Unlock(); return ok; }));
+    chk("Lock succeeds once free", r2 == true);
+
+    // With() releases even when fn throws
+    withRan = false;
+    var caught = nil;
+    try {
+        m.With(fn() { withRan = true; throw(1, "boom"); });
+    } catch (e) { caught = e; }
+    chk("With propagates fn's throw", caught != nil);
+    chk("With ran fn", withRan);
+    chk("With released after throw", !m.IsLocked());
+    chkEq("With returns fn's value", m.With(fn() { return 42; }), 42);
+}
+
+// ============================================================
+// Semaphore
+// ============================================================
+
+fn testSemaphore() {
+    Console.WriteLine("--- Semaphore ---");
+    let s = new Semaphore(2);
+    chkEq("initial count", s.Count(), 2);
+    chkEq("max", s.Max(), 2);
+    chk("acquire 1", s.Acquire());
+    chk("acquire 2", s.Acquire());
+    chkEq("count now 0", s.Count(), 0);
+    chk("try fails at 0", !s.TryAcquire());
+    chk("release", s.Release());
+    chkEq("count 1", s.Count(), 1);
+    s.Release();
+    chkEq("count back to 2", s.Count(), 2);
+    chk("over-release returns false", !s.Release());
+    chkEq("count still 2", s.Count(), 2);
+
+    // at most 2 fibers inside at once, all six get in eventually
+    cur = 0;
+    maxSeen = 0;
+    let ids = [];
+    iter (i from 0 to 6) {
+        Array.Append(ids, Fiber.Run(fn() {
+            if (s.Acquire(2000)) {
+                cur = cur + 1;
+                if (cur > maxSeen) { maxSeen = cur; }
+                Fiber.Sleep(5);
+                cur = cur - 1;
+                s.Release();
+            }
+        }));
+    }
+    foreach (id in ids) { Fiber.Await(Fiber.FromId(id)); }
+    chk("never more than 2 inside", maxSeen <= 2);
+    chk("all six got in eventually", maxSeen == 2);
+    chkEq("count restored", s.Count(), 2);
+
+    // Acquire with timeout while exhausted
+    s.Acquire(); s.Acquire();
+    let r = Fiber.Await(Fiber.New(fn() { return s.Acquire(60); }));
+    chkEq("Acquire(60) times out when exhausted", r, false);
+    s.Release(); s.Release();
+}
+
+// ============================================================
+// RWLock
+// ============================================================
+
+fn testRWLock() {
+    Console.WriteLine("--- RWLock ---");
+    let rw = new RWLock();
+
+    // two readers overlap
+    chk("read 1", rw.LockRead());
+    let r2 = Fiber.Await(Fiber.New(fn() { let ok = rw.TryLockRead(); rw.UnlockRead(); return ok; }));
+    chk("second reader overlaps", r2 == true);
+    chkEq("main still holds one read", rw.Readers(), 1);
+
+    // writer excluded while a reader holds
+    let w = Fiber.Await(Fiber.New(fn() { return rw.TryLockWrite(); }));
+    chk("writer excluded by reader", w == false);
+    rw.UnlockRead();
+    chkEq("readers 0", rw.Readers(), 0);
+
+    // writer excludes everyone
+    chk("write lock", rw.LockWrite());
+    chk("WriterActive", rw.WriterActive());
+    let r3 = Fiber.Await(Fiber.New(fn() { return rw.TryLockRead(); }));
+    let w2 = Fiber.Await(Fiber.New(fn() { return rw.TryLockWrite(); }));
+    chk("reader excluded by writer", r3 == false);
+    chk("writer excluded by writer", w2 == false);
+
+    // a queued writer is not overtaken by a barging reader (FIFO fairness)
+    writerQueued = false;
+    writerGot = false;
+    let wid = Fiber.Run(fn() {
+        writerQueued = true;
+        let ok = rw.LockWrite(2000);
+        writerGot = ok;
+        if (ok) { rw.UnlockWrite(); }
+    });
+    while (!writerQueued) { Fiber.Sleep(2); }
+    Fiber.Sleep(10);                       // let it enqueue inside LockWrite
+    chk("reader cannot barge past queued writer", !rw.TryLockRead());
+    rw.UnlockWrite();                      // release main's write lock -> writer is granted
+    Fiber.Await(Fiber.FromId(wid));
+    chk("queued writer acquired after unlock", writerGot == true);
+    chk("write lock free again", !rw.WriterActive());
+
+    // Unlock() dispatches by what the caller holds
+    rw.LockRead();
+    chk("Unlock() releases a read lock", rw.Unlock() && rw.Readers() == 0);
+    rw.LockWrite();
+    chk("Unlock() releases a write lock", rw.Unlock() && !rw.WriterActive());
+
+    // WithRead / WithWrite
+    chkEq("WithRead value", rw.WithRead(fn() { return rw.Readers(); }), 1);
+    chk("read released after WithRead", rw.Readers() == 0);
+    rw.WithWrite(fn() { return 0; });
+    chk("write released after WithWrite", !rw.WriterActive());
+}
+
+// ============================================================
+// Channel
+// ============================================================
+
+fn testChannel() {
+    Console.WriteLine("--- Channel ---");
+
+    // buffered
+    let ch = new Channel(2);
+    chkEq("capacity", ch.Capacity(), 2);
+    chk("send 1", ch.TrySend(1));
+    chk("send 2", ch.TrySend(2));
+    chk("buffer full", !ch.TrySend(3));
+    chkEq("len", ch.Len(), 2);
+    chkEq("recv order 1", ch.TryRecv(), 1);
+    chkEq("recv order 2", ch.TryRecv(), 2);
+    chk("empty recv nil", ch.TryRecv() == nil);
+
+    // unbuffered rendezvous: sender parks until a receiver arrives
+    let u = new Channel();
+    sent = false;
+    let fid = Fiber.Run(fn() { sent = u.Send(42, 2000); });
+    Fiber.Sleep(20);                       // let the sender park
+    chk("send parked (not done yet)", !sent);
+    chkEq("recv gets the value", u.Recv(1000), 42);
+    Fiber.Await(Fiber.FromId(fid));
+    chk("send completed after handoff", sent == true);
+
+    // timeouts on an empty, unbuffered channel
+    chk("recv timeout nil", u.Recv(50) == nil);
+    chkEq("send timeout false", u.Send(1, 50), false);
+
+    // buffered send fills, then parks; a Recv frees a slot and completes it
+    let b = new Channel(1);
+    chk("fill buffer", b.TrySend("a"));
+    sent = false;
+    let fid2 = Fiber.Run(fn() { sent = b.Send("b", 2000); });
+    Fiber.Sleep(20);
+    chk("second send parked (full)", !sent);
+    chkEq("recv a", b.Recv(1000), "a");
+    Fiber.Await(Fiber.FromId(fid2));
+    chk("parked send completed", sent == true);
+    chkEq("b arrived in buffer", b.Recv(1000), "b");
+
+    // close semantics: drain first, then nil; send fails
+    ch.TrySend(7);
+    ch.Close();
+    chk("closed", ch.IsClosed());
+    chkEq("drain after close", ch.Recv(), 7);
+    chk("recv on closed+drained is nil", ch.Recv() == nil);
+    chkEq("send on closed is false", ch.Send(8), false);
+
+    // close wakes a parked receiver with nil
+    let c2 = new Channel();
+    recvResult = "unset";
+    let rid = Fiber.Run(fn() { recvResult = c2.Recv(5000); });
+    Fiber.Sleep(20);                       // let it park in Recv
+    c2.Close();
+    Fiber.Await(Fiber.FromId(rid));
+    chkEq("parked receiver woke with nil on close", recvResult, nil);
+}
+
+// A waiter that is cancelled or times out must leave no trace: no lock handed
+// to a fiber that is gone, no queue stuck behind it, no value lost with it.
+fn testCancellation() {
+    Console.WriteLine("--- cancellation and ordering ---");
+
+    let m = new Mutex();
+    m.Lock();
+    let w = Fiber.Run(fn() { m.Lock(); m.Unlock(); });
+    Fiber.Sleep(20);                       // let it queue
+    Fiber.Cancel(Fiber.FromId(w));
+    Fiber.Sleep(10);
+    m.Unlock();
+    chk("a cancelled waiter is not handed the mutex", !m.IsLocked());
+    chk("the mutex locks again afterwards", m.Lock(200));
+    m.Unlock();
+
+    let s = new Semaphore(1);
+    s.Acquire();
+    let sw = Fiber.Run(fn() { s.Acquire(); });
+    Fiber.Sleep(20);
+    Fiber.Cancel(Fiber.FromId(sw));
+    Fiber.Sleep(10);
+    s.Release();
+    chkEq("a cancelled waiter does not take the permit", s.Count(), 1);
+
+    // A reader queued behind a writer that gave up gets in.
+    let rw = new RWLock();
+    rw.LockRead();
+    let box = { r: "unset" };
+    Fiber.Run(fn() { rw.LockWrite(50); });
+    Fiber.Sleep(10);
+    Fiber.Run(fn() { box.r = rw.LockRead(1000); });
+    Fiber.Sleep(150);
+    chkEq("a reader behind a timed-out writer is let in", box.r, true);
+
+    // Values arrive in the order they were sent, also when the first went
+    // straight to a parked receiver and the second to the buffer.
+    let ch = new Channel(4);
+    let got = [];
+    let rf = Fiber.Run(fn() { Array.Append(got, ch.Recv(1000)); Array.Append(got, ch.Recv(1000)); });
+    Fiber.Sleep(20);
+    ch.Send(1);
+    ch.Send(2);
+    Fiber.Await(Fiber.FromId(rf));
+    chk("values arrive in send order", len(got) == 2 && got[0] == 1 && got[1] == 2);
+
+    // TryRecv on an unbuffered channel takes a parked sender's value.
+    let u = new Channel();
+    let box2 = { sent: "unset" };
+    let sf = Fiber.Run(fn() { box2.sent = u.Send(5, 1000); });
+    Fiber.Sleep(20);
+    chkEq("TryRecv takes from a parked sender", u.TryRecv(), 5);
+    Fiber.Await(Fiber.FromId(sf));
+    chkEq("... and the sender sees it delivered", box2.sent, true);
+
+    // A receiver that was cancelled is no longer there to hand a value to.
+    let c3 = new Channel();
+    let rf3 = Fiber.Run(fn() { c3.Recv(); });
+    Fiber.Sleep(20);
+    Fiber.Cancel(Fiber.FromId(rf3));
+    Fiber.Sleep(10);
+    chkEq("TrySend to a cancelled receiver is not a delivery", c3.TrySend(9), false);
+}
+
+// The other half of the race: the lock, permit or value was already handed to
+// the head waiter, and it is cancelled before it gets to run. It must pass on
+// to the next waiter, not leave with the cancelled fiber. Nothing between the
+// handover and the Cancel can switch fibers, so the cancelled one never runs.
+fn testCancelAfterHandover() {
+    Console.WriteLine("--- cancelled after the handover ---");
+    let box = { m: "unset", s: "unset", c: "unset" };
+
+    let m = new Mutex();
+    m.Lock();
+    let m1 = Fiber.Run(fn() { m.Lock(); m.Unlock(); });
+    Fiber.Sleep(10);
+    Fiber.Run(fn() { box.m = m.Lock(300); m.Unlock(); });
+    Fiber.Sleep(10);
+    m.Unlock();                            // hands the mutex to m1 ...
+    Fiber.Cancel(Fiber.FromId(m1));        // ... which never runs to take it
+    Fiber.Sleep(30);
+    chkEq("a mutex handed to a cancelled waiter goes to the next one", box.m, true);
+    chk("... and is free afterwards", !m.IsLocked());
+
+    let s = new Semaphore(1);
+    s.Acquire();
+    let s1 = Fiber.Run(fn() { s.Acquire(); s.Release(); });
+    Fiber.Sleep(10);
+    Fiber.Run(fn() { box.s = s.Acquire(300); if (box.s == true) { s.Release(); } });
+    Fiber.Sleep(10);
+    s.Release();
+    Fiber.Cancel(Fiber.FromId(s1));
+    Fiber.Sleep(30);
+    chkEq("a permit handed to a cancelled waiter goes to the next one", box.s, true);
+    chkEq("... and no permit leaks", s.Count(), 1);
+
+    let ch = new Channel();
+    let c1 = Fiber.Run(fn() { ch.Recv(); });
+    Fiber.Sleep(10);
+    Fiber.Run(fn() { box.c = ch.Recv(300); });
+    Fiber.Sleep(10);
+    chk("send hands 7 to the head receiver", ch.TrySend(7));
+    Fiber.Cancel(Fiber.FromId(c1));
+    Fiber.Sleep(30);
+    chkEq("a value handed to a cancelled receiver goes to the next one", box.c, 7);
+
+    // A cancelled sender's value is withdrawn: nobody receives a send that
+    // its caller saw fail.
+    let u = new Channel();
+    let s2 = Fiber.Run(fn() { u.Send(5); });
+    Fiber.Sleep(10);
+    Fiber.Cancel(Fiber.FromId(s2));
+    Fiber.Sleep(10);
+    chkEq("a cancelled sender's value is not received", u.Recv(20), nil);
+}
+
+fn Main() {
+    testMutex();
+    testSemaphore();
+    testRWLock();
+    testChannel();
+    testCancellation();
+    testCancelAfterHandover();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: " + str(passed + failed) + "  failed: " + str(failed));
+    if (failed == 0) {
+        Console.Ok("All Sync tests passed!");
+    } else {
+        Console.WriteLine("Some tests FAILED.");
+    }
+    return failed;
+}

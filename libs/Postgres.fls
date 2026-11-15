@@ -302,25 +302,35 @@ class Postgres {
     // Wraps f() in BEGIN/COMMIT. If f() returns false, rolls back and returns
     // false; if it throws, rolls back and rethrows the same exception.
     // Example: db.Transaction(fn() { return db.ExecParams("...", [...]) == 1; });
+    // A COMMIT that fails (a deferred constraint, a lost connection) committed
+    // nothing - the server has rolled back - so the result is false.
     fn Transaction(f: fn): bool {
-        this.Exec("BEGIN");
+        if (this.Exec("BEGIN") == -1) { return false; }
         try {
             let ok = f();
             if (ok == false) {
                 this.Exec("ROLLBACK");
                 return false;
             }
-            this.Exec("COMMIT");
-            return true;
         } catch (e) {
             this.Exec("ROLLBACK");
             throw e;
         }
+        if (this.Exec("COMMIT") == -1) {
+            this.Exec("ROLLBACK");
+            return false;
+        }
+        return true;
     }
 
     // db.Close() - bool
+    // The handle is cleared, so a second Close, or a connection a pool closed
+    // while a caller still held it, reaches the plugin as 0 - which it
+    // refuses - rather than as a freed pointer.
     fn Close(): bool {
-        return this._pg_close(this._conn);
+        let ok = this._pg_close(this._conn);
+        this._conn = 0;
+        return ok;
     }
 }
 

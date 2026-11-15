@@ -93,7 +93,7 @@ class Graph {
     let _edgeMaps = nil;
     let _directed = false;
     let _edgeCount = 0;
-    let _wNative = nil; 
+    let _wNative: bool = false; 
     let _weightType: string = nil; 
     fn Constructor() {
         this._directed   = false;
@@ -200,7 +200,8 @@ class Graph {
     // ---------- Edges ----------
 
     fn AddEdge(src, dst, weight): instance {
-        if (src == dst) return this;  // self-loops not supported
+        // Self-loops are not supported, but the node itself is still added.
+        if (src == dst) { this.AddNode(src); return this; }
         if (weight == nil) weight = this._wOne();
 
         // AddNode(src) and AddNode(dst), in that order.
@@ -674,7 +675,6 @@ class Graph {
 
         let g      = Collections.HashMap();  // best known cost from start
         let prev   = Collections.HashMap();
-        let closed = Collections.HashMap();
         let open   = Collections.HashMap();  // frontier set: node -> true
 
         g.Set(start, zero);
@@ -698,18 +698,18 @@ class Graph {
             }
 
             open.Delete(u);
-            closed.Set(u, true);
 
+            // A node is reopened whenever a cheaper route to it turns up. With
+            // a heuristic that is admissible but not consistent that happens
+            // after the node was expanded, and skipping it returns a longer path.
             let gu = g.Get(u);
             foreach (e in this._adj.Get(u)) {
-                if (!closed.Has(e.To)) {
-                    let nd  = this._wAdd(gu, e.Weight);
-                    let cur = g.Get(e.To);
-                    if (cur == nil || this._wLt(nd, cur)) {
-                        g.Set(e.To, nd);
-                        prev.Set(e.To, u);
-                        open.Set(e.To, true);
-                    }
+                let nd  = this._wAdd(gu, e.Weight);
+                let cur = g.Get(e.To);
+                if (cur == nil || this._wLt(nd, cur)) {
+                    g.Set(e.To, nd);
+                    prev.Set(e.To, u);
+                    open.Set(e.To, true);
                 }
             }
         }
@@ -1118,6 +1118,7 @@ class Graph {
         let t: instance  = new Graph();
         t._directed      = true;
         t._weightType    = wt;
+        t._wNative       = this._wNative;   // BigInt/Decimal weights stay so
         let nodes: array = this._adj.Keys();
         foreach (n in nodes) { t.AddNode(n); }
 
@@ -1183,14 +1184,15 @@ class Graph {
                 let v = neighbors[j];
                 if (str(u) < str(v)) {
                     let w = this.GetEdgeWeight(u, v);
-                    if (w == nil) w = 1;
-                    Array.Append(edges, { src: u, dst: v, weight: w });
+                    Array.Append(edges, { src: u, dst: v, weight: w ?? this._wOne() });
                 }
             }
         }
 
         // Sort edges by weight ascending
-        Array.Sort(edges, fn(a, b) { return a.weight < b.weight; });
+        // Through _wLt, so BigInt and Decimal weights compare by value.
+        let self = this;
+        Array.Sort(edges, fn(a, b) { return self._wLt(a.weight, b.weight); });
 
         // Union-Find: parent stored in a HashMap keyed by str(node)
         let parent = Collections.HashMap();

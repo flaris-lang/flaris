@@ -56,6 +56,7 @@ The Flaris VM binary is `flarisvm`.
 | `flarisvm -w …` | Silence all analyzer warnings |
 | `flarisvm --diagnostics json …` | Emit diagnostics as a JSON array on stdout |
 | `flarisvm --version` | Print version string |
+| `flarisvm --help` | Print the usage summary |
 | `flarisvm --compile <input.fls> <output.flx> --bundle [options]` | Compile and bundle every module the program imports (transitively) into a self-contained `.flx` |
 | `flarisvm --compile <input.fls> <output.flx> --bundle='<file1.flx>;...' [options]` | Compile and bundle the named modules into a self-contained `.flx` |
 | `flarisvm --embed <input.fls\|.flx> <output> [options]` | Build a self-contained native executable (program + runtime in one file). See *Self-contained executables* |
@@ -118,6 +119,7 @@ flarisvm --format-write src/app.fls   # rewrite in place
 | `-g` / `--no-strip` | Keep debug info: source line numbers for stack traces and the debugger. Off by default (stack traces then report line 0); implied by `--debug` and `--dap` |
 | `--trace` | Very verbose / print disassembled bytecode before execution |
 | `--jit-disable` | Turn the JIT off. It is ON by default: eligible functions get JIT IR at compile time and native code at run time (ARM64 and x86-64) |
+| `--jit` | Accepted and ignored: the JIT is on by default |
 | `--debug` | Stop at the start of `Main` and open the debugger prompt; disables the JIT (see [R9](#r9---debug-reference)) |
 | `--dap=<port>` | Serve the Debug Adapter Protocol on loopback for an editor; implies `--debug` |
 
@@ -132,13 +134,13 @@ convention) forces plain output.
 | 0 | Success |
 | `fn Main` return | A numeric return value from `Main` becomes the process exit code |
 | exception code | An uncaught exception exits with the exception's numeric code - except that a code whose low byte is 0 (`Exception.NullPtr`, or a custom 256) exits with 6 (`RuntimeError`), so an uncaught exception never reports success |
-| 1 | Tokenizer error |
-| 2 | Compile error (bad source on the CLI or in a compiled unit) |
+| 1 | Reserved (a tokenizer error exits with 2) |
+| 2 | Compile error: tokenizer, parser or analyzer, on the CLI or in a compiled unit |
 | 3 | Assert failure (`Assert`/`AssertEq` or an internal invariant) |
 | 4 | File error: missing or unreadable source or bytecode, or a `.flx` refused by validation, signature or trust checks |
 | 5 | Debugger quit (`q`) |
-| 6 | Reserved (analyzer failures currently surface as code 2) |
-| 7 | Fingerprint/pin mismatch on a signed or pinned import |
+| 6 | Reserved (an analyzer error exits with 2) |
+| 7 | Pin mismatch: an imported module's whole-file SHA-256 differs from the pin given to `library(..., hash)` or `VM.Import` |
 | 8 | Reserved |
 
 ### VM Tuning Flags
@@ -149,6 +151,7 @@ These override the compiled-in defaults. Values must be within min/max ranges li
 | ------ | -------- |
 | `--stack=<int>` | Override evaluation stack size |
 | `--slabs=<int>` | Override slab allocator count |
+| `--max-alloc=<MB>` | Ceiling on the heap the VM holds besides the object pool: string, array and buffer contents, tables, fibers, streams, code. Past it an allocation raises `OutOfMemory`. What the call that reached it builds is still made, so that one call can pass the ceiling by it; an array, map or buffer the script keeps does not grow past it. Default 65536 (64 GB) |
 | `--fibers=<int>` | Override maximum fiber count |
 | `--frames=<int>` | Override maximum call-frames |
 | `--io-threads=<int>` | Worker threads for the I/O pool (1-16). Default: half the logical CPUs, minimum 4. Raise it if `--stats` reports jobs run inline. |
@@ -173,12 +176,16 @@ import string, the on-disk filename, and any pinned name byte-identical
 (convention: capitalized first letter). Imported symbol names must also match the
 library's `export` exactly - `{ Jwt }` ≠ `{ JWT }`.
 
-Search order for a non-path name: (1) the name as a path relative to the working
-directory, (2) each `;`-separated entry of `--libs`, (3) the per-user install
+Search order: (1) a module already loaded, or indexed from `--libs`, whose
+version satisfies the requirement; (2) the name as a path relative to the working
+directory; (3) each `;`-separated entry of `--libs`; (4) the per-user install
 dir - `~/.flaris/libs` (POSIX) / `%USERPROFILE%\.flaris\libs` (Windows), or
-`$FLARIS_LIBS` if set. The first version-satisfying candidate wins (`--libs`
-beats the global dir). Step 3 lets a package manager install once into the home
-directory and have `flarisvm script.fls` resolve imports with no `--libs` flag.
+`$FLARIS_LIBS` if set. The first version-satisfying candidate wins. At the first
+import every `.flx` on `--libs` is indexed under its file name without `.flx`, so
+step 1 matches by that short name: with `--libs` set, a `Y.flx` there is used even
+for `library("./x/Y")` or when a `Y.flx` sits in the working directory. Step 4
+lets a package manager install once into the home directory and have
+`flarisvm script.fls` resolve imports with no `--libs` flag.
 
 ### Library integrity (pinning)
 
@@ -190,7 +197,8 @@ Supply it from a trusted source (a registry, a README, or `flaris.json`).
 
 - An optional `sha256:` prefix is accepted, so a value recorded by flarispm in
   `flaris.json` (`"sha256:<hex>"`) can be pasted verbatim.
-- A mismatch halts the VM (fail-closed) and is **not** affected by `--no-verify`
+- A mismatch stops the program with exit code 7 (fail-closed; under an embedding
+  host the import fails instead) and is **not** affected by `--no-verify`
   (`--no-verify` only disables the FFI shared-library check in `Ffi.Load`).
 - Omit the hash to load without pinning.
 - No hash is embedded in the `.flx` itself: a self-recomputed embedded hash would
@@ -204,9 +212,11 @@ on first use), an **embedded Ed25519 signature** answers *"who produced this?"* 
 authenticity that survives an untrusted transport, registry, or mirror.
 
 A signature is carried inside the `.flx` header (192-byte header; algorithm +
-32-byte public key + 64-byte signature). It covers the SHA-256 of the **entire
-file with the signature field masked to zero**, so it authenticates the header
-metadata (name, version, entry), the constants, and the code together.
+32-byte public key + 64-byte signature). The signed message is the ASCII string
+`flaris.flx.sig.v1`, a zero byte, then the SHA-256 of the **entire file with the
+64 signature bytes zeroed** - so it authenticates the header metadata (name,
+version, entry, algorithm, public key), the constants, and the code together,
+and the prefix keeps a Flaris signature from being valid for any other message.
 
 **Producing a signed `.flx`:**
 
@@ -249,6 +259,13 @@ later with `Crypto.Ed25519Verify`.
   `flarisvm --import-key <name> <pubkey>` to append one safely (it dedupes). The
   label (and the built-in `flaris-lang.org` name) is shown as the *signer* by
   `flarisvm --disasm` and `flarisvm --sig-info`.
+- **The trust store is a file your user account owns.** Anything that can write it
+  can add a publisher - a script you run included, since a script has your
+  authority over your files - and that publisher's packages then pass
+  `--require-signed` and keep their JIT code. Protect it as you would
+  `~/.ssh/authorized_keys`. Where the set of publishers must not change, use the
+  runtime-only build, which reads one system-wide store and ignores the
+  environment, or an embedding host with its own key list.
 - Signature verification is independent of `--no-verify` and of the `library(..., hash)`
   pin; use signing for *authenticity* and the hash pin for *exact-artifact* checks.
 
@@ -266,12 +283,14 @@ a security sandbox for *malicious* input.
   the artifact you vetted, and/or require a trusted Ed25519 signature
   (`--require-signed`, see *Package signing*) to authenticate the publisher. These
   are the primary defenses.
-- **The JIT widens the trust surface.** JIT-compiled functions omit the runtime
-  type checks the interpreter performs, so a *tampered* `.flx` run with the JIT on can
-  crash or corrupt memory where the interpreter would raise a clean error. The
-  embedded JIT code is structurally validated at load and rejected if malformed,
-  but that check does not type-verify it. **Run untrusted bytecode with
-  `--jit-disable`**, which ignores the embedded JIT code entirely.
+- **The JIT trusts the code it compiles.** JIT-compiled functions omit the runtime
+  type checks the interpreter performs, so hostile JIT code could crash or corrupt
+  memory where the interpreter would raise a clean error. The JIT code a `.flx`
+  carries is therefore used only when the file is signed by a trusted key (see
+  *Package signing*); from any other file it is ignored and the functions run
+  interpreted. It is also structurally validated at load and rejected if malformed,
+  but that check does not type-verify it. `--jit-disable` turns the JIT off
+  entirely.
 - `--unsafe` grants FFI and raw-memory access; never combine it with untrusted code.
 - `--allow-ffi` grants FFI alone, so a script that only needs a plugin does not also get raw memory and plain-http imports. `--unsafe` implies it.
 
@@ -390,7 +409,7 @@ OS loader ignores it and a plain file copy still works.
 - **Runtime settings are chosen at embed time.** A self-contained binary hands
   every CLI argument to the script, so flags meant for the VM are recorded in the
   settings block instead: give `--jit-disable`, `--unsafe`, `--allow-ffi`, or any VM limit (`--stack=`,
-  `--slabs=`, `--fibers=`, `--frames=`, `--io-threads=`) alongside
+  `--slabs=`, `--max-alloc=`, `--fibers=`, `--frames=`, `--io-threads=`) alongside
   `--embed` and the binary applies them on every start. Nothing is on by
   default - an embedded program gets JIT or unsafe/FFI mode only if you opted in
   when building it. Limits are validated at startup against the same ranges as
@@ -597,7 +616,7 @@ compile errors.
 
 **Keywords.** `fn` `async` `static` `inline` `let` `var` `const` `global`
 `if` `else` `for` `foreach` `iter` `from` `to` `while` `do` `switch` `case`
-`default` `break` `continue` `return` `yield` `await` `guard` `nil` `true`
+`default` `break` `continue` `return` `yield` `await` `guard` `capture` `nil` `true`
 `false` `class` `this` `super` `new` `enum` `import` `export` `library` `as`
 `try` `catch` `finally` `throw` `breakpoint`. The words `in` `is`
 are operators. (`var` is an alias for `let`.) Every keyword, plus the operator
@@ -712,10 +731,10 @@ exponent); they are stripped before the value is parsed.
 
 **Display vs. round-trip:** `str()` and `Console.WriteLine`/`Print` use a
 **compact** form - an integral value prints with no decimal point or exponent
-(`5000.0` shows as `5000`), and a fractional value uses `%g` (up to ~6
-significant digits, so `0.1 + 0.2` shows as `0.3`). For a **precise,
-round-trippable** string (full `%.17g`) use `Convert.ToString` /
-`String.ToString` instead.
+(`5000.0` shows as `5000`, `-0.0` as `0`), and a fractional value shows up
+to 15 significant digits (`1234.5678` stays `1234.5678`, `0.1 + 0.2` shows as
+`0.3`). String concatenation and `String.Format` use the same form. For a **precise,
+round-trippable** string (full `%.17g`) use `Convert.ToString` instead.
 
 Float literals:
 
@@ -895,7 +914,7 @@ greet();         // Hello stranger
 | ------ | ------- | ------- |
 | `let name = expr` | Local (block / function) | Cannot be used at module top level |
 | `var name = expr` | Local (block / function) | Identical to `let` |
-| `const name = expr` | Local or global | Immutable binding |
+| `const name = expr` | Local or global | Cannot be reassigned or written through; a value only it holds (a literal, a new object, a fresh result) is frozen too |
 | `global name = expr` | Module (global) | Accessible from all scopes in the file. Redeclaring in the same file is a compile error, and so is redefining one from a `VM.Eval` or `VM.Compile` unit (1004); another module that defines the same name warns and rebinds |
 | `global name:type = expr` | Module (global) | Type-annotated global |
 
@@ -988,10 +1007,10 @@ let b   = (bool)0;        // - false
 
 | Type | Kind | Runtime effect |
 | ------ | ------ | --------------- |
-| `int` | Value | Conversion - truncates float, converts string/bool/char |
-| `float` | Value | Conversion - widens int to double |
+| `int` | Value | Conversion - truncates float, converts string/bool/char; `nil` gives `0` |
+| `float` | Value | Conversion - widens int to double; `nil` gives `0.0` |
 | `char` | Value | Conversion - converts int/string to a single character value |
-| `string` | Value | Conversion - any value - string representation |
+| `string` | Value | Conversion - any value - string representation, as `str()`: `(string)'A'` is `"A"` |
 | `bool` | Value | Double logical-NOT (`!!x`) - truthy - `true`, falsy - `false` |
 | `u8` `u16` `u32` `i8` `i16` `i32` | Value | Conversion - as the built-in of the same name (Bitcast / Narrowing): `(u8)300` is `44`, `(i8)200` is `-56` |
 | `u64` `i64` | Value | Conversion - as `int` |
@@ -1223,6 +1242,12 @@ A subclass reaches its base class through `super`:
 - `super.method(args)` calls the base class's version of a method statically
   ("invokespecial"), letting an overriding method reach the one it overrides.
 
+A subclass may redeclare an inherited field, for another default, but a typed
+inherited field keeps its type: `class B : A { let s: int = 1; }` over
+`let s: string` in `A` is error 1000 (and a runtime error when `A` comes from
+a compiled library). Every instance of the chain stores the field the same way,
+which is what lets a base method run natively on a subclass instance.
+
 ```js
 class Animal {
     let name = "";
@@ -1428,7 +1453,7 @@ These functions are VM instructions - available everywhere, no namespace require
 |----------|-------------|-------|
 | `int(x)` | Integer | Truncates floats toward zero; `NaN` gives `0` and a value beyond the `int` range saturates to `Math.Int64Max`/`Math.Int64Min`. A numeric string is parsed the same way (optional sign, decimal digits, saturating on overflow) |
 | `float(x)` | Float | Widens int to double |
-| `str(x)` | String | Converts any value to string. An array gives `<array[n]>`, an object `<object>`, a class instance `<ClassName>` (a collection `<Stack[n]>`), a class `<class ClassName>`. |
+| `str(x)` | String | Converts any value to string. A char gives its own text (`str('A')` is `"A"`, `(char)0` gives `""`), with no quotes - the same text concatenation gives. An array gives what `Console.WriteLine` prints (`[1, 2]`), an object `<object>`, a class instance `<ClassName>` (a collection `<Stack[n]>`), a class `<class ClassName>`. |
 | `char(x)` | Char | Unicode code point; outside 0–0x10FFFF gives U+FFFD |
 
 ### Bitcast / Narrowing
@@ -1459,13 +1484,32 @@ an object) converts to `0`, and so does `nil` - unlike a mask, where
 len([1, 2, 3]);        // 3 (array element count)
 len("hello");          // 5 (byte count, not char count)
 len({ a: 1, b: 2 });   // 2 (property count)
+len(Collections.Stack().Push(7));  // 1 (a collection's element count, as Size())
 ```
+
+A class instance counts its fields; a weak reference or a `Random` generator,
+which keeps its state out of sight, has length 0. Anything else (`nil`, a
+number, a function) has length 0.
 
 ### Guard
 
 ```js
 guard(expr)   // Raises Exception.GuardCheck if expr evaluates to nil
 ```
+
+### Capture
+
+```js
+capture(expr, fallback)   // The value of expr, or of fallback when evaluating expr raises
+```
+
+`capture` catches every exception raised while `expr` is evaluated, as a
+`catch` with no filter does, and evaluates `fallback` only then. Its type is
+the union of its two operands, and a postfix chain applies to the result
+(`capture(f(), [])[0]`). A `capture` is a try region: it counts toward the
+limit of nested try regions per fiber, and a function containing one runs
+interpreted (R11). It belongs in a function body: a `global` or `const`
+initializer cannot hold one.
 
 ---
 
@@ -1555,14 +1599,15 @@ Exposed as **static members of the `Exception` class** (`Exception.RuntimeError`
 | `Exception.FieldUndeclared` | `24` | Write to an instance field not declared with `let`/`var` (see *Sealed instance fields*) |
 | `Exception.ModuleDenied` | `25` | A built-in module the embedding host withheld. Distinct from `UnsafeOperation`: no runtime switch enables it and only the host can change it (see the Embedding guide §10) |
 | `Exception.Cancelled` | `26` | `Fiber.Cancel` unwinding the fiber. **Not catchable** - see the note below |
-| `Exception.Interrupted` | `27` | Reserved for an embedding host stopping a script. Nothing raises it today |
+| `Exception.Interrupted` | `27` | An embedding host stopping a script: its checkpoint budget ran out (see the Embedding guide §5). **Not catchable** |
 
 **Design notes:**
 
-- `Cancelled` (26) is *uncatchable*, and `Interrupted` (27) is reserved for the same treatment. A cancellation runs every enclosing `finally` on its way out, so a fiber still closes its files and releases its locks, but no `catch` clause is offered the value and the fiber always ends. The constants exist so an `await`-side handler, which *does* see them, can tell a cancellation from a failure - never so that the fiber being stopped can refuse.
+- `Cancelled` (26) and `Interrupted` (27) are *uncatchable*. A cancellation runs every enclosing `finally` on its way out, so a fiber still closes its files and releases its locks, but no `catch` clause is offered the value and the fiber always ends. The constants exist so an `await`-side handler, which *does* see them, can tell a cancellation from a failure - never so that the fiber being stopped can refuse.
 
 - Exceptions 16, 20 indicate corrupted or hostile bytecode - treated as hard failures.
 - `OutOfMemory` (8) and `ExecOutOfMemory` (17) are separate to enable more precise diagnostics.
+- `OutOfMemory` (8) is catchable when an allocation would pass the heap ceiling (`--max-alloc`), and when the object pool reaches its ceiling (`--slabs`): the exception is always built, at the pool's ceiling in one more slab kept for it. A fiber that catches it and keeps allocating until that slab is full as well is stopped with it the way `Interrupted` stops one: every enclosing `finally` runs, no `catch` is offered it, and with nothing awaiting the fiber the run ends with code 8.
 - When an exception fires, the current fiber unwinds to the nearest enclosing error boundary (`try`/`catch`). If a boundary catches it, the fiber resumes there, other fibers continue, and the VM stays alive. If the exception escapes the top of the fiber with no handler, the VM prints the trace and exits the whole process with the exception's code (see R9).
 
 ---
@@ -1650,24 +1695,28 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
 - Shifts operate on `int64` and mask the shift count to `& 63`, so a count `>= 64` wraps into range. `<<` is a logical left shift; `>>` is an **arithmetic** right shift (the sign bit is replicated), so `-8 >> 1` = -4. `>>>` is a **logical** right shift of the same 64 bits (zero bits shift in), so `-8 >>> 1` = 9223372036854775804 and `-1 >>> 60` = 15; unlike JavaScript there is no 32-bit truncation.
 - `??` (null coalescing) is lower than all arithmetic - `x + y ?? z` means `(x + y) ?? z`.
 - `x in c` is containment. For an object it is property presence (`"name" in obj`), for an array it is an element equal to `x` (deep equality, same type: `1 in [1.0]` is `false`), and for a string it is a substring test: `"ab" in "xaby"` and `'a' in "xaby"` are `true`, `"zz" in "xaby"` is `false`, and the empty string is contained in every string. Any other combination is `false`.
-- `x is C` is true when `x` is an instance of class `C` or of a class derived from it (for a class value `x`: `C` itself or a subclass). With a right operand that is not a class it compares identity, so `x is nil` is true only for `nil`. Two equal numbers may or may not be identical - small ones are, large ones are not, and where the line falls depends on the platform - so compare numbers with `==`. It is not a type test: `x is int` compares `x` with the conversion function `int` (warning 2022) - use `Type.IsInt(x)` or `type(x) == Type.Int`.
+- `x is C` is true when `x` is an instance of class `C` or of a class derived from it (for a class value `x`: `C` itself or a subclass). With a right operand that is not a class it is true for the same type and the same value: numbers and strings by value on every platform (an int with an int, boxed or not; a float by its bits, so `NaN is NaN` is `true` and `0.0 is -0.0` is `false`; `1 is 1.0` is `false`), anything else by identity, so `x is nil` is true only for `nil`. It is not a type test: `x is int` compares `x` with the conversion function `int` (warning 2022) - use `Type.IsInt(x)` or `type(x) == Type.Int`.
 - Division `/` and power `^^` produce `int` when both operands are `int` (division truncates toward zero; an integer power is exact and wraps on overflow like `*`, and a negative exponent gives 0 except for the bases 1 and -1, so `2 ^^ -1` = 0), and `float` when either operand is `float`. Force a float result with a float operand: `a / (b * 1.0)` or `float(a) / b`.
 - `^^` is exponentiation (`x ^^ y` = x raised to y). It binds tighter than every other binary operator and than a prefix operator on its **left**, and it nests to the **right**, as in mathematics and as `**` does in Python: `2 * 3 ^^ 2` = 18, `2 ^^ 3 ^^ 2` = 512, `-2 ^^ 2` = -4 (write `(-2) ^^ 2` for 4). Its right operand is a unary expression, so `2 ^^ -1` parses.
 - A `nil` operand on either side makes every arithmetic and bitwise operator
   yield `nil`: `+ - * / % ^^ & | ^ << >> >>>`, unary `-` and `~`, the compound
   assignments, and `++`/`--` (a `nil` target stays `nil`). `nil + 5`, `"a" + nil`
-  and `[1] + nil` are all `nil`. A slot that cannot hold `nil` - an `[int]` or
+  and `nil + [1]` are all `nil`; `[1] + nil` is the one exception, it appends
+  `nil` like any other value (`[1, nil]`). A slot that cannot hold `nil` - an `[int]` or
   `[float]` element, a typed field - refuses the result with `TypeMismatch`, as
   it refuses a plain store of `nil`. Comparisons, `==`, `!=`, `??`, `&&`, `||`,
   `in` and `is` are not arithmetic and are unaffected.
-- `+` is **overloaded by operand type** and never a type error (see also
+- `+` is **overloaded by operand type** (see also
   [Operator operand checking](#operator-operand-checking)):
   - `number + number` - arithmetic (int lane unless an operand is `float`).
   - `char + char` / `char + string` - concatenate into a `string`; `char + int`
     is arithmetic on the code point (`'a' + 1` is `98`).
   - `array + array` - a **new** array with the elements of both (neither operand
-    is mutated); `array + value` appends `value` to a copy.
+    is mutated); `array + value` appends `value` to a copy, `nil` included.
   - `object + object` - a **new** merged object (right operand's keys win).
+  - a value plus an array, or an object plus anything but an object - raises
+    `InvalidArguments`: `1 + [2]`, `"a" + [1]`, `{k: 1} + 1` and `"a" + {k: 1}`
+    all raise.
   - anything else - the operands are coerced to their string forms and
     concatenated (`true`/`false` render as themselves), so `true + 5` is
     `"true5"`.
@@ -1675,16 +1724,33 @@ Operators listed from **highest** (evaluated first) to **lowest** (evaluated las
   structural and recursive (bounded by the comparison-depth limit below):
   - `array`/`array` and `block`/`block` compare **lexicographically** for
     ordering (first differing element decides; a prefix is "less"), and
-    element-by-element for equality. `!=` is the negation of `==`.
+    element-by-element for equality, each pair by `==`'s own rules
+    (`[1] == [1.0]` is `true`; two arrays holding different but equal-looking
+    objects are not equal). `!=` is the negation of `==`.
   - `object`/`object`, `exception`/`exception`, `instance`/`instance` and
     `class`/`class` compare by **identity**: two separately built objects with
-    the same keys and values are not equal.
+    the same keys and values are not equal. They have no order: `<` `<=` `>`
+    `>=` on them raise `InvalidArguments`.
   - Mixed numeric kinds compare by value across `int`/`float`/`char`/`bool`
-    (`'A' == 65` is `true`; `1 == 1.0` is `true`). Two values of otherwise
-    unrelated types are never equal.
+    (`'A' == 65` is `true`; `1 == 1.0` is `true`), for ordering as well. An
+    int meets a float exactly, never as a rounded double: `9007199254740993`
+    (2^53 + 1) is greater than `9007199254740992.0`, and the largest int is
+    less than `9223372036854775808.0` (2^63). Two
+    values of otherwise unrelated types are never equal, and ordering them
+    (`"a" < 1`, `[1] < 2`) raises `InvalidArguments`, as `"a" - 1` does - a
+    compile error when both types are known. A comparison with `nil` is
+    `false` for every ordering operator and never raises.
 - Unary `+x` is an identity operator (yields `x` unchanged); `await expr` is a
-  prefix operator usable in expression position, whereas `yield` is a
+  prefix operator usable in expression position (on a value that is not a fiber
+  it gives the value itself: `await 5` is `5`), whereas `yield` is a
   **statement** only and cannot appear inside a larger expression.
+- A callback a builtin runs (an `Array.Select` selector, a sort comparator)
+  cannot suspend its fiber: nothing could resume the builtin. Neither can a
+  global initializer: nothing could resume the top level. There `yield`,
+  `Fiber.Await` (except of a finished fiber), `Fiber.AwaitAll`, `Fiber.Resume`,
+  `Fiber.Run`, `Fiber.Park`, `Event.WaitOne` and `Event.WaitFor` raise
+  `RuntimeError`, an `*Async` call runs detached, and `Fiber.Sleep` and a
+  synchronous read or write wait in place, pausing every fiber until they finish.
 - `≈` (approximate equality) uses `APPROX_REL_EPS = 1e-2` and `APPROX_ABS_EPS = 1e-9`.
 
 ---
@@ -1721,7 +1787,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | ------- | ------- | ------- | ------------- |
 | Call frames | 64 | 1,024 | Call stack depth; override with `--frames=` |
 | Nested try/catch handlers | 24 | 24 | Maximum nested try/catch handlers |
-| Evaluation stack | 1,024 | 65,535 | VM evaluation stack size per fiber; override with `--stack=` |
+| Evaluation stack | 1,024 | 65,535 | VM evaluation stack size per fiber, every call's parameters and locals included; override with `--stack=` |
 
 ### Locals and Arguments
 
@@ -1761,7 +1827,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | Limit | Value | Description |
 |-------|-------|-------------|
 | String size | 256 MB | Maximum size of a single string |
-| String split parts | 100,000 | Maximum parts returned by string split |
+| String split parts | 16,777,216 | The array element limit: `Split`, `SplitLines` and `Fields` raise `RuntimeError` past it |
 | OS command output | 16 MB | Maximum captured stdout/stderr from OS commands |
 
 ### Memory Blocks and Buffers
@@ -1769,7 +1835,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | Limit | Value | Description |
 |-------|-------|-------------|
 | Single block allocation | 2 GiB | Maximum size of a single block allocation |
-| Total block allocations | 64 GiB | Total cap across all active block allocations |
+| VM heap (`--max-alloc`) | 64 GiB | Default ceiling on everything the VM holds besides the object pool, blocks included |
 | `Memory.Process()` input | 1 GiB | Max span per call: 128 Mi elements at up to 8 bytes each |
 
 ### Collections
@@ -1791,7 +1857,7 @@ reached is dropped with a warning, since there is no fiber to raise on.
 | Method | Called when | Notes |
 | --- | --- | --- |
 | `Constructor(...)` | `new ClassName(...)` | Optional. Return value is ignored; `new` always returns the instance. |
-| `Destructor()` | Last reference to the instance is released | Optional. `this` is the dying instance. Exceptions are swallowed. Not inherited. **Not run for instances still alive at process exit** - teardown tears down the fiber that would execute it, so release anything that must be cleaned up (or do it explicitly) before returning from `Main`. **Do not let `this` escape** (store it in a global, array, or another object's field): the instance then stays alive, and its destructor runs again when that reference is released - copy out the field values you need instead. |
+| `Destructor()` | After the last reference to the instance is released: at the next loop iteration or function call, at the latest when the fiber ends; never inside a built-in function. `VM.CompactMemory()` runs every waiting one | Optional. `this` is the dying instance. Exceptions are swallowed. Not inherited. **Not run for instances still alive at process exit** - teardown runs no script, so release anything that must be cleaned up (or do it explicitly) before returning from `Main`. **Do not let `this` escape** (store it in a global, array, or another object's field): the instance then stays alive, and its destructor runs again when that reference is released - copy out the field values you need instead. |
 
 ### Float Approximation Thresholds
 
@@ -1877,6 +1943,16 @@ written. `Math.Fma` is the explicit single-rounding multiply-add. `--no-opt` exi
 not for changing behaviour; the only observable difference is that deep tail
 recursion needs the optimized build.
 
+**Branch layout.** In `if (c) { A } else { B }` the then-arm A ends with a
+jump over B; B falls through. Every execution of A therefore costs one extra
+dispatch, about a cycle. In a hot loop put the rare case in the then-arm and
+the common case in the `else`, or handle the rare case with an `if` that
+returns, breaks or continues and let the common code follow it. An `if`
+without an `else` costs the same whichever way it goes. The same holds for
+`c ? a : b`: the first value pays the jump. Outside hot loops the difference
+is not worth bending the code for, and in the JIT a small two-value `if` or
+ternary becomes a select, where the order does not matter.
+
 ### Dynamic Typing and Runtime Checks
 
 Types are checked at runtime. Invalid operations fail fast with no undefined behavior. In hot loops, avoid changing the type of a variable frequently - type stability helps the VM dispatch efficiently.
@@ -1893,8 +1969,8 @@ for (let i = 0; i < n; i += 1) {
 
 Flaris uses **deterministic reference counting**, not a garbage collector.
 
-- Objects are freed immediately when the last reference drops.
-- No stop-the-world pauses, and `Destructor` runs at a predictable point.
+- Objects are freed when the last reference drops.
+- No stop-the-world pauses, and `Destructor` runs at a predictable point: the next loop iteration or function call.
 - Avoid creating short-lived objects inside tight loops.
 - Reuse arrays and objects where possible.
 
@@ -1946,9 +2022,10 @@ flarisvm --mem myprogram.fls
 
 A leak count that is stable across runs but non-zero almost always means a cycle
 rather than a missing release. `Debug.Refs(value)` reports an individual value's
-reference count, and `VM.MemoryStats()` returns the same counters programmatically
-for an in-test check. Note that the project's own suite runs `flarisvm --mem`,
-so a program that looks clean without the flag can still fail there.
+reference count, `Debug.Heap()` shows which types and classes hold the memory, and
+`VM.MemoryStats()` returns the same counters programmatically for an in-test check.
+Note that the project's own suite runs `flarisvm --mem`, so a program that looks
+clean without the flag can still fail there.
 
 ### Locals vs Property Access
 
@@ -2017,7 +2094,7 @@ Fibers are cooperatively scheduled - they never run unless resumed or awaited. N
 - Batch work inside a fiber before yielding.
 - Avoid spawning fibers for tiny tasks.
 - Avoid `yield` inside tight numeric loops.
-- Default scheduling quantum per fiber: 10,000 checkpoints (tunable via `Fiber.SetQuantum()`, up to 100,000). A checkpoint occurs at each loop back-edge and at each function call - not at every instruction. A fiber created by another inherits its creator's quantum, so throttling a fiber throttles everything it spawns.
+- Default scheduling quantum per fiber: 10,000 checkpoints (tunable via `Fiber.SetQuantum()`, up to 100,000). A checkpoint occurs at each loop back-edge and at each function call - not at every instruction. A builtin call is never preempted, callbacks it runs included (an `Array.Sort` comparator, an `Array.Select` function): the checkpoints those callbacks pass count toward the fiber's slice, so the fiber may yield right after the builtin returns. A fiber created by another inherits its creator's quantum, so throttling a fiber throttles everything it spawns.
 
 ### Strings
 
@@ -2079,6 +2156,8 @@ let root = Math.Sqrt(2.0);
 ```
 
 No import statement is needed - all modules are always available. Two modules additionally need a runtime flag: `Memory` needs `--unsafe`, and `Ffi` needs `--allow-ffi` (or `--unsafe`, which implies it).
+
+An argument the compiler can see is of the wrong type for a parameter is a compile error (1000). At run time no call checks argument types: a value of another type reaches the function, which reads it as it reads `nil` - a transform gives `nil`, a predicate `false`, a search `-1` - or converts it where the function converts (a float for an `int` parameter truncates, so `Math.Abs(2.5)` is `2`). A function that raises for `nil` raises for such a value as well.
 
 Each function table has a `JIT` column stating whether the function can be called directly from JIT-compiled code (see R11 for the legend and the surrounding rules).
 
@@ -2144,7 +2223,7 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 
 **Equality:** `Contains`, `IndexOf`, and `Distinct` use strict value+type equality — `2` (int) does not match `2.0` (float), unlike the `==` operator and `BinarySearch`/`Append`, which coerce ints to float when the array is a `[float]` array.
 
-**Default order** (`Sort` without a predicate, `SortBy` keys, `BinarySearch`/`SortedInsert` without a predicate): `nil` < `bool` < numbers (ints and floats compared by value, NaN last) < `char` < `string` < everything else. Strings compare byte by byte with a shorter prefix first, exactly like `<`.
+**Default order** (`Sort` without a predicate, `SortBy` keys, `BinarySearch`/`SortedInsert` without a predicate): `nil` < `bool` < numbers (ints, floats and chars compared by value - a char by its code, as `<` does - NaN last) < `string` < everything else. Strings compare byte by byte with a shorter prefix first, exactly like `<`; arrays element by element in this order, then the shorter first. Unlike `<`, the default order never raises: values of a kind with no order (objects, instances, functions) count as equal, so a stable sort keeps them where they were.
 
 **Sort stability:** `Sort` and `SortBy` are stable: equal elements keep their original order. With a predicate that holds for a strict-less relation (`a < b`); a non-strict (`a <= b`) predicate is also accepted but does not preserve the original order of equal elements.
 
@@ -2158,12 +2237,12 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **All** | `All(arr:array, pred:fn) - bool` | `true` if `pred(x)` is truthy for every element (an empty array is `true`). Stops at the first falsy result. | — |
 | **Any** | `Any(arr:array, pred:fn) - bool` | `true` if `pred(x)` is truthy for some element. Stops at the first truthy result. | — |
 | **Average** | `Average(arr:array) - float\|nil` | Returns the arithmetic mean of all elements as `float`. Returns `nil` if empty. | ✓ |
-| **BinarySearch** | `BinarySearch(arr:array, value:any, less?:fn) - int` | Binary search over a SORTED array. Returns the index of a match, or `-(insertionPoint) - 1` when absent (so `-(result) - 1` is where it would go). Optional `less(a,b)-bool` must be the same predicate the array was sorted with; without it, or with `nil`, the default order. O(log n). | ✓² without `less` |
+| **BinarySearch** | `BinarySearch(arr:array, value:any, less?:fn) - int` | Binary search over a SORTED array. Returns the index of a match, or `-(insertionPoint) - 1` when absent (so `-(result) - 1` is where it would go). Optional `less(a,b)-bool` must be the same predicate the array was sorted with, and must return a bool, as for `Sort`; without it, or with `nil`, the default order. Raises a type mismatch for a value no element of a typed array can equal (`2.0` in an `[int]`, `1` in a `[string]`), as `SortedInsert` does. O(log n). | ✓² without `less` |
 | **Capacity** | `Capacity(arr:array) - int` | Returns current internal capacity (may exceed length). | ✓ |
 | **Clear** | `Clear(arr:array) - bool` | Removes all elements; capacity kept. Mutates. | ✓² |
-| **Concat** | `Concat(a:array, b:array) - array` | Returns new array: all of `a` followed by all of `b`. When both have the same element type (`[int]`, `[string]`, ...) the result keeps it; otherwise it is untyped. `nil` past 16,777,216 elements. | — |
+| **Concat** | `Concat(a:array, b:array) - array` | Returns new array: all of `a` followed by all of `b`. When both have the same element type (`[int]`, `[string]`, ...) the result keeps it; otherwise it is untyped. Raises `SizeLimit` past 16,777,216 elements. | — |
 | **Contains** | `Contains(arr:array, value:any) - bool` | `true` if any element equals `value` (deep equality). | ✓ |
-| **Create** | `Create(size:int, type?:int) - array` | Creates new array with `size` pre-allocated slots (`nil` if `size` is negative or above 16,777,216). Optional `type` (a `Type.*` constant) pre-fills all slots with the zero value for that type - `Type.Float` gives a `[float]` array of 0.0 values; `Type.Int` gives a `[int]` array of 0 values; `Type.String` gives a `[string]` array of "" values. Without a type argument all slots are `nil`. | ✓ owned¹ |
+| **Create** | `Create(size:int, type?:int) - array` | Creates new array with `size` pre-allocated slots. Raises `InvalidArguments` for a negative `size`, `SizeLimit` above 16,777,216 and `OutOfMemory` when the allocation fails. Optional `type` (a `Type.*` constant) pre-fills all slots with the zero value for that type - `Type.Float` gives a `[float]` array of 0.0 values; `Type.Int` gives a `[int]` array of 0 values; `Type.String` gives a `[string]` array of "" values. Without a type argument all slots are `nil`. | ✓ owned¹ |
 | **Distinct** | `Distinct(arr:array) - array` | Returns new array with only the first occurrence of each value, in order, by strict equality (`1`, `1.0` and `"1"` are all kept; `0.0` and `-0.0` are equal; deep-equal arrays and objects are duplicates). O(n) for every element type. Keeps the element type. | — |
 | **Clone** | `Clone(arr:array) - array` | Returns a shallow copy: a new array with the same elements (element refs shared). Preserves a typed array's element type. | — |
 | **Count** | `Count(arr:array, pred:fn) - int` | Number of elements for which `pred(x)` is truthy. | — |
@@ -2175,11 +2254,11 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **FindLastIndex** | `FindLastIndex(arr:array, pred:fn) - int` | Index of the last element for which `pred(x)` is truthy, or `-1`. | — |
 | **First** | `First(arr:array) - any` | Returns first element or `nil` if empty. | — |
 | **FlatMap** | `FlatMap(arr:array, func:fn) - array` | Returns new array of `fn(x)` for every element; an array result is spliced in, any other value appended. | — |
-| **Flatten** | `Flatten(arr:array) - array` | Returns new array with one level of nested arrays collapsed. Non-array elements are kept as-is. A flat `[int]`/`[float]` array is returned as a copy of the same type. When every element is an `[int]` array, or every element is a `[float]` array, the result has that type too. | — |
+| **Flatten** | `Flatten(arr:array) - array` | Returns new array with one level of nested arrays collapsed. Non-array elements are kept as-is. An `[int]`/`[float]` array is returned as a copy of the same type. When every element is an `[int]` array, or every element is a `[float]` array, the result has that type too. | — |
 | **Chunk** | `Chunk(arr:array, size:int) - array` | Splits `arr` into sub-arrays of at most `size` elements. The last chunk may be smaller; each chunk keeps the element type. Raises if `size <= 0`. Returns a new array of arrays. | — |
 | **GroupBy** | `GroupBy(arr:array, keyFn:fn) - array` | Groups elements by `keyFn(x)`: returns an array of `{Key, Items}` objects, one per distinct key (strict equality, as `Distinct`) in first-seen order; each `Items` keeps the element type. | — |
 | **IndexOf** | `IndexOf(arr:array, value:any) - int` | Returns first index of `value` or `-1` if not found. | ✓ |
-| **InsertAt** | `InsertAt(arr:array, index:int, value:any) - arr` | Inserts `value` at `index`, shifts remaining right; returns the array (`nil` on out-of-range, or raises on a typed-array element-type mismatch). Mutates. | ✓ statement² |
+| **InsertAt** | `InsertAt(arr:array, index:int, value:any) - arr` | Inserts `value` at `index`, shifts remaining right; returns the array. Raises `OutOfBounds` for an `index` outside `0..len`, `SizeLimit` on a full array, and a type mismatch for a typed-array element of another type. Mutates. | ✓ statement² |
 | **LastIndexOf** | `LastIndexOf(arr:array, value:any) - int` | Index of the last element strictly equal to `value`, or `-1`. | ✓ |
 | **Last** | `Last(arr:array) - any` | Returns last element or `nil` if empty. | — |
 | **MaxBy** | `MaxBy(arr:array, keyFn:fn) - any` | The element whose `keyFn(x)` orders last by the default order (the earliest one on ties), or `nil` if empty. | — |
@@ -2189,25 +2268,25 @@ Higher-level operations on arrays: mapping, filtering, sorting, aggregation, and
 | **ProcessIdx** | `ProcessIdx(arr:array, func:fn) - array` | Applies `fn(value:any, index:int)` to every element in-place, replacing each element with the return value. Returns same array. Mutates. | — |
 | **IsAllInt** | `IsAllInt(arr:array) - bool` | `true` if every element is an integer (an empty array is `true`). Use before `ProcessCallback`/`ProcessEvent` with an `int` kernel. | ✓ |
 | **IsAllFloat** | `IsAllFloat(arr:array) - bool` | `true` if every element is a float (an empty array is `true`). Use before `ProcessCallback`/`ProcessEvent` with a `float` kernel. | ✓ |
-| **ProcessCallback** | `ProcessCallback(fn:function, arr:array, len:int, cb:function) - nil` | Processes a scalar array with your worker function `fn(arr, len)`, then calls `cb(arr, result)` when finished. While the worker runs, the array cannot grow: `Append`, `InsertAt`, `Reserve` or an indexed write past its capacity raise, and `ShrinkToFit` returns `false`. Runs on another CPU core when `fn` is simple enough (only touches `arr`, plain number math, no calls or allocations) — otherwise runs normally, same result. The array must be all-`int`, `float`, `char`, or `bool`, and match the kernel's parameter type (`fn(arr:[int],…)` needs an int array, `fn(arr:[float],…)` a float array, etc.); anything else (mixed, or holding strings/arrays/objects) returns `nil`. See `Buffer.ProcessCallback`. | — |
+| **ProcessCallback** | `ProcessCallback(fn:function, arr:array, len:int, cb:function) - nil` | Processes a scalar array with your worker function `fn(arr, len)`, then calls `cb(arr, result)` when finished. Runs on another CPU core when `fn` is simple enough (only touches `arr`, plain number math, no calls or allocations; writing into an `[int]` or `[float]` array counts as an allocation, since a value may need a box), and then reads a copy of `arr` taken at the call, so the script may change the array meanwhile — otherwise runs normally, same result. The array must be all-`int`, `float`, `char`, or `bool`, and match the kernel's parameter type (`fn(arr:[int],…)` needs an int array, `fn(arr:[float],…)` a float array, etc.); anything else (mixed, or holding strings/arrays/objects) returns `nil`. See `Buffer.ProcessCallback`. | — |
 | **ProcessEvent** | `ProcessEvent(fn:function, arr:array, len:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | — |
 | **Reduce** | `Reduce(arr:array, func:fn, initial?:any) - any` | Aggregates left-to-right: `acc = fn(acc, x)` starting from `initial`. Without `initial`, seeds with the first element (empty array → `nil`). `acc`/result may be any type the callback returns. | — |
 | **RemoveAll** | `RemoveAll(arr:array, pred:fn) - int` | Removes every element for which `pred(x)` is truthy and returns how many; the rest keep their order. `nil` if `pred` raises (nothing is removed). Mutates. | — |
 | **RemoveAt** | `RemoveAt(arr:array, index:int) - bool` | Removes element at `index`, shifts remaining left. Mutates. `false` when `index` is out of range. | ✓² |
-| **Reserve** | `Reserve(arr:array, capacity:int) - bool` | Ensures capacity ≥ `capacity`. Does not affect length. Mutates capacity. `false` on a negative `capacity`; raises when the allocation fails or while an offloaded worker uses the array. | ✓² |
+| **Reserve** | `Reserve(arr:array, capacity:int) - bool` | Ensures capacity ≥ `capacity`. Does not affect length. Mutates capacity. `false` on a negative `capacity`; raises when the allocation fails. | ✓² |
 | **Reverse** | `Reverse(arr:array) - array` | Reverses elements in-place. Returns same array. Mutates. | — |
 | **Select** | `Select(arr:array, func:fn ) - array` | Returns new array by applying `fn(x)` to every element (map). | — |
 | **Shuffle** | `Shuffle(arr:array) - array` | Randomly shuffles elements in-place (Fisher-Yates, CSPRNG). Returns same array. Mutates. | — |
-| **ShrinkToFit** | `ShrinkToFit(arr:array) - bool` | Reduces capacity to match current length. `false` while an offloaded worker uses the array. Mutates capacity. | — |
+| **ShrinkToFit** | `ShrinkToFit(arr:array) - bool` | Reduces capacity to match current length. Mutates capacity. | — |
 | **Skip** | `Skip(arr:array, count:int) - array` | Returns new array with first `count` elements removed (a non-positive `count` keeps all). Keeps the element type. | — |
 | **Slice** | `Slice(arr:array, start:int, end?:int) - array` | Returns a new array with elements `[start, end)` (to the end by default), of the same element type as `arr`. Negative indices count from the end (Python-style); both are clamped, an empty range yields `[]`. | ✓ owned¹ |
 | **SequenceEqual** | `SequenceEqual(a:array, b:array) - bool` | `true` if `a` and `b` have the same length and equal elements in order (strict value+type equality: `2 ≠ 2.0`). | ✓ |
-| **Sort** | `Sort(arr:array, fn?:fn) - array` | Sorts in-place by the default order (no predicate, or `nil`), or by the optional predicate `fn(a,b)-bool` (`true` = `a` first). Stable. Mutates. | ✓ statement² without `fn` |
-| **SortedInsert** | `SortedInsert(arr:array, value:any, less?:fn) - int` | Inserts `value` into a SORTED array keeping it sorted (after any equal run). Returns the insertion index, or `nil` on failure. Same optional `less` predicate as `Sort`/`BinarySearch`. Mutates. | — |
+| **Sort** | `Sort(arr:array, fn?:fn) - array` | Sorts in-place by the default order (no predicate, or `nil`), or by the optional predicate `fn(a,b)-bool` (`true` = `a` first); a predicate that returns anything but a bool (`a - b`, `nil`) raises `InvalidArguments`. Stable. Mutates. | ✓ statement² without `fn` |
+| **SortedInsert** | `SortedInsert(arr:array, value:any, less?:fn) - int` | Inserts `value` into a SORTED array keeping it sorted (after any equal run). Returns the insertion index. A `nil` `less` means the default order, as for `BinarySearch`. Raises `SizeLimit` on a full array, `ConstAssign` on a constant one, and a type mismatch for a typed-array element of another type. Same optional `less` predicate as `Sort`/`BinarySearch`. Mutates. | — |
 | **SortBy** | `SortBy(arr:array, func:fn) - array` | Sorts in-place, stably, by extracted key: calls `fn(x)` once per element and orders by the keys' default order. Builtin functions (e.g. `String.Length`, `Type.Of`) use the fast path. Mutates. | — |
 | **Tally** | `Tally(arr:array) - object` | Counts occurrences of each element keyed by its string form, so `2`, `"2"` and `2.0` share one entry. Returns `{value: count}`. | — |
-| **Subset** | `Subset(arr:array, from:int, count:int) - array` | Returns new array of `count` elements starting at index `from`; `nil` unless `0 <= from < len` and `0 < count <= len - from` (use `Slice` for clamping). Keeps the element type. | — |
-| **Swap** | `Swap(arr:array, i:int, j:int) - arr` | Swaps elements at indices `i` and `j`; returns the array (`nil` if either index is out of range). Mutates. | — |
+| **Subset** | `Subset(arr:array, from:int, count:int) - array` | Returns new array of `count` elements starting at index `from`; raises `OutOfBounds` unless `0 <= from < len` and `0 < count <= len - from` (use `Slice` for clamping). Keeps the element type. | — |
+| **Swap** | `Swap(arr:array, i:int, j:int) - arr` | Swaps elements at indices `i` and `j`; returns the array. Raises `OutOfBounds` if either index is out of range. Mutates. | — |
 | **Take** | `Take(arr:array, count:int) - array` | Returns new array of the first `count` elements (clamped). Keeps the element type. | — |
 | **Where** | `Where(arr:array, func:fn ) - array` | Returns new array of elements for which `fn(x)` is truthy (filter). Keeps the element type. | — |
 | **Zip** | `Zip(a:array, b:array) - array` | Returns array of `[a[i], b[i]]` pairs. Length is `min(len(a), len(b))`. | — |
@@ -2256,21 +2335,21 @@ writes it (`Write*At`, `Fill`, `Fill16`/`32`/`64`, `FillRange`, `FillPattern`,
 | -------- | --------- | ----------- | --- |
 | **ChangeToString** | `ChangeToString(buf:block) - bool` | Reinterprets the buffer in place as a `string` whose length ends at the first NUL byte (the whole extent when there is none; the block is then grown by one byte for the terminator, so an address from `GetAddress` is stale afterwards). Destructive - the block handle is a string after the call. | — |
 | **Copy** | `Copy(src:block, srcOff:int, dst:block, dstOff:int, len:int) - bool` | Copies `len` bytes from `src` to `dst`. Offsets in bytes. Bounds-checked. | ✓ |
-| **CopyBytesToArray** | `CopyBytesToArray(buf:block, arr:array, offset?:int) - bool` | Writes `len(buf)` raw bytes from `buf` into `arr` starting at `offset`. Existing elements are updated in-place; elements past the current array length are appended. Optional `offset` defaults to 0. Returns `false` when nothing could be written: not an array, an array whose elements are not ints (`[float]`, `[string]`, `[char]`, `[bool]`, a matrix), a negative `offset`, or an `offset` past the end. A constant array raises `Exception.ConstAssign`, and a copy that would grow the array past 16,777,216 elements raises `Exception.SizeLimit`; neither writes anything. | — |
+| **CopyBytesToArray** | `CopyBytesToArray(buf:block, arr:array, offset?:int) - bool` | Writes every raw byte of `buf` (`len(buf)` × its element size) into `arr`, one element per byte, starting at `offset`. Existing elements are updated in-place; elements past the current array length are appended. Optional `offset` defaults to 0. Returns `false` when nothing could be written: not an array, an array whose elements are not ints (`[float]`, `[string]`, `[char]`, `[bool]`, a matrix), a negative `offset`, or an `offset` past the end. A constant array raises `Exception.ConstAssign`, and a copy that would grow the array past 16,777,216 elements raises `Exception.SizeLimit`; neither writes anything. | — |
 | **CopyStringAt** | `CopyStringAt(buf:block, offset:int, s:string, n:int) - bool` | Copies `n` bytes of `s` into `buf` at byte `offset`. `n` defaults to `len(s)`. Bounds-checked against the full byte extent (`count × size`); returns `false` if `offset + n` exceeds it, or on a non-block/non-string. | ✓ |
 | **WriteVarintAt** | `WriteVarintAt(buf:block, offset:int, value:int) - int` | Writes `value` as an unsigned LEB128 varint (protobuf-style: 7 bits/byte, high bit = continuation, max 10 bytes). Returns the byte count written, or 0 if it would not fit. Zigzag-encode signed values first: `(n << 1) ^ (n >> 63)`. | ✓ |
 | **ReadVarintAt** | `ReadVarintAt(buf:block, offset:int) - array` | Reads an unsigned LEB128 varint at `offset`. Returns `[value, bytesRead]`; `bytesRead` is 0 on out-of-range or malformed/truncated input (never reads past the block). | — |
-| **Create** | `Create(count:int, size:int) - block` | Allocates new buffer: `count` elements, `size` bytes each (`size` in 1–255). `count` 0 gives an empty block, which a memory stream (`Stream.Open`) can grow. `nil` if `count` is negative or above 2^32-1, or `size` is outside 1–255; raises when the allocation exceeds the 2 GiB cap or fails. | ✓ owned¹ |
+| **Create** | `Create(count:int, size:int) - block` | Allocates new buffer: `count` elements, `size` bytes each (`size` in 1–255). `count` 0 gives an empty block, which a memory stream (`Stream.Open`) can grow. Raises `InvalidArguments` for a negative `count` or a `size` outside 1–255, `SizeLimit` for a `count` above 2^32-1 or a block of 2 GiB or more, and `OutOfMemory` when the allocation fails or would pass the VM's heap ceiling (`--max-alloc`, 64 GB by default). | ✓ owned¹ |
 | **Fill** | `Fill(buf:block, value:int) - bool` | Fills entire buffer with byte `value` (0–255). Mutates. | ✓ |
 | **ProcessCallback** | `ProcessCallback(fn:function, buf:block, len:int, blocksize:int, cb:function) - nil` | Processes `buf` with your worker function `fn(buf, len, blocksize)`, then calls `cb(buf, result)` when finished. Returns immediately. Runs on another CPU core when `fn` is simple enough (see the note below), otherwise runs normally — same result either way. | ✓ |
 | **ProcessEvent** | `ProcessEvent(fn:function, buf:block, len:int, blocksize:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Start several and wait for them all with `Event.WaitFor([ids])`. See the note below. | ✓ |
 | **FromArray** | `FromArray(buf:block, arr:array) - bool` | Writes integer array into buffer elements. Element size must be 1, 2, 4, or 8. Mutates. | ✓ |
 | **FromString** | `FromString(s:string) - block` | Copies the raw bytes of `s` into a new block (`count = len(s)`, `size = 1`). Non-destructive - both string and block remain valid. | ✓ owned¹ |
-| **GetAddress** | `GetAddress(buf:block) - int` | Returns raw memory address as integer (for FFI/Memory API use). **Requires `--unsafe`** (unsafe mode); returns raw pointers, so it is gated like the `Memory.*` API. | ✓ |
+| **GetAddress** | `GetAddress(buf:block) - int\|nil` | Returns raw memory address as integer (for FFI/Memory API use). **Requires `--unsafe`** (unsafe mode); returns raw pointers, so it is gated like the `Memory.*` API. | ✓ |
 | **FillRange** | `FillRange(buf:block, offset:int, length:int, value:int) - bool` | Sets `length` bytes starting at byte `offset` to byte `value` (0–255). Bounds-checked against the full backing span (`count × size`). `false` on a bad value or out-of-range span. | ✓ |
 | **IndexOf** | `IndexOf(buf:block, needle:int\|string, start?:int) - int` | Byte offset of the first match at or after `start` (default 0), or `-1`. `needle` is a byte (int 0–255) or a byte substring (string; empty string matches at `start`). | ✓ |
 | **LastIndexOf** | `LastIndexOf(buf:block, needle:int\|string, start?:int) - int` | Byte offset of the last match that begins at or before `start` (default: the end), or `-1`. Same `needle` forms as `IndexOf`; an empty string matches at `min(start, extent)`. | ✓ |
-| **Compare** | `Compare(a:block, b:block) - int` | `memcmp`-style ordering (`-1`/`0`/`1`) over the two backing byte spans; the shorter buffer sorts first when one is a prefix of the other. `nil` if either argument is not a block. | ✓ |
+| **Compare** | `Compare(a:block, b:block) - int\|nil` | `memcmp`-style ordering (`-1`/`0`/`1`) over the two backing byte spans; the shorter buffer sorts first when one is a prefix of the other. `nil` if either argument is not a block. | ✓ |
 | **Equals** | `Equals(a:block, b:block) - bool` | `true` if both backing spans are the same byte length and byte-for-byte equal. | ✓ |
 | **ReadI8At** | `ReadI8At(buf:block, offset:int) - int` | Reads a sign-extended signed byte at `offset`. `0` if out of bounds. | ✓ |
 | **ReadI16At** | `ReadI16At(buf:block, offset:int, bigEndian?:bool) - int` | Reads a sign-extended signed 2-byte integer at `offset`. Optional `bigEndian` defaults to `false`. `0` if out of bounds. | ✓ |
@@ -2284,10 +2363,10 @@ writes it (`Write*At`, `Fill`, `Fill16`/`32`/`64`, `FillRange`, `FillPattern`,
 | **ReadU32At** | `ReadU32At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 4-byte unsigned integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
 | **ReadU64At** | `ReadU64At(buf:block, offset:int, bigEndian?:bool) - int` | Reads 8-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns 0 if out of bounds. | ✓ |
 | **Reserve** | `Reserve(buf:block, capacity:int) - bool` | Ensures `buf` holds at least `capacity` **elements** (`capacity × size` bytes). Grows the buffer in-place via `realloc` if needed; the block object is mutated, `len(buf)` reflects the new element count and the new elements are zero. No-op if already large enough; `false` on a non-block, a capacity outside 1..2^32-1, or a failed grow (the block is left untouched). | ✓ |
-| **Slice** | `Slice(buf:block, offset:int, count:int) - block` | Returns new buffer: `count` elements starting at element index `offset`. | ✓ owned¹ |
+| **Slice** | `Slice(buf:block, offset:int, count:int) - block` | Returns new buffer: `count` elements starting at element index `offset`. Raises `OutOfBounds` for a range outside the block. | ✓ owned¹ |
 | **StringToArray** | `StringToArray(s:string, arr:array, offset?:int) - int` | Writes the raw UTF-8 bytes of `s` directly into `arr` at `offset` without allocating an intermediate block. Returns the number of bytes written (`len(s)`), or 0 when nothing could be written (not an array, an array whose elements are not ints, a negative `offset`, or an `offset` past the end). A constant array or a copy past 16,777,216 elements raises, as for `CopyBytesToArray`. Optional `offset` defaults to 0. | — |
-| **ToArray** | `ToArray(buf:block, offset?:int, count?:int) - [int]` | A flat `[int]` array of the unsigned element values, `count` elements from element `offset` (`offset` defaults to 0, `count` to the rest). Element size must be 1, 2, 4, or 8; `nil` on a bad range. | ✓ owned¹ |
-| **ToString** | `ToString(buf:block, offset?:int, count?:int) - string` | Copies the raw bytes of `count` elements from element `offset` into a new string (`offset` defaults to 0, `count` to the rest), so `ToString(buf, off, n)` gives what `ToString(Slice(buf, off, n))` does without the intermediate block. Total bytes read = `count × size`. Non-destructive - block remains valid. `nil` on a bad range. | ✓ owned¹ |
+| **ToArray** | `ToArray(buf:block, offset?:int, count?:int) - [int]` | An `[int]` array of the unsigned element values, `count` elements from element `offset` (`offset` defaults to 0, `count` to the rest). Element size must be 1, 2, 4, or 8, else `InvalidArguments` is raised; a range outside the block raises `OutOfBounds`. | ✓ owned¹ |
+| **ToString** | `ToString(buf:block, offset?:int, count?:int) - string` | Copies the raw bytes of `count` elements from element `offset` into a new string (`offset` defaults to 0, `count` to the rest), so `ToString(buf, off, n)` gives what `ToString(Slice(buf, off, n))` does without the intermediate block. Total bytes read = `count × size`. Non-destructive - block remains valid. A range outside the block raises `OutOfBounds`; more than 256 MB of bytes raises `SizeLimit`. | ✓ owned¹ |
 | **WriteU8At** | `WriteU8At(buf:block, offset:int, v:int) - bool` | Writes `v & 0xFF` at byte `offset`. Returns `false` if out of bounds. | ✓ |
 | **WriteU16At** | `WriteU16At(buf:block, offset:int, v:int, bigEndian?:bool) - bool` | Writes 2-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
 | **WriteU32At** | `WriteU32At(buf:block, offset:int, v:int, bigEndian?:bool) - bool` | Writes 4-byte integer at `offset`. Optional `bigEndian` defaults to `false`. Returns `false` if out of bounds. | ✓ |
@@ -2301,7 +2380,7 @@ writes it (`Write*At`, `Fill`, `Fill16`/`32`/`64`, `FillRange`, `FillPattern`,
 | **FillPattern** | `FillPattern(buf:block, pattern:block\|string) - int` | Tiles the pattern's bytes (a block or a string) across the whole buffer extent (the last copy is truncated to fit). Returns the number of bytes written (the buffer extent), or `0` on a bad type or an empty pattern. | ✓ |
 | **Reverse** | `Reverse(buf:block) - bool` | Reverses the buffer's elements in place (each element is `size` bytes; a byte buffer is reversed byte-for-byte). `false` on a non-block. | ✓ |
 | **CopyWithin** | `CopyWithin(buf:block, destOff:int, srcOff:int, length:int) - bool` | Moves `length` bytes within the same buffer from byte `srcOff` to byte `destOff` (memmove; the spans may overlap). Bounds-checked against the byte extent; `false` if out of range. | ✓ |
-| **Concat** | `Concat(a:block, b:block) - block` | Returns a new byte block (element size 1) holding `a`'s bytes followed by `b`'s bytes (each buffer's full extent). `nil` on a non-block. | ✓ owned¹ |
+| **Concat** | `Concat(a:block, b:block) - block` | Returns a new byte block (element size 1) holding `a`'s bytes followed by `b`'s bytes (each buffer's full extent). `nil` when either is `nil`. | ✓ owned¹ |
 | **Append** | `Append(buf:block, src:block\|string) - int` | Grows `buf` in place and appends `src`'s bytes. Returns the new element count, or `0` on failure (non-block/-src, a byte count that is not a multiple of the element size, or a failed grow — on failure `buf` is left unchanged). | ✓ |
 
 - **ProcessCallback / ProcessEvent** — process a buffer, optionally on another CPU core
@@ -2362,7 +2441,6 @@ fn async Main() {
   - These avoid the round-trip overhead of `ToArray` + a Flaris loop when writing into an existing byte array.
   - `StringToArray` reads directly from the string's internal bytes - no block is allocated.
   - Both are zero-copy for the destination: existing array slots (0–255 byte values) are updated in-place without heap allocation.
-  - Elements the copy replaces are released after the whole copy, so a destructor one of them runs sees the copy finished.
   
 ```js
     // Write UTF-8 bytes of a string into a pre-allocated byte array at offset 10
@@ -2387,22 +2465,22 @@ Type-level introspection, inheritance inspection, and dynamic reflection on user
 | **SubclassOf** | `SubclassOf(A:class, B:class) - bool` | `true` if `A` is `B` or `A` descends from `B`. Siblings (a shared parent) and same-named unrelated classes are **not** subclasses. | ✓ |
 | **IsClass** | `IsClass(value:any) - bool` | `true` if value is a class object. | ✓ |
 | **IsInstance** | `IsInstance(value:any) - bool` | `true` if value is a class instance. | ✓ |
-| **Of** | `Of(obj:instance\|class) - class` | Runtime class of an instance; identity for a class. The unambiguous "get the type" primitive. | — |
-| **GetBase** | `GetBase(obj:instance\|class) - class` | For a **class**, its immediate base (or nil). For an **instance**, its own class — use `Of` when you want the type unambiguously. | — |
+| **Of** | `Of(obj:instance\|class) - class\|nil` | Runtime class of an instance; identity for a class. The unambiguous "get the type" primitive. | — |
+| **GetBase** | `GetBase(obj:instance\|class) - class\|nil` | For a **class**, its immediate base (or nil). For an **instance**, its own class — use `Of` when you want the type unambiguously. | — |
 | **GetName** | `GetName(obj:instance\|class) - string` | Class name string, or nil for other types. | — |
 | **Name** | `Name(obj:instance\|class) - string` | Alias of `GetName`. Allocation-free (returns the existing class-name string). | — |
-| **Fields** | `Fields(inst:instance) - array` | Field name strings on an instance, inherited included. | — |
-| **InstanceMethods** | `InstanceMethods(cls:class) - array` | Instance method names declared on the class (not inherited). | — |
-| **StaticMethods** | `StaticMethods(cls:class) - array` | Static method names declared on the class (not inherited). | — |
-| **AllMethods** | `AllMethods(obj:instance\|class) - array` | Every resolved method name, inherited included (overrides appear once). | — |
+| **Fields** | `Fields(inst:instance) - array\|nil` | Field name strings on an instance, inherited included. | — |
+| **InstanceMethods** | `InstanceMethods(cls:class) - array\|nil` | Instance method names declared on the class (not inherited). | — |
+| **StaticMethods** | `StaticMethods(cls:class) - array\|nil` | Static method names declared on the class (not inherited). | — |
+| **AllMethods** | `AllMethods(obj:instance\|class) - array\|nil` | Every resolved method name, inherited included (overrides appear once). | — |
 | **HasMethod** | `HasMethod(target:instance\|class, name:string) - bool` | `true` if `name` resolves to a method (inherited included). | — |
 | **GetMethod** | `GetMethod(target:instance\|class, name:string) - any` | Callable handle for method `name`: a bound method for an instance method, the raw function for a static; nil if absent or cross-context. | — |
 | **GetField** | `GetField(inst:instance, name:string) - any` | Value of the declared field `name` (inherited included), or nil. Methods/consts are not fields. | — |
 | **SetField** | `SetField(inst:instance, name:string, value:any) - bool` | Writes a declared field; returns `false` for an undeclared name or frozen instance. Never fabricates a field. | — |
 | **Invoke** | `Invoke(target:instance\|class, name:string, ...args) - any` | Dynamically calls method `name` on instance or class. | — |
-| **Instantiate** | `Instantiate(name:string) - instance` | New instance of the named global class **without** running its Constructor (fields get declared defaults). Nil for an unknown or non-class name. | — |
-| **Define** | `Define(name:string, fields:object) - class` | Build a class at runtime from `fields` (field name → default value) and return it. The class is **anonymous**: it is never bound to a global, so it cannot shadow a declared class, and two calls with the same `name` yield two distinct types (`name` is metadata for `GetName`). Instances get a real slot per field, are sealed exactly like a declared class's, and work with every `Class.*` function, `Json.Deserialize`. Each default is cloned, so instances never share one mutable value and later mutation of the object you passed cannot reach the template. Field order follows the object's insertion order. **The field set is final** — an instance is a single allocation sized from the field count, so a class can never gain a field afterwards. Raises `InvalidArgs` on a non-string name, a non-object `fields`, or more than 4096 fields. | — |
-| **New** | `New(target:class\|string, ...args) - instance` | New instance of a class (object or global name) **with** its Constructor run against `args`. Nil for an unknown/non-class target. | — |
+| **Instantiate** | `Instantiate(name:string) - instance\|nil` | New instance of the named global class **without** running its Constructor (fields get declared defaults). Nil for an unknown or non-class name. | — |
+| **Define** | `Define(name:string, fields:object) - class` | Build a class at runtime from `fields` (field name → default value) and return it. The class is **anonymous**: it is never bound to a global, so it cannot shadow a declared class, and two calls with the same `name` yield two distinct types (`name` is metadata for `GetName`). Instances get a real slot per field, are sealed exactly like a declared class's, and work with every `Class.*` function, `Json.Deserialize`. Each default is cloned, so instances never share one mutable value and later mutation of the object you passed cannot reach the template. Field order follows the object's insertion order. **The field set is final** — an instance is a single allocation sized from the field count, so a class can never gain a field afterwards. Raises `InvalidArguments` on a non-string name, a non-object `fields`, or more than 4096 fields. | — |
+| **New** | `New(target:class\|string, ...args) - instance\|nil` | New instance of a class (object or global name) **with** its Constructor run against `args`. Nil for an unknown/non-class target. | — |
 
 ---
 
@@ -2419,6 +2497,7 @@ Every collection works with the generic operations:
 | `foreach (v, k in c)` | `v` = element (the `ToArray` order), `k` = index | `v` = value, `k` = key (OrderedMap: insertion order) | `v` = `{Value, Priority}` (heap order), `k` = index |
 | `Json.Stringify(c)` | JSON array | JSON object (keys as `str(key)`) | array of `{Value, Priority}` |
 | `str(c)` | `<Stack[3]>` - the kind and the element count | `<HashMap[2]>` | `<PriorityQueue[1]>` |
+| `len(c)` | the element count, as `Size()` | the entry count | the element count |
 | `Object.Clone(c)` | independent deep copy | independent deep copy, same order | independent deep copy |
 
 `foreach` walks a snapshot taken when the loop starts, so changing the
@@ -2468,7 +2547,7 @@ A stored `nil` and an empty queue both make `Dequeue()` return `nil`; pass a
 
 #### HashMap - `Collections.HashMap(capacity?:int) - object`
 
-Keys may be any hashable value (int, char, bool, string, float, ...); lookup matches by hash, which is **by value** for numbers, bools, and strings (equal values, however computed, hit the same entry; `1`, `1.0`, `true`, and `'1'` are all different keys). Other heap objects (arrays, instances, ...) hash by identity, so only the same object matches. Pass an optional `capacity` to pre-size the map when the final key count is known, avoiding intermediate regrows. Iteration order (`Keys`/`Values`) is **not** stable across processes.
+Keys may be any hashable value (int, char, bool, string, float, ...); lookup matches **by value** for numbers, bools, and strings (equal values of one type, however computed, hit the same entry; `1`, `1.0`, `true`, and `'1'` are all different keys, and two keys that only share a hash never match). Other heap objects (arrays, instances, ...) hash by identity, so only the same object matches. Pass an optional `capacity` to pre-size the map when the final key count is known, avoiding intermediate regrows. Iteration order (`Keys`/`Values`) is **not** stable across processes.
 
 | Method | Description |
 | -------- | ------------- |
@@ -2479,9 +2558,9 @@ Keys may be any hashable value (int, char, bool, string, float, ...); lookup mat
 | `m.GetOrAdd(key, value)` | The stored value for `key`; if there is none, store `value` and return it. |
 | `m.Clear()` | Remove all entries. |
 | `m.Size()` | Number of entries. |
-| `m.Keys()` | Return array of all keys (unspecified order). |
+| `m.Keys()` | Return array of all keys, in insertion order. |
 | `m.Entries()` | Return array of `[key, value]` pairs (same order as `Keys`). |
-| `m.Values()` | Return array of all values (unspecified order). |
+| `m.Values()` | Return array of all values, in insertion order. |
 
 #### PriorityQueue - `Collections.PriorityQueue() - object`
 
@@ -2489,7 +2568,7 @@ Min-heap: `Dequeue()` always returns the smallest value.
 
 | Method | Description |
 | -------- | ------------- |
-| `q.Enqueue(v, priority)` | Insert value with numeric priority (int or float; a NaN priority raises `InvalidArgs`). |
+| `q.Enqueue(v, priority)` | Insert value with numeric priority (int or float; a NaN priority raises `InvalidArguments`). |
 | `q.Dequeue(default?)` | Remove and return the value with the lowest priority; when empty, `default` (or `nil`). |
 | `q.Peek(default?)` | Return the lowest-priority value without removing; when empty, `default` (or `nil`). |
 | `q.IsEmpty()` | `true` if queue has no elements. |
@@ -2548,9 +2627,9 @@ compare by value; arrays, objects, and instances by identity.
 | `s.IsEmpty()` | `true` if the set has no elements. |
 | `s.Size()` | Number of elements. |
 | `s.Clear()` | Remove all elements. |
-| `s.ToArray()` | Return the elements as an array (hash order, not insertion order). |
+| `s.ToArray()` | Return the elements as an array, in insertion order. |
 
-The operations that take `other` raise `InvalidArgs` when it is not a `Set`.
+The operations that take `other` raise `InvalidArguments` when it is not a `Set`.
 
 ```flaris
 let seen = Collections.Set();
@@ -2616,13 +2695,13 @@ Terminal I/O, color, and cursor control. Every read of stdin - these functions a
 | **Clear** | `Clear() - nil` | Clear the entire terminal screen and move cursor to home (1,1). | — |
 | **ClearLine** | `ClearLine() - nil` | Erase the current line and move cursor to column 1. | — |
 | **Error** | `Error(...args:any) - nil` | Print the arguments, space-separated, to stdout after a `❌ ` marker, with a newline. | — |
-| **GetCursor** | `GetCursor() - object` | The cursor position as `{Cols, Rows}`, counted from 0. `nil` when stdin or stdout is not a terminal, or the terminal does not answer. | — |
+| **GetCursor** | `GetCursor() - object\|nil` | The cursor position as `{Cols, Rows}`, counted from 0. `nil` when stdin or stdout is not a terminal, or the terminal does not answer. | — |
 | **IsTTY** | `IsTTY() - bool` | `true` if stdout is a real terminal (not piped). | — |
 | **KeyPressed** | `KeyPressed() - bool` | `true` if a key is waiting (non-blocking), a byte stdin has already read ahead included. | — |
 | **Ok** | `Ok(...args:any) - nil` | Print the arguments, space-separated, to stdout after a `✅ ` marker, with a newline. | — |
-| **ReadChar** | `ReadChar() - char` | Read a single character from stdin (blocking); `nil` at end of input. | — |
-| **ReadFloat** | `ReadFloat() - float` | Read one line from stdin as a float; `nil` at end of input, or when the line is not one clean number (surrounding spaces allowed). The whole line is consumed. | — |
-| **ReadInt** | `ReadInt() - int` | Read one line from stdin as an integer; `nil` at end of input, or when the line is not one clean integer (surrounding spaces allowed) or overflows. The whole line is consumed. | — |
+| **ReadChar** | `ReadChar() - char\|nil` | Read a single character from stdin (blocking); `nil` at end of input. | — |
+| **ReadFloat** | `ReadFloat() - float\|nil` | Read one line from stdin as a float; `nil` at end of input, or when the line is not one clean number (surrounding spaces allowed). The whole line is consumed. | — |
+| **ReadInt** | `ReadInt() - int\|nil` | Read one line from stdin as an integer; `nil` at end of input, or when the line is not one clean integer (surrounding spaces allowed) or overflows. The whole line is consumed. | — |
 | **ReadKey** | `ReadKey() - object` | Blocking read of one keypress. Returns `{Key:string, Char:char, IsSpecial:bool}`. `Key` is `"Up"`, `"Down"`, `"Left"`, `"Right"`, `"Home"`, `"End"`, `"PageUp"`, `"PageDown"`, `"Insert"`, `"Delete"`, `"Enter"`, `"Escape"`, `"Backspace"`, `"Tab"`, `"F1"`–`"F12"`, or a single printable character, and `""` at end of input. `IsSpecial` is `true` for arrows, function keys, and the navigation cluster. | — |
 | **ReadLine** | `ReadLine() - string` | Read a line from stdin (blocking). The line ends at `\n`, and a `\r` right before it is dropped - the rule `Stream.ReadLine` uses, so any other `\r` stays in the line. `nil` at end of input. | — |
 | **ReadPassword** | `ReadPassword() - string` | Read a line without echo, by the same rule as `ReadLine`; `""` at end of input. | — |
@@ -2633,13 +2712,22 @@ Terminal I/O, color, and cursor control. Every read of stdin - these functions a
 | **SetCursor** | `SetCursor(row:int, col:int) - nil` | Move the cursor to `row`, `col`, both counted from 1 (a value below 1 counts as 1). | — |
 | **SetRaw** | `SetRaw(enable:bool) - nil` | Enable or disable terminal raw mode. When `true`: disables line buffering and echo so individual keypresses are available immediately without pressing Enter. Restore with `SetRaw(false)` before exit. Has no effect if not running on a TTY. | — |
 | **Size** | `Size() - array` | The terminal's size as `[cols, rows]`; `nil` when stdout is not a terminal. | — |
-| **TryReadChar** | `TryReadChar() - char` | Non-blocking: the waiting character, or `nil` when there is none. | — |
+| **TryReadChar** | `TryReadChar() - char\|nil` | Non-blocking: the waiting character, or `nil` when there is none. | — |
 | **Warn** | `Warn(...args:any) - nil` | Print the arguments, space-separated, to stdout after a `⚠️ ` marker, with a newline. | — |
 | **Write** | `Write(...args:any) - nil` | Print to stdout without trailing newline. | — |
 | **WriteLines** | `WriteLines(...args:any) - nil` | Print multiple values each on its own line. | — |
-| **WriteLine** | `WriteLine(...args:any) - nil` | Print to stdout with trailing newline. A built-in class's instance (a collection, `Random`, a `Weak` handle) prints as `str()` shows it, e.g. `<Stack[2]>`. | — |
+| **WriteLine** | `WriteLine(...args:any) - nil` | Print to stdout with trailing newline. Output is buffered the way the C library buffers stdout - line by line on a terminal, in blocks to a file or pipe - and is flushed whenever the program waits, reads stdin, starts a process or reports an error; `Write` flushes at once, so a prompt shows. A built-in class's instance (a collection, `Random`, a `Weak` handle) prints as `str()` shows it, e.g. `<Stack[2]>`. | — |
 
-**ConsoleColor constants** (`Console.ConsoleColor.Red`, ...): `Default`, `Red`, `Green`, `Blue`, `Yellow`, `Cyan`
+**ConsoleColor constants** - pass to `SetColor` / `SetBackground`; the value is the ANSI foreground code:
+
+| Constant | Value |
+| ---------- | ------- |
+| `Console.ConsoleColor.Default` | `0` |
+| `Console.ConsoleColor.Red` | `31` |
+| `Console.ConsoleColor.Green` | `32` |
+| `Console.ConsoleColor.Yellow` | `33` |
+| `Console.ConsoleColor.Blue` | `34` |
+| `Console.ConsoleColor.Cyan` | `36` |
 
 ---
 
@@ -2664,7 +2752,7 @@ Type conversion and parsing with full range of integer widths.
 | **ToUInt32** | `ToUInt32(v:int\|float\|bool\|char) - int` | Truncate to unsigned 32-bit, stored as int. | ✓ |
 | **ToUInt64** | `ToUInt64(v:int\|float\|bool\|char) - int` | Truncate to unsigned 64-bit, stored as int. | ✓ |
 | **ToString** | `ToString(v:int\|float\|bool\|char\|string) - string` | Precise, round-trippable string form (floats via `%.17g`). Chars/bools render as their numeric value (`ToString('A')` → `"65"`); use `str()` for the short display form. | ✓ owned¹ |
-| **ToRadixString** | `ToRadixString(n:int, base:int) - string\|nil` | `n` written in an explicit base 2–36 (lowercase digits, `-` for negatives). `nil` if base is out of range. Inverse of `ParseRadix`. | ✓ owned¹ |
+| **ToRadixString** | `ToRadixString(n:int, base:int) - string` | `n` written in an explicit base 2–36 (lowercase digits, `-` for negatives). Raises `InvalidArguments` if base is out of range. Inverse of `ParseRadix`. | ✓ owned¹ |
 | **ParseBool** | `ParseBool(s:string) - bool\|nil` | Parse `"true"`/`"false"` (case-insensitive) or `"1"`/`"0"`. **Returns `nil`** on anything else - never raises. | ✓ |
 | **ParseChar** | `ParseChar(s:string) - char\|nil` | Parse a one-character string to a char. `nil` if empty, multi-character, or not valid UTF-8. | ✓ |
 | **ParseFloat** | `ParseFloat(s:string) - float\|nil` | Parse a decimal/exponent string. **Returns `nil`** on failure - never raises. (Accepts `inf`/`nan` and hex floats via C `strtod`.) | ✓ |
@@ -2780,7 +2868,7 @@ Authenticated encryption (XChaCha20-Poly1305), Ed25519 signatures, X25519 key ex
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **Argon2** | `Argon2(password:string\|block, salt:string\|block, iterations?:int, memKiB?:int) - string` | Argon2id password hash (64-hex). `salt` >= 8 bytes (16 recommended); `iterations` 1-1024, default 3; `memKiB` memory cost in KiB, 8-1048576 (1 GiB), default 65536 (64 MiB). A value outside those ranges raises `InvalidArgs`. | — |
+| **Argon2** | `Argon2(password:string\|block, salt:string\|block, iterations?:int, memKiB?:int) - string` | Argon2id password hash (64-hex). `salt` >= 8 bytes (16 recommended); `iterations` 1-1024, default 3; `memKiB` memory cost in KiB, 8-1048576 (1 GiB), default 65536 (64 MiB). A value outside those ranges raises `InvalidArguments`. | — |
 | **ChaCha20** | `ChaCha20(key:string\|block, nonce:string\|block, counter:int, data:string\|block) - block` | The raw ChaCha20 stream cipher: XOR `data` with the keystream under the 32-byte `key`, starting at block `counter`, and return the result as a block; the same call encrypts and decrypts. An 8-byte `nonce` selects the original variant with a 64-bit counter, a 12-byte `nonce` the IETF (RFC 8439) one with a 32-bit counter. No authentication - pair it with `Poly1305`. For ordinary encryption use `Encrypt`, which does both and picks the nonce. Raises on any other key or nonce length, a negative counter, or more than 256 MB. | ✓ owned¹ |
 | **ConstantTimeEquals** | `ConstantTimeEquals(a:string\|block, b:string\|block) - bool` | Compare two byte sequences in constant time (no early exit). Use instead of `==` when verifying MACs, signatures, or tokens so equality checks don't leak timing. Only length inequality returns early. | ✓ |
 | **Decrypt** | `Decrypt(cipher:string\|block, cipherLen:int, key:string\|block, nonce:string\|block, tag:string) - object` | Decrypt `cipherLen` bytes of XChaCha20-Poly1305 `cipher` with the 32-byte `key`, 24-byte `nonce`, and hex `tag` returned by `Encrypt`. Returns `{Ok:bool, Plain:block}`. On authentication failure `Ok` is `false` and `Plain` is zeroed - always check `Ok` before using `Plain`. | — |
@@ -2809,6 +2897,7 @@ Runtime introspection and assertion tools. Available in all builds; overhead is 
 | **Assert** | `Assert(left:any, right:any, ?message:any) - bool` | Verify `left == right`. On mismatch prints both values (plus optional `message`) and a stack trace, then **ends the program** - not a catchable raise. Inside a host application it raises instead, so the host keeps running. Returns `true` when it holds. | — |
 | **AssertTrue** | `AssertTrue(condition:any, ?message:any) - bool` | Verify `condition` is truthy. On failure prints it (plus optional `message`) and a stack trace, then **ends the program**. Inside a host application it raises instead, so the host keeps running. Returns `true` when it holds. | — |
 | **GuardAddress** | `GuardAddress(addr:int)` | Installs an allocator watchpoint that traps when `addr` is touched. Requires `--unsafe`. An editor arms the same watch with a data breakpoint at an address (see *Editor Debugging*). | — |
+| **Heap** | `Heap()` | Prints the live objects grouped by type, an instance by its class (`[Point]`), largest first: their count, the bytes they take in the object pool, and the heap bytes they own (string text, array slots, block bytes, object tables, fiber stacks). The heading line totals them beside the whole VM heap, which also holds code and closures. Objects already dropped are released first, so only live ones are counted. | — |
 | **Here** | `Here(?label:string)` | Prints the current file, line, and function name to stdout (with an optional `label`). | — |
 | **Pool** | `Pool()` | Prints allocator statistics and a per-slab dump. Requires `--unsafe` (the dump shows heap addresses). | — |
 | **Refs** | `Refs(value:any) - int` | Returns `value`'s external reference count (`-1` for tagged immediates, which have none). | — |
@@ -2830,7 +2919,7 @@ Filesystem directory operations.
 | **Create** | `Create(path:string) - bool` | Create directory at `path`. Returns `false` if already exists. | — |
 | **CreateTemp** | `CreateTemp(prefix?:string) - string` | Atomically create a uniquely-named directory in the system temp dir and return its path (`mkdtemp`). Optional name prefix (default `"flaris"`) must not contain path separators. Not auto-removed - pair with `DeleteAll`. `nil` on failure. | — |
 | **Delete** | `Delete(path:string) - bool` | Delete directory (must be empty). | — |
-| **DeleteAll** | `DeleteAll(path:string) - bool` | Recursively delete a directory and everything under it (`rm -rf`). Symlinks are removed as links, never followed out of the tree. Refuses an empty path or the filesystem root. `true` only if every entry was removed. | — |
+| **DeleteAll** | `DeleteAll(path:string) - bool` | Recursively delete a directory and everything under it (`rm -rf`). Symlinks are removed as links, never followed out of the tree. Refuses an empty path and the filesystem root in any spelling (`/`, `/.`, `//`, `/../`, a bare drive root). `true` only if every entry was removed. | — |
 | **Ensure** | `Ensure(path:string) - bool` | Create directory (and parents) if not exists; no-op if exists. `true` when `path` is a directory afterwards, `false` otherwise (empty path, a file in the way, no permission). | — |
 | **Exists** | `Exists(path:string) - bool` | `true` if path exists and is a directory. | — |
 | **GetModifiedTime** | `GetModifiedTime(path:string) - int\|nil` | Returns Unix timestamp of last modification; `nil` if the path is not a directory. | — |
@@ -2851,9 +2940,9 @@ Signals fibers can wait on. Max 256 events per VM (a shared, fixed pool).
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Create** | `Create() - int` | Claims a new event id (`0..255`), or **`-1`** if the 256-id pool is exhausted. Always check for `-1`. | ✓ |
-| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..255`, or `InvalidArgs` for an id that was never created. | ✓ |
+| **Set** | `Set(id:int, value?:any)` | Signal the event; optionally attach a value. Wakes **every** fiber waiting on it (broadcast). Raises `IndexOutOfBounds` for an id outside `0..255`, or `InvalidArguments` for an id that was never created. | ✓ |
 | **WaitOne** | `WaitOne(id:int, timeoutMs?:int) - any` | Parks the caller until `Set` is called on this event, then returns the value it was set with. With a positive `timeoutMs` it resumes with **`nil`** once the deadline passes; `0`/omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id. | — |
-| **WaitFor** | `WaitFor(ids:array, timeoutMs?:int) - array` | Waits until **all** of the events in `ids` have been set, then returns their values as an array. Use it to start several `ProcessEvent`/`Set` jobs and continue once they've all finished. (An empty list returns `[]` right away.) With a positive `timeoutMs`, if the deadline passes before every event fires it returns **`nil`** and stops waiting; `0` or omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id or `InvalidArgs` for a non-int element. | — |
+| **WaitFor** | `WaitFor(ids:array, timeoutMs?:int) - array` | Waits until **all** of the events in `ids` have been set, then returns their values as an array. Use it to start several `ProcessEvent`/`Set` jobs and continue once they've all finished. (An empty list returns `[]` right away.) With a positive `timeoutMs`, if the deadline passes before every event fires it returns **`nil`** and stops waiting; `0` or omitted waits forever. Raises `IndexOutOfBounds` for an out-of-range id or `InvalidArguments` for a non-int element. | — |
 | **Free** | `Free(id:int)` | Releases an id back to the pool. Use to reclaim an event you created but never delivered (a dropped job) so the fixed pool is not exhausted. Raises `IndexOutOfBounds` for an out-of-range id. | ✓ |
 | **Reset** | `Reset(id:int)` | Clears a claimed event's signalled state and value so it can be `Set` and waited on again, without returning the id to the pool. Raises `IndexOutOfBounds` for an out-of-range id. | ✓ |
 
@@ -2878,7 +2967,7 @@ Dynamic loading of native shared libraries (`.so`, `.dylib`). Requires `--allow-
 | **RemoveCallback** | `RemoveCallback(handle:pointer, name:string) - bool` | Unregister a previously registered callback by name without unloading the library. Useful for one-shot callbacks. | — |
 | **GetVersion** | `GetVersion(handle:pointer) - int` | Returns the plugin's version as a `uint32` in `0xMMmmppbb` format. Plugin must export `uint32_t flaris_version(void)`. Returns `0` if symbol not found. | — |
 | **Call** | `Call(handle:pointer, name:string, ...args) - any` | Resolve and call a named symbol in one step without allocating an `ffi_function` object. Accepts up to 4 extra arguments. The symbol lookup is cached per `(handle, name)`, but the call is still unvalidated - `GetFunction` with a signature is the safer and slightly faster form for hot paths. | — |
-| **CallAsync** | `CallAsync(fn:ffi_function, args:array) - any` | Runs a **pure** FFI function (from `GetFunction`) on the I/O thread pool so the calling fiber suspends instead of blocking the scheduler. Must be `await`ed. `args` is the call's argument array; block arguments are refused (they alias VM memory and cannot cross threads). The function must be side-effect-free with respect to the VM: no callbacks, no shared mutable state, thread-safe. A declared return type that does not match resolves to `nil`. | — |
+| **CallAsync** | `CallAsync(fn:ffi_function, args:array) - any` | Runs a **pure** FFI function (from `GetFunction`) on the I/O thread pool so the calling fiber suspends instead of blocking the scheduler. Must be `await`ed. `args` is the call's argument array. A block argument, at any depth (inside an array or object too), reaches the plugin as live memory and is pinned for the call: `Buffer.Append`, `Reserve` and `ChangeToString` on it refuse until the call resolves, and the script should not read or write it meanwhile. The function must be side-effect-free with respect to the VM: no callbacks, no shared mutable state, thread-safe. A declared return type that does not match resolves to `nil`. | — |
 | **LastError** | `LastError() - string\|nil` | Text of the most recent `Load`/`GetFunction`/`Call` failure, or `nil` if the last one succeeded. Those three clear it on entry, so it always describes the most recent call. | — |
 | **LAZY** | `LAZY - int` | `dlopen` flag: resolve symbols on first use (the default). | — |
 | **NOW** | `NOW - int` | `dlopen` flag: resolve every symbol at load, so a missing symbol fails `Load` instead of crashing on first call. | — |
@@ -2963,26 +3052,38 @@ Cooperative green-thread creation, communication, and lifecycle management.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **Cancel** | `Cancel(f:fiber) - bool` | Cancel a fiber: `Exception.Cancelled` is raised at the point it is parked, so every `finally` it is inside runs on the way out. No `catch` can see it - a cancelled fiber cannot talk itself out of stopping - and any I/O it was parked on is cancelled. Asynchronous: the fiber does its unwinding on a later scheduler pass, so it is not finished the moment `Cancel` returns, and a `finally` that awaits keeps it alive until that await resolves. Whoever is waiting on `await f` receives `Exception.Cancelled`; with nobody waiting it is discarded, because cancelling is not an error. `true` if the fiber was still live, `false` if it had already finished or was already being cancelled. Raises `OutOfFibers`, leaving `f` untouched, when `f` is parked in an unawaited `yield` and the [fiber limit](#fibers-and-scheduling) is reached - it needs a turn to unwind. | — |
+| **Cancel** | `Cancel(f:fiber) - bool` | Cancel a fiber: `Exception.Cancelled` is raised at the point it is parked, so every `finally` it is inside runs on the way out. No `catch` can see it - a cancelled fiber cannot talk itself out of stopping - and any I/O it was parked on is cancelled. Asynchronous: the fiber does its unwinding on a later scheduler pass, so it is not finished the moment `Cancel` returns, and a `finally` that awaits keeps it alive until that await resolves. Whoever is waiting on `await f` receives `Exception.Cancelled`, and a `Fiber.AwaitAll` that includes `f` raises it - also when `f` never got to run; with nobody waiting it is discarded, because cancelling is not an error. `true` if the fiber was still live, `false` if it had already finished or was already being cancelled. Raises `OutOfFibers`, leaving `f` untouched, when `f` is parked in an unawaited `yield` and the [fiber limit](#fibers-and-scheduling) is reached - it needs a turn to unwind. | — |
 | **CancelIo** | `CancelIo(f:fiber) - bool` | Abandon `f`'s pending async I/O **without** killing the fiber: it wakes from its `await` with `nil` and `Stream.LastError()` reporting `7` (cancelled), then carries on running. Bytes a cancelled `Stream.ReadAsync` or `Stream.ReadLineAsync` had already received go back to the stream, so the next read sees them. `Stream.ConnectAsync` and `Stream.ConnectTlsAsync` cannot be cancelled; they end at their own `timeoutMs`. Use it to drop a stalled read while still answering the client — `Cancel` by contrast stops the fiber for good. `false` if `f` was not waiting on I/O. | — |
-| **FromId** | `FromId(id:int) - fiber` | Returns the live fiber with that integer ID, or `nil` when none matches (it finished, or the ID was never used). Inside a host application a script only finds fibers of its own context. | — |
+| **FromId** | `FromId(id:int) - fiber\|nil` | Returns the live fiber with that integer ID, or `nil` when none matches (it finished, or the ID was never used). Inside a host application a script only finds fibers of its own context. | — |
 | **GetMessage** | `GetMessage(f:fiber) - any` | Consume and return the oldest queued message (FIFO), or `nil` if the mailbox is empty. | — |
 | **HasMessage** | `HasMessage(f:fiber) - bool` | `true` if at least one message is queued for `f`. | — |
 | **Id** | `Id() - int` | Returns current fiber's integer ID. | — |
 | **MessageCount** | `MessageCount(f:fiber) - int` | Number of messages currently queued in `f`'s mailbox. | — |
 | **IsDone** | `IsDone(f:fiber) - bool` | `true` once the fiber has finished - returned, raised, or finished unwinding after `Cancel` (which is asynchronous). | — |
-| **Await** | `Await(x:any) - any` | The `await` operator as a call, so a plain (non-`async`) function can wait too. Parks the calling fiber until fiber `x` finishes and returns its value; an exception that escaped `x` is raised here instead. Any number of fibers can wait on the same fiber and each receives its value (or its exception). A fiber that has already finished returns its value at once - as often as it is awaited - and one that has not started yet (an `async` call, `Fiber.New`) is started. Passing the `nil` that an `*Async` builtin returns waits for that operation's result, so `Fiber.Await(Stream.ReadLineAsync(s))` reads a line without `await`. Waiting on the current fiber raises. | — |
+| **Await** | `Await(x:any) - any` | The `await` operator as a call, so a plain (non-`async`) function can wait too. Parks the calling fiber until fiber `x` finishes and returns its value; an exception that escaped `x` is raised here instead. Any number of fibers can wait on the same fiber and each receives its value (or its exception). A fiber that has already finished returns its value at once, or raises the exception that ended it, as often as it is awaited; one that has not started yet (an `async` call, `Fiber.New`) is started. Passing the `nil` that an `*Async` builtin returns waits for that operation's result, so `Fiber.Await(Stream.ReadLineAsync(s))` reads a line without `await`. Any other value is returned as it is, as `await 5` gives `5`. Waiting on the current fiber raises. | — |
 | **AwaitAll** | `AwaitAll(fibers:array) - array` | Start every fiber in `fibers` that has not started yet, so they all run at once, then park until every one has finished and return their values in array order. A fiber that has already finished contributes the value it returned; the same fiber may appear more than once. If any of them ended with an unhandled exception, the first one in array order is raised here once all have finished - a failing fiber does not end the program while it is part of an `AwaitAll`. A fiber that yields runs on until it returns, as with `await`. The array is copied, so changing it meanwhile has no effect. An element that is not a fiber, or is the calling fiber, raises `InvalidArguments` before anything starts. An empty array returns `[]`. | — |
 | **New** | `New(func:fn ) - fiber` | Create a new fiber (not yet started). | — |
-| **Park** | `Park(timeoutMs?:int) - nil` | Suspend the current fiber until another fiber calls `Unpark` on it, or until `timeoutMs` has passed (at most an hour, which is also the default). `Park` may also return early - a message arriving, a cancel - so call it in a loop that re-checks what you are waiting for. A parked fiber uses no CPU. | — |
-| **Resume** | `Resume(f:fiber\|nil, detached?:bool) - any` | Schedule `f` to run and yield self. Default (attached): the caller parks until `f` yields/finishes and that value is routed back. `detached=true`: the caller just suspends and `f` runs independently. Passing `nil` (or a finished `f`) returns `nil`; resuming the running fiber itself, or a `detached` that is not a bool, raises `InvalidArgs`. The resume value is delivered later by the scheduler. | — |
+| **Park** | `Park(timeoutMs?:int) - nil` | Suspend the current fiber until another fiber calls `Unpark` on it, or until `timeoutMs` has passed (at most an hour); without `timeoutMs` only `Unpark` wakes it. `Park` may also return early - a message arriving, a cancel - so call it in a loop that re-checks what you are waiting for. A parked fiber uses no CPU. | — |
+| **Resume** | `Resume(f:fiber\|nil, detached?:bool) - any` | Schedule `f` to run and yield self. Default (attached): the caller parks until `f` yields/finishes and that value is routed back. `detached=true`: the caller just suspends and `f` runs independently. Passing `nil` (or a finished `f`) returns `nil`; resuming the running fiber itself, or a `detached` that is not a bool, raises `InvalidArguments`. The resume value is delivered later by the scheduler. | — |
 | **Run** | `Run(func:fn ) - int` | Create and immediately start a detached fiber. Returns its integer ID. Raises `InvalidArguments` if `func` is not a function, and `OutOfFibers` at the [fiber limit](#fibers-and-scheduling). | — |
 | **Unpark** | `Unpark(f:fiber) - bool` | Wake `f` from `Park`. `true` if it was parked; `false` if it was not | — |
 | **SendMessage** | `SendMessage(f:fiber, msg:any) - bool` | Append `msg` to `f`'s bounded FIFO mailbox (depth 64) and wake it if idle/sleeping. `false` if `f` is missing, finished, or its mailbox is full (older messages are kept, not overwritten); `true` otherwise. Non-blocking. Raises `OutOfFibers`, without queueing `msg`, when `f` has to be woken and the [fiber limit](#fibers-and-scheduling) is reached. | — |
 | **SetQuantum** | `SetQuantum(f:fiber, quantum:int) - bool` | Override the scheduling quantum for `f` - the number of checkpoints (loop back-edges and function calls) before yielding to the scheduler. Clamped to at most ten times the default quantum; `0` (or a negative value) means "use the default". Inside a host application that set a quantum limit, neither the value nor the default can exceed that limit. | — |
 | **GetQuantum** | `GetQuantum(f:fiber) - int` | The scheduling quantum in force for `f`, or `0` when it runs on the VM default. A new fiber inherits the quantum of the fiber that created it, so this also reports what a spawned fiber was given. | — |
-| **Sleep** | `Sleep(ms:int) - nil` | Suspend current fiber for at least `ms` milliseconds (other fibers keep running). Negative `ms` yields immediately. | — |
-| **Status** | `Status(f:fiber) - int` | Returns status code. Constants: `Fiber.Status.New=0`, `Running=1`, `Suspended=2`, `Finished=3`, `WaitIO=4`, `Yield=5`, `WaitFiber=6`. | — |
+| **Sleep** | `Sleep(ms:int) - nil` | Suspend current fiber for at least `ms` milliseconds (other fibers keep running). Negative `ms` yields immediately. Inside a callback a builtin runs it waits in place instead, pausing every fiber. | — |
+| **Status** | `Status(f:fiber) - int` | Returns the fiber's status: one of the `Fiber.Status.*` constants below; `nil` when `f` is not a fiber. | — |
+
+**Status constants:**
+
+| Constant | Value | The fiber |
+| ---------- | ------- | ----------- |
+| `Fiber.Status.New` | `0` | is created but has not run yet |
+| `Fiber.Status.Running` | `1` | is running or queued to run |
+| `Fiber.Status.Suspended` | `2` | is parked: sleeping, in `Park`, or waiting for an event |
+| `Fiber.Status.Finished` | `3` | has returned, raised, or finished unwinding after `Cancel` |
+| `Fiber.Status.WaitIO` | `4` | is parked on I/O |
+| `Fiber.Status.Yield` | `5` | has yielded and waits to be resumed |
+| `Fiber.Status.WaitFiber` | `6` | waits for another fiber (`await`) |
 
 #### Fiber instance method syntax
 
@@ -3023,7 +3124,7 @@ A call that fails - `nil` or `false` where it would return a value or `true` - s
 | **CreateSymlink** | `CreateSymlink(target:string, linkPath:string) - bool` | Create a symbolic link at `linkPath` pointing to `target` (need not exist). On Windows requires Developer Mode / admin. | — |
 | **Delete** | `Delete(path:string) - bool` | Delete the file (or symbolic link) at `path`. `false` if it can't be removed - including for a directory, which takes `Directory.Delete`. | — |
 | **Exists** | `Exists(path:string) - bool` | `true` if path exists and is a regular file (symlinks followed). Directories report `false` - use `Directory.Exists`. | — |
-| **GetModifiedTime** | `GetModifiedTime(path:string) - int` | Returns Unix timestamp of last modification. | — |
+| **GetModifiedTime** | `GetModifiedTime(path:string) - int\|nil` | Returns Unix timestamp of last modification. | — |
 | **Lines** | `Lines(path:string, callback:fn) - int\|nil` | Stream the file line by line, calling `callback(line)` for each (terminators stripped as `ReadLines` does) without building an array - the memory-cheap alternative to `ReadLines` for large files. The callback may return `false` to stop early. Returns the number of lines processed, or `nil` if the file can't be opened or read (a directory), or a line passes 256 MB. An exception the callback raises propagates. | — |
 | **Move** | `Move(src:string, dst:string) - bool` | Move/rename a file. An existing file at `dst` is replaced. Atomic within one filesystem; fails across filesystems, with no copy+delete fallback. | — |
 | **ReadAllBytes** | `ReadAllBytes(path:string) - block` | Read the entire file as a byte block, to end of file - pipes and `/proc` files, whose reported size is 0, read in full. `nil` if it can't be opened or read, or passes 2 GiB. | — |
@@ -3036,13 +3137,13 @@ A call that fails - `nil` or `false` where it would return a value or `true` - s
 | **Sha256Async** | `Sha256Async(path:string, raw?:bool) - fiber` | Non-blocking `Sha256`. Use with `await`; resolves to the hex string (or 32-byte block if `raw`), or `nil` if the file can't be opened or hashed. | — |
 | **SetMode** | `SetMode(path:string, mode:int) - bool` | Set permission bits (POSIX `chmod`, low `07777` of `mode`). On Windows only the write bit is honored. `false` if it can't be applied. | — |
 | **SetModifiedTime** | `SetModifiedTime(path:string, unixSeconds:int) - bool` | Set the file's modification time to a Unix timestamp; access time is preserved where the platform allows. `false` on failure. | — |
-| **Size** | `Size(path:string) - int` | Size in bytes of a regular file (symlinks followed). `nil` for anything else - missing, a directory, a device or pipe (which is never opened, so it can't block). | — |
+| **Size** | `Size(path:string) - int\|nil` | Size in bytes of a regular file (symlinks followed). `nil` for anything else - missing, a directory, a device or pipe (which is never opened, so it can't block). | — |
 | **Stat** | `Stat(path:string) - object` | One-syscall metadata: `{Size, Modified, Accessed, Created, IsDir, IsFile, IsSymlink, Mode}`. Times are Unix timestamps; `Mode` is the permission bits (octal 7777 mask); `Created` uses birth time on macOS/BSD, else ctime. Returns `nil` if the path does not exist. A dangling symlink stats as the link itself. | — |
 | **Touch** | `Touch(path:string) - bool` | Create file if missing; set access + modification time to now (like POSIX `touch`). `false` on failure. | — |
 | **Truncate** | `Truncate(path:string, size:int) - bool` | Resize the file to exactly `size` bytes (extension zero-fills). `false` if `size` is negative or the file can't be resized. | — |
 | **WriteAllBytes** | `WriteAllBytes(path:string, data:string\|block) - bool` | Write binary data to file (overwrite). `false` on open/write failure. | ✓ |
 | **WriteAtomic** | `WriteAtomic(path:string, data:string\|block) - bool` | Durable write: stream into a temp file in the same directory, `fsync`, then `rename()` over the target - a reader never sees a half-written file, and a crash leaves either the old or new content, never a truncated mix. An existing file keeps its permission bits; a new one gets the same mode `WriteText` would give it. `false` on any failure (temp file removed). Atomic only within one filesystem. | ✓ |
-| **WriteLines** | `WriteLines(path:string, lines:array) - bool` | Write each string element followed by `\n` (overwrite); other elements are skipped. Written verbatim, so `\n` stays `\n` on Windows too. `false` on open/write failure, or for a typed `[int]`/`[float]` array. | — |
+| **WriteLines** | `WriteLines(path:string, lines:array) - bool` | Write each string element followed by `\n` (overwrite); other elements are skipped. Written verbatim, so `\n` stays `\n` on Windows too. `false` on open/write failure. | — |
 | **WriteText** | `WriteText(path:string, text:string) - bool` | Write text to the file (overwrite), bytes written verbatim. `false` on open/write failure. | — |
 | **WriteTextAsync** | `WriteTextAsync(path:string, text:string) - fiber` | Non-blocking `WriteText`. Use with `await`; resolves to `true`, or `false` on failure. Other fibers run while the file is written. | — |
 
@@ -3107,7 +3208,7 @@ Non-cryptographic and cryptographic hashes. Input accepts `string` or `block`. M
 
 A digest comes back as lowercase hex; with its `raw` flag `true` it comes back as a block of the digest's bytes instead. The type of the result follows the flag: written as the literal `true` it is a `block`, left out or written `false` it is a `string`, and a flag held in a variable gives `string|block`.
 
-`Begin`, `Update` and `Final` hash input that arrives in pieces - a download, an upload, a file read in chunks - with the same result as one call over all of it. The state `Begin` returns is a block whose layout belongs to the VM: every call checks it, and a block that did not come from `Begin`, or was altered, raises `InvalidArgs`. A copy of a state (`Buffer.Slice(st, 0, len(st))`) is a second, independent state, so a shared prefix is hashed once:
+`Begin`, `Update` and `Final` hash input that arrives in pieces - a download, an upload, a file read in chunks - with the same result as one call over all of it. The state `Begin` returns is a block whose layout belongs to the VM: every call checks it, and a block that did not come from `Begin`, or was altered, raises `InvalidArguments`. A copy of a state (`Buffer.Slice(st, 0, len(st))`) is a second, independent state, so a shared prefix is hashed once:
 
 ```flaris
 let st = Hash.Begin("sha256");
@@ -3122,19 +3223,19 @@ let rawA = Hash.Final(withA, true);  // the 32 bytes of SHA-256 of header + part
 | Function | Signature | Description | JIT |
 | ---------- | ----------- |------------- | --- |
 | **Adler32** | `Adler32(data:string\|block, seed?:int) - int` | Adler-32 checksum. With `seed`, an earlier result, the checksum continues over `data` as zlib's `adler32` does: `Adler32(b, Adler32(a)) == Adler32(a + b)`. | ✓ |
-| **Begin** | `Begin(algorithm:string, outLen?:int) - block` | A new streaming state for `"sha1"`, `"sha256"`, `"sha512"` or `"blake2b"` (any case). `outLen` is BLAKE2b's digest length, 1-64 bytes, default 32; the SHA algorithms take none. Any other algorithm or length raises `InvalidArgs`. | ✓ owned¹ |
-| **Blake2b** | `Blake2b(data:string\|block, outLen?:int, raw?:bool) - string\|block` | BLAKE2b hash (hex string, or a block when `raw`). `outLen` 1-64 bytes, default 32; outside that range raises `InvalidArgs`. | ✓ owned¹ |
+| **Begin** | `Begin(algorithm:string, outLen?:int) - block` | A new streaming state for `"sha1"`, `"sha256"`, `"sha512"` or `"blake2b"` (any case). `outLen` is BLAKE2b's digest length, 1-64 bytes, default 32; the SHA algorithms take none. Any other algorithm or length raises `InvalidArguments`. | ✓ owned¹ |
+| **Blake2b** | `Blake2b(data:string\|block, outLen?:int, raw?:bool) - string\|block` | BLAKE2b hash (hex string, or a block when `raw`). `outLen` 1-64 bytes, default 32; outside that range raises `InvalidArguments`. | ✓ owned¹ |
 | **Blake2s** | `Blake2s(data:string\|block, raw?:bool) - string\|block` | BLAKE2s hash (hex string, or a block when `raw`). | ✓ owned¹ |
 | **Crc8** | `Crc8(data:string\|block) - int` | CRC-8 (poly `0x07`, init `0x00`, refin/refout false, xorout `0x00`). | ✓ |
 | **Crc16** | `Crc16(data:string\|block) - int` | CRC-16/ARC (poly `0xA001` reflected, init `0x0000`, refin/refout true, xorout `0x0000`). | ✓ |
 | **Crc32** | `Crc32(data:string\|block, seed?:int) - int` | CRC-32/ISO-HDLC (zlib/gzip; reflected poly `0xEDB88320`, init/xorout `0xFFFFFFFF`). With `seed`, an earlier result, the CRC continues over `data` as zlib's `crc32` does: `Crc32(b, Crc32(a)) == Crc32(a + b)`, so a stream is checksummed a chunk at a time. | ✓ |
 | **Crc32c** | `Crc32c(data:string\|block) - int` | CRC-32C/Castagnoli (reflected poly `0x82F63B78`, init/xorout `0xFFFFFFFF`). | ✓ |
-| **Final** | `Final(state:block, raw?:bool) - string\|block` | The digest of everything fed to `state` (hex, or a block when `raw`). The state then keeps the digest: `Final` again returns it, `Update` raises `InvalidArgs`. | ✓ owned¹ |
+| **Final** | `Final(state:block, raw?:bool) - string\|block` | The digest of everything fed to `state` (hex, or a block when `raw`). The state then keeps the digest: `Final` again returns it, `Update` raises `InvalidArguments`. Writing the digest into a `const` state raises `ConstAssign`. | ✓ owned¹ |
 | **Sha1** | `Sha1(data:string\|block, raw?:bool) - string\|block` | SHA-1 hash (hex string, or the 20 bytes as a block when `raw`). Legacy; prefer SHA-256/BLAKE2 for security. | ✓ owned¹ |
 | **Sha256** | `Sha256(data:string\|block, raw?:bool) - string\|block` | SHA-256 hash (hex string, or the 32 bytes as a block when `raw`). | ✓ owned¹ |
 | **Sha512** | `Sha512(data:string\|block, raw?:bool) - string\|block` | SHA-512 hash (hex string, or the 64 bytes as a block when `raw`). | ✓ owned¹ |
-| **SipHash24** | `SipHash24(data:string\|block, key:string) - int` | SipHash-2-4 with a 16-byte key; any other key length raises `InvalidArgs`. | ✓ |
-| **Update** | `Update(state:block, data:string\|block) - int` | Feed `data` to a state from `Begin`; returns the number of bytes fed so far. Raises `InvalidArgs` after `Final`. | ✓ |
+| **SipHash24** | `SipHash24(data:string\|block, key:string) - int` | SipHash-2-4 with a 16-byte key; any other key length raises `InvalidArguments`. | ✓ |
+| **Update** | `Update(state:block, data:string\|block) - int` | Feed `data` to a state from `Begin`; returns the number of bytes fed so far. Raises `InvalidArguments` after `Final`, or for a block that is not an intact state, and `ConstAssign` on a `const` state. | ✓ |
 | **Xxhash32** | `Xxhash32(data:string\|block, seed?:int) - int` | xxHash-32. Optional seed. | ✓ |
 | **Xxhash64** | `Xxhash64(data:string\|block, seed?:int) - int` | xxHash-64. Optional seed. | ✓ |
 
@@ -3171,19 +3272,19 @@ A path with a wildcard, slice or `..` can match many nodes: `Find` and `FastSele
 | **Diff** | `Diff(a:object, b:object) - object` | Produce an RFC 7386 merge-patch such that `Merge(copy-of-a, patch)` yields `b`: changed/added keys carry b's value, removed keys map to `null`, nested objects recurse. `nil` if either argument is not an object. Cannot represent a key whose value in `b` is genuinely `null` (null means delete). Raises `NestingError` past the depth cap. | — |
 | **Exists** | `Exists(path:string, value:any) - bool` | `true` if `path` matches at least one node within `value` (a parsed object/array, or a class instance for name steps). Stops at the first match. | ✓ |
 | **FastSelect** | `FastSelect(path:string, json:string) - any` | `Find` on raw JSON text. Paths made of names, non-negative indices and wildcards are answered in one forward scan that parses only the matched values - the skipped parts are **not validated**, so malformed text elsewhere can still yield a result (use `Parse` + `Find` when the whole document must be valid). Other paths (negative index, slice, `..`) parse the whole text first. On duplicate keys a single-match path returns the last. | ✓ checked |
-| **Find** | `Find(path:string, value:any) - any` | Navigate a parsed value by path. A single-match path returns the node or `nil`; a multi-match path returns an array of the matches. Name steps descend into class instances (by field name); wildcards and slices apply to plain objects and arrays. Raises `NestingError` if `..` meets a cyclic value. | ✓ checked |
+| **Find** | `Find(path:string, value:any) - any` | Navigate a parsed value by path. A single-match path returns the node or `nil`; a multi-match path returns an array of the matches. Name steps descend into a class instance (by field name), and `..` visits its declared fields; wildcards and slices apply to plain objects and arrays. A `Collections` container (a `HashMap`, `Deque`, `OrderedMap`, …) is opaque to a path query - query its contents with `Json.Stringify` or a snapshot. Raises `NestingError` if `..` meets a cyclic value. | ✓ checked |
 | **Format** | `Format(json:string, indent?:int) - string` | Re-lay out JSON text with `indent` spaces per level (0-10, default 2), validating it as strictly as `Parse`. Strings and numbers are copied as written, so escapes, number spelling (`1.50`, `1e2`), key order and duplicate keys survive. `nil` for invalid input (see `LastError`). | ✓ owned¹ |
 | **IsValid** | `IsValid(json:string) - bool` | `true` if the string is exactly one well-formed JSON document. Disambiguates the case `Parse` cannot (it returns `nil` for both invalid input and a literal `null`). Sets `LastError` on `false`; returns `false` rather than raising past a size cap. | ✓ |
 | **LastError** | `LastError() - object\|nil` | Why the most recent failing `Parse`, `IsValid`, `ParseLines`, `Deserialize`, `Format`, `Minify` or `Patch` failed: `{message, line, column, offset}` - line and column 1-based (the column counts bytes), offset 0-based; all three `nil` for an error with no position (a `Deserialize` field mismatch, a `Patch` operation). `nil` after one of those functions succeeds. | — |
 | **Merge** | `Merge(target:object, patch:object) - bool` | Apply an RFC 7386 merge-patch to `target` **in place**: a `null` patch value deletes that key, an object value merges recursively, any other value (including arrays) replaces. `false` if either argument is not an object. All-or-nothing: raises `ConstAssign` (a frozen object would be written) or `NestingError` (the patch is too deep or cyclic) before changing anything. Because `null` deletes, a patch cannot set a key to `null`. | — |
-| **Minify** | `Minify(json:string) - string` | `Format` with indent 0: all insignificant whitespace removed. | ✓ owned¹ |
+| **Minify** | `Minify(json:string) - string\|nil` | `Format` with indent 0: all insignificant whitespace removed. | ✓ owned¹ |
 | **Parse** | `Parse(json:string) - any` | Parse a JSON document into a Flaris value (object/array/string/int/float/bool/nil). `nil` on malformed input (see `LastError`); raises past the size caps. | — |
 | **ParseLines** | `ParseLines(text:string) - array` | Parse NDJSON / JSON Lines: one JSON value per line (`\n` or `\r\n`). Blank lines skipped; `nil` if any non-empty line is invalid (`LastError` gives its line in the whole text). Size caps apply per line and raise. | — |
 | **Patch** | `Patch(value:any, ops:array) - any` | Apply an RFC 6902 JSON Patch - operations `{op, path, value}` / `{op, from, path}` with `op` one of `add`, `remove`, `replace`, `move`, `copy`, `test`, paths as JSON Pointers - to a **deep copy** of `value` and return the copy; `value` itself is never changed (a frozen value can be patched). All-or-nothing: `nil` if any operation fails, with `LastError` naming it (`"operation 2: test failed"`). | — |
-| **Remove** | `Remove(root:object\|array, path:string) - bool` | Remove the value at `path` (object key or array element, in place). `false` on a missing node, a type mismatch or a multi-match path. | — |
-| **Set** | `Set(root:object\|array, path:string, value:any) - bool` | Set `value` at `path` in place, creating missing intermediate objects/arrays (a created array only takes index `0`). Replaces an existing array element or appends at exactly the length (`/list/-` appends). `false` on a multi-match path, a wrong-type intermediate (never clobbered) or an out-of-range index - and then nothing was created. | — |
-| **Stringify** | `Stringify(value:any, options?:int\|bool\|object) - string` | Serialize to JSON. A truthy int or bool indents by 2 spaces. An options object takes `indent` (0-10 spaces), `sortKeys` (members in UTF-16 key order), `escapeHtml` (`\u`-escape `<`, `>`, `&`, U+2028 and U+2029, safe inside an HTML `<script>`) and `ascii` (`\u`-escape every non-ASCII character; invalid UTF-8 becomes `\ufffd`). Raises for a reference cycle, nesting past the depth cap or output over 128 MB. | — |
-| **StringifyLines** | `StringifyLines(array:array) - string` | Serialize each element as a compact JSON value on its own line, each line ending in `\n` (JSON Lines); inverse of `ParseLines`. Raises like `Stringify`. | — |
+| **Remove** | `Remove(root:object\|array, path:string) - bool` | Remove the value at `path` (object key or array element, in place). `false` on a missing node, a type mismatch, a multi-match path or a `nil` path. | — |
+| **Set** | `Set(root:object\|array, path:string, value:any) - bool` | Set `value` at `path` in place, creating missing intermediate objects/arrays (a created array only takes index `0`). Replaces an existing array element or appends at exactly the length (`/list/-` appends). `false` on a multi-match or `nil` path, a wrong-type intermediate (never clobbered) or an out-of-range index - and then nothing was created. | — |
+| **Stringify** | `Stringify(value:any, options?:int\|bool\|object) - string` | Serialize to JSON. A truthy int or bool indents by 2 spaces. An options object takes `indent` (0-10 spaces), `sortKeys` (members in UTF-16 key order), `escapeHtml` (`\u`-escape `<`, `>`, `&`, U+2028 and U+2029, safe inside an HTML `<script>`) and `ascii` (`\u`-escape every non-ASCII character). An invalid UTF-8 byte is always written as `\ufffd`, so the output parses back. Raises for a reference cycle, nesting past the depth cap or output over 128 MB. | — |
+| **StringifyLines** | `StringifyLines(array:array) - string\|nil` | Serialize each element as a compact JSON value on its own line, each line ending in `\n` (JSON Lines); inverse of `ParseLines`. Raises like `Stringify`. | — |
 
 ---
 
@@ -3240,13 +3341,13 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | **LogBase** | `LogBase(x:int\|float, base:int\|float) - float` | Logarithm with arbitrary base. | ✓ |
 | **Max** | `Max(a:int, b:int) - int` | Larger of a, b. For floats use `MaxF`. | ✓ |
 | **MaxF** | `MaxF(a:int\|float, b:int\|float) - float` | Larger of a, b as float. | ✓ |
-| **MaxOf** | `MaxOf(arr:array) - int\|float` | Largest element of a numeric array (type preserved: an int for an `[int]`, a float for a `[float]`). `nil` if empty or non-numeric. | — |
+| **MaxOf** | `MaxOf(arr:array) - int\|float\|nil` | Largest element of a numeric array (type preserved: an int for an `[int]`, a float for a `[float]`). `nil` if empty or non-numeric. | — |
 | **Min** | `Min(a:int, b:int) - int` | Smaller of a, b. For floats use `MinF`. | ✓ |
 | **MinF** | `MinF(a:int\|float, b:int\|float) - float` | Smaller of a, b as float. | ✓ |
-| **MinOf** | `MinOf(arr:array) - int\|float` | Smallest element of a numeric array (type preserved: an int for an `[int]`, a float for a `[float]`). `nil` if empty or non-numeric. | — |
-| **Mod** | `Mod(a:int\|float, b:int\|float) - int\|float` | Floored modulo: the result takes the sign of b, so Mod(-1,5)=4. Two ints give an exact int, and b=0 raises `ModByZero` as `%` does; otherwise a float, `NaN` when b=0. | — |
+| **MinOf** | `MinOf(arr:array) - int\|float\|nil` | Smallest element of a numeric array (type preserved: an int for an `[int]`, a float for a `[float]`). `nil` if empty or non-numeric. | — |
+| **Mod** | `Mod(a:int\|float, b:int\|float) - int\|float` | Floored modulo: the result takes the sign of b, so Mod(-1,5)=4. Two ints give an exact int, otherwise a float; b=0 raises `ModByZero` either way, as `%` does. | — |
 | **Pow** | `Pow(base:int\|float, exp:int\|float) - float` | base^exp. | ✓ |
-| **Product** | `Product(arr:array) - int\|float` | Product of array elements (int if all-int, else float; an `[int]` always gives an int and a `[float]` a float, which the compiler knows). `1` if empty (`1.0` for an empty `[float]`); `nil` if non-numeric. | — |
+| **Product** | `Product(arr:array) - int\|float\|nil` | Product of array elements (int if all-int, else float; an `[int]` always gives an int and a `[float]` a float, which the compiler knows). `1` if empty (`1.0` for an empty `[float]`); `nil` if non-numeric. | — |
 | **Rad** | `Rad(x:int\|float) - float` | Convert degrees to radians. | ✓ |
 | **RandBool** | `RandBool() - bool` | Random boolean. | ✓ |
 | **RandChoice** | `RandChoice(arr:array) - any` | Random element from array. | — |
@@ -3261,7 +3362,7 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | **Sin** | `Sin(x:int\|float) - float` | Sine. | ✓ |
 | **Sinh** | `Sinh(x:int\|float) - float` | Hyperbolic sine. | ✓ |
 | **Sqrt** | `Sqrt(x:int\|float) - float` | Square root. | ✓ |
-| **Sum** | `Sum(arr:array) - int\|float` | Sum of array elements (int if all-int, else float; an `[int]` always gives an int and a `[float]` a float, which the compiler knows). `0` if empty (`0.0` for an empty `[float]`); `nil` if non-numeric. | — |
+| **Sum** | `Sum(arr:array) - int\|float\|nil` | Sum of array elements (int if all-int, else float; an `[int]` always gives an int and a `[float]` a float, which the compiler knows). `0` if empty (`0.0` for an empty `[float]`); `nil` if non-numeric. | — |
 | **Tan** | `Tan(x:int\|float) - float` | Tangent. | ✓ |
 | **Tanh** | `Tanh(x:int\|float) - float` | Hyperbolic tangent. | ✓ |
 | **Trunc** | `Trunc(x:int\|float) - float` | Truncate toward zero. | ✓ |
@@ -3320,7 +3421,26 @@ domain errors yield `NaN` (`Sqrt(-1)`, `Log(-1)`, `Asin(2)`, `Acosh(0.5)`,
 | `Math.Infinity` | `+Inf` |
 | `Math.NaN` | `NaN` |
 
-**Range constants:** `Int8Min/Max`, `Int16Min/Max`, `Int32Min/Max`, `Int64Min/Max`, `IntMin/Max`, `UInt8Min/Max`, `UInt16Min/Max`, `UInt32Min/Max`, `UInt64Min/Max`, `Float32Min/Max/Epsilon`, `Float64Min/Max/Epsilon`, `FloatMin/Max/Epsilon`, `Float32Lowest`, `Float64Lowest`, `FloatLowest`.
+**Range constants:**
+
+| Constant | Type | Value |
+| ---------- | ------ | ------- |
+| `Math.Int8Min` / `Math.Int8Max` | `int` | `-128` / `127` |
+| `Math.Int16Min` / `Math.Int16Max` | `int` | `-32768` / `32767` |
+| `Math.Int32Min` / `Math.Int32Max` | `int` | `-2147483648` / `2147483647` |
+| `Math.Int64Min` / `Math.Int64Max` | `int` | `-9223372036854775808` / `9223372036854775807` |
+| `Math.IntMin` / `Math.IntMax` | `int` | same as `Int64Min` / `Int64Max` |
+| `Math.UInt8Min` / `Math.UInt8Max` | `int` | `0` / `255` |
+| `Math.UInt16Min` / `Math.UInt16Max` | `int` | `0` / `65535` |
+| `Math.UInt32Min` / `Math.UInt32Max` | `int` | `0` / `4294967295` |
+| `Math.UInt64Min` / `Math.UInt64Max` | `int` | `0` / `9223372036854775807` (see the note below) |
+| `Math.Float32Min` / `Math.Float32Max` | `float` | `2^-126` ≈ `1.1754944e-38` / ≈ `3.4028235e+38` |
+| `Math.Float32Epsilon` | `float` | `2^-23` ≈ `1.1920929e-07` |
+| `Math.Float32Lowest` | `float` | `-Float32Max` |
+| `Math.Float64Min` / `Math.Float64Max` | `float` | `2^-1022` ≈ `2.2250738585072014e-308` / ≈ `1.7976931348623157e+308` |
+| `Math.Float64Epsilon` | `float` | `2^-52` ≈ `2.220446049250313e-16` |
+| `Math.Float64Lowest` | `float` | `-Float64Max` |
+| `Math.FloatMin` / `Math.FloatMax` / `Math.FloatEpsilon` / `Math.FloatLowest` | `float` | same as the `Float64*` constants (`float` is 64-bit) |
 
 > **Notes.** `UInt64Max` is capped at `Int64Max` (`9223372036854775807`) because constants live in a signed 64-bit slot. For floats, `*Min` is the smallest *positive normal* (like C's `FLT_MIN`/`DBL_MIN`), **not** the most-negative value - use `*Lowest` (= −`*Max`) for that.
 
@@ -3426,10 +3546,10 @@ Unsafe raw memory access. Requires `--unsafe` flag. `ptr` = `int\|string\|block\
 | **Read16** | `Read16(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 2 bytes, host byte order (little-endian on every supported target). | ✓ `--unsafe` |
 | **Read32** | `Read32(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 4 bytes, host byte order (little-endian on every supported target). | ✓ `--unsafe` |
 | **Read64** | `Read64(ptr:int\|string\|block\|pointer, offset?:int) - int` | Read 8 bytes, host byte order (little-endian on every supported target). | ✓ `--unsafe` |
-| **ReadBytes** | `ReadBytes(ptr:int\|string\|block\|pointer, offset?:int) - block` | Read a NUL-terminated byte run at `ptr`(+`offset`) into a new block (excluding the terminator). The scan is bounded to the registered region. Raises `Forbidden/Invalid memory-access` outside every registered region; `nil` when no terminator lies inside it. | ✓ owned¹ `--unsafe` |
+| **ReadBytes** | `ReadBytes(ptr:int\|string\|block\|pointer, offset?:int) - block\|nil` | Read a NUL-terminated byte run at `ptr`(+`offset`) into a new block (excluding the terminator). The scan is bounded to the registered region. Raises `Forbidden/Invalid memory-access` outside every registered region; `nil` when no terminator lies inside it. | ✓ owned¹ `--unsafe` |
 | **ReadFloat32** | `ReadFloat32(ptr:int\|string\|block\|pointer, offset?:int) - float` | Read IEEE-754 single. | ✓ `--unsafe` |
 | **ReadFloat64** | `ReadFloat64(ptr:int\|string\|block\|pointer, offset?:int) - float` | Read IEEE-754 double. | ✓ `--unsafe` |
-| **ReadString** | `ReadString(ptr:int\|string\|block\|pointer, offset?:int) - string` | Read a NUL-terminated string from `ptr`(+`offset`). The scan is bounded to the registered region (never runs off the allocation). Raises `Forbidden/Invalid memory-access` outside every registered region; `nil` when no terminator lies inside it. | ✓ owned¹ `--unsafe` |
+| **ReadString** | `ReadString(ptr:int\|string\|block\|pointer, offset?:int) - string\|nil` | Read a NUL-terminated string from `ptr`(+`offset`). The scan is bounded to the registered region (never runs off the allocation). Raises `Forbidden/Invalid memory-access` outside every registered region; `nil` when no terminator lies inside it. | ✓ owned¹ `--unsafe` |
 | **Swap16** | `Swap16(v:int) - int` | Byte-swap 16-bit value. No `--unsafe` needed. | ✓ |
 | **Swap32** | `Swap32(v:int) - int` | Byte-swap 32-bit value. No `--unsafe` needed. | ✓ |
 | **Swap64** | `Swap64(v:int) - int` | Byte-swap 64-bit value. No `--unsafe` needed. | ✓ |
@@ -3495,17 +3615,19 @@ field count. The mutating and higher-order helpers (`Merge`, `Delete`, `Clear`,
 **object-only** — a class's schema is sealed.
 
 Properties iterate in insertion order, identically in every process. Field
-reflection order is the class's declaration order.
+reflection order is the class's declaration order. A `foreach` over an object
+may delete members as it goes but must not add any; loop over `Object.Keys(obj)`
+to add (see *Foreach* in the guide).
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
-| **Clear** | `Clear(obj:object) - bool` | Remove all properties from `obj`. Mutates. Raises if `obj` is frozen. | — |
-| **Clone** | `Clone(value:any) - any` | Deep clone: scalars, strings, arrays (including flat `[int]`/`[float]`), objects, classes and instances are copied recursively; functions, builtins, modules and exceptions are shared (ref-counted, not copied). A **cyclic** value (or nesting past the clone-depth limit) raises `Exception.NestingError` rather than looping forever. | — |
+| **Clear** | `Clear(obj:object) - bool\|nil` | Remove all properties from `obj`. Mutates. Raises if `obj` is frozen. | — |
+| **Clone** | `Clone(value:any) - any` | Deep clone: scalars, strings, arrays, objects, classes and instances are copied recursively, and a buffer's bytes are copied; functions (bound and FFI ones too), builtins, modules, exceptions, fibers and streams are shared (ref-counted, not copied). A **cyclic** value (or nesting past the clone-depth limit) raises `Exception.NestingError` rather than looping forever. | — |
 | **Count** | `Count(obj:object\|instance\|class) - int` | Number of properties (object) or declared fields (instance/class); `0` for anything else. | ✓ |
 | **Delete** | `Delete(obj:object, key:string\|int\|char) - bool` | Delete property `key`. Returns `true` if existed. Raises if `obj` is frozen. | — |
 | **Entries** | `Entries(obj:object\|instance\|class) - array` | Array of `[key, value]` pairs (object properties, or field name → value). | — |
 | **Freeze** | `Freeze(obj:object) - bool` | Makes `obj` read-only. Any subsequent write throws — including via `Merge`/`Delete`/`Clear`. Shallow only. Returns `false` for a non-object. Query with `IsFrozen`. | — |
-| **FromEntries** | `FromEntries(pairs:array) - object` | Inverse of `Entries`: builds an object from an array of `[key, value]` pairs. A key is a string, or an int or char standing for its text. A later duplicate key overwrites the earlier. `nil` for a malformed entry or any other key. | — |
+| **FromEntries** | `FromEntries(pairs:array) - object` | Inverse of `Entries`: builds an object from an array of `[key, value]` pairs. A key is a string, or an int or char standing for its text. A later duplicate key overwrites the earlier. Raises `InvalidArguments` for a malformed entry or any other key. | — |
 | **FromKeys** | `FromKeys(arr:array, value:any) - object` | Creates new object from an array of keys, all set to `value`. A key is a string, or an int or char standing for its text (`[1, 2]` gives the properties `"1"` and `"2"`). `nil` if `arr` is nil or holds any other key. | — |
 | **All** | `All(obj:object, func:fn) - bool` | Returns `true` if `fn(key, value)` is truthy for every entry. Returns `true` for an empty object. | — |
 | **Any** | `Any(obj:object, func:fn) - bool` | Returns `true` if `fn(key, value)` is truthy for at least one entry. Returns `false` for an empty object. | — |
@@ -3572,7 +3694,7 @@ Type.Assert(x, Type.Number, "expected a number");
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
-| **Assert** | `Assert(x:any, mask:int, msg?:string) - bool` | Throws `InvalidArgs` if `type(x)` does not match `mask`. Optional custom message. Returns `true` on success. | ✓ |
+| **Assert** | `Assert(x:any, mask:int, msg?:string) - bool` | Throws `InvalidArguments` if `type(x)` does not match `mask`. Optional custom message. Returns `true` on success. | ✓ |
 | **Is** | `Is(x:any, mask:int) - bool` | Returns `true` if `type(x)` matches any bit in `mask`. Use with composite constants. | ✓ |
 | **IsArray** | `IsArray(x:any) - bool` | `true` if `x` is an array. Single-arg; usable as a fast-path callback to `Array.Where`, `Array.Select`, `Array.Count`, etc. | ✓ |
 | **IsBlock** | `IsBlock(x:any) - bool` | `true` if `x` is a memory block/typed buffer. | ✓ |
@@ -3666,14 +3788,15 @@ Process, environment, and system interface. None of it needs `--unsafe`: an embe
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
 | **Arch** | `Arch() - string` | Returns the CPU architecture: `"x86_64"`, `"x86"`, `"mips"`, `"arm64"`, `"arm"`, or `"unknown"`. | — |
-| **Args** | `Args() - array` | Returns CLI argument strings as passed to the script. | — |
-| **Bits** | `Bits() - int` | Returns the pointer width of the platform in bits. Flaris ships 64-bit-only, so this currently always returns `64`. | — |
+| **Args** | `Args() - array` | Returns the argument strings passed to the script: those after the script name on the command line, every argument of a self-contained executable, or what an embedding host set. | — |
+| **Bits** | `Bits() - int` | Returns the pointer width of the platform in bits. Flaris ships 64-bit-only, so this always returns `64`. | — |
 | **Chdir** | `Chdir(path:string) - bool` | Change working directory. Process-global - affects every fiber. | — |
 | **GetCwd** | `GetCwd() - string` | Returns the current working directory, or `nil` if it cannot be read (e.g. the directory was removed, or its path exceeds 4096 bytes). Pairs with `Chdir`. | — |
 | **Exec** | `Exec(path:string, args?:array) - nil` | Replace the current process image with `path` via `execvp` (searched on `PATH`). Buffered output is flushed first. Only returns on error. Does not require `--unsafe`. | — |
-| **Execute** | `Execute(cmd:string, sha256?:string) - string` | Run `cmd` as `sh -c cmd` (`cmd.exe /d /s /c "cmd"` on Windows, where line endings come back as `\n`); returns stdout and stderr merged into one string. Binary-safe. Returns `nil` when the shell cannot be started, the output exceeds 16 MB, or the `sha256` gate rejects the command; the command's own non-zero exit status does **not** map to `nil` (the captured output is returned regardless). Does **not** require `--unsafe`. **The command string is passed directly to the shell with no escaping or sanitization - never pass untrusted or externally-supplied input** (command-injection risk). Pass `sha256` (64-char hex, case-insensitive) to run the command only if its leading binary matches that digest - see [Verifying the binary before it runs](#verifying-the-binary-before-it-runs). To run a program with separate arguments and no shell, use `Os.Spawn`/`Os.RunEx` (which capture output via `execvp`) or `Os.Exec` (which replaces the image). | — |
+| **Execute** | `Execute(cmd:string, sha256?:string) - string` | Run `cmd` as `sh -c cmd` (`cmd.exe /d /s /c "cmd"` on Windows, where line endings come back as `\n`); returns stdout and stderr merged into one string. Binary-safe. Returns `nil` when the shell cannot be started, the output exceeds 16 MB, the `sha256` gate rejects the command, or `cmd` is `nil`; the command's own non-zero exit status does **not** map to `nil` (the captured output is returned regardless). Does **not** require `--unsafe`. **The command string is passed directly to the shell with no escaping or sanitization - never pass untrusted or externally-supplied input** (command-injection risk). Pass `sha256` (64-char hex, case-insensitive) to run the command only if its leading binary matches that digest - see [Verifying the binary before it runs](#verifying-the-binary-before-it-runs). To run a program with separate arguments and no shell, use `Os.Spawn`/`Os.RunEx` (which capture output via `execvp`) or `Os.Exec` (which replaces the image). | — |
 | **ExecuteAsync** | `ExecuteAsync(cmd:string, sha256?:string) - fiber` | Non-blocking `Execute`. Use with `await`. Other fibers run while the command runs. Same security warning and the same optional `sha256` gate as `Execute`; a rejected gate resolves the await to `nil`. | — |
-| **GetEnv** | `GetEnv(name:string) - string` | Read environment variable. Returns `nil` if not set. | — |
+| **GetEnv** | `GetEnv(name:string) - string` | Read environment variable. Returns `nil` if not set, or for a `nil` name. | — |
+| **Getenv** | `Getenv(name:string) - string` | Alias of `GetEnv`. | — |
 | **GetArgValue** | `GetArgValue(name:string, default?:string) - string` | Value of the first script argument of the form `name=value`. Leading dashes are ignored on both sides and a trailing `=` on `name` is optional, so `"port"`, `"--port"` and `"--port="` all find `--port=8080` — but none of them matches `--report=1`. Returns `default` (or `nil`) if not found. | — |
 | **Gid** | `Gid() - int` | Returns the real group ID of the process; `0` on Windows. | — |
 | **IsRoot** | `IsRoot() - bool` | `true` if the process is running as root (UID 0); on Windows, if it runs elevated (as administrator). | — |
@@ -3681,25 +3804,26 @@ Process, environment, and system interface. None of it needs `--unsafe`: an embe
 | **Name** | `Name() - string` | Returns OS name: `"Windows"`, `"Linux"` or `"macOS"`. | — |
 | **Pid** | `Pid() - int` | Returns the current process ID. | — |
 | **Ppid** | `Ppid() - int` | Returns the parent process ID; `0` on Windows. | — |
-| **SetEnv** | `SetEnv(name:string, value:string) - bool` | Set environment variable. Process-wide: child processes started afterwards inherit it. | — |
-| **UnsetEnv** | `UnsetEnv(name:string) - bool` | Remove an environment variable. `true` once it is not set (also when it never was); `false` for an empty name or one containing `=`. | — |
-| **ShellQuote** | `ShellQuote(s:string) - string` | Quote `s` as a single word for `Execute`'s shell, so untrusted text can be passed as one argument: `Os.Execute("grep -- " + Os.ShellQuote(pattern) + " log.txt")`. On Linux and macOS a safe word comes back unchanged and anything else is single-quoted. On Windows `cmd.exe` expands `%VAR%` even inside quotes and cannot escape `"` there, so a string containing `%`, `"`, CR or LF returns `nil` - pass such values with `RunEx` instead. | — |
+| **SetEnv** | `SetEnv(name:string, value:string) - bool` | Set environment variable. Process-wide: child processes started afterwards inherit it. `false` for a `nil` name or value. | — |
+| **Setenv** | `Setenv(name:string, value:string) - bool` | Alias of `SetEnv`. | — |
+| **UnsetEnv** | `UnsetEnv(name:string) - bool` | Remove an environment variable. `true` once it is not set (also when it never was); `false` for an empty or `nil` name or one containing `=`. | — |
+| **ShellQuote** | `ShellQuote(s:string) - string` | Quote `s` as a single word for `Execute`'s shell, so untrusted text can be passed as one argument: `Os.Execute("grep -- " + Os.ShellQuote(pattern) + " log.txt")`. On Linux and macOS a safe word comes back unchanged and anything else is single-quoted. On Windows `cmd.exe` expands `%VAR%` even inside quotes and cannot escape `"` there, so a string containing `%`, `"`, CR or LF returns `nil` - pass such values with `RunEx` instead. A `nil` string returns `nil`. | — |
 | **Which** | `Which(name:string) - string` | Full path of the program `name` would start, or `nil`. A name containing a path separator is checked as given; otherwise each absolute directory on `PATH` is searched (plus the `PATHEXT` extensions on Windows). Relative `PATH` entries, including an empty one, are skipped, so a program planted in the working directory is never picked. | — |
 | **Sleep** | `Sleep(ms:int) - bool` | Sleep current OS thread for `ms` milliseconds. Blocks all fibers - prefer `Fiber.Sleep`. | — |
 | **TempDir** | `TempDir() - string` | Returns path to system temp directory. | — |
 | **Uid** | `Uid() - int` | Returns the real user ID of the process; `0` on Windows. | — |
-| **Wait** | `Wait(pid:int) - int` | Wait (blocking) for child process to exit. Returns its exit code, the negative signal number if killed by a signal, or `nil` when `pid` is not an unreaped child of this process (`0` and negative values included - they never select a process group). | — |
+| **Wait** | `Wait(pid:int) - int\|nil` | Wait (blocking) for child process to exit. Returns its exit code, the negative signal number if killed by a signal, or `nil` when `pid` is not an unreaped child of this process (`0` and negative values included - they never select a process group). | — |
 | **WaitTimeout** | `WaitTimeout(pid:int, timeoutMs:int) - object` | Wait (blocking) up to `timeoutMs` milliseconds for a child process to exit. Returns `{Alive:bool, Exit:int, TimedOut:bool}`; when the deadline expires first, `Alive` stays `true`, `Exit` is `nil` and `TimedOut` is `true`. `timeoutMs <= 0` checks once. `Exit` is `nil` when `pid` is not an unreaped child of this process. | — |
 | **WaitAsync** | `WaitAsync(pid:int, timeoutMs?:int) - fiber` | Wait for a child to exit without blocking other fibers: `await` resolves to `{Alive:bool, Exit:int, TimedOut:bool}`, as `WaitTimeout` returns, and reaps the child once it has exited. Without `timeoutMs` it waits for the exit; `timeoutMs <= 0` checks once. On Linux and macOS the wait costs no thread and `Fiber.CancelIo` abandons it (`nil`, `Stream.LastError()` 7); on Windows it runs on the I/O pool in short slices, where `Fiber.CancelIo` cannot interrupt it - pass a timeout there. | — |
-| **Spawn** | `Spawn(cmd:string, args?:array, options?:object) - object` | Start `cmd` (searched on `PATH`, no shell) with separate stdin/stdout/stderr pipes. Returns `{Pid:int, Stdin:stream, Stdout:stream, Stderr:stream}`: read and write them with `Stream.ReadLine`, `Stream.ReadLineAsync`, `Stream.WriteString` and friends, and `Stream.Close` them yourself. They are ordinary pipes, so a synchronous read waits for the child and holds up every fiber meanwhile - use the `*Async` calls to wait on the child alone. Accepts `Cwd`, `Env`, `MergeStderr` (then `Stderr` is `nil`) and `Streams`, which is still accepted and changes nothing. Returns `nil` when the program cannot be started, or while 256 spawned children are still unreaped. The child is never reaped for you - `TryWait`/`Wait` it, or it stays a zombie. | — |
+| **Spawn** | `Spawn(cmd:string, args?:array, options?:object) - object\|nil` | Start `cmd` (searched on `PATH`, no shell) with separate stdin/stdout/stderr pipes. Returns `{Pid:int, Stdin:stream, Stdout:stream, Stderr:stream}`: read and write them with `Stream.ReadLine`, `Stream.ReadLineAsync`, `Stream.WriteString` and friends, and `Stream.Close` them yourself. They are ordinary pipes, so a synchronous read waits for the child and holds up every fiber meanwhile - use the `*Async` calls to wait on the child alone. Accepts `Cwd`, `Env`, `MergeStderr` (then `Stderr` is `nil`) and `Streams`, which is still accepted and changes nothing. Returns `nil` when the program cannot be started, or while 256 spawned children are still unreaped. The child is never reaped for you - `TryWait`/`Wait` it, or it stays a zombie. | — |
 | **ReadPipe** | `ReadPipe(pipe:stream) - string` | Deprecated, kept for this release: use `Stream.ReadBytes` or `Stream.ReadLine`. Reads up to 4 KB of what has arrived on a pipe from `Spawn`, without waiting. Binary-safe. Returns `nil` when nothing has arrived yet, at end of file, or for a closed stream - use `TryWait` to tell "not yet" from "finished". | — |
 | **WritePipe** | `WritePipe(pipe:stream, data:string) - int` | Deprecated, kept for this release: use `Stream.WriteString`. Writes all of `data` to a spawned process's `Stdin` and returns the byte count, or `-1` on an error (the child has gone) or for a closed stream. Blocks every fiber while the pipe is full. | — |
 | **ClosePipe** | `ClosePipe(pipe:stream) - bool` | Deprecated, kept for this release: use `Stream.Close`. Closes a pipe from `Spawn`; on `Stdin` the child sees end of file. `false` for a stream that is already closed. | — |
 | **IsAlive** | `IsAlive(pid:int) - bool` | Returns `true` if the process with `pid` is still running. Non-blocking. Does not reap the child: a child that has exited reports `false` while its exit code stays available to `TryWait`/`Wait`. | — |
 | **TryWait** | `TryWait(pid:int) - object` | Non-blocking wait. Returns `{Alive:bool, Exit:int}`. While `Alive` is `true`, `Exit` is `nil`. When `Alive` is `false` the child has been reaped and `Exit` holds the exit code - or `nil` when `pid` is not an unreaped child of this process (never spawned, or already reaped). | — |
 | **KillChild** | `KillChild(pid:int, signal:int) - bool` | Send `signal` to a process previously spawned via `Os.Spawn`. Does **not** require `--unsafe`. Returns `false` if `pid` was not spawned by this VM instance or has already been reaped. For sending signals to arbitrary PIDs use `Os.Kill`. | — |
-| **RunEx** | `RunEx(cmd:string, args?:array, options?:object) - object` | Run `cmd` (searched on `PATH`, no shell) and wait for it to finish. Returns `{Exit:int, Stdout:string, Stderr:string}` with stdout and stderr captured separately; stdin is inherited unless `Stdin` is given. Accepts `Cwd`, `Env`, `Stdin`, `MergeStderr` and `Timeout` (see [Launch options](#launch-options)); with `Timeout` the result also carries `TimedOut`. Returns `nil` when the program cannot be started (not found, not executable). Each stream keeps its first 16 MB; after that the pipe is closed, so a child that keeps writing receives `SIGPIPE`. | — |
-| **RunExTimeout** | `RunExTimeout(cmd:string, timeoutMs:int, args?:array, options?:object) - object` | Takes the same options as `RunEx` except `Timeout`. Run `cmd` with separate stdout/stderr capture and wait up to `timeoutMs` milliseconds. Returns `{Exit:int, Stdout:string, Stderr:string, TimedOut:bool}`. If the timeout expires first, the child is terminated and `TimedOut` is `true` with `Exit` set to `124`. The child runs in its own process group (a Job Object on Windows) and the whole group is killed, so a grandchild cannot outlive the deadline or stretch the call past it. `timeoutMs <= 0` means no limit. | — |
+| **RunEx** | `RunEx(cmd:string, args?:array, options?:object) - object\|nil` | Run `cmd` (searched on `PATH`, no shell) and wait for it to finish. Returns `{Exit:int, Stdout:string, Stderr:string}` with stdout and stderr captured separately; stdin is inherited unless `Stdin` is given. Accepts `Cwd`, `Env`, `Stdin`, `MergeStderr` and `Timeout` (see [Launch options](#launch-options)); with `Timeout` the result also carries `TimedOut`. Returns `nil` when the program cannot be started (not found, not executable). Each stream keeps its first 16 MB; after that the pipe is closed, so a child that keeps writing receives `SIGPIPE`. | — |
+| **RunExTimeout** | `RunExTimeout(cmd:string, timeoutMs:int, args?:array, options?:object) - object\|nil` | Takes the same options as `RunEx` except `Timeout`. Run `cmd` with separate stdout/stderr capture and wait up to `timeoutMs` milliseconds. Returns `{Exit:int, Stdout:string, Stderr:string, TimedOut:bool}`. If the timeout expires first, the child is terminated and `TimedOut` is `true` with `Exit` set to `124`. The child runs in its own process group (a Job Object on Windows) and the whole group is killed, so a grandchild cannot outlive the deadline or stretch the call past it. `timeoutMs <= 0` means no limit. | — |
 | **GetEnvAll** | `GetEnvAll() - object` | Returns all environment variables as an object `{NAME: "value", ...}`; `Object.Keys` lists the names. | — |
 
 #### Launch options
@@ -3711,7 +3835,7 @@ ignored.
 | Option | Type | Effect | Accepted by |
 |--------|------|--------|-------------|
 | `Cwd` | string | Working directory of the child. | all three |
-| `Env` | object | Variables to set in the child, merged over this process's environment; a `nil` value removes the variable. The program itself is still looked up with this process's `PATH`. | all three |
+| `Env` | object | Variables to set in the child, merged over this process's environment; a `nil` value removes the variable. A key must be a plain variable name: not empty, no `=`, no NUL byte; anything else raises `InvalidArguments`. The program itself is still looked up with this process's `PATH`. | all three |
 | `Stdin` | string | Text written to the child's stdin, which is then closed. `""` gives the child an empty stdin instead of this process's. Written while the output is read, so a child that writes before it reads cannot deadlock. | `RunEx`, `RunExTimeout` |
 | `MergeStderr` | bool | Send stderr to the same pipe as stdout, interleaved as written. | all three |
 | `Timeout` | int | Milliseconds before the child and its process group are killed; `Exit` is then `124` and `TimedOut` is `true`. | `RunEx` |
@@ -3790,7 +3914,7 @@ against accidentally passing an unset value where a digest was intended.
 
 Namespace: **`Path`**
 
-Cross-platform path string manipulation.
+Cross-platform path string manipulation. A `nil` path argument follows the String policy: the transforms return `nil`, and `IsAbsolute` and `HasExtension` return `false`.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
@@ -3820,18 +3944,22 @@ Regular expression matching, search, replace, and split. The engine is a lightwe
 
 A pattern is compiled on first use and kept: the 16 patterns used most recently stay compiled, so passing the pattern string on every call costs one string comparison, also when several patterns take turns. A program cycling through more than 16 patterns compiles again on each call.
 
+A `nil` input or pattern follows the String policy: `Match`, `Capture`, `Matches`, `MatchAll`, `Split`, `Replace`, `ReplaceFn` and `Escape` return `nil`, `IsMatch` returns `false` and `Count` returns `0`.
+
+A pattern that cannot be compiled raises `InvalidArguments` in every function that takes one: a malformed pattern (an unbalanced `(` or `)`, an unterminated `[`, a bad `{n,m}`, a repeat over 1000), and syntax this engine does not implement, so it is never read as something else - lazy and possessive quantifiers (`+?`, `*?`, `??`, `{n}?`, `++`), a quantifier on a quantifier (`a**`), lookaround (`(?=` `(?!` `(?<=` `(?<!`), named groups (`(?<name>`), inline flags other than a leading `(?i)`, and backreferences (`\1`-`\9`).
+
 #### Functions
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **IsMatch** | `IsMatch(input:string, pattern:string) - bool` | `true` if pattern matches anywhere in input. | ✓ |
-| **Match** | `Match(input:string, pattern:string) - string` | Returns first match substring, or `nil`. | ✓ owned¹ |
+| **Match** | `Match(input:string, pattern:string) - string\|nil` | Returns first match substring, or `nil`. | ✓ owned¹ |
 | **Matches** | `Matches(input:string, pattern:string) - array` | Returns all non-overlapping match substrings, empty matches included (see [Matching semantics](#matching-semantics)). | — |
 | **Count** | `Count(input:string, pattern:string) - int` | The number of matches `Matches` would return, without building the array. | ✓ |
 | **MatchAll** | `MatchAll(input:string, pattern:string) - array` | Every match as `{Index:int, Text:string, Groups:array}`: the byte offset where it starts, the matched text, and the capture groups from group 1 on (`nil` for a group that did not participate). | — |
 | **Capture** | `Capture(input:string, pattern:string) - array` | Returns `[fullMatch, group1, group2, ...]` for the first match, or `nil` if no match. Element 0 is the whole match; subsequent elements are the capture groups in order of their opening `(`. A group that did not participate in the match (e.g. an unmatched optional group) is `nil`. | — |
 | **Replace** | `Replace(input:string, pattern:string, replacement:string) - string` | Replace all matches. In `replacement`, `$0`-`$31` or `${n}` insert a capture group (empty if it did not participate), `$&` the whole match and `$$` a literal `$`; a `$` that forms none of these - including a group the pattern does not have - stays literal, so `"costs $5"` needs no escaping. | ✓ owned¹ |
-| **ReplaceFn** | `ReplaceFn(input:string, pattern:string, fn:fn) - string` | Replace each match with the result of `fn(match)`. The callback receives the matched substring and must return a string (`nil` deletes the match). If the callback raises, or returns a value that is neither a string nor `nil`, the exception propagates to the caller (wrap the call in `try`/`catch` to handle it). | — |
+| **ReplaceFn** | `ReplaceFn(input:string, pattern:string, fn:fn) - string\|nil` | Replace each match with the result of `fn(match)`. The callback receives the matched substring and must return a string (`nil` deletes the match). If the callback raises, or returns a value that is neither a string nor `nil`, the exception propagates to the caller (wrap the call in `try`/`catch` to handle it). | — |
 | **Split** | `Split(input:string, pattern:string) - array` | Split input at the matches. The text after the last match is kept (`Split("a,b,", ",")` is `["a", "b", ""]`); an empty match at the very start or end adds no empty element, so `Split("a1b2c", "[0-9]*")` is `["a", "b", "c"]`. An empty input gives `[""]`. | — |
 | **Escape** | `Escape(s:string) - string` | `s` with every metacharacter backslash-escaped, so the result used as a pattern matches `s` literally: `Regex.Split(line, Regex.Escape(sep))`. | ✓ owned¹ |
 
@@ -3919,7 +4047,7 @@ Groups may be nested and quantified. With `Regex.Capture`, a quantified group re
 
 | Syntax | Description |
 | -------- |------------- |
-| `(?i)` | Case-insensitive matching. Must appear at the start of the pattern. |
+| `(?i)` | Case-insensitive matching. Must appear at the start of the pattern; anywhere else it raises `InvalidArguments`. |
 
 #### Examples
 
@@ -3976,10 +4104,14 @@ fn use(a: int|nil) {
 }
 ```
 
-Two shapes are recognised:
+Three shapes are recognised:
 
 - **Branch narrowing.** The `if` branch the test proves non-nil - the `then` of
-  `a != nil`, the `else` of `a == nil`.
+  `a != nil`, the `else` of `a == nil`; likewise the branch of a ternary
+  (`a == nil ? -1 : a + 1`).
+- **Loop tests.** A `while` or `for` test narrows the loop body, since it runs
+  before every iteration (`while (a != nil) { total += a; a = next(); }`). A
+  `do … while` body runs before its test and is not narrowed.
 - **Early-exit guards.** When the branch handling the nil case always leaves
   (`return` or `throw`), the value stays narrowed for the remainder of the
   enclosing region. That region ends at the enclosing block, and also at the
@@ -4003,6 +4135,18 @@ narrowing the true branch, `||` when narrowing the false branch:
 if (a != nil && b != nil) { /* both a and b narrowed */ }
 if (!is_nil(a))           { /* a narrowed */ }
 if (a == nil || b == nil) { return; }   // both narrowed after the guard
+```
+
+A loop that stores `nil` back into a guarded variable undoes the guard: the
+loop's back-edge returns to the body without passing the test, so from that
+store on - inside the loop and after it - the variable may be nil again:
+
+```js
+if (a == nil) { return; }
+while (more()) {
+    let bad: int = a;              // 1000 - nil from the second round on
+    a = Convert.ParseInt(next());
+}
 ```
 
 Narrowing only ever **removes** `nil` from a type for a bounded region, so it
@@ -4058,6 +4202,8 @@ Namespace: **`Stream`**
 
 Unified I/O for files, network sockets, pipes, and serial ports. All functions operate on a `stream` value backed by a file descriptor. A `nil` stream argument behaves exactly like a closed stream (`IsOpen` is `false`, reads return `nil`), so closing the result of a failed `Open` is harmless.
 
+**Opening needs the owning module too.** A stream opened by name reaches what the name stands for, so an embedding host that withholds `File` or `Net` withholds those streams as well: `Open` with a path, `SendFile` and `OpenSerial` raise `Exception.ModuleDenied` without `File`, and `Connect`, `ConnectAsync`, `ConnectTls`, `ConnectTlsAsync` and `Listen` without `Net`. `Open` on a block, `Pipe`, the standard streams and every operation on a stream the script already holds need `Stream` alone.
+
 **TLS streams.** `ConnectTls`, `StartTls` and `AcceptTls` return an ordinary `stream` whose bytes happen to be encrypted, so every function below works over TLS and any Stream-based library runs unchanged — there is no separate TLS API to port to. TLS comes from the OS stack (macOS Secure Transport, Linux OpenSSL via `dlopen`, Windows SChannel) and the system trust store; certificates and hostnames are verified by default (TLS >= 1.2).
 
 Four operations behave differently on a TLS stream, because a TLS session is a byte conversation with no file offset:
@@ -4072,7 +4218,7 @@ Four operations behave differently on a TLS stream, because a TLS session is a b
 
 `PeerAddr`, `LocalAddr`, `SetNoDelay`, `SetKeepAlive` and `Shutdown` transparently reach the underlying socket.
 
-A read on a TLS stream that has to wait for the peer parks the calling fiber - other fibers run - until the data arrives or the read timeout passes, as on a plain socket.
+A read on a TLS stream that has to wait for the peer parks the calling fiber - other fibers run - until the data arrives or the read timeout passes, as on a plain socket. A write that finds the socket full parks the same way and goes out in parts as room comes; when the send timeout cuts it short, `WriteBytes` and `WriteAsync` report the bytes that went and `LastError()` is `1`.
 
 **Server credentials** depend on the platform backend, because each OS TLS stack accepts a different form:
 
@@ -4092,7 +4238,7 @@ On macOS 15 and later the bundle is imported to process memory only, so a server
 running as a daemon (no `HOME`, no logged-in user) needs no keychain. On earlier
 macOS `SecPKCS12Import` still requires an accessible login keychain.
 
-**The server handshake parks only its own fiber.** `AcceptTls` and `StartTls` run the handshake on the I/O pool and suspend the calling fiber alone, with no `await`; other fibers, other connections and timers keep running. `AcceptTls` first waits, parked, for the client's first bytes, so a client that connects and says nothing costs no pool thread. One that stops in the middle of the handshake holds a pool thread until `handshakeTimeoutMs`, so on a public listener keep it tight (the 10 s default is generous). `ConnectTls` is synchronous and holds the VM for its handshake; `ConnectTlsAsync` does not.
+**The server handshake parks only its own fiber.** `AcceptTls` and `StartTls` run the handshake on the I/O pool and suspend the calling fiber alone, with no `await`; other fibers, other connections and timers keep running. `AcceptTls` first waits, parked, for the client's first bytes, so a client that connects and says nothing costs no pool thread. One that stops in the middle of the handshake holds a pool thread until `handshakeTimeoutMs` - a peer that keeps sending a byte now and then cannot stretch it - so on a public listener keep it tight (the 10 s default is generous). `ConnectTls` is synchronous and holds the VM for its handshake; `ConnectTlsAsync` does not.
 
 ```flaris
 // Client - an ordinary stream, encrypted.
@@ -4139,9 +4285,9 @@ ones already running. Sockets never pay this on any platform. `Close` and
 exception: a read from the Windows console sits in the operating system until
 input arrives, so its timeout and a cancel take effect only then.
 
-**Synchronous calls wait without blocking.** A socket that has been used with
-`WaitReadable` or an `*Async` call stays non-blocking, and a serial port is
-opened that way on Linux and macOS. A synchronous call that has to wait on one -
+**Synchronous calls wait without blocking.** A socket is non-blocking from the
+moment `Connect`, `ConnectAsync`, `Accept` or `Listen` returns it, and a serial port
+is opened that way on Linux and macOS. A synchronous call that has to wait on one -
 a read with nothing there yet, a write to a full socket, `SendFile` with no room
 - parks only the calling fiber until it can go on, for as long as `SetTimeout`
 allows; other fibers keep running. `ReadBytes` and `ReadString` then return what
@@ -4150,7 +4296,11 @@ and the rest) and `ReadVarint` for exactly the bytes they decode, and a write
 returns once every byte is out. A read that the timeout cuts short gives back
 what it had read, so the next read starts there. Inside a completion callback or
 a host call, where a fiber cannot be parked, the same calls wait in place and
-the other fibers wait with them.
+the other fibers wait with them; an `*Async` call made there cannot wait at all,
+so it resolves to `nil` with `LastError()` `7` at once and runs no `cb`. An
+`*Async` call does its work before it returns to the `await`: one that nobody
+awaits still runs to completion, holding its fiber meanwhile, and its result is
+dropped.
 
 **End of stream and closed streams.** A fixed-width reader (`ReadU16` and the
 rest) that reaches the end of the stream part-way through a value returns `nil`
@@ -4189,13 +4339,13 @@ from the stream stay there, so a later read still gets them.
 | -------- | --------- | ----------- | --- |
 | **Accept** | `Accept(s:stream) - stream` | Accept an incoming connection on a listening socket. Returns `nil` if no connection is pending (`LastError()` `0`), or for anything but a listening TCP socket (`5`). The new socket is blocking on every platform, like one from `Connect`, so `SetTimeout` applies to it. | — |
 | **Close** | `Close(s:stream) - bool` | Close the stream. Pending output is delivered first, as `Flush` would; it does not wait for storage (see `Sync`). `false` when that output could not be delivered or the operating system reported an error closing - the stream is closed either way, and closing it again returns `true`. An async operation still pending on the stream - in this fiber's `await` or another's - resolves to `nil` with `LastError()` `2`. A stream that is dropped without being closed is flushed and closed when it is collected, so nothing written is lost either way; a pending async operation keeps its stream alive until it finishes. | ✓ |
-| **Connect** | `Connect(proto:string, host:string, port:int, timeoutMs?:int) - stream` | Open socket. `proto`: `"tcp"` or `"udp"`. `host`: hostname or IP (v4/v6); every address it resolves to is tried in turn. Returns `nil` on failure, with `LastError()` `1` when `timeoutMs` passed and `6` otherwise (refused, unreachable, a name that does not resolve). `timeoutMs` bounds the connect - all the addresses together, not the name lookup - and then each later read and write, as `SetTimeout` would (call `SetTimeout` afterwards to change or remove that part). Omitted, `nil` or `<= 0`, the connect waits as long as the operating system lets it, which can be over a minute for a host that does not answer. Synchronous - like every blocking call it parks all fibers until it returns; `ConnectAsync` waits on the calling fiber alone. | — |
+| **Connect** | `Connect(proto:string, host:string, port:int, timeoutMs?:int) - stream\|nil` | Open socket. `proto`: `"tcp"` or `"udp"`. `host`: hostname or IP (v4/v6); every address it resolves to is tried in turn. Returns `nil` on failure, with `LastError()` `1` when `timeoutMs` passed and `6` otherwise (refused, unreachable, a name that does not resolve). `timeoutMs` bounds the connect - all the addresses together, not the name lookup - and then each later read and write, as `SetTimeout` would (call `SetTimeout` afterwards to change or remove that part). Omitted, `nil` or `<= 0`, the connect waits as long as the operating system lets it, which can be over a minute for a host that does not answer. Synchronous - like every blocking call it parks all fibers until it returns; `ConnectAsync` waits on the calling fiber alone. | — |
 | **ConnectAsync** | `ConnectAsync(proto:string, host:string, port:int, timeoutMs?:int) - fiber` | Non-blocking `Connect`: the DNS lookup and TCP handshake are offloaded to the io pool, so the fiber suspends instead of stalling the VM. Use with `await`; resolves to a socket stream, or `nil` on failure with `LastError()` as for `Connect`. The socket comes back non-blocking, like every socket an `*Async` call has used, so a synchronous read or write on it parks only the calling fiber instead of the VM. `timeoutMs` means what it does for `Connect`. Raises on a bad `proto`/`port`. | — |
 | **AcceptTls** | `AcceptTls(s:stream, options:object) - stream` | Terminate TLS on a socket `Accept` already returned. Upgrades `s` in place and returns it: on success `s` is a TLS stream over the same socket, on failure it is closed. A memory stream is refused (`5`). `options`: `pkcs12File` + `password` (all platforms) or `certFile` + `keyFile` (PEM, OpenSSL only); `handshakeTimeoutMs` (default 10000) bounds the wait for the client's first bytes, the handshake *and* every later read/write; `requireClientCert` demands a client certificate, validated against the system trust store. The handshake parks only the calling fiber, which gets the stream back when it resumes. `nil` on failure, with `LastError()` `1` when the handshake timed out, `6` for any other failure, `2` for a closed stream and `5` for one that is already TLS; the reason as text via `TlsLastError()`. | — |
 | **StartTls** | `StartTls(s:stream, options:object) - stream` | Switch a plain socket the program is already talking over to client TLS - the STARTTLS step of SMTP, IMAP or LDAP: negotiate the switch in the protocol, then call this once the server has said go ahead. Upgrades `s` in place and returns it: on success `s` is a TLS stream over the same socket, on failure it is closed. `options`: `sni` (the host name verified against the certificate, required unless `insecure`), `insecure`, `timeoutMs` (default 30000) bounds the handshake and each later read/write. The handshake parks only the calling fiber. Refused (`nil`, `LastError()` `5`) without `sni` or `insecure`, for anything but an open plain socket (`2` when closed), and when the stream still holds unread buffered input, i.e. the protocol exchange was not finished. `nil` on a failed handshake, with `LastError()` `1` when it timed out and `6` otherwise; the reason as text via `TlsLastError()`. | — |
 | **ConnectTlsAsync** | `ConnectTlsAsync(host:string, port:int, options?:object) - fiber` | Async `ConnectTls`: DNS, the TCP handshake **and** the TLS handshake run on the I/O pool, so only the calling fiber suspends. `await` resolves to a stream, or `nil` on failure with `LastError()` and `TlsLastError()` as for `ConnectTls`. Same `options` as `ConnectTls`. Prefer this in any client that must stay responsive - a TLS handshake is far more expensive than a plain connect. | — |
-| **ConnectTls** | `ConnectTls(host:string, port:int, options?:object) - stream` | Open a TLS connection as an ordinary stream. `options`: `insecure` skips certificate/hostname verification (trusted hosts only), `timeoutMs` (default 30000) bounds the connect - every address the host resolves to, together - the handshake and each later read/write, `sni` overrides the name sent and verified against the certificate. `nil` on failure, with `LastError()` `1` when the connect or the handshake ran out of time and `6` for any other failure; the reason as text via `TlsLastError()`. | — |
-| **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy from `src` to `dst` until `src` ends, or at most `limit` bytes when `limit` is given (`0` copies nothing; omitted, `nil` or negative means no limit). Nothing past the limit is taken from `src`, so the next read starts right after the copied bytes. There is no size cap: a copy of any length works, since only one 64 KB chunk is held at a time. `false` if either stream is closed (`LastError()` `2`) or a read or write fails (`LastError()` says why). Synchronous - like every blocking call it parks all fibers until it finishes. | — |
+| **ConnectTls** | `ConnectTls(host:string, port:int, options?:object) - stream\|nil` | Open a TLS connection as an ordinary stream. `options`: `insecure` skips certificate/hostname verification (trusted hosts only), `timeoutMs` (default 30000) bounds the connect - every address the host resolves to, together - the handshake and each later read/write, `sni` overrides the name sent and verified against the certificate. `nil` on failure, with `LastError()` `1` when the connect or the handshake ran out of time and `6` for any other failure; the reason as text via `TlsLastError()`. | — |
+| **Copy** | `Copy(src:stream, dst:stream, limit?:int) - bool` | Copy from `src` to `dst` until `src` ends, or at most `limit` bytes when `limit` is given (`0` copies nothing; omitted, `nil` or negative means no limit). Nothing past the limit is taken from `src`, so the next read starts right after the copied bytes. There is no size cap: a copy of any length works, since only one 64 KB chunk is held at a time. `false` if either stream is closed (`LastError()` `2`) or a read or write fails (`LastError()` says why). A source socket with nothing more there yet parks the calling fiber, as a read does, until more arrives or its receive timeout passes (`LastError()` `1`); the destination is written as the bytes come. | — |
 | **Flush** | `Flush(s:stream) - bool` | Deliver pending output to the operating system, so another handle, another process or a reader that outlives a crash of this one sees it. Cheap - one write of whatever has accumulated - so it is fine after every record where visibility matters, as a logger does. Only a file stream holds output back at all; sockets, pipes, serial ports and the console write through, and `Flush` on them is a no-op. Does not wait for the device: that is `Sync`. `false` when the output could not be delivered, or on a closed stream (`LastError()` `2`). | ✓ |
 | **Sync** | `Sync(s:stream) - bool` | `Flush`, then wait until the bytes are on the device - `fsync` for a file, `tcdrain` for a serial port, nothing for a socket or pipe. Milliseconds, a storage barrier: use it at a checkpoint, not after every write. `false` when either step fails, or on a closed stream (`LastError()` `2`). | ✓ |
 | **IsOpen** | `IsOpen(s:stream) - bool` | `true` if stream is still open. | ✓ |
@@ -4208,51 +4358,51 @@ from the stream stay there, so a later read still gets them.
 | **Open** | `Open(path:string, mode:string) - stream` | Open file stream. Mode: `"r"` (read-only), `"w"` (write/create/truncate), `"a"` (append/create) or `"rw"` (read-write/create). Returns `nil` with `LastError()` `6` on failure, for a directory, or for a `nil` path; a mode other than these four raises. Reads are buffered ahead and writes are held back, 4 KB each way, so reading or writing a byte at a time costs no more than reading or writing a chunk; see `Flush` for when held-back output becomes visible to others. | — |
 | **Open** | `Open(data:block, mode:string) - stream` | A memory stream over a byte block (element size 1): every stream call works on the block's own bytes, at a position of the stream's own. The modes are as for a file - `"r"` reads only, `"w"` empties the block first, `"a"` writes at its end wherever the position points, `"rw"` reads and writes - and writes grow the block at once, so it holds them without a `Flush`. `Seek`, `Tell`, `Size` and `Truncate` work; a write past the end fills the gap with zeros. A memory stream never waits, and `Close` releases the block. Returns `nil` with `LastError()` `5` for a block of wider elements, or for a write mode on a constant block. | — |
 | **OpenSerial** | `OpenSerial(port:string, baud:int, format?:string, flow?:string) - stream` | Open serial port in raw mode. Returns `nil` if the port cannot be opened. `format` is `[7\|8][N\|E\|O][1\|2]`, default `"8N1"` (databits, parity, stopbits). `flow` is `"none"` (default), `"rtscts"` (hardware RTS/CTS) or `"xonxoff"` (software). Flow control is always applied explicitly, so a port left in RTS/CTS by a previous opener is reset by `"none"`. **Baud:** on Linux any rate the C library names, `50`–`4000000` – including `230400`, `460800` and `921600` for LTE/PPP; on macOS/BSD any rate the driver accepts; on Windows any rate the driver accepts. An unsupported rate raises rather than silently running at the wrong speed. | — |
-| **Peek** | `Peek(s:stream) - int` | Return the next byte (0–255) without consuming it, on any kind of stream. Waits for a byte exactly as a read would, and returns `nil` at EOF or on error - `LastError()` tells them apart. | — |
+| **Peek** | `Peek(s:stream) - int\|nil` | Return the next byte (0–255) without consuming it, on any kind of stream. Waits for a byte exactly as a read would, and returns `nil` at EOF or on error - `LastError()` tells them apart. | — |
 | **PeerAddr** | `PeerAddr(s:stream) - string` | Remote endpoint of a connected socket as `"ip:port"` (`"[ip]:port"` for IPv6). `nil` for anything but a connected socket (`LastError()` `5`) or on error. | — |
 | **Pipe** | `Pipe() - array` | Create a pipe. Returns `[readStream, writeStream]`. | — |
-| **ReadAll** | `ReadAll(s:stream, limit?:int, timeout?:int) - block` | Read until EOF or `limit` bytes and return a `block`. A file is read to its end; a socket or pipe until the peer closes (EOF) or, for a socket, the `timeout` fires (seconds of silence, default 3; `0` waits without one) — bytes already read are returned, not discarded. The timeout applies to this call only: a timeout set with `SetTimeout` is back in force afterwards. `nil` for `limit` or `timeout` means the default; a negative `limit` means no limit, as for `Copy`, and `0` reads nothing. On a socket left non-blocking by `WaitReadable` or an `*Async` call it returns at once with what has already arrived, and `timeout` does not apply. Returns `nil` on a hard I/O error, and for a closed stream (`LastError()` `2`). | — |
+| **ReadAll** | `ReadAll(s:stream, limit?:int, timeout?:int) - block` | Read until EOF or `limit` bytes and return a `block`. A file is read to its end; a socket or pipe until the peer closes (EOF) or, for a socket or a serial port, the `timeout` fires (seconds of silence, default 3; `0` waits without one) — bytes already read are returned, not discarded. The timeout applies to this call only: a timeout set with `SetTimeout` is back in force afterwards. `nil` for `limit` or `timeout` means the default; a negative `limit` means no limit, as for `Copy`, and `0` reads nothing. Returns `nil` on a hard I/O error, and for a closed stream (`LastError()` `2`). | — |
 | **ReadAsync** | `ReadAsync(s:stream, count?:int, timeout?:int, cb?:fn) - fiber` | Async read. `count > 0` completes once exactly `count` bytes have arrived; `count` omitted, `0` or negative reads until EOF. A closed stream resolves to `nil` with `LastError()` `2`. `await` resolves to a `block`, or `nil`. A block can be shorter than `count` - empty when the stream had already ended - when EOF arrives first **or when the deadline fires after some bytes have arrived** — a timeout hands over what it already has rather than discarding it, so always check `len()`, and call `Stream.LastError()` (`1` = timed out) to tell a short block from a complete one. `nil` means a timeout with nothing received, or a hard error. A read that is not bounded by `count` stops at 2 GiB and reports `Stream.LastError() == 4`, so a peer that never closes cannot grow it without limit. `timeout` in ms; `<= 0` (default) = no deadline. With `cb`, `cb(block)` is invoked on completion and the awaited result is `nil`; a `cb` that raises is reported on stderr and the exception dropped. | — |
-| **ReadByte** | `ReadByte(s:stream) - int` | Read one byte as integer (0–255). `nil` on EOF. | — |
-| **ReadBytes** | `ReadBytes(s:stream, count:int) - block` | Read up to `count` bytes into a block. A short block is not an error: a peer close or a `SetTimeout` firing part-way keeps the bytes already read, and on a non-blocking socket it returns what has arrived, so check `len()` and loop until you have `count`. `nil` only when nothing at all was read: `LastError()` is `0` at end of file, `1` on a timeout - and for a `count` of `0` or less. | — |
-| **ReadLine** | `ReadLine(s:stream, delim?:string\|int) - string` | Read until `\n`, stripping a preceding `\r` (so `\r\n` and `\n` both work). A lone `\r` - also one right before the end of the stream - and an embedded NUL are data, not terminators. `delim` ends the line at another byte instead - a one-character string such as `"\r"` (a device that ends lines with CR alone) or `";"`, or a byte value `0`-`255` (`0` for NUL-separated records, which a string literal cannot hold); with it nothing else is stripped, so a CR before it stays part of the line. Anything else as `delim` raises. Nothing past the terminator is consumed, so a byte-oriented read may follow one directly. A blank line is `""`; end of file is `nil`, as it is for `ReadLineAsync`, so `while (line != nil)` terminates and a blank line inside the file does not end the loop. `nil` also comes back on error, on a read timeout and if the line passes 256 MB - `Stream.LastError()` tells them apart (`0` = clean end of file, `1` = the timeout set with `SetTimeout` or `Connect` passed, `4` = over the line cap, `6` = an OS error). A line cut off by a timeout stays buffered, so the next read starts at the beginning of it. On a serial port (Linux and macOS), and on a socket that has been used with `WaitReadable` or an `*Async` call, a line that has not fully arrived parks the calling fiber - other fibers run - until it does or, on a socket, until the read timeout passes. | — |
+| **ReadByte** | `ReadByte(s:stream) - int\|nil` | Read one byte as integer (0–255). `nil` on EOF. | — |
+| **ReadBytes** | `ReadBytes(s:stream, count:int) - block\|nil` | Read up to `count` bytes into a block. A short block is not an error: a peer close or a `SetTimeout` firing part-way keeps the bytes already read, and on a socket it returns what has arrived, so check `len()` and loop until you have `count`. `nil` only when nothing at all was read: `LastError()` is `0` at end of file, `1` on a timeout - and for a `count` of `0` or less. | — |
+| **ReadLine** | `ReadLine(s:stream, delim?:string\|int) - string` | Read until `\n`, stripping a preceding `\r` (so `\r\n` and `\n` both work). A lone `\r` - also one right before the end of the stream - and an embedded NUL are data, not terminators. `delim` ends the line at another byte instead - a one-character string such as `"\r"` (a device that ends lines with CR alone) or `";"`, or a byte value `0`-`255` (`0` for NUL-separated records, which a string literal cannot hold); with it nothing else is stripped, so a CR before it stays part of the line. Anything else as `delim` raises. Nothing past the terminator is consumed, so a byte-oriented read may follow one directly. A blank line is `""`; end of file is `nil`, as it is for `ReadLineAsync`, so `while (line != nil)` terminates and a blank line inside the file does not end the loop. `nil` also comes back on error, on a read timeout and if the line passes 256 MB - `Stream.LastError()` tells them apart (`0` = clean end of file, `1` = the timeout set with `SetTimeout` or `Connect` passed, `4` = over the line cap, `6` = an OS error). A line cut off by a timeout stays buffered, so the next read starts at the beginning of it. On a serial port (Linux and macOS), and on a socket that has been used with `WaitReadable` or an `*Async` call, a line that has not fully arrived parks the calling fiber - other fibers run - until it does or until the read timeout set with `SetTimeout` passes. | — |
 | **ReadLineAsync** | `ReadLineAsync(s:stream, timeout?:int, cb?:fn, delim?:string\|int) - fiber` | Async counterpart of `ReadLine`, with the same `delim` (pass `nil` for `timeout` and `cb` to give only a terminator). `await` resolves to one line with the terminator (and a preceding `\r`) stripped, or `nil` at EOF, on timeout, or on error. Like the synchronous call it consumes nothing past the terminator, so consecutive calls stay in step on a line protocol and a byte-oriented read may follow one directly. `timeout` in ms; `<= 0` (default) = no deadline. A stream that ends mid-line hands over the unterminated remainder (a trailing `\r` included), and the call after that is the `nil` for EOF - check `Stream.LastError()` (`0` = clean EOF, `1` = timed out, `4` = the line exceeded 256 MB). A line that times out, or is abandoned with `Fiber.CancelIo`, gives back what it had read, so the next read starts at the beginning of that line. With `cb`, `cb(line)` is invoked on completion and the awaited result is `nil`; a `cb` that raises is reported on stderr and the exception dropped. A closed stream resolves to `nil` with `LastError()` `2`. | — |
-| **ReadString** | `ReadString(s:stream, count:int) - string` | Read `count` bytes as string - fewer, like `ReadBytes`, at end of file, on a timeout or from a non-blocking socket that has not received them all yet. Binary-safe: an embedded NUL is data, so the result is as long as what was read. `nil` with nothing read, with `LastError()` saying why, and for a `count` of `0` or less, as for `ReadBytes`. | — |
+| **ReadString** | `ReadString(s:stream, count:int) - string\|nil` | Read `count` bytes as string - fewer, like `ReadBytes`, at end of file, on a timeout or from a socket that has not received them all yet. Binary-safe: an embedded NUL is data, so the result is as long as what was read. `nil` with nothing read, with `LastError()` saying why, and for a `count` of `0` or less, as for `ReadBytes`. | — |
 | **Seek** | `Seek(s:stream, pos:int, whence?:int) - bool` | Seek a file stream. `whence`: `0` from start (default), `1` from the current position, `2` from the end (`pos` may be negative); any other `whence` raises. Returns `true` on success, `false` for a position before the start (`LastError()` `6`) or a stream that cannot seek (`5`). | ✓ |
-| **SendFile** | `SendFile(s:stream, path:string, offset?:int, count?:int) - int` | Zero-copy file-to-socket transfer (`sendfile` on Linux and macOS/BSD); what the kernel path cannot take - a TLS stream, a file or pipe on macOS, targets without it such as OpenWrt - is copied instead. Returns the bytes sent: all of them on a blocking socket; on a non-blocking one that fills, what fit, so call again from `offset` plus that count (with nothing sent yet it waits for room, like a write). `count` defaults to the rest of the file, as does a negative `count`; `0` - or an `offset` at or past the end - sends nothing and returns `0`. `nil` when nothing could be sent: a missing file or a negative `offset` (`LastError()` `6`), a closed stream (`2`), a reader that is gone (`3`), a write timeout with nothing sent (`1`). | — |
+| **SendFile** | `SendFile(s:stream, path:string, offset?:int, count?:int) - int\|nil` | Zero-copy file-to-socket transfer (`sendfile` on Linux and macOS/BSD); what the kernel path cannot take - a TLS stream, a file or pipe on macOS, targets without it such as OpenWrt - is copied instead. Returns the bytes sent: all of them on a blocking socket; on a non-blocking one that fills, what fit, so call again from `offset` plus that count (with nothing sent yet it waits for room, like a write). `count` defaults to the rest of the file, as does a negative `count`; `0` - or an `offset` at or past the end - sends nothing and returns `0`. `nil` when nothing could be sent: a missing file or a negative `offset` (`LastError()` `6`), a closed stream (`2`), a reader that is gone (`3`), a write timeout with nothing sent (`1`). | — |
 | **SetKeepAlive** | `SetKeepAlive(s:stream, on:bool) - bool` | Enable/disable TCP keep-alive probes (`SO_KEEPALIVE`) on a TCP socket. Returns `true` if set; `false` for anything but a TCP socket (`LastError()` `5`). | — |
 | **SetNoDelay** | `SetNoDelay(s:stream, on:bool) - bool` | Enable/disable `TCP_NODELAY` (disable Nagle) so small writes go out immediately. Returns `true` if set; `false` for anything but a TCP socket (`LastError()` `5`). | — |
-| **SetTimeout** | `SetTimeout(s:stream, readMs:int, writeMs?:int) - bool` | Set read and write timeouts in milliseconds on a socket stream. If `writeMs` is omitted, both directions use `readMs`; `0` removes a timeout. `false` for anything but a socket (`LastError()` `5`), or a negative time (`6`). | — |
+| **SetTimeout** | `SetTimeout(s:stream, readMs:int, writeMs?:int) - bool\|nil` | Set read and write timeouts in milliseconds on a socket, or on a serial port (Linux and macOS): a read or write that waits longer ends with `nil` and `LastError()` `1`. If `writeMs` is omitted, both directions use `readMs`; `0` removes a timeout, and a value above the 32-bit int range counts as its maximum. A timeout counts silence: it restarts whenever bytes move. `true`, or `nil` for a stream that cannot wait with a deadline - a file, a pipe, the console, a serial port on Windows (`LastError()` `5`) - a closed stream (`2`) or a negative time (`6`). On a pipe, `ReadLineAsync` and `ReadAsync` take a timeout of their own. | — |
 | **Shutdown** | `Shutdown(s:stream, how:string) - bool` | Half-close a socket. `how`: `"r"` stops reads, `"w"` stops writes (sends EOF to the peer while the read side stays open), anything else shuts both. Returns `true` on success; `false` for anything but a connected TCP socket - a listener or a UDP socket included (`LastError()` `5`). | — |
-| **Size** | `Size(s:stream) - int` | Byte length of the underlying file, including output the stream still holds back (it is delivered first). `nil` for anything but a regular file - a socket, pipe or terminal (`LastError()` `5`) - or on error (`6`). | — |
-| **Stderr** | `Stderr() - stream` | A `dup()` of the process stderr as a writable stream. Closing it (or its GC) leaves the real stderr open. | — |
-| **Stdin** | `Stdin() - stream` | The process stdin as a readable stream: the same stream on every call, shared with `Console`'s reads, so neither loses what the other read ahead. Closing it leaves the real stdin open; the next call opens a fresh one, and what the closed one had read ahead is gone. | — |
-| **Stdout** | `Stdout() - stream` | A `dup()` of the process stdout as a writable stream. Closing it leaves the real stdout open. | — |
+| **Size** | `Size(s:stream) - int\|nil` | Byte length of the underlying file, including output the stream still holds back (it is delivered first). `nil` for anything but a regular file - a socket, pipe or terminal (`LastError()` `5`) - or on error (`6`). | — |
+| **Stderr** | `Stderr() - stream` | A `dup()` of the process stderr as a writable stream; its writes go through the same buffer as `Console.Error`, so the two keep their order. Closing it (or its GC) leaves the real stderr open. | — |
+| **Stdin** | `Stdin() - stream` | The process stdin as a readable stream: the same stream on every call, shared with `Console`'s reads, so neither loses what the other read ahead. Closing it leaves the real stdin open; the next call opens a fresh one, and what the closed one had read ahead is gone. Redirected from a file it has an offset: `Seek` and `Tell` work, and what was read ahead is given back before a seek and at exit, so a process sharing the file continues where this one stopped. | — |
+| **Stdout** | `Stdout() - stream` | A `dup()` of the process stdout as a writable stream; its writes go through the same buffer as `Console.WriteLine`, so the two keep their order, and each write is flushed at once. Closing it leaves the real stdout open. | — |
 | **Tell** | `Tell(s:stream) - int` | Current byte offset, or `-1` when the stream cannot seek - a pipe, socket or TLS session (`LastError()` `5`). | ✓ |
 | **Truncate** | `Truncate(s:stream, size:int) - bool` | Grow or shrink the file to exactly `size` bytes. Returns `true` on success, `false` for a negative `size` (`LastError()` `6`) or a stream that is not a file (`5`). | ✓ |
-| **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. On a socket this leaves the descriptor non-blocking for good (async slots re-arm it, and a socket may have read and write armed at once); synchronous calls on it then wait by parking the fiber - see above. On Windows only a socket can be waited on: a pipe or a file raises. A closed stream gives `nil` with `LastError()` `2`. | — |
+| **WaitReadable** | `WaitReadable(s:stream, timeoutMs?:int) - bool\|nil` | Park the calling fiber until `s` (typically a listen socket from `Listen`) becomes readable. Resumes with `true` on readiness, `nil` on timeout. `timeoutMs <= 0` (default `-1`) waits without a deadline. Suspends without `await` — callable from a plain function, so a server loop is `while (Stream.WaitReadable(srv, -1)) { let c = Stream.Accept(srv); ... }`. A synchronous read or write on a socket parks the same way, so `WaitReadable` is for its deadline and for a listener. On Windows only a socket can be waited on: a pipe or a file raises. A closed stream gives `nil` with `LastError()` `2`. | — |
 | **WriteAll** | `WriteAll(s:stream, data:string\|block) - bool` | Write all bytes, retrying on partial writes. A block writes all of its bytes: element count × element size. `false` on a write error, a write timeout or a closed stream; `LastError()` says which. | ✓ |
 | **WriteAsync** | `WriteAsync(s:stream, data:string\|block, timeout?:int) - fiber` | Async write of all of `data`. `await` resolves to the bytes written (int). **A deadline that fires part-way still resolves to a count** - the bytes already delivered - so compare it with the size of `data` in bytes (`len(data)` for a string or a buffer of 1-byte elements) rather than treating any int as success, and resume from that offset if you need the rest; `Stream.LastError()` reports `1` for the short case and `0` for a complete one. `nil` means nothing was delivered at all, or a hard I/O error, where no resume is possible; a closed stream resolves to `nil` with `LastError()` `2`. The write is tried at once and waits only for what does not fit. `timeout` in ms; `<= 0` (default) = no deadline. `data` is retained while the write is in flight. | — |
 | **WriteByte** | `WriteByte(s:stream, value:int) - bool` | Write single byte: the low 8 bits of `value`. Returns `true` on success, `false` on a write error (`LastError()` says why). | ✓ |
 | **WriteBytes** | `WriteBytes(s:stream, buf:block, count:int) - int` | Write `count` bytes from block, at most its size in bytes (element count × element size); returns bytes written - fewer only when a `SetTimeout` write timeout cut it off - or `-1` on failure (`LastError()` says why). A `count` of `0` or less writes nothing and returns `0`. | ✓ |
 | **WriteString** | `WriteString(s:stream, s:string) - bool` | Write the string's bytes — all of them, including any embedded NUL. `false` on a write error, a write timeout or a closed stream; `LastError()` says which. A file holds output back, so an error delivering it can also surface later, at `Flush` or `Close`. | ✓ |
-| **ReadU8** | `ReadU8(s:stream) - int` | Read one unsigned byte (0–255). Returns `nil` on EOF. | — |
-| **ReadU16** | `ReadU16(s:stream, bigEndian?:bool) - int` | Read 2 bytes as unsigned 16-bit integer. Default little-endian. `nil` on EOF. | — |
-| **ReadU32** | `ReadU32(s:stream, bigEndian?:bool) - int` | Read 4 bytes as unsigned 32-bit integer. Default little-endian. `nil` on EOF. | — |
-| **ReadU64** | `ReadU64(s:stream, bigEndian?:bool) - int` | Read 8 bytes as 64-bit integer (all bits set reads as `-1`). Default little-endian. `nil` on EOF. | — |
+| **ReadU8** | `ReadU8(s:stream) - int\|nil` | Read one unsigned byte (0–255). Returns `nil` on EOF. | ✓ |
+| **ReadU16** | `ReadU16(s:stream, bigEndian?:bool) - int\|nil` | Read 2 bytes as unsigned 16-bit integer. Default little-endian. `nil` on EOF. | ✓ |
+| **ReadU32** | `ReadU32(s:stream, bigEndian?:bool) - int\|nil` | Read 4 bytes as unsigned 32-bit integer. Default little-endian. `nil` on EOF. | ✓ |
+| **ReadU64** | `ReadU64(s:stream, bigEndian?:bool) - int\|nil` | Read 8 bytes as 64-bit integer (all bits set reads as `-1`). Default little-endian. `nil` on EOF. | ✓ |
 | **WriteU8** | `WriteU8(s:stream, value:int) - bool` | Write one byte. Returns `true` on success. | ✓ |
 | **WriteU16** | `WriteU16(s:stream, value:int, bigEndian?:bool) - bool` | Write 2 bytes. Default little-endian. Returns `true` on success. | ✓ |
 | **WriteU32** | `WriteU32(s:stream, value:int, bigEndian?:bool) - bool` | Write 4 bytes. Default little-endian. Returns `true` on success. | ✓ |
 | **WriteU64** | `WriteU64(s:stream, value:int, bigEndian?:bool) - bool` | Write 8 bytes. Default little-endian. Returns `true` on success. | ✓ |
-| **ReadI8** | `ReadI8(s:stream) - int` | Read one signed byte (−128…127). `nil` on EOF. | — |
-| **ReadI16** | `ReadI16(s:stream, bigEndian?:bool) - int` | Read a signed 16-bit integer. Default little-endian. `nil` on EOF. | — |
-| **ReadI32** | `ReadI32(s:stream, bigEndian?:bool) - int` | Read a signed 32-bit integer. Default little-endian. `nil` on EOF. | — |
-| **ReadI64** | `ReadI64(s:stream, bigEndian?:bool) - int` | Read a signed 64-bit integer. Default little-endian. `nil` on EOF. | — |
-| **ReadF32** | `ReadF32(s:stream, bigEndian?:bool) - float` | Read a 32-bit IEEE-754 float. Default little-endian. `nil` on EOF. | — |
-| **ReadF64** | `ReadF64(s:stream, bigEndian?:bool) - float` | Read a 64-bit IEEE-754 double. Default little-endian. `nil` on EOF. | — |
+| **ReadI8** | `ReadI8(s:stream) - int\|nil` | Read one signed byte (−128…127). `nil` on EOF. | ✓ |
+| **ReadI16** | `ReadI16(s:stream, bigEndian?:bool) - int\|nil` | Read a signed 16-bit integer. Default little-endian. `nil` on EOF. | ✓ |
+| **ReadI32** | `ReadI32(s:stream, bigEndian?:bool) - int\|nil` | Read a signed 32-bit integer. Default little-endian. `nil` on EOF. | ✓ |
+| **ReadI64** | `ReadI64(s:stream, bigEndian?:bool) - int\|nil` | Read a signed 64-bit integer. Default little-endian. `nil` on EOF. | ✓ |
+| **ReadF32** | `ReadF32(s:stream, bigEndian?:bool) - float\|nil` | Read a 32-bit IEEE-754 float. Default little-endian. `nil` on EOF. | — |
+| **ReadF64** | `ReadF64(s:stream, bigEndian?:bool) - float\|nil` | Read a 64-bit IEEE-754 double. Default little-endian. `nil` on EOF. | — |
 | **WriteF32** | `WriteF32(s:stream, value:float, bigEndian?:bool) - bool` | Write a 32-bit IEEE-754 float. Default little-endian. | ✓ |
 | **WriteF64** | `WriteF64(s:stream, value:float, bigEndian?:bool) - bool` | Write a 64-bit IEEE-754 double. Default little-endian. | ✓ |
-| **ReadVarint** | `ReadVarint(s:stream) - int` | Decode an unsigned LEB128 varint (1–10 bytes). `nil` on EOF/truncation or an over-long encoding. | — |
+| **ReadVarint** | `ReadVarint(s:stream) - int\|nil` | Decode an unsigned LEB128 varint (1–10 bytes). `nil` on EOF/truncation or an over-long encoding. | — |
 | **WriteVarint** | `WriteVarint(s:stream, value:int) - bool` | Encode `value` as an unsigned LEB128 varint. Returns `true` on success. | ✓ |
 
 #### Stream instance method syntax
@@ -4319,7 +4469,7 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **CharAt** | `CharAt(s:string, pos:int) - char` | Character at byte position `pos` as a `char` immediate. Returns `'\0'` if `pos` is out of range. Zero allocation - prefer over `Substr(s, pos, 1)` in tight loops. | ✓ |
 | **Contains** | `Contains(s:string, sub:str\|char) - bool` | `true` if `sub` appears anywhere in `s`. A char matches its UTF-8 bytes, as `c in s` does. | ✓ |
 | **Count** | `Count(s:string, sub:string) - int` | Returns the number of non-overlapping occurrences of `sub` in `s`. Returns `0` if `sub` is empty. | ✓ |
-| **Create** | `Create(n:int, fill?:int\|char) - string` | Create a mutable string of length `n` filled with `fill` (default space). Returns `""` for `n ≤ 0`, `nil` for `n` exceeding the string size limit or `fill` outside 1–255 (a NUL fill would embed `'\0'` bytes and corrupt length bookkeeping). Intended for use with JIT functions that write characters in-place via `s[i] = ch`. | ✓ owned¹ |
+| **Create** | `Create(n:int, fill?:int\|char) - string` | Create a mutable string of length `n` filled with `fill` (default space). Returns `""` for `n ≤ 0`. Raises `InvalidArguments` for `fill` outside 1–255 (a NUL fill would embed `'\0'` bytes and corrupt length bookkeeping) and `SizeLimit` for `n` over the string size limit. Intended for use with JIT functions that write characters in-place via `s[i] = ch`. | ✓ owned¹ |
 | **Empty** | `Empty - string` | Property: the empty string constant `""`. Not a function. | — |
 | **EndsWith** | `EndsWith(s:string, suffix:string) - bool` | `true` if `s` ends with `suffix`. | ✓ |
 | **EqualsIgnoreCase** | `EqualsIgnoreCase(a:string, b:string) - bool` | Case-insensitive equality. ASCII only (`A-Z` folds to `a-z`) and locale-independent, matching `ToLower`/`ToUpper`; non-ASCII bytes compare exactly, so `"Å"` and `"å"` are **not** equal. | ✓ |
@@ -4340,7 +4490,7 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **IsNullOrWhitespace** | `IsNullOrWhitespace(s:string) - bool` | `true` if `s` is `nil`, `""`, or only whitespace - the same answer as `s == nil \|\| Trim(s) == ""`, without allocating. Whitespace is the ASCII set `Trim` strips (space, `\t`, `\n`, `\v`, `\f`, `\r`); a non-breaking space (U+00A0) is not whitespace. | ✓ |
 | **IsNumeric** | `IsNumeric(s:string) - bool` | `true` if all characters are numeric digits. `false` for `""`. | ✓ |
 | **IsWhitespace** | `IsWhitespace(s:string) - bool` | `true` if all characters are whitespace. `false` for `""`; `IsNullOrWhitespace` counts it as blank. | ✓ |
-| **Join** | `Join(arr:array, sep:str\|char) - string` | Concatenate array elements with separator. | ✓ owned¹ |
+| **Join** | `Join(arr:array, sep:str\|char) - string` | Concatenate array elements with separator. Raises `SizeLimit` when the result would pass the string size limit. | ✓ owned¹ |
 | **JsonPretty** | `JsonPretty(json:string) - string` | Pretty-print JSON with 2-space indent (same as `Json.Format(json)`); input that is not valid JSON is returned unchanged. | ✓ owned¹ |
 | **Left** | `Left(s:string, n:int) - string` | Return first `n` bytes. | ✓ owned¹ |
 | **Length** | `Length(s:string) - int` | Byte length of string. | ✓ |
@@ -4348,9 +4498,9 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **NaturalCompare** | `NaturalCompare(a:string, b:string) - int` | Three-way compare with digit runs compared numerically, so `"file2" < "file10"`. ASCII case-insensitive with a byte-wise tiebreak (total, deterministic order). Sort naturally: `Array.Sort(arr, fn(x,y) { return String.NaturalCompare(x,y) < 0; })`. `nil` counts as `""`. | ✓ |
 | **ProcessCallback** | `ProcessCallback(fn:function, s:string, len:int, cb:function) - nil` | Processes a string with your worker function `fn(s, len)`, then calls `cb(s, result)` when finished. A **read-only** kernel (reads `s[i]`, returns an `int`/`float` — a hash, checksum, count, or scan) runs on another CPU core when simple enough; a kernel that **writes** to the string runs normally (inline) so the string stays correct. Returns immediately. See `Buffer.ProcessCallback`. | ✓ |
 | **ProcessEvent** | `ProcessEvent(fn:function, s:string, len:int, eventId:int) - nil` | Like `ProcessCallback`, but signals event `eventId` with the result instead of calling a callback. Wait for several with `Event.WaitFor([ids])`. | ✓ |
-| **PadLeft** | `PadLeft(s:string, width:int, fill?:str\|char) - string` | Left-pad to `width` bytes with `fill` (default space; a string fill uses its first byte). `fill` must be ASCII - a NUL or non-ASCII fill returns `nil`. | ✓ owned¹ |
+| **PadLeft** | `PadLeft(s:string, width:int, fill?:str\|char) - string` | Left-pad to `width` bytes with `fill` (default space; a string fill uses its first byte). `fill` must be ASCII: a NUL or non-ASCII fill raises `InvalidArguments`, and a `width` past the string size limit raises `SizeLimit`. | ✓ owned¹ |
 | **PadRight** | `PadRight(s:string, width:int, fill?:str\|char) - string` | Right-pad to `width` bytes with `fill`; same `fill` rules as `PadLeft`. | ✓ owned¹ |
-| **Repeat** | `Repeat(s:string, n:int) - string` | Concatenate `s` with itself `n` times. Returns `""` for `n ≤ 0` and `nil` if the result would exceed the string size limit. | ✓ owned¹ |
+| **Repeat** | `Repeat(s:string, n:int) - string` | Concatenate `s` with itself `n` times. Returns `""` for `n ≤ 0`; raises `SizeLimit` if the result would exceed the string size limit. | ✓ owned¹ |
 | **Replace** | `Replace(s:string, old:string, new:string, count?:int) - string` | Replace occurrences of `old` with `new`, left to right. Without `count` (or with a negative one) every occurrence is replaced; `0` replaces none. Matching is non-overlapping, so `Replace("aaa", "aa", "b")` is `"ba"`. | ✓ owned¹ |
 | **Reverse** | `Reverse(s:string) - string` | Reverse the characters of a string. A multi-byte UTF-8 character keeps its bytes in order, so valid text stays valid: `Reverse("héj")` is `"jéh"`. A byte that is not part of a valid UTF-8 character moves on its own. | ✓ owned¹ |
 | **Right** | `Right(s:string, n:int) - string` | Return last `n` bytes. | ✓ owned¹ |
@@ -4360,7 +4510,7 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **SplitLines** | `SplitLines(s:string) - array` | Split by newlines; returns array of strings. | — |
 | **StartsWith** | `StartsWith(s:string, prefix:string) - bool` | `true` if `s` starts with `prefix`. | ✓ |
 | **Substr** | `Substr(s:string, start:int, len?:int) - string` | Byte substring from `start`, `len` bytes long, or to the end when `len` is left out. A negative `start` counts as 0 and a `len` past the end stops there; a negative `len` or a `start` past the end gives `""`. | ✓ owned¹ |
-| **ToAscii** | `ToAscii(s:string, replacement?:str\|char\|int) - string` | Replace every non-ASCII codepoint with `replacement` (default `'?'`). The replacement must be ASCII 1-127, else `nil`; `nil` on invalid UTF-8. | ✓ owned¹ |
+| **ToAscii** | `ToAscii(s:string, replacement?:str\|char\|int) - string` | Replace every non-ASCII codepoint with `replacement` (default `'?'`; an empty string keeps the default, as a pad fill does). The replacement must be ASCII 1-127, else `InvalidArguments` is raised; `nil` on invalid UTF-8. | ✓ owned¹ |
 | **ToLower** | `ToLower(s:string) - string` | Lowercase ASCII characters. Non-ASCII is left untouched - use `Utf8ToLower` for Unicode. | ✓ owned¹ |
 | **ToUpper** | `ToUpper(s:string) - string` | Uppercase ASCII characters. Non-ASCII is left untouched - use `Utf8ToUpper` for Unicode. | ✓ owned¹ |
 | **Trim** | `Trim(s:string, cutset?:str\|char) - string` | Remove leading and trailing whitespace, or every leading/trailing character present in `cutset` when given. An empty `cutset` trims nothing. | ✓ owned¹ |
@@ -4378,7 +4528,7 @@ A `nil` argument in a string position never crashes and follows one policy: tran
 | **Utf8CpNext** | `Utf8CpNext(s:string, bytePos:int) - int` | Byte offset of the codepoint after the one at `bytePos`: the length at the end, `0` for a negative `bytePos`. An invalid byte is one codepoint wide, so a walk from `0` takes exactly `Utf8Length` steps. | ✓ |
 | **Utf8GetCharAt** | `Utf8GetCharAt(s:string, cpIndex:int) - char` | Character at codepoint index `cpIndex`: `'\0'` outside the string, U+FFFD for an invalid byte. | ✓ |
 | **Utf8Length** | `Utf8Length(s:string) - int` | Number of Unicode codepoints; an invalid byte counts as one (U+FFFD). | ✓ |
-| **Utf8Substr** | `Utf8Substr(s:string, cpStart:int, cpLen:int) - string` | Substring by codepoint indices. `nil` when the range falls outside the string (unlike the clamping `Substr`) or on invalid UTF-8. | ✓ owned¹ |
+| **Utf8Substr** | `Utf8Substr(s:string, cpStart:int, cpLen:int) - string` | Substring by codepoint indices. `nil` when the range falls outside the string (unlike the clamping `Substr`). Codepoints are counted as `Utf8Length` counts them, so invalid UTF-8 does not make it `nil`. | ✓ owned¹ |
 | **Utf8ToLower** | `Utf8ToLower(s:string) - string` | Unicode-aware lowercase: `Utf8ToLower("ÅÄÖ")` is `"åäö"`, where the ASCII-only `ToLower` leaves it unchanged. Uses the same tables as `Char.ToLower`; uncased codepoints pass through. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
 | **Utf8ToUpper** | `Utf8ToUpper(s:string) - string` | Unicode-aware uppercase: `Utf8ToUpper("åäö")` is `"ÅÄÖ"`. Returns `nil` on invalid UTF-8. | ✓ owned¹ |
 
@@ -4402,14 +4552,14 @@ system cannot place.
 
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
-| **AddDays** | `AddDays(t:int, n:number) - int` | Add `n` days to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
-| **AddHours** | `AddHours(t:int, n:number) - int` | Add `n` hours to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
-| **AddMinutes** | `AddMinutes(t:int, n:number) - int` | Add `n` minutes to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
-| **AddSeconds** | `AddSeconds(t:int, n:number) - int` | Add `n` seconds to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
-| **AddWeeks** | `AddWeeks(t:int, n:number) - int` | Add `n` weeks to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
+| **AddDays** | `AddDays(t:int, n:number) - int\|nil` | Add `n` days to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
+| **AddHours** | `AddHours(t:int, n:number) - int\|nil` | Add `n` hours to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
+| **AddMinutes** | `AddMinutes(t:int, n:number) - int\|nil` | Add `n` minutes to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
+| **AddSeconds** | `AddSeconds(t:int, n:number) - int\|nil` | Add `n` seconds to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
+| **AddWeeks** | `AddWeeks(t:int, n:number) - int\|nil` | Add `n` weeks to timestamp. Fractional values allowed; `nil` if the result would overflow. | ✓ |
 | **Day** | `Day(t:int) - int` | Day of month (1–31). | ✓ |
 | **DiffDays** | `DiffDays(a:int, b:int) - int` | Whole days between two timestamps (`a - b`), truncated toward zero. | ✓ |
-| **Format** | `Format(t:int, fmt?:string) - string` | Format timestamp as string (UTC). Named aliases: `"short"` (`YYYY-MM-DD`), `"long"` / `"log"` (`YYYY-MM-DD HH:MM:SS`), `"time"` (`HH:MM:SS`), `"iso"` (`YYYY-MM-DDTHH:MM:SSZ`). Default: `"long"`. Custom strftime patterns also accepted (capped at 128 chars); `%z` is always `+0000` and `%Z` always `UTC`. An empty pattern yields `""`. `nil` on a bad time or format failure. | ✓ owned¹ |
+| **Format** | `Format(t:int, fmt?:string) - string\|nil` | Format timestamp as string (UTC). Named aliases: `"short"` (`YYYY-MM-DD`), `"long"` / `"log"` (`YYYY-MM-DD HH:MM:SS`), `"time"` (`HH:MM:SS`), `"iso"` (`YYYY-MM-DDTHH:MM:SSZ`). Default: `"long"`. Custom strftime patterns also accepted (capped at 128 chars); `%z` is always `+0000` and `%Z` always `UTC`. An empty pattern yields `""`. `nil` on a bad time or format failure. | ✓ owned¹ |
 | **FromMillis** | `FromMillis(ms:int) - int` | Convert epoch milliseconds to seconds (truncate). Inverse of `ToMillis`. | ✓ |
 | **Hour** | `Hour(t:int) - int` | Hour (0–23). | ✓ |
 | **Millis** | `Millis() - int` | Monotonic millisecond timestamp for timing/intervals. The epoch is arbitrary (not Unix time); use only for deltas. For wall-clock milliseconds use `NowMillis`. | ✓ |
@@ -4417,7 +4567,7 @@ system cannot place.
 | **Month** | `Month(t:int) - int` | Month (1–12). | ✓ |
 | **Now** | `Now() - int` | Current Unix timestamp in seconds. | ✓ |
 | **NowMillis** | `NowMillis() - int` | Current Unix time in whole milliseconds (wall clock). `FromMillis(NowMillis()) == Now()`. | ✓ |
-| **Parse** | `Parse(s:string, fmt?:string) - int\|nil` | Parse timestamp string (UTC). Named aliases: `"ISO"` (default, `%Y-%m-%dT%H:%M:%S`), `"RFC"` (`%a, %d %b %Y %H:%M:%S`), `"DATE_ONLY"` (`%Y-%m-%d`). Custom strptime patterns also accepted. `%z` reads a numeric offset (`+hhmm`) and yields the UTC instant; `%Z` matches `UTC` or `GMT`. `Parse(Format(t, fmt), fmt) == t` for a pattern that carries every field. Returns `nil` on failure. | ✓ |
+| **Parse** | `Parse(s:string, fmt?:string) - int\|nil` | Parse timestamp string (UTC). Named aliases: `"ISO"` (default, `%Y-%m-%dT%H:%M:%S`), `"RFC"` (`%a, %d %b %Y %H:%M:%S`), `"DATE_ONLY"` (`%Y-%m-%d`). Custom strptime patterns also accepted; a pattern without a date part anchors at 1900-01-01. `%z` reads a numeric offset (`+hhmm`) and yields the UTC instant; `%Z` matches `UTC` or `GMT`. `Parse(Format(t, fmt), fmt) == t` for a pattern that carries every field. Returns `nil` on failure. | ✓ |
 | **Second** | `Second(t:int) - int` | Second (0–59). | ✓ |
 | **Ticks** | `Ticks() - int` | Monotonic nanosecond counter. The epoch is undefined; use only for deltas with `TicksToMs`/`TicksToUs`. | ✓ |
 | **TicksToMs** | `TicksToMs(ticks:int) - float` | Convert a nanosecond tick delta to milliseconds. Example: `Time.TicksToMs(Time.Ticks() - t0)` - `1.234` | ✓ |
@@ -4436,16 +4586,17 @@ Namespace: **`Timers`**
 Fiber-based timer scheduling.
 Max 256 simultaneous timers.
 Timer resolution is approx 1-3ms.
+A timer fires only while the program runs: once no fiber is alive the program ends, armed timers included (see *Program lifetime* in the guide).
 Every `Set*` function raises `InvalidArguments` when `func` is `nil`.
 
 | Function | Signature | Description | JIT |
 | ---------- | ----------- | ------------- | --- |
 | **Cancel** | `Cancel(id:int\|float) - bool` | Cancel a timer by its handle; `false` for a handle that is not live (a fired one-shot, an already-cancelled timer, or a number that never was one). Handles are never reused, so a stale handle can never hit a newer timer. | — |
 | **IsActive** | `IsActive(id:int\|float) - bool` | `true` if `id` refers to a live timer (a scheduled one-shot not yet fired, or a still-repeating interval). | — |
-| **SetAtTime** | `SetAtTime(timestamp:int\|float, func:fn ) - int\|nil` | Fire `fn` once at the given **Unix timestamp** (seconds since epoch); a time already in the past fires as soon as possible. Returns a handle, or `nil` on a NaN timestamp or when the timer table (max 256) is full. | — |
+| **SetAtTime** | `SetAtTime(timestamp:int\|float, func:fn ) - int\|nil` | Fire `fn` once at the given **Unix timestamp** (seconds since epoch); a time already in the past fires as soon as possible. Returns a handle, or `nil` when the timer table (max 256) is full; raises `InvalidArguments` for a NaN timestamp. | — |
 | **SetImmediate** | `SetImmediate(func:fn ) - int\|nil` | Fire `fn` on the next scheduler pump (a zero-delay one-shot), akin to Node's `setImmediate`. Returns a handle, or `nil` when the timer table is full. | — |
-| **SetInterval** | `SetInterval(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` every `ms` milliseconds; ticks missed while the VM was busy are dropped, not replayed as a burst. Returns a handle, or `nil` if `ms` is NaN or `<= 0`, or the timer table is full. | — |
-| **SetTimeout** | `SetTimeout(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` once after `ms` milliseconds (a negative delay fires as soon as possible). Returns a handle, or `nil` on a NaN delay or when the timer table is full. | — |
+| **SetInterval** | `SetInterval(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` every `ms` milliseconds; ticks missed while the VM was busy are dropped, not replayed as a burst. Returns a handle, or `nil` when the timer table is full; raises `InvalidArguments` if `ms` is NaN or `<= 0`. | — |
+| **SetTimeout** | `SetTimeout(ms:int\|float, func:fn ) - int\|nil` | Fire `fn` once after `ms` milliseconds (a negative delay fires as soon as possible). Returns a handle, or `nil` when the timer table is full; raises `InvalidArguments` for a NaN delay. | — |
 
 ---
 
@@ -4458,16 +4609,16 @@ Virtual machine introspection and control.
 | Function | Signature | Description | JIT |
 | -------- | --------- | ----------- | --- |
 | **Compile** | `Compile(src:string, arity?:int) - function\|nil` | Compile a STATEMENT body into a callable function. `src` becomes the body of a function taking `arity` parameters named `arg0..argN` (use `return` for the result). Max 10 KB; returns `nil` on compile failure. | — |
-| **CompactMemory** | `CompactMemory()` | Run a memory compaction pass: dropped objects are reclaimed and empty object slabs go back to the OS. String memory stays with the VM and is reused for new strings until the VM ends. Cheap when there is nothing to return; call it after a burst of temporary objects a long-running program will not repeat. | — |
+| **CompactMemory** | `CompactMemory()` | Run a memory compaction pass: dropped objects are reclaimed, every `Destructor` still waiting runs, and empty object slabs go back to the OS. String memory stays with the VM and is reused for new strings until the VM ends. Cheap when there is nothing to return; call it after a burst of temporary objects a long-running program will not repeat. | — |
 | **CurrentAllocations** | `CurrentAllocations() - int` | Current live allocation count. | — |
 | **Eval** | `Eval(src:string, ...args) - any` | Compile and immediately evaluate `src`. Tried first as an EXPRESSION (`Eval("40 + 2")` → `42`); if that fails to compile it is retried as a statement body, where an explicit `return` provides the result (`nil` otherwise). Extra call arguments are bound to `arg0..argN`: `Eval("arg0 * arg1", 6, 7)` → `42`. Max 10 KB; returns `nil` on compile failure (the process is never terminated by a bad `src`). Each `Eval` compiles as its own unit: it cannot reference host globals by name, and a `global` declaration naming one that already exists is a compile error (1004), so Eval cannot change a value the program was compiled against. Eval'd code runs with full VM authority - never pass it untrusted input. | — |
 | **Exit** | `Exit(code:int) - nil` | End the program with this exit code. Inside a host application it raises instead, reporting the code: a script choosing to stop does not stop the host. | — |
 | **GetFunctionInfo** | `GetFunctionInfo(fn:callable) - object` | Return an object describing a function. Accepts `function`, `builtin`, `ffi`, and bound methods. See field table below. | — |
 | **GetModuleInfo** | `GetModuleInfo(name:string) - object\|nil` | Return an object describing a built-in module. `Members` array contains `{Name, Signature}` per function; `Constants` array contains `{Name, Type, Value}` per constant. Returns `nil` if the module name is not found. | — |
 | **GetStartTimeMs** | `GetStartTimeMs() - int` | VM start time in milliseconds since epoch. | — |
-| **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the VM halts regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
-| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (cumulative bytes requested from malloc/calloc/realloc, by every VM in the process together), `BlockRegions`/`BlockBytes` (live block allocations and their size), `SlabCacheFree` (objects held in the free-list cache), `StringPoolChunks`/`StringPoolBytes` (chunks the string pool currently holds and their size) and `StringPoolFree` (string bodies parked in the pool for reuse). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
-| **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a non-function handler returns `false`. | — |
+| **Import** | `VM.Import(name:string, version:string, fingerprint?:string)` | Load or return cached module by name and version requirement. `version` uses the same syntax as `library()`: `"1.0"`, `">=1.2 <2.0"`, etc. Optional `fingerprint` is the whole-file SHA-256 (== `sha256sum`; a `sha256:` prefix is accepted) - if provided and mismatched, the program stops with exit code 7 (under an embedding host the call raises `RuntimeError`), regardless of `--no-verify`. `let m = VM.Import("jwt", "1.0");`. See version syntax table in Guide §6. | — |
+| **MemoryStats** | `MemoryStats() - object` | Snapshot of allocator counters: `Current` (live objects), `Peak` (high-water live objects), `HeapBytes` (bytes this VM's heap holds now, the count `--max-alloc` bounds), `BlockRegions`/`BlockBytes` (live block allocations and their size) and `SlabCacheFree` (objects held in the free-list cache). A superset of `CurrentAllocations`/`PeakAllocations` for tooling and leak checks. | — |
+| **OnSignal** | `OnSignal(signum:int, handler:fn) - bool` | Register a signal handler and return `true`. Only signals the VM installs an OS handler for are accepted: SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGTERM (numbers are platform-specific). Any other signal - including the uncatchable SIGKILL/SIGSTOP, which could never be delivered - or a handler that is not a script function (a bound method or a builtin) returns `false`; wrap one in `fn(s) { ... }`. | — |
 | **NotifyHost** | `NotifyHost(code:int, payload?:any) - bool` | Hand `code` (and optionally a value) to the embedding host application. Returns `true` when a host handler ran, `false` when nothing is listening - which is what the `flarisvm` command and any host that does not install a handler report, so a script using this runs unchanged everywhere. One-way and COOPERATIVE: it fires only where the script calls it, so a host cannot use it to interrupt a script that never returns. See the Embedding guide §11. | — |
 | **PatchFunction** | `PatchFunction(original:fn, replacement:fn) - bool` | Replace function at runtime. Requires running unsafe-mode `--unsafe`. The replacement may be a Flaris-function, a builtin-function or a FFI-function. Pass `nil` as replacement to remove the patch. Caveats: call sites the compiler inlined (trivial single-`return` functions) and calls made from inside JIT-compiled functions bypass the patch; self-recursive calls inside the original body also keep calling the original. | — |
 | **PeakAllocations** | `PeakAllocations() - int` | Peak allocation count since VM start. | — |
@@ -4569,6 +4720,7 @@ Stack trace (depth: 2):
 | ---------- | --------- |
 | `Debug.Stack()` | Dump operand stack to stdout |
 | `Debug.Pool()` | Memory slab statistics (requires `--unsafe`) |
+| `Debug.Heap()` | Live objects by type and class: count, pool bytes, heap bytes |
 | `Debug.Value(v)` | Inspect value (type, ref-count, address) (requires `--unsafe`) |
 | `Debug.Assert(a, b)` | Equality check - aborts the VM on failure |
 | `Debug.AssertTrue(c)` | Truthiness check - ends the program on failure (raises inside a host) |
@@ -4640,7 +4792,7 @@ order.label = (string) espresso
 | `frame <n>` | Select frame `<n>` |
 | `up` / `down [n]` | Move `n` frames outward / inward (default 1) |
 | `locals` | Locals of the selected frame, named from debug info |
-| `p <path>` | Print a value: `name`, `name.field`, `name[0]`, or a chain of those |
+| `p <path>` | Print a value: `name`, `name.field`, `name[0]`, or a chain of those. Of two locals sharing a name, the innermost declaration |
 | `list` | Source lines around the selected frame |
 | `dis [n]` | Bytecode around the instruction the selected frame is stopped at, `n` either side (default 6) |
 | `dis ir [fn]` | JIT IR of the selected frame, or of a named function |
@@ -4677,17 +4829,37 @@ reachable off the machine.
 
 **A DAP thread is a fiber.** The mapping is exact - fibers have ids, their own
 call stacks and their own scheduling state - so the editor's thread picker
-becomes a fiber picker.
+becomes a fiber picker. Every frame id names the fiber it belongs to, so the
+stack, scopes and variables shown for a fiber are its own.
 
 Supported requests: `initialize`, `launch`, `setBreakpoints`,
 `dataBreakpointInfo`, `setDataBreakpoints`, `configurationDone`, `threads`,
 `stackTrace`, `scopes`, `variables`, `evaluate`, `disassemble`, `continue`,
-`next`, `stepIn`, `stepOut`, `pause`, `disconnect`.
+`next`, `stepIn`, `stepOut`, `pause`, `terminate`, `disconnect`.
 
 `evaluate` resolves the same paths the prompt's `p` does (`order.items[0]`), not
 arbitrary expressions, and reports a failure rather than inventing a value.
 Conditional breakpoints and `setVariable` are not implemented, and the adapter
 says so during `initialize` so the editor does not offer them.
+
+**Values are addressed by position.** The handle behind every row of the
+variables pane names a slot and a chain of child indexes, not a name, so two
+block-scoped locals that share a name expand to their own elements, and a key
+that is not an identifier (`"two words"`, `42`) expands like any other. A large
+array is paged: its element count goes out with the row, and `variables`
+honours `start` and `count`.
+
+**Stopping the session.** `terminate`, and `disconnect` unless it carries
+`terminateDebuggee: false`, end the program with exit code 5 - what `q` does at
+the prompt - after reporting `exited` and `terminated`. A client that leaves
+before `configurationDone` ends the session before anything has run, and the VM
+exits with code 1.
+
+**Breakpoints on lines without code.** A breakpoint on a line where no statement
+starts never fires. It is reported unverified - greyed out in the editor - as
+soon as the file's code is loaded: at the stop at `Main` for one placed before
+the start, in the `setBreakpoints` answer for one set while the program runs.
+Lines of imported units are taken on trust.
 
 **Pausing and editing breakpoints while running.** Requests are normally served
 while the program is stopped, but `pause` and `setBreakpoints` also have to be
@@ -4701,10 +4873,10 @@ while running rather than answered with stale frames.
 **Disassembly.** The editor's Disassembly View is served from the same
 disassembler `dis` uses at the prompt. A bytecode VM has no machine address to
 report, but the client parses memory references and instruction addresses
-*numerically*, so a position is dressed as one: the frame level occupies the high
-byte and the bytecode offset the low 24 bits (`0x0000003A` is offset `0x3A` in
-frame 0). A non-numeric reference makes the view report "Disassembly not
-available". Only real instructions are returned - padding rows would need
+*numerically*, so a position is dressed as one: the fiber id and frame level
+occupy the high bits and the bytecode offset the low 24 bits
+(`0x000000010000003A` is offset `0x3A` in frame 0 of fiber 1). A non-numeric
+reference makes the view report "Disassembly not available". Only real instructions are returned - padding rows would need
 invented addresses, and the client indexes rows by address.
 
 Open it by right-clicking a frame in the Call Stack and choosing **Open
@@ -5224,15 +5396,16 @@ What runs natively inside a JIT function:
 | `Buffer.Create` / `Array.Create` and other allocating builtins | Only as a local initializer or a return value (the frame owns and releases the result) |
 | `Array.Append` / `InsertAt` / `RemoveAt` / `Clear` / `Reserve` on a typed array | On an `[int]`/`[float]`/`[char]`/`[bool]` array. `Append` and `InsertAt` as a statement, also `a = Array.Append(a, v)`; `RemoveAt`, `Clear` and `Reserve` anywhere. Each has the method form `a.Append(v)` |
 | Homogeneous `[int]` / `[float]` array literals with computed elements (`[x, y, x*2]`) | Only as a local initializer (allocated + filled as an owned typed array). Fully-constant literals are already const-folded |
-| `this.<field>` reads (scalar unboxed; string/array/block/object/float borrowed) and stores (int/bool/char inline, `float` copy-on-write, object fields borrowed) | Declared fields of the method's own class |
+| `this.<field>` reads (scalar unboxed; string/array/block/object/float borrowed) and stores (int/bool/char inline, `float` copy-on-write, object fields borrowed) | Declared fields of the method's own class. An instance method enters native code for an instance of its class or of a subclass, since an inherited field keeps its slot and its type (a subclass may not redeclare an inherited field with another type); a method that calls `this.m()` or `super.m()` natively binds the owner's `m`, so it enters only for an instance of exactly its class and a subclass instance runs it interpreted, as a class-typed parameter does for an instance of any other class |
 | `<recv>.<field>` reads and stores, where `recv` is a **class-typed parameter** (`a: Vec2`) or a **`new`-pinned local** | The receiver's class is known at compile time; int/bool/char store inline, `float` fields store copy-on-write (no per-store allocation), object fields take a borrowed value |
 | `<recv>.method(...)` on a class-typed parameter or `new`-pinned local | The method must be a non-overridden instance method that is itself JIT-eligible |
+| A `global` declared with a JIT type (`global K: [int] = [...]`, `global t: block = nil`) | Read through the declaring module as a possibly-`nil` value: copy it to a local and test it before indexing it or passing it to a typed parameter (`let t = K; if (t == nil) { return -1; }`); an `int`, `bool` or `char` global reads as its value. A value the declared type could not hold stops the function with error code 22. A function that assigns a global stays interpreted |
 | `let p = new C()` for a **constructor-less** class | The frame owns and releases the instance; `p` must not be reassigned |
-| Calls to other JIT-compiled script functions | Callee must be JIT-eligible and return a scalar (object returns stay at the interpreter boundary). Recursion stays native too: a function or static method calling itself, and functions or sibling static methods calling each other |
+| Calls to other JIT-compiled script functions | Callee must be JIT-eligible and return a scalar (object returns stay at the interpreter boundary). Recursion stays native too: a function or static method calling itself, and functions or sibling static methods calling each other. An instance argument is passed natively only from a `new`-pinned local, or a parameter, of the parameter's class, and a callee's object result is treated as possibly `nil` whatever it declares |
 | Calls to stdlib builtins marked in the `JIT` column of R8 | See the column legend below |
 | `x == nil` / `x != nil` | A parameter not declared `T\|nil` folds to a constant - a native call always has all arguments present and typed; any other string, block, instance, array or object value is compared with nil directly |
-| `a ?? b` | Tests for `nil` only - `false` and `0` are values. When `a` cannot be nil in native code - an optional parameter (a native call has every argument present), a parameter not declared `T\|nil`, a scalar - it is the result and `b` is not evaluated. A `T\|nil` value picks between two values of the same kind read in place: variables, fields, literals, `nil`, or another `??`. A right side that allocates (a call, a concatenation) keeps the function interpreted |
-| `T\|nil` parameters, returns and locals (`string\|nil`, `block\|nil`, `instance\|nil`) | A nullable value may be compared, stored, returned, concatenated, passed to a builtin or to a `T\|nil` parameter. Indexing and `foreach` need it narrowed first (`if (s == nil) { return 0; }`), because interpreted code yields `nil` there, or runs the loop zero times |
+| `a ?? b` | Tests for `nil` only - `false` and `0` are values. When `a` cannot be nil in native code - an optional parameter (a native call has every argument present), a parameter not declared `T\|nil`, a scalar - it is the result and `b` is not evaluated. A `T\|nil` value picks between two values of the same kind read in place: variables, fields, literals, `nil`, or another `??`. A right side that allocates (a call, a concatenation) keeps the function interpreted. A builtin call on the left whose answer may be nil (`Convert.ParseInt(s) ?? 7`, `Os.GetEnv(name) ?? ""`) is tested where it stands, with any right side; an `int\|nil`, `bool\|nil` or `char\|nil` answer continues as the number. A `float\|nil` answer, and a chain whose middle term is such a call (`f() ?? g() ?? 0`), keep the function interpreted |
+| `T\|nil` parameters, returns and locals (`string\|nil`, `block\|nil`, `instance\|nil`) | A nullable value may be compared, stored, returned, concatenated, passed to a builtin or to a `T\|nil` parameter; a builtin whose result is declared `T\|nil` (`Regex.Match`, `Stream.ReadString`, ...) is called natively and answers one. Indexing and `foreach` need it narrowed first (`if (s == nil) { return 0; }`), because interpreted code yields `nil` there, or runs the loop zero times |
 | `nil` literals | Stored into an object-typed local or field, returned from an object-returning function, compared, or passed to a builtin or a `T\|nil` parameter |
 | String literals | Read-only uses share the literal: comparisons, concatenation, arguments to a builtin that neither keeps nor returns them, and a local that is only read. A literal passed to a script function, stored in a field, returned, or given to a builtin that may keep or return it is a fresh copy, as in interpreted code. A local holding a literal must not be written through (`s[i] = c`), returned, stored or passed to a script function |
 | A builtin with an `any` result, stored into an annotated local (`let n: int = Json.FastSelect(p, j);`) or returned from a typed function | The value gets the same run-time check as in interpreted code - error code 22 with the same message, `int` converted for a `float` target, `nil` refused for a scalar - and the function stops at a mismatch. Targets: `int`, `float`, `bool`, `char`, `string`, `block` |
@@ -5251,7 +5424,7 @@ What still requires the interpreter:
 | Object literals `{a: 1}`; `[char]`/`[bool]` or heterogeneous array literals | Untracked heap allocation (homogeneous `[int]`/`[float]` literals in a declaration are lowered) |
 | `new Foo(...)` with a constructor, or with arguments | Constructor dispatch — only argument-less `let p = new C()` on a constructor-less class is lowered |
 | `obj.field` on an object of unknown class | Dynamic property lookup — resolved only for `this`, a class-typed parameter, or a `new`-pinned local |
-| `try`/`catch`, `yield`, `await` | Interpreter machinery |
+| `try`/`catch`, `capture`, `yield`, `await` | Interpreter machinery |
 | A lambda that captures a variable of the enclosing function, or uses its `this` | The captured values live in the lambda's own environment, which native code cannot see |
 | Global variable reads/writes | Globals live in the interpreter environment |
 | A string, array, block, instance or `nil` value tested for truth (`if (s)`, `!s`, `s && t`) | `nil` and empty values are false in the interpreter; compare explicitly (`s != nil`, `len(s) > 0`) to stay native |
@@ -5288,19 +5461,12 @@ What an array is born as decides this, and it is not visible afterwards:
 | `[]`, then `Array.Append(...)` | no |
 | `[1, 2, 3]` — a literal | no |
 | `Array.Append` / `Array.RemoveAt` / element writes on an already-typed array | yes — mutation preserves it |
-| `Array.Subset(src, ...)` of a `[float]` array | yes |
-| `Array.Subset(src, ...)` of an `[int]` / `[char]` / `[bool]` array | **no** |
+| `Array.Subset(src, ...)` of a typed array | yes |
 | `Array.Concat(src, [])` — of any typed array | **no** |
 
-The split in the last three rows is the element type, not the operation.
-`Array.Create(n, Type.Float)` returns a *flat* `double[]`, a representation
-`Array.Subset` carries across; the other element types are boxed arrays wearing a
-type tag, and `Array.Subset` hands back an untagged one. `Array.Concat` drops the
-tag in every case.
-
 So an empty accumulator that must stay typed is `Array.Create(0, Type.Int)`, not
-`[]`; copying a `[float]` with `Array.Subset` is safe, and copying an `[int]`
-means `Array.Create` plus a loop.
+`[]`, and `Array.Subset` copies a typed array with its type; `Array.Concat` drops
+it.
 
 ```flaris
 fn sumL(a: [int]): int {
@@ -5393,7 +5559,7 @@ There is no keyword to mark a function for JIT. Unless `--jit-disable` is given,
 - Parameter and return types are: `int`, `float`, `bool`, `char`, `string`, or `block`; typed arrays `[int]`, `[float]`, `[char]`, `[bool]`; or a **user-defined class** (`a: Vec2`) - the receiver's class is verified at the native entry, so field and method access on it is resolved statically. Optional parameters (`k?: int`) are fine - a native call always has every argument present and typed, and other call shapes take the interpreter path
 - `string|nil`, `block|nil` and `instance|nil` are JIT types too, and a `nil` argument enters native code for them. `int|nil` and the other nullable scalars are not, and neither is `[int]|nil`: it cannot be told apart from `[int|nil]`
 - The number of parameters does not matter, up to the language's limit of 16. Arguments beyond what the CPU passes in registers travel on the native stack, both from the interpreter and from other JIT-compiled functions
-- The function body contains **none** of: `try`/`catch`, `yield`, `await`, member-access on an object of unknown class (`obj.field` - resolved for `this`, a class-typed parameter, or a `new`-pinned local), object literals (`{k: v}`), global variable access, or calls to non-eligible script functions. `new` is allowed only as `let p = new C()` for a constructor-less class, and array literals only as a `let a = [..]` initializer of a homogeneous `[int]`/`[float]` array
+- The function body contains **none** of: `try`/`catch`, `capture`, `yield`, `await`, member-access on an object of unknown class (`obj.field` - resolved for `this`, a class-typed parameter, or a `new`-pinned local), object literals (`{k: v}`), global variable access, or calls to non-eligible script functions. `new` is allowed only as `let p = new C()` for a constructor-less class, and array literals only as a `let a = [..]` initializer of a homogeneous `[int]`/`[float]` array
 - String operations are native: comparisons (`==`, `!=`, ordering) anywhere, concatenation (`+`) as a local initializer, return value, or builtin-call argument, and string literals (see the table above for when a literal is copied)
 - `foreach` over a typed-array or `string` parameter/local is allowed; `foreach (v, i in arr)` with an index variable is also supported. The loop variables are typed (see [Loop variables](#loop-variables)), so they can be compared, appended, passed on and returned like typed locals
 
@@ -5823,15 +5989,15 @@ diagnostics.
 | 1000 | `type-error` | `TYPE_ERROR` | Operand, assignment or argument type mismatch |
 | 1001 | `arg-count` | `ARG_COUNT` | Wrong number of arguments to a function, method or constructor |
 | 1002 | `invalid-return` | `INVALID_RETURN` | A path can finish without returning a declared value, or `return;` where a value is required |
-| 1003 | `undefined-symbol` | `UNDEFINED_SYMBOL` | Name does not resolve - undefined variable, function, export or base class, or a member a built-in module does not have (`Math.Flor` suggests `Floor`; a read reports the same as a call) |
+| 1003 | `undefined-symbol` | `UNDEFINED_SYMBOL` | Name does not resolve - undefined variable, function, export or base class, or a member a built-in module does not have (`Math.Flor` suggests `Floor`; a read reports the same as a call). Also a local read above the `let` or `const` that declares it, in its own function or a lambda inside it |
 | 1004 | `redeclaration` | `REDECLARATION` | Name already declared in this scope |
-| 1005 | `const-assign` | `CONST_ASSIGN` | Write to a `const` binding, or to one of its properties or elements |
+| 1005 | `const-assign` | `CONST_ASSIGN` | Write to a `const` binding, or to one of its properties or elements; or assignment to a name declared with `fn` (calls are bound to the declaration - hold a function value in a `let`) |
 | 1006 | `invalid-control-flow` | `INVALID_CONTROL_FLOW` | `break`/`continue` outside a loop or switch, `return` outside a function, or control leaving a `finally` |
 | 1007 | `invalid-throw` | `INVALID_THROW` | Thrown value is not an `Exception` (or subclass) instance |
 | 1008 | — | `INVALID_CAST` | *Reserved* - a cast is an assertion and is not checked |
 | 1009 | `import-resolution` | `IMPORT_RESOLUTION` | An imported name is not among the exports of a library whose compiled `.flx` was found - see [Reserved codes](#reserved-codes) for what is deliberately left to the loader |
 | 1010 | `class-this-usage` | `CLASS_THIS_USAGE` | `this` used outside an instance method |
-| 1011 | `async-await-misuse` | `ASYNC_AWAIT_MISUSE` | `await` outside an `async` function, or applied to a non-fiber |
+| 1011 | `async-await-misuse` | `ASYNC_AWAIT_MISUSE` | `await` outside an `async` function |
 | 1012 | `missing-entry` | `MISSING_ENTRY` | The program has neither `fn Main` nor any `export` |
 | 1013 | `invalid-assign` | `INVALID_ASSIGN` | Assignment used as an `if`/`while`/`for` condition (e.g. `if (x = 1)`) - almost always a typo for `==` |
 | 1014 | `undeclared-field` | `UNDECLARED_FIELD` | Member is not declared on a sealed instance - unknown field or method |
@@ -5861,7 +6027,7 @@ differ - so copy it from this column rather than deriving it.
 | 2010 | — | `TYPE_ERROR` | *Reserved* - a store outside a variable's declared type is error 1000 |
 | 2011 | `no-effect` | `NO_EFFECT` | Expression statement that only computes a value: a literal, a name, an operator, member, index or conditional expression, or an array/object literal built from such parts. A call is never reported, whatever its purity - a pure function may still raise, and `Type.Assert(v, "int");` is a call made for exactly that |
 | 2012 | — | `CLASS_RESERVED_NAME` | *Reserved* - instances have no built-in properties, so no method name is reserved |
-| 2013 | `duplicate-key` | `DUPLICATE_KEY` | Repeated key in an object literal - the first value is kept |
+| 2013 | `duplicate-key` | `DUPLICATE_KEY` | Repeated key in an object literal - the last value wins, and the key keeps its first position |
 | 2014 | `duplicate-case` | `DUPLICATE_CASE` | Repeated `case` value, or a `case Class:` after a case for the same class or one of its bases - only the first match runs |
 | 2015 | `override-mismatch` | `OVERRIDE_MISMATCH` | An override takes a different number of parameters than the method it replaces |
 | 2016 | `class-shadows-module` | `CLASS_SHADOWS_MODULE` | A non-static method is named after a built-in namespace *and* the class calls that namespace - the call resolves to the method and yields `nil` |
@@ -6011,14 +6177,16 @@ actually accepts:
 | `-` `*` `/` `%` `^^` | `int`, `float`, `bool`, `char`, `nil` |
 | `&` `\|` `^` `<<` `>>` `>>>` | `int`, `char`, `bool`, `nil` - a `float` operand is an error, not a widening |
 | `~` | `int`, `nil` |
-| `+` | **anything** - see below |
+| `<` `<=` `>` `>=` | numbers (`int`, `float`, `char`, `bool`) with numbers; a `string`, array or block with its own kind; `nil` (always `false`) |
+| `+` | **anything** at compile time - see below |
 
-A `nil` operand is accepted everywhere and makes the result `nil`. `+` is never
-a type error: it is overloaded by operand type (numeric add, char and container
-concatenation/merge), and when no numeric, array or object rule applies it
-falls back to string concatenation, so any operand pair produces a value
-(`true + 5` is `"true5"`). The full per-type rules are listed under
-[R5 - Operator Precedence](#r5---operator-precedence).
+A `nil` operand is accepted everywhere and makes the result `nil` (`array + nil`
+appends it). `+` is never diagnosed: it is overloaded by operand type (numeric
+add, char and container concatenation/merge), and when no numeric, array or
+object rule applies it falls back to string concatenation (`true + 5` is
+`"true5"`). A value plus an array, or an object plus anything but an object,
+has no such fallback and raises `InvalidArguments` when it runs. The full
+per-type rules are listed under [R5 - Operator Precedence](#r5---operator-precedence).
 
 A diagnostic is only reported when an operand's type is fully known and shares
 nothing with the operator's domain. Dynamic values - unannotated parameters,

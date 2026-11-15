@@ -1,0 +1,481 @@
+// test_gps.fls - Test suite for GPS.fls
+//
+// Parser tests run anywhere. The serial part drives the library against
+// tests/fake_gps.py on a pseudo-terminal - no GPS hardware, no --unsafe -
+// and is skipped when python3 is not available.
+//
+// Run: flarisvm tests/test_gps.fls --libs='./libs'
+
+import { GPS, Gps } from library("GPS", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn chk(label:string, cond:bool) {
+    if (cond) {
+        passed += 1;
+    } else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label);
+    }
+}
+
+fn chkEq(label:string, got, expected) {
+    if (got == expected) {
+        passed += 1;
+    } else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label + " - expected: " + str(expected) + "  got: " + str(got));
+    }
+}
+
+fn chkNear(label:string, got, expected, eps:float) {
+    var d = got - expected;
+    if (d < 0.0) { d = -d; }
+    if (got != nil && d <= eps) {
+        passed += 1;
+    } else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label + " - expected: " + str(expected) + "  got: " + str(got));
+    }
+}
+
+// Well-known vectors (the classic u-blox example sentences; checksums verified
+// against an independent XOR implementation when these tests were written).
+const GGA = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47";
+const GGA_BAD = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*00";
+const RMC = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W,A*07";
+const GSA = "$GPGSA,A,3,04,05,,09,12,,,,,,,,2.5,1.3,2.1*3F";
+const GSV1 = "$GPGSV,2,1,08,01,40,083,41,02,17,308,42,12,07,344,39,14,15,270,40*7D";
+const GSV2 = "$GPGSV,2,2,08,22,62,180,45,25,30,120,,*56";
+const VTG = "$GPVTG,084.4,T,081.3,M,022.4,N,041.5,K,A*25";
+const GLL = "$GPGLL,4807.038,N,01131.000,E,123519,A,A*48";
+const ZDA = "$GPZDA,123519,23,03,1994,00,00*42";
+const PMTK = "$PMTK001,314,3*36";
+const GLGGA = "$GLGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*5B";
+const XYZ = "$GPXYZ,1,2*4F";
+
+// ============================================================
+// Checksum and validation
+// ============================================================
+
+fn testChecksum() {
+    Console.WriteLine("--- Checksum / Validate ---");
+    chkEq("Checksum GGA body", GPS.Checksum("GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"), 0x47);
+    chkEq("ChecksumHex", GPS.ChecksumHex("GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"), "47");
+    chkEq("Checksum empty", GPS.Checksum(""), 0);
+    chk("Validate good GGA", GPS.Validate(GGA));
+    chk("Validate good RMC", GPS.Validate(RMC));
+    chk("Validate tolerates trailing CRLF", GPS.Validate(GGA + "\r\n"));
+    chk("Validate rejects bad checksum", !GPS.Validate(GGA_BAD));
+    chk("Validate rejects missing checksum", !GPS.Validate("$GPGGA,123519"));
+    chk("Validate rejects junk after checksum", !GPS.Validate(GGA + "x"));
+    chk("Validate rejects non-sentence", !GPS.Validate("hello"));
+    chk("Validate rejects nil", !GPS.Validate(nil));
+}
+
+// ============================================================
+// Parse - one type at a time
+// ============================================================
+
+fn testParseGGA() {
+    Console.WriteLine("--- Parse GGA ---");
+    let o = GPS.Parse(GGA);
+    chk("parsed", o != nil);
+    chkEq("talker", o.talker, "GP");
+    chkEq("type", o.type, "GGA");
+    chkEq("checksum", o.checksum, "47");
+    chkEq("raw", o.raw, GGA);
+    chkEq("fields len", len(o.fields), 15);
+    chkNear("lat", o.lat, 48.1173, 1e-9);
+    chkNear("lon", o.lon, 11 + 31.0 / 60.0, 1e-9);
+    chkEq("fixQuality", o.fixQuality, 1);
+    chkEq("sats", o.sats, 8);
+    chkNear("hdop", o.hdop, 0.9, 1e-12);
+    chkNear("altitude", o.altitude, 545.4, 1e-9);
+    chkNear("geoidSep", o.geoidSep, 46.9, 1e-9);
+    chkNear("time sod", o.time, 45319.0, 1e-9);
+    chk("no date in GGA", o.date == nil);
+    chk("no timestamp in GGA", o.timestamp == nil);
+}
+
+fn testParseRMC() {
+    Console.WriteLine("--- Parse RMC ---");
+    let o = GPS.Parse(RMC);
+    chk("parsed", o != nil);
+    chkEq("type", o.type, "RMC");
+    chkEq("status", o.status, "A");
+    chkNear("lat", o.lat, 48.1173, 1e-9);
+    chkNear("speedKnots", o.speedKnots, 22.4, 1e-12);
+    chkNear("speedKmh", o.speedKmh, 41.4848, 1e-9);
+    chkNear("course", o.course, 84.4, 1e-12);
+    chkEq("date (ddmmyy 230394 -> 1994)", o.date, "1994-03-23");
+    chkEq("timestamp", o.timestamp, 764426119);
+    chkEq("iso", o.iso, "1994-03-23T12:35:19Z");
+    chkNear("magVar W is negative", o.magVar, -3.1, 1e-12);
+    chkEq("mode", o.mode, "A");
+
+    // void fix: status V, empty fields
+    let v = GPS.Parse("$GPRMC,123519,V,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*7D");
+    chk("void parsed", v != nil);
+    chkEq("void status", v.status, "V");
+}
+
+fn testParseGSA() {
+    Console.WriteLine("--- Parse GSA ---");
+    let o = GPS.Parse(GSA);
+    chkEq("mode", o.mode, "A");
+    chkEq("fixType", o.fixType, 3);
+    chkEq("sats len", len(o.sats), 4);
+    chkEq("sats[0]", o.sats[0], 4);
+    chkEq("sats[3]", o.sats[3], 12);
+    chkNear("pdop", o.pdop, 2.5, 1e-12);
+    chkNear("hdop", o.hdop, 1.3, 1e-12);
+    chkNear("vdop", o.vdop, 2.1, 1e-12);
+}
+
+fn testParseGSV() {
+    Console.WriteLine("--- Parse GSV ---");
+    let o = GPS.Parse(GSV1);
+    chkEq("totalMsgs", o.totalMsgs, 2);
+    chkEq("msgNum", o.msgNum, 1);
+    chkEq("satsInView", o.satsInView, 8);
+    chkEq("sat count", len(o.sats), 4);
+    chkEq("sat0 prn", o.sats[0].prn, 1);
+    chkNear("sat0 elevation", o.sats[0].elevation, 40.0, 1e-12);
+    chkNear("sat0 azimuth", o.sats[0].azimuth, 83.0, 1e-12);
+    chkNear("sat0 snr", o.sats[0].snr, 41.0, 1e-12);
+    let o2 = GPS.Parse(GSV2);
+    chkEq("second message", o2.msgNum, 2);
+    chkEq("sat with empty snr", o2.sats[1].snr, nil);
+    // NMEA 4.10 appends a signal id: one field, not a fifth satellite.
+    let o3 = GPS.Parse("$GPGSV,2,2,08,22,62,180,45,25,30,120,,1*67");
+    chkEq("signal id is not a satellite", len(o3.sats), 2);
+}
+
+fn testParseVTG() {
+    Console.WriteLine("--- Parse VTG ---");
+    let o = GPS.Parse(VTG);
+    chkNear("courseTrue", o.courseTrue, 84.4, 1e-12);
+    chkNear("courseMag", o.courseMag, 81.3, 1e-12);
+    chkNear("speedKnots", o.speedKnots, 22.4, 1e-12);
+    chkNear("speedKmh", o.speedKmh, 41.5, 1e-12);
+    chkEq("mode", o.mode, "A");
+}
+
+fn testParseGLL() {
+    Console.WriteLine("--- Parse GLL ---");
+    let o = GPS.Parse(GLL);
+    chkNear("lat", o.lat, 48.1173, 1e-9);
+    chkNear("time", o.time, 45319.0, 1e-9);
+    chkEq("status", o.status, "A");
+    chkEq("mode", o.mode, "A");
+}
+
+fn testParseZDA() {
+    Console.WriteLine("--- Parse ZDA ---");
+    let o = GPS.Parse(ZDA);
+    chkEq("date", o.date, "1994-03-23");
+    chkEq("timestamp", o.timestamp, 764426119);
+    chkEq("iso", o.iso, "1994-03-23T12:35:19Z");
+    chkEq("localZoneHours", o.localZoneHours, 0);
+    chkEq("localZoneMins", o.localZoneMins, 0);
+}
+
+// ============================================================
+// Parse - talker variants, proprietary, unknown, bad input
+// ============================================================
+
+fn testTalkersAndFallback() {
+    Console.WriteLine("--- talkers / proprietary / unknown ---");
+    let gl = GPS.Parse(GLGGA);
+    chkEq("GLONASS talker", gl.talker, "GL");
+    chkEq("GLONASS type", gl.type, "GGA");
+    chkNear("GLONASS lat", gl.lat, 48.1173, 1e-9);
+
+    let p = GPS.Parse(PMTK);
+    chk("proprietary parsed", p != nil);
+    chkEq("proprietary type is the full head", p.type, "PMTK001");
+    chkEq("proprietary talker empty", p.talker, "");
+    chkEq("proprietary field", p.fields[1], "314");
+
+    let x = GPS.Parse(XYZ);
+    chk("unknown parsed generically", x != nil);
+    chkEq("unknown type", x.type, "XYZ");
+    chkEq("unknown fields", len(x.fields), 3);
+}
+
+fn testBadInput() {
+    Console.WriteLine("--- bad input ---");
+    chk("garbage -> nil", GPS.Parse("hello") == nil);
+    chk("empty -> nil", GPS.Parse("") == nil);
+    chk("nil -> nil", GPS.Parse(nil) == nil);
+    chk("lone $ -> nil", GPS.Parse("$") == nil);
+    chk("bad checksum -> nil", GPS.Parse(GGA_BAD) == nil);
+    chk("junk after checksum -> nil", GPS.Parse(GGA + "x") == nil);
+    let nv = GPS.Parse(GGA_BAD, { verifyChecksum: false });
+    chk("verifyChecksum:false accepts", nv != nil);
+    chkNear("  and still parses fields", nv.lat, 48.1173, 1e-9);
+    let nos = GPS.Parse("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,");
+    chk("no checksum parses", nos != nil && nos.type == "GGA");
+    chk("no checksum has no checksum field", nos.checksum == nil);
+}
+
+// ============================================================
+// Conversions
+// ============================================================
+
+fn testConversions() {
+    Console.WriteLine("--- coordinates / units ---");
+    chkNear("ParseCoord N", GPS.ParseCoord("4807.038", "N"), 48.1173, 1e-9);
+    chkNear("ParseCoord S", GPS.ParseCoord("4807.038", "S"), -48.1173, 1e-9);
+    chkNear("ParseCoord E", GPS.ParseCoord("01131.000", "E"), 11 + 31.0 / 60.0, 1e-9);
+    chkNear("ParseCoord W", GPS.ParseCoord("01131.000", "W"), -(11 + 31.0 / 60.0), 1e-9);
+    chk("minutes >= 60 -> nil", GPS.ParseCoord("4860.0", "N") == nil);
+    chk("bad hemisphere -> nil", GPS.ParseCoord("4807.038", "X") == nil);
+    chk("empty -> nil", GPS.ParseCoord("", "N") == nil);
+    chk("garbage -> nil", GPS.ParseCoord("abc", "N") == nil);
+    chkNear("KnotsToKmh", GPS.KnotsToKmh(22.4), 41.4848, 1e-9);
+    chkNear("KmhToKnots", GPS.KmhToKnots(41.4848), 22.4, 1e-9);
+    chk("KnotsToKmh(nil) is nil", GPS.KnotsToKmh(nil) == nil);
+}
+
+// ============================================================
+// Geo math
+// ============================================================
+
+fn testGeo() {
+    Console.WriteLine("--- geo math ---");
+    // one degree of longitude at the equator: pi/180 * 6371000
+    let oneDeg = 3.14159265358979 / 180.0 * 6371000.0;
+    chkNear("distance (0,0)-(0,1)", GPS.Distance(0.0, 0.0, 0.0, 1.0), oneDeg, 1e-6);
+    chkNear("distance km", GPS.Distance(0.0, 0.0, 0.0, 1.0, "km"), oneDeg / 1000.0, 1e-9);
+    chkNear("distance mi", GPS.Distance(0.0, 0.0, 0.0, 1.0, "mi"), oneDeg * 0.000621371192, 1e-6);
+    chkNear("distance nmi", GPS.Distance(0.0, 0.0, 0.0, 1.0, "nmi"), oneDeg / 1852.0, 1e-6);
+    chkNear("distance is symmetric", GPS.Distance(48.1173, 11.5167, 59.3293, 18.0686),
+            GPS.Distance(59.3293, 18.0686, 48.1173, 11.5167), 1e-6);
+    chk("nil coords -> nil", GPS.Distance(nil, 0.0, 0.0, 1.0) == nil);
+    try {
+        GPS.Distance(0.0, 0.0, 0.0, 1.0, "furlongs");
+        chk("unknown unit throws", false);
+    } catch (e) { chk("unknown unit throws", true); }
+
+    chkNear("bearing east", GPS.Bearing(0.0, 0.0, 0.0, 1.0), 90.0, 1e-9);
+    chkNear("bearing north", GPS.Bearing(0.0, 0.0, 1.0, 0.0), 0.0, 1e-9);
+    chkNear("bearing west", GPS.Bearing(0.0, 1.0, 0.0, 0.0), 270.0, 1e-9);
+    chkNear("bearing south", GPS.Bearing(1.0, 0.0, 0.0, 0.0), 180.0, 1e-9);
+    chk("bearing nil -> nil", GPS.Bearing(nil, 0.0, 0.0, 1.0) == nil);
+
+    // Destination is the inverse of Distance+Bearing
+    let d = GPS.Destination(48.1173, 11.5167, 42.0, 500000.0);
+    chk("destination not nil", d != nil);
+    chkNear("destination distance", GPS.Distance(48.1173, 11.5167, d.lat, d.lon), 500000.0, 1e-3);
+    chkNear("destination bearing", GPS.Bearing(48.1173, 11.5167, d.lat, d.lon), 42.0, 1e-6);
+    let back = GPS.Destination(0.0, 0.0, 90.0, oneDeg);
+    chkNear("dest east 1 deg lon", back.lon, 1.0, 1e-9);
+    chkNear("dest east lat stays", back.lat, 0.0, 1e-9);
+    chk("destination nil -> nil", GPS.Destination(nil, 0.0, 0.0, 1.0) == nil);
+
+    let mid = GPS.Midpoint(0.0, 0.0, 0.0, 2.0);
+    chkNear("midpoint lat", mid.lat, 0.0, 1e-9);
+    chkNear("midpoint lon", mid.lon, 1.0, 1e-9);
+    let mid2 = GPS.Midpoint(48.1173, 11.5167, 59.3293, 18.0686);
+    chkNear("midpoint symmetric", GPS.Distance(mid2.lat, mid2.lon, 48.1173, 11.5167),
+            GPS.Distance(mid2.lat, mid2.lon, 59.3293, 18.0686), 1e-3);
+
+    // DMS round trip
+    let dms = GPS.ToDMS(48.1173);
+    chkEq("dms deg", dms.deg, 48);
+    chkEq("dms min", dms.min, 7);
+    chkNear("dms sec", dms.sec, 2.28, 1e-6);
+    chkEq("dms dir", dms.dir, "N");
+    chkEq("dms lon dir", GPS.ToDMS(-11.5167, "lon").dir, "W");
+    chkNear("FromDMS round trip", GPS.FromDMS(dms.deg, dms.min, dms.sec, dms.dir), 48.1173, 1e-9);
+    chkNear("FromDMS S negative", GPS.FromDMS(48, 7, 2.28, "S"), -48.1173, 1e-9);
+    chk("ToDMS nil -> nil", GPS.ToDMS(nil) == nil);
+    try {
+        GPS.FromDMS(1, 2, 3.0, "X");
+        chk("bad hemisphere throws", false);
+    } catch (e) { chk("bad hemisphere throws", true); }
+}
+
+// ============================================================
+// Gps reader without a stream: buffering, dispatch, fix merging
+// ============================================================
+
+fn testIngest() {
+    Console.WriteLine("--- Gps._ingest (no stream) ---");
+    let rd = new Gps();
+    chk("parser-only handle is not open", !rd.IsOpen());
+    chkEq("Poll on parser-only handle", rd.Poll(10), 0);
+    chk("NextFix on parser-only handle", rd.NextFix(10) == nil);
+
+    let types = [];
+    let fixSrc = [];
+    rd.OnSentence(fn(o) { Array.Append(types, o.type); });
+    rd.OnFix(fn(f) { Array.Append(fixSrc, f.source); });
+
+    // a line split across two ingests, plus a bad-checksum line
+    let n1 = rd._ingest(GGA + "\r\n$GPR");
+    chkEq("first ingest: one sentence", n1, 1);
+    let n2 = rd._ingest("MC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W,A*07\r\n" + GGA_BAD + "\r\n");
+    chkEq("second ingest: split line completed, bad dropped", n2, 1);
+    chkEq("types seen", str(types), str(["GGA", "RMC"]));
+    chk("OnFix fired for GGA and RMC", len(fixSrc) == 2 && fixSrc[0] == "GGA" && fixSrc[1] == "RMC");
+
+    let lf = rd.LastFix();
+    chk("LastFix present", lf != nil);
+    chkNear("fix lat", lf.lat, 48.1173, 1e-9);
+    chkEq("fix quality from GGA", lf.fixQuality, 1);
+    chkEq("fix satsVisible from GGA", lf.satsVisible, 8);
+    chkNear("fix speedKmh from RMC", lf.speedKmh, 41.4848, 1e-9);
+    chkEq("fix timestamp from RMC date+time", lf.timestamp, 764426119);
+    chkEq("fix iso", lf.iso, "1994-03-23T12:35:19Z");
+    chkEq("fix source is the last sentence", lf.source, "RMC");
+
+    // LF-only line endings (some loggers strip the CR)
+    let rd2 = new Gps();
+    let n = rd2._ingest(GGA + "\n");
+    chkEq("LF-only line", n, 1);
+    chkNear("LF-only fix lat", rd2.LastFix().lat, 48.1173, 1e-9);
+
+    // a GGA-only stream gets a timestamp once a date-bearing sentence arrived
+    let rd3 = new Gps();
+    rd3._ingest(ZDA + "\r\n");
+    chk("ZDA alone makes no fix", rd3.LastFix() == nil);
+    rd3._ingest(GGA + "\r\n");
+    chkEq("GGA after ZDA gets the date's timestamp", rd3.LastFix().timestamp, 764426119);
+
+    // void RMC (status V) does not touch the fix
+    let rd4 = new Gps();
+    rd4._ingest("$GPRMC,123519,V,,,,,230394,,,A*5E\r\n");
+    chk("void RMC makes no fix", rd4.LastFix() == nil);
+
+    // The timestamp follows each GGA, not just the first one after the date.
+    rd3._ingest("$GPGGA,123619,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*44\r\n");
+    chkEq("a later GGA moves the timestamp on", rd3.LastFix().timestamp, 764426179);
+
+    // Input with no line feed (wrong baud, a binary protocol) is not kept forever.
+    let rd5 = new Gps();
+    rd5._ingest(String.Repeat("x", 10000));
+    chk("a buffer with no line feed is capped", len(rd5._buf) <= 4096);
+}
+
+// ============================================================
+// Serial port against tests/fake_gps.py (pseudo-terminal)
+// ============================================================
+
+fn runSerialChecks(port:string) {
+    Console.WriteLine("--- serial via tests/fake_gps.py on " + port + " ---");
+
+    let gps = GPS.Open(port);
+    chk("GPS.Open opens the pty", gps.IsOpen());
+    chkEq("Error() nil while open", gps.Error(), nil);
+    chkEq("Port()", gps.Port(), port);
+
+    let sentences = [];
+    let fixes = [];
+    gps.OnSentence(fn(o) { Array.Append(sentences, o); });
+    gps.OnFix(fn(f) { Array.Append(fixes, f); });
+
+    // collect until the fake has emitted at least one full round (10 valid
+    // sentences: 8 standard + proprietary + the split-write RMC)
+    let deadline = Time.Millis() + 6000;
+    while (Time.Millis() < deadline && len(sentences) < 10) {
+        gps.Poll(200);
+    }
+    chk("collected a full round (got " + str(len(sentences)) + ")", len(sentences) >= 10);
+
+    let types = {};
+    var rmcCount = 0;
+    var ggaAllGood = true;
+    foreach (s in sentences) {
+        types[s.type] = true;
+        if (s.type == "RMC") { rmcCount += 1; }
+        if (s.type == "GGA" && s.checksum != "47") { ggaAllGood = false; }
+    }
+    chk("GGA seen", "GGA" in types);
+    chk("RMC seen", "RMC" in types);
+    chk("GSA seen", "GSA" in types);
+    chk("GSV seen", "GSV" in types);
+    chk("VTG seen", "VTG" in types);
+    chk("GLL seen", "GLL" in types);
+    chk("ZDA seen", "ZDA" in types);
+    chk("proprietary PMTK seen", "PMTK001" in types);
+    chk("bad-checksum GGA was dropped (every parsed GGA has checksum 47)", ggaAllGood);
+    chk("split-write RMC arrived whole (2+ RMCs)", rmcCount >= 2);
+
+    let lf = gps.LastFix();
+    chk("LastFix present", lf != nil);
+    chkNear("serial fix lat", lf.lat, 48.1173, 1e-9);
+    chkEq("serial fix quality", lf.fixQuality, 1);
+    chkEq("serial fix satsVisible", lf.satsVisible, 8);
+    chkNear("serial fix speedKmh", lf.speedKmh, 41.4848, 1e-9);
+    chkEq("serial fix timestamp", lf.timestamp, 764426119);
+    chkEq("serial fix iso", lf.iso, "1994-03-23T12:35:19Z");
+    chk("OnFix fired (GGA+RMC+GLL per round)", len(fixes) >= 3);
+
+    // the fake loops, so a fresh fix and a fresh sentence are always coming
+    let nf = gps.NextFix(3000);
+    chk("NextFix returned a new fix", nf != nil && nf.lat != nil);
+    let rs = gps.ReadSentence(3000);
+    chk("ReadSentence returned a sentence", rs != nil && rs.type != nil);
+
+    gps.Close();
+    chk("closed", !gps.IsOpen());
+}
+
+fn async Main() {
+    testChecksum();
+    testParseGGA();
+    testParseRMC();
+    testParseGSA();
+    testParseGSV();
+    testParseVTG();
+    testParseGLL();
+    testParseZDA();
+    testTalkersAndFallback();
+    testBadInput();
+    testConversions();
+    testGeo();
+    testIngest();
+
+    if (Os.Which("python3") == nil) {
+        Console.WriteLine("SKIP: python3 not available to run tests/fake_gps.py");
+    } else {
+        let fake = Os.Spawn("python3", ["tests/fake_gps.py"]);
+        if (fake == nil) {
+            chk("could start python3 tests/fake_gps.py", false);
+        } else {
+            let port = await Stream.ReadLineAsync(fake.Stdout, 5000);
+            if (port == nil || File.Stat(port) == nil) {
+                chk("fake_gps.py came up (got " + str(port) + ")", false);
+            } else {
+                runSerialChecks(port);
+            }
+            // the fake serves until its stdin closes
+            Stream.Close(fake.Stdin);
+            let done = await Os.WaitAsync(fake.Pid, 3000);
+            if (done == nil || done.Alive) {
+                Os.KillChild(fake.Pid, 9);
+                await Os.WaitAsync(fake.Pid, 3000);
+            }
+            let errText = Stream.ReadAll(fake.Stderr);
+            if (failed > 0 && errText != nil && len(errText) > 0) {
+                Console.WriteLine("fake_gps.py stderr:");
+                Console.WriteLine(Buffer.ToString(errText));
+            }
+            Stream.Close(fake.Stdout);
+            Stream.Close(fake.Stderr);
+        }
+    }
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: " + str(passed + failed) + "  failed: " + str(failed));
+    if (failed == 0) {
+        Console.Ok("All GPS tests passed!");
+    } else {
+        Console.WriteLine("Some tests FAILED.");
+    }
+    return failed;
+}

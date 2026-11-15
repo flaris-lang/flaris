@@ -1,0 +1,378 @@
+// Gpio.fls - GPIO lines on Linux for Flaris.
+// Version: 1.0
+//
+// One Gpio object is one GPIO line, named the way the kernel names it or given
+// as an offset on a chip. On a Raspberry Pi the 40-pin header's lines are
+// "GPIO2" to "GPIO27" on every model with that header - Pi 3, 4 and 5 alike -
+// so the same name works on all of them: header pin 11 is "GPIO17".
+//
+// Usage:
+//   import { Gpio } from library("Gpio", "1.0");
+//
+//   let led = new Gpio("GPIO17");
+//   led.Write(1);                         // high until the next Write, Release or Close
+//
+//   let button = new Gpio("GPIO27", { bias: "pull-up", activeLow: true });
+//   Console.WriteLine(button.Read());    // 1 while pressed: the button pulls the pin low
+//   button.Watch(fn(edge, seconds) { Console.WriteLine(edge, " ", seconds); }, { debounceMs: 20 });
+//
+// Values are logical: 1 is active, 0 inactive. With activeLow a line that is
+// electrically low reads 1, and Write(1) drives it low. bias picks the pin's
+// internal resistor - "pull-up", "pull-down" or "disabled"; without it the
+// resistor is left as it is.
+//
+// One use of a line at a time. While an object drives its line, Read returns
+// the value it drives. Write and Watch exclude each other: Release or Unwatch
+// first. A line that another program (or another Gpio object) holds fails
+// every call with errorKind "busy".
+//
+// Events. Watch(cb, opts) calls cb(edge, seconds) for every change: edge is
+// "rising" or "falling", seconds a monotonic timestamp for measuring the time
+// between events. opts.edges picks "both" (default), "rising" or "falling";
+// opts.debounceMs ignores changes shorter than that (a mechanical button wants
+// 10-50). Events arrive on a fiber of their own, which also runs cb, so the
+// program keeps running while it waits. A cb that raises is reported on stderr
+// and the watch goes on. Unwatch() stops it.
+//
+// Errors. Nothing here raises for a line problem or a bad argument. A call
+// that fails returns nil (false for Write, Release, Watch and Unwatch), Error()
+// says why and ErrorKind() names the class:
+//   "line"        no such line: a wrong name, chip or offset
+//   "busy"        something else holds the line
+//   "permission"  this user may not open the GPIO chip
+//   "timeout"     a tool did not answer in time
+//   "tool"        libgpiod's tools are not installed
+//   "usage"       a bad argument, or a use the line is not free for
+//   "io"          anything else, with the tool's own message
+// Both go back to nil on the next call that succeeds.
+//
+// How it reaches the lines. Through gpioget, gpioset and gpiomon from libgpiod
+// 2 (Raspberry Pi OS ships them; elsewhere `sudo apt install gpiod`). A Read is
+// one gpioget run: a few milliseconds that pause every fiber. A line is driven
+// for as long as the gpioset holding it runs - the kernel gives a line back
+// when its holder exits - so every Write that changes the value starts a new
+// one. Each driven or watched line is one child process, and it ends when the
+// program does, so a line is never left held. After Release or Close the line
+// is free; a Raspberry Pi keeps its last level, other boards may let it float.
+// opts.timeoutMs (default 2000) bounds a tool's answer.
+//
+// Any other transport is passed as opts.backend: any object with
+//   Get(chip, line, bias, activeLow)                                  -> { ok, value, error, errorKind }
+//   Hold(chip, line, value, bias, activeLow)                          -> { ok, handle, error, errorKind }
+//   Watch(chip, line, edges, debounceMs, bias, activeLow, onEvent)    -> { ok, handle, error, errorKind }
+//   Release(handle)
+// line is a name (string) or an offset (int), chip a name or nil, and the
+// backend calls onEvent(edge, seconds) for each event of a watch.
+//
+// Exported:
+//   Gpio - new Gpio(line, opts?)     opts: { chip, bias, activeLow, timeoutMs, backend }
+//          values : Read / Write / Release
+//          events : Watch / Unwatch / Watching
+//          state  : Line / Chip / Error / ErrorKind / Close
+
+const _BIASES = ["pull-up", "pull-down", "disabled"];
+const _EDGES  = ["both", "rising", "falling"];
+
+// The tool runs in the background of a shell that waits on its stdin: closing
+// that pipe - Release, or the program ending - stops the tool, which would
+// otherwise hold the line after the program has gone.
+const _TIED = "\"$@\" & read _; kill $! 2>/dev/null; wait";
+
+fn _fail(kind: string, msg: string): object {
+    return { ok: false, error: msg, errorKind: kind };
+}
+
+fn _toolMissing(tool: string): object {
+    return _fail("tool", tool + " not found - install libgpiod's tools (sudo apt install gpiod)");
+}
+
+// A tool's error message (libgpiod prints "tool: what went wrong") as an error result.
+fn _toolError(tool: string, msg: string): object {
+    if (String.Contains(msg, "cannot find") || String.Contains(msg, "No such file") || String.Contains(msg, "out of range")) {
+        return _fail("line", msg);
+    }
+    if (String.Contains(msg, "Device or resource busy")) {
+        return _fail("busy", msg + " - another program, or another Gpio object, holds the line");
+    }
+    if (String.Contains(msg, "Permission denied")) {
+        return _fail("permission", "no permission to open the GPIO chip: add the user to the gpio group (sudo usermod -aG gpio $USER) and log in again");
+    }
+    if (len(msg) == 0) { msg = tool + " failed without a message"; }
+    return _fail("io", msg);
+}
+
+// The default backend: libgpiod's tools.
+class _GpioTools {
+    let _timeoutMs = 2000;
+    let _get = nil;     // path of gpioget, resolved on first use
+    let _set = nil;     // path of gpioset
+    let _mon = nil;     // path of gpiomon
+
+    fn Constructor(timeoutMs: int) {
+        this._timeoutMs = timeoutMs;
+        this._get = nil;
+        this._set = nil;
+        this._mon = nil;
+    }
+
+    // The options every tool takes, then the line.
+    fn static _args(args: [string], chip, line, bias, activeLow: bool): [string] {
+        if (chip != nil) { Array.Append(args, "-c"); Array.Append(args, chip); }
+        if (bias != nil) { Array.Append(args, "-b"); Array.Append(args, bias); }
+        if (activeLow) { Array.Append(args, "-l"); }
+        if (Type.Of(line) == Type.String) { Array.Append(args, "--by-name"); }
+        return args;
+    }
+
+    fn Get(chip, line, bias, activeLow: bool): object {
+        if (this._get == nil) { this._get = Os.Which("gpioget"); }
+        if (this._get == nil) { return _toolMissing("gpioget"); }
+        let args = _GpioTools._args(["--numeric"], chip, line, bias, activeLow);
+        Array.Append(args, str(line));
+        let r = Os.RunEx(this._get, args, { Stdin: "", Timeout: this._timeoutMs });
+        if (r == nil) { return _fail("tool", "gpioget could not be started"); }
+        if (r.TimedOut) { return _fail("timeout", "gpioget did not finish in time"); }
+        if (r.Exit != 0) { return _toolError("gpioget", String.Trim(r.Stderr)); }
+        let out = String.Trim(r.Stdout);
+        if (out != "0" && out != "1") { return _fail("io", "gpioget printed something unexpected: " + out); }
+        return { ok: true, value: out == "1" ? 1 : 0 };
+    }
+
+    fn Hold(chip, line, value: int, bias, activeLow: bool): object {
+        if (this._set == nil) { this._set = Os.Which("gpioset"); }
+        if (this._set == nil) { return _toolMissing("gpioset"); }
+        let args = _GpioTools._args(["--banner", "-C", "flaris"], chip, line, bias, activeLow);
+        Array.Append(args, str(line) + "=" + str(value));
+        return this._start("gpioset", this._set, args);
+    }
+
+    fn Watch(chip, line, edges: string, debounceMs: int, bias, activeLow: bool, onEvent): object {
+        if (this._mon == nil) { this._mon = Os.Which("gpiomon"); }
+        if (this._mon == nil) { return _toolMissing("gpiomon"); }
+        let args = _GpioTools._args(["--banner", "-C", "flaris", "-F", "%e %S", "-e", edges], chip, line, bias, activeLow);
+        if (debounceMs > 0) { Array.Append(args, "-p"); Array.Append(args, str(debounceMs) + "ms"); }
+        Array.Append(args, str(line));
+        let s = this._start("gpiomon", this._mon, args);
+        if (!s["ok"]) { return s; }
+        // One line per event, "1 <seconds>" for rising and "2 <seconds>" for falling, until Release closes the pipe.
+        let out = s["handle"].Stdout;
+        Fiber.Run(fn() {
+            var ln = Fiber.Await(Stream.ReadLineAsync(out, 0));
+            while (ln != nil) {
+                let f = String.Split(ln, " ");
+                if (len(f) == 2) { onEvent(f[0] == "1" ? "rising" : "falling", Convert.ParseFloat(f[1])); }
+                ln = Fiber.Await(Stream.ReadLineAsync(out, 0));
+            }
+        });
+        return s;
+    }
+
+    fn Release(h) {
+        Stream.Close(h.Stdin);      // the shell stops the tool and exits
+        Os.Wait(h.Pid);
+        Stream.Close(h.Stdout);
+    }
+
+    // Start a tool that holds the line while it runs. It prints a banner once
+    // it has the line, or "<path it was started as>: why" and exits.
+    fn _start(tool: string, path: string, args: [string]): object {
+        let shArgs = ["-c", _TIED, "sh", path];
+        foreach (a in args) { Array.Append(shArgs, a); }
+        let p = Os.Spawn("/bin/sh", shArgs, { MergeStderr: true });
+        if (p == nil) { return _fail("tool", tool + " could not be started"); }
+        let first = Fiber.Await(Stream.ReadLineAsync(p.Stdout, this._timeoutMs));
+        if (first != nil && !String.StartsWith(first, path + ":") && !String.StartsWith(first, tool + ":")) {
+            return { ok: true, handle: p };
+        }
+        var msg = first;
+        if (msg == nil) {
+            msg = Os.TryWait(p.Pid).Alive ? tool + " did not answer in time" : tool + " exited without a message";
+        }
+        this.Release(p);
+        if (first == nil && String.Contains(msg, "in time")) { return _fail("timeout", msg); }
+        return _toolError(tool, msg);
+    }
+}
+
+class Gpio {
+    let _line      = nil;   // a name (string) or an offset (int)
+    let _chip      = nil;
+    let _bias      = nil;
+    let _activeLow = false;
+    let _backend   = nil;
+    let _hold      = nil;   // the backend's handle while this object drives the line
+    let _value     = 0;     // the value it drives
+    let _watch     = nil;   // the backend's handle while this object watches the line
+    let _bad       = nil;   // why the constructor arguments are unusable, or nil
+    let _err       = nil;
+    let _errKind: string|nil = nil;
+
+    // A bad line or option does not raise: the object is returned anyway and
+    // every call on it fails with errorKind "usage" and the reason.
+    fn Constructor(line, opts?) {
+        this._hold    = nil;
+        this._watch   = nil;
+        this._bad     = nil;
+        this._err     = nil;
+        this._errKind = nil;
+        let backend = Gpio._opt(opts, "backend", nil);
+        this._backend = (backend != nil) ? backend : new _GpioTools(Gpio._opt(opts, "timeoutMs", 2000));
+
+        let chip      = Gpio._opt(opts, "chip", nil);
+        let bias      = Gpio._opt(opts, "bias", nil);
+        let activeLow = Gpio._opt(opts, "activeLow", false);
+        if (Type.Of(line) == Type.Int) {
+            if (line < 0) { this._bad = "a line offset must be 0 or more"; }
+            if (chip == nil) { chip = "gpiochip0"; }
+        } else if (Type.Of(line) != Type.String || len(line) == 0) {
+            this._bad = "line must be a name such as \"GPIO17\" or an offset on a chip";
+        }
+        if (this._bad == nil) {
+            if (chip != nil && (Type.Of(chip) != Type.String || len(chip) == 0)) {
+                this._bad = "chip must be a name such as \"gpiochip0\"";
+            } else if (bias != nil && Array.IndexOf(_BIASES, bias) < 0) {
+                this._bad = "bias must be \"pull-up\", \"pull-down\" or \"disabled\"";
+            } else if (Type.Of(activeLow) != Type.Bool) {
+                this._bad = "activeLow must be true or false";
+            }
+        }
+        if (this._bad != nil) {
+            this._setError("usage", this._bad);
+            return;
+        }
+        this._line      = line;
+        this._chip      = chip;
+        this._bias      = bias;
+        this._activeLow = activeLow;
+    }
+
+    fn Line() { return this._line; }
+    fn Chip() { return this._chip; }
+    fn Watching(): bool { return this._watch != nil; }
+
+    // Why the last call failed, or nil when it succeeded.
+    fn Error() { return this._err; }
+    fn ErrorKind() { return this._errKind; }
+
+    // 1 or 0, or nil when the line cannot be read.
+    fn Read() {
+        if (!this._usable()) { return nil; }
+        if (this._watch != nil) { this._usage("the line is being watched: Unwatch() first"); return nil; }
+        if (this._hold != nil) { this._clearError(); return this._value; }
+        var r = nil;
+        try { r = this._backend.Get(this._chip, this._line, this._bias, this._activeLow); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return nil; }
+        if (!this._ok(r)) { return nil; }
+        this._clearError();
+        return r["value"];
+    }
+
+    // Drive the line to value (0, 1, false or true) and keep it there.
+    fn Write(value): bool {
+        if (!this._usable()) { return false; }
+        if (this._watch != nil) { return this._usage("the line is being watched: Unwatch() first"); }
+        var v = nil;
+        if (Type.Of(value) == Type.Bool) { v = value ? 1 : 0; }
+        else if (Type.Of(value) == Type.Int && (value == 0 || value == 1)) { v = value; }
+        if (v == nil) { return this._usage("value must be 0, 1, false or true"); }
+        if (this._hold != nil && v == this._value) { this._clearError(); return true; }
+        if (this._hold != nil && !this.Release()) { return false; }
+        var r = nil;
+        try { r = this._backend.Hold(this._chip, this._line, v, this._bias, this._activeLow); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return false; }
+        if (!this._ok(r)) { return false; }
+        this._hold  = r["handle"];
+        this._value = v;
+        this._clearError();
+        return true;
+    }
+
+    // Stop driving the line. true when it is not driven afterwards.
+    fn Release(): bool {
+        if (this._hold == nil) { this._clearError(); return true; }
+        let h = this._hold;
+        this._hold = nil;
+        try { this._backend.Release(h); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return false; }
+        this._clearError();
+        return true;
+    }
+
+    // Call cb(edge, seconds) for every change of the line until Unwatch.
+    fn Watch(cb, opts?): bool {
+        if (!this._usable()) { return false; }
+        if (this._hold != nil) { return this._usage("the line is being driven: Release() first"); }
+        if (this._watch != nil) { return this._usage("the line is already watched: Unwatch() first"); }
+        if (!Type.Is(cb, Type.Function | Type.BoundMethod | Type.BuiltinFunction)) { return this._usage("cb must be a function"); }
+        let edges      = Gpio._opt(opts, "edges", "both");
+        let debounceMs = Gpio._opt(opts, "debounceMs", 0);
+        if (Array.IndexOf(_EDGES, edges) < 0) { return this._usage("edges must be \"both\", \"rising\" or \"falling\""); }
+        if (Type.Of(debounceMs) != Type.Int || debounceMs < 0) { return this._usage("debounceMs must be an int of 0 or more"); }
+        let guarded = fn(edge, seconds) {
+            try { cb(edge, seconds); }
+            catch (e) { Console.Error("Gpio: a Watch callback raised: " + e.Error); }
+        };
+        var r = nil;
+        try { r = this._backend.Watch(this._chip, this._line, edges, debounceMs, this._bias, this._activeLow, guarded); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return false; }
+        if (!this._ok(r)) { return false; }
+        this._watch = r["handle"];
+        this._clearError();
+        return true;
+    }
+
+    fn Unwatch(): bool {
+        if (this._watch == nil) { this._clearError(); return true; }
+        let h = this._watch;
+        this._watch = nil;
+        try { this._backend.Release(h); }
+        catch (e) { this._setError("io", "backend failed: " + e.Error); return false; }
+        this._clearError();
+        return true;
+    }
+
+    // Release and Unwatch: the line is free afterwards.
+    fn Close(): bool {
+        let released = this.Release();
+        return this.Unwatch() && released;
+    }
+
+    // -- internals ---------------------------------------------------------
+
+    fn static _opt(opts, key: string, fallback) {
+        if (opts == nil || !(key in opts) || opts[key] == nil) { return fallback; }
+        return opts[key];
+    }
+
+    fn _usable(): bool {
+        if (this._bad == nil) { return true; }
+        this._setError("usage", this._bad);
+        return false;
+    }
+
+    fn _ok(r): bool {
+        if (r != nil && r["ok"]) { return true; }
+        if (r == nil) { this._setError("io", "the backend returned nothing"); return false; }
+        let kind = ("errorKind" in r && r["errorKind"] != nil) ? r["errorKind"] : "io";
+        let msg  = ("error" in r && r["error"] != nil) ? r["error"] : "the call failed";
+        this._setError(kind, msg);
+        return false;
+    }
+
+    fn _usage(msg: string): bool {
+        this._setError("usage", msg);
+        return false;
+    }
+
+    fn _setError(kind: string, msg: string) {
+        this._errKind = kind;
+        this._err     = msg;
+    }
+
+    fn _clearError() {
+        this._errKind = nil;
+        this._err     = nil;
+    }
+}
+
+export { Gpio };

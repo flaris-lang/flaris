@@ -34,7 +34,8 @@
 // API:
 //   SetLevel(level:int|string)          - "debug"/"info"/"warn"/"error"/"fatal" or int
 //   GetLevel()  →  int
-//   SetOutput(sink, path?)              - "console" (default), "file" (needs path), "syslog"
+//   SetOutput(sink, path?)              - "console" or "stdout" (default), "stderr",
+//                                         "file" (needs path); syslog is SetSyslog
 //   SetSyslog(host, port?)              - UDP syslog; default port 514
 //   Enable() / Disable() / IsEnabled()
 //   SetPrefix(s)                        - string prepended to every message
@@ -101,6 +102,7 @@ class _LogSink {
     let maxBytes:int  = 0;      // rotation threshold (0 = disabled)
     let maxFiles:int  = 5;      // number of rotated backups to keep
     let written:int   = 0;      // bytes written to the current file since open
+    let reopen:bool   = false;  // the reopen after a rotation failed; retried per record
     let more          = nil;    // the sinks AddSink added (an array), or nil
     let moreMin:int   = 99;     // the lowest level among them
     // An added sink's own settings.
@@ -114,6 +116,7 @@ class _LogSink {
             Stream.Close(this.stream);
             this.stream = nil;
         }
+        this.reopen = false;
     }
 
     fn CloseSyslog() {
@@ -131,6 +134,16 @@ class _LogSink {
     }
 
     fn WriteFile(line: string) {
+        // A reopen that failed (after a rotation, say) is retried with each
+        // record, so a passing problem - a full disk, a moved directory - does
+        // not silence the log for the rest of the run.
+        if (this.reopen && this.stream == nil && this.file != nil) {
+            this.stream = Stream.Open(this.file, "a");
+            if (this.stream != nil) {
+                this.reopen = false;
+                this.written = File.Exists(this.file) ? File.Size(this.file) : 0;
+            }
+        }
         if (this.stream == nil) { return; }
         Stream.WriteString(this.stream, line);
         // A log record must be visible to a reader - a tail, a test, a
@@ -162,6 +175,7 @@ class _LogSink {
         if (File.Exists(this.file)) { File.Move(this.file, this.file + ".1"); }
 
         this.stream = Stream.Open(this.file, "a");
+        this.reopen = this.stream == nil;
         this.written = 0;
     }
 }
@@ -177,7 +191,7 @@ class Logger {
 
     let _level:int     = 1;
     let _enabled:bool  = true;
-    let _out           = nil;    // the _LogSink, shared with children
+    let _out: _LogSink|nil = nil;    // the _LogSink, shared with children
     let _ownsSink:bool = true;   // false for a child until it calls SetOutput
     let _prefix:string = "";
     let _timestamp:bool = false;
@@ -221,7 +235,7 @@ class Logger {
 
     fn SetOutput(sink: int|string, path?: string): bool {
         let kind = -1;
-        if      (sink == "stdout" || sink == 0) { kind = 0; }
+        if      (sink == "stdout" || sink == "console" || sink == 0) { kind = 0; }
         else if (sink == "stderr" || sink == 1) { kind = 1; }
         else if (sink == "file"   || sink == 2) { kind = 2; }
         else { throw(1, "Logger.SetOutput: unknown sink"); }
@@ -428,7 +442,12 @@ class Logger {
             if (this._prefix != "") { entry["logger"] = this._prefix; }
             entry["msg"] = msg;
             if (fields != nil) {
-                foreach (v, k in fields) { entry[k] = v; }
+                // A field may not replace the record's own time, level, logger
+                // or msg - a "level": "FATAL" in caller data would forge the
+                // record. It is kept under "fields.<name>" instead.
+                foreach (v, k in fields) {
+                    if (Object.HasKey(entry, k)) { entry["fields." + k] = v; } else { entry[k] = v; }
+                }
             }
             return Json.Stringify(entry) + "\n";
         }

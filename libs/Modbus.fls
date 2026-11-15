@@ -352,15 +352,16 @@ class ModbusClient {
     let _rtu:bool       = false;
     let _host:string    = "";
     let _port:int       = 502;
-    let _sock           = nil;
+    let _sock: stream|nil = nil;
     let _unit:int       = 1;
     let _timeout:int    = 1000;
     let _tid:int        = 0;
     let _gap:int        = 4;       // RTU silent interval, ms
     let _lastEnd:int    = 0;       // when the last RTU frame ended, Time.Millis
     let _dirty:bool     = false;   // RTU: bytes of an abandoned answer may follow
+    let _staleUntil:int = 0;       // RTU: a timed-out request's answer may still come until then
     let _busy:bool      = false;
-    let _waiters        = nil;     // fiber ids waiting for their turn
+    let _waiters        = [];     // fiber ids waiting for their turn
 
     fn Constructor() { this._waiters = []; }
 
@@ -498,7 +499,7 @@ class ModbusClient {
         if (s == nil) { _mbFail("io", f, "no stream"); }
         let quiet = this._lastEnd + this._gap - Time.Millis();
         if (quiet > 0) { Fiber.Sleep(quiet); }
-        if (this._dirty) { this._drain(); }
+        this._drain();
 
         let n = len(pdu);
         let frame = Buffer.Create(n + 3, 1);
@@ -532,11 +533,11 @@ class ModbusClient {
         var want = 3;
         while (len(got) < want) {
             let left = deadline - Time.Millis();
-            if (left <= 0) { this._dirty = true; _mbFail("timeout", f, "no complete answer in " + str(this._timeout) + " ms"); }
+            if (left <= 0) { this._timedOut(); _mbFail("timeout", f, "no complete answer in " + str(this._timeout) + " ms"); }
             let part = Fiber.Await(Stream.ReadAsync(s, want - len(got), left));
             if (part == nil || len(part) == 0) {
                 this._dirty = true;
-                if (Stream.LastError() == 1) { _mbFail("timeout", f, "no complete answer in " + str(this._timeout) + " ms"); }
+                if (Stream.LastError() == 1) { this._timedOut(); _mbFail("timeout", f, "no complete answer in " + str(this._timeout) + " ms"); }
                 _mbFail("io", f, "stream closed");
             }
             Buffer.Append(got, part);
@@ -562,12 +563,32 @@ class ModbusClient {
     }
 
     // Discards what is left of an abandoned answer.
+    // RTU has no transaction id, so an answer that arrives late is taken for
+    // the next request's - and every request after it is one answer behind.
+    // A device that missed its deadline may still be answering, so that
+    // answer is waited out and thrown away before the next request goes.
+    fn _timedOut() {
+        this._dirty = true;
+        this._staleUntil = Time.Millis() + this._timeout;
+    }
+
+    // Discard what is on the line before a request: whatever is buffered
+    // (1 ms), and after a failure everything up to a silence - after a
+    // timeout, also the answer still owed.
     fn _drain() {
+        var wait = 1;
+        if (this._dirty) {
+            wait = this._gap + 1;
+            let owed = this._staleUntil - Time.Millis();
+            if (owed > wait) { wait = owed; }
+        }
         while (true) {
-            let part = Fiber.Await(Stream.ReadAsync(this._sock, 256, this._gap + 1));
+            let part = Fiber.Await(Stream.ReadAsync(this._sock, 256, wait));
             if (part == nil || len(part) == 0) break;
+            wait = this._gap + 1;
         }
         this._dirty = false;
+        this._staleUntil = 0;
     }
 
     fn _readBits(function: int, addr: int, count: int, unit): array {

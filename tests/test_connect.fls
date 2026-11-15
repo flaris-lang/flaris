@@ -318,6 +318,30 @@ fn async test_json_codec() {
     check("json: unknown codec refused", caught, true);
 }
 
+// A request body that is not the method's input message is the caller's
+// error: invalid_argument and 400, not internal and 500.
+fn test_malformed_request() {
+    let g = API["Greeter"];
+    let port = Convert.ParseInt(String.Substr(BASE, String.LastIndexOf(BASE, ":") + 1)) ?? 0;
+    let s = Stream.Connect("tcp", "127.0.0.1", port, 2000);
+    if (s == nil) { check("malformed request: connect", false, true); return 0; }
+    Stream.WriteString(s, "POST " + g.methods.SayHello.path + " HTTP/1.1\r\nHost: t\r\n"
+        + "Content-Type: application/proto\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\x09\x01\x02");
+    var reply = "";
+    if (Stream.WaitReadable(s, 2000) != nil) {
+        var part = Stream.ReadBytes(s, 4096);
+        while (part != nil) {
+            reply = reply + Buffer.ToString(part);
+            if (Stream.WaitReadable(s, 500) == nil) { break; }
+            part = Stream.ReadBytes(s, 4096);
+        }
+    }
+    Stream.Close(s);
+    check("malformed request: 400", String.StartsWith(reply, "HTTP/1.1 400"), true);
+    check("malformed request: invalid_argument", String.Contains(reply, "invalid_argument"), true);
+    return 0;
+}
+
 fn async test_errors() {
     let g = API["Greeter"];
     let c = new Connect(BASE);
@@ -491,6 +515,7 @@ fn async Main() {
     await test_unary();
     await test_headers();
     await test_errors();
+    test_malformed_request();
     await test_async_handlers();
     await test_binary_fidelity();
     await test_json_codec();

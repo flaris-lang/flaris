@@ -31,7 +31,8 @@
 //
 // Construction:
 //   new Graphics(width, height)      Graphics.Create(width, height)
-//   Graphics.FromFile(path)          Graphics.LoadImage(path)     -> instance|nil
+//   Graphics.FromFile(path, opts?)   Graphics.LoadImage(path)     -> instance|nil
+//     opts: { maxPixels } - larger images give nil (default 64 M pixels)
 //
 //   Files are recognised by content, not name: PNG and TIFF (see Png.fls and
 //   Tiff.fls for the variants each decodes). A multi-page TIFF loads page 0.
@@ -141,6 +142,13 @@ class Raster {
     let _deadOff:array = [];
     let _deadLen:array = [];
     let _lutBase:int  = 0;
+    // One flush at a time. A flush parks its fiber while the kernels run, and
+    // every canvas shares this engine: without the lock a second fiber's flush
+    // would run the same commands again, and a grow would swap the arena out
+    // from under a running kernel.
+    let _lockOwner = nil;
+    let _lockDepth:int = 0;
+    let _arenaGen:int = 0;   // bumped when Grow swaps in a new arena block
 
     fn Constructor(pixelWords:int, cmdSlots:int) {
         this._cmdCap = cmdSlots;
@@ -170,7 +178,13 @@ class Raster {
         var off = this._reserve(w * h);
         if (off < 0 && this.EnsureFree(w * h)) { off = this._reserve(w * h); }
         if (off < 0) { return nil; }
-        return { off: off, w: w, h: h };
+        // Reused space - a free-list span, or one given back to the bump
+        // pointer - still holds a dropped canvas's pixels; a new surface starts
+        // transparent. A freed span is only reused after the flush that ran its
+        // last commands, so writing it directly races nothing.
+        let s = { off: off, w: w, h: h };
+        this._store(s, 0, h, 0);
+        return s;
     }
 
     // Surface allocation.
@@ -307,11 +321,14 @@ class Raster {
     // Make room for `words` more pixels, growing the arena if needed. Dropped
     // canvases are given back first. A grow adds at least half the arena, so a
     // run of small surfaces on a full arena copies it a few times, not once each.
+    // A surface needs one contiguous span, so what counts is the largest free
+    // span - not the sum of the free ones, which can be plenty while every
+    // single span is too small.
     fn EnsureFree(words:int):bool {
-        if (this.Available() >= words) { return true; }
+        if (this._largestFree() >= words) { return true; }
         if (len(_deadOff) > 0) {
             this.Flush();
-            if (this.Available() >= words) { return true; }
+            if (this._largestFree() >= words) { return true; }
         }
         let need = _cap + words;
         if (need > Raster.MaxPixels()) { return false; }
@@ -325,18 +342,50 @@ class Raster {
         return n;
     }
 
+    fn _largestFree():int {
+        var n = _cap - _next;
+        var i = 0;
+        while (i < len(_freeLen)) { if (_freeLen[i] > n) { n = _freeLen[i]; } i = i + 1; }
+        return n;
+    }
+
     // Grow the arena to at least `words` of pixel space. Surfaces hold offsets,
     // not pointers, so copying into a larger block keeps every one of them valid.
+    // Held under the flush lock: no kernel may be writing the old block while
+    // it is copied.
     fn Grow(words:int):bool {
         if (words <= _cap) { return true; }
         if (words > Raster.MaxPixels()) { return false; }
-        this.Flush();
-        let bigger = Buffer.Create(words, 4);
-        if (bigger == nil) { return false; }
-        Buffer.Copy(_arena, 0, bigger, 0, _cap * 4);
-        _arena = bigger;
-        _cap = words;
-        return true;
+        this._lock();
+        try {
+            this._flushLocked();
+            let bigger = Buffer.Create(words, 4);
+            if (bigger == nil) { return false; }
+            Buffer.Copy(_arena, 0, bigger, 0, _cap * 4);
+            _arena = bigger;
+            _arenaGen = _arenaGen + 1;
+            _cap = words;
+            return true;
+        } finally {
+            this._unlock();
+        }
+    }
+
+    // Reentrant for its holder. The wait-then-take has no call or loop edge
+    // between the test and the store, so no other fiber can slip in.
+    fn _lock() {
+        let me = Fiber.Id();
+        if (_lockOwner == me) { _lockDepth = _lockDepth + 1; return; }
+        while (_lockOwner != nil) { Fiber.Sleep(1); }
+        _lockOwner = me;
+        _lockDepth = 1;
+        return;
+    }
+
+    fn _unlock() {
+        _lockDepth = _lockDepth - 1;
+        if (_lockDepth <= 0) { _lockDepth = 0; _lockOwner = nil; }
+        return;
     }
 
     // Clip, then queue. Clipping here means the kernel never re-checks bounds
@@ -357,10 +406,13 @@ class Raster {
 
     // Append a pre-clipped rect command.
     fn _emitRect(op:int, s:object, x:int, y:int, w:int, h:int, col:int) {
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let cmdRect_ = Raster.CmdRect();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
         _arena[p]     = op;
-        _arena[p + 1] = Raster.CmdRect();
+        _arena[p + 1] = cmdRect_;
         _arena[p + 2] = s.off;
         _arena[p + 3] = s.w;
         _arena[p + 4] = x;
@@ -368,7 +420,7 @@ class Raster {
         _arena[p + 6] = w;
         _arena[p + 7] = h;
         _arena[p + 8] = col;
-        _cmdEnd = p + Raster.CmdRect();
+        _cmdEnd = p + cmdRect_;
         _nCmd = _nCmd + 1;
         return;
     }
@@ -376,10 +428,14 @@ class Raster {
     // Append a thin-line command. Lines clip per pixel inside the kernel, so
     // the surface extent travels with the command.
     fn _emitLine(s:object, x0:int, y0:int, x1:int, y1:int, col:int) {
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let opLine_ = Raster.OpLine();
+        let cmdLine_ = Raster.CmdLine();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
-        _arena[p]      = Raster.OpLine();
-        _arena[p + 1]  = Raster.CmdLine();
+        _arena[p]      = opLine_;
+        _arena[p + 1]  = cmdLine_;
         _arena[p + 2]  = s.off;
         _arena[p + 3]  = s.w;
         _arena[p + 4]  = s.w;
@@ -389,7 +445,7 @@ class Raster {
         _arena[p + 8]  = x1;
         _arena[p + 9]  = y1;
         _arena[p + 10] = col;
-        _cmdEnd = p + Raster.CmdLine();
+        _cmdEnd = p + cmdLine_;
         _nCmd = _nCmd + 1;
         return;
     }
@@ -400,10 +456,14 @@ class Raster {
     // this in the kernel rather than expanding to spans here is the difference
     // between one command and 2r+1 per sample.
     fn _emitStamp(s:object, x0:int, y0:int, x1:int, y1:int, r:int, col:int) {
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let opStamp_ = (r <= 0) ? Raster.OpStampDot() : Raster.OpStamp();
+        let cmdStamp_ = Raster.CmdStamp();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
-        if (r <= 0) { _arena[p] = Raster.OpStampDot(); } else { _arena[p] = Raster.OpStamp(); }
-        _arena[p + 1]  = Raster.CmdStamp();
+        _arena[p] = opStamp_;
+        _arena[p + 1]  = cmdStamp_;
         _arena[p + 2]  = s.off;
         _arena[p + 3]  = s.w;
         _arena[p + 4]  = s.w;
@@ -414,7 +474,7 @@ class Raster {
         _arena[p + 9]  = y1;
         _arena[p + 10] = r;
         _arena[p + 11] = col;
-        _cmdEnd = p + Raster.CmdStamp();
+        _cmdEnd = p + cmdStamp_;
         _nCmd = _nCmd + 1;
         return;
     }
@@ -600,10 +660,14 @@ class Raster {
         if (t < 0) { t = 0; }
         if (fill != 0 || t == 0 || t >= r) { this._disk(s, cx, cy, r, col); return; }
         if ((u8)(col >> 24) == 0) { return; }
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let opRing_ = Raster.OpRing();
+        let cmdRing_ = Raster.CmdRing();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let q = _cmdEnd;
-        _arena[q]     = Raster.OpRing();
-        _arena[q + 1] = Raster.CmdRing();
+        _arena[q]     = opRing_;
+        _arena[q + 1] = cmdRing_;
         _arena[q + 2] = s.off;
         _arena[q + 3] = s.w;
         _arena[q + 4] = s.w;
@@ -613,7 +677,7 @@ class Raster {
         _arena[q + 8] = r;
         _arena[q + 9] = r - t;
         _arena[q + 10] = col;
-        _cmdEnd = q + Raster.CmdRing();
+        _cmdEnd = q + cmdRing_;
         _nCmd = _nCmd + 1;
         return;
     }
@@ -689,7 +753,7 @@ class Raster {
         let st:[int]   = Array.Create(3, Type.Int);
         st[0] = yTop;
         st[1] = -1;
-        while (!this._polyScan(_arena, st, yBot, ne, eYmin, eYmax, eX, eInv, xs, s.off, s.w, s.h, op, col)) {
+        while (!this._polyScan(st, yBot, ne, eYmin, eYmax, eX, eInv, xs, s.off, s.w, s.h, op, col)) {
             this.Flush();
         }
         return;
@@ -702,9 +766,14 @@ class Raster {
     // full, with the row, the next crossing pair and the crossing count left in
     // st[0..2]; the caller flushes and calls again. st[1] < 0 means the row's
     // crossings are not built yet.
-    fn _polyScan(ar:block, st:[int], yBot:int, ne:int, eYmin:[int], eYmax:[int], eX:[float],
+    fn _polyScan(st:[int], yBot:int, ne:int, eYmin:[int], eYmax:[int], eX:[float],
                  eInv:[float], xs:[float], off:int, sw:int, sh:int, op:int, col:int): bool {
         let size = Raster.CmdRect();
+        // Read together, with no call between: another fiber's Grow can swap
+        // the arena while this loop is preempted, and writes to the old block
+        // would be lost - so a changed generation sends the caller round again.
+        let ar = this._arena;
+        let gen = this._arenaGen;
         var y = st[0];
         var c = st[1];
         var nx = st[2];
@@ -734,7 +803,7 @@ class Raster {
                     if (x0 < 0) { x0 = 0; }
                     if (x1 > sw) { x1 = sw; }
                     if (x1 > x0 && y >= 0 && y < sh) {
-                        if (this._nCmd >= this._cmdCap) {
+                        if (this._nCmd >= this._cmdCap || this._arenaGen != gen) {
                             st[0] = y;
                             st[1] = c;
                             st[2] = nx;
@@ -780,10 +849,14 @@ class Raster {
         if (ddy + bh > s.h) { bh = s.h - ddy; }
         if (bw <= 0 || bh <= 0) { return; }
 
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let opComposite_ = Raster.OpComposite();
+        let cmdComposite_ = Raster.CmdComposite();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
-        _arena[p]     = Raster.OpComposite();
-        _arena[p + 1] = Raster.CmdComposite();
+        _arena[p]     = opComposite_;
+        _arena[p + 1] = cmdComposite_;
         _arena[p + 2] = s.off + ddy * s.w + ddx;
         _arena[p + 3] = s.w;
         _arena[p + 4] = src.off + sy0 * src.w + sx0;
@@ -791,7 +864,7 @@ class Raster {
         _arena[p + 6] = bw;
         _arena[p + 7] = bh;
         _arena[p + 8] = a;
-        _cmdEnd = p + Raster.CmdComposite();
+        _cmdEnd = p + cmdComposite_;
         _nCmd = _nCmd + 1;
         return;
     }
@@ -832,10 +905,14 @@ class Raster {
         if (newW <= 0 || newH <= 0) { return nil; }
         let out = this.NewSurface(newW, newH);
         if (out == nil) { return nil; }
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let opScale_ = Raster.OpScale();
+        let cmdScale_ = Raster.CmdScale();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
-        _arena[p]     = Raster.OpScale();
-        _arena[p + 1] = Raster.CmdScale();
+        _arena[p]     = opScale_;
+        _arena[p + 1] = cmdScale_;
         _arena[p + 2] = out.off;
         _arena[p + 3] = newW;
         _arena[p + 4] = s.off;
@@ -844,7 +921,7 @@ class Raster {
         _arena[p + 7] = newH;
         _arena[p + 8] = s.w;
         _arena[p + 9] = s.h;
-        _cmdEnd = p + Raster.CmdScale();
+        _cmdEnd = p + cmdScale_;
         _nCmd = _nCmd + 1;
         return out;
     }
@@ -929,10 +1006,14 @@ class Raster {
     }
 
     fn _emitGlyph(s:object, x:int, y:int, code:int, scale:int, col:int) {
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let opGlyph_ = Raster.OpGlyph();
+        let cmdGlyph_ = Raster.CmdGlyph();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
-        _arena[p]      = Raster.OpGlyph();
-        _arena[p + 1]  = Raster.CmdGlyph();
+        _arena[p]      = opGlyph_;
+        _arena[p + 1]  = cmdGlyph_;
         _arena[p + 2]  = s.off;
         _arena[p + 3]  = s.w;
         _arena[p + 4]  = s.w;
@@ -943,7 +1024,7 @@ class Raster {
         _arena[p + 9]  = scale;
         _arena[p + 10] = _fontBase;
         _arena[p + 11] = col;
-        _cmdEnd = p + Raster.CmdGlyph();
+        _cmdEnd = p + cmdGlyph_;
         _nCmd = _nCmd + 1;
         return;
     }
@@ -972,7 +1053,7 @@ class Raster {
         let st:[int] = Array.Create(3, Type.Int);
         st[1] = x;
         st[2] = y;
-        while (!this._glyphRun(_arena, st, bytes, x, adv, lineAdv, s.off, s.w, s.h, sc, col)) {
+        while (!this._glyphRun(st, bytes, x, adv, lineAdv, s.off, s.w, s.h, sc, col)) {
             this.Flush();
         }
         return;
@@ -983,12 +1064,14 @@ class Raster {
     // to x0 on the next line, a tab moves it four cells. Returns false when the
     // command queue is full, with st holding where to resume; the caller
     // flushes and calls again.
-    fn _glyphRun(ar:block, st:[int], bytes:block, x0:int, adv:int, lineAdv:int,
+    fn _glyphRun(st:[int], bytes:block, x0:int, adv:int, lineAdv:int,
                  off:int, sw:int, sh:int, sc:int, col:int): bool {
         let n = len(bytes);
         let op = Raster.OpGlyph();
         let size = Raster.CmdGlyph();
         let font = this._fontBase;
+        let ar = this._arena;          // see _polyScan
+        let gen = this._arenaGen;
         var i = st[0];
         var penX = st[1];
         var penY = st[2];
@@ -997,7 +1080,7 @@ class Raster {
             if (b == 10) { penX = x0; penY = penY + lineAdv; }
             else if (b == 9) { penX = penX + adv * 4; }
             else {
-                if (this._nCmd >= this._cmdCap) {
+                if (this._nCmd >= this._cmdCap || this._arenaGen != gen) {
                     st[0] = i;
                     st[1] = penX;
                     st[2] = penY;
@@ -1091,10 +1174,14 @@ class Raster {
     }
 
     fn _emitFilter(s:object, rgn:object, mode:int) {
-        if (_nCmd >= _cmdCap) { this.Flush(); }
+        // Everything that needs a call is computed first: from the queue check
+        // to the publish below there is none, so no other fiber can take this slot.
+        let opFilter_ = Raster.OpFilter();
+        let cmdFilter_ = Raster.CmdFilter();
+        while (_nCmd >= _cmdCap) { this.Flush(); }
         let p = _cmdEnd;
-        _arena[p]     = Raster.OpFilter();
-        _arena[p + 1] = Raster.CmdFilter();
+        _arena[p]     = opFilter_;
+        _arena[p + 1] = cmdFilter_;
         _arena[p + 2] = s.off;
         _arena[p + 3] = s.w;
         _arena[p + 4] = rgn.x;
@@ -1103,7 +1190,7 @@ class Raster {
         _arena[p + 7] = rgn.h;
         _arena[p + 8] = mode;
         _arena[p + 9] = _lutBase;
-        _cmdEnd = p + Raster.CmdFilter();
+        _cmdEnd = p + cmdFilter_;
         _nCmd = _nCmd + 1;
         return;
     }
@@ -1258,19 +1345,31 @@ class Raster {
     }
 
     fn Flush() {
-        if (_nCmd <= 0) {
+        this._lock();
+        try { this._flushLocked(); }
+        finally { this._unlock(); }
+        return;
+    }
+
+    // Runs the commands queued when it starts. The wait on each batch of
+    // kernels lets other fibers run, and they may queue more: those are kept
+    // for the next flush rather than reset away with the ones run here.
+    fn _flushLocked() {
+        let total = _nCmd;
+        if (total <= 0) {
             if (len(_deadOff) > 0) { this._freeDead(); }
             return;
         }
+        let endAt = _cmdEnd;
         var p = 1;
         var done = 0;
-        while (done < _nCmd) {
+        while (done < total) {
             let cls = Raster._class(_arena[p]);
             var q = p;
             var run = 0;
             var scanning = 1;
             while (scanning == 1) {
-                if (done + run >= _nCmd) { scanning = 0; }
+                if (done + run >= total) { scanning = 0; }
                 else if (Raster._class(_arena[q]) != cls) { scanning = 0; }
                 else { q = q + _arena[q + 1]; run = run + 1; }
             }
@@ -1302,9 +1401,21 @@ class Raster {
             done = done + run;
         }
         _arena[0] = 0;
-        _nCmd = 0;
-        _cmdEnd = 1;
-        if (len(_deadOff) > 0) { this._freeDead(); }
+        let more = _nCmd - total;
+        if (more > 0) {
+            // Move what other fibers queued meanwhile to the front. Commands
+            // name surfaces by arena offset, not by their own position.
+            let tail = _cmdEnd - endAt;
+            let moved = Buffer.Slice(_arena, endAt, tail);
+            Buffer.Copy(moved, 0, _arena, 4, tail * 4);
+            _cmdEnd = 1 + tail;
+            _nCmd = more;
+            // Dropped canvases wait: a queued command may still refer to one.
+        } else {
+            _nCmd = 0;
+            _cmdEnd = 1;
+            if (len(_deadOff) > 0) { this._freeDead(); }
+        }
         return;
     }
 
@@ -1925,11 +2036,14 @@ class Graphics {
         return new Graphics(w, h);
     }
 
-    fn static FromFile(file:string) : instance|nil {
-        let img = Graphics._decodeFile(file);
+    // opts: { maxPixels } for the decoder (default 64 M; see Png/Tiff).
+    fn static FromFile(file:string, opts?:object) : instance|nil {
+        let img = Graphics._decodeFile(file, opts);
         if (img == nil) return nil;
         let gi = new Graphics(img.Width, img.Height);
-        if (gi._s == nil) return nil;
+        // A canvas that could not be allocated comes back 1x1; copying the
+        // whole image into it would overwrite whatever lies next to it.
+        if (gi._s == nil || gi._s.w != img.Width || gi._s.h != img.Height) return nil;
         Buffer.Copy(img.Pixels, 0, _r().Arena(), gi._s.off * 4,
                     img.Width * img.Height * 4);
         return gi;
@@ -2443,11 +2557,11 @@ class Graphics {
 
     // Decode a PNG or TIFF file, told apart by signature:
     // { Width, Height, Pixels } or nil.
-    fn static _decodeFile(file:string) : object|nil {
+    fn static _decodeFile(file:string, opts) : object|nil {
         let bytes = File.ReadAllBytes(file);
         if (bytes == nil) return nil;
-        if (Tiff.IsTiff(bytes)) return Tiff.Decode(bytes);
-        return Png.Decode(bytes);
+        if (Tiff.IsTiff(bytes)) return Tiff.Decode(bytes, opts);
+        return Png.Decode(bytes, opts);
     }
 
     // This canvas's pixels as a standalone block, for the image encoders.
@@ -2458,10 +2572,10 @@ class Graphics {
 
     // Load a PNG or TIFF, scale it to w x h if needed, and composite it at (x, y).
     fn _drawFile(file:string, x:int, y:int, w:int, h:int) {
-        let img = Graphics._decodeFile(file);
+        let img = Graphics._decodeFile(file, nil);
         if (img == nil) return;
         let tmp = _newSurface(img.Width, img.Height);
-        if (tmp == nil) return;
+        if (tmp == nil || tmp.w != img.Width || tmp.h != img.Height) return;
         Buffer.Copy(img.Pixels, 0, _r().Arena(), tmp.off * 4,
                     img.Width * img.Height * 4);
         if (w == img.Width && h == img.Height) {

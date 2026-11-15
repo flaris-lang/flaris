@@ -37,14 +37,52 @@ REPLIES = {
     "AT+CPIN?":    ["+CPIN: READY"],
     "AT+QCCID":    ["+QCCID: 89460800000000000000"],
     "AT+CSQ":      ["+CSQ: 23,99"],
-    "AT+COPS?":    ['+COPS: 0,0,"Telia",7'],
     "AT+CREG?":    ["+CREG: 0,1"],
     "AT+CNUM":     ['+CNUM: "","+46701234567",145'],
 }
 
 
+# Stored messages: index -> (27.005 status, PDU). 1 is a received message from
+# the alphanumeric sender "Telia"; 2 (sent) and 3 (unsent) are stored outgoing
+# messages, which DeleteMessages("sent") must tell apart.
+STORE = {
+    1: (1, "000409D0D4323B1D0600004230112100000002E834"),
+    2: (3, "0001000B916407281553F80000A0"),
+    3: (2, "0001000B916407281553F80000A0"),
+}
+
+
+# +COPS? answers in the format the last AT+COPS=3,<fmt> chose: 0 long name,
+# 2 numeric MCC/MNC. Operator() switches it and back, so a command from
+# another fiber in between shows up as the wrong format.
+COPS_FORMAT = [0]
+
+
 def respond(fd, cmd):
     """Write the reply for one command, in the shape a real modem uses."""
+    if cmd in ("AT+COPS=3,0", "AT+COPS=3,2"):
+        COPS_FORMAT[0] = int(cmd[-1])
+        if COPS_FORMAT[0] == 2:
+            time.sleep(0.1)                       # slow, so a second caller queues meanwhile
+        os.write(fd, b"\r\nOK\r\n")
+        return
+    if cmd == "AT+COPS?":
+        oper = '"24001"' if COPS_FORMAT[0] == 2 else '"Telia"'
+        os.write(fd, ("\r\n+COPS: 0,%d,%s,7\r\n\r\nOK\r\n" % (COPS_FORMAT[0], oper)).encode())
+        return
+    if cmd == "AT+CMGF=0":
+        os.write(fd, b"\r\nOK\r\n")
+        return
+    if cmd == "AT+CMGL=4":
+        for i in sorted(STORE):
+            stat, pdu = STORE[i]
+            os.write(fd, ("\r\n+CMGL: %d,%d,,%d\r\n%s\r\n" % (i, stat, len(pdu) // 2 - 1, pdu)).encode())
+        os.write(fd, b"\r\nOK\r\n")
+        return
+    if cmd.startswith("AT+CMGD="):
+        STORE.pop(int(cmd[8:].split(",")[0]), None)
+        os.write(fd, b"\r\nOK\r\n")
+        return
     if cmd == "AT+AWKWARD":
         return                                    # silent: the caller must time out
     if cmd == "AT+SLOW":
@@ -52,6 +90,18 @@ def respond(fd, cmd):
         # owed and the next command has to read past it.
         time.sleep(0.4)
         os.write(fd, b"\r\n+SLOW: 1\r\n\r\nOK\r\n")
+        return
+    if cmd == "AT+LATE":
+        # answers after the caller's timeout: the reply must not be taken by
+        # the next command.
+        time.sleep(0.6)
+        os.write(fd, b"\r\n+LATE: 1\r\n\r\nOK\r\n")
+        return
+    if cmd == "AT+HANGUP":
+        # the far end hangs up a call while an unrelated command is running
+        os.write(fd, b"\r\nNO CARRIER\r\n")
+        time.sleep(0.02)
+        os.write(fd, b"\r\n+HANG: 1\r\n\r\nOK\r\n")
         return
     if cmd == "AT+FAIL":
         os.write(fd, b"\r\nERROR\r\n")

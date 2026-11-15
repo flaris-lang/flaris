@@ -34,7 +34,7 @@ Flaris is a lightweight, embedded scripting language designed for high performan
 
 Flaris is:
 
-- **Deterministic** - execution order is always clear and reproducible.
+- **Predictable** - script code runs on one thread, so there are no data races, and a fiber hands over only at an `await`, a sleep, an I/O wait or the end of its time slice (a JIT-compiled function never hands over mid-call). The same source compiles to byte-identical bytecode. What the outside world decides is not fixed: the order in which I/O completions, timers and worker-pool results arrive.
 - **Fast** - written in C with a compact bytecode interpreter.
 - **Embeddable** - ideal for applications, tools, servers, and games.
 - **Safe by default** - unsafe features (FFI, raw pointers/memory) require explicit enabling (`--unsafe`, or `--allow-ffi` for FFI alone). Static analysis runs on every compile and catches mistakes before the program starts. A runtime-only binary (`flaris`) ships without the compiler, `VM.Eval` or `VM.Compile`.
@@ -311,6 +311,7 @@ Flaris source files are UTF-8 encoded and must not contain NUL bytes. Identifier
 | `import` / `export` / `as` | Modules |
 | `try` / `catch` / `finally` / `throw` | Exceptions |
 | `guard` | Assert non-nil (throws if nil) |
+| `capture` | Value of an expression, or a fallback if it raises |
 | `enum` | Define enumeration |
 | `breakpoint` | Debug pause |
 | `in` | Membership test / foreach iterator |
@@ -322,6 +323,12 @@ name a variable, parameter, function or class field, e.g.
 `fn Range(from: int, to: int) { return to - from; }`. Exception: at the start
 of a statement, `iter`, `global`, `do`, `static` and `inline` still begin
 their own construct, so `iter = 1;` there is not a valid assignment.
+
+**Reserved words:** `abstract`, `defer`, `interface`, `match`, `namespace`,
+`override`, `private`, `protected`, `public`, `struct`, `trait` and `using` are
+kept for later versions. They start no construct yet, and like keywords they
+cannot name a variable, parameter, function or class field; after `.` and as an
+object-literal key they are ordinary names (`o.private`, `{ match: 1 }`).
 
 ### Literals
 
@@ -402,7 +409,6 @@ reference's *Lexical Structure* has the full rules.
 
 // Logical
 &&  ||  !
-and  or       // aliases for &&  ||
 
 // Comparison
 ==  !=  <  <=  >  >=  is
@@ -461,7 +467,11 @@ cfg = {};          // ❌ compile error 1005 (reassigning the binding)
 ```
 
 A change that reaches a const object some other way, through a function
-parameter for example, raises at run time. Use `let` for an object you mutate.
+parameter for example, raises at run time - when the const is the object's only
+holder: a literal, a new object or a fresh result. A const bound to a value
+something else already holds (`const c = x;`) is only a name for it: `x` can
+still change it, because freezing it would freeze it for `x` too. Use `let` for
+an object you mutate.
 
 **Globals**
 
@@ -732,7 +742,7 @@ fn worker(id) {
 
 - `let x;` is illegal - always provide an initializer - forces developers to set a reasonable initial value
 - `let` and `var` at the top level are illegal - use `global name = value;` at module scope
-- `const` prevents rebinding the name and mutating the value it holds
+- `const` prevents rebinding the name and mutating the value through it; a value only it holds is frozen too
 - Declaring `let x` inside a function does not modify a global `x` - use `global x = value;` to declare a new global from within a function
 - Reusing the same name in nested scopes shadows the outer variable
 - `global x = value;` executed again for an existing global (a function that declares it, called twice) warns and redefines it - not a silent no-op; a `VM.Eval` unit may not redefine one at all (1004)
@@ -804,10 +814,11 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 **Arithmetic:** `+` `-` `*` `/` `%` `^^` 
 
 - `/` yields float if any term is float, else int
+- `%` truncates like C's: the result takes the sign of the left side, so `-7 % 3` is `-1` (`Math.Mod` floors, taking the sign of the right side). Dividing by zero raises, `/` and `%` alike, on ints and floats
 - `^^` is exponentiation: `2 ^^ 3` - `8`. It binds tightest and nests to the right: `2 * 3 ^^ 2` is `18`, `2 ^^ 3 ^^ 2` is `512`, and `-2 ^^ 2` is `-4`
 - An assignment is an expression: `a = b = 5` sets both, `let c = (a = 3)` stores and reads `3`. It is still an error as an `if`/`while` condition.
 - `++`/`--` work on variables, fields and elements: `i++`, `o.n++`, `a[i]--`
-- A `nil` operand on either side makes the result `nil`, for every arithmetic and bitwise operator: `nil + 5`, `"a" + nil` and `-nil` are all `nil`. A misspelled field (`o.cuont + 1`) gives `nil` too, not a number. Supply a default with `??` when you need one: `(o.count ?? 0) + 1`
+- A `nil` operand on either side makes the result `nil`, for every arithmetic and bitwise operator: `nil + 5`, `"a" + nil` and `-nil` are all `nil`; only `array + nil` differs, it appends `nil`. A misspelled field (`o.cuont + 1`) gives `nil` too, not a number. Supply a default with `??` when you need one: `(o.count ?? 0) + 1`
 
 **Bitwise:** `&` `|` `^` `~` `<<` `>>` `>>>` (and, or, xor, not, shl, arithmetic shr, logical shr)
 
@@ -815,7 +826,9 @@ Note: `Array.Create` and similar factory functions that do not take an array as 
 
 **Comparison:** `==` `!=` `<` `<=` `>` `>=` `is`
 
-- `x is C` tests for an instance of class `C`, subclasses included; with any other right side it compares identity (`x is nil`). It is not a type test: use `Type.IsInt(x)`, `Type.IsString(x)` and the other `Type.Is*` functions for that
+- `==` compares numbers by value across kinds - an int with a float exactly, never through a rounded double (`9007199254740993 > 9007199254740992.0`), a char by its code (`'a' == 97`), a bool as 0 or 1 - strings and arrays by contents, and anything else by identity; values of kinds that never compare equal are simply unequal
+- `<` `<=` `>` `>=` order numbers with numbers (a char by its code), and a string, array or block with its own kind (bytes and elements in order, the shorter first). A comparison with `nil` is `false`. Any other pair - a string with an int, two objects - raises `InvalidArguments`, as `"a" - 1` does, and is a compile error when the types are known
+- `x is C` tests for an instance of class `C`, subclasses included; with any other right side it is true for the same type and value - numbers and strings by value (a float by its bits, so `NaN is NaN` and `0.0 is -0.0` is false), anything else by identity (`x is nil`). It is not a type test: use `Type.IsInt(x)`, `Type.IsString(x)` and the other `Type.Is*` functions for that
 
 **Logical:** `&&` `||` `!`
 
@@ -918,6 +931,17 @@ let addr = guard(user.address);  // throws if nil
 
 Use `guard` when a nil value means something has gone wrong. For optional values, just use `??` or check directly.
 
+### `capture`
+
+`capture(expr, fallback)` yields the value of `expr`; if evaluating `expr` raises, the exception is dropped and the value of `fallback` is yielded instead. It is a `try`/`catch` for one expression:
+
+```js
+let n = capture(values[i], 0);                   // 0 when i is out of range
+let items = capture(Array.Create(count), []);    // [] when count is not a valid size
+```
+
+`fallback` is evaluated only when `expr` raises, and every exception is caught, as by a `catch` with no filter. When the exception itself matters, use `try`/`catch`.
+
 ### `Weak.Create`
 
 `Weak.Create(expr)` returns a handle on `expr` that does not keep it alive. Read it back with `Weak.Get`, which yields `nil` once the target is gone. It is the way to hold a back-reference without forming a reference cycle:
@@ -949,6 +973,11 @@ Note:
 
 - `await expr;` used as a **statement** discards the resulting value.
 - `let x = await expr;` used in an **expression** keeps the value.
+- `await` on a value that is not a fiber gives the value itself: `await 5` is `5`,
+  and `await Fiber.AwaitAll(fibers)` is the array `Fiber.AwaitAll` already waited for.
+  `Fiber.Await(5)` is `5` too.
+- A fiber keeps how it ended: every `await` of a fiber that returned gives its value,
+  and every `await` of a fiber that raised raises that exception again.
 
 ### Operator Precedence (high to low)
 
@@ -1063,7 +1092,14 @@ foreach (ch in "hello") {
 | Object | property name (string) | property value |
 | String | byte index | byte, as a `char` |
 | Stack, Queue, Deque, Set | index | element (a snapshot taken when the loop starts) |
-| HashMap, OrderedMap | key | value (OrderedMap: insertion order) |
+| HashMap, OrderedMap | key | value, in insertion order |
+
+Over an object the loop walks its members as they are, in insertion order.
+Deleting members during the loop is safe: one not reached yet is skipped. Adding
+members is not: the object can rebuild its storage, and the loop may then skip
+members it has not reached. To add members while looping, loop over
+`Object.Keys(obj)` instead: that list is taken once, so a key deleted meanwhile
+still comes up and reads `nil`.
 
 The loop variables need no annotation: over an `[int]`, `[float]`, `[char]` or
 `[bool]` array the value has the element type, over a `[[T]]` matrix it is a
@@ -1234,6 +1270,10 @@ unless fallthrough is intended.
 Re-raise from a catch with `throw e;`. The same `instanceof` test is available
 as the `is` operator: `if (e is NetworkError) { ... }`.
 
+When only a fallback value matters, `capture(expr, value)` stands in for a
+`try`/`catch` around one expression: the value of `expr`, or `value` if
+evaluating `expr` raised (see [`capture`](#capture)).
+
 `finally` runs on every exit path - normal completion, a caught (or re-raised)
 exception, and `return` / `break` / `continue` that leave the `try` or `catch`
 (the leave runs every enclosing `finally` first, even across loop boundaries).
@@ -1379,12 +1419,13 @@ which always takes precedence (useful when the dependency isn't compiled yet, or
 to be explicit):
 
 ```js
-import { ApiError:class, MAX_RETRIES:int, connect:fn } from library("./net", "1.0");
+import { ApiError, MAX_RETRIES:int, retryDelay:float } from library("./net", "1.0");
 ```
 
 Recognised type names: `nil`, `bool`, `int`, `float`, `char`, `string`, `array`,
-`object`, `class`, `instance`, `fn`, `module`, `fiber`, `stream`, `block`,
-`exception`, `any`, `number`.
+`object`, `instance`, `module`, `fiber`, `stream`, `block`, `exception`, `any`,
+`number`. `class` and `fn` are keywords and are not accepted after the colon in
+an import list; leave a class or function import unannotated.
 
 If a symbol's type is unknown (no annotation and the dependency wasn't available
 at compile time), it is treated as `any` - code still runs correctly at runtime
@@ -1506,7 +1547,7 @@ fn add(a: int, b: int): int {
 
 add(5, 10);         // ✓ OK
 add("x", "y");      // ❌ compile error 1000 - expected int, got string
-add(Json.Parse(s), 1); // checked when called: raises InvalidArgs unless it is an int
+add(Json.Parse(s), 1); // checked when called: raises InvalidArguments unless it is an int
 
 fn count(o): int {
     return o.n;     // o is untyped: the returned value is checked, and a
@@ -1516,8 +1557,8 @@ fn count(o): int {
 Use `any` to explicitly accept all types for a parameter - this disables type checking for that parameter while still annotating the others:
 
 ```js
-fn log(label: str, value: any) {
-    print(label, value);
+fn log(label: string, value: any) {
+    Console.WriteLine(label + ": " + str(value));
 }
 
 log("result", 42);       // ✓ OK
@@ -1801,6 +1842,9 @@ Inside the class body you may declare:
 
 - Instance field defaults declared with `let` in the class body must be **compile-time constant expressions**.
 - `const` declarations inside a class define **static members** (class-level constants).
+- A class holds no variables: a `const`, its own or a base's, and any value a program stores on a
+  class are constants, and writing one again - directly or through a value holding the class -
+  raises `ConstAssign` and keeps the value. Methods can still be replaced.
 
 ### Sealed instance fields
 
@@ -1899,7 +1943,7 @@ class User {
 
 ### The Destructor
 
-`Destructor` is called automatically when the last reference to an instance is released (ref-count drops to zero). Use it to release external resources such as file handles, network connections, or native memory blocks.
+`Destructor` is called automatically after the last reference to an instance is released (ref-count drops to zero). It never runs in the middle of a statement or inside a built-in function: the instance waits, and its destructor runs at the next loop iteration or function call, at the latest when the fiber ends. `VM.CompactMemory()` runs every destructor still waiting. Use it to release external resources such as file handles, network connections, or native memory blocks; a resource that must be released at an exact point gets a method such as `Close()` that the code calls.
 
 ```js
 class FileHandle {
@@ -1920,7 +1964,7 @@ class FileHandle {
 fn Main() {
     let f = new FileHandle("out.txt");
     f.Write("hello");
-    // f goes out of scope here - Destructor is called automatically
+    // f goes out of scope here; its Destructor runs as the fiber ends
 }
 ```
 
@@ -1930,6 +1974,7 @@ Rules and caveats:
 - `this` refers to the instance being freed, exactly as in any other method
 - If `Destructor` throws, the exception is swallowed and a warning is printed - it does **not** propagate
 - `Destructor` is **not** inherited; each class must declare its own if needed
+- Instances still alive when the program exits - in a global, or in a fiber that never finished - are freed without running their `Destructor`
 - Avoid storing `this` anywhere inside `Destructor` - resurrection (re-referencing the dying object) is not supported and results in a dangling pointer
 
 ### Reference cycles
@@ -2194,6 +2239,17 @@ Flaris supports two complementary models that run on the same scheduler:
 - `fn async` creates a fiber-based task
 - `await` runs it to completion and returns the final result
 - `yield` inside async functions is a scheduler hint, not visible to the caller
+
+**Program lifetime.** A program runs while one of its fibers is alive - running,
+ready, sleeping or waiting - or I/O it started is still in flight, so `Main`
+returning does not end it while other fibers live. Timers, events, file watches
+and signal handlers start work only for a live program; alone they keep nothing
+running, so a timer whose callback must run needs a fiber that waits for it
+(`Fiber.Sleep`, an event). When every fiber left waits on something nothing can
+deliver any more - no timer, I/O, file watch or signal handler is left to wake
+one - the program ends with a deadlock report naming each fiber and what it
+waits for, and exit code 6. A host that embeds the VM keeps its timers between
+calls.
 
 ---
 
@@ -2679,13 +2735,14 @@ by source position.
 
 **Symptom**
 
-- `1000: Type mismatch for 'b' (expected compatible with declared type).` on a
-  read of a `T|nil` value.
+- `1000: Type mismatch for 'b': declared int, got nil|int - add '?? 0', or cast with (int), which turns nil into 0.`
+  on a read of a `T|nil` value.
 
 **Fix**
 
 - Prove it is not nil first. The analyzer narrows the value for the region the
-  test covers - the guarded branch, or the rest of the block after an early
+  test covers - the guarded branch (of an `if` or a ternary), the body of a
+  `while`/`for` whose test proves it, or the rest of the block after an early
   exit:
 
 ```js
@@ -2703,7 +2760,8 @@ fn use(a: int|nil) {
 
 `a == nil`, `a != nil` (either operand order), `is_nil(a)`, `!`, and `&&` / `||`
 combinations are all recognised. Narrowing applies to plain variables only, not
-to `a.b` or `a[i]`. If none of these fit, cast: `let ok: int = (int)a;`.
+to `a.b` or `a[i]`. If none of these fit, give a default, `let ok: int = a ?? 0;`, or cast,
+`let ok: int = (int)a;`: a cast to `int` turns `nil` into `0`, and to `float` into `0.0`.
 
 ### Assignment used as a condition
 
@@ -2798,8 +2856,10 @@ while ((line = Next()) != nil) { ... }
 
 - Convert explicitly - `(int)x`, `Convert.ToInt(s)`. Note that `<<`, `>>`, `>>>`, `&`,
   `|` and `^` run on integers only and never widen to float. `+` is never
-  reported: it falls back to string concatenation for any operand pair without
-  a `nil`, and a `nil` operand makes any arithmetic result `nil`.
+  reported: it falls back to string concatenation for operand pairs it has no
+  other rule for, and a value plus an array, or an object plus anything but an
+  object, raises when it runs. A
+  `nil` operand makes any arithmetic result `nil` (`array + nil` appends it).
 
 ## 12. Debugging
 
@@ -2957,6 +3017,7 @@ if (data[i] == nil) {
 Debug.Value(obj)          // deep inspection: type, refs, address, value
 Debug.Assert(actual, expected)  // halt with diff if not equal
 Debug.Pool()              // memory allocator statistics
+Debug.Heap()              // live objects by type and class, with their bytes
 Debug.StackPtr()          // current stack depth (int)
 Debug.Refs(obj)           // reference count of obj
 Debug.GuardAddress(addr)  // software memory watchpoint
@@ -2981,9 +3042,13 @@ Debug.Assert(result, 42);
 **`Debug.GuardAddress` - software memory watchpoint:**
 
 ```js
-Debug.GuardAddress(data);   // any read/write to this address triggers a pause
+Debug.GuardAddress(data);   // the next block read or write at this address stops once
 process(data);
 ```
+
+The access prints the function and line, waits for Enter on a terminal, and
+disarms the watch. `Debug.Pool`, `Debug.Value` and `Debug.GuardAddress` need
+`--unsafe`: they print heap addresses or arm a VM-wide trap.
 
 In VS Code, a data breakpoint at the address arms the same watch and stops in the
 editor, with the stack and locals of the access.
@@ -3129,7 +3194,7 @@ These tours help you get productive quickly if you're coming from another langua
 > **Flaris ≈ C# syntax + scripting flexibility + VM predictability**
 
 **What feels familiar:** classes, methods, `try/catch`, loops, `async/await`  
-**What is different:** no static typing, no GC, fibers instead of Tasks, `nil` instead of null references
+**What is different:** optional type annotations, reference counting instead of a GC, fibers instead of Tasks, `nil` instead of null references
 
 ### Side-by-Side Basics
 
@@ -3140,7 +3205,7 @@ These tours help you get productive quickly if you're coming from another langua
 | `int x = 10;` | `let x = 10;` |
 | `var x = 10;` | `var x = 10;` |
 | `const int MAX = 100;` | `const MAX = 100;` |
-| `x++` | `x += 1;` |
+| `x++` | `x++;` or `x += 1;` |
 
 **Functions:**
 
@@ -3245,7 +3310,7 @@ fn async compute() { return 42; }
 var v = await compute();  // compute() returns a fiber
 ```
 
-Mental model: a **fiber** ≈ a `Task`, but cooperatively scheduled. No OS threads, no preemption, no race conditions.
+Mental model: a **fiber** ≈ a `Task`, but cooperatively scheduled on one thread. A fiber gives way at an `await`, a sleep, an I/O wait, or when its time slice runs out at a loop back-edge or a call - so two fibers never run at once, but a long loop does not hold the others up.
 
 **Errors:**
 
@@ -3265,7 +3330,7 @@ try {
 - ✔ Think like C# for **structure**
 - ✔ Think like a scripting language for **flexibility**
 - ✔ Think like a VM for **performance**
-- ✖ Don't rely on static typing
+- ✖ Don't expect every type checked at compile time - annotations are optional
 - ✖ Don't rely on GC behavior - use reference counting patterns
 
 ---
@@ -3283,10 +3348,10 @@ try {
 | --------- | ------------ |-------- |
 | `undefined` | Yes | No - just `nil` |
 | null | Dangerous | Safe `nil` |
-| Globals | Implicit | Explicit `let` at top level |
+| Globals | Implicit | Explicit `global` at top level |
 | Prototypes | Implicit | Classes |
 | Event loop | Mandatory | Fiber scheduler |
-| Implicit coercion | Yes | No |
+| Implicit coercion | Yes | Only `+` with a string: the other side becomes text |
 
 ### Side-by-Side
 
@@ -3367,7 +3432,7 @@ class Point {
 - ✔ Predictable semantics - no coercion surprises
 - ✔ No event-loop surprises
 - ✖ No `undefined`
-- ✖ No implicit coercion
+- ✖ No implicit coercion beyond `+` with a string
 
 ---
 
@@ -3378,11 +3443,11 @@ class Point {
 > **Rust's safety goals applied to a dynamic, embeddable VM**
 
 **What feels familiar:** predictable execution, no undefined behavior, explicit control flow, strong safety defaults  
-**What is different:** dynamic typing, reference counting (not borrowing), runtime errors (not `Result<T,E>`)
+**What is different:** dynamic typing with optional annotations, reference counting (not borrowing), runtime errors (not `Result<T,E>`)
 
 | Concept | Rust | Flaris |
 | --------- | ------ | -------- |
-| Typing | Static | Dynamic |
+| Typing | Static | Dynamic; optional annotations checked at compile time |
 | Memory | Ownership + borrowing | Reference counting |
 | Nulls | `Option<T>` | Safe `nil` |
 | Errors | `Result<T, E>` | Runtime exceptions |
@@ -3482,13 +3547,11 @@ Mental model: no data races by default, cooperative scheduling.
 - ✔ No undefined behavior
 - ✔ Explicit performance costs
 - ✔ Strong safety defaults
-- ✖ No compile-time type guarantees
+- ✖ Type checks only where annotations are written
 - ✖ No zero-cost abstractions
 - ✖ Errors are runtime, not typed
 
 Think of Flaris as **a safe, dynamic VM - not a systems language**.
-
----
 
 ---
 

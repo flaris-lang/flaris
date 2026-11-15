@@ -170,6 +170,7 @@ fn addRoutes(srv) {
     srv.Get("/status/:code", sendStatus);
     srv.Post("/status/:code", sendStatus);
     srv.Get("/redirect/:n", sendRedirect);
+    srv.Post("/see-other", fn(_req, res) { res.Redirect("/anything", 303); });
     srv.Get("/json", sendJson);
     srv.Get("/delay/:ms", sendDelayed);
     srv.Get("/peer", fn(req, res) { res.Json({ peer: req.peer }); });
@@ -731,6 +732,21 @@ fn test_status_codes() {
 //  Redirect following
 // --------------------------------------------------------
 
+// A header the caller sets replaces the automatic one rather than joining it.
+fn test_header_overrides() {
+    Console.WriteLine("== caller headers ==");
+    let ct = Http.Post(base + "/anything", "x", { "Content-Type": "text/x-custom" });
+    checkEq(Json.Parse(ct.body).headers["Content-Type"], "text/x-custom", "a caller's Content-Type is the only one sent");
+    let hh = Http.Get(base + "/headers", { "Host": "example.test" });
+    checkEq(statusOf(hh), Status.OK, "a caller's Host replaces the automatic one");
+    checkEq((hh == nil || hh.body == nil) ? nil : Json.Parse(hh.body).headers["Host"], "example.test", "... and is the one the server sees");
+    let so = Http.Post(base + "/see-other", "payload", { "Content-Type": "text/x-custom" });
+    let sj = Json.Parse(so.body);
+    checkEq(sj.method, "GET", "a 303 is followed with GET");
+    checkEq(Object.TryGet(sj.headers, "Content-Type", nil), nil, "... without the POST body's Content-Type");
+    return 0;
+}
+
 fn test_redirect() {
     Console.WriteLine("== Redirect ==");
 
@@ -855,6 +871,14 @@ fn test_curl() {
     check(res2 != nil,                "curl: omitted options not nil");
     checkEq(statusOf(res2), Status.OK, "curl: omitted options status 200");
 
+    // A body starting with "@" is sent as written, not read from that file.
+    let secret = Path.Combine(tmpDir, "flaris_curl_secret.txt");
+    File.WriteText(secret, "SECRET-CONTENT");
+    let at = Http.Curl(base + "/bytes", { method: "POST", body: "@" + secret });
+    let atBytes = (at == nil) ? nil : Json.Parse(at.body);
+    checkEq((atBytes == nil) ? -1 : len(atBytes.bytes), len(secret) + 1, "curl: an @body is sent literally");
+    File.Delete(secret);
+
     return 0;
 }
 
@@ -873,6 +897,14 @@ fn test_wget() {
     }
     checkEq(res.path, dest, "wget: path matches dest");
     checkEq(statusOf(res), Status.OK, "wget: status 200");
+
+    // A "URL" starting with "-" is not read as an option: as one, this would
+    // fetch whatever the list file names.
+    let list = Path.Combine(tmpDir, "flaris_wget_list.txt");
+    File.WriteText(list, base + "/get\n");
+    let opt = Http.WGet("--input-file=" + list, Path.Combine(tmpDir, "flaris_wget_opt.json"));
+    check(opt == nil || statusOf(opt) != Status.OK, "wget: a URL starting with - is not an option");
+    File.Delete(list);
 
     // WGet has no option to accept a self-signed certificate; a wgetrc that
     // names the local certificate as the CA lets wget verify it.
@@ -1341,6 +1373,7 @@ fn async Main() {
         test_delete();
         test_status_codes();
         test_redirect();
+        test_header_overrides();
         test_query_string();
         test_error_paths();
         test_curl();

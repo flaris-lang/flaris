@@ -21,9 +21,10 @@
 //   keyFile     an unencrypted OpenSSH private key file (ssh-ed25519)
 //   key         the same key as text, when it is not on disk
 //   hostKey     pin the server: its key as known_hosts shows it,
-//               "ssh-ed25519 AAAA..." or the base64 alone. Without a pin the
-//               first key seen is accepted and returned as hostKey, so the
-//               caller can store it and pin the next connection.
+//               "ssh-ed25519 AAAA..." or the base64 alone. Without a pin,
+//               Connect fails with errorKind "hostkey" and returns the key
+//               the server proved it holds as hostKey, for the caller to
+//               check and pin. "any" accepts whatever key the server has.
 //   timeoutMs   how long each socket wait may take                (default 10000)
 //   version     the client's version string                     (default "Flaris_1.0")
 //
@@ -233,6 +234,7 @@ class SshClient
     let _seqIn: int = 0;
 
     let _nextChannel: int = 0;
+    let _inKex: bool = false;     // a key exchange is running; a KEXINIT then is its own
 
     fn Constructor(host: string, port: int, opts?) {
         _host = host;
@@ -365,6 +367,14 @@ class SshClient
             if (p == nil) { return nil; }
             let t = Buffer.ReadU8At(p, 0);
             if (Array.Contains(wanted, t)) { return p; }
+            // A server rekeys on its own schedule (OpenSSH after about 1 GB,
+            // Dropbear after hours): its KEXINIT can arrive in the middle of
+            // anything, and is answered with a full exchange under the old keys.
+            if (t == _KEXINIT && _encrypted && !_inKex) {
+                let kx = this._keyExchange(p);
+                if (!kx.ok) { _lastError = "rekey failed: " + str(kx.error); _lastKind = kx.errorKind ?? "protocol"; return nil; }
+                continue;
+            }
             if (t == _DISCONNECT) {
                 let r = new _Reader(p);
                 r.Byte(); r.U32();
@@ -395,9 +405,14 @@ class SshClient
         _sock = Fiber.Await(Stream.ConnectAsync("tcp", _host, _port, _timeoutMs)); // on the I/O pool: only this fiber waits
         if (_sock == nil) { return { ok: false, error: "cannot connect to " + _host + ":" + str(_port), errorKind: "connect" }; }
         Stream.SetTimeout(_sock, _timeoutMs);
+        // A reconnect is a new session: keys derive from its own exchange hash,
+        // and channel numbers start again.
         _encrypted = false;
         _seqOut = 0;
         _seqIn = 0;
+        _sessionId = nil;
+        _hostKeyBlob = nil;
+        _nextChannel = 0;
 
         if (!this._write(_vc + "\r\n")) { return this._fail("connect", "write failed"); }
         // The server may send banner lines before its version.
@@ -415,7 +430,11 @@ class SshClient
         }
 
         let kex = this._keyExchange();
-        if (!kex.ok) { return this._fail(kex.errorKind, kex.error); }
+        if (!kex.ok) {
+            let f = this._fail(kex.errorKind, kex.error);
+            f.hostKey = kex.hostKey;
+            return f;
+        }
         _connected = true;
 
         let auth = this._authenticate(user);
@@ -423,7 +442,14 @@ class SshClient
         return { ok: true, hostKey: this.HostKey() };
     }
 
-    fn _keyExchange() {
+    // serverInit: the server's KEXINIT when it started the exchange (a rekey).
+    fn _keyExchange(serverInit?) {
+        _inKex = true;
+        try { return this._keyExchangeRun(serverInit); }
+        finally { _inKex = false; }
+    }
+
+    fn _keyExchangeRun(serverInit) {
         let init = new _Bytes();
         init.Byte(_KEXINIT).Raw(Crypto.RandomBytes(16))
             .Str(_KEX_NAMES).Str(_HOSTKEY_NAMES)
@@ -435,7 +461,7 @@ class SshClient
         let ic = init.Build();
         if (!this._send(ic)) { return { ok: false, error: "write failed", errorKind: "closed" }; }
 
-        let sInit = this._expect([_KEXINIT]);
+        let sInit = (serverInit != nil) ? serverInit : this._expect([_KEXINIT]);
         if (sInit == nil) { return { ok: false, error: _lastError, errorKind: _lastKind }; }
         let sr = new _Reader(sInit);
         sr.Byte(); sr.Bytes(16);
@@ -472,13 +498,14 @@ class SshClient
             return { ok: false, error: "malformed key exchange reply", errorKind: "protocol" };
         }
 
-        // Host key: pinned, or trusted on first sight.
+        // Host key: pinned, or "any"; without either it is checked and
+        // reported below, but not trusted.
         let kr = new _Reader(ks);
         if (kr.Text() != "ssh-ed25519") { return { ok: false, error: "host key is not ssh-ed25519", errorKind: "hostkey" }; }
         let hostPub = kr.Str();
         if (hostPub == nil || len(hostPub) != 32) { return { ok: false, error: "malformed host key", errorKind: "hostkey" }; }
         let pin = Object.TryGet(_opts, "hostKey", nil);
-        if (pin != nil) {
+        if (pin != nil && pin != "any") {
             let expect = _pinBlob(pin);
             if (expect == nil || !Buffer.Equals(expect, ks)) {
                 return { ok: false, error: "host key mismatch: server presents ssh-ed25519 " + Util.Base64Encode(ks), errorKind: "hostkey" };
@@ -497,22 +524,32 @@ class SshClient
             return { ok: false, error: "host key signature does not verify", errorKind: "hostkey" };
         }
         _hostKeyBlob = ks;
+        // Trusting whatever key answers is what lets a machine in the middle
+        // read the password. The key is real (it signed this exchange), so it
+        // is reported for the caller to check and pin.
+        if (pin == nil) {
+            return { ok: false, errorKind: "hostkey", hostKey: this.HostKey(),
+                     error: "unknown host key " + this.HostKey()
+                            + " - pin it with the hostKey option, or pass hostKey: \"any\" to accept any key" };
+        }
         if (_sessionId == nil) { _sessionId = h; }
 
         // Keys: HASH(K || H || letter || session_id), extended by hashing again.
+        // Staged, not installed: in a rekey both NEWKEYS messages still travel
+        // under the old keys, and each direction switches only after its own.
         let km = new _Bytes();
         km.Mpint(shared);
         let kEnc = km.Build();
-        _cK2 = this._deriveKey(kEnc, h, "C", 64);
-        _cK1 = Buffer.Slice(_cK2, 32, 32);
-        _cK2 = Buffer.Slice(_cK2, 0, 32);
-        _sK2 = this._deriveKey(kEnc, h, "D", 64);
-        _sK1 = Buffer.Slice(_sK2, 32, 32);
-        _sK2 = Buffer.Slice(_sK2, 0, 32);
+        let cK = this._deriveKey(kEnc, h, "C", 64);
+        let sK = this._deriveKey(kEnc, h, "D", 64);
 
         let nk = new _Bytes();
         if (!this._send(nk.Byte(_NEWKEYS).Build())) { return { ok: false, error: "write failed", errorKind: "closed" }; }
+        _cK1 = Buffer.Slice(cK, 32, 32);
+        _cK2 = Buffer.Slice(cK, 0, 32);
         if (this._expect([_NEWKEYS]) == nil) { return { ok: false, error: _lastError, errorKind: _lastKind }; }
+        _sK1 = Buffer.Slice(sK, 32, 32);
+        _sK2 = Buffer.Slice(sK, 0, 32);
         _encrypted = true;
         return { ok: true };
     }
@@ -610,7 +647,10 @@ class SshClient
         let cr = new _Reader(conf);
         if (cr.Byte() == _CHANNEL_OPEN_FAILURE) {
             cr.U32(); cr.U32();
-            return this._execFail("protocol", "channel refused: " + (cr.Text() ?? ""));
+            // No channel was opened, so nothing is left in flight: the
+            // connection stays usable.
+            return { ok: false, error: "channel refused: " + (cr.Text() ?? ""), errorKind: "protocol",
+                     stdout: "", stderr: "", exitStatus: -1 };
         }
         cr.U32();
         let theirs = cr.U32();
@@ -634,7 +674,9 @@ class SshClient
             if (p == nil) { return this._execFail(_lastKind, _lastError); }
             let r = new _Reader(p);
             let t = r.Byte();
-            r.U32(); // our channel number; one channel at a time
+            // A packet for another channel - what an earlier, abandoned
+            // command still had in flight - is not this command's output.
+            if (r.U32() != mine) { continue; }
             if (t == _CHANNEL_FAILURE) { return this._execFail("protocol", "server refused to run the command"); }
             if (t == _CHANNEL_SUCCESS) { accepted = true; }
             else if (t == _CHANNEL_DATA || t == _CHANNEL_EXTENDED_DATA) {
@@ -671,8 +713,11 @@ class SshClient
         return { ok: true, stdout: String.Join(stdout, ""), stderr: String.Join(stderr, ""), exitStatus: exitStatus };
     }
 
+    // A command that fails once its channel is open may still have output on
+    // the way, and the server may block on a window nobody adjusts any more;
+    // the connection is closed rather than left half in use.
     fn _execFail(kind: string, msg: string) {
-        if (kind == "closed" || kind == "timeout") { this.Close(); }
+        this.Close();
         return { ok: false, error: msg, errorKind: kind, stdout: "", stderr: "", exitStatus: -1 };
     }
 }

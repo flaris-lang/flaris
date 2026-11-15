@@ -531,6 +531,23 @@ fn test_validator() {
     check(ok(1, { type: ["string", "integer"] }), "3.1 type array");
     check(ok("a", { enum: ["a", "b"] }) && !ok("c", { enum: ["a", "b"] }), "enum");
     check(ok(3, { "const": 3 }) && !ok(4, { "const": 3 }), "const");
+
+    // Too deep is an error, never a pass (the check used to sit past the
+    // frame limit, where it returned "valid").
+    let nest = fn(d) {
+        var s = { type: "integer" };
+        var v = "not an integer";
+        var i = 0;
+        while (i < d) { s = { type: "object", properties: { c: s } }; v = { c: v }; i += 1; }
+        return [v, s];
+    };
+    let at = nest(16);
+    checkEq(len(OpenApi.ValidateValue(at[0], at[1], nil)), 1, "16 levels are validated to the bottom");
+    let past = nest(17);
+    let errs = OpenApi.ValidateValue(past[0], past[1], nil);
+    check(len(errs) == 1 && String.Contains(errs[0].message, "deeper"), "17 levels are refused: " + str(errs));
+    let combo = { anyOf: [past[1]] };
+    check(len(OpenApi.ValidateValue(past[0], combo, nil)) > 0, "a too-deep branch does not satisfy anyOf");
     checkEq(OpenApi.ValidateValue("x", { type: "integer" }, nil)[0].message, "expected integer, got string", "type message");
 
     check(ok("abc", { type: "string", minLength: 3, maxLength: 3 }), "length bounds inclusive");
@@ -575,6 +592,11 @@ fn test_validator() {
     checkEq(OpenApi.ValidateValue({ id: 1, friend: { id: "x" } }, { "$ref": "#/components/schemas/Pet" }, schemas)[0].path, "value.friend.id", "nested $ref error path");
     checkEq(OpenApi.ValidateValue(1, { "$ref": "#/components/schemas/Nope" }, schemas)[0].message, "unresolved $ref #/components/schemas/Nope", "unresolved ref reported");
     check(ok(nil, { allOf: [{ "$ref": "#/components/schemas/Pet" }], nullable: true }), "nullable ref wrapper accepts nil");
+    check(len(OpenApi.ValidateValue(nil, { allOf: [{ "$ref": "#/components/schemas/Pet" }] }, schemas)) > 0,
+          "null fails an allOf whose branch is an object");
+    check(!ok(nil, { anyOf: [{ type: "string" }, { type: "integer" }] }), "null fails an anyOf with no null branch");
+    check(!ok(nil, { oneOf: [{ type: "string" }, { type: "integer" }] }), "null fails a oneOf with no null branch");
+    check(ok(nil, { anyOf: [{ type: "string" }, { type: "null" }] }), "null passes an anyOf with a null branch");
 
     check(ok(5, { allOf: [{ type: "integer" }, { minimum: 3 }] }) && !ok(2, { allOf: [{ type: "integer" }, { minimum: 3 }] }), "allOf");
     check(ok("x", { anyOf: [{ type: "integer" }, { type: "string" }] }) && !ok(true, { anyOf: [{ type: "integer" }, { type: "string" }] }), "anyOf");
@@ -677,8 +699,28 @@ fn test_validate_middleware() {
 
     api3.Unserve();
     checkEq(app3._dispatch(mkReq("GET", "/undeclared")).status, 418, "Unserve turns Validate into a pass-through");
+
+    // The router answers HEAD with the GET route, so HEAD is validated as GET.
+    checkEq(app._dispatch(mkReq("HEAD", "/pets/abc")).status, 400, "HEAD is validated like GET");
+
+    // A loaded document's path-level parameters apply to every operation.
+    let doc = { openapi: "3.1.0", info: { title: "L", version: "1" }, paths: { "/items/{id}": {
+        parameters: [{ name: "id", "in": "path", required: true, schema: { type: "integer" } }],
+        get: { parameters: [{ name: "key", "in": "query", required: true, schema: { type: "string" } }],
+               responses: { "200": { description: "ok" } } } } } };
+    let api4 = OpenApi.Load(doc);
+    let app4 = new Router();
+    app4.Use(api4.Validate());
+    app4.Get("/items/:id", fn(r) { return Response.Text("item", nil); });
+    let noKey = app4._dispatch(mkReq("GET", "/items/notanint"));
+    checkEq(noKey.status, 400, "path-level parameter is validated");
+    checkJson(errPaths(Json.Parse(noKey.body).details), ["path.id", "query.key"], "path-level and operation parameters both checked");
+    let okItem = mkReq("GET", "/items/7"); okItem.query = { key: "k" };
+    checkEq(app4._dispatch(okItem).status, 200, "a conforming request to a loaded document passes");
+
     api.Unserve();
     api2.Unserve();
+    api4.Unserve();
 }
 
 // ---------------------------------------------------------------------------

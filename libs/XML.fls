@@ -43,8 +43,11 @@
 //   let fdoc = XML.ParseFile("config.xml");
 //
 // Parsing:
-//   XML.Parse(source:string)         →  root node (or nil on error)
-//   XML.ParseFile(path:string)       →  root node (or nil on error)
+//   XML.Parse(source:string, opts?)  →  root node (or nil on error)
+//   XML.ParseFile(path:string, opts?) → root node (or nil on error)
+//   opts: { maxDepth } - elements nested deeper make the document an error
+//   (nil). Default XML.MAX_DEPTH, 32: Build, Pretty and the searches below
+//   recurse a call frame per level, and a fiber has 64.
 //
 // Serialization:
 //   XML.Build(node)                  →  compact XML string
@@ -63,6 +66,8 @@
 
 class XML {
 
+    const MAX_DEPTH = 32;     // default maxDepth for Parse
+
     let _results: array = [];
     let _parts:   array = [];
 
@@ -80,7 +85,8 @@ class XML {
     //   4  text node of a mixed element, in document order; flag 16 = holds "&"
     //   5  one of several text runs of the element; flag 16 = holds "&"
     //   6  CDATA section (element = its parent, -1 for none)
-    //   7  closing tag whose name differs from the element's tag
+    //   7  closing tag whose name differs from the element's tag, or (with
+    //      element -1) an element nested past maxDepth; the scan stops there
     //   8  the element's only text run, already trimmed; flag 16 = holds "&",
     //      flag 32 = decoding it can expose whitespace at an end
     //   9  the element's text runs are complete and want trimming
@@ -253,7 +259,7 @@ class XML {
         return n;
     }
 
-    fn static _scan(s: string) : [int] {
+    fn static _scan(s: string, maxDepth: int) : [int] {
         let ev = Array.Create(0, Type.Int);
         let n  = len(s);
 
@@ -271,7 +277,9 @@ class XML {
         var elems  = 0;
         var amp    = -1;     // first "&" at or after the last range tested; n = none left
         let nameStop = " \t\n\r>/=\"'<";   // characters that end a name
-        var pos    = XML._ws(s, 0, n);
+        // A UTF-8 byte-order mark is not content.
+        let bom = String.StartsWith(s, "\u{FEFF}") ? len("\u{FEFF}") : 0;
+        var pos    = XML._ws(s, bom, n);
         if (pos >= n || s[pos] != '<') { return ev; }
         var markup = true;   // pos is on a "<" that starts markup
 
@@ -372,8 +380,10 @@ class XML {
                 skipped = true;
             }
             if (skipped) {
-                pos = XML._ws(s, pos, n);
+                // Only between top-level items is the whitespace after it
+                // insignificant; inside an element it is text ("foo<!--c--> bar").
                 if (depth == 0) {
+                    pos = XML._ws(s, pos, n);
                     if (pos < n && s[pos] == '<') {
                         markup = true;
                         continue;
@@ -417,6 +427,10 @@ class XML {
             }
             elems += 1;
             depth += 1;
+            if (depth > maxDepth) {
+                XML._ev(ev, 7, 0, -1);
+                return ev;
+            }
             pos = ne;
 
             while (true) {
@@ -471,9 +485,12 @@ class XML {
             if (pos < n && s[pos] == '>') { pos += 1; }
         }
 
-        // Elements still open at the end of the input end there.
+        // Elements still open at the end of the input: the document was cut
+        // short, which Parse reports as an error (the same event as a
+        // mismatched end tag).
         while (depth > 0) {
             depth -= 1;
+            XML._ev(ev, 7, 0, dElem[depth]);
             let r = dRuns[depth];
             if (r > 0) {
                 XML._textDone(s, ev, dElem[depth], r, dRunAt[depth], dRunEnd[depth], dRunAmp[depth]);
@@ -681,10 +698,10 @@ class XML {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    fn static Parse(source: string) {
+    fn static Parse(source: string, opts?) {
         if (source == nil) return nil;
         let src   = str(source);
-        let ev    = XML._scan(src);
+        let ev    = XML._scan(src, (opts != nil && opts.maxDepth != nil) ? opts.maxDepth : MAX_DEPTH);
         let m     = len(ev);
         var elems = [];     // element nodes in document order
         var root  = nil;
@@ -746,7 +763,8 @@ class XML {
                     Array.Append(elems[parent].children, cdata);
                 }
             } else if (kind == 7) {
-                Console.WriteLine("[XML] Warning: mismatched tag </" + String.Substr(src, ev[i + 1], w >> 8) + "> inside <" + elems[ev[i + 2]].tag + ">");
+                // A mismatched or missing end tag: not a well-formed document.
+                return nil;
             }
             i += 3;
         }
@@ -754,10 +772,10 @@ class XML {
     }
 
     // Parse XML from a file. Returns nil if the file cannot be read.
-    fn static ParseFile(path: string) {
+    fn static ParseFile(path: string, opts?) {
         let src = File.ReadText(path);
         if (src == nil) return nil;
-        return XML.Parse(src);
+        return XML.Parse(src, opts);
     }
 
     fn static Build(node) : string {

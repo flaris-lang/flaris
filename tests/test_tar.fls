@@ -279,6 +279,20 @@ fn test_gzip() {
     broken[0] = 0x1F; broken[1] = 0x8B;
     check(Tar.Read(broken) == nil, "broken gzip is an error");
 
+    // Limits. The plain image is a whole number of 10 KiB records.
+    let plain = w.ToBlock();
+    check(Tar.Read(gz, { maxBytes: len(plain) - 1 }) == nil, "tar.gz over maxBytes -> nil");
+    check(String.Contains(str(Tar.LastError()), "maxBytes"), "LastError names maxBytes");
+    checkEq(len(Tar.Read(gz, { maxBytes: len(plain) })), 2, "tar.gz at maxBytes reads");
+    check(Tar.List(plain, { maxBytes: len(plain) - 1 }) == nil, "plain tar over maxBytes -> nil");
+    check(Tar.List(plain, { maxEntries: 1 }) == nil, "over maxEntries -> nil");
+    check(String.Contains(str(Tar.LastError()), "maxEntries"), "LastError names maxEntries");
+    checkEq(len(Tar.List(plain, { maxEntries: 2 })), 2, "at maxEntries lists");
+    let lim = Directory.CreateTemp("flaris_tar_lim");
+    check(Tar.ExtractTo(gz, lim, { maxEntries: 1 }) == nil, "ExtractTo over a limit -> nil");
+    check(!File.Exists(lim + "/a.txt"), "and writes nothing");
+    Directory.DeleteAll(lim);
+
     let dir = Directory.CreateTemp("flaris_tar_gz");
     check(w.Save(dir + "/out/a.tgz"), "Save creates the directory and writes .tgz");
     let saved = File.ReadAllBytes(dir + "/out/a.tgz");
@@ -377,7 +391,28 @@ fn test_extract_hostile() {
         checkEq(File.ReadText(out + "/hard"), "fine", "a hard link inside the root is made");
         check(!File.Stat(out + "/victim.txt").IsSymlink, "a link on disk at the entry's path is replaced");
         checkEq(File.ReadText(out + "/victim.txt"), "replaced", "... not written through");
+
+        // "d/l -> .." is the root itself, so "d/l/../marker" reads as d/marker
+        // but the OS resolves it above the root.
+        File.WriteText(base + "/marker", "outside");
+        let w2 = Tar.Create();
+        w2.AddDirectory("d");
+        w2.AddSymlink("d/l", "..");
+        w2.AddSymlink("escape", "d/l/../marker");
+        let r2 = Tar.ExtractTo(w2.ToBlock(), out);
+        check(String.Contains(String.Join(r2.skipped, ","), "escape"), "a link whose .. follows a name is skipped");
+        check(File.ReadText(out + "/escape") == nil, "nothing outside is reachable through it");
     }
+    let nb = Buffer.Create(1, 1);
+    nb[0] = 0;
+    check(Tar.SafeName("evil.sh" + Buffer.ToString(nb) + ".png") == nil, "SafeName refuses a NUL");
+
+    // The archive's own root, "./", is not reported as a refused name.
+    let rw = Tar.Create();
+    rw.AddDirectory("./");
+    rw.AddFile("./in.txt", "x");
+    let rr = Tar.ExtractTo(rw.ToBlock(), out);
+    checkEq(len(rr.skipped), 0, "./ is not reported as skipped");
     checkEq(Tar.SafeName("./a//b/"), "a/b", "SafeName normalises");
     check(Tar.SafeName("../x") == nil && Tar.SafeName("/x") == nil && Tar.SafeName("..\\x") == nil,
           "SafeName refuses what escapes");

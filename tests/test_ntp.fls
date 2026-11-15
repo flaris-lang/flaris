@@ -1,0 +1,201 @@
+// test_ntp.fls - Test suite for Ntp.fls
+//
+// The packet layer (build/parse, offset math) is tested in-process with a
+// crafted reply. The live round trip runs against tests/fake_ntp.py, an SNTP
+// responder on 127.0.0.1 - no internet, no --unsafe - and is skipped when
+// python3 is not available.
+//
+// Run: flarisvm tests/test_ntp.fls --libs='./libs'
+
+import { Ntp } from library("Ntp", "1.0");
+
+global passed = 0;
+global failed = 0;
+
+fn chk(label:string, cond:bool) {
+    if (cond) { passed += 1; }
+    else { failed += 1; Console.WriteLine("[FAIL] " + label); }
+}
+
+fn chkEq(label:string, got, expected) {
+    if (got == expected) { passed += 1; }
+    else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label + " - expected: " + str(expected) + "  got: " + str(got));
+    }
+}
+
+fn chkNear(label:string, got, expected, eps:float) {
+    var d = got - expected;
+    if (d < 0.0) { d = -d; }
+    if (got != nil && d <= eps) { passed += 1; }
+    else {
+        failed += 1;
+        Console.WriteLine("[FAIL] " + label + " - expected: " + str(expected) + "  got: " + str(got));
+    }
+}
+
+// ============================================================
+// Packet layer, no network
+// ============================================================
+
+fn testEpochConversion() {
+    Console.WriteLine("--- epoch conversion ---");
+    let t = Ntp.UnixToNtp(764426119.25);
+    chkNear("NtpToUnix(UnixToNtp(x))", Ntp.NtpToUnix(t.secs, t.frac), 764426119.25, 1e-6);
+    chkEq("1970-01-01 is NTP 2208988800", Ntp.UnixToNtp(0.0).secs, 2208988800);
+    chkNear("NTP 0 is unix -2208988800", Ntp.NtpToUnix(0, 0), -2208988800.0, 1e-9);
+    chkNear("frac half", Ntp.NtpToUnix(2208988800, 2147483648), 0.5, 1e-6);
+}
+
+fn testBuildRequest() {
+    Console.WriteLine("--- BuildRequest ---");
+    let req = Ntp.BuildRequest();
+    chkEq("48 bytes", len(req), 48);
+    chkEq("LI=0 VN=4 mode=3 (0x23)", req[0], 0x23);
+    chkEq("rest is zero", req[1], 0);
+    let t = Ntp._tsAt(req, 40);
+    let now = Time.NowMillis() / 1000.0;
+    chk("transmit is now", t > now - 2.0 && t < now + 2.0);
+    let r3 = Ntp.BuildRequest(3);
+    chkEq("VN=3 -> 0x1B", r3[0], 0x1B);
+}
+
+// A crafted server reply: server clock 2 s ahead of the client's.
+// t0 = 1000.00 (client send), t1 = 1002.05 (server recv), t2 = 1002.06 (server
+// tx), t3 = 1000.10 (client recv)  =>  offset = 2.005, rtt = 0.09.
+fn makeReply(): block {
+    let b = Buffer.Create(48, 1);
+    b[0] = 0x24;                    // LI=0, VN=4, mode=4 (server)
+    b[1] = 2;                       // stratum
+    b[2] = 6;                       // poll
+    b[3] = 0xEC;                    // precision -20
+    Ntp._w32(b, 4, 0x00010000);     // root delay 1.0 s (16.16 fixed point)
+    Ntp._w32(b, 8, 0x00008000);     // root dispersion 0.5 s
+    b[12] = 71; b[13] = 80; b[14] = 83; b[15] = 0;   // "GPS\0"
+    Ntp._setTs(b, 16, 764426000.0); // reference
+    Ntp._setTs(b, 24, 1000.00);     // originate (client's transmit)
+    Ntp._setTs(b, 32, 1002.05);     // receive
+    Ntp._setTs(b, 40, 1002.06);     // transmit
+    return b;
+}
+
+fn testParseResponse() {
+    Console.WriteLine("--- ParseResponse ---");
+    let o = Ntp.ParseResponse(makeReply(), 1000.0, 1000.10);
+    chk("parsed", o != nil);
+    chkEq("ok", o.ok, true);
+    chkEq("mode 4 (server)", o.mode, 4);
+    chkEq("version 4", o.version, 4);
+    chkEq("leap 0", o.leap, 0);
+    chkEq("stratum", o.stratum, 2);
+    chkEq("poll", o.poll, 6);
+    chkEq("precision -20", o.precision, -20);
+    chkNear("rootDelay 1.0", o.rootDelay, 1.0, 1e-9);
+    chkNear("rootDispersion 0.5", o.rootDispersion, 0.5, 1e-9);
+    chkEq("referenceId", o.referenceId, "GPS");
+    chkNear("referenceTime", o.referenceTime, 764426000.0, 1e-3);
+    chkNear("originateTime", o.originateTime, 1000.0, 1e-6);
+    chkNear("receiveTime", o.receiveTime, 1002.05, 1e-6);
+    chkNear("transmitTime", o.transmitTime, 1002.06, 1e-6);
+    chkNear("offset 2.005", o.offset, 2.005, 1e-6);
+    chkNear("rtt 0.09", o.rtt, 0.09, 1e-6);
+    chkNear("serverTime = t3 + offset", o.serverTime, 1002.105, 1e-6);
+    chkNear("localSend", o.localSend, 1000.0, 1e-9);
+    chkNear("localRecv", o.localRecv, 1000.10, 1e-9);
+
+    // also accepts a string packet
+    let o2 = Ntp.ParseResponse(Buffer.ToString(makeReply()), 1000.0, 1000.10);
+    chk("string packet parses", o2 != nil);
+    chkNear("string offset", o2.offset, 2.005, 1e-6);
+
+    // garbage
+    chk("short packet -> nil", Ntp.ParseResponse(Buffer.Create(10, 1), 0.0, 1.0) == nil);
+    chk("nil -> nil", Ntp.ParseResponse(nil, 0.0, 1.0) == nil);
+}
+
+// ============================================================
+// Live round trip against tests/fake_ntp.py on 127.0.0.1
+// ============================================================
+
+fn runLiveChecks(port:int) {
+    Console.WriteLine("--- live query via tests/fake_ntp.py on 127.0.0.1:" + str(port) + " ---");
+    let r = Ntp.Query("127.0.0.1", { port: port, timeoutMs: 2000 });
+    chk("query answered", r != nil);
+    if (r == nil) { return; }
+    chkEq("ok", r.ok, true);
+    chkEq("server", r.server, "127.0.0.1");
+    chkEq("port", r.port, port);
+    chkEq("mode 4", r.mode, 4);
+    chkEq("stratum 2", r.stratum, 2);
+    chkEq("leap 0", r.leap, 0);
+    chkEq("referenceId LOCL", r.referenceId, "LOCL");
+    chk("offset small (same machine)", r.offset > -5.0 && r.offset < 5.0);
+    chk("rtt sane", r.rtt >= 0.0 && r.rtt < 2.0);
+    let now = Time.NowMillis() / 1000.0;
+    chk("serverTime close to local now", r.serverTime > now - 5.0 && r.serverTime < now + 5.0);
+    chk("originate echoed", r.originateTime > now - 5.0 && r.originateTime < now + 5.0);
+
+    // Now() convenience
+    let t = Ntp.Now("127.0.0.1", { port: port, timeoutMs: 2000 });
+    chk("Now returns a time", t != nil && t > now - 5.0 && t < now + 5.0);
+
+    // a second query still works (socket was closed properly)
+    let r2 = Ntp.Query("127.0.0.1", { port: port, timeoutMs: 2000 });
+    chk("second query answered", r2 != nil && r2.ok);
+
+    // Replies that are not a synchronised server's answer to this request are
+    // not used: the fake sends one per request version.
+    chk("kiss-o'-death (stratum 0) -> nil", Ntp.Query("127.0.0.1", { port: port, timeoutMs: 2000, version: 3 }) == nil);
+    chk("unsynchronised (leap 3) -> nil", Ntp.Query("127.0.0.1", { port: port, timeoutMs: 2000, version: 2 }) == nil);
+    chk("originate not ours -> nil", Ntp.Query("127.0.0.1", { port: port, timeoutMs: 2000, version: 1 }) == nil);
+}
+
+fn async Main() {
+    testEpochConversion();
+    testBuildRequest();
+    testParseResponse();
+
+    // no answer -> nil (nothing listens on the discard port, locally)
+    let dead = Ntp.Query("127.0.0.1", { port: 9, timeoutMs: 300 });
+    chk("query to a silent port -> nil", dead == nil);
+
+    if (Os.Which("python3") == nil) {
+        Console.WriteLine("SKIP: python3 not available to run tests/fake_ntp.py");
+    } else {
+        let fake = Os.Spawn("python3", ["tests/fake_ntp.py"]);
+        if (fake == nil) {
+            chk("could start python3 tests/fake_ntp.py", false);
+        } else {
+            let portLine = await Stream.ReadLineAsync(fake.Stdout, 5000);
+            let port = (portLine != nil) ? Convert.ParseInt(String.Trim(portLine)) : nil;
+            if (port == nil) {
+                chk("fake_ntp.py came up (got " + str(portLine) + ")", false);
+            } else {
+                runLiveChecks(port);
+            }
+            Stream.Close(fake.Stdin);
+            let done = await Os.WaitAsync(fake.Pid, 3000);
+            if (done == nil || done.Alive) {
+                Os.KillChild(fake.Pid, 9);
+                await Os.WaitAsync(fake.Pid, 3000);
+            }
+            let errText = Stream.ReadAll(fake.Stderr);
+            if (failed > 0 && errText != nil && len(errText) > 0) {
+                Console.WriteLine("fake_ntp.py stderr:");
+                Console.WriteLine(Buffer.ToString(errText));
+            }
+            Stream.Close(fake.Stdout);
+            Stream.Close(fake.Stderr);
+        }
+    }
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run: " + str(passed + failed) + "  failed: " + str(failed));
+    if (failed == 0) {
+        Console.Ok("All NTP tests passed!");
+    } else {
+        Console.WriteLine("Some tests FAILED.");
+    }
+    return failed;
+}

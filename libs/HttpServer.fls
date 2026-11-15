@@ -67,7 +67,8 @@
 //       backlog              listen backlog                    (default 128)
 //       keepAlive            allow connection reuse            (default true)
 //       idleTimeoutMs        keep-alive idle wait              (default 5000)
-//       readTimeoutMs        socket read timeout               (default 10000)
+//       readTimeoutMs        socket read timeout; also the time (default 10000)
+//                            the whole request head may take
 //       maxRequestsPerConn   requests before a forced close    (default 100)
 //       maxHeaders           header count cap                  (default 100)
 //       maxHeaderBytes       total header-block cap            (default 65536)
@@ -79,7 +80,8 @@
 //                            protection: a stalled peer is refused on its own.
 //       streamBodies         leave the body on the socket for   (default false)
 //                            the handler to pull - see Uploads
-//       maxUploadBytes       ceiling for a streamed body        (default 0 = none)
+//       maxUploadBytes       ceiling for a streamed body,       (default 0 = none)
+//                            Content-Length or chunked
 //       serverName           Server: header                    (default "Flaris")
 //       timing               per-request phase times           (default false)
 //                            see Timing below
@@ -581,6 +583,15 @@ fn _sendFileAll(conn, path:string, offset:int, count:int): bool {
     return true;
 }
 
+// Whether path is the mount prefix or below it at a segment boundary: a mount
+// at "/static" serves "/static/a.css", not "/staticfoo".
+fn _underMount(path:string, prefix:string): bool {
+    if (!String.StartsWith(path, prefix)) { return false; }
+    let n = String.Length(prefix);
+    if (String.Length(path) == n || String.EndsWith(prefix, "/")) { return true; }
+    return String.CharAt(path, n) == '/';
+}
+
 // Any control byte in a decoded path, NUL included. A "%00" would otherwise
 // reach the filesystem layer and truncate the name there, so a check on the
 // extension (".js", ".txt") can be walked straight past.
@@ -679,9 +690,16 @@ fn _streamChunked(conn, maxBytes:int, sink, timeoutMs:int) {
         } else {
             total = total + n;
             if (maxBytes > 0 && total > maxBytes) { return { ok: false, status: 413, total: total }; }
-            let part = _readExact(conn, n, timeoutMs);
-            if (part == nil || len(part) != n) { return { ok: false, status: 400, total: total }; }
-            if (!sink(part)) { return { ok: false, status: 0, total: total }; }
+            // In slices: the chunk size is the client's claim, and allocating it
+            // up front would let one header line ask for any amount of memory.
+            let left:int = n;
+            while (left > 0) {
+                let want:int = (left > 65536) ? 65536 : left;
+                let part = _readExact(conn, want, timeoutMs);
+                if (part == nil) { return { ok: false, status: 400, total: total }; }
+                if (!sink(part)) { return { ok: false, status: 0, total: total }; }
+                left = left - want;
+            }
             // Only the CRLF may follow the chunk data: anything else would let
             // a front end and this server disagree on where the body ends.
             if (Stream.ReadLine(conn) != "") { return { ok: false, status: 400, total: total }; }
@@ -892,7 +910,7 @@ class HttpStatus
 // so compaction happens in place.
 class _Buf
 {
-    let _b        = nil;
+    let _b: block|nil = nil;
     let _cap:int  = 0;
     let _len:int  = 0;
 
@@ -982,7 +1000,7 @@ class _MultipartParser
 {
     let _delim:string = "";
     let _dlen:int     = 0;
-    let _buf          = nil;
+    let _buf: _Buf|nil = nil;
     let _state:int    = 0;      // 0 seek, 1 headers, 2 data, 3 done
     let _err          = nil;
 
@@ -1034,8 +1052,15 @@ class _MultipartParser
         return false;
     }
 
+    // A part still open here never finished, and is in no list the handler
+    // sees, so nobody else could delete its file: repeated cut-off or
+    // over-limit uploads would fill the disk.
     fn _abortPart() {
-        if (_sinkFile != nil) { Stream.Close(_sinkFile); _sinkFile = nil; }
+        if (_sinkFile != nil) {
+            Stream.Close(_sinkFile);
+            _sinkFile = nil;
+            if (_sinkPath != "") { File.Delete(_sinkPath); }
+        }
         _sinkBuf = nil;
         return nil;
     }
@@ -1228,7 +1253,12 @@ class HttpRequest
     let _pending:int    = 0;
     let _chunkedBody:bool = false;
     let _maxBody:int    = 0;
+    let _maxUpload:int  = 0;       // the server's maxUploadBytes, 0 = none
     let _readTimeout:int = 10000;
+    // A body read that did not finish - truncated, over a cap, refused by the
+    // sink, or a sink that raised - leaves an unknown part of the body on the
+    // socket, so the connection cannot carry another request.
+    let _broken:bool    = false;
     let _cookies         = nil;    // lazily parsed from the Cookie header
     let _form            = nil;    // lazily parsed from a urlencoded body
 
@@ -1325,8 +1355,10 @@ class HttpRequest
 
     // Stream the body, handing each block to `sink` as it arrives - the point
     // being that an upload never has to fit in memory. Returns the byte count,
-    // or -1 if the body was truncated or the sink refused a block.
-    //   maxBytes: 0 (default) means no ceiling beyond the server's own.
+    // or -1 if the body was truncated, ran over a cap, or the sink refused a
+    // block; the connection then closes after the response.
+    //   maxBytes: 0 (default) means no ceiling beyond the server's own
+    //   maxUploadBytes; a smaller value tightens it.
     //
     // A closure captures a scalar by value, so a sink cannot count into a plain
     // local - the write is simply lost. Use the returned total, or accumulate
@@ -1335,17 +1367,21 @@ class HttpRequest
     //   let n = req.ReadBody(fn(b) { acc.chunks = acc.chunks + 1; return true; });
     fn ReadBody(sink:fn, maxBytes?): int {
         if (!this.HasPendingBody()) { return 0; }
-        let cap:int = maxBytes ?? 0;
+        var cap:int = maxBytes ?? 0;
+        if (_maxUpload > 0 && (cap <= 0 || cap > _maxUpload)) { cap = _maxUpload; }
         let c       = _conn;
         let chunked = _chunkedBody;
         let pending = _pending;
 
-        // Clear first: a sink that raises must not leave the request looking
-        // like it still owns an unread body.
+        // The body is taken off the request before reading, so it is never read
+        // twice; until the read completes the connection counts as broken, which
+        // also covers a sink that raises.
         _conn = nil; _pending = 0; _chunkedBody = false;
+        _broken = true;
 
         let r = chunked ? _streamChunked(c, cap, sink, _readTimeout)
                         : _streamFixed(c, pending, cap, sink, _readTimeout);
+        if (r.ok) { _broken = false; }
         return r.ok ? r.total : -1;
     }
 
@@ -1410,6 +1446,10 @@ class HttpResponse
     let _headOnly:bool  = false;   // HEAD: send headers, suppress the body
     let _keepAlive:bool = true;
     let _chunked:bool   = false;
+    // The body on the wire is not whole: a chunked body never ended, or a file
+    // send that stopped short. The connection must close after it, or the
+    // client would read what follows as part of this response.
+    let _incomplete:bool = false;
     let _serverName:string = nil;
     let _setCookies      = nil;    // one entry per Set-Cookie line, nil until the first
     let _hijacked:bool   = false;  // the caller took the socket
@@ -1622,7 +1662,8 @@ class HttpResponse
         }
         if (bodyLen < 0) {
             h = h + "Transfer-Encoding: chunked\r\n";
-        } else {
+        } else if (_status != 204) {
+            // RFC 9110 8.6: a 204 carries no Content-Length at all.
             h = h + "Content-Length: " + str(bodyLen) + "\r\n";
         }
         return h + (_keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n");
@@ -1632,7 +1673,9 @@ class HttpResponse
     // `contentType` is trusted: only the server's own constants arrive here,
     // anything a caller supplies goes through Header() first.
     fn _send(body, contentType?: string, status?) {
-        if (_sent) return false;
+        // After StartChunked a head is already out: a second one (an error
+        // page, say) would land inside the chunked body.
+        if (_sent || _chunked) return false;
         if (status != nil) { _status = int(status); }
         let ct = (contentType != nil && (_headers == nil || !Object.HasKey(_headers, "Content-Type")))
                ? contentType : nil;
@@ -1771,10 +1814,11 @@ class HttpResponse
         // small files that dominate a real static mount.
         if (count <= _COALESCE_MAX) {
             let data = (_files != nil) ? _files.Get(path, st) : _fileBytes(path);
-            if (data != nil) {
-                if (start > 0 || count < size) { data = Buffer.Slice(data, start, count); }
-                return this._send(data, nil, nil);
-            }
+            // Stat'd but unreadable (permissions, or gone since): no head has
+            // gone out yet, so it can still be answered properly.
+            if (data == nil) { return this.Error(404, "Not Found"); }
+            if (start > 0 || count < size) { data = Buffer.Slice(data, start, count); }
+            return this._send(data, nil, nil);
         }
 
         // Large body: the kernel moves it straight from page cache to socket,
@@ -1782,7 +1826,7 @@ class HttpResponse
         // still streams.
         Stream.WriteAll(_conn, this._headBlock(count, nil));
         _bodyBytes = count;
-        if (count > 0) { _sendFileAll(_conn, path, start, count); }
+        if (count > 0 && !_sendFileAll(_conn, path, start, count)) { _incomplete = true; }
         _sent = true;
         return true;
     }
@@ -1868,6 +1912,7 @@ class HttpResponse
             this.ContentType(contentType);
         }
         _chunked = true;
+        _incomplete = true;
         Stream.WriteAll(_conn, this._headBlock(-1, nil));
         return true;
     }
@@ -1898,6 +1943,7 @@ class HttpResponse
         if (!_chunked || _sent) return false;
         if (!_headOnly) { Stream.WriteAll(_conn, "0\r\n\r\n"); }
         _sent = true;
+        _incomplete = false;
         return true;
     }
 }
@@ -1997,7 +2043,7 @@ class HttpServer
     let _serverName:string     = "Flaris";
     let _tls                    = nil;   // AcceptTls options, or nil for plain HTTP
 
-    let _sock                   = nil;
+    let _sock: stream|nil       = nil;
     let _running:bool          = false;
     let _boundPort:int         = 0;
     let _activeConns:int       = 0;
@@ -2359,9 +2405,11 @@ class HttpServer
         // A handler that wrote nothing still owes the client a response.
         if (!res.Sent()) { res.Error(500, "handler produced no response"); }
 
-        // A body the handler never read is still sitting on the socket, and
-        // would frame the next request on this connection. Close instead.
-        if (req._conn != nil && req.HasPendingBody()) { return 0; }
+        // A body the handler never read, or only partly read, is still sitting
+        // on the socket and would frame the next request. Close instead.
+        if (req._broken || (req._conn != nil && req.HasPendingBody())) { return 0; }
+        // Nor can a connection carry on after a response cut short.
+        if (res._incomplete) { return 0; }
         return keep ? 1 : 0;
     }
 
@@ -2457,7 +2505,7 @@ class HttpServer
         if (req.method != "GET" && req.method != "HEAD") return false;
 
         foreach (m in _statics) {
-            if (!res.Sent() && String.StartsWith(req.path, m.prefix)) {
+            if (!res.Sent() && _underMount(req.path, m.prefix)) {
                 var rel = String.Substr(req.path, String.Length(m.prefix));
                 if (String.CharAt(rel, 0) == '/') { rel = String.Substr(rel, 1); }
                 if (rel == "") { rel = m.index; }
@@ -2552,6 +2600,13 @@ class HttpServer
     // none: status > 0 is the error code to report, -1 means the peer closed
     // and nothing should be sent.
     fn _readRequest(conn, peer:string) {
+        // The socket timeout counts silence and restarts whenever a byte
+        // arrives, so a client trickling header lines would hold the connection
+        // forever. The whole head gets readTimeoutMs instead, checked per line.
+        // shortcut: a single line trickled without its LF is not caught until it
+        // completes (Stream.ReadLine has no length or time cap); needs a VM
+        // ReadLine with a max length to close.
+        let headDeadline:int = (_readTimeoutMs > 0) ? Time.Millis() + _readTimeoutMs : 0;
         let line = Stream.ReadLine(conn);
         // RFC 9112 asks a server to ignore an empty line before the request
         // line; a client may send one after the previous request's body.
@@ -2596,7 +2651,9 @@ class HttpServer
                 target = String.Substr(target, 0, q);
                 req.query = HttpUtil.ParseQuery(qs) ?? {};
             }
-            req.path = HttpUtil.UrlDecode(target) ?? target;
+            // UrlDecode follows query-string rules, where "+" is a space; in a
+            // path it is a plus ("/c++.html"), so it is protected first.
+            req.path = HttpUtil.UrlDecode(String.Replace(target, "+", "%2B")) ?? target;
         }
         if (len(req.path) == 0 || req.path[0] != '/') {
             return { req: nil, status: 400, message: "path must be absolute" };
@@ -2668,6 +2725,9 @@ class HttpServer
                     return { req: nil, status: 400, message: "invalid Host" };
                 }
             }
+            if (headDeadline > 0 && Time.Millis() > headDeadline) {
+                return { req: nil, status: 408, message: "request headers too slow" };
+            }
             hl = Stream.ReadLine(conn);
         }
         // ReadLine returns "" for the blank line that ends the headers, and nil
@@ -2705,6 +2765,22 @@ class HttpServer
                          || !String.Contains(String.ToLower(conn0), "close");
         }
 
+        // The declared length is checked against the caps before anything else
+        // is said to the client - in particular before a 100 Continue invites
+        // a body that would only be refused. The validated, collapsed value is
+        // used, not the raw header, which may still read "5, 5".
+        var cl:int = 0;
+        if (clCount > 0) {
+            let clP = Convert.ParseInt(clVal);
+            if (clP == nil || clP < 0) {
+                return { req: nil, status: 400, message: "bad Content-Length" };
+            }
+            cl = clP;
+            let over = _streamBodies ? (_maxUploadBytes > 0 && cl > _maxUploadBytes)
+                                     : (cl > _maxBodyBytes);
+            if (over) { return { req: nil, status: 413, message: "body too large" }; }
+        }
+
         // RFC 9110 10.1.1: a client that sent "Expect: 100-continue" is waiting
         // for permission before it sends the body, so it must be answered with
         // either an interim 100 or a final status. Without this the client
@@ -2728,25 +2804,15 @@ class HttpServer
         // bounds only what Text()/Json() will buffer; maxUploadBytes bounds the
         // stream itself.
         req._maxBody     = _maxBodyBytes;
+        req._maxUpload   = _maxUploadBytes;
         req._readTimeout = _readTimeoutMs;
         if (_streamBodies) {
             if (teSeen) {
                 req._conn        = conn;
                 req._chunkedBody = true;
-                return req;
-            }
-            if (clCount > 0) {
-                let clS = Convert.ParseInt(clVal);
-                if (clS == nil || clS < 0) {
-                    return { req: nil, status: 400, message: "bad Content-Length" };
-                }
-                if (_maxUploadBytes > 0 && clS > _maxUploadBytes) {
-                    return { req: nil, status: 413, message: "body too large" };
-                }
-                if (clS > 0) {
-                    req._conn    = conn;
-                    req._pending = clS;
-                }
+            } else if (cl > 0) {
+                req._conn    = conn;
+                req._pending = cl;
             }
             return req;
         }
@@ -2762,28 +2828,14 @@ class HttpServer
                     : { req: nil, status: 400, message: "malformed chunked body" };
             }
             req.body = r.body;
-        } else {
-            // The validated, collapsed value - not the raw header, which may
-            // still read "5, 5".
-            if (clCount > 0) {
-                let cl = Convert.ParseInt(clVal);
-                if (cl == nil || cl < 0) {
-                    return { req: nil, status: 400, message: "bad Content-Length" };
-                }
-                if (cl > _maxBodyBytes) {
-                    return { req: nil, status: 413, message: "body too large" };
-                }
-                if (cl > 0) {
-                    req.body = _readExact(conn, cl, _readTimeoutMs);
-                    // ReadBytes can come up short when the peer stalls or hangs
-                    // up. A body that never fully arrived must not be dispatched
-                    // as though it had: the handler would see a truncated
-                    // payload, and the bytes still owed would frame the next
-                    // request on this connection.
-                    if (req.body == nil || len(req.body) != cl) {
-                        return { req: nil, status: 400, message: "incomplete request body" };
-                    }
-                }
+        } else if (cl > 0) {
+            req.body = _readExact(conn, cl, _readTimeoutMs);
+            // ReadBytes can come up short when the peer stalls or hangs up. A
+            // body that never fully arrived must not be dispatched as though it
+            // had: the handler would see a truncated payload, and the bytes
+            // still owed would frame the next request on this connection.
+            if (req.body == nil || len(req.body) != cl) {
+                return { req: nil, status: 400, message: "incomplete request body" };
             }
         }
 

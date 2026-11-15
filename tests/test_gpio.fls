@@ -1,0 +1,380 @@
+// test_gpio.fls - Tests for Gpio.fls against simulated lines, and live on a board
+// Run: flarisvm tests/test_gpio.fls --libs=./libs
+//      GPIO_TEST_LINE=GPIO17 flarisvm tests/test_gpio.fls --libs=./libs    (also the live part)
+//
+// Most of it needs no hardware: every Gpio there is given a SimGpio through
+// opts.backend, which tests everything above the lines - values, active-low,
+// one use at a time, events, argument checks and error reporting.
+//
+// The live part runs libgpiod's tools against a real line, and only when
+// GPIO_TEST_LINE names a line that is safe to drive: nothing may be wired to
+// it, because the test drives it high and low. Its events are made by
+// switching the pin's pull resistor with pinctrl (Raspberry Pi), which is
+// skipped where pinctrl is missing. The line is left an input with pull-down.
+
+import { Gpio } from library("Gpio", "1.0");
+
+global testsRun    = 0;
+global testsFailed = 0;
+global _sink       = 0;
+
+fn bench(name: string, f: fn, n: int) {
+    f(); f(); f();
+    let t0: int = Time.Ticks();
+    iter (i from 0 to n) { f(); }
+    let dt: int = Time.Ticks() - t0;
+    let ms: float = Time.TicksToMs(dt);
+    let us: float = Time.TicksToUs(dt) / float(n);
+    Console.WriteLine(
+        String.PadRight(name, 48),
+        String.PadLeft(String.FormatArray("{0:.2f}", [ms]),   9), " ms  ",
+        String.PadLeft(String.FormatArray("{0:.4f}", [us]),  11), " µs/call"
+    );
+}
+
+fn benchSep() { Console.WriteLine(String.Repeat("-", 74)); }
+
+fn check(cond, msg) {
+    testsRun = testsRun + 1;
+    if (!cond) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg);
+    }
+    return 0;
+}
+
+fn checkEq(actual, expected, msg) {
+    testsRun = testsRun + 1;
+    if (actual != expected) {
+        testsFailed = testsFailed + 1;
+        Console.WriteLine("FAIL:", msg, "  expected=", expected, "  got=", actual);
+    }
+    return 0;
+}
+
+// Lines by name: "GPIO17" (low), "GPIO27" (high), and offset 5 on "gpiochip1".
+// A held line belongs to one handle; Drive changes a line from outside, the
+// way a button or another chip would, and reports the edge to its watchers.
+class SimGpio {
+    let level   = nil;  // line key -> electrical level
+    let holder  = nil;  // line key -> handle of whoever holds it
+    let watch   = nil;  // handle -> { key, edges, activeLow, onEvent }
+    let next    = 0;
+    let calls   = 0;
+    let lastGet = nil;
+    let lastHold = nil;
+    let lastWatch = nil;
+    let released = 0;
+
+    fn Constructor() {
+        this.level  = { "GPIO17": 0, "GPIO27": 1, "gpiochip1:5": 0 };
+        this.holder = {};
+        this.watch  = {};
+        this.next   = 0;
+        this.calls  = 0;
+        this.released = 0;
+    }
+
+    fn static key(chip, line): string {
+        return Type.Of(line) == Type.Int ? chip + ":" + str(line) : line;
+    }
+
+    fn _free(k: string, mine) {
+        if (!(k in this.level)) { return { ok: false, errorKind: "line", error: "cannot find line '" + k + "'" }; }
+        if (k in this.holder && this.holder[k] != mine) { return { ok: false, errorKind: "busy", error: "Device or resource busy" }; }
+        return nil;
+    }
+
+    fn Get(chip, line, bias, activeLow: bool) {
+        this.calls += 1;
+        let k = SimGpio.key(chip, line);
+        this.lastGet = { chip: chip, line: line, bias: bias, activeLow: activeLow };
+        let f = this._free(k, nil);
+        if (f != nil) { return f; }
+        return { ok: true, value: activeLow ? 1 - this.level[k] : this.level[k] };
+    }
+
+    fn Hold(chip, line, value: int, bias, activeLow: bool) {
+        this.calls += 1;
+        let k = SimGpio.key(chip, line);
+        this.lastHold = { chip: chip, line: line, value: value, bias: bias, activeLow: activeLow };
+        let f = this._free(k, nil);
+        if (f != nil) { return f; }
+        this.next += 1;
+        let h = "h" + str(this.next);
+        this.holder[k] = h;
+        this.level[k]  = activeLow ? 1 - value : value;
+        return { ok: true, handle: h };
+    }
+
+    fn Watch(chip, line, edges: string, debounceMs: int, bias, activeLow: bool, onEvent) {
+        this.calls += 1;
+        let k = SimGpio.key(chip, line);
+        this.lastWatch = { line: line, edges: edges, debounceMs: debounceMs, bias: bias, activeLow: activeLow };
+        let f = this._free(k, nil);
+        if (f != nil) { return f; }
+        this.next += 1;
+        let h = "h" + str(this.next);
+        this.holder[k] = h;
+        this.watch[h]  = { key: k, edges: edges, activeLow: activeLow, onEvent: onEvent };
+        return { ok: true, handle: h };
+    }
+
+    fn Release(h) {
+        this.released += 1;
+        foreach (k in Object.Keys(this.holder)) {
+            if (this.holder[k] == h) { Object.Delete(this.holder, k); }
+        }
+        if (h in this.watch) { Object.Delete(this.watch, h); }
+    }
+
+    fn Drive(k: string, lvl: int) {
+        if (this.level[k] == lvl) { return; }
+        this.level[k] = lvl;
+        foreach (h in Object.Keys(this.watch)) {
+            let w = this.watch[h];
+            if (w["key"] != k) { continue; }
+            let logical = w["activeLow"] ? 1 - lvl : lvl;
+            let edge = logical == 1 ? "rising" : "falling";
+            if (w["edges"] == "both" || w["edges"] == edge) { w["onEvent"](edge, 1.5); }
+        }
+    }
+}
+
+fn ignore(_edge, _seconds) { return 0; }
+
+class RaisingGpio {
+    fn Get(_c, _l, _b, _a) { throw(1, "chip on fire"); }
+    fn Hold(_c, _l, _v, _b, _a) { throw(1, "chip on fire"); }
+    fn Watch(_c, _l, _e, _d, _b, _a, _cb) { throw(1, "chip on fire"); }
+    fn Release(_h) { throw(1, "chip on fire"); }
+}
+
+class NilGpio {
+    fn Get(_c, _l, _b, _a) { return nil; }
+    fn Hold(_c, _l, _v, _b, _a) { return nil; }
+    fn Watch(_c, _l, _e, _d, _b, _a, _cb) { return nil; }
+    fn Release(_h) { return nil; }
+}
+
+fn simTests() {
+    let sim = new SimGpio();
+
+    Console.WriteLine("[ settings ]");
+    let a = new Gpio("GPIO17", { backend: sim });
+    checkEq(a.Line(), "GPIO17", "Line() is the name given");
+    checkEq(a.Chip(), nil, "a name searches every chip");
+    checkEq(new Gpio(5, { backend: sim }).Chip(), "gpiochip0", "an offset defaults to gpiochip0");
+    checkEq(new Gpio(5, { backend: sim, chip: "gpiochip1" }).Chip(), "gpiochip1", "  or the chip given");
+    check(a.Error() == nil && a.ErrorKind() == nil && !a.Watching(), "a good line starts with no error, not watched");
+
+    Console.WriteLine("[ read ]");
+    checkEq(a.Read(), 0, "GPIO17 reads 0");
+    checkEq(new Gpio("GPIO27", { backend: sim }).Read(), 1, "GPIO27 reads 1");
+    checkEq(new Gpio("GPIO27", { backend: sim, activeLow: true }).Read(), 0, "activeLow inverts a read");
+    checkEq(new Gpio(5, { backend: sim, chip: "gpiochip1" }).Read(), 0, "an offset on a chip reads");
+    new Gpio("GPIO17", { backend: sim, bias: "pull-up" }).Read();
+    check(sim.lastGet["bias"] == "pull-up" && sim.lastGet["chip"] == nil, "bias reaches the backend");
+
+    Console.WriteLine("[ write ]");
+    let out = new Gpio("GPIO17", { backend: sim });
+    check(out.Write(1), "Write(1) succeeds");
+    checkEq(sim.lastHold["value"], 1, "  the backend holds the line at 1");
+    checkEq(out.Read(), 1, "Read returns the value driven");
+    let held = sim.calls;
+    check(out.Write(true), "Write(true) is the same value");
+    checkEq(sim.calls, held, "  and starts nothing new");
+    let rel = sim.released;
+    check(out.Write(false) && sim.lastHold["value"] == 0, "Write(false) drives 0");
+    checkEq(sim.released, rel + 1, "  after releasing the old hold");
+    check(out.Release(), "Release succeeds");
+    checkEq(sim.released, rel + 2, "  and releases the hold");
+    check(out.Release(), "Release with nothing held is fine");
+    check(new Gpio("GPIO27", { backend: sim, activeLow: true }).Write(1) && sim.level["GPIO27"] == 0,
+          "activeLow Write(1) drives the line low");
+    sim.Release("h" + str(sim.next));
+
+    Console.WriteLine("[ one use of a line at a time ]");
+    let w = new Gpio("GPIO27", { backend: sim });
+    let d = new Gpio("GPIO27", { backend: sim });
+    check(d.Write(1), "one object drives GPIO27");
+    check(!w.Write(0) && w.ErrorKind() == "busy", "another one's Write is busy");
+    check(w.Read() == nil && w.ErrorKind() == "busy", "  and so is its Read");
+    check(!d.Watch(ignore) && d.ErrorKind() == "usage", "Watch on a driven line is a usage error");
+    d.Close();
+    check(w.Watch(ignore) && w.Watching(), "after Close the other object can watch");
+    check(!w.Write(1) && w.ErrorKind() == "usage", "Write on a watched line is a usage error");
+    check(w.Read() == nil && w.ErrorKind() == "usage", "Read on a watched line is a usage error");
+    check(!w.Watch(ignore) && w.ErrorKind() == "usage", "a second Watch is a usage error");
+    check(w.Unwatch() && !w.Watching(), "Unwatch ends it");
+    check(w.Unwatch(), "Unwatch with nothing watched is fine");
+
+    Console.WriteLine("[ events ]");
+    let seen = [];
+    let button = new Gpio("GPIO27", { backend: sim, bias: "pull-up", activeLow: true });
+    check(button.Watch(fn(e, s) { Array.Append(seen, e + "@" + str(s)); }, { debounceMs: 20 }), "Watch succeeds");
+    let lw = sim.lastWatch;
+    check(lw["edges"] == "both" && lw["debounceMs"] == 20 && lw["bias"] == "pull-up" && lw["activeLow"],
+          "edges, debounce, bias and active-low reach the backend");
+    sim.Drive("GPIO27", 0);
+    sim.Drive("GPIO27", 1);
+    checkEq(str(seen), "[rising@1.5, falling@1.5]", "a press and a release, active-low");
+    button.Unwatch();
+    sim.Drive("GPIO27", 0);
+    checkEq(len(seen), 2, "no events after Unwatch");
+
+    let rising = [];
+    let r = new Gpio("GPIO27", { backend: sim });
+    r.Watch(fn(e, _s) { Array.Append(rising, e); }, { edges: "rising" });
+    checkEq(sim.lastWatch["edges"], "rising", "edges reaches the backend");
+    sim.Drive("GPIO27", 1);
+    sim.Drive("GPIO27", 0);
+    checkEq(str(rising), "[rising]", "only the rising edge arrives");
+    r.Unwatch();
+
+    let calls = [];
+    let rx = new Gpio("GPIO27", { backend: sim });
+    rx.Watch(fn(e, _s) { Array.Append(calls, e); throw(1, "callback trouble"); });
+    sim.Drive("GPIO27", 1);
+    sim.Drive("GPIO27", 0);
+    checkEq(len(calls), 2, "a raising callback does not stop the watch");
+    rx.Unwatch();
+
+    Console.WriteLine("[ bad settings never reach the backend ]");
+    let before = sim.calls;
+    let bads = [["", nil, "an empty name"], [1.5, nil, "a float line"], [nil, nil, "a nil line"], [-1, nil, "a negative offset"],
+                ["GPIO17", { bias: "up" }, "an unknown bias"], ["GPIO17", { activeLow: "yes" }, "activeLow as a string"],
+                ["GPIO17", { chip: "" }, "an empty chip"], [3, { chip: 7 }, "a chip as an int"]];
+    foreach (b in bads) {
+        let opts = b[1] != nil ? b[1] : {};
+        opts["backend"] = sim;
+        let g = new Gpio(b[0], opts);
+        checkEq(g.ErrorKind(), "usage", "constructor reports " + b[2]);
+        check(g.Read() == nil && !g.Write(1) && !g.Watch(ignore) && g.ErrorKind() == "usage",
+              "  and every call fails: " + b[2]);
+    }
+    checkEq(sim.calls, before, "no bad setting reached the backend");
+
+    Console.WriteLine("[ bad arguments never reach the backend ]");
+    let g = new Gpio("GPIO17", { backend: sim });
+    before = sim.calls;
+    check(!g.Write(2), "Write refuses 2");
+    check(!g.Write("1"), "Write refuses a string");
+    check(!g.Write(nil), "Write refuses nil");
+    check(!g.Write(1.0), "Write refuses a float");
+    check(!g.Watch(nil), "Watch refuses no callback");
+    check(!g.Watch("cb"), "Watch refuses a string callback");
+    check(!g.Watch(ignore, { edges: "up" }), "Watch refuses unknown edges");
+    check(!g.Watch(ignore, { debounceMs: -1 }), "Watch refuses a negative debounce");
+    check(!g.Watch(ignore, { debounceMs: 2.5 }), "Watch refuses a fractional debounce");
+    checkEq(g.ErrorKind(), "usage", "the failures are usage errors");
+    checkEq(sim.calls, before, "none of them reached the backend");
+
+    Console.WriteLine("[ errors ]");
+    let missing = new Gpio("GPIO99", { backend: sim });
+    check(missing.Read() == nil && missing.ErrorKind() == "line", "a missing line is errorKind line");
+    check(String.Contains(missing.Error(), "GPIO99"), "  with the backend's message");
+    check(!missing.Write(1) && missing.ErrorKind() == "line", "  for Write too");
+
+    let raising = new Gpio("GPIO17", { backend: new RaisingGpio() });
+    check(raising.Read() == nil && raising.ErrorKind() == "io", "a backend that raises does not raise through Gpio");
+    check(String.Contains(raising.Error(), "chip on fire"), "  with the backend's message");
+    check(!raising.Write(1) && !raising.Watch(ignore), "  for Write and Watch too");
+
+    let silent = new Gpio("GPIO17", { backend: new NilGpio() });
+    check(silent.Read() == nil && silent.ErrorKind() == "io", "a backend that returns nothing is an io error");
+
+    check(g.Read() == 0 && g.Error() == nil && g.ErrorKind() == nil, "a successful call clears the error");
+
+    if (Os.Which("gpioget") == nil) {
+        let nt = new Gpio("GPIO17");
+        check(nt.Read() == nil && nt.ErrorKind() == "tool", "without libgpiod's tools the error is errorKind tool");
+    }
+}
+
+fn liveTests(line: string) {
+    Console.WriteLine("[ live: " + line + " through libgpiod ]");
+    let up = new Gpio(line, { bias: "pull-up" });
+    let down = new Gpio(line, { bias: "pull-down" });
+    checkEq(up.Read(), 1, "pull-up reads 1 with nothing wired");
+    checkEq(down.Read(), 0, "pull-down reads 0");
+
+    let out = new Gpio(line);
+    check(out.Write(1) && out.Read() == 1, "Write(1) holds the line high");
+    check(up.Read() == nil && up.ErrorKind() == "busy", "another object's Read is busy");
+    check(String.Contains(Os.RunEx("gpioinfo", [line]).Stdout, "consumer=\"flaris\""), "gpioinfo names the holder flaris");
+    check(out.Write(0) && out.Release(), "Write(0) and Release");
+    checkEq(down.Read(), 0, "the line is free again");
+
+    let missing = new Gpio("NO_SUCH_LINE_X");
+    check(missing.Read() == nil && missing.ErrorKind() == "line", "an unknown line is errorKind line");
+    check(!missing.Write(1) && missing.ErrorKind() == "line", "  for Write too");
+
+    // A program that ends while it drives the line must not leave it held.
+    let vm = Os.GetEnv("FLARISVM");
+    if (vm == nil || len(vm) == 0) { vm = "../flaris-lang/flarisvm"; }
+    let child = Os.TempDir() + "/gpio_child.fls";
+    File.WriteText(child, "import { Gpio } from library(\"Gpio\", \"1.0\");\nfn Main() { let g = new Gpio(\"" + line +
+                          "\"); return g.Write(1) ? 0 : 1; }\n");
+    let r = Os.RunEx(vm, ["--libs=./libs", child], { Stdin: "", Timeout: 10000 });
+    checkEq(r != nil ? r.Exit : -1, 0, "a child program drives the line and exits");
+    Fiber.Sleep(200);
+    check(!String.Contains(Os.RunEx("gpioinfo", [line]).Stdout, "consumer="), "  and leaves it unheld");
+    File.Delete(child);
+
+    if (Os.Which("pinctrl") == nil) {
+        Console.WriteLine("  (events skipped: no pinctrl to switch the pull resistor)");
+    } else {
+        let pin = String.Replace(line, "GPIO", "");
+        let edges = [];
+        let w = new Gpio(line, { bias: "pull-down" });
+        check(w.Watch(fn(e, _s) { Array.Append(edges, e); }), "Watch starts gpiomon");
+        foreach (p in ["pu", "pd", "pu", "pd"]) {
+            Os.RunEx("pinctrl", ["set", pin, "ip", p]);
+            Fiber.Sleep(30);
+        }
+        var waited = 0;
+        while (len(edges) < 4 && waited < 2000) { Fiber.Sleep(10); waited += 10; }
+        checkEq(str(edges), "[rising, falling, rising, falling]", "pull switches arrive as edges");
+        check(w.Unwatch(), "Unwatch stops gpiomon");
+    }
+    new Gpio(line, { bias: "pull-down" }).Read();
+}
+
+fn Main() {
+    simTests();
+    let line = Os.GetEnv("GPIO_TEST_LINE");
+    if (line == nil || len(line) == 0) {
+        Console.WriteLine("[ live part skipped: set GPIO_TEST_LINE to a line nothing is wired to ]");
+    } else if (Os.Which("gpioget") == nil || new Gpio(line, { bias: "pull-down" }).Read() == nil) {
+        Console.WriteLine("[ live part skipped: no libgpiod tools, or no line " + line + " here ]");
+    } else {
+        liveTests(line);
+    }
+
+    Console.WriteLine("");
+    Console.WriteLine("Results: " + str(testsRun - testsFailed) + "/" + str(testsRun) + " passed");
+
+    // ===================================================================
+    // Benchmarks - library overhead over simulated lines (no process spawn)
+    // ===================================================================
+    Console.WriteLine("");
+    benchSep();
+    Console.WriteLine("Benchmarks");
+    benchSep();
+    let sim = new SimGpio();
+    let rd = new Gpio("GPIO17", { backend: sim });
+    let wr = new Gpio("GPIO27", { backend: sim });
+    var v = 0;
+    bench("Read", fn() { _sink = _sink + rd.Read(); }, 20000);
+    bench("Write toggling (release + hold)", fn() { v = 1 - v; wr.Write(v); }, 20000);
+    wr.Close();
+    let ev = new Gpio("GPIO27", { backend: sim });
+    ev.Watch(fn(_e, _s) { _sink = _sink + 1; });
+    var lvl = 0;
+    bench("event delivery (two edges)", fn() { lvl = 1 - lvl; sim.Drive("GPIO27", lvl); }, 20000);
+    ev.Unwatch();
+    benchSep();
+    Console.WriteLine("_sink=" + str(_sink));
+    return testsFailed;
+}

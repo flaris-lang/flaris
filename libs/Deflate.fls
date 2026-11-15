@@ -29,10 +29,12 @@
 // input and each output buffer is created that way. A read gives 0..255 and a
 // store keeps the low byte, so byte reads and writes carry no mask.
 //
-// Limits: a decoded stream is capped at INFLATE_MAX_OUT unless the caller
-// passes an expected size - a decoder must not inherit decompression bombs
-// from its input. Encoding falls back to stored blocks whenever compressing
-// would not pay, so incompressible input never grows unboundedly.
+// Limits: a decoded stream is capped at INFLATE_MAX_OUT (256 MiB) - a decoder
+// must not inherit decompression bombs from its input. Every Inflate call takes
+// an optional third argument, maxBytes, that replaces that cap, lower or higher;
+// `expected` never exceeds the cap in force. Encoding falls back to stored
+// blocks whenever compressing would not pay, so incompressible input never
+// grows unboundedly.
 
 const INFLATE_MAX_OUT = 268435456;      // 256 MiB safety cap
 
@@ -106,10 +108,12 @@ const S_CNT = 1;         // bits currently in the accumulator
 const S_POS = 2;         // next byte offset in src
 const S_OUT = 3;         // next byte offset in dst
 const S_ERR = 4;         // 0 = ok, negative = error code
-const S_SIZE = 5;
+const S_LASTERR = 5;     // why the decode returned nil: -1 truncated, -2 malformed, -3 over the cap
+const S_END = 6;         // input offset just past the stream
+const S_SIZE = 7;
 
-// Built on first use and shared by every call in this VM: no kernel writes into C.
-global _deflateConsts = nil;
+// Built when the module loads and shared by every call in this VM: no kernel writes into C.
+global _deflateConsts: [int] = nil;
 
 fn _inflateConsts(): array {
     if (_deflateConsts != nil) { return _deflateConsts; }
@@ -405,58 +409,58 @@ fn _fixedDist(W: [int]): int {
     return 0;
 }
 
-global _lastErr = 0;
-global _lastEnd = 0;     // input offset just past the stream the last decode read
+global _lastErr: int = 0;
+global _lastEnd: int = 0;     // input offset just past the stream the last decode read
 
 // One decode attempt, from src[start], into a buffer of exactly `cap` bytes.
 // nil on failure, with _lastErr set (-3 means the output buffer was too small).
-fn _inflateOnce(src: block, start: int, sLen: int, cap: int): block {
-    _lastErr = 0;
+fn _inflateOnce(src: block, start: int, sLen: int, cap: int, S: [int]): block {
+    let C = _deflateConsts;
+    if (C == nil) { return nil; }
     let dst = Buffer.Create(cap, 1);
-    let C = _inflateConsts();
     let W: [int] = Array.Create(W_SIZE, Type.Int);
-    let S: [int] = Array.Create(S_SIZE, Type.Int);
+    Array.Fill(S, 0);
     S[S_POS] = start;
 
     let done = false;
     while (!done) {
         let final = _bits(src, sLen, S, 1);
         let btype = _bits(src, sLen, S, 2);
-        if (S[S_ERR] != 0) { _lastErr = -1; return nil; }
+        if (S[S_ERR] != 0) { S[S_LASTERR] = -1; return nil; }
 
         if (btype == 0) {
             // Whole bytes still in the accumulator belong to this block.
             let p = S[S_POS] - (S[S_CNT] >> 3);
             S[S_BUF] = 0; S[S_CNT] = 0;
-            if (p + 4 > sLen) { _lastErr = -1; return nil; }
+            if (p + 4 > sLen) { S[S_LASTERR] = -1; return nil; }
             let ln = src[p] | (src[p + 1] << 8);
             let nl = src[p + 2] | (src[p + 3] << 8);
-            if ((ln ^ 0xFFFF) != nl) { _lastErr = -2; return nil; }
+            if ((ln ^ 0xFFFF) != nl) { S[S_LASTERR] = -2; return nil; }
             p = p + 4;
-            if (p + ln > sLen) { _lastErr = -1; return nil; }
+            if (p + ln > sLen) { S[S_LASTERR] = -1; return nil; }
             let o = S[S_OUT];
-            if (o + ln > cap) { _lastErr = -3; return nil; }
+            if (o + ln > cap) { S[S_LASTERR] = -3; return nil; }
             Buffer.Copy(src, p, dst, o, ln);
             S[S_OUT] = o + ln;
             S[S_POS] = p + ln;
         } else if (btype == 1 || btype == 2) {
             if (btype == 1) {
                 _fixedLens(W);
-                if (_buildHuff(W, W_LCOUNT, W_LSYM, W_LENS, 288) != 0) { _lastErr = -2; return nil; }
+                if (_buildHuff(W, W_LCOUNT, W_LSYM, W_LENS, 288) != 0) { S[S_LASTERR] = -2; return nil; }
                 _fixedDist(W);
-                if (_buildHuff(W, W_DCOUNT, W_DSYM, W_LENS, 30) != 0) { _lastErr = -2; return nil; }
+                if (_buildHuff(W, W_DCOUNT, W_DSYM, W_LENS, 30) != 0) { S[S_LASTERR] = -2; return nil; }
             } else {
                 let rd = _readDynamic(src, sLen, S, W, C);
-                if (rd != 0) { _lastErr = rd; return nil; }
+                if (rd != 0) { S[S_LASTERR] = rd; return nil; }
             }
             let rc = _inflateFast(src, sLen, dst, cap, S, W, C);
-            if (rc != 0) { _lastErr = rc; return nil; }
+            if (rc != 0) { S[S_LASTERR] = rc; return nil; }
         } else {
-            _lastErr = -2; return nil;
+            S[S_LASTERR] = -2; return nil;
         }
         if (final == 1) { done = true; }
     }
-    _lastEnd = S[S_POS] - (S[S_CNT] >> 3);
+    S[S_END] = S[S_POS] - (S[S_CNT] >> 3);
     return Buffer.Slice(dst, 0, S[S_OUT]);
 }
 
@@ -477,35 +481,45 @@ fn _asBlock(x): block {
 }
 
 // The raw DEFLATE stream starting at src[start] -> block, or nil on
-// malformed input; _lastEnd is left just past the stream.
-fn _inflateFrom(src: block, start: int, expected): block {
+// malformed input; _lastErr and _lastEnd are left as the decode reported them.
+fn _inflateFrom(src: block, start: int, expected, maxBytes): block {
     let sLen = len(src);
     if (sLen <= start) return nil;
+    let limit = _inflateLimit(maxBytes);
 
     // A known size needs no growth; otherwise start at a modest multiple of
     // the input and retry on overflow, since the ratio is unknowable up
     // front and a wrong guess must not truncate the result.
     let exp = (expected == nil || expected <= 0) ? 0 : expected;
     var cap = exp > 0 ? exp : ((sLen - start) * 4 + 1024);
-    if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
+    if (cap > limit) { cap = limit; }
 
+    let S: [int] = Array.Create(S_SIZE, Type.Int);
     while (true) {
-        let got = _inflateOnce(src, start, sLen, cap);
+        let got = _inflateOnce(src, start, sLen, cap, S);
+        _lastErr = S[S_LASTERR];
+        _lastEnd = S[S_END];
         if (got != nil) return got;
-        if (_lastErr != -3 || exp > 0 || cap >= INFLATE_MAX_OUT) return nil;
+        if (_lastErr != -3 || exp > 0 || cap >= limit) return nil;
         cap = cap * 4;
-        if (cap > INFLATE_MAX_OUT) { cap = INFLATE_MAX_OUT; }
+        if (cap > limit) { cap = limit; }
     }
+}
+
+// The output cap for one decode: the caller's maxBytes, else INFLATE_MAX_OUT.
+fn _inflateLimit(maxBytes): int {
+    return (maxBytes == nil || maxBytes <= 0) ? INFLATE_MAX_OUT : maxBytes;
 }
 
 class Inflate {
 
     // Raw DEFLATE stream -> block, or nil on malformed input.
-    // `expected` sizes the output buffer when known (0 = grow to the cap).
-    fn static Raw(input, expected?): block {
+    // `expected` sizes the output buffer when known (0 = grow to the cap);
+    // `maxBytes` replaces the 256 MiB cap (see the header).
+    fn static Raw(input, expected?, maxBytes?): block {
         let src = _asBlock(input);
         if (src == nil) return nil;
-        return _inflateFrom(src, 0, expected);
+        return _inflateFrom(src, 0, expected, maxBytes);
     }
 
     // Reason the last decode returned nil: -1 truncated input, -2 malformed
@@ -514,7 +528,7 @@ class Inflate {
 
     // zlib (RFC 1950) container: 2-byte header, deflate stream, Adler-32.
     // Bytes after the Adler-32 are ignored.
-    fn static Zlib(input, expected?): block {
+    fn static Zlib(input, expected?, maxBytes?): block {
         let src = _asBlock(input);
         if (src == nil || len(src) < 6) return nil;
         let cmf = src[0];
@@ -522,7 +536,7 @@ class Inflate {
         if ((cmf & 15) != 8) return nil;                       // not deflate
         if (((cmf << 8) + flg) % 31 != 0) return nil;          // header check
         if ((flg & 32) != 0) return nil;                       // preset dictionary
-        let out = _inflateFrom(src, 2, expected);
+        let out = _inflateFrom(src, 2, expected, maxBytes);
         if (out == nil) return nil;
         let p = _lastEnd;
         if (p + 4 > len(src)) { _lastErr = -1; return nil; }
@@ -533,11 +547,12 @@ class Inflate {
 
     // gzip (RFC 1952) container. Several members one after another decode to
     // their contents concatenated; bytes after the last member that do not
-    // start another one are ignored.
-    fn static Gzip(input, expected?): block {
+    // start another one are ignored. maxBytes caps the members together.
+    fn static Gzip(input, expected?, maxBytes?): block {
         let src = _asBlock(input);
         if (src == nil || len(src) < 18) return nil;
         let n = len(src);
+        let limit = _inflateLimit(maxBytes);
         var all = nil;
         var at = 0;
         while (at + 18 <= n && src[at] == 31 && src[at + 1] == 139) {
@@ -552,18 +567,16 @@ class Inflate {
             if ((flg & 16) != 0) { while (p < n && src[p] != 0) { p = p + 1; } p = p + 1; }
             if ((flg & 2) != 0)  { p = p + 2; }                     // FHCRC
             if (p >= n - 8) return nil;
-            let out = _inflateFrom(src, p, expected);
+            // Each member may only use what the ones before it left of the cap.
+            let left = (all == nil) ? limit : limit - len(all);
+            if (left <= 0) { _lastErr = -3; return nil; }
+            let out = _inflateFrom(src, p, expected, left);
             if (out == nil) return nil;
             let q = _lastEnd;
             if (q + 8 > n) { _lastErr = -1; return nil; }
             let want = src[q] | (src[q+1] << 8) | (src[q+2] << 16) | (src[q+3] << 24);
             if ((u32)Hash.Crc32(out) != (u32)want) { _lastErr = -2; return nil; }
-            if (all == nil) {
-                all = out;
-            } else {
-                if (len(all) + len(out) > INFLATE_MAX_OUT) { _lastErr = -3; return nil; }
-                Buffer.Append(all, out);
-            }
+            if (all == nil) { all = out; } else { Buffer.Append(all, out); }
             at = q + 8;
         }
         if (all == nil) return nil;
@@ -571,15 +584,15 @@ class Inflate {
     }
 
     // Sniff the container and decode accordingly.
-    fn static Auto(input, expected?): block {
+    fn static Auto(input, expected?, maxBytes?): block {
         let src = _asBlock(input);
         if (src == nil || len(src) < 2) return nil;
-        if (src[0] == 31 && src[1] == 139) { return Inflate.Gzip(src, expected); }
+        if (src[0] == 31 && src[1] == 139) { return Inflate.Gzip(src, expected, maxBytes); }
         if ((src[0] & 15) == 8 && ((src[0] << 8) + src[1]) % 31 == 0) {
-            let z = Inflate.Zlib(src, expected);
+            let z = Inflate.Zlib(src, expected, maxBytes);
             if (z != nil) return z;
         }
-        return Inflate.Raw(src, expected);
+        return Inflate.Raw(src, expected, maxBytes);
     }
 }
 
@@ -1026,3 +1039,7 @@ fn _emitBlock(dst: block, tl: [int], tv: [int], C: [int], E: [int], P: [int]): i
     P[P_BUF] = bitbuf; P[P_CNT] = bitcnt; P[P_OUT] = outp;
     return 0;
 }
+
+// The constants exist from module load on: a global initializer runs then,
+// after every kernel it needs is defined.
+global _constsReady: bool = _inflateConsts() != nil;

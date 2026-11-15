@@ -378,6 +378,13 @@ fn test_malformed() {
     check(Tiff.Decode(big) == nil, "width over MAX_DIM -> nil");
     check(String.Contains(str(Tiff.LastError()), "limit"), "LastError explains the size limit");
 
+    let gi = Tiff.Info(good);
+    let gpx = gi.Width * gi.Height;
+    check(Tiff.Decode(good, { maxPixels: gpx - 1 }) == nil, "over maxPixels -> nil");
+    check(String.Contains(str(Tiff.LastError()), "maxPixels"), "LastError names maxPixels");
+    check(Tiff.Info(good, { maxPixels: gpx - 1 }).Supported == false, "Info agrees with Decode on maxPixels");
+    check(Tiff.Decode(good, { maxPixels: gpx }) != nil, "exactly maxPixels -> decodes");
+
     let jpeg = copyOf(good);
     Buffer.WriteU16At(jpeg, tagValueAt(jpeg, 259), 7);
     check(Tiff.Decode(jpeg) == nil, "compression 7 -> nil");
@@ -395,6 +402,19 @@ fn test_malformed() {
     let offs = copyOf(good);
     Buffer.WriteU32At(offs, tagValueAt(offs, 273), len(offs) + 1000);
     check(Tiff.Decode(offs) == nil, "strip offset past the end -> nil");
+
+    // Tile sides of 0xFFFFFFF0 (re-typed SHORT -> LONG) overflowed the tile
+    // byte count to a negative that passed the size check, and then raised.
+    let tiled = File.ReadAllBytes("tests/tiff/rgb8_tiled_lzw.tif");
+    foreach (tag in [322, 323]) {
+        let v = tagValueAt(tiled, tag);
+        Buffer.WriteU16At(tiled, v - 6, 4);           // field type LONG
+        Buffer.WriteU32At(tiled, v, 4294967280);
+    }
+    var raisedTile = false;
+    var tileImg = nil;
+    try { tileImg = Tiff.Decode(tiled); } catch (_e) { raisedTile = true; }
+    check(!raisedTile && tileImg == nil, "huge tile sides -> nil, not an exception");
 
     // An IFD chain that points back at itself must not loop forever.
     let loop = copyOf(good);

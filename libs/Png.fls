@@ -55,8 +55,12 @@
 //
 // Limits:
 //   Images are bounded to 16384 pixels per side, matching the `Gfx` surface cap.
+//   Decode and Load also refuse (nil) an image of more than `maxPixels` pixels,
+//   default Png.MAX_PIXELS (64 M), before allocating anything for it - the size
+//   comes from the file, so it must not decide the allocation alone:
+//     Png.Decode(bytes, { maxPixels: 16384 * 16384 })
 //
-// Constants:  Png.MAX_DIM  Png.FILTER_ADAPTIVE  Png.FILTER_NONE
+// Constants:  Png.MAX_DIM  Png.MAX_PIXELS  Png.FILTER_ADAPTIVE  Png.FILTER_NONE
 // =============================================================================
 
 import { Inflate, Deflate } from library("Deflate", "1.0");
@@ -68,6 +72,7 @@ class Png {
     // ----------------------------------------------------------------
 
     const MAX_DIM = 16384;
+    const MAX_PIXELS = 67108864;    // default maxPixels for Decode/Load
 
     // Filter strategies for Encode/Save.
     const FILTER_ADAPTIVE = 0;
@@ -116,9 +121,9 @@ class Png {
     // Decode
     // ----------------------------------------------------------------
 
-    // Decode(bytes:block) -> { Width:int, Height:int, Pixels:block } or nil.
-    // Pixels holds Width*Height 32-bit 0xAARRGGBB words.
-    fn static Decode(bytes:block) : object|nil {
+    // Decode(bytes:block, opts?) -> { Width:int, Height:int, Pixels:block } or nil.
+    // Pixels holds Width*Height 32-bit 0xAARRGGBB words. opts: { maxPixels }.
+    fn static Decode(bytes:block, opts?:object) : object|nil {
         if (bytes == nil) { return nil; }
         let n = len(bytes);
         if (n < 33) { return nil; }
@@ -183,6 +188,8 @@ class Png {
         if (!gotIhdr || idatTotal <= 0) { return nil; }
         if (w <= 0 || h <= 0) { return nil; }
         if (w > MAX_DIM || h > MAX_DIM) { return nil; }
+        let maxPx = (opts != nil && opts.maxPixels != nil) ? opts.maxPixels : MAX_PIXELS;
+        if (w * h > maxPx) { return nil; }
         // Adam7 would need seven sub-image passes; decoding it as progressive
         // produces a scrambled image, so refuse instead.
         if (interlace != 0) { return nil; }
@@ -218,19 +225,26 @@ class Png {
             i = i + 1;
         }
 
+        // maxPixels already bounds this size, so it may pass Inflate's 256 MiB cap.
         let rawExpect = h * (1 + rowBytes);
-        let raw = Inflate.Zlib(idat, rawExpect);
+        let raw = Inflate.Zlib(idat, rawExpect, rawExpect);
         // A truncated-but-well-formed stream inflates to fewer bytes than IHDR
         // promised; the filter loop would then read uninitialised buffer into
         // pixels, so demand the exact length.
         if (raw == nil || len(raw) != rawExpect) { return nil; }
+        // Filter types are 0..4; anything else is a corrupt file, not "None".
+        var fy = 0;
+        while (fy < h) {
+            let ft = (u8)raw[fy * (1 + rowBytes)];
+            if (ft > 4) { return nil; }
+            fy = fy + 1;
+        }
 
         let out = Buffer.Create(w * h, 4);
         if (out == nil) { return nil; }
 
-        // Claim an event only on the path that consumes it: an id that is
-        // created and never signalled is never released back to the 64-slot
-        // pool, and the scheduler still waits on it at shutdown.
+        // Claim an event only on the path that consumes it: an id nobody
+        // waits for is never released back to the pool.
         var fast = false;
         if (ct == 6 && bd == 8) {
             let id = Event.Create();
@@ -244,16 +258,18 @@ class Png {
         if (!fast) {
             Png._unfilter(raw, h, rowBytes, filtBpp);
             Png._expand(raw, out, w, h, rowBytes, ct, bd, plte, plteN, trns, trnsN);
+            // For gray and RGB, tRNS is one colour that stands for transparent.
+            if (trns != nil && (ct == 0 || ct == 2)) { Png._applyKey(out, w * h, ct, bd, trns, trnsN); }
         }
 
         return { Width: w, Height: h, Pixels: out };
     }
 
-    // Load(path:string) -> { Width, Height, Pixels } or nil.
-    fn static Load(path:string) : object|nil {
+    // Load(path:string, opts?) -> { Width, Height, Pixels } or nil.
+    fn static Load(path:string, opts?:object) : object|nil {
         let bytes = File.ReadAllBytes(path);
         if (bytes == nil) { return nil; }
-        return Png.Decode(bytes);
+        return Png.Decode(bytes, opts);
     }
 
     // Reconstruct all five filter types in place over the raw scanline buffer.
@@ -449,6 +465,34 @@ class Png {
                 x = x + 1;
             }
             y = y + 1;
+        }
+        return;
+    }
+
+    // Make every pixel of the tRNS key colour transparent. The key is compared
+    // after expansion to 8 bits per channel, the way the expanders produce it.
+    // shortcut: a 16-bit image is keyed on the high byte of each sample, so a
+    // colour that differs from the key only in its low byte goes transparent
+    // too; compare raw samples if 16-bit keyed images ever matter.
+    fn static _applyKey(out:block, n:int, ct:int, bd:int, trns:block, trnsN:int) {
+        var key = 0;
+        if (ct == 0) {
+            if (trnsN < 2) { return; }
+            let k = ((u8)trns[0] << 8) | (u8)trns[1];
+            let g = (bd == 16) ? (k >> 8) : Png._gray8(k, bd);
+            key = (g << 16) | (g << 8) | g;
+        } else {
+            if (trnsN < 6) { return; }
+            let hi = (bd == 16);
+            let r = hi ? (u8)trns[0] : (u8)trns[1];
+            let g = hi ? (u8)trns[2] : (u8)trns[3];
+            let b = hi ? (u8)trns[4] : (u8)trns[5];
+            key = (r << 16) | (g << 8) | b;
+        }
+        var i = 0;
+        while (i < n) {
+            if ((out[i] & 0xFFFFFF) == key) { out[i] = out[i] & 0xFFFFFF; }
+            i = i + 1;
         }
         return;
     }

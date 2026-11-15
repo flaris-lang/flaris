@@ -66,19 +66,19 @@ The same holds for calling a function `Ffi.GetFunction` returned: it runs only
 where FFI is allowed, so handing one to an embedded context or fiber without it
 raises `UnsafeOperation` there (`ModuleDenied` when the host withholds `Ffi`).
 
-**Prefer `--allow-ffi`.** `--unsafe` is a single switch over four separate
-capabilities, so granting FFI with it also grants the other three:
+**Prefer `--allow-ffi`.** `--unsafe` is a single switch over several separate
+capabilities, so granting FFI with it also grants the rest:
 
 | capability | granted by `--allow-ffi` | granted by `--unsafe` |
 |---|---|---|
 | `Ffi.*` - load and call native code | yes | yes |
 | `Memory.*`, `Buffer.GetAddress` - read/write any address | no | yes |
 | `import` over plain `http://` | no | yes |
-| raw JIT entry points | no | yes |
+| `VM.PatchFunction`, `Debug.Pool` / `Value` / `GuardAddress` - redirect calls, see heap addresses | no | yes |
 
 A script that needs a database plugin needs the first row and none of the rest.
-`--unsafe` keeps its existing meaning and still implies `--allow-ffi`, so
-existing command lines, `.flx` embed headers and `cfg.unsafe` are unaffected.
+`--unsafe` implies `--allow-ffi`. An embedding host grants the same through the
+`FLARIS_CAP_FFI` and `FLARIS_CAP_UNSAFE` capabilities.
 
 Neither flag makes a plugin safe: native code runs in your process with your
 privileges, and `--allow-ffi` only narrows what the *script* around it may do.
@@ -103,14 +103,14 @@ Namespace: **`Ffi`** - requires `--allow-ffi` (or `--unsafe`, which implies it).
 
 | Function | Signature | Description |
 | ---------- | ----------- | ------------- |
-| **Load** | `Load(path:string, sha256:string\|nil, flags?:int) - pointer` | Load shared library at `path`. When `sha256` is a 64-character hex string the library's fingerprint is verified before loading; pass `nil` to skip the check. A digest that is not 64 hex characters is treated as a malformed pin and raises `Exception.ChecksumError` rather than loading unverified - as does a fingerprint mismatch. `flags` may combine `Ffi.LAZY` (default), `Ffi.NOW` and `Ffi.GLOBAL`; ignored on Windows. Returns a library handle (`pointer`), or `nil` if the file cannot be loaded - call `Ffi.LastError()` for the reason. Libraries are cached - loading the same path twice returns the same handle, and stay loaded for the lifetime of the process. |
+| **Load** | `Load(path:string, sha256:string\|nil, flags?:int) - pointer` | Load shared library at `path`. When `sha256` is a 64-character hex string the library's fingerprint is verified before loading; pass `nil` to skip the check. A digest that is not 64 hex characters is treated as a malformed pin and raises `Exception.ChecksumError` rather than loading unverified - as does a fingerprint mismatch, a plugin built for a newer FFI ABI (see _ABI version_), or a file that changed between hashing and loading. `--no-verify` skips the fingerprint check. `flags` may combine `Ffi.LAZY` (default), `Ffi.NOW` and `Ffi.GLOBAL`; ignored on Windows. Returns a library handle (`pointer`), or `nil` if the file cannot be loaded - call `Ffi.LastError()` for the reason. Libraries are cached - loading the same path twice returns the same handle - and stay loaded until the VM shuts down. |
 | **GetFunction** | `GetFunction(handle:pointer, name:string, signature?:string) - ffi_function` | Resolve a named symbol from a loaded library. Returns a callable FFI function, or `nil` if the symbol is not found or the signature is malformed. The optional `signature` takes the form `fn(arg1,arg2,...):returnType`, for example `fn(int,int):int` or `fn():nil`; argument count, argument types **and the return type** are then validated on every call. A return that does not match raises `Exception.TypeMismatch`; `nil` is always accepted, so a plugin can signal failure with `nil` whatever type it declares. Omit the signature to leave the call fully dynamic. |
 | **HasFunction** | `HasFunction(handle:pointer, name:string) - bool` | Returns `true` if the named symbol exists in the library. Does not allocate an object. Use to guard optional symbols before calling `GetFunction`. |
 | **SetCallback** | `SetCallback(handle:pointer, name:string, fn:function) - bool` | Register a Flaris function as a named callback for the library. The library must export `flaris_set_callback`. Registrations are scoped to `handle`, so two libraries may use the same name without colliding; a name is resolved against the library whose code is calling back. Re-registering the same name for the same library replaces the previous function. |
 | **RemoveCallback** | `RemoveCallback(handle:pointer, name:string) - bool` | Unregister a single named callback without unloading the library. Useful for one-shot callbacks. |
 | **GetVersion** | `GetVersion(handle:pointer) - int` | Returns the plugin version as `uint32` (`0xMMmmppbb`). Plugin must export `uint32_t flaris_version(void)`. Returns `0` if symbol not found. |
 | **Call** | `Call(handle:pointer, name:string, ...args) - any` | Resolve and call a named symbol in one step. Up to 4 extra arguments. Calls `dlsym` on every invocation - use `GetFunction` for hot paths. |
-| **CallAsync** | `CallAsync(fn:ffi_function, args:array) - any` | Run a **pure** FFI function on the I/O thread pool so the calling fiber parks instead of freezing the scheduler. Must be `await`ed; `args` is the argument array; block arguments are refused. See _Async calls_ below. |
+| **CallAsync** | `CallAsync(fn:ffi_function, args:array) - any` | Run a **pure** FFI function on the I/O thread pool so the calling fiber parks instead of freezing the scheduler. Must be `await`ed; `args` is the argument array; a block argument is passed as its live memory, pinned until the call returns. See _Async calls_ below. |
 | **LastError** | `LastError() - string\|nil` | Text of the most recent `Load`/`GetFunction`/`Call` failure, or `nil` if the last one succeeded. Those three clear it on entry, so it always describes the most recent call - it does not linger errno-style. |
 | **LAZY** / **NOW** / **GLOBAL** | `int` | `dlopen` flag constants for `Load`. `LAZY` (default) resolves symbols on first use; `NOW` resolves everything at load, turning a missing symbol into a failed `Load` instead of a crash on first call; `GLOBAL` exposes the library's symbols to libraries loaded afterwards. |
 
@@ -195,8 +195,8 @@ let Greet = Ffi.GetFunction(lib, "ffi_greet", "fn(string):nil");
 let result = Add(10, 32);        // - 42
 let msg = Greet("Flaris");       // - "Hello, Flaris!"
 
-// No unload step: a loaded library stays mapped for the process lifetime
-// and is closed by the VM at exit.
+// No unload step: a loaded library stays loaded until the VM shuts down,
+// which closes it.
 ```
 
 ### Version checking
@@ -268,7 +268,7 @@ A plugin that owns a resource - a database connection, a decoder context, a
 socket - returns it as `FFIVAL_POINTER`. Script can hold the handle and pass it
 back, but cannot dereference it, do arithmetic on it, or **create** one: there
 is no pointer literal and no conversion into `pointer`. Declaring the parameter
-as `ptr` therefore turns what used to be a segfault into a catchable exception:
+as `ptr` therefore turns a wrong argument into a catchable exception instead of a segfault:
 
 ```js
 let open  = Ffi.GetFunction(lib, "db_open",  "fn(string):ptr");
@@ -310,7 +310,7 @@ of scope, so a plugin that hands out handles must expose a close entry point,
 and script must call it. A handle used after close is a use-after-free the VM
 cannot detect - keep the tag check, but note it cannot catch this case.
 
-**Strings** are passed zero-copy: `string.data` points at the live Flaris string (marked with the `FFI_FLAG_BORROWED` flag bit). It is valid for the duration of the call only - `memcpy` the bytes if you need them after your function returns, and never `free()` or write through the pointer. The container structure of **arrays and objects** (element and pair nodes) is still built per call and freed by the VM after the function returns, so large nested structures have proportional marshalling cost.
+**Strings** are passed zero-copy: `string.data` points at the live Flaris string (marked with the `FFI_FLAG_BORROWED` flag bit). It is valid for the duration of the call only - `memcpy` the bytes if you need them after your function returns, and never `free()` or write through the pointer. An **object** argument carries the same flag: its keys are borrowed in the same way. The container structure of **arrays and objects** (element and pair nodes) is still built per call and freed by the VM after the function returns, so large nested structures have proportional marshalling cost.
 
 **Blocks** also alias VM memory directly (`block.memory`) - zero-copy and writable by convention, but the plugin must **never free or reallocate** that pointer. Total byte size is `block.block_size * block.block_count`. Blocks are by far the cheapest way to move bulk data across the boundary; prefer them over big arrays in hot paths.
 
@@ -337,7 +337,7 @@ typedef enum {
 
 struct FfiObject {
     FfiObjectType type;
-    uint32_t flags;       // FFI_FLAG_BORROWED on some args; 0 in values you build
+    uint32_t flags;       // FFI_FLAG_BORROWED / FFI_FLAG_ARG on args; 0 in values you build
 
     union {
         double   fval;    // FFIVAL_FLOAT
@@ -408,7 +408,7 @@ for (uint32_t r = 0; r < nrows; r++)
 return t;
 ```
 
-See `ffi/pg_ffi.c` and `ffi/sqlite_ffi.c` for complete examples.
+The library repository's `ffi/pg_ffi.c` and `ffi/sqlite_ffi.c` are complete examples.
 
 ### Constructing return values
 
@@ -532,6 +532,9 @@ Understanding memory ownership is critical to writing correct plugins.
 - All string `.data` fields inside args - read-only views of live VM strings
   (`FFI_FLAG_BORROWED`), valid only until your function returns; copy the bytes
   to keep them
+- Every node of an argument carries `FFI_FLAG_ARG`. You may return an argument
+  as it came, or place it inside a value you build and return (once or several
+  times): the VM copies it and still frees the original once, after the call
 
 ### Plugin owns (and is responsible for freeing)
 
@@ -627,10 +630,11 @@ Notes:
 - The guard macros expand to `return ffi_nil();` and assume the parameters are
   named `args` and `argc` (the required signature) - use them only inside an
   FFI function body.
-- `ffi_string`/`ffi_string_n` and `ffi_object_get` use `malloc`/`strdup`. To
-  build without libc (freestanding targets), define `FFI_OBJECT_NO_STDLIB`
-  before including the header; the scalar constructors and all macros remain
-  available.
+- `ffi_string`, `ffi_string_n`, `ffi_array_n`, `ffi_object_n` and `ffi_table_n`
+  allocate with `malloc`; `ffi_object_get` allocates nothing but compares keys
+  with `strcmp`. To build without libc (freestanding targets), define
+  `FFI_OBJECT_NO_STDLIB` before including the header: those six are left out,
+  and the scalar constructors and all macros remain available.
 
 Example using guards and constructors:
 
@@ -1041,7 +1045,7 @@ String data you pass into `g_dispatch` via `strdup` is consumed and freed by the
 
 Registrations are scoped to the library handle you pass to `Ffi.SetCallback`, so two libraries can use the same callback name without colliding. Registering a new function under the same name, for the same library, replaces the previous one. Use `Ffi.RemoveCallback(handle, name)` to unregister one explicitly; everything still registered is released when the VM shuts down.
 
-Libraries themselves are never unloaded during the process. There is no `Ffi.Unload`: `dlclose` would leave every symbol already resolved through `Ffi.GetFunction` pointing into unmapped memory, and whether it unloads at all depends on what the library links, so reloading a rebuilt `.so` in-process is not supported. Restart the process, or isolate the plugin in a child process you can restart.
+A library stays loaded until the VM that loaded it shuts down. There is no `Ffi.Unload`: `dlclose` would leave every symbol already resolved through `Ffi.GetFunction` pointing into unmapped memory, and whether it unloads at all depends on what the library links, so reloading a rebuilt `.so` in-process is not supported. Restart the process, or isolate the plugin in a child process you can restart.
 
 ### Async calls
 
@@ -1072,9 +1076,14 @@ author's contract; a function that calls back anyway is refused by the callback
 trampoline - the dispatch is dropped and a warning printed - rather than being
 allowed to touch VM state from the worker.
 
-Two rules the runtime enforces: arguments marshal as **owned copies** (so the
-worker never reads VM memory), and **block arguments are refused** — blocks alias
-VM memory and cannot cross to a worker thread. A declared return type that does
+Two rules the runtime enforces: every argument except a block marshals as an
+**owned copy** (so the worker never reads VM objects), and a **block argument**,
+at any depth, is passed as its live memory and **pinned** for the duration of the
+call: it stays alive, and the calls that would grow or move it (`Buffer.Reserve`,
+`Buffer.Append`, `Buffer.ChangeToString`, ...) refuse until the worker is done,
+as they do while a `Buffer.ProcessCallback` kernel runs. The plugin works on the
+live bytes, so the script must not expect a consistent view of the block while
+the call runs. A declared return type that does
 not match the plugin's result resolves to `nil`, the same failure signal the
 async `File.*` builtins use.
 
@@ -1102,7 +1111,7 @@ version is accepted: revisions only append, so an old plugin's fields all still
 mean what they meant, and it needs no rebuild. A library exporting nothing is
 loaded with a warning, because it cannot be told apart from a shared library
 that was never a plugin - but every Flaris plugin is expected to carry the
-macro, and that leniency may be removed.
+macro.
 
 | ABI | change |
 |-----|--------|
@@ -1120,8 +1129,8 @@ marshalling contract and is owned by the runtime.
 - **Handles.** An `Ffi.Load` handle stays valid for the lifetime of the VM that loaded it, and the library stays mapped for as long as any VM holds it. A handle belongs to that VM: passing it to another one, or passing anything that did not come from `Ffi.Load` at all - including a plugin's own `FFIVAL_POINTER` handle - raises instead of being used to resolve a symbol.
 - **Handle lifetime is the plugin's.** The VM never frees what an `FFIVAL_POINTER` points at, and has no way to know when script drops the last reference. A plugin handing out handles must expose a close entry point; using a handle after close is a use-after-free the runtime cannot detect.
 - **Exceptions.** A Flaris callback that raises unwinds the native frames back to the `Ffi` call that entered the plugin, and the exception continues to propagate in script. Native code between those two points does **not** get to clean up: destructors, `free` calls and locks in the abandoned C frames are skipped. Keep callback-invoking C code free of state that needs unwinding.
-- **Crashes are fatal.** There is no signal handler. A plugin that segfaults, aborts or corrupts the heap takes the whole VM down; no exception is raised and no diagnostic is produced.
-- **No raw C ABI.** A plugin function must have the shape `FfiObject f(FfiObject *args, int argc)`. You cannot point `Ffi.GetFunction` at an arbitrary C function such as `sqlite3_open` - it needs a shim compiled against `ffi_object.h` (see `ffi/sqlite_ffi.c`).
+- **Crashes are fatal.** There is no fault handler. A plugin that segfaults, aborts or corrupts the heap takes the whole process down - an embedding host and every VM in it included; no exception is raised and no diagnostic is produced.
+- **No raw C ABI.** A plugin function must have the shape `FfiObject f(FfiObject *args, int argc)`. You cannot point `Ffi.GetFunction` at an arbitrary C function such as `sqlite3_open` - it needs a shim compiled against `ffi_object.h` (the library repository's `ffi/sqlite_ffi.c` is one).
 
 ### Limitations
 

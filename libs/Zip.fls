@@ -42,9 +42,16 @@
 // directory - see ZipReader.SafeName and ZipReader.SkippedUnsafe.
 //
 // Limits: classic ZIP only - no ZIP64, no encryption, no multi-disk. An
-// archive is capped at 4 GiB and 65535 entries, and a single entry at 4 GiB.
-// Methods 0 (stored) and 8 (deflate) are read; writing picks whichever of the
-// two is smaller per entry, unless the caller passes { store: true }.
+// archive is capped at 4 GiB and 65535 entries. A deflated entry is read up to
+// 256 MiB (Inflate's cap); a larger one reads as nil. Methods 0 (stored) and 8
+// (deflate) are read; writing picks whichever of the two is smaller per entry,
+// unless the caller passes { store: true }.
+//
+// ExtractAll(dir, opts?) checks the archive against two limits before it
+// writes anything, and returns -1 (writing nothing) when it is over either:
+//   maxBytes   - the files' sizes together (default 4 GiB). A few KB of ZIP
+//                can name the same compressed data from thousands of entries.
+//   maxEntries - the number of files (default: no limit beyond the format's)
 //
 // Both reading and writing hold the whole archive in memory, so the practical
 // ceiling is well under the format's - which is also why ZIP64 would buy
@@ -74,6 +81,7 @@ const FLAG_UTF8   = 2048;     // general-purpose bit 11: the name is UTF-8
 const MAX_U32     = 4294967295;
 const MAX_ENTRIES = 65535;
 const EOCD_MIN    = 22;
+const ZIP_MAX_EXTRACT = 4294967296;   // ExtractAll's default maxBytes: 4 GiB
 
 // ---------------------------------------------------------------------------
 //  Helpers
@@ -266,10 +274,12 @@ fn _zipVerify(data: block, e: object): block {
 //
 // Rejecting rather than repairing is deliberate. Stripping a leading "../" turns
 // a hostile name into a plausible one and writes it anyway; the caller wants to
-// know the archive tried. (An embedded NUL needs no check here: a Flaris string
-// cannot hold one, so ReadStringFixed has already truncated at that byte.)
+// know the archive tried. A name holding a NUL is refused too: the string keeps
+// every byte, but the filesystem stops at the NUL, so "evil.sh\0.png" would
+// list as a .png and be written as evil.sh.
 fn _zipSafeRel(name: string): string {
     if (name == nil || len(name) == 0) return nil;
+    if (String.IndexOfAnyFrom(name, _zipNul(), 0) >= 0) return nil;
 
     // Archives written on Windows store "\\" separators. Normalising both ways
     // means "..\\..\\x" is caught wherever the archive is opened, not only on
@@ -288,6 +298,13 @@ fn _zipSafeRel(name: string): string {
     }
     if (len(parts) == 0) return nil;
     return String.Join(parts, "/");
+}
+
+// A one-byte string holding NUL, which a literal cannot spell.
+fn _zipNul(): string {
+    let b = Buffer.Create(1, 1);
+    b[0] = 0;
+    return Buffer.ToString(b);
 }
 
 // Containment test with a separator boundary, so a root of "/srv/out" does not
@@ -423,9 +440,23 @@ class ZipReader {
     // Entries are read by position rather than looked up by name, so an archive
     // carrying two entries under one name extracts both instead of writing the
     // first one twice.
-    fn ExtractAll(dir: string): int {
+    //
+    // -1, with nothing written, when the files are over opts.maxBytes or
+    // opts.maxEntries (see the header). The sizes checked are the ones each
+    // entry is verified against when it is read, so an entry cannot exceed its own.
+    fn ExtractAll(dir: string, opts?): int {
         this._ensure();
         this._skipped = 0;
+        let maxBytes = (opts != nil && opts.maxBytes != nil) ? opts.maxBytes : ZIP_MAX_EXTRACT;
+        let maxEntries = (opts != nil && opts.maxEntries != nil) ? opts.maxEntries : -1;
+        var total = 0;
+        var files = 0;
+        foreach (e in this._entries) {
+            if (e.IsDir) { continue; }
+            total = total + e.Size;
+            files = files + 1;
+        }
+        if (total > maxBytes || (maxEntries >= 0 && files > maxEntries)) return -1;
         let root = Path.Resolve(dir);
         if (root == nil) return 0;
 
@@ -447,6 +478,10 @@ class ZipReader {
                 this._skipped = this._skipped + 1;
                 continue;
             }
+            // A symlink already sitting at the entry's own path would be
+            // written through; replace it, as tar does.
+            let st = File.Stat(dest);
+            if (st != nil && st.IsSymlink) { File.Delete(dest); }
 
             if (this._writeEntry(e, dest)) { n = n + 1; }
         }
@@ -485,7 +520,7 @@ class ZipReader {
 // ---------------------------------------------------------------------------
 
 class ZipWriter {
-    let _items = nil;
+    let _items = [];
     let _comment = "";
 
     fn Constructor() { this._items = []; this._comment = ""; }
@@ -723,14 +758,16 @@ class ZipWriter {
 // ---------------------------------------------------------------------------
 
 class Archive {
+    // nil for bytes that are not a zip archive (no end-of-central-directory
+    // record), rather than a reader that lists nothing.
     fn static Open(data: block): ZipReader {
-        if (data == nil) return nil;
+        if (data == nil || _zipFindEocd(data) < 0) return nil;
         return new ZipReader(data);
     }
 
     fn static OpenFile(path: string): ZipReader {
         let data = File.ReadAllBytes(path);
-        if (data == nil) return nil;
+        if (data == nil || _zipFindEocd(data) < 0) return nil;
         return new ZipReader(data);
     }
 

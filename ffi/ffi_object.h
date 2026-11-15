@@ -1,51 +1,43 @@
+// ffi_object.h - the only header a Flaris FFI plugin includes: the FfiObject struct values cross the
+// boundary in, the ABI version every plugin exports, and inline helpers to read arguments and build results.
+// The helpers do not change the struct layout, so a plugin built against this header stays ABI-compatible
+// with the matching VM.
 #ifndef FLARIS_FFI_OBJECT_H
 #define FLARIS_FFI_OBJECT_H
 
 #include <stdint.h>
 
-/*
- * ffi_object.h - the only header a Flaris FFI plugin needs to include.
- *
- * It defines the FfiObject marshalling struct plus a set of convenience
- * macros and `static inline` helpers for inspecting arguments and building
- * return values. The helpers do not change the struct layout, so a plugin
- * built against this header stays ABI-compatible with the matching VM.
- *
- * Constructors that allocate (ffi_string, ffi_array_n, ffi_object_n,
- * ffi_table_n, ffi_object_get) need malloc/strdup. Define FFI_OBJECT_NO_STDLIB
- * before including to drop those helpers (and the <stdlib.h>/<string.h>
- * includes) for freestanding builds.
- */
+// The allocating constructors (ffi_string, ffi_string_n, ffi_array_n, ffi_object_n, ffi_table_n) and
+// ffi_object_get need <stdlib.h> and <string.h>. Define FFI_OBJECT_NO_STDLIB before including to drop them,
+// and those includes, for a freestanding build.
 #ifndef FFI_OBJECT_NO_STDLIB
 #include <stdlib.h>
 #include <string.h>
 #endif
 
-/* ── ABI version ────────────────────────────────────────────────────────────
- *
- * FfiObject's layout is shared between the VM and every plugin, so a plugin
- * built against a different revision of this header would misread every
- * argument - undefined behaviour, not a clean error. The version below is
- * bumped whenever that layout changes.
- *
- * Every plugin must invoke FLARIS_PLUGIN_ABI() exactly once at file scope:
- *
- *     #include "ffi_object.h"
- *     FLARIS_PLUGIN_ABI()
- *
- * It exports flaris_abi_version(), which the runtime checks at Ffi.Load. A
- * plugin reporting a version NEWER than the runtime knows is refused - it may
- * use a struct member the runtime cannot see. An OLDER version is accepted:
- * revisions only append, so an old plugin's fields all still mean what they
- * meant. A plugin exporting nothing is loaded with a warning, since it cannot
- * be told apart from a shared library that is not a plugin at all.
- *
- * History
- *   1  initial
- *   2  FFIVAL_POINTER (opaque handles). Appended to the enum, and its union
- *      member fits inside the existing `table` member, so sizeof(FfiObject) is
- *      unchanged and v1 plugins need no rebuild.
- */
+// ---- ABI version ---------------------------------------------------------------------------------------------
+// FfiObject's layout is shared between the VM and every plugin, so a plugin
+// built against a different revision of this header would misread every
+// argument - undefined behaviour, not a clean error. The version below is
+// bumped whenever that layout changes.
+//
+// Every plugin must invoke FLARIS_PLUGIN_ABI() exactly once at file scope:
+//
+//     #include "ffi_object.h"
+//     FLARIS_PLUGIN_ABI()
+//
+// It exports flaris_abi_version(), which the runtime checks at Ffi.Load. A
+// plugin reporting a version NEWER than the runtime knows is refused - it may
+// use a struct member the runtime cannot see. An OLDER version is accepted:
+// revisions only append, so an old plugin's fields all still mean what they
+// meant. A plugin exporting nothing is loaded with a warning, since it cannot
+// be told apart from a shared library that is not a plugin at all.
+//
+// Versions
+//   1  the first layout
+//   2  FFIVAL_POINTER (opaque handles). Appended to the enum, and its union
+//      member fits inside the existing `table` member, so sizeof(FfiObject) is
+//      unchanged and v1 plugins need no rebuild.
 #define FLARIS_FFI_ABI_VERSION 2u
 
 #if defined(_WIN32)
@@ -80,25 +72,27 @@ typedef struct FfiObject FfiObject;
 typedef struct FfiKV FfiKV;
 typedef FfiObject (*FFIFunc)(FfiObject *args, int argc);
 
-/* ── FfiObject.flags bits ───────────────────────────────────────────────────
- *
- * FFI_FLAG_BORROWED (FFIVAL_STRING / FFIVAL_BLOCK arguments, set by the
- * runtime): the pointed-to memory belongs to the caller and is only valid for
- * the duration of the plugin call. Strings: read freely while your function
- * runs; memcpy the bytes if you need them afterwards; never free() or write
- * through the pointer. Blocks: shared memory, writable by convention, never
- * free() or realloc().
- *
- * Rules for plugin code:
- *   - Treat every incoming argument as read-only unless documented otherwise
- *     (BLOCK memory is the documented exception - it is shared and writable).
- *   - Build return values with the ffi_* constructors below and leave `flags`
- *     as they set it (0). All other bits are reserved by the runtime.
- *   - A returned string must be a malloc'd buffer the runtime can take
- *     ownership of (ffi_string / ffi_string_n do this for you); do not return
- *     pointers to static, stack, or argument memory.
- */
+// ---- FfiObject.flags bits ------------------------------------------------------------------------------------
+// FFI_FLAG_BORROWED (set by the runtime on FFIVAL_STRING and FFIVAL_BLOCK
+// arguments, and on an FFIVAL_OBJECT argument whose keys are then borrowed the
+// same way): the pointed-to memory belongs to the caller and is only valid for
+// the duration of the plugin call. Strings: read freely while your function
+// runs; memcpy the bytes if you need them afterwards; never free() or write
+// through the pointer. Blocks: shared memory, writable by convention, never
+// free() or realloc().
+//
+// Rules for plugin code:
+//   - Treat every incoming argument as read-only unless documented otherwise
+//     (BLOCK memory is the documented exception - it is shared and writable).
+//   - Build return values with the ffi_* constructors below and leave `flags`
+//     as they set it (0). All other bits are reserved by the runtime.
+//   - A returned string must be a malloc'd buffer the runtime can take
+//     ownership of (ffi_string / ffi_string_n do this for you); do not return
+//     pointers to static, stack, or argument memory.
 #define FFI_FLAG_BORROWED 0x1u
+// FFI_FLAG_ARG (set by the runtime on every node of an argument it passes): the node and what it points at stay
+// the runtime's. Returning an argument, or putting one inside a result, is safe - the runtime copies it.
+#define FFI_FLAG_ARG 0x2u
 
 struct FfiObject
 {
@@ -120,13 +114,13 @@ struct FfiObject
 
         struct
         {
-            FfiKV *pairs; /* contiguous; each pair embeds its value */
+            FfiKV *pairs; // contiguous; each pair embeds its value
             uint32_t length;
         } object;
 
         struct
         {
-            FfiObject *elements; /* contiguous value array, NOT pointers */
+            FfiObject *elements; // contiguous value array, NOT pointers
             uint32_t length;
         } array;
 
@@ -137,28 +131,28 @@ struct FfiObject
             uint32_t block_count;
         } block;
 
-        /* Rowset: column names stated once + cells in row-major order.
-         * cell (r, c) lives at cells[r * ncols + c]. The runtime converts a
-         * table to an array of objects ({ col: value, ... } per row), so
-         * script code sees the same shape a FFIVAL_ARRAY of FFIVAL_OBJECT
-         * rows would produce, while hashing each column name once per table
-         * rather than once per row: measured ~1.5x faster to marshal on a
-         * 500-row, 2-column result. Use this for anything row-shaped
-         * (database results, CSV, etc.). */
+        // Rowset: column names stated once + cells in row-major order.
+        // cell (r, c) lives at cells[r * ncols + c]. The runtime converts a
+        // table to an array of objects ({ col: value, ... } per row), so
+        // script code sees the same shape a FFIVAL_ARRAY of FFIVAL_OBJECT
+        // rows would produce, while hashing each column name once per table
+        // rather than once per row: measured ~1.5x faster to marshal on a
+        // 500-row, 2-column result. Use this for anything row-shaped
+        // (database results, CSV, etc.).
         struct
         {
-            char **col_names;    /* ncols malloc'd names, owned by this node */
-            FfiObject *cells;    /* nrows*ncols cells, owned by this node */
+            char **col_names;    // ncols malloc'd names, owned by this node
+            FfiObject *cells;    // nrows*ncols cells, owned by this node
             uint32_t ncols;
             uint32_t nrows;
         } table;
 
-        /* Opaque handle: a pointer the PLUGIN owns for as long as it likes and
-         * the VM never dereferences, frees or lets script arithmetic reach -
-         * a sqlite3*, a connection, a decoder context. `tag` is a plugin-chosen
-         * type id carried alongside, so a plugin handed the wrong kind of handle
-         * can reject it instead of casting blind; the VM only copies it. Pick
-         * any nonzero constant per handle type. Compare with FFI_PTR_IS. */
+        // Opaque handle: a pointer the PLUGIN owns for as long as it likes and
+        // the VM never dereferences, frees or lets script arithmetic reach -
+        // a sqlite3*, a connection, a decoder context. `tag` is a plugin-chosen
+        // type id carried alongside, so a plugin handed the wrong kind of handle
+        // can reject it instead of casting blind; the VM only copies it. Pick
+        // any nonzero constant per handle type. Compare with FFI_PTR_IS.
         struct
         {
             void *addr;
@@ -170,10 +164,10 @@ struct FfiObject
 struct FfiKV
 {
     char *key;
-    FfiObject value; /* embedded by value, not a pointer */
+    FfiObject value; // embedded by value, not a pointer
 };
 
-/* ── Type checks (take FfiObject by value) ─────────────────────────────────── */
+// ---- Type checks (take FfiObject by value) -------------------------------------------------------------------
 #define IS_NIL(v) ((v).type == FFIVAL_NIL)
 #define IS_CHAR(v) ((v).type == FFIVAL_CHAR)
 #define IS_INT(v) ((v).type == FFIVAL_INT)
@@ -188,45 +182,46 @@ struct FfiKV
 #define IS_POINTER(v) ((v).type == FFIVAL_POINTER)
 #define IS_NUMBER(v) (IS_INT(v) || IS_FLOAT(v))
 
-/* ── Value accessors (take FfiObject by value) ─────────────────────────────── */
+// ---- Value accessors (take FfiObject by value) ---------------------------------------------------------------
 #define AS_INT(v) ((v).ival)
 #define AS_FLOAT(v) ((v).fval)
 #define AS_CHAR(v) ((v).ival)
 #define AS_STRING(v) ((v).string.data)
 #define AS_STRING_LEN(v) ((v).string.length)
 #define AS_BOOL(v) ((v).ival != 0)
-/* Numeric arg as double regardless of int/float storage. */
+// Numeric arg as double regardless of int/float storage.
 #define AS_NUMBER(v) (IS_FLOAT(v) ? (v).fval : (double)(v).ival)
 
-/* ── Container accessors ───────────────────────────────────────────────────── */
-/* NOTE: FFI_ARR_AT / FFI_OBJ_VAL yield an FfiObject VALUE, not a
- * pointer. Use `FfiObject e = FFI_ARR_AT(v, i);` or take &FFI_ARR_AT(v, i). */
+// ---- Container accessors -------------------------------------------------------------------------------------
+// NOTE: FFI_ARR_AT / FFI_OBJ_VAL yield an FfiObject VALUE, not a
+// pointer. Use `FfiObject e = FFI_ARR_AT(v, i);` or take &FFI_ARR_AT(v, i).
 #define FFI_ARR_LEN(v) ((v).array.length)
 #define FFI_ARR_AT(v, i) ((v).array.elements[i])
 #define FFI_OBJ_LEN(v) ((v).object.length)
 #define FFI_OBJ_KEY(v, i) ((v).object.pairs[i].key)
 #define FFI_OBJ_VAL(v, i) ((v).object.pairs[i].value)
-/* Total byte size of a block: block_size * block_count. */
+// Total byte size of a block: block_size * block_count.
 #define FFI_BLOCK_BYTES(v) ((uint64_t)(v).block.block_size * (uint64_t)(v).block.block_count)
 #define FFI_BLOCK_PTR(v) ((v).block.memory)
-/* Table accessors: cell (r, c) in row-major order. */
+// Table accessors: cell (r, c) in row-major order.
 #define FFI_TBL_ROWS(v) ((v).table.nrows)
 #define FFI_TBL_COLS(v) ((v).table.ncols)
 #define FFI_TBL_NAME(v, c) ((v).table.col_names[c])
 #define FFI_TBL_CELL(v, r, c) ((v).table.cells[(uint64_t)(r) * (v).table.ncols + (c)])
-/* Opaque handles. FFI_PTR_IS is the check to make before casting AS_POINTER to
- * your own type: script cannot forge a pointer, but it can pass one handle
- * where another was meant. */
+// Opaque handles. FFI_PTR_IS is the check to make before casting AS_POINTER to
+// your own type: script cannot forge a pointer, but it can pass one handle
+// where another was meant.
 #define AS_POINTER(v) ((v).pointer.addr)
 #define FFI_PTR_TAG(v) ((v).pointer.tag)
 #define FFI_PTR_IS(v, t) (IS_POINTER(v) && (v).pointer.tag == (uint32_t)(t) && (v).pointer.addr)
 
-/* ── Version helper: pack maj.min.patch.build into 0xMMmmppbb ───────────────── */
+// ---- Version helper ------------------------------------------------------------------------------------------
+// Pack maj.min.patch.build into 0xMMmmppbb.
 #define FLARIS_VERSION(maj, min, pat, bld)        \
     (((uint32_t)(maj) << 24) | ((uint32_t)(min) << 16) | \
      ((uint32_t)(pat) << 8) | (uint32_t)(bld))
 
-/* ── Return-value constructors ─────────────────────────────────────────────── */
+// ---- Return-value constructors -------------------------------------------------------------------------------
 static inline FfiObject ffi_nil(void)
 {
     FfiObject v = {0};
@@ -261,10 +256,10 @@ static inline FfiObject ffi_char(int64_t codepoint)
     v.ival = codepoint;
     return v;
 }
-/* An opaque handle for script to hold and hand back. The VM copies the pointer
- * and never dereferences or frees it - the plugin owns the lifetime and must
- * provide a close/free entry point. `tag` identifies the handle type; use a
- * nonzero constant per type so FFI_PTR_IS can reject a mismatched handle. */
+// An opaque handle for script to hold and hand back. The VM copies the pointer
+// and never dereferences or frees it - the plugin owns the lifetime and must
+// provide a close/free entry point. `tag` identifies the handle type; use a
+// nonzero constant per type so FFI_PTR_IS can reject a mismatched handle.
 static inline FfiObject ffi_pointer(void *addr, uint32_t tag)
 {
     FfiObject v = {0};
@@ -282,7 +277,7 @@ static inline FfiObject ffi_func(FFIFunc f)
 }
 
 #ifndef FFI_OBJECT_NO_STDLIB
-/* Returns a string the VM takes ownership of after conversion; NULL yields nil. */
+// Returns a string the VM takes ownership of after conversion; NULL yields nil.
 static inline FfiObject ffi_string_n(const char *s, uint32_t len)
 {
     if (!s)
@@ -303,8 +298,8 @@ static inline FfiObject ffi_string(const char *s)
     return s ? ffi_string_n(s, (uint32_t)strlen(s)) : ffi_nil();
 }
 
-/* Array of n elements in ONE allocation, all initialised to nil. Fill via
- * FFI_ARR_AT(v, i) = ffi_int(...). Returns nil if allocation fails. */
+// Array of n elements in ONE allocation, all initialised to nil. Fill via
+// FFI_ARR_AT(v, i) = ffi_int(...). Returns nil if allocation fails.
 static inline FfiObject ffi_array_n(uint32_t n)
 {
     FfiObject v = {0};
@@ -319,8 +314,8 @@ static inline FfiObject ffi_array_n(uint32_t n)
     return v;
 }
 
-/* Object with n key/value pairs in ONE allocation (keys NULL, values nil).
- * Set pairs[i].key to a malloc'd/strdup'd name the VM will free. */
+// Object with n key/value pairs in ONE allocation (keys NULL, values nil).
+// Set pairs[i].key to a malloc'd/strdup'd name the VM will free.
 static inline FfiObject ffi_object_n(uint32_t n)
 {
     FfiObject v = {0};
@@ -335,10 +330,10 @@ static inline FfiObject ffi_object_n(uint32_t n)
     return v;
 }
 
-/* Rowset with nrows x ncols nil cells and NULL column names. Set col_names[c]
- * to malloc'd/strdup'd names and fill cells via FFI_TBL_CELL(v, r, c) = ... .
- * The cheapest way to return database-style results. Returns nil on
- * allocation failure or if nrows*ncols overflows. */
+// Rowset with nrows x ncols nil cells and NULL column names. Set col_names[c]
+// to malloc'd/strdup'd names and fill cells via FFI_TBL_CELL(v, r, c) = ... .
+// The cheapest way to return database-style results. Returns nil on
+// allocation failure or if nrows*ncols overflows.
 static inline FfiObject ffi_table_n(uint32_t nrows, uint32_t ncols)
 {
     FfiObject v = {0};
@@ -369,7 +364,7 @@ static inline FfiObject ffi_table_n(uint32_t nrows, uint32_t ncols)
     return v;
 }
 
-/* Look up a key in an FFIVAL_OBJECT argument; NULL if absent. */
+// Look up a key in an FFIVAL_OBJECT argument; NULL if absent.
 static inline FfiObject *ffi_object_get(const FfiObject *o, const char *key)
 {
     if (!o || o->type != FFIVAL_OBJECT || !key)
@@ -382,9 +377,10 @@ static inline FfiObject *ffi_object_get(const FfiObject *o, const char *key)
     }
     return NULL;
 }
-#endif /* FFI_OBJECT_NO_STDLIB */
+#endif // FFI_OBJECT_NO_STDLIB
 
-/* ── Argument guards (use inside an FFI function body; return nil on failure) ── */
+// ---- Argument guards -----------------------------------------------------------------------------------------
+// For an FFI function body: each returns nil from it on failure.
 #define REQUIRE_ARGC(n)        \
     do                         \
     {                          \

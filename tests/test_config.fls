@@ -245,10 +245,10 @@ fn test_merge() {
     let base = new Config();
     base.Load("host = \"localhost\"\nport = 8080\ndebug = false\n");
 
-    let override = new Config();
-    override.Load("port = 9090\ndebug = true\nextra = \"yes\"\n");
+    let overlay = new Config();
+    overlay.Load("port = 9090\ndebug = true\nextra = \"yes\"\n");
 
-    base.Merge(override);
+    base.Merge(overlay);
     check("merge: unchanged key",  base.GetString("host", nil),  "localhost");
     check("merge: overridden int",  base.GetInt("port", nil),    9090);
     check("merge: overridden bool", base.GetBool("debug", nil),  true);
@@ -265,6 +265,44 @@ fn test_merge() {
     check("merge chaining x", c1.GetInt("x", nil), 1);
     check("merge chaining y", c1.GetInt("y", nil), 2);
     check("merge chaining z", c1.GetInt("z", nil), 3);
+
+    // A section is merged, not replaced: overriding the port keeps the host.
+    let d1 = new Config();
+    d1.Load("[database]\nhost = \"db1\"\nport = 1\n");
+    let d2 = new Config();
+    d2.Load("[database]\nport = 2\n");
+    d1.Merge(d2);
+    check("deep merge keeps the other keys of a section", d1.GetString("database.host", nil), "db1");
+    check("deep merge overrides the key it names", d1.GetInt("database.port", nil), 2);
+}
+
+fn test_review_fixes() {
+    Console.WriteLine("\n[review] typed getters on strings, dotenv quoting, YAML keys, file errors");
+    let e = new Config();
+    e.LoadEnv("DEBUG=true\nN=5\nF=2.5\nOFF=no\nJUNK=abc\n", false);
+    check(".env bool string", e.GetBool("DEBUG", false), true);
+    check(".env int string", e.GetInt("N", 0), 5);
+    check(".env float string", e.GetFloat("F", 0.0), 2.5);
+    check(".env 'no' is false", e.GetBool("OFF", true), false);
+    check("a non-number gives the default", e.GetInt("JUNK", 7), 7);
+
+    let q = new Config();
+    q.LoadEnv("GREETING=\"hello\" # a comment\nWINPATH=\"C:\\\\temp\\\\new\"\nLIT='a b' # c\n", false);
+    check("dotenv: a comment after the closing quote is dropped", q.GetString("GREETING", nil), "hello");
+    check("dotenv: an escaped backslash stays a backslash", q.GetString("WINPATH", nil), "C:\\temp\\new");
+    check("dotenv: single quotes then a comment", q.GetString("LIT", nil), "a b");
+
+    let y = new Config();
+    y.LoadYaml("\"my key\": 1\nsite: {url: http://x, port: 80}\n");
+    check("YAML: a quoted key loses its quotes", y.GetInt("my key", nil), 1);
+    check("YAML: a colon inside a flow value stays in the value", y.GetString("site.url", nil), "http://x");
+    check("YAML: the next flow entry still parses", y.GetInt("site.port", nil), 80);
+
+    let m = new Config();
+    m.Load("a = 1\n");
+    m.LoadFile("/nonexistent/flaris/config.toml");
+    checkTrue("LoadFile of a missing file says so", m.LastError() != nil);
+    check("... and keeps what was loaded", m.GetInt("a", nil), 1);
 }
 
 fn test_defaults() {
@@ -385,6 +423,27 @@ fn test_yaml_inline_flow() {
     let colors = c.GetArray("colors");
     check("yaml flow array len", len(colors), 3);
     check("yaml flow array[1]",  colors[1],   "green");
+}
+
+// Nesting past Config.MAX_NEST loads as nil instead of running out of call frames.
+fn test_nesting_limit() {
+    Console.WriteLine("\n[nest] Nesting limit");
+    let toml = fn(d) { return "a = " + String.Repeat("[", d) + "1" + String.Repeat("]", d) + "\nb = 2\n"; };
+    let yaml = fn(d) { return "a: " + String.Repeat("[", d) + "1" + String.Repeat("]", d) + "\nb: 2\n"; };
+    let c = new Config();
+    c.Load(toml(Config.MAX_NEST));
+    checkTrue("toml at the limit loads", c.Get("a") != nil);
+    c = new Config();
+    c.Load(toml(Config.MAX_NEST + 1));
+    check("toml past the limit is nil", c.Get("a"), nil);
+    check("toml: the next line still loads", c.GetInt("b", nil), 2);
+    c = new Config();
+    c.LoadYaml(yaml(Config.MAX_NEST));
+    checkTrue("yaml at the limit loads", c.Get("a") != nil);
+    c = new Config();
+    c.LoadYaml(yaml(200));
+    check("yaml past the limit is nil", c.Get("a"), nil);
+    check("yaml: the next line still loads", c.GetInt("b", nil), 2);
 }
 
 fn test_yaml_booleans() {
@@ -691,6 +750,7 @@ fn Main() {
     test_get_array_fallback();
     test_keys();
     test_merge();
+    test_review_fixes();
     test_defaults();
     test_from_object();
     test_get_raw();
@@ -700,6 +760,7 @@ fn Main() {
     test_yaml_nested();
     test_yaml_sequences();
     test_yaml_inline_flow();
+    test_nesting_limit();
     test_yaml_booleans();
     test_yaml_load_file();
     test_yaml_multiline_blocks();

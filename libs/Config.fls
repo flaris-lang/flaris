@@ -56,16 +56,23 @@
 // Writing:
 //   Set(key, value)                   - set or update a value; returns this
 //   Remove(key)                       →  bool
-//   Merge(other:Config)               - copy all keys from other; returns this
+//   Merge(other:Config)               - merge other in, section by section (other wins
+//                                       on a value; a section is merged, not replaced)
 //   Defaults(obj)                     - set keys only if not already present; returns this
 //
 // Serialization:
 //   ToString()                        →  TOML string representation
 //   Save(path)                        - write TOML to file; returns this
+//   LastError()                       →  why the last LoadFile or Save failed, or nil
 
 class Config {
-    let p = nil; 
-    let _data: object = nil; 
+    // Arrays and inline tables (TOML) or flow collections (YAML) nested deeper
+    // load as nil: a TOML level costs two call frames, and a fiber has 64.
+    const MAX_NEST = 16;
+
+    let p = nil;
+    let _data: object = nil;
+    let _err = nil;      // why the last LoadFile/Save failed
 
     fn Constructor() {
         this._data = {};
@@ -76,7 +83,7 @@ class Config {
     // =========================================================================
 
     fn static _cNew(src:string) {
-        return { s: src, p: 0, n: String.Length(src) };
+        return { s: src, p: 0, n: String.Length(src), d: 0 };
     }
 
     fn static _cCh(c): string {
@@ -478,8 +485,13 @@ class Config {
         let ch = Config._cCh(c);
         if (ch == "\"")     return Config._parseBasicStr(c);
         if (ch == "'")      return Config._parseLiteralStr(c);
-        if (ch == "[")      return Config._parseArray(c);
-        if (ch == "{")      return Config._parseInlineTable(c);
+        if (ch == "[" || ch == "{") {
+            if (c.d >= MAX_NEST) return nil;
+            c.d += 1;
+            let v = (ch == "[") ? Config._parseArray(c) : Config._parseInlineTable(c);
+            c.d -= 1;
+            return v;
+        }
         if (Config._cAhead(c, 4) == "true")  { c.p += 4; return true; }
         if (Config._cAhead(c, 5) == "false") { c.p += 5; return false; }
         return Config._parseNumber(c);
@@ -728,8 +740,11 @@ class Config {
         return -1;
     }
 
-    fn static _yFlow(s:string, pos:int, end_ch:string) {
+    // A flow collection nested `depth` deep (1 for the outermost); past
+    // MAX_NEST its value is nil and the rest of the line is not read.
+    fn static _yFlow(s:string, pos:int, end_ch:string, depth:int) {
         let n = String.Length(s);
+        if (depth > MAX_NEST) { return { val: nil, end: n }; }
         let is_arr = (end_ch == "]");
         let result = is_arr ? [] : {};
         let cur_key = nil; let cur_val = "";
@@ -746,13 +761,15 @@ class Config {
             if (ch == "\"") { dq = true;  cur_val += ch; continue; }
             if (ch == "'")  { sq = true;  cur_val += ch; continue; }
             if (ch == "[") {
-                let r = Config._yFlow(s, pos, "]"); pos = r.end;
+                let r = Config._yFlow(s, pos, "]", depth + 1); pos = r.end;
+                if (r.val == nil) { return r; }      // too deep: the whole value is nil
                 if (is_arr) { Array.Append(result, r.val); }
                 else if (cur_key != nil) { result[cur_key] = r.val; cur_key = nil; }
                 continue;
             }
             if (ch == "{") {
-                let r = Config._yFlow(s, pos, "}"); pos = r.end;
+                let r = Config._yFlow(s, pos, "}", depth + 1); pos = r.end;
+                if (r.val == nil) { return r; }
                 if (is_arr) { Array.Append(result, r.val); }
                 else if (cur_key != nil) { result[cur_key] = r.val; cur_key = nil; }
                 continue;
@@ -769,13 +786,27 @@ class Config {
                 else if (cur_key != nil) { result[cur_key] = Config._yScalar(v); cur_key = nil; }
                 cur_val = ""; continue;
             }
-            if (!is_arr && ch == ":") {
+            // A key ends at the first ": " (or ":" before the end of the entry);
+            // a colon in the value - "http://x" - is part of the value.
+            if (!is_arr && cur_key == nil && ch == ":"
+                && (pos >= n || String.Substr(s, pos, 1) == " " || String.Substr(s, pos, 1) == ","
+                    || String.Substr(s, pos, 1) == end_ch)) {
                 if (pos < n && String.Substr(s, pos, 1) == " ") { pos += 1; }
-                cur_key = String.Trim(cur_val); cur_val = ""; continue;
+                cur_key = Config._yKey(String.Trim(cur_val)); cur_val = ""; continue;
             }
             cur_val += ch;
         }
         return { val: result, end: pos };
+    }
+
+    // A mapping key without its quotes: "my key": 1 is the key my key.
+    fn static _yKey(k:string): string {
+        let n = String.Length(k);
+        if (n >= 2) {
+            let f = String.Substr(k, 0, 1);
+            if ((f == "\"" || f == "'") && String.Substr(k, n - 1, 1) == f) { return String.Substr(k, 1, n - 2); }
+        }
+        return k;
     }
 
     // "|" or ">" with an optional chomping indicator (- strip, + keep) and
@@ -898,9 +929,9 @@ class Config {
                             let r = Config._yBlock(lines, i, val_s, ind);
                             Array.Append(top.obj, r.val); i = r.next;
                         } else if (String.StartsWith(val_s, "[")) {
-                            let r = Config._yFlow(val_s, 1, "]"); Array.Append(top.obj, r.val);
+                            let r = Config._yFlow(val_s, 1, "]", 1); Array.Append(top.obj, r.val);
                         } else if (String.StartsWith(val_s, "{")) {
-                            let r = Config._yFlow(val_s, 1, "}"); Array.Append(top.obj, r.val);
+                            let r = Config._yFlow(val_s, 1, "}", 1); Array.Append(top.obj, r.val);
                         } else {
                             let ci = Config._yFindColon(val_s);
                             if (ci >= 0) {
@@ -927,7 +958,7 @@ class Config {
                     let ci = Config._yFindColon(s);
                     if (ci >= 0) {
                         let slen  = String.Length(s);
-                        let key   = String.Trim(String.Substr(s, 0, ci));
+                        let key   = Config._yKey(String.Trim(String.Substr(s, 0, ci)));
                         let val_s = ci + 2 <= slen ? String.Trim(String.Substr(s, ci + 2, slen - ci - 2)) : "";
 
                         if (val_s == "") {
@@ -937,9 +968,9 @@ class Config {
                             let r = Config._yBlock(lines, i, val_s, ind);
                             top.obj[key] = r.val; i = r.next;
                         } else if (String.StartsWith(val_s, "[")) {
-                            let r = Config._yFlow(val_s, 1, "]"); top.obj[key] = r.val;
+                            let r = Config._yFlow(val_s, 1, "]", 1); top.obj[key] = r.val;
                         } else if (String.StartsWith(val_s, "{")) {
-                            let r = Config._yFlow(val_s, 1, "}"); top.obj[key] = r.val;
+                            let r = Config._yFlow(val_s, 1, "}", 1); top.obj[key] = r.val;
                         } else {
                             top.obj[key] = Config._yScalar(val_s);
                         }
@@ -1025,13 +1056,43 @@ class Config {
         return out;
     }
 
-    // Unescape common sequences inside a double-quoted .env value.
+    // Unescape a double-quoted .env value in one left-to-right pass. Chained
+    // replaces would re-read their own output: "C:\\temp" became "C:<TAB>emp".
     fn static _envUnescape(s:string): string {
-        var r = String.Replace(s, "\\n", "\n");
-        r = String.Replace(r, "\\t", "\t");
-        r = String.Replace(r, "\\r", "\r");
-        r = String.Replace(r, "\\\"", "\"");
-        return r;
+        var out = "";
+        var i = 0;
+        let n = String.Length(s);
+        while (i < n) {
+            let c = String.Substr(s, i, 1);
+            if (c == "\\" && i + 1 < n) {
+                let e = String.Substr(s, i + 1, 1);
+                if      (e == "n")  { out = out + "\n"; }
+                else if (e == "t")  { out = out + "\t"; }
+                else if (e == "r")  { out = out + "\r"; }
+                else if (e == "\"") { out = out + "\""; }
+                else if (e == "\\") { out = out + "\\"; }
+                else                { out = out + c + e; }
+                i = i + 2;
+            } else {
+                out = out + c;
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+
+    // Index of the quote that closes a value opening with `q` at 0, or -1.
+    // Inside double quotes a backslash escapes the next character.
+    fn static _closingQuote(s:string, q:string): int {
+        var i = 1;
+        let n = String.Length(s);
+        while (i < n) {
+            let c = String.Substr(s, i, 1);
+            if (q == "\"" && c == "\\") { i = i + 2; continue; }
+            if (c == q) { return i; }
+            i = i + 1;
+        }
+        return -1;
     }
 
     // Drop an inline " # comment" from an unquoted value.
@@ -1059,11 +1120,14 @@ class Config {
                     let tv  = String.Trim(String.Substr(line, eq + 1, String.Length(line) - eq - 1));
                     var val:string  = "";
                     var doInterp    = interpolate;
-                    let tvLen = String.Length(tv);
-                    if (tvLen >= 2 && String.StartsWith(tv, "\"") && String.EndsWith(tv, "\"")) {
-                        val = Config._envUnescape(String.Substr(tv, 1, tvLen - 2));
-                    } else if (tvLen >= 2 && String.StartsWith(tv, "'") && String.EndsWith(tv, "'")) {
-                        val = String.Substr(tv, 1, tvLen - 2);
+                    // A quoted value ends at its closing quote; anything after
+                    // it (a " # comment") is not part of the value.
+                    let dq = String.StartsWith(tv, "\"") ? Config._closingQuote(tv, "\"") : -1;
+                    let sq = String.StartsWith(tv, "'") ? Config._closingQuote(tv, "'") : -1;
+                    if (dq > 0) {
+                        val = Config._envUnescape(String.Substr(tv, 1, dq - 1));
+                    } else if (sq > 0) {
+                        val = String.Substr(tv, 1, sq - 1);
                         doInterp = false;                       // literal, no interpolation
                     } else {
                         val = String.Trim(Config._stripInlineComment(tv));
@@ -1108,9 +1172,16 @@ class Config {
         return this;
     }
 
+    // A file that cannot be read leaves the config as it was, and says why in
+    // LastError() - not an empty config that looks like a successful load.
     fn LoadFile(path:string): instance {
-        return this.Load(File.ReadText(path));
+        let text = File.ReadText(path);
+        if (text == nil) { _err = "cannot read " + path; return this; }
+        _err = nil;
+        return this.Load(text);
     }
+
+    fn LastError() { return _err; }
 
     fn LoadYaml(text:string): instance {
         this._data = Config._parseYaml(text);
@@ -1118,7 +1189,10 @@ class Config {
     }
 
     fn LoadYamlFile(path:string): instance {
-        return this.LoadYaml(File.ReadText(path));
+        let text = File.ReadText(path);
+        if (text == nil) { _err = "cannot read " + path; return this; }
+        _err = nil;
+        return this.LoadYaml(text);
     }
 
     // =========================================================================
@@ -1144,21 +1218,32 @@ class Config {
         return str(v);
     }
 
+    // The typed getters read strings too: every .env value is one, and so is
+    // a quoted TOML or YAML value. A string that is not a number (or a bool)
+    // gives the default, not 0 or false.
     fn GetInt(key:string, default_val?) {
         let v = this.Get(key);
         if (v == nil) return default_val ?? nil;
+        if (Type.IsString(v)) { return Convert.TryParseInt(String.Trim(v)) ?? (default_val ?? nil); }
         return Convert.ToInt(v);
     }
 
     fn GetFloat(key:string, default_val?) {
         let v = this.Get(key);
         if (v == nil) return default_val ?? nil;
+        if (Type.IsString(v)) { return Convert.TryParseFloat(String.Trim(v)) ?? (default_val ?? nil); }
         return Convert.ToFloat(v);
     }
 
     fn GetBool(key:string, default_val?) {
         let v = this.Get(key);
         if (v == nil) return default_val ?? nil;
+        if (Type.IsString(v)) {
+            let s = String.ToLower(String.Trim(v));
+            if (s == "true" || s == "yes" || s == "on" || s == "1") { return true; }
+            if (s == "false" || s == "no" || s == "off" || s == "0") { return false; }
+            return default_val ?? nil;
+        }
         return v == true || v == 1;
     }
 
@@ -1229,12 +1314,23 @@ class Config {
         return result;
     }
 
-    // Merge all keys from another Config into this one (other wins on conflict)
+    // Merge another Config into this one: other wins on a value, and a section
+    // present in both is merged key by key - an override file that sets only
+    // [database] port keeps database.host.
     fn Merge(other:instance): instance {
-        foreach (entry in Object.Entries(other._data)) {
-            this._data[entry[0]] = entry[1];
-        }
+        Config._mergeInto(this._data, other._data);
         return this;
+    }
+
+    fn static _mergeInto(dst, src) {
+        foreach (entry in Object.Entries(src)) {
+            let k = entry[0];
+            let v = entry[1];
+            let cur = Object.TryGet(dst, k, nil);
+            if (Type.IsObject(v) && Type.IsObject(cur)) { Config._mergeInto(cur, v); }
+            else { dst[k] = v; }
+        }
+        return 0;
     }
 
     // For each key in obj that is NOT already set in this._data, set it.
@@ -1270,7 +1366,7 @@ class Config {
     }
 
     fn Save(path:string): instance {
-        File.WriteText(path, this.ToString());
+        _err = File.WriteText(path, this.ToString()) ? nil : "cannot write " + path;
         return this;
     }
 }

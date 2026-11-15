@@ -297,9 +297,20 @@ fn test_editing(a) {
     checkEq(len(trimmed), 20, "Trim: returns 20 samples");
     checkApprox(trimmed[0], s1[10], "Trim: starts at offset");
 
-    // Trim past end clamps - Subset(s1, 90, 10) = 10 samples
+    // Trim past end clamps to the 10 samples that are there
     let clamped = a.Trim(s1, 90, 50);
     checkEq(len(clamped), 10, "Trim: clamps at signal end");
+
+    // Edge lengths give an empty signal instead of raising.
+    let three = Array.Slice(s1, 0, 3);
+    var raisedEdge = false;
+    try {
+        checkEq(len(a.Trim(s1, 1, 0)), 0, "Trim: zero length is empty");
+        checkEq(len(a.Trim(three, 5, 2)), 0, "Trim: a start past the end is empty");
+        checkEq(len(a.FadeIn([], 4)), 0, "FadeIn of an empty signal is empty");
+        checkEq(len(a.FadeOut([], 4)), 0, "FadeOut of an empty signal is empty");
+    } catch (_e) { raisedEdge = true; }
+    check(!raisedEdge, "edge lengths do not raise");
 
     let rep = a.Repeat(s1, 3);
     checkEq(len(rep), 300, "Repeat ×3: length = 300");
@@ -385,6 +396,40 @@ fn readWavBytes(a, bytes: block) {
     let w = a.ReadWav(path);
     File.Delete(path);
     return w;
+}
+
+// Files written by Python's wave module (tests/make_media_fixtures.py): mono
+// and stereo, 8/16/24/32-bit, each starting with the smallest and largest
+// sample. The scale is ReadWav's documented one.
+fn test_wav_python_fixtures(a) {
+    Console.WriteLine("== WAV files from Python's wave module ==");
+    let dir = "./tests/wav/";
+    let lines = String.Split(String.Trim(File.ReadText(dir + "expected.txt") ?? ""), "\n");
+    check(len(lines) >= 5, "the fixture list is there");
+    foreach (line in lines) {
+        let f = String.Split(line, "|");
+        let name = f[0];
+        let bits = Convert.ParseInt(f[3]);
+        let w = a.ReadWav(dir + name + ".wav");
+        check(w != nil, name + " reads");
+        if (w == nil) { continue; }
+        checkEq(w.channels, Convert.ParseInt(f[1]), name + " channels");
+        checkEq(w.sampleRate, Convert.ParseInt(f[2]), name + " sampleRate");
+        checkEq(w.bits, bits, name + " bits");
+        let want = String.Split(f[4], " ");
+        checkEq(len(w.signal), len(want), name + " sample count");
+        var bad = -1;
+        iter (i from 0 to len(want)) {
+            let s = Convert.ParseInt(want[i]);
+            var v = 0.0;
+            if (bits == 8) { v = (s - 128) / 128.0; }
+            else if (bits == 16) { v = s / 32768.0; }
+            else if (bits == 24) { v = s / 8388608.0; }
+            else { v = s / 2147483648.0; }
+            if (bad < 0 && (i >= len(w.signal) || w.signal[i] != v)) { bad = i; }
+        }
+        check(bad < 0, name + " samples" + (bad < 0 ? "" : ": sample " + str(bad) + " differs"));
+    }
 }
 
 fn test_wav_chunks_and_encodings(a) {
@@ -603,6 +648,7 @@ fn Main() {
     test_editing(a);
     test_wav_io(a);
     test_wav_chunks_and_encodings(a);
+    test_wav_python_fixtures(a);
 
     // ============================================================
     //  9. Additional Normalize / StereoToMono / Mix inline tests

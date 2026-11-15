@@ -114,8 +114,8 @@ fn test_large_payload() {
 }
 
 fn test_malformed() {
-    checkEq(len(Archive.Open(Buffer.FromString("not a zip at all")).List()), 0, "garbage -> 0 entries");
-    checkEq(len(Archive.Open(Buffer.Create(4, 1)).List()), 0, "too short -> 0 entries");
+    check(Archive.Open(Buffer.FromString("not a zip at all")) == nil, "garbage -> nil, not an empty reader");
+    check(Archive.Open(Buffer.Create(4, 1)) == nil, "too short -> nil");
     check(Archive.Open(nil) == nil, "Open(nil) -> nil");
 
     // A valid archive truncated mid-payload must not hand back bad bytes.
@@ -123,7 +123,8 @@ fn test_malformed() {
     w.Add("a.txt", "some content here");
     let good = w.Build();
     let cut = Buffer.Slice(good, 0, len(good) - 10);
-    checkEq(len(Archive.Open(cut).List()), 0, "truncated central dir -> 0 entries");
+    let cutR = Archive.Open(cut);
+    check(cutR == nil || len(cutR.List()) == 0, "truncated central dir -> nothing listed");
 }
 
 fn test_disk_io() {
@@ -143,6 +144,15 @@ fn test_disk_io() {
 
     checkEq(r.ExtractAll("/tmp/flaris_test_zip_all"), 2, "ExtractAll returns file count");
     checkEq(File.ReadText("/tmp/flaris_test_zip_all/a.txt"), "disk round trip", "ExtractAll content");
+
+    // Limits are checked before anything is written. The two files hold 21 bytes.
+    let lim = "/tmp/flaris_test_zip_lim";
+    Directory.DeleteAll(lim);
+    checkEq(r.ExtractAll(lim, { maxBytes: 20 }), -1, "over maxBytes -> -1");
+    checkEq(r.ExtractAll(lim, { maxEntries: 1 }), -1, "over maxEntries -> -1");
+    check(!File.Exists(lim + "/a.txt"), "a refused archive writes nothing");
+    checkEq(r.ExtractAll(lim, { maxBytes: 21, maxEntries: 2 }), 2, "exactly at both limits -> extracted");
+    Directory.DeleteAll(lim);
 
     check(Archive.OpenFile("/tmp/definitely_missing_zip.zip") == nil, "OpenFile missing -> nil");
 
@@ -243,7 +253,28 @@ fn test_path_containment() {
         checkEq(r2.ExtractAll(root + "/dest2"), 0, "symlinked parent blocks the write");
         checkEq(r2.SkippedUnsafe(), 1, "symlink traversal counted as unsafe");
         check(!File.Exists(root + "/outside/app.txt"), "nothing written through the symlink");
+
+        // A symlink at the entry's own path is replaced, not written through.
+        File.WriteText(root + "/outside/leaf.txt", "original");
+        Directory.Ensure(root + "/dest3");
+        File.CreateSymlink(root + "/outside/leaf.txt", root + "/dest3/leaf.txt");
+        let w3 = Archive.Create();
+        w3.Add("leaf.txt", "from the archive");
+        checkEq(Archive.Open(w3.Build()).ExtractAll(root + "/dest3"), 1, "leaf entry is written");
+        checkEq(File.ReadText(root + "/outside/leaf.txt"), "original", "the file outside is untouched");
+        check(!File.Stat(root + "/dest3/leaf.txt").IsSymlink, "the link at the entry's path is replaced");
     }
+
+    // "evil.sh<NUL>.png" lists as a .png; the filesystem would write evil.sh.
+    let nb = Buffer.Create(1, 1);
+    nb[0] = 0;
+    let w4 = Archive.Create();
+    w4.Add("evil.sh" + Buffer.ToString(nb) + ".png", "#!/bin/sh");
+    let r4 = Archive.Open(w4.Build());
+    Directory.Ensure(root + "/dest4");
+    checkEq(r4.ExtractAll(root + "/dest4"), 0, "a name with a NUL is not written");
+    checkEq(r4.SkippedUnsafe(), 1, "... and counted as unsafe");
+    check(!File.Exists(root + "/dest4/evil.sh"), "nothing written under the truncated name");
 
     Directory.DeleteAll(root);
 }

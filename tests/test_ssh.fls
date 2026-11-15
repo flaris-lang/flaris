@@ -202,6 +202,12 @@ fn test_live() {
     if (pin != nil && pin != "") { opts["hostKey"] = pin; }
     let port = Convert.ParseInt(Os.GetEnv("SSH_TEST_PORT") ?? "22") ?? 22;
 
+    // Without a pin the server's key is checked and reported, but not trusted.
+    let probe = new SshClient(host, port, { user: opts.user, password: pw, keyFile: keyFile, timeoutMs: 8000 }).Connect();
+    checkEq(probe.errorKind, "hostkey", "an unpinned host key is refused");
+    check(String.StartsWith(probe.hostKey ?? "", "ssh-ed25519 "), "... and reported for pinning");
+    if (opts["hostKey"] == nil) { opts["hostKey"] = probe.hostKey; }
+
     let ssh = new SshClient(host, port, opts);
     let c = ssh.Connect();
     check(c.ok, "connects: " + str(c.error ?? ""));
@@ -221,13 +227,34 @@ fn test_live() {
     ssh.Close();
     checkEq(ssh.IsConnected(), false, "closed");
 
-    if (pin != nil && pin != "") {
-        let wrong = new SshClient(host, port, { user: opts.user, keyFile: keyFile, password: pw,
-            hostKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
-        let w = wrong.Connect();
-        checkEq(w.errorKind, "hostkey", "a wrong pin is refused before authentication");
-    }
-    let bad = new SshClient(host, port, { user: opts.user, password: "definitely-not-the-password" });
+    // The same client connects again: a new session with its own keys.
+    let again = ssh.Connect();
+    check(again.ok, "reconnects on the same client: " + str(again.error ?? ""));
+    if (again.ok) { checkEq(ssh.Exec("echo again").stdout, "again\n", "exec on the second session"); }
+    ssh.Close();
+
+    // A command cut off by maxOutputBytes leaves output in flight; the next
+    // command on the same client must get its own output, not that.
+    let lim = new SshClient(host, port, { user: opts.user, keyFile: keyFile, password: pw,
+                                          hostKey: opts.hostKey, maxOutputBytes: 1000 });
+    lim.Connect();
+    // More output, and the exit, arrive while the next command is running.
+    let over = lim.Exec("head -c 2000 /dev/zero | tr '\\0' 'z'; sleep 1; echo LEFTOVER; sleep 1");
+    checkEq(over.ok, false, "output over maxOutputBytes fails");
+    if (!lim.IsConnected()) { lim.Connect(); }
+    let clean = lim.Exec("sleep 2; echo clean");
+    checkEq(clean.stdout, "clean\n", "the next command gets its own output");
+    lim.Close();
+
+    let anyKey = new SshClient(host, port, { user: opts.user, keyFile: keyFile, password: pw, hostKey: "any" });
+    check(anyKey.Connect().ok, "hostKey \"any\" accepts the server's key");
+    anyKey.Close();
+
+    let wrong = new SshClient(host, port, { user: opts.user, keyFile: keyFile, password: pw,
+        hostKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
+    let w = wrong.Connect();
+    checkEq(w.errorKind, "hostkey", "a wrong pin is refused before authentication");
+    let bad = new SshClient(host, port, { user: opts.user, password: "definitely-not-the-password", hostKey: opts.hostKey });
     let b = bad.Connect();
     checkEq(b.errorKind, "auth", "a wrong password is an auth failure");
 }

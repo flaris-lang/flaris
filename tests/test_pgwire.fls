@@ -568,6 +568,23 @@ fn test_sharing() {
     let all = Array.Concat(got[0], got[1]);
     checkEq(Array.Sort(all), [1, 2, 3, 4], "each fiber got its own answers");
     db.Close();
+
+    // A fiber cancelled halfway through its rows leaves the rest on the
+    // socket. The fiber queued behind it must not read them as its own reply.
+    let rows = [bytes([rowDesc([["v", 25]]), dataRow(["a1"])]), dataRow(["a2"]), bytes([complete("SELECT 2"), ready("I")])];
+    let p2 = fakePg({ steps: [rows, bytes([rowDesc([["v", 25]]), dataRow(["b"]), complete("SELECT 1"), ready("I")])] });
+    let db2 = PgWire.Connect(connTo(p2, nil));
+    let box = { b: "unset" };
+    let fa = Fiber.Run(fn() { db2.Query("SELECT rows"); });
+    Fiber.Sleep(5);                               // a has the first row, waits for the next
+    let fb = Fiber.Run(fn() {
+        try { box.b = db2.QueryValue("SELECT 'b'"); } catch (e) { box.b = kindOf(e); }
+    });
+    Fiber.Sleep(5);                               // b queues behind a
+    Fiber.Cancel(Fiber.FromId(fa));
+    Fiber.Await(Fiber.FromId(fb));
+    checkEq(box.b, "closed", "the fiber behind a cancelled exchange does not get its leftover rows");
+    db2.Close();
 }
 
 // ---- TLS ----------------------------------------------------------------------
@@ -727,6 +744,21 @@ fn test_live(url) {
     checkEq(db.TransactionStatus(), "failed", "an error inside BEGIN leaves the transaction failed");
     db.Rollback();
     checkEq(db.TransactionStatus(), "idle", "ROLLBACK");
+
+    // Another fiber's query on the same connection waits for a transaction to
+    // end, instead of running inside it and being rolled back with it.
+    let side = { done: false };
+    db.Transaction(fn() {
+        db.Exec("INSERT INTO pw_items (name) VALUES ('tx-only')");
+        Fiber.Run(fn() { db.Exec("INSERT INTO pw_items (name) VALUES ('other-fiber')"); side.done = true; });
+        Fiber.Sleep(50);                          // the other fiber tries now
+        return false;                             // roll back this transaction
+    });
+    var waited = 0;
+    while (!side.done && waited < 200) { Fiber.Sleep(10); waited += 1; }
+    checkEq(db.ScalarInt("SELECT count(*) FROM pw_items WHERE name = 'other-fiber'"), 1,
+            "another fiber's insert is not rolled back with this transaction");
+    checkEq(db.ScalarInt("SELECT count(*) FROM pw_items WHERE name = 'tx-only'"), 0, "the transaction's own insert is");
 
     // LISTEN / NOTIFY between two connections.
     let ch = "flaris_pw_" + Util.BinToHex(Crypto.RandomBytes(4));

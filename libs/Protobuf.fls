@@ -124,8 +124,11 @@
 //
 //   EncodeDelimited(msg:instance)        -> block    varint length + message
 //   DecodeDelimited(r:PbReader, cls)     -> instance one length-prefixed message
-//   ReadDelimited(s:stream, cls:class)   -> instance one message off a stream,
-//                                                    or nil at a clean EOF
+//   ReadDelimited(s:stream, cls:class, opts?) -> instance one message off a
+//                                                    stream, or nil at a clean EOF;
+//                                                    raises when its length prefix
+//                                                    is over opts.maxBytes (default
+//                                                    64 MiB) - then close the stream
 //   WriteDelimited(s:stream, msg)        -> bool     length-prefixed to a stream
 //
 //   WhichOneof(msg:instance, name:string) -> string  the set field's name, or nil
@@ -149,6 +152,11 @@
 //
 //   LoadProto(source:string, name?)      -> object   .proto text -> { name: class }
 //   LoadProtoFile(path, includes?)       -> object   same, resolving imports
+//   Release(types:object)                           forget the classes in a map
+//                                                    LoadProto/DefineSchema returned;
+//                                                    they no longer encode or decode.
+//                                                    Without it every class loaded
+//                                                    stays registered for good
 //   ParseProto(source:string, name?)     -> schema   parse only, as plain data
 //   ParseProtoFile(path, includes?)      -> schema   parse a file and its imports
 //   DefineSchema(schema)                 -> object   schema -> { name: class },
@@ -312,8 +320,9 @@
 //
 // Wire-type constants: Pb.WIRE_VARINT, WIRE_64, WIRE_LEN, WIRE_32.
 //
-// Limits: nesting is capped at 100 levels and a field number must be in
-// 1..536870911; both raise rather than recurse or emit a malformed tag.
+// Limits: nesting is capped at Pb.MAX_DEPTH (16) levels - a level costs up to
+// three of the 64 call frames a fiber has by default - and a field number must
+// be in 1..536870911; both raise rather than recurse or emit a malformed tag.
 // =============================================================================
 
 
@@ -467,9 +476,11 @@ class PbReader
     // Narrow to a subregion and return the previous limit, for restoring.
     fn PushLimit(length:int):int {
         let prev:int = _end;
-        let e:int = _pos + length;
-        if (e > prev) { throw(2, "Protobuf: submessage length runs past its parent"); }
-        _end = e;
+        // A negative length would move the limit backwards, and a later Seek
+        // to it re-reads the same bytes forever; a huge one would overflow a
+        // plain `_pos + length > prev`.
+        if (length < 0 || length > prev - _pos) { throw(2, "Protobuf: submessage length runs past its parent"); }
+        _end = _pos + length;
         return prev;
     }
 
@@ -582,7 +593,7 @@ class PbReader
     }
 
     fn Str(n:int):string {
-        if (n < 0 || _pos + n > _end) { throw(2, "Protobuf: truncated string"); }
+        if (n < 0 || n > _end - _pos) { throw(2, "Protobuf: truncated string"); }
         if (n == 0) { return ""; }
         let s:string = Buffer.ToString(_buf, _pos, n);
         _pos += n;
@@ -590,7 +601,7 @@ class PbReader
     }
 
     fn Bytes(n:int):block {
-        if (n < 0 || _pos + n > _end) { throw(2, "Protobuf: truncated bytes"); }
+        if (n < 0 || n > _end - _pos) { throw(2, "Protobuf: truncated bytes"); }
         let b:block = Buffer.Slice(_buf, _pos, n);
         _pos += n;
         return b;
@@ -603,7 +614,7 @@ class PbReader
         if (wire == 5) { if (_pos + 4 > _end) { throw(2, "Protobuf: truncated fixed32"); } _pos += 4; return; }
         if (wire == 2) {
             let n:int = VarInt();
-            if (n < 0 || _pos + n > _end) { throw(2, "Protobuf: truncated length-delimited field"); }
+            if (n < 0 || n > _end - _pos) { throw(2, "Protobuf: truncated length-delimited field"); }
             _pos += n;
             return;
         }
@@ -1155,8 +1166,10 @@ class Pb
     const WIRE_LEN    = 2;
     const WIRE_32     = 5;
 
-    const MAX_DEPTH     = 100;
+    // A level costs up to three call frames, and a fiber has 64 by default.
+    const MAX_DEPTH     = 16;
     const MAX_FIELD_NUM = 536870911;
+    const MAX_DELIMITED = 67108864;     // ReadDelimited's default maxBytes: 64 MiB
 
     // -------------------------------------------------------------------------
     // Descriptor preparation
@@ -1204,6 +1217,27 @@ class Pb
         }
         Pb._Cache().Delete(cls);
         return cls;
+    }
+
+    // Undo what DefineSchema registered for the classes in `types` (its return
+    // value): descriptor, prepared plan and name. A name now held by a later
+    // load of the same schema is left to it. Returns the number of classes
+    // released.
+    fn static Release(types) {
+        var n:int = 0;
+        if (is_nil(types)) { return n; }
+        foreach (v in types) {
+            if (!Class.IsClass(v) || is_nil(_pb_registry) || is_nil(_pb_registry.Get(v))) { continue; }
+            _pb_registry.Delete(v);
+            Pb._Cache().Delete(v);
+            let fq = is_nil(_pb_fqNames) ? nil : _pb_fqNames.Get(v);
+            if (!is_nil(fq)) {
+                _pb_fqNames.Delete(v);
+                if (_pb_byName.Get(fq) == v) { _pb_byName.Delete(fq); }
+            }
+            n += 1;
+        }
+        return n;
     }
 
     // The class registered under a fully-qualified protobuf name, or nil.
@@ -1608,14 +1642,14 @@ class Pb
     }
 
     // Raised past Pb.MAX_DEPTH levels. _EncMsg and _DecMsg compare depth with
-    // the literal 100, because reading a class constant costs a lookup per
+    // the literal 16, because reading a class constant costs a lookup per
     // message.
     fn static _TooDeep() {
         throw(2, "Protobuf: message nests deeper than " + str(Pb.MAX_DEPTH) + " levels");
     }
 
     fn static _EncMsg(buf:block, pos:int, msg, prep, depth:int):int {
-        if (depth > 100) { Pb._TooDeep(); }
+        if (depth > 16) { Pb._TooDeep(); }
         // One reflection call reads every field. A value of another class than
         // the plan's is read field by field, by name.
         let own:bool = Class.Of(msg) == prep.cls;
@@ -1822,7 +1856,7 @@ class Pb
             if (raw < 128) { pos += 1; }
             else { pos = Pb._VarintSlow(buf, pos, end, box); raw = box[0]; }
             if (code >= 12) {
-                if (raw < 0 || pos + raw > end) {
+                if (raw < 0 || raw > end - pos) {
                     throw(2, (code == 12) ? "Protobuf: truncated string" : "Protobuf: truncated bytes");
                 }
                 if (code == 13)    { box[0] = Buffer.Slice(buf, pos, raw); }
@@ -1871,14 +1905,14 @@ class Pb
         if (wire == 2) {
             pos = Pb._ReadAt(buf, pos, end, 1, box);
             let n:int = box[0];
-            if (n < 0 || pos + n > end) { throw(2, "Protobuf: truncated length-delimited field"); }
+            if (n < 0 || n > end - pos) { throw(2, "Protobuf: truncated length-delimited field"); }
             return pos + n;
         }
         throw(2, "Protobuf: unsupported wire type " + str(wire));
     }
 
     fn static _DecMsg(buf:block, pos:int, end:int, msg, prep, depth:int, box:array) {
-        if (depth > 100) { Pb._TooDeep(); }
+        if (depth > 16) { Pb._TooDeep(); }
         let info   = prep.info;
         let tags   = prep.tags;
         let names  = prep.names;
@@ -1943,7 +1977,7 @@ class Pb
                 if (pos < end) { sl = buf[pos]; }
                 if (sl < 128) { pos += 1; }
                 else { pos = Pb._VarintSlow(buf, pos, end, box); sl = box[0]; }
-                if (sl < 0 || pos + sl > end) { throw(2, "Protobuf: truncated string"); }
+                if (sl < 0 || sl > end - pos) { throw(2, "Protobuf: truncated string"); }
                 v = "";
                 if (sl > 0) { v = Buffer.ToString(buf, pos, sl); }
                 pos += sl;
@@ -1978,7 +2012,7 @@ class Pb
         if (pos < end) { n = buf[pos]; }
         if (n < 128) { pos += 1; }
         else { pos = Pb._VarintSlow(buf, pos, end, box); n = box[0]; }
-        if (n < 0 || pos + n > end) { throw(2, "Protobuf: submessage length runs past its parent"); }
+        if (n < 0 || n > end - pos) { throw(2, "Protobuf: submessage length runs past its parent"); }
         var m = into;
         if (is_nil(m) || Class.Of(m) != cls) { m = Pb._NewMessage(cls); }
         Pb._DecMsg(buf, pos, pos + n, m, sub, depth + 1, box);
@@ -2016,7 +2050,7 @@ class Pb
         // A packed run.
         pos = Pb._ReadAt(buf, pos, end, 1, box);
         let n:int = box[0];
-        if (n < 0 || pos + n > end) { throw(2, "Protobuf: submessage length runs past its parent"); }
+        if (n < 0 || n > end - pos) { throw(2, "Protobuf: submessage length runs past its parent"); }
         let stop:int = pos + n;
         if (code <= 3) {
             while (pos < stop) {
@@ -2052,7 +2086,7 @@ class Pb
         while (true) {
             pos = Pb._ReadAt(buf, pos, end, 1, box);
             let n:int = box[0];
-            if (n < 0 || pos + n > end) { throw(2, "Protobuf: submessage length runs past its parent"); }
+            if (n < 0 || n > end - pos) { throw(2, "Protobuf: submessage length runs past its parent"); }
             let stop:int = pos + n;
 
             // An entry may omit a default key or value; the spec has the reader
@@ -2952,12 +2986,15 @@ class Pb
             if (is_nil(val)) { continue; }      // JSON null leaves it unset
 
             if (e.isMap) {
+                if (!Type.Is(val, Type.Object)) { Pb._JsonBad(e, "a JSON object"); }
                 let m = {};
                 foreach (mv, mk in val) {
                     m[mk] = Pb._JsonValue(mv, e.valKind, e, o, depth);
                 }
                 Class.SetField(msg, e.name, m);
             } else if (e.rep) {
+                // A string is not a list: "abc" used to become ["97","98","99"].
+                if (!Type.IsArray(val)) { Pb._JsonBad(e, "a JSON array"); }
                 let arr:array = [];
                 var i:int = 0;
                 while (i < len(val)) {
@@ -2978,8 +3015,16 @@ class Pb
             if (is_nil(jv)) { return nil; }
             return Pb._JsonRead(jv, e.msg, o, depth + 1);
         }
-        if (kind == Pb.BOOL)   { return (jv == true); }
-        if (kind == Pb.STRING) { return Convert.ToString(jv); }
+        // Each kind takes its own JSON type: "yes" is not a bool, 5 not a
+        // string, 1.7 not an integer.
+        if (kind == Pb.BOOL) {
+            if (jv != true && jv != false) { Pb._JsonBad(e, "true or false"); }
+            return jv;
+        }
+        if (kind == Pb.STRING) {
+            if (!Type.Is(jv, Type.String)) { Pb._JsonBad(e, "a JSON string"); }
+            return jv;
+        }
         if (kind == Pb.BYTES) {
             let b = Util.Base64DecodeBlock(Convert.ToString(jv));
             if (is_nil(b)) { throw(1, "Pb.FromJson: field '" + e.name
@@ -3011,12 +3056,27 @@ class Pb
             return Pb._ParseUnsigned(Convert.ToString(jv));
         }
         // Every remaining kind is an integer; a JSON string form is legal too.
+        var n = nil;
         if (Type.Is(jv, Type.String)) {
-            let n = Convert.ParseInt(jv);
+            n = Convert.ParseInt(jv);
             if (is_nil(n)) { throw(1, "Pb.FromJson: '" + jv + "' is not an integer"); }
-            return n;
+        } else if (Type.IsInt(jv)) {
+            n = jv;
+        } else if (Type.IsFloat(jv) && jv == Math.Floor(jv) && Math.AbsF(jv) < 9.0e18) {
+            n = int(jv);                          // 3.0 is an integer written as a float
+        } else {
+            Pb._JsonBad(e, "an integer");
         }
-        return int(jv);
+        if (kind == Pb.INT32 || kind == Pb.SINT32 || kind == Pb.SFIXED32) {
+            if (n < -2147483648 || n > 2147483647) { Pb._JsonBad(e, "a 32-bit integer"); }
+        } else if (kind == Pb.UINT32 || kind == Pb.FIXED32) {
+            if (n < 0 || n > 4294967295) { Pb._JsonBad(e, "an unsigned 32-bit integer"); }
+        }
+        return n;
+    }
+
+    fn static _JsonBad(e, want:string) {
+        throw(1, "Pb.FromJson: field '" + e.name + "' expects " + want);
     }
 
     // A decimal string that may exceed int64, as the two's-complement value the
@@ -3443,10 +3503,16 @@ class Pb
     }
 
     // One length-prefixed message off a stream, or nil at a clean end of input.
-    fn static ReadDelimited(s:stream, cls) {
+    // The prefix comes from the peer, so it is checked against opts.maxBytes
+    // (default Pb.MAX_DELIMITED, 64 MiB) before anything is read for it.
+    fn static ReadDelimited(s:stream, cls, opts?) {
         let n = Stream.ReadVarint(s);
         if (is_nil(n)) { return nil; }
         if (n < 0) { throw(2, "Pb.ReadDelimited: negative length prefix"); }
+        let max = (opts != nil && opts.maxBytes != nil) ? opts.maxBytes : Pb.MAX_DELIMITED;
+        if (n > max) {
+            throw(2, "Pb.ReadDelimited: a " + str(n) + "-byte message is over maxBytes (" + str(max) + ")");
+        }
         if (n == 0) { return Pb._NewMessage(cls); }
         // Stream.ReadBytes hands over what has arrived; a socket can take
         // several reads to deliver one message.

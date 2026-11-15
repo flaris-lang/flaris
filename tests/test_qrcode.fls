@@ -10,6 +10,29 @@ fn qrBit(px: array, n: int, r: int, c: int) : int {
     return px[(r + 4) * (n + 8) + c + 4] == 0xFF000000 ? 1 : 0;
 }
 
+// n printable ASCII characters that vary, so masks and codewords vary too.
+fn qrText(n: int) : string {
+    let parts = [];
+    iter (i from 0 to n) { Array.Append(parts, String.Utf8Concat(33 + (i * 37 + n) % 94)); }
+    return String.Join(parts, "");
+}
+
+// One input line for tests/qr_decode.py: QR|ec|side|payload hex|modules.
+fn qrLine(text: string, ec: int, fast: bool) : string {
+    let px = QRCode.ToPixels(text, 1, ec, fast);
+    let full = int(Math.Sqrt(len(px)) + 0.5);
+    let bits = [];
+    iter (i from 0 to len(px)) { Array.Append(bits, px[i] == 0xFF000000 ? "1" : "0"); }
+    let b = Buffer.FromString(text);
+    let hex = [];
+    let digits = "0123456789abcdef";
+    iter (i from 0 to len(b)) {
+        let v = (u8)b[i];
+        Array.Append(hex, String.Substr(digits, v >> 4, 1) + String.Substr(digits, v & 15, 1));
+    }
+    return "QR|" + str(ec) + "|" + str(full) + "|" + String.Join(hex, "") + "|" + String.Join(bits, "");
+}
+
 // The 15 format bits of the top-left copy, read most significant first.
 fn qrFormat(px: array, n: int) : int {
     let rs = [8, 8, 8, 8, 8, 8, 8, 8, 7, 5, 4, 3, 2, 1, 0];
@@ -284,6 +307,41 @@ fn Main() {
 
     let f6 = t6.run();
 
+    // ── Suite 7: an independent decoder ───────────────────────────────────────
+    // tests/qr_decode.py checks every symbol against ISO/IEC 18004 on its own:
+    // patterns, format and version information, Reed-Solomon syndromes, the
+    // unmasked payload and the version choice. Skipped without python3.
+
+    let t7 = Test.Suite("QRCode against tests/qr_decode.py");
+
+    t7.it("every EC level, version 1 to 10, both mask modes, decodes", fn() {
+        if (Os.Which("python3") == nil) {
+            Console.WriteLine("   (python3 not available - skipped)");
+            return;
+        }
+        let maxLen = [213, 271, 119, 151];          // M, L, H, Q at version 10
+        let texts = [];
+        iter (ec from 0 to 4) {
+            foreach (n in [1, 5, 14, 17, 18, 32, 53, 78, 106, maxLen[ec]]) {
+                if (n <= maxLen[ec]) { Array.Append(texts, [ec, qrText(n)]); }
+            }
+            Array.Append(texts, [ec, "Grüße ✓ 漢字"]);
+        }
+        let lines = [];
+        foreach (t in texts) {
+            foreach (fast in [false, true]) { Array.Append(lines, qrLine(t[1], t[0], fast)); }
+        }
+        let path = Os.TempDir() + "/flaris_test_qr_symbols.txt";
+        File.WriteText(path, String.Join(lines, "\n") + "\n");
+        let out = Os.Execute("python3 tests/qr_decode.py " + path) ?? "";
+        File.Delete(path);
+        if (!String.Contains(out, "BAD: 0")) { Console.WriteLine(out); }
+        t7.ok(String.Contains(out, "decoded OK: " + str(len(lines)) + " "));
+        t7.ok(String.Contains(out, "BAD: 0"));
+    });
+
+    let f7 = t7.run();
+
     // ── Benchmarks: QR encode throughput ─────────────────────────────────────
 
     Console.WriteLine("=== QRCode benchmarks ===");
@@ -306,5 +364,5 @@ fn Main() {
 
     Console.WriteLine("=== benchmarks done ===");
 
-    return (f1 + f2 + f3 + f4 + f5 + f6) > 0 ? 1 : 0;
+    return (f1 + f2 + f3 + f4 + f5 + f6 + f7) > 0 ? 1 : 0;
 }

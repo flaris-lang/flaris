@@ -277,6 +277,35 @@ fn test_varint() {
     let w3 = new BinaryWriter(nil);
     w3.WriteVarUInt(128);
     check("VarUInt 128 = 2 bytes", w3.Size(), 2);
+
+    // The full 64-bit range: a negative value is ten bytes (as protobuf writes
+    // uint64 -1), and zigzag reaches both ends.
+    let w4 = new BinaryWriter(nil);
+    w4.WriteVarUInt(-1);
+    check("VarUInt -1 = 10 bytes", w4.Size(), 10);
+    w4.WriteVarInt(4611686018427387904);
+    w4.WriteVarInt(9223372036854775807);
+    w4.WriteVarInt(-9223372036854775807 - 1);
+    let r4 = new BinaryReader(w4.ToBuffer(), nil);
+    check("VarUInt -1 round trip", r4.ReadVarUInt(), -1);
+    check("VarInt 2^62 round trip", r4.ReadVarInt(), 4611686018427387904);
+    check("VarInt max i64 round trip", r4.ReadVarInt(), 9223372036854775807);
+    check("VarInt min i64 round trip", r4.ReadVarInt(), -9223372036854775807 - 1);
+
+    // A hostile length prefix reads short instead of raising.
+    let hostile = Buffer.Create(9, 1);
+    iter (i from 0 to 8) { hostile[i] = 255; }
+    hostile[8] = 127;
+    let rh = new BinaryReader(hostile, nil);
+    check("ReadStringVar with a huge length reads short", rh.ReadStringVar(), "");
+    check("... and the position stays in range", rh.Position(), 9);
+    let rn = new BinaryReader(Buffer.FromString("abc"), nil);
+    check("ReadBytes(-5) is empty", len(rn.ReadBytes(-5)), 0);
+
+    // A 16-bit prefix cannot carry 70000 bytes.
+    var threw = false;
+    try { new BinaryWriter(nil).WriteString(String.Repeat("x", 70000)); } catch (_e) { threw = true; }
+    check("WriteString over 65535 bytes throws", threw, true);
 }
 
 fn test_string32_and_stringvar() {

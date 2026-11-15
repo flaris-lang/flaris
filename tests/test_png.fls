@@ -93,12 +93,15 @@ fn test_filter_modes() {
 }
 
 fn test_malformed() {
+    test_foreign_fixtures();
     check(Png.Decode(nil) == nil,                              "Decode(nil) -> nil");
     check(Png.Decode(Buffer.FromString("")) == nil,            "Decode(empty) -> nil");
     check(Png.Decode(Buffer.FromString("not a png at all")) == nil, "Decode(garbage) -> nil");
 
     let px = mkImage(16, 16, 0);
     let good = Png.Encode(px, 16, 16, nil);
+    check(Png.Decode(good, { maxPixels: 255 }) == nil,         "over maxPixels -> nil");
+    check(Png.Decode(good, { maxPixels: 256 }) != nil,         "exactly maxPixels -> decodes");
     check(Png.Decode(Buffer.Slice(good, 0, 20)) == nil,        "truncated header -> nil");
     // Cutting only the trailing IEND leaves a complete IDAT, which a decoder
     // may legitimately accept - truncate into the compressed data instead.
@@ -115,6 +118,62 @@ fn test_malformed() {
     check(Png.Encode(px, 8, 0, nil) == nil,                    "Encode(zero height) -> nil");
     check(Png.Encode(px, Png.MAX_DIM + 1, 8, nil) == nil,      "Encode(over MAX_DIM) -> nil");
     check(Png.Encode(px, 4096, 4096, nil) == nil,              "Encode(pixels too few for w*h) -> nil");
+    return 0;
+}
+
+// Independent fixtures (made by Python's zlib/struct, not by Png.Encode).
+fn hexBlock(h: string): block {
+    let b = Buffer.Create(len(h) / 2, 1);
+    iter (i from 0 to len(h) / 2) { b[i] = Convert.ParseInt("0x" + String.Substr(h, i * 2, 2)) ?? 0; }
+    return b;
+}
+
+fn test_foreign_fixtures() {
+    // RGB8 with a tRNS key of pure red: the red pixel is transparent.
+    let rgb = Png.Decode(hexBlock("89504e470d0a1a0a0000000d49484452000000020000000108020000007b40e8dd0000000674524e5300ff00000000a4c2c01d0000000f49444154789c63f8cfc0c0f09f010007ff01ff017f89a70000000049454e44ae426082"));
+    check(rgb != nil, "RGB8 with tRNS decodes");
+    if (rgb != nil) {
+        checkEq((rgb.Pixels[0] >> 24) & 255, 0, "the tRNS key colour is transparent");
+        checkEq((rgb.Pixels[1] >> 24) & 255, 255, "other colours stay opaque");
+    }
+    // Gray8 with a tRNS key of 7.
+    let gray = Png.Decode(hexBlock("89504e470d0a1a0a0000000d4948445200000002000000010800000000d14920560000000274524e530007e8f7589b0000000b49444154789c6360e70400001a001160cd24920000000049454e44ae426082"));
+    check(gray != nil && ((gray.Pixels[0] >> 24) & 255) == 0, "a gray tRNS key is transparent");
+    // Filter type 9 does not exist.
+    check(Png.Decode(hexBlock("89504e470d0a1a0a0000000d49484452000000010000000108000000003a7e9b550000000a49444154789ce36405000019000f48ddf59d0000000049454e44ae426082")) == nil,
+          "an unknown filter type is refused");
+}
+
+// Fixtures written by tests/make_media_fixtures.py (Python's zlib and struct):
+// every colour type and bit depth, all five filter types, palette and key
+// tRNS, several IDAT chunks, and an interlaced image, which Decode refuses.
+fn test_python_fixtures() {
+    let dir = "./tests/png/";
+    let lines = String.Split(String.Trim(File.ReadText(dir + "expected.txt") ?? ""), "\n");
+    check(len(lines) >= 19, "the fixture list is there");
+    foreach (line in lines) {
+        let f = String.Split(line, "|");
+        let name = f[0];
+        let img = Png.Load(dir + name + ".png");
+        if (f[3] == "interlaced") {
+            check(img == nil, name + ": interlaced is refused");
+            continue;
+        }
+        check(img != nil, name + " decodes");
+        if (img == nil) { continue; }
+        checkEq(img.Width, Convert.ParseInt(f[1]), name + " width");
+        checkEq(img.Height, Convert.ParseInt(f[2]), name + " height");
+        let want = String.Split(f[4], " ");
+        var bad = -1;
+        iter (i from 0 to len(want)) {
+            if (bad < 0 && ((u32)img.Pixels[i]) != Convert.ParseInt("0x" + want[i])) { bad = i; }
+        }
+        if (bad >= 0) {
+            check(false, name + ": pixel " + str(bad) + " is " + String.Format("{0:x8}", (u32)img.Pixels[bad]) + ", want " + want[bad]);
+        } else {
+            check(true, name + " pixels");
+        }
+    }
     return 0;
 }
 
@@ -164,6 +223,7 @@ fn Main() {
     test_roundtrips();
     test_filter_modes();
     test_malformed();
+    test_python_fixtures();
     test_disk();
     test_benchmarks();
     Console.WriteLine("");

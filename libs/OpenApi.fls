@@ -160,7 +160,8 @@
 //       numbers (3.0 boolean and 3.1 numeric exclusive bounds), multipleOf,
 //       pattern, uniqueItems, allOf / anyOf / oneOf / not, $ref into
 //       components.schemas, and the formats date, date-time, uuid, email, uri,
-//       ipv4. Class instances validate by their fields.
+//       ipv4. Class instances validate by their fields. A value nested more
+//       than 16 levels deep (combinators count as levels) is an error.
 //
 // Operation doc object - every key is optional:
 //   summary, description, operationId, deprecated, tags ("pets" or ["pets"])
@@ -2093,7 +2094,9 @@ class OpenApi
     }
 
     fn static _validate(valueIn, schemaIn, schemas, path:string, errors:array, depth:int) {
-        if (depth > 64) { return; }
+        // A level costs two call frames, and a fiber has 64 by default: past
+        // this the value is refused, never passed unchecked.
+        if (depth > 16) { _fail(errors, path, "nests deeper than 16 levels"); return; }
         var value = valueIn;
         if (Class.IsInstance(value)) { value = Json.Parse(Json.Stringify(value)); }
         let schema = OpenApi._resolveRef(schemaIn, schemas);
@@ -2109,6 +2112,19 @@ class OpenApi
             if (schema.nullable == true) { return; }
             if (schema.type == "null") { return; }
             if (Type.IsArray(schema.type) && Array.Contains(schema.type, "null")) { return; }
+            // A schema built only of combinators says nothing about null by
+            // itself: null passes when its branches allow it, and not otherwise.
+            if (Type.IsArray(schema.allOf)) {
+                foreach (s in schema.allOf) { OpenApi._validate(nil, s, schemas, path, errors, depth + 1); }
+            }
+            let alts = Type.IsArray(schema.anyOf) ? schema.anyOf : (Type.IsArray(schema.oneOf) ? schema.oneOf : nil);
+            if (alts != nil) {
+                var some = false;
+                foreach (s in alts) {
+                    if (len(OpenApi._check(nil, s, schemas, path, depth + 1)) == 0) { some = true; break; }
+                }
+                if (!some) { _fail(errors, path, "must not be null"); return; }
+            }
             if (schema.type != nil || schema.properties != nil || schema.items != nil || schema.enum != nil) {
                 _fail(errors, path, "must not be null");
             }
@@ -2318,19 +2334,34 @@ class OpenApi
 
     // The operation that answers `method` + `path`, with the path parameters
     // the template captured, or nil.
+    //   shared: the path item's own `parameters` (a loaded document keeps them
+    //   beside the operations), which apply to every operation on the path.
     fn _matchOperation(method:string, path:string) {
         let m = String.ToLower(method);
         let segs = [];
         foreach (sg in String.Split(path, "/")) { if (String.Length(sg) > 0) { Array.Append(segs, sg); } }
         let direct = _paths.Get("/" + String.Join(segs, "/"));
-        if (direct != nil && direct.Has(m)) { return { op: direct.Get(m), params: {} }; }
+        let dm = OpenApi._methodIn(direct, m);
+        if (dm != nil) { return { op: direct.Get(dm), params: {}, shared: direct.Get("parameters") }; }
         foreach (tpl in _paths.keys) {
             if (!String.Contains(tpl, "{")) { continue; }
             let ops = _paths.map[tpl];
-            if (!ops.Has(m)) { continue; }
+            let om = OpenApi._methodIn(ops, m);
+            if (om == nil) { continue; }
             let params = OpenApi._matchTemplate(tpl, segs);
-            if (params != nil) { return { op: ops.Get(m), params: params }; }
+            if (params != nil) { return { op: ops.Get(om), params: params, shared: ops.Get("parameters") }; }
         }
+        return nil;
+    }
+
+    // The operation key that answers method `m` on a path item, or nil. Only
+    // real methods count - a path item also holds keys like "parameters" and
+    // "summary". HEAD is GET without a body and a router answers it with the
+    // GET route, so it is validated as GET unless the item has its own head.
+    fn static _methodIn(ops, m:string) {
+        if (ops == nil || !Array.Contains(_METHOD_ORDER, m)) { return nil; }
+        if (ops.Has(m)) { return m; }
+        if (m == "head" && ops.Has("get")) { return "get"; }
         return nil;
     }
 
@@ -2368,26 +2399,47 @@ class OpenApi
         let me = this;
         return fn(req, next) {
             if (me._detached) { return next(req); }
-            return me._validateRequest(req, next, cfg);
+            let route = me._matchOperation(req.method ?? "", req.path ?? "");
+            if (route == nil) { return next(req); }
+            // A value the checks cannot handle (nesting past the VM's frame
+            // limit, say) is a bad request, not a crash out of the router.
+            var checked = nil;
+            try {
+                checked = me._checkRequest(req, route, cfg);
+            } catch (_e) {
+                checked = { errors: [{ path: "request", message: "could not be validated" }] };
+            }
+            if (len(checked.errors) > 0) {
+                return { status: cfg.status, headers: { "Content-Type": "application/json" },
+                         body: Json.Stringify({ error: "Validation failed", details: checked.errors }) };
+            }
+            req.validated = checked.validated;
+            let resp = next(req);
+            if (!cfg.responses || resp == nil) { return resp; }
+
+            let rerrors = [];
+            OpenApi._checkResponse(resp, route.op, me._plainSchemas(), rerrors);
+            if (len(rerrors) == 0) { return resp; }
+            return { status: 500, headers: { "Content-Type": "application/json" },
+                     body: Json.Stringify({ error: "Response does not match the API description", details: rerrors }) };
         };
     }
 
-    fn _validateRequest(req, next, cfg) {
-        let match = this._matchOperation(req.method ?? "", req.path ?? "");
-        if (match == nil) { return next(req); }
-        let op      = match.op;
+    // Checks one matched request. Returns { errors, validated }.
+    fn _checkRequest(req, route, cfg) {
+        let op      = route.op;
         let schemas = this._plainSchemas();
         let errors  = [];
         let validated = { params: {}, query: {}, headers: {}, cookies: {}, body: nil };
+        let paramRefs = Object.TryGet(_componentsExtra, "parameters", {});
 
-        foreach (pIn in op.parameters ?? []) {
-            let p = OpenApi._resolveRef(pIn, Object.TryGet(_componentsExtra, "parameters", {}));
+        foreach (p in OpenApi._mergeParams(route.shared, op.parameters, paramRefs)) {
             if (!Type.IsObject(p) || p.name == nil) { continue; }
             let where:string = p["in"] ?? "query";
             let name:string  = p.name;
             var raw = nil;
             if (where == "path") {
-                raw = Object.TryGet(req.params ?? {}, name, nil) ?? Object.TryGet(match.params, name, nil);
+                raw = Object.TryGet(req.params ?? {}, name, nil) ?? Object.TryGet(route.params, name, nil);
                 if (raw == nil && name == "path") { raw = Object.TryGet(req.params ?? {}, "*", nil); }
             } else if (where == "query")  { raw = Object.TryGet(req.query ?? {}, name, nil); }
             else if (where == "header")   { raw = OpenApi._headerValue(req.headers, name); }
@@ -2433,19 +2485,31 @@ class OpenApi
             }
         }
 
-        if (len(errors) > 0) {
-            return { status: cfg.status, headers: { "Content-Type": "application/json" },
-                     body: Json.Stringify({ error: "Validation failed", details: errors }) };
-        }
-        req.validated = validated;
-        let resp = next(req);
-        if (!cfg.responses || resp == nil) { return resp; }
+        return { errors: errors, validated: validated };
+    }
 
-        let rerrors = [];
-        OpenApi._checkResponse(resp, op, schemas, rerrors);
-        if (len(rerrors) == 0) { return resp; }
-        return { status: 500, headers: { "Content-Type": "application/json" },
-                 body: Json.Stringify({ error: "Response does not match the API description", details: rerrors }) };
+    // Path-level parameters plus the operation's own, resolved; an operation
+    // entry replaces a path-level one with the same name and location.
+    fn static _mergeParams(shared, own, refs) {
+        let out = [];
+        let ownR = [];
+        foreach (pIn in own ?? []) {
+            let p = OpenApi._resolveRef(pIn, refs);
+            if (Type.IsObject(p) && p.name != nil) { Array.Append(ownR, p); }
+        }
+        if (Type.IsArray(shared)) {
+            foreach (sIn in shared) {
+                let s = OpenApi._resolveRef(sIn, refs);
+                if (!Type.IsObject(s) || s.name == nil) { continue; }
+                var replaced = false;
+                foreach (p in ownR) {
+                    if (p.name == s.name && (p["in"] ?? "query") == (s["in"] ?? "query")) { replaced = true; break; }
+                }
+                if (!replaced) { Array.Append(out, s); }
+            }
+        }
+        foreach (p in ownR) { Array.Append(out, p); }
+        return out;
     }
 
     // Form fields arrive as strings; coerce each against its property schema.
@@ -2502,9 +2566,9 @@ class OpenApi
     }
 
     fn _learn(req, resp, cfg) {
-        let match = this._matchOperation(req.method ?? "", req.path ?? "");
-        if (match == nil) { return; }
-        let op = match.op;
+        let route = this._matchOperation(req.method ?? "", req.path ?? "");
+        if (route == nil) { return; }
+        let op = route.op;
         var meta = Object.TryGet(op, "x-learned", nil);
         if (meta == nil) { meta = { samples: 0 }; op["x-learned"] = meta; }
         if (meta.samples >= cfg.maxSamples) { return; }

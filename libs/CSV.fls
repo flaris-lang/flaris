@@ -198,6 +198,14 @@ class CSV {
                     break;
                 }
             }
+            // Text between the closing quote and the delimiter (`"a" ,b`)
+            // belongs to this field, as other readers have it - left alone it
+            // ended the row and started a new one.
+            if (p < n) {
+                let stop = String.IndexOfAnyFrom(src, stopSet, p);
+                let e = (stop < 0) ? n : stop;
+                if (e > p) { out += String.Substr(src, p, e - p); p = e; }
+            }
             c.p = p;
             return out;
         }
@@ -358,7 +366,7 @@ class CSV {
         foreach (row in raw) {
             if (doTrim) { Array.Process(row, String.Trim); }
             if (o.headers && st.hdrs == nil) {
-                st.hdrs = row;
+                st.hdrs = CSV._uniqueNames(row);
                 continue;
             }
             let hdrs = st.hdrs;
@@ -374,6 +382,22 @@ class CSV {
                 Array.Append(sink, row);
             }
         }
+    }
+
+    // A repeated header name would make the later column overwrite the
+    // earlier one in every row object; the repeat gets a suffix instead:
+    // id, name, name -> id, name, name_2.
+    fn static _uniqueNames(hdrs:array): array {
+        let seen = {};
+        let out = [];
+        foreach (h in hdrs) {
+            var name = h;
+            var k = 2;
+            while (Object.HasKey(seen, name)) { name = h + "_" + str(k); k += 1; }
+            seen[name] = true;
+            Array.Append(out, name);
+        }
+        return out;
     }
 
     fn static _plain(o): bool { return !o.trim && !o.headers && !o.types; }
@@ -605,6 +629,12 @@ class CSV {
             if (isObjs) {
                 r = Array.Create(nk);
                 iter (j from 0 to nk) { r[j] = row[keys[j]]; }
+            }
+            // A row of one empty field would be a blank line, which a reader
+            // skips: it is written as "" so the row survives a round trip.
+            if (len(r) == 1 && (r[0] == nil || r[0] == "")) {
+                Array.Append(lines, w.quote + w.quote);
+                continue;
             }
             if (fast && Array.All(r, Type.IsString)) {
                 let line:string = String.Join(r, delim);

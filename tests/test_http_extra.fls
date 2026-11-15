@@ -929,6 +929,25 @@ fn async test_size_cap() {
     checkEq(st.Error(), "too large", "... then stops with Error() \"too large\"");
     let big = await Http.OpenAsync("GET", peerBase + "/ten", nil, nil, nil, { maxBodyBytes: 5 });
     check(big != nil && big.Chunk() == nil && big.Error() == "too large", "a stream whose Content-Length is past the cap");
+
+    // A buffered response has a 64 MiB default: 65 gzip members of 1 MiB each
+    // are 65 KB on the wire.
+    let member = Buffer.ToString(Deflate.Gzip(Buffer.Create(1048576, 1)));
+    let bomb = String.Repeat(member, 65);
+    peerRoutes["/bomb"] = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: " + str(len(bomb)) +
+                          "\r\n\r\n" + bomb;
+    check(await Http.RequestAsync("GET", peerBase + "/bomb") == nil, "default cap: a 65 MiB body fails");
+    checkEq(len(await capped("/bomb", 0)), 65 * 1048576, "maxBodyBytes 0 lifts the default");
+
+    route("/badgzip", "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 11\r\n\r\nnot gzipped");
+    check(await Http.RequestAsync("GET", peerBase + "/badgzip") == nil, "a gzip body that does not decode fails");
+
+    let many = String.Repeat("X-A: b\r\n", 1000);
+    route("/manyheaders", "HTTP/1.1 200 OK\r\n" + many + "Content-Length: 2\r\n\r\nok");
+    check(await Http.RequestAsync("GET", peerBase + "/manyheaders") == nil, "a head of over 1000 lines fails");
+    route("/someheaders", "HTTP/1.1 200 OK\r\n" + String.Repeat("X-A: b\r\n", 900) + "Content-Length: 2\r\n\r\nok");
+    let some = await Http.RequestAsync("GET", peerBase + "/someheaders");
+    check(some != nil && some.status == 200, "900 header lines are fine");
     return 0;
 }
 

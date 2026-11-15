@@ -201,7 +201,9 @@ class Template {
 
         if (raw)                                   return Template._pathTag("raw", 2, inner);
         if (String.StartsWith(inner, "!"))         return { t: "comment" };
-        if (inner == "#else")                      return { t: "else" };
+        // {{else}} is the Handlebars spelling; read as a variable it rendered
+        // both branches.
+        if (inner == "#else" || inner == "else")   return { t: "else" };
         if (inner == "/if")                        return { t: "end_if" };
         if (inner == "/each")                      return { t: "end_each" };
         if (inner == "/unless")                    return { t: "end_unless" };
@@ -311,10 +313,19 @@ class Template {
     // loop meta-variable.
     fn static _resolveAt(path, at:int, meta:bool, ctx) {
         if (ctx == nil || path == nil || len(path) <= at) return nil;
-        if (type(ctx) != Type.Object) return nil;
-
         let key  = path[at];
         let more = len(path) - at > 1;
+
+        // A class instance reads like an object, through its declared fields;
+        // any other non-object (a string or array as the data) is only "."
+        if (type(ctx) != Type.Object) {
+            var v = nil;
+            if (key == ".") { v = ctx; }
+            else if (Class.IsInstance(ctx)) { v = Class.GetField(ctx, key); }
+            else { return nil; }
+            if (more) return Template._resolveAt(path, at + 1, Template._isMeta(path[at + 1]), v);
+            return v;
+        }
 
         // "." = the current iteration item - nil included - in an each-frame
         // (which always holds _value), the data itself at the root.
@@ -338,6 +349,8 @@ class Template {
         let item = Object.TryGet(ctx, "_value", nil);
         if (item != nil && type(item) == Type.Object) {
             val = Object.TryGet(item, key, nil);
+        } else if (item != nil && Class.IsInstance(item)) {
+            val = Class.GetField(item, key);
         }
 
         // Fall back to the context frame / root data, then walk up the parent chain

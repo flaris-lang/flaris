@@ -80,12 +80,12 @@
 // -------------
 // Blocking:
 //   AI.Chat(model, messages, opts?)              → string | nil
-//   AI.ChatStream(model, messages, fn, opts?)    → nil  (streams via callback)
+//   AI.ChatStream(model, messages, fn, opts?)    → { ok, status, error }  (tokens via fn)
 //   AI.ChatJson(model, messages, opts?)          → object | nil
 //   AI.ChatStats(model, messages, opts?)         → { content, promptTokens, evalTokens, totalMs } | nil
 //   AI.Ask(model, system, user, opts?)           → string | nil
 //   AI.Generate(model, prompt, opts?)            → string | nil
-//   AI.GenerateStream(model, prompt, fn, opts?)  → nil
+//   AI.GenerateStream(model, prompt, fn, opts?)  → { ok, status, error }
 //
 // Async (use the await keyword):
 //   AI.ChatAsync(model, messages, opts?)         → fiber → string | nil
@@ -220,12 +220,32 @@ class AIClient {
     }
 
     // ChatStream(model, messages, callback, opts?) - callback(token:string)
+    // Returns { ok, status, error }.
     fn ChatStream(model: string, messages, callback: fn, opts?) {
-        let body = Json.Stringify(this._chatPayload(model, messages, true, opts));
-        Http.StreamPost(this._base + "/api/chat", body, fn(line) {
+        return this._stream("/api/chat", this._chatPayload(model, messages, true, opts), opts, callback,
+                            fn(d) { return (d.message == nil) ? nil : d.message.content; });
+    }
+
+    // One NDJSON stream. timeoutMs bounds the silence between lines (a model
+    // may think for a while, but not forever). An {"error": ...} line - an
+    // unknown model, say - ends it with that error, instead of reaching the
+    // callback as a nil token.
+    fn _stream(path: string, payload, opts, onToken: fn, pick: fn) {
+        var tr = nil;
+        if (opts != nil && "timeoutMs" in opts) { tr = { timeoutMs: opts.timeoutMs, readTimeoutMs: opts.timeoutMs }; }
+        let st = { error: nil };
+        let status = Http.StreamPost(this._base + path, Json.Stringify(payload), fn(line) {
             let d = Json.Parse(line);
-            if (d != nil && !d.done) { callback(d.message.content); }
-        });
+            if (d == nil) { return; }
+            if (d.error != nil) { st.error = str(d.error); return; }
+            if (d.done != true) {
+                let t = pick(d);
+                if (t != nil) { onToken(t); }
+            }
+        }, nil, tr);
+        if (status == nil) { return { ok: false, status: nil, error: st.error ?? "no answer" }; }
+        if (st.error == nil && status != 200) { st.error = "HTTP " + str(status); }
+        return { ok: st.error == nil, status: status, error: st.error };
     }
 
     // ChatJson(model, messages, opts?) → object | nil
@@ -347,12 +367,10 @@ class AIClient {
     }
 
     // GenerateStream(model, prompt, callback, opts?) - callback(token:string)
+    // Returns { ok, status, error }.
     fn GenerateStream(model: string, prompt: string, callback: fn, opts?) {
-        let body = Json.Stringify(this._genPayload(model, prompt, true, opts));
-        Http.StreamPost(this._base + "/api/generate", body, fn(line) {
-            let d = Json.Parse(line);
-            if (d != nil && !d.done) { callback(d.response); }
-        });
+        return this._stream("/api/generate", this._genPayload(model, prompt, true, opts), opts, callback,
+                            fn(d) { return d.response; });
     }
 
     // ── Async ─────────────────────────────────────────────────────────────────
@@ -438,7 +456,7 @@ class AIClient {
 // ── AIConversation ─────────────────────────────────────────────────────────────
 
 class AIConversation {
-    let _buf = nil; 
+    let _buf: string|nil = nil; 
     let _client = nil; 
     let _messages = nil; 
     let _model = nil; 
@@ -457,7 +475,7 @@ class AIConversation {
         if (len(this._messages) > 0 && this._messages[0].role == "system") {
             this._messages[0] = { role: "system", content: msg };
         } else {
-            Array.Append(this._messages, { role: "system", content: msg });
+            Array.InsertAt(this._messages, 0, { role: "system", content: msg });
         }
     }
 

@@ -102,6 +102,42 @@ fn workerAnyReject() { let pid = Promise.ReceiveId(); Fiber.Sleep(2);  Promise.F
 fn workerAnySlow()   { let pid = Promise.ReceiveId(); Fiber.Sleep(20); Promise.Notify(pid, "slow-ok"); }
 
 // 1. Basic
+fn workerThrows() { Promise.ReceiveId(); throw(5, "worker failed"); }
+
+fn test_review_fixes() {
+    Console.WriteLine("== review fixes ==");
+
+    // A handler that waits must not let a second dispatch run it again.
+    let p = new Promise();
+    let runs = { n: 0 };
+    p.Then(fn(v) { runs.n = runs.n + 1; Fiber.Sleep(30); return v; });
+    Fiber.Run(fn() { Fiber.Sleep(5); p.Then(fn(v) { return v; }); });
+    p.Resolve(1);
+    Fiber.Sleep(80);
+    checkEq(runs.n, 1, "a waiting Then handler runs once");
+
+    // A worker that throws rejects its promise; it does not end the program.
+    let r = Promise.Run(workerThrows).AwaitResult();
+    checkEq(r.ok, false, "a throwing worker rejects");
+    check(r.reason != nil && String.Contains(str(r.reason.Error), "worker failed"), "... with its exception as the reason");
+
+    // The documented result shape.
+    let settled = Promise.AllSettled([Promise.Resolved(1), Promise.Rejected("no")]);
+    checkEq(settled[0].ok, true, "AllSettled: ok on a resolved one");
+    checkEq(settled[1].ok, false, "AllSettled: not ok on a rejected one");
+    checkEq(settled[1].reason, "no", "AllSettled: the reason");
+    checkEq(Promise.FirstSettled([Promise.Rejected("x")]).reason, "x", "FirstSettled: the reason");
+    checkEq(Promise.Rejected("why").AwaitResult().reason, "why", "AwaitResult: the reason");
+
+    // From passes a promise through; a Then that returns one is adopted.
+    let inner = Promise.Resolved(7);
+    check(Promise.From(inner) == inner, "From(promise) is that promise");
+    checkEq(Promise.Resolved(1).Then(fn(_v) { return Promise.Resolved(42); }).Await(), 42,
+            "a Then returning a promise resolves with its value");
+    let adoptedReject = Promise.Resolved(1).Then(fn(_v) { return Promise.Rejected("inner no"); }).AwaitResult();
+    checkEq(adoptedReject.reason, "inner no", "... and rejects with its reason");
+}
+
 fn test_basic() {
     Console.WriteLine("== Basic resolve/reject ==");
 
@@ -634,6 +670,7 @@ fn async Main() {
     test_all_settled();
     test_retry();
     test_any();
+    test_review_fixes();
 
     Console.WriteLine("=== Promise.fls test done ===");
     Console.WriteLine("Tests run: " + str(testsRun) + "  failed: " + str(testsFailed));

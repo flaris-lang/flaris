@@ -56,7 +56,12 @@
 // contents can be written.
 //
 // Limits: the whole archive is held in memory both ways, so an entry is capped
-// by the 2 GiB block limit.
+// by the 2 GiB block limit, and a .tar.gz decompresses to at most 256 MiB.
+// Read, List and ExtractTo take an optional last argument with two limits;
+// over either, they return nil and LastError() says which:
+//   maxBytes   - the most bytes the archive may hold once decompressed; for a
+//                .tar.gz it replaces the 256 MiB cap, higher or lower
+//   maxEntries - the most entries (default: no limit)
 
 import { Inflate, Deflate } from library("Deflate", "1.0");
 
@@ -264,14 +269,22 @@ fn _tarFail(why: string) {
 }
 
 // The entries of a tar (or tar.gz) image; with `withData` each carries its
-// payload. nil with _tarErr set when the image is not a readable archive.
-fn _tarParse(input: block, withData: bool): array {
+// payload. nil with _tarErr set when the image is not a readable archive or
+// is over a limit in `opts` (see the header).
+fn _tarParse(input: block, withData: bool, opts): array {
     _tarErr = nil;
     if (input == nil) return _tarFail("no data");
+    let maxBytes = (opts == nil) ? nil : opts.maxBytes;
+    let maxEntries = (opts == nil || opts.maxEntries == nil) ? -1 : opts.maxEntries;
     var b = input;
     if (len(b) >= 2 && b[0] == 31 && b[1] == 139) {
-        b = Inflate.Gzip(b);
-        if (b == nil) return _tarFail("gzip stream does not decode");
+        b = Inflate.Gzip(b, nil, maxBytes);
+        if (b == nil) {
+            if (Inflate.LastError() == -3) return _tarFail("archive is over maxBytes once decompressed");
+            return _tarFail("gzip stream does not decode");
+        }
+    } else if (maxBytes != nil && len(b) > maxBytes) {
+        return _tarFail("archive is over maxBytes");
     }
     let n = len(b);
     let out = [];
@@ -345,6 +358,7 @@ fn _tarParse(input: block, withData: bool): array {
         if (withData) {
             e.data = (e.type == "file" && body > 0) ? Buffer.Slice(b, dataOff, body) : Buffer.Create(0, 1);
         }
+        if (maxEntries >= 0 && len(out) >= maxEntries) return _tarFail("archive has more than maxEntries entries");
         Array.Append(out, e);
         off = next;
     }
@@ -360,6 +374,11 @@ fn _tarParse(input: block, withData: bool): array {
 
 fn _tarSafeRel(name: string): string {
     if (name == nil || len(name) == 0) return nil;
+    // A pax path can carry a NUL; the filesystem would stop there and write a
+    // different name from the one listed.
+    let nul = Buffer.Create(1, 1);
+    nul[0] = 0;
+    if (String.IndexOfAnyFrom(name, Buffer.ToString(nul), 0) >= 0) return nil;
     let s = String.Replace(name, "\\", "/");
     if (String.StartsWith(s, "/")) return nil;
     if (len(s) >= 2 && String.CharAt(s, 1) == ':') return nil;
@@ -392,6 +411,23 @@ fn _tarCrossesSymlink(root: string, rel: string): bool {
     return false;
 }
 
+// The OS follows a link target through the links already on disk, which the
+// lexical check cannot see: with "d/l -> ..", the target "d/l/../x" reads as
+// "d/x" but lands above the root. So ".." may only lead a target, climbing from
+// the link's own directory (a real one: entries never go through a symlink),
+// and never follow a name. Every link made then points inside the root.
+fn _tarClimbsFirst(t: string): bool {
+    var named = false;
+    foreach (sg in String.Split(String.Replace(t, "\\", "/"), "/")) {
+        if (sg == "..") {
+            if (named) return false;
+        } else if (len(sg) > 0 && sg != ".") {
+            named = true;
+        }
+    }
+    return true;
+}
+
 fn _tarSafeMode(mode: int, isDir: bool): int {
     let m = mode & 493;                  // 0755
     return isDir ? (m | 448) : m;        // a directory keeps owner rwx
@@ -410,7 +446,7 @@ fn _tarClear(path: string): int {
 // ---------------------------------------------------------------------------
 
 class TarWriter {
-    let _items = nil;
+    let _items = [];
 
     fn Constructor() { this._items = []; }
 
@@ -602,13 +638,13 @@ class Tar {
     // Every entry with its payload, or nil (see LastError) for bytes that are
     // not a readable archive. `data` is a tar or tar.gz image, as File.ReadAllBytes
     // returns one.
-    fn static Read(data: block): array {
-        return _tarParse(data, true);
+    fn static Read(data: block, opts?): array {
+        return _tarParse(data, true, opts);
     }
 
     // As Read, without the payloads.
-    fn static List(data: block): array {
-        return _tarParse(data, false);
+    fn static List(data: block, opts?): array {
+        return _tarParse(data, false, opts);
     }
 
     // Why the last Read, List or ExtractTo failed, or nil.
@@ -620,9 +656,10 @@ class Tar {
 
     // Writes the archive's files, directories and links under `dir` (created if
     // missing). Returns { written, skipped } - the count written and the names
-    // refused - or nil when `data` is not a readable archive.
-    fn static ExtractTo(data: block, dir: string) {
-        let entries = _tarParse(data, true);
+    // refused - or nil when `data` is not a readable archive or is over a limit
+    // in `opts` (then nothing is written).
+    fn static ExtractTo(data: block, dir: string, opts?) {
+        let entries = _tarParse(data, true, opts);
         if (entries == nil) return nil;
         if (!Directory.Ensure(dir)) return _tarFail("cannot create " + dir);
         let root = Path.Resolve(dir);
@@ -630,6 +667,9 @@ class Tar {
         let skipped = [];
         let dirs = [];
         foreach (e in entries) {
+            // "./" is the archive's own root - the directory being extracted
+            // into - not an unsafe name.
+            if (e.type == "dir" && (e.name == "./" || e.name == ".")) { continue; }
             let rel = _tarSafeRel(e.name);
             let dest = (rel == nil) ? nil : Path.Resolve(Path.Combine(root, rel));
             if (dest == nil || !_tarIsUnder(dest, root) || dest == root || _tarCrossesSymlink(root, rel)) {
@@ -652,7 +692,10 @@ class Tar {
             } else if (e.type == "symlink") {
                 let t = e.linkname;
                 let aim = (len(t) == 0 || Path.IsAbsolute(t)) ? nil : Path.Resolve(Path.Combine(parent, t));
-                if (aim == nil || !_tarIsUnder(aim, root)) { Array.Append(skipped, e.name); continue; }
+                if (aim == nil || !_tarIsUnder(aim, root) || !_tarClimbsFirst(t)) {
+                    Array.Append(skipped, e.name);
+                    continue;
+                }
                 Directory.Ensure(parent);
                 _tarClear(dest);
                 if (File.CreateSymlink(t, dest)) { written += 1; } else { Array.Append(skipped, e.name); }

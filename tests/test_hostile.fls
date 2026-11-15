@@ -1,0 +1,399 @@
+// test_hostile.fls - every decoder fed 200 damaged inputs.
+//
+// Each decoder starts from valid inputs its own library (or Python, for the
+// fixtures) produced, then gets them back with bits flipped, cut short, with
+// huge length fields written in, bytes overwritten, slices duplicated and runs
+// zeroed. A decoder passes when every call returns - nil, a partial result or
+// an error result, whatever its header documents - or raises only the error it
+// documents, and no call takes longer than BUDGET_MS. A VM error (index out of
+// range, stack overflow, out of memory) from library code is a failure.
+//
+// The mutations come from a fixed seed, so a failing case is reproducible:
+// HOSTILE_VERBOSE=1 prints each case before it runs.
+//
+// Run: ./flarisvm --libs=./libs tests/test_hostile.fls
+
+import { HttpServer } from library("HttpServer", "1.0");
+import { Http } from library("Http", "1.0");
+import { XML } from library("XML", "1.0");
+import { CSV } from library("CSV", "1.0");
+import { Config } from library("Config", "1.0");
+import { Pb } from library("Protobuf", "1.0");
+import { Png } from library("Png", "1.0");
+import { Tiff } from library("Tiff", "1.0");
+import { Archive } from library("Zip", "1.0");
+import { Tar } from library("Tar", "1.0");
+import { Inflate, Deflate } from library("Deflate", "1.0");
+import { BinaryWriter, BinaryReader, BinaryFileReader } from library("BinaryIO", "1.0");
+import { Jwt } from library("Jwt", "1.0");
+import { HttpUtil } from library("HttpUtil", "1.0");
+
+const CASES = 200;
+const BUDGET_MS = 2000;
+const T0 = 1700000000;           // fixed timestamps: the same seeds, so the same cases, every run
+
+global testsRun = 0;
+global testsFailed = 0;
+global VERBOSE = false;
+global _rs = 2463534242;
+
+fn check(cond, msg) {
+    testsRun += 1;
+    if (!cond) { testsFailed += 1; Console.WriteLine("FAIL: " + msg); }
+}
+
+// 32-bit xorshift: the same sequence on every run.
+fn rnd(n: int): int {
+    _rs = _rs ^ (u32)(_rs << 13);
+    _rs = _rs ^ (_rs >> 17);
+    _rs = _rs ^ (u32)(_rs << 5);
+    return n <= 0 ? 0 : _rs % n;
+}
+
+fn bytesOf(s: string): block { return Buffer.FromString(s); }
+
+// A damaged copy of `src`; the kind of damage cycles with k.
+fn mutate(src: block, k: int): block {
+    let n = len(src);
+    if (n == 0) { return Buffer.Create(1, 1); }
+    let kind = k % 6;
+    if (kind == 1) { return Buffer.Slice(src, 0, rnd(n)); }          // cut short
+    if (kind == 4) {                                                  // a slice repeated elsewhere
+        let a = rnd(n);
+        let l = 1 + rnd(Math.Min(64, n - a));
+        let p = rnd(n);
+        let out = Buffer.Slice(src, 0, p);
+        Buffer.Append(out, Buffer.Slice(src, a, l));
+        Buffer.Append(out, Buffer.Slice(src, p, n - p));
+        return out;
+    }
+    let b = Buffer.Slice(src, 0, n);
+    if (kind == 0) {                                                  // bit flips
+        iter (i from 0 to 1 + rnd(4)) {
+            let p = rnd(n);
+            b[p] = (u8)b[p] ^ (1 << rnd(8));
+        }
+    } else if (kind == 2) {                                           // a huge length field
+        let p = rnd(n);
+        let pat = rnd(3);
+        iter (i from 0 to 10) {
+            if (p + i >= n) { break; }
+            if (pat == 0) { b[p + i] = (i < 3) ? 0xFF : (i == 3 ? 0x7F : (u8)b[p + i]); }
+            else if (pat == 1) { b[p + i] = (i == 0) ? 0x7F : (i < 4 ? 0xFF : (u8)b[p + i]); }
+            else { b[p + i] = 0xFF; }                                 // a varint that never ends
+        }
+    } else if (kind == 3) {                                           // bytes overwritten
+        iter (i from 0 to 1 + rnd(8)) { b[rnd(n)] = rnd(256); }
+    } else {                                                          // a run zeroed
+        let p = rnd(n);
+        iter (i from 0 to 1 + rnd(16)) { if (p + i < n) { b[p + i] = 0; } }
+    }
+    return b;
+}
+
+fn hexHead(b: block): string {
+    let digits = "0123456789abcdef";
+    let parts = [];
+    iter (i from 0 to Math.Min(48, len(b))) {
+        let v = (u8)b[i];
+        Array.Append(parts, String.Substr(digits, v >> 4, 1) + String.Substr(digits, v & 15, 1));
+    }
+    return String.Join(parts, "") + (len(b) > 48 ? "... (" + str(len(b)) + " bytes)" : "");
+}
+
+fn allowed(msg: string, prefixes): bool {
+    if (prefixes == nil) { return false; }
+    foreach (p in prefixes) { if (String.StartsWith(msg, p)) { return true; } }
+    return false;
+}
+
+// Feed `call` CASES damaged copies of the seeds. `prefixes`: the start of the
+// error messages the library documents raising, nil when it must never raise.
+fn fuzz(name: string, seeds: array, call, prefixes) {
+    var seedOk = true;
+    foreach (s in seeds) {
+        try { call(s); } catch (e) { seedOk = false; Console.WriteLine("  " + name + ": a valid seed raised: " + str(e.Error)); }
+    }
+    check(seedOk, name + ": the valid seeds decode");
+
+    var bad = 0;
+    var maxMs = 0;
+    var worst = -1;
+    var decoded = 0;     // damaged inputs that still gave a result: the damage reached past the first check
+    iter (k from 0 to CASES) {
+        let input = mutate(seeds[k % len(seeds)], k);
+        if (VERBOSE) { Console.WriteLine("  " + name + " case " + str(k) + ": " + hexHead(input)); }
+        let t0 = Time.Millis();
+        try {
+            if (call(input) != nil) { decoded += 1; }
+        } catch (e) {
+            let msg = str(e.Error);
+            if (!allowed(msg, prefixes)) {
+                bad += 1;
+                if (bad <= 3) {
+                    Console.WriteLine("  " + name + " case " + str(k) + " raised (code " + str(e.Code) + "): " + msg);
+                    Console.WriteLine("    input: " + hexHead(input));
+                }
+            }
+        }
+        let dt = Time.Millis() - t0;
+        if (dt > maxMs) { maxMs = dt; worst = k; }
+    }
+    check(bad == 0, name + ": " + str(bad) + " of " + str(CASES) + " damaged inputs raised an undocumented error");
+    check(maxMs < BUDGET_MS, name + ": the slowest case took " + str(maxMs) + " ms (case " + str(worst) + ")");
+    Console.WriteLine("  " + name + ": " + str(CASES) + " cases, " + str(decoded) + " still gave a result, slowest "
+                      + str(maxMs) + " ms");
+}
+
+// ---------------------------------------------------------------- seeds
+
+fn pixels(w: int, h: int): block {
+    let px = Buffer.Create(w * h, 4);
+    iter (i from 0 to w * h) { px[i] = 0xFF000000 | ((i * 2654435761) & 0xFFFFFF); }
+    return px;
+}
+
+// ---------------------------------------------------------------- HTTP over sockets
+
+// One raw exchange with the server: send the bytes, read until it closes or
+// goes quiet. Every wait parks the fiber, so the server keeps running.
+fn exchange(port: int, raw: block) {
+    let c = Stream.Connect("tcp", "127.0.0.1", port);
+    if (c == nil) { return nil; }
+    Stream.SetTimeout(c, 1000);
+    Stream.WriteBytes(c, raw, len(raw));
+    var first = nil;
+    while (Stream.WaitReadable(c, 500) != nil) {
+        let got = Stream.ReadBytes(c, 65536);
+        if (got == nil) { break; }
+        if (first == nil) { first = got; }
+    }
+    Stream.Close(c);
+    return first;
+}
+
+global _fakeResp = nil;      // what the fake server answers the next request with
+global _fakeOn = true;
+
+// Answers every connection with _fakeResp, then hangs up.
+fn fakeServer(ls) {
+    while (_fakeOn) {
+        if (Stream.WaitReadable(ls, 100) == nil) { continue; }
+        let c = Stream.Accept(ls);
+        if (c == nil) { continue; }
+        var line = "x";
+        while (line != nil && line != "" && Stream.WaitReadable(c, 500) != nil) { line = Stream.ReadLine(c); }
+        if (_fakeResp != nil) { Stream.WriteBytes(c, _fakeResp, len(_fakeResp)); }
+        Stream.Close(c);
+    }
+    Stream.Close(ls);
+    return 0;
+}
+
+fn testHttp() {
+    let srv = new HttpServer({ port: 0, host: "127.0.0.1", readTimeoutMs: 200, idleTimeoutMs: 100 });
+    srv.Get("/", fn(_req, res) { res.Text("ok"); });
+    srv.Post("/echo", fn(req, res) { res.Text(str(len(req.body ?? ""))); });
+    let port = srv.ListenAsync();
+    fuzz("HttpServer request", [
+            bytesOf("GET /?a=1&b=%20x HTTP/1.1\r\nHost: t\r\nAccept: */*\r\nCookie: a=b\r\nConnection: close\r\n\r\n"),
+            bytesOf("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world"),
+            bytesOf("POST /echo HTTP/1.1\r\nHost: t\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;x=y\r\n world\r\n0\r\nT: 1\r\n\r\n"),
+            bytesOf("POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc")],
+         fn(b) { return exchange(port, b); }, nil);
+    let after = exchange(port, bytesOf("GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"));
+    check(after != nil && String.StartsWith(Buffer.ToString(after), "HTTP/1.1 200"), "HttpServer still serves after the damaged requests");
+    srv.Stop(1000);
+
+    let ls = Stream.Listen("tcp", 0, 128, "127.0.0.1");
+    let a: string = Stream.LocalAddr(ls);
+    let fport = Convert.ParseInt(String.Substr(a, String.LastIndexOf(a, ":") + 1, 10));
+    Fiber.Run(fn() { fakeServer(ls); });
+    let url = "http://127.0.0.1:" + str(fport) + "/";
+    let opts = { timeoutMs: 1000, keepAlive: false };
+    fuzz("Http response", [
+            bytesOf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: a=b\r\nContent-Length: 5\r\n\r\nhello"),
+            bytesOf("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"),
+            Buffer.Concat(bytesOf("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 33\r\n\r\n"), Deflate.Gzip(bytesOf("zipped zipped"))),
+            bytesOf("HTTP/1.0 301 Moved\r\nLocation: /elsewhere\r\n\r\n")],
+         fn(b) {
+             _fakeResp = b;
+             return Fiber.Await(Http.RequestAsync("GET", url, nil, nil, nil, opts));
+         }, nil);
+    _fakeOn = false;
+    return 0;
+}
+
+fn protoSchema() {
+    return Pb.LoadProto(
+        "syntax = \"proto3\";\n"
+      + "message Inner { int32 a = 1; string s = 2; }\n"
+      + "message All {\n"
+      + "  int32 i32 = 1; int64 i64 = 2; uint32 u32 = 3; sint32 s32 = 4; sint64 s64 = 5;\n"
+      + "  fixed32 f32 = 6; fixed64 f64 = 7; float fl = 8; double db = 9; bool b = 10;\n"
+      + "  string str = 11; bytes by = 12; Inner inner = 13; repeated int32 packed = 14;\n"
+      + "  repeated string names = 15; map<string, Inner> m = 16; repeated Inner kids = 17;\n"
+      + "  oneof pick { string os = 18; Inner oi = 19; }\n"
+      + "  All self = 20;\n"
+      + "}\n", "hostile.proto");
+}
+
+// Targeted cases for bug shapes seen in other VMs: invalid UTF-8 sequences
+// (a lead 0xFF followed by continuation bytes - the shape of a shift-overflow
+// report in another runtime's utf8 decoder) and a u32 length field far larger
+// than the buffer. Each call must return or raise a documented error quickly;
+// a crash, a hang or a VM-level error is a failure.
+fn targeted() {
+    Console.WriteLine("  targeted: invalid UTF-8 and oversize length fields");
+    let bad = "\xff\x8f\x8f\x8f\x8f\x8f\x8f\x8f";
+    check(String.Utf8Length(bad) == 1, "Utf8Length counts the invalid run as one U+FFFD");
+    check(int(String.Utf8CpAt(bad, 0)) == 0xFFFD, "Utf8CpAt of an invalid lead byte is U+FFFD");
+    check(Json.Parse("\"" + bad + "\"") == nil, "Json rejects invalid UTF-8 in a string");
+    check(Json.Parse("\"\\uD800\"") == nil, "Json rejects a lone surrogate escape");
+    check(len(HttpUtil.UrlDecode("%FF%8F%8F")) == 3, "UrlDecode keeps the raw bytes");
+    let r = new BinaryReader(bytesOf("\xFF\xFF\xFF\x7Fab"));
+    let t0 = Time.Millis();
+    let s = r.ReadString32();
+    check(len(s) == 2, "a huge u32 length field clamps to the remaining bytes");
+    check(Time.Millis() - t0 < BUDGET_MS, "the oversize length field returns quickly");
+}
+
+fn Main() {
+    VERBOSE = Os.GetEnv("HOSTILE_VERBOSE") != nil;
+    Console.WriteLine("=== Hostile input ===");
+
+    // XML, and the tree walkers over whatever Parse returns.
+    fuzz("XML", [bytesOf("<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY e \"x\">]><root a=\"1\" b='x &amp; y'>"
+                       + "<item id=\"1\">text &lt; &#65; &#x42;</item><![CDATA[raw <b>]]><!-- c -->"
+                       + "<p>mixed <b>bold</b> tail</p><e/></root>")],
+         fn(b) {
+             let n = XML.Parse(Buffer.ToString(b));
+             if (n != nil) { XML.Text(n); XML.Build(n); XML.Pretty(n, " "); XML.FindAll(n, "item"); }
+             return n;
+         }, nil);
+
+    fuzz("CSV", [bytesOf("name,age,note\nAlice,30,\"a, \"\"quoted\"\"\nnote\"\nBob,25,plain\r\n,,\n\"x\",1.5e3,true\n")],
+         fn(b) {
+             let s = Buffer.ToString(b);
+             CSV.Parse(s);
+             return CSV.Parse(s, { headers: true, types: true, trim: true });
+         }, nil);
+
+    fuzz("Config TOML", [bytesOf("title = \"x\"\n[db]\nport = 5432\nhosts = [\"a\", \"b\"]\n"
+                               + "inline = { k = 1, n = { m = [1, [2, 3]] } }\n[[items]]\nname = 'lit'\n"
+                               + "text = \"\"\"\nmulti\\u00e5\nline\"\"\"\nhex = 0xff\nwhen = 1979-05-27T07:32:00Z\n")],
+         fn(b) { new Config().Load(Buffer.ToString(b)); }, nil);
+    fuzz("Config YAML", [bytesOf("app:\n  name: \"x\\ty\"\n  list:\n    - a\n    - b: 1\n  flow: {k: [1, 2, {z: 3}]}\n"
+                               + "text: |\n  line1\n  line2\nfolded: >-\n  a\n  b\n# comment\nurl: http://x/#frag\n")],
+         fn(b) { new Config().LoadYaml(Buffer.ToString(b)); }, nil);
+    fuzz("Config dotenv", [bytesOf("A=1\nexport B=\"two ${A}\\n\"\nC='lit $A'\n# c\nD=${B}x\n")],
+         fn(b) { new Config().LoadEnv(Buffer.ToString(b), true); }, nil);
+
+    let t = protoSchema();
+    let all = Pb.FromJson("{\"i32\":-5,\"i64\":\"9000000000\",\"u32\":7,\"s32\":-3,\"s64\":\"-4\",\"f32\":9,"
+                        + "\"f64\":\"10\",\"fl\":1.5,\"db\":-2.25,\"b\":true,\"str\":\"héllo\",\"by\":\"AAEC\","
+                        + "\"inner\":{\"a\":1,\"s\":\"in\"},\"packed\":[1,300,-1],\"names\":[\"x\",\"y\"],"
+                        + "\"m\":{\"k\":{\"a\":2}},\"kids\":[{\"a\":3},{}],\"os\":\"one\",\"self\":{\"i32\":1}}", t["All"]);
+    fuzz("Protobuf", [Pb.Encode(all)], fn(b) { return Pb.Decode(b, t["All"]); }, ["Pb.", "Protobuf"]);
+
+    fuzz("Png", [Png.Encode(pixels(9, 7), 9, 7), File.ReadAllBytes("./tests/png/pal4.png"),
+                 File.ReadAllBytes("./tests/png/gray16.png"), File.ReadAllBytes("./tests/png/rgb8_trns.png")],
+         fn(b) { return Png.Decode(b); }, nil);
+
+    fuzz("Tiff", [Tiff.Encode(pixels(9, 7), 9, 7, { compression: Tiff.COMPRESSION_LZW }),
+                  Tiff.Encode(pixels(9, 7), 9, 7, { compression: Tiff.COMPRESSION_PACKBITS }),
+                  Tiff.Encode(pixels(9, 7), 9, 7, { compression: Tiff.COMPRESSION_DEFLATE }),
+                  File.ReadAllBytes("./tests/tiff/gray2_none.tif")],
+         fn(b) { Tiff.Info(b); Tiff.PageCount(b); return Tiff.Decode(b); }, nil);
+
+    let zw = Archive.Create();
+    zw.Add("a.txt", String.Repeat("compress me ", 40), { modified: T0 });
+    zw.Add("dir/", "", { modified: T0 });
+    zw.Add("dir/b.bin", "x", { store: true, modified: T0 });
+    zw.SetComment("hostile");
+    fuzz("Zip", [zw.Build()],
+         fn(b) {
+             let r = Archive.Open(b);
+             if (r == nil) { return nil; }
+             var got = nil;
+             foreach (e in r.List()) { got = r.Read(e.Name) ?? got; }
+             r.Comment();
+             return got;
+         }, nil);
+
+    let tw = Tar.Create();
+    tw.AddFile("a.txt", String.Repeat("tar data ", 30), { mtime: T0 });
+    tw.AddDirectory("d", { mtime: T0 });
+    tw.AddSymlink("l", "a.txt", { mtime: T0 });
+    tw.AddFile(String.Repeat("long/", 30) + "name.txt", "pax", { mtime: T0 });
+    fuzz("Tar", [tw.ToBlock(), tw.ToGzip()], fn(b) { Tar.List(b); return Tar.Read(b); }, nil);
+
+    let text = bytesOf(String.Repeat("the quick brown fox jumps over the lazy dog ", 30));
+    fuzz("Deflate", [Deflate.Raw(text), Deflate.Zlib(text), Deflate.Gzip(text)],
+         fn(b) { Inflate.Raw(b); Inflate.Zlib(b); Inflate.Gzip(b); return Inflate.Auto(b); }, nil);
+
+    let bw = new BinaryWriter();
+    bw.WriteVarUInt(300);
+    bw.WriteString("hello");
+    bw.WriteU32(0xDEADBEEF);
+    bw.WriteStringVar("var");
+    bw.WriteString32("thirty-two");
+    bw.WriteU16(3);
+    bw.WriteBytes(bytesOf("abc"));
+    bw.WriteVarInt(-77);
+    bw.WriteCString("c-str");
+    let binPath = Os.TempDir() + "/flaris_test_hostile.bin";
+    fuzz("BinaryIO", [bw.ToBuffer()],
+         fn(b) {
+             let r = new BinaryReader(b);
+             var rounds = 0;
+             while (!r.IsEOF() && rounds < 1000) {
+                 r.ReadVarUInt(); r.ReadString(); r.ReadU32(); r.ReadStringVar(); r.ReadString32();
+                 r.ReadBytes(r.ReadU16()); r.ReadVarInt(); r.ReadCString(); r.ReadBits(5);
+                 rounds += 1;
+             }
+             File.WriteAllBytes(binPath, b);
+             let f = new BinaryFileReader(binPath);
+             var more = true;
+             while (more) {
+                 more = f.ReadU8() != nil && f.ReadString() != nil && f.ReadStringFixed(f.ReadU16() ?? 0) != nil
+                        && f.ReadBytes(f.ReadU32() ?? 0) != nil && f.ReadCString() != nil;
+             }
+             f.Close();
+             return rounds > 0 ? rounds : nil;
+         }, nil);
+    File.Delete(binPath);
+
+    let secret = "hostile-secret";
+    let tok = Jwt.EncodeHS256({ sub: "u1", exp: 4102444800, nbf: 0, roles: ["a", "b"] }, secret);
+    fuzz("Jwt", [bytesOf(tok)],
+         fn(b) {
+             let s = Buffer.ToString(b);
+             let d = Jwt.Decode(s);
+             Jwt.VerifyHS256(s, secret);
+             Jwt.VerifyHS256WithClaims(s, secret, { leeway: 5 });
+             return d;
+         }, nil);
+
+    fuzz("HttpUtil", [bytesOf("Host: example.com\r\nContent-Type: text/plain; charset=utf-8\r\nX-A: 1\r\n"
+                            + "Cookie: a=b; c=d\r\nContent-Length: 12\r\n")],
+         fn(b) { return HttpUtil.ParseHeaders(Buffer.ToString(b)); }, nil);
+    fuzz("HttpUtil URL", [bytesOf("https://user:pw@example.com:8443/a/b%20c/../d?x=1&y=%E2%9C%93+z#frag"),
+                          bytesOf("http://[::1]:8080/?q=%zz&&=&a")],
+         fn(b) {
+             let s = Buffer.ToString(b);
+             let u = HttpUtil.ParseUrl(s);
+             HttpUtil.ParseQuery(s);
+             HttpUtil.UrlDecode(s);
+             HttpUtil.ResolveUrl("http://base.example/x/y", s);
+             return u;
+         }, nil);
+
+    testHttp();
+    targeted();
+
+    Console.WriteLine("");
+    Console.WriteLine("Tests run:" + str(testsRun) + "  failed:" + str(testsFailed));
+    if (testsFailed == 0) { Console.WriteLine("✅ All hostile-input tests passed!"); }
+    return testsFailed == 0 ? 0 : 1;
+}

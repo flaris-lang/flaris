@@ -484,6 +484,35 @@ fn test_recursive() {
     check("recursive: LR",       d.left.right.label,  "LR");
     check("recursive: R",        d.right.label,       "R");
     check("recursive: L.left nil", is_nil(d.left.left), true);
+
+    // Pb.MAX_DEPTH must fire before the fiber's 64 call frames run out, so a
+    // too-deep message gets the documented error, not "Stack full".
+    let chain = fn(d) {
+        let top = new Tree();
+        var at = top;
+        var i = 0;
+        while (i < d) { at.left = new Tree(); at = at.left; i += 1; }
+        at.label = "leaf";
+        return top;
+    };
+    let ok = Pb.Decode(Pb.Encode(chain(Pb.MAX_DEPTH)), Tree);
+    check("recursive: MAX_DEPTH levels round-trip", ok != nil, true);
+    var encErr = "";
+    try { Pb.Encode(chain(Pb.MAX_DEPTH + 1)); } catch (e) { encErr = str(e.Error); }
+    check("recursive: Encode past MAX_DEPTH names the limit", String.Contains(encErr, "nests deeper"), true);
+    // Bytes from elsewhere: wrap a leaf in field 2 (left), MAX_DEPTH + 1 times.
+    var b = Pb.Encode(new Tree());
+    var i = 0;
+    while (i <= Pb.MAX_DEPTH) {
+        let w = new PbWriter();
+        w.Tag(2, Pb.WIRE_LEN);
+        w.Bytes(b);
+        b = w.ToBuffer();
+        i += 1;
+    }
+    var decErr = "";
+    try { Pb.Decode(b, Tree); } catch (e) { decErr = str(e.Error); }
+    check("recursive: Decode past MAX_DEPTH names the limit", String.Contains(decErr, "nests deeper"), true);
 }
 
 fn test_unknown_fields() {
@@ -571,6 +600,19 @@ fn test_delimited() {
     try { Pb.DecodeDelimited(new PbReader(BitConverter.FromHex("05089601")), Spec1); }
     catch (e) { caught = e.Error; }
     check("delimited: length past the reader raises", String.Contains(caught, "runs past"), true);
+
+    // A negative length (varint -10) used to move the reader backwards, so a
+    // `while (!r.AtEnd())` loop never ended.
+    caught = "";
+    try { Pb.DecodeDelimited(new PbReader(BitConverter.FromHex("f6ffffffffffffffff01")), Spec1); }
+    catch (e) { caught = e.Error; }
+    check("delimited: a negative length raises", String.Contains(caught, "runs past"), true);
+
+    // A length near 2^63 must not wrap past the bounds check.
+    caught = "";
+    let huge = new PbReader(BitConverter.FromHex("0affffffffffffffff7f00"));
+    try { huge.VarInt(); huge.Skip(2); } catch (e) { caught = e.Error; }
+    check("Skip: a huge length raises truncated", String.Contains(caught, "truncated"), true);
 }
 
 global pbPeer = nil;
@@ -595,6 +637,23 @@ fn test_delimited_stream() {
     Fiber.Run(fn () { Fiber.Sleep(50); Stream.WriteBytes(pbPeer, pbRest, len(pbRest)); });
     let back = Pb.ReadDelimited(acc, Inner);
     check("delimited stream: a message in two parts", back == nil ? 0 : len(back.note), 200);
+
+    // A prefix over maxBytes is refused before any body byte is read: only
+    // the prefix is sent, so reading the body would wait for data never coming.
+    Stream.WriteBytes(cli, Buffer.Slice(bytes, 0, 2), 2);
+    Stream.WaitReadable(acc, 1000);
+    var capErr = "";
+    try { Pb.ReadDelimited(acc, Inner, { maxBytes: 100 }); } catch (e) { capErr = str(e.Error); }
+    check("delimited stream: a prefix over maxBytes raises", String.Contains(capErr, "maxBytes"), true);
+    // 2^40: refused by the 64 MiB default.
+    let huge = Buffer.Create(6, 1);
+    iter (k from 0 to 5) { huge[k] = 0x80; }
+    huge[5] = 0x20;
+    Stream.WriteBytes(cli, huge, 6);
+    Stream.WaitReadable(acc, 1000);
+    capErr = "";
+    try { Pb.ReadDelimited(acc, Inner); } catch (e) { capErr = str(e.Error); }
+    check("delimited stream: a terabyte prefix hits the default", String.Contains(capErr, "maxBytes"), true);
     Stream.Close(cli);
     Stream.Close(acc);
     Stream.Close(srv);
@@ -957,6 +1016,24 @@ fn test_proto_define() {
     check("rt: oneof value",  back.inv, 42);
 }
 
+// Release drops what a load registered; a newer load of the same schema keeps its name.
+fn test_proto_release() {
+    let src = "syntax = \"proto3\"; package rel; message A { int32 v = 1; } message B { A a = 1; }";
+    let first = Pb.LoadProto(src, "rel.proto");
+    let second = Pb.LoadProto(src, "rel.proto");
+    check("release: two classes", Pb.Release(first), 2);
+    check("release: twice is a no-op", Pb.Release(first), 0);
+    check("release: the newer load keeps the name", Pb.ClassFor("rel.A") == second["A"], true);
+    let m = Class.New(second["A"]);
+    m.v = 7;
+    check("release: the newer load still works", Pb.Decode(Pb.Encode(m), second["A"]).v, 7);
+    var gone = false;
+    try { Pb.Encode(Class.New(first["A"])); } catch (e) { gone = true; }
+    check("release: a released class no longer encodes", gone, true);
+    Pb.Release(second);
+    check("release: the name is gone with the last load", Pb.ClassFor("rel.A") == nil, true);
+}
+
 // A schema loaded at runtime must decode bytes a generated class produced, and
 // vice versa - they describe the same wire format.
 fn test_proto_matches_static() {
@@ -1300,6 +1377,20 @@ fn test_json() {
     let u2 = Pb.FromJson("{\"fUint64\":\"9223372036854775808\"}", AllTypes);
     check("json: 2^63 boundary", u2.f_uint64, -9223372036854775807 - 1);
 
+    // Each kind takes its own JSON type and range; anything else raises.
+    let jsonRaises = fn(j) {
+        var r = false;
+        try { Pb.FromJson(j, AllTypes); } catch (_e) { r = true; }
+        return r;
+    };
+    check("json: a string for a repeated field raises", jsonRaises("{\"strs\":\"abc\"}"), true);
+    check("json: \"yes\" for a bool raises", jsonRaises("{\"fBool\":\"yes\"}"), true);
+    check("json: int32 over 2^31 raises", jsonRaises("{\"fInt32\":3000000000}"), true);
+    check("json: 1.7 for an int32 raises", jsonRaises("{\"fInt32\":1.7}"), true);
+    check("json: -1 for a uint32 raises", jsonRaises("{\"fUint32\":-1}"), true);
+    check("json: a list for a map raises", jsonRaises("{\"mSi\":[1,2]}"), true);
+    check("json: 3.0 is still an integer", Pb.FromJson("{\"fInt32\":3.0}", AllTypes).f_int32, 3);
+
     // A parser must accept what a writer never emits.
     let alt = Pb.FromJson("{\"f_int32\":7,\"fInt64\":-5,\"fBool\":true}", AllTypes);
     check("json: proto name accepted", alt.f_int32, 7);
@@ -1466,6 +1557,7 @@ fn Main() {
     test_proto_parse();
     test_proto_keyword_fields();
     test_proto_define();
+    test_proto_release();
     test_proto_matches_static();
     test_proto_imports();
     test_optional_args();

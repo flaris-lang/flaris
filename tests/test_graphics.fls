@@ -65,6 +65,71 @@ fn test_construction() {
     let tiny = new Graphics(0, -5);
     checkEq(tiny.Width(),  1, "width clamped to 1");
     checkEq(tiny.Height(), 1, "height clamped to 1");
+
+    // A new canvas starts transparent, even on space a dropped one gave back.
+    dropRedCanvas();
+    tiny.GetPixel(0, 0);                 // a flush hands the dropped span back
+    let fresh = new Graphics(64, 64);
+    checkEq(fresh.GetPixel(5, 5), 0, "a new canvas does not show a dropped canvas's pixels");
+}
+
+// Two fibers drawing at once, each on its own canvas: every canvas shares the
+// one engine, and a flush that parks while its kernels run used to let the
+// other fiber's flush run the same commands again or reset them away.
+fn paintHalf(g) {
+    iter (y from 0 to 100) {
+        iter (x from 0 to 100) { g.Pixel(x, y, 0x80FFFFFF); }
+    }
+    g.GetPixel(0, 0);
+    return 0;
+}
+
+fn test_two_fibers() {
+    Console.WriteLine("-- two fibers drawing");
+    let ref = new Graphics(100, 100);
+    ref.Clear(0xFF000000);
+    paintHalf(ref);
+    let want = ref.GetPixel(50, 50);
+
+    let a = new Graphics(100, 100);
+    let b = new Graphics(100, 100);
+    a.Clear(0xFF000000);
+    b.Clear(0xFF000000);
+    let fa = Fiber.Run(fn() { paintHalf(a); });
+    let fb = Fiber.Run(fn() { paintHalf(b); });
+    Fiber.Await(Fiber.FromId(fa));
+    Fiber.Await(Fiber.FromId(fb));
+    var wrong = 0;
+    iter (y from 0 to 100) {
+        iter (x from 0 to 100) {
+            if (a.GetPixel(x, y) != want) { wrong += 1; }
+            if (b.GetPixel(x, y) != want) { wrong += 1; }
+        }
+    }
+    checkEq(wrong, 0, "two fibers drawing translucent pixels each blend every pixel exactly once");
+}
+
+// A fragmented arena: plenty of free space in total, no single span big
+// enough. The canvas must still come out at the size asked for, not 1x1.
+global gFrag = nil;
+
+fn test_fragmented_arena() {
+    Console.WriteLine("-- fragmented arena");
+    // 600x600, 10x10, 600x600, then drop the first: a hole in front of two
+    // live canvases, with the rest of the free space after them.
+    gFrag = [new Graphics(600, 600), new Graphics(10, 10), new Graphics(600, 600)];
+    gFrag[0] = nil;
+    gFrag[1].GetPixel(0, 0);             // a flush hands the dropped span back
+    let big = new Graphics(700, 700);
+    checkEq(big.Width(), 700, "a canvas larger than any free span is still allocated at full size");
+    checkEq(big.Height(), 700, "... both sides");
+}
+
+fn dropRedCanvas() {
+    let d = new Graphics(64, 64);
+    d.Clear(0xFFFF0000);
+    d.GetPixel(0, 0);
+    return 0;
 }
 
 // ============================================================
@@ -645,7 +710,8 @@ fn test_png_roundtrip() {
     check(g.Save(path) == true, "Save returns true");
     check(File.Exists(path),    "PNG file exists on disk");
 
-    let loaded = Graphics.FromFile(path);
+    check(Graphics.FromFile(path, { maxPixels: 20 * 12 - 1 }) == nil, "FromFile over maxPixels -> nil");
+    let loaded = Graphics.FromFile(path, { maxPixels: 20 * 12 });
     check(loaded != nil, "FromFile loads the PNG");
     if (loaded != nil) {
         checkEq(loaded.Width(),  20, "loaded width");
@@ -931,6 +997,76 @@ fn test_arena() {
     checkEq(real, 64, "canvases past the arena's size are all allocated");
 }
 
+// A new canvas on another fiber can grow the shared arena while a polygon fill
+// or a text run is queueing its commands. Those loops are preempted, so each
+// must notice the swap and queue into the new arena, not the old block it was
+// copied from. The two drawing fibers run with a quantum of 1, so the grow
+// lands inside both loops.
+global gGrowKeep = nil;
+
+fn queuePolyOrText(g, which) {
+    if (which == 0) {
+        g.SetFill(WHITE);
+        g.FillPolygon([0, 0, 299, 0, 150, 299]);
+    } else {
+        var t = "";
+        iter (i from 0 to 30) { t = t + "The quick brown fox jumps 0123456789\n"; }
+        g.SetStroke(WHITE);
+        g.DrawText(0, 0, t);
+    }
+    return 0;
+}
+
+fn test_grow_while_drawing() {
+    Console.WriteLine("-- arena grows under two drawing fibers");
+    let refs = [new Graphics(300, 300), new Graphics(300, 300)];
+    let gs = [new Graphics(300, 300), new Graphics(300, 300)];
+    iter (k from 0 to 2) {
+        refs[k].Clear(BLACK);
+        queuePolyOrText(refs[k], k);
+        gs[k].Clear(BLACK);
+        gs[k].GetPixel(0, 0);
+    }
+    let box = { started: 0, queued: 0, midway: false };
+    let me = Fiber.FromId(Fiber.Id());
+    Fiber.SetQuantum(me, 1);               // the drawing fibers inherit it
+    let ids = [];
+    iter (k from 0 to 2) {
+        let g = gs[k];
+        let which = k;
+        Array.Append(ids, Fiber.Run(fn() {
+            box.started = box.started + 1;
+            queuePolyOrText(g, which);
+            box.queued = box.queued + 1;
+            g.GetPixel(0, 0);
+        }));
+    }
+    Fiber.SetQuantum(me, 0);
+    Array.Append(ids, Fiber.Run(fn() {
+        while (box.started < 2) { Fiber.Sleep(-1); }
+        iter (i from 0 to 100) { Fiber.Sleep(-1); }
+        // 8M words, more than the ~5M-word arena the tests above leave: the
+        // arena grows for one of the two.
+        // shortcut: the arena size is not visible from here, so nothing checks
+        // that the grow happened; if a test above ever leaves the arena past
+        // 8M words, this test passes without testing a grow - raise the size then.
+        gGrowKeep = [new Graphics(2048, 2048), new Graphics(2048, 2048)];
+        box.midway = box.queued == 0;
+    }));
+    foreach (id in ids) { Fiber.Await(Fiber.FromId(id)); }
+    gGrowKeep = nil;
+    check(box.midway, "the arena grew while both fibers were still queueing");
+    var wrong = 0;
+    iter (k from 0 to 2) {
+        iter (y from 0 to 300) {
+            iter (x from 0 to 300) {
+                if (gs[k].GetPixel(x, y) != refs[k].GetPixel(x, y)) { wrong += 1; }
+            }
+        }
+    }
+    checkEq(wrong, 0, "a polygon and a text run queued across an arena grow draw every pixel");
+}
+
 // ============================================================
 // Benchmarks
 // ============================================================
@@ -990,6 +1126,8 @@ fn Main() {
     Console.WriteLine("=== Graphics test suite ===");
 
     test_construction();
+    test_two_fibers();
+    test_fragmented_arena();
     test_style();
     test_colors();
     test_pixels();
@@ -1007,6 +1145,7 @@ fn Main() {
     test_draw_image();
     test_filter_offload();
     test_arena();
+    test_grow_while_drawing();
     test_benchmarks();
 
     Console.WriteLine("Tests run:", testsRun, " failed:", testsFailed);

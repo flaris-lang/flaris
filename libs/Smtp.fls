@@ -30,10 +30,13 @@
 //   user, password  credentials; without them no AUTH is attempted
 //   token           an OAuth2 access token: XOAUTH2 with `user` as the account
 //   tls             "auto" (default): implicit TLS on port 465, STARTTLS when the
-//                   server offers it, otherwise plain
+//                   server offers it, otherwise plain - but with user/password
+//                   or token set, a plain link fails with errorKind "tls"
+//                   rather than send the credentials unencrypted
 //                   "starttls": STARTTLS is required, a server without it fails
 //                   "implicit": TLS from the first byte, any port
-//                   "none": never encrypt (test servers on loopback)
+//                   "none": never encrypt, credentials included (test servers
+//                   on loopback)
 //   insecure        accept any certificate (self-signed test servers)
 //   serverCert      pin the server: the SHA-256 fingerprint of its certificate
 //                   as hex, as Stream.TlsPeerCert / PeerCert() report it. A
@@ -48,7 +51,9 @@
 //
 // Every call returns a result object with ok; on failure error tells what
 // happened and errorKind which side it was on: "connect", "tls", "auth",
-// "protocol", "rejected", "timeout" or "closed". Nothing raises.
+// "protocol", "rejected", "timeout" or "closed". "unknown" means the link went
+// after the whole message was sent: it may have been delivered, so Send does
+// not retry it. Nothing raises.
 //
 // Send connects and authenticates on first use, so Connect() is optional; call
 // it to inspect the server (capabilities, whether the link is encrypted)
@@ -687,6 +692,15 @@ fn _collapseWsp(v: string): string {
     return String.Join(out, " ");
 }
 
+// A body line under relaxed canonicalisation (RFC 6376 3.4.4): a run of
+// space/tab becomes one space - a leading run too, unlike a header value -
+// and whitespace at the end of the line goes.
+fn _bodyWsp(l: string): string {
+    let c = _collapseWsp(l);
+    if (c != "" && (String.StartsWith(l, " ") || String.StartsWith(l, "\t"))) { return " " + c; }
+    return c;
+}
+
 fn _isHex(s: string): bool {
     let b = Buffer.FromString(s);
     if (len(b) == 0) { return false; }
@@ -835,7 +849,7 @@ class Dkim
         let lines = String.Split(text, "\n");
         if (canon == "relaxed") {
             let out = [];
-            foreach (l in lines) { Array.Append(out, _collapseWsp(l)); }
+            foreach (l in lines) { Array.Append(out, _bodyWsp(l)); }
             lines = out;
         }
         // Drop the empty lines at the end; a non-empty body ends in CRLF.
@@ -943,7 +957,7 @@ class SmtpClient
     let _port: int = 587;
     let _opts = nil;
     let _timeoutMs: int = 30000;
-    let _sock = nil;
+    let _sock: stream|nil = nil;
     let _connected: bool = false;
     let _encrypted: bool = false;
     let _authenticated: bool = false;
@@ -1037,6 +1051,15 @@ class SmtpClient
             } else if (pin != nil) {
                 return this._fail("tls", "serverCert given but the server does not offer STARTTLS");
             }
+        }
+
+        // "auto" encrypts when it can, but it must not then hand credentials
+        // to a server - or to whoever stripped STARTTLS from its EHLO - over a
+        // plain link. tls: "none" is the explicit way to allow that.
+        let hasCreds = Object.TryGet(_opts, "user", nil) != nil
+            && (Object.TryGet(_opts, "password", nil) != nil || Object.TryGet(_opts, "token", nil) != nil);
+        if (!_encrypted && tls != "none" && hasCreds) {
+            return this._fail("tls", "the server offers no STARTTLS, and credentials are not sent unencrypted (tls: \"none\" allows it)");
         }
 
         let a = this._authenticate();
@@ -1151,7 +1174,10 @@ class SmtpClient
         if (d.code != 354) { this._cmd("RSET"); return this._rejected("DATA refused: " + d.text, refused); }
         if (!this._write(SmtpMessage.ForData(rendered))) { return this._fail("closed", "write failed during DATA"); }
         let q = this._reply();
-        if (q == nil) { return this._fail(this._kindOfNil(), "no reply after the message"); }
+        // The whole message is on the wire, so the server may have queued it
+        // before the link went: "unknown", which Send does not retry, because
+        // a retry could deliver it twice.
+        if (q == nil) { return this._fail("unknown", "no reply after the message; it may or may not have been delivered"); }
         if (q.code != 250) { return this._rejected("message refused: " + q.text, refused); }
 
         let id = q.text;

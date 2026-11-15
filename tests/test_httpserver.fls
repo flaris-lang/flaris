@@ -326,7 +326,8 @@ fn test_response_builders() {
 
     let r3 = req1(gPort, "GET", "/nocontent");
     checkEq(r3.code, 204, "NoContent status");
-    checkEq(Object.TryGet(r3.headers, "content-length", ""), "0", "204 has zero length");
+    // RFC 9110 8.6: a server must not send Content-Length with a 204.
+    checkEq(Object.TryGet(r3.headers, "content-length", ""), "", "204 has no Content-Length");
     checkEq(r3.body, "", "204 has no body");
 
     let r4 = req1(gPort, "GET", "/redirect");
@@ -583,6 +584,20 @@ fn test_limits() {
     let r4 = request(gLimitPort,
         "POST /raw HTTP/1.1\r\nHost: t\r\nContent-Length: abc\r\nConnection: close\r\n\r\n", false);
     checkEq(r4.code, 400, "bad Content-Length rejected with 400");
+
+    // An oversized body is refused before a 100 Continue invites it.
+    let ex = request(gLimitPort,
+        "POST /raw HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 999999\r\n\r\n", false);
+    checkEq(ex.code, 413, "oversized Expect: 100-continue gets 413, not 100");
+
+    // The whole head gets readTimeoutMs (500 ms here), even when each line
+    // arrives well inside the socket's silence timeout.
+    let c = openConn(gSlowPort);
+    Stream.WriteString(c, "GET / HTTP/1.1\r\nHost: t\r\n");
+    iter (i from 0 to 6) { Fiber.Sleep(250); Stream.WriteString(c, "X-Drip" + str(i) + ": v\r\n"); }
+    let drip = readResponse(c, false);
+    Stream.Close(c);
+    checkEq((drip == nil) ? 0 : drip.code, 408, "trickled header lines end in 408");
     return 0;
 }
 
@@ -591,6 +606,25 @@ fn test_limits() {
 // ---------------------------------------------------------------------------
 fn test_static() {
     Console.WriteLine("== static files ==");
+
+    // A file that stats but cannot be read gets a proper 404, not a 200 head
+    // promising bytes that never come.
+    let locked = Path.Combine(gStaticDir, "locked.txt");
+    File.WriteText(locked, "secret");
+    Os.Execute("chmod 000 '" + locked + "'");
+    let rl = req1(gPort, "GET", "/pub/locked.txt");
+    checkEq(rl.code, 404, "an unreadable file is a 404");
+    Os.Execute("chmod 644 '" + locked + "'");
+    File.Delete(locked);
+
+    // A mount at /pub serves /pub/..., not /pubhello.txt.
+    checkEq(req1(gPort, "GET", "/pubhello.txt").code, 404, "a mount prefix matches whole segments only");
+    // "+" in a path is a plus, not a space.
+    checkEq(req1(gPort, "GET", "/plus/a+b").body, "a+b", "+ in a path stays a plus");
+    // A 204 carries no Content-Length.
+    let nc = rawHeaders(gPort, "GET /nocontent HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    check(String.StartsWith(nc, "HTTP/1.1 204") && !String.Contains(String.ToLower(nc), "content-length"),
+          "a 204 has no Content-Length");
 
     let r = req1(gPort, "GET", "/pub/hello.txt");
     checkEq(r.code, 200, "static file served");
@@ -1204,6 +1238,13 @@ fn test_multipart() {
     let jl = Json.Parse(rl.body);
     checkEq(jl.ok, false, "oversized file refused");
     check(String.Contains(jl.error, "too large"), "and says why");
+
+    // A file part cut off by its cap leaves nothing on disk: it is in no list
+    // the handler sees, so nobody else could clean it up.
+    let rd = mpPost(gStreamPort, "/mpdirlimit", B,
+                    mpBody(B, [["f", "x.bin", nil, String.Repeat("Z", 5000)]]));
+    checkEq(Json.Parse(rd.body).ok, false, "oversized file to disk refused");
+    checkEq(len(Directory.List(gUploadDir + "_limit") ?? []), 0, "and its partial file is deleted");
     return 0;
 }
 
@@ -1254,6 +1295,33 @@ fn test_streaming_bodies() {
         + "AAAAAAAAAAAAAAAAAAAA" + "GET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
     checkEq(ign.code, 200, "handler that ignores the body still answers");
     check(!ign.second, "an unread body does not become a second request");
+
+    // A read that stops part-way - over the handler's cap, refused by the sink,
+    // or a sink that raises - leaves the rest of the body on the socket. It
+    // must not be answered as a second request.
+    // The body is over one 64 KB read, so a sink that stops after the first
+    // block really does leave bytes behind.
+    let smuggle = String.Repeat("A", 70000) + "\r\nGET /ping HTTP/1.1\r\nHost: t\r\n\r\n";
+    let head = "Host: t\r\nContent-Length: " + str(String.Length(smuggle)) + "\r\n\r\n";
+    let capped = rawExchange(gStreamPort, "POST /capped HTTP/1.1\r\n" + head + smuggle);
+    checkEq(capped.code, 200, "capped ReadBody still answers");
+    check(!capped.second, "body left over a ReadBody cap is not a second request");
+    let refused = rawExchange(gStreamPort, "POST /refuse HTTP/1.1\r\n" + head + smuggle);
+    check(!refused.second, "body left after a refusing sink is not a second request");
+    let raised = rawExchange(gStreamPort, "POST /raise HTTP/1.1\r\n" + head + smuggle);
+    checkEq(raised.code, 500, "a sink that raises gives a 500");
+    check(!raised.second, "body left after a raising sink is not a second request");
+
+    // maxUploadBytes (1 MiB here) bounds a chunked body too, and a chunk
+    // header claiming more than that is refused before anything is allocated.
+    // Without the cap the server would wait out its 3 s read timeout for the
+    // missing bytes, so the refusal has to come back at once.
+    let t0 = Time.Millis();
+    let big = request(gStreamPort,
+        "POST /count HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n"
+        + "Connection: close\r\n\r\n200000\r\nabcd", false);
+    checkEq(Json.Parse(big.body).n, -1, "chunked body over maxUploadBytes is refused");
+    check(Time.Millis() - t0 < 1500, "the refusal does not wait for the body");
     return 0;
 }
 
@@ -1341,6 +1409,20 @@ fn test_file_semantics() {
 // ---------------------------------------------------------------------------
 fn test_response_framing() {
     Console.WriteLine("== response framing ==");
+
+    // A handler that throws after StartChunked: the 500 cannot be sent - a
+    // head is already out - so the connection closes rather than carry on
+    // after a body that never ended.
+    let cc = openConn(gPort);
+    Stream.WriteString(cc, "GET /chunkboom HTTP/1.1\r\nHost: t\r\n\r\nGET /ping HTTP/1.1\r\nHost: t\r\n\r\n");
+    var wire = "";
+    while (Stream.WaitReadable(cc, 1500) != nil) {
+        let part = Stream.ReadBytes(cc, 65536);
+        if (part == nil || len(part) == 0) { break; }
+        wire = wire + Buffer.ToString(part);
+    }
+    Stream.Close(cc);
+    checkEq(countLines(wire, "HTTP/1.1 "), 1, "after an exception mid-stream: one status line, then close");
 
     // RFC 9110: a server with a clock sends Date on every response.
     let r = req1(gPort, "GET", "/");
@@ -1710,6 +1792,8 @@ fn buildServer() {
     });
 
     srv.Get("/boom",   fn(_req, _res) { throw(1, "handler exploded"); });
+    srv.Get("/plus/:name", fn(req, res) { res.Text(req.Param("name")); });
+    srv.Get("/chunkboom", fn(_req, res) { res.StartChunked("text/plain"); res.WriteChunk("part"); throw(1, "mid-stream"); });
     srv.Get("/silent", fn(_req, _res) { _sink = _sink + 1; });
 
     srv.Get("/stream", fn(_req, res) {
@@ -1763,7 +1847,12 @@ fn buildSlowServer() {
 // A server that leaves request bodies on the socket for the handler to pull.
 fn buildStreamServer() {
     let srv = new HttpServer({ port: 0, streamBodies: true, idleTimeoutMs: 700,
-                               readTimeoutMs: 3000, maxRequestsPerConn: 5000 });
+                               readTimeoutMs: 3000, maxRequestsPerConn: 5000,
+                               maxUploadBytes: 1048576 });
+    // Reads that stop part-way through the body.
+    srv.Post("/capped", fn(req, res) { res.Json({ n: req.ReadBody(fn(_b) { return true; }, 4) }); });
+    srv.Post("/refuse", fn(req, res) { res.Json({ n: req.ReadBody(fn(_b) { return false; }, 0) }); });
+    srv.Post("/raise",  fn(req, res) { req.ReadBody(fn(_b) { throw(9, "sink failed"); }, 0); res.Text("x"); });
     // Stream to a file without ever holding the whole upload.
     srv.Post("/upload", fn(req, res) {
         let n = req.SaveBody(gUploadPath, 0);
@@ -1808,6 +1897,10 @@ fn buildStreamServer() {
                                 body: (f.data == nil) ? "" : Buffer.ToString(f.data) });
         }
         res.Json({ ok: true, fields: mp.fields, files: out });
+    });
+    srv.Post("/mpdirlimit", fn(req, res) {
+        let mp = req.Multipart({ dir: gUploadDir + "_limit", maxFileBytes: 16 });
+        res.Json({ ok: mp.ok, error: mp.error });
     });
     srv.Post("/mplimit", fn(req, res) {
         let mp = req.Multipart({ maxFileBytes: 16, maxParts: 3 });
@@ -1891,6 +1984,8 @@ fn async Main() {
     gUploadPath = Path.Combine(Os.TempDir(), "flaris_upload_test.bin");
     gUploadDir  = Path.Combine(Os.TempDir(), "flaris_mp_test");
     Os.Execute("mkdir -p '" + gUploadDir + "'");
+    Directory.DeleteAll(gUploadDir + "_limit");
+    Directory.Ensure(gUploadDir + "_limit");
     gPort       = srv.ListenAsync();
     gLimitPort  = lim.ListenAsync();
     gSlowPort   = slow.ListenAsync();

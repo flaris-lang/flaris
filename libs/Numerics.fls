@@ -13,7 +13,7 @@
 //   LinAlg   - flat row-major [float] matrices: solve, det, inverse, Cholesky, norms
 //   Matrix   - dense 2-D matrix object over flat storage: add/sub/mul/transpose,
 //              det, inverse, 2D affine constructors
-//   Vec      - flat [float] vector algebra: add/sub/scale/dot/norm/normalize
+//   Vec      - [float] vector algebra: add/sub/scale/dot/norm/normalize
 //   Chart    - multi-series line/scatter plots on the built-in Gfx rasterizer
 //
 // Distribution CDFs build on the Math.* special functions (Erf/GammaP/BetaInc,
@@ -414,8 +414,13 @@ class Numerics {
         if (disc < 0.0) return [];
         if (Math.AbsF(disc) < 1e-15) return [ -b / (2.0 * a) ];
         let s: float = Math.Sqrt(disc);
-        let r1: float = (-b - s) / (2.0 * a);
-        let r2: float = (-b + s) / (2.0 * a);
+        // q = -(b + sign(b) s)/2 never subtracts near-equal numbers, so the
+        // small root keeps its digits (1e-8 for x^2 + 1e8 x + 1, where the
+        // textbook formula gives -7.45e-9).
+        let q: float = (b >= 0.0) ? -0.5 * (b + s) : -0.5 * (b - s);
+        var r1: float = q / a;
+        var r2: float = (q != 0.0) ? c / q : -r1;
+        if (r1 > r2) { let t: float = r1; r1 = r2; r2 = t; }
         return [ r1, r2 ];
     }
 
@@ -503,7 +508,7 @@ class Numerics {
         return (lo + hi) * 0.5;
     }
 
-    // Sample f at n+1 evenly spaced points on [a, b] into a flat float array.
+    // Sample f at n+1 evenly spaced points on [a, b] into a [float] array.
     fn SampleFn(f: fn, a: float, b: float, n: int): array {
         if (n < 1) return [];
         let cnt: int = n + 1;
@@ -724,7 +729,7 @@ class Stats {
         return _st_sum(xs, n) / (n + 0.0);
     }
 
-    // Flat float copy, ascending-sorted (leaves the caller's array untouched).
+    // [float] copy, ascending-sorted (leaves the caller's array untouched).
     fn _sortedCopy(xs: array, n: int): array {
         let c: [float] = Array.Create(n, Type.Float);
         iter(i from 0 to n) { c[i] = xs[i] + 0.0; }
@@ -923,12 +928,16 @@ class Stats {
 
     fn PoissonPmf(k: int, lambda: float): float {
         if (k < 0) return 0.0;
+        if (lambda == 0.0) return (k == 0) ? 1.0 : 0.0;   // log(0) would make it NaN
         return Math.Exp((k + 0.0) * Math.Log(lambda) - lambda -
                         Math.LnGamma((k + 1) + 0.0));
     }
 
     fn BinomialPmf(k: int, n: int, p: float): float {
         if (k < 0 || k > n) return 0.0;
+        // p = 0 or 1 puts all the mass on k = 0 or k = n; log(0) would be NaN.
+        if (p == 0.0) return (k == 0) ? 1.0 : 0.0;
+        if (p == 1.0) return (k == n) ? 1.0 : 0.0;
         let ln: float = Math.LnGamma((n + 1) + 0.0) - Math.LnGamma((k + 1) + 0.0) -
                         Math.LnGamma((n - k + 1) + 0.0);
         return Math.Exp(ln + (k + 0.0) * Math.Log(p) + ((n - k) + 0.0) * Math.Log(1.0 - p));
@@ -949,8 +958,13 @@ class Stats {
     }
 
     fn StudentTQuantile(prob: float, df: float): float {
-        let lo: float = -1000.0;
-        let hi: float = 1000.0;
+        // A fixed +-1000 bracket clipped heavy tails (df 1, p 0.9999 is
+        // 3183.1); widen until the quantile is inside.
+        var lo: float = -1000.0;
+        var hi: float = 1000.0;
+        var grow: int = 0;
+        while (grow < 60 && StudentTCdf(hi, df) < prob) { lo = hi; hi = hi * 2.0; grow = grow + 1; }
+        while (grow < 60 && StudentTCdf(lo, df) > prob) { hi = lo; lo = lo * 2.0; grow = grow + 1; }
         let i: int = 0;
         while (i < 200) {
             let mid: float = (lo + hi) * 0.5;
@@ -1055,6 +1069,16 @@ fn _la_norm2(a: [float], n: int): float {
 // row-major; on return it holds L (unit diagonal, below) and U (on/above).
 // piv[k] receives the pivot row chosen at step k. Returns 1, or 0 if singular.
 fn _la_lu(a: [float], n: int, piv: [float]): int {
+    // Singular means a pivot at rounding-noise level for this matrix: an
+    // exactly singular 3x3 leaves ~1e-16, far above any absolute cutoff.
+    let scale: float = 0.0;
+    let q: int = 0;
+    while (q < n * n) {
+        let v: float = Math.AbsF(a[q]);
+        if (v > scale) { scale = v; }
+        q = q + 1;
+    }
+    let tiny: float = scale * (n + 0.0) * 2.220446049250313e-16;
     let k: int = 0;
     while (k < n) {
         let pmax: float = Math.AbsF(a[k * n + k]);
@@ -1066,7 +1090,7 @@ fn _la_lu(a: [float], n: int, piv: [float]): int {
             i = i + 1;
         }
         piv[k] = prow + 0.0;
-        if (pmax < 1e-300) { return 0; }
+        if (pmax <= tiny || pmax < 1e-300) { return 0; }
         if (prow != k) {
             let j: int = 0;
             while (j < n) {
@@ -1193,9 +1217,9 @@ fn _mx_copy(a: [float], out: [float], n: int): int {
     return 0;
 }
 
-// Any numeric array as flat [float] storage the kernels can read.
-// A float array is returned AS IS (no copy) - Array.IsAllFloat is O(1) on flat
-// float storage - so the common case allocates nothing. An int or mixed array
+// Any numeric array as [float] storage the kernels can read.
+// A float array is returned AS IS (no copy) - Array.IsAllFloat is O(1) on a
+// [float] array - so the common case allocates nothing. An int or mixed array
 // is converted once; that loop is interpreted (the source is untyped), so hoist
 // the call out of a hot loop when feeding the same array repeatedly.
 // nil in, nil out.
@@ -1339,7 +1363,7 @@ class LinAlg {
 
 class Matrix {
     let _c = 0;
-    let _d = nil;
+    let _d: [float] = [];
     let _r = 0;
 
     // `data` is adopted, not copied: rows*cols flat row-major floats. Use the
@@ -1426,31 +1450,35 @@ class Matrix {
     fn Flat(): array { return this._d; }
 
     fn Get(i: int, j: int): float {
+        let d = this._d;
         if (i < 0 || j < 0 || i >= this._r || j >= this._c) return 0.0;
-        return this._d[i * this._c + j];
+        return d[i * this._c + j];
     }
 
     fn Set(i: int, j: int, v: float): bool {
+        let d = this._d;
         if (i < 0 || j < 0 || i >= this._r || j >= this._c) return false;
-        this._d[i * this._c + j] = v;
+        d[i * this._c + j] = v;
         return true;
     }
 
     // Back to an array-of-rows, each row its own [float].
     fn ToRows(): array {
+        let d = this._d;
         let outer = [];
         iter(i from 0 to this._r) {
             let row: [float] = Array.Create(this._c, Type.Float);
-            iter(j from 0 to this._c) { row[j] = this._d[i * this._c + j]; }
+            iter(j from 0 to this._c) { row[j] = d[i * this._c + j]; }
             Array.Append(outer, row);
         }
         return outer;
     }
 
     fn Copy(): Matrix {
+        let src = this._d;
         let n: int = this._r * this._c;
         let d: [float] = Array.Create(n, Type.Float);
-        iter(i from 0 to n) { d[i] = this._d[i]; }
+        iter(i from 0 to n) { d[i] = src[i]; }
         return new Matrix(d, this._r, this._c);
     }
 
@@ -1546,17 +1574,19 @@ class Matrix {
 
     // Element-wise comparison within `tol`.
     fn Equals(o: Matrix, tol: float): bool {
+        let a = this._d;
+        let b = o._d;
         if (o == nil || o._r != this._r || o._c != this._c) return false;
         let n: int = this._r * this._c;
         iter(i from 0 to n) {
-            if (Math.AbsF(this._d[i] - o._d[i]) > tol) return false;
+            if (Math.AbsF(a[i] - b[i]) > tol) return false;
         }
         return true;
     }
 }
 
 // ============================================================
-//  Vec - flat [float] vector algebra.
+//  Vec - [float] vector algebra.
 //
 //  Operates on flat numeric arrays and returns a fresh [float]; a length
 //  mismatch yields nil rather than raising. The kernels underneath are

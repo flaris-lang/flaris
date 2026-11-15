@@ -124,6 +124,11 @@ fn testKdf() {
     assert("HKDF non-bytes ikm -> nil", Kdf.Hkdf(42, salt, info, 32) == nil);
 
     Console.WriteLine("\n--- Kdf: PBKDF2 (RFC 6070 / RFC 7914 vectors) ---");
+    // A wrong type is nil, as the header promises - not an exception.
+    assert("Pbkdf2 with a string iteration count -> nil", Kdf.Pbkdf2("password", "salt", "1", 20) == nil);
+    assert("Hkdf with a string length -> nil", Kdf.Hkdf("ikm", "salt", "info", "32") == nil);
+    assert("HkdfExpand with a float length -> nil", Kdf.HkdfExpand("0123456789abcdef0123456789abcdef", "i", 32.5) == nil);
+    assert("Hotp with a string counter -> nil", Otp.Hotp("12345678901234567890", "1") == nil);
     assertEq("PBKDF2-SHA1 c=1",    hex(Kdf.Pbkdf2("password", "salt", 1, 20, "sha1")),    "0c60c80f961f0e71f3a9b524af6012062fe037a6");
     assertEq("PBKDF2-SHA1 c=2",    hex(Kdf.Pbkdf2("password", "salt", 2, 20, "sha1")),    "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957");
     assertEq("PBKDF2-SHA1 c=4096", hex(Kdf.Pbkdf2("password", "salt", 4096, 20, "sha1")), "4b007901b765489abead49d926f721d065a429c1");
@@ -385,6 +390,15 @@ fn testEnvelope() {
     assertEq("DeriveKey == Argon2", hex(Envelope.DeriveKey("pw", "0123456789abcdef", fast)), Crypto.Argon2("pw", "0123456789abcdef", 1, 1024));
     let dblob = Envelope.SealWithPassword("defaults", "pw");
     assertEq("default-cost password blob opens", Buffer.ToString(Envelope.OpenWithPassword(dblob, "pw")), "defaults");
+
+    // The blob names its own cost, so the cost a caller will pay is bounded:
+    // 13 passes is over the default ceiling of 12, 8192 KiB over a 4096 cap.
+    let costly = Envelope.SealWithPassword("pricey", "pw", { memKiB: 1024, iterations: 13 });
+    assert("a blob over the default iteration cap -> nil", Envelope.OpenWithPassword(costly, "pw") == nil);
+    assertEq("... opens when the caller raises the cap",
+             Buffer.ToString(Envelope.OpenWithPassword(costly, "pw", { maxIterations: 13 })), "pricey");
+    let roomy = Envelope.SealWithPassword("roomy", "pw", { memKiB: 8192, iterations: 1 });
+    assert("a blob over the caller's memory cap -> nil", Envelope.OpenWithPassword(roomy, "pw", { maxMemKiB: 4096 }) == nil);
 }
 
 // ============================================================

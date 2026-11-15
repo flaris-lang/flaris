@@ -363,6 +363,29 @@ fn test_fake_handshake() {
     r2.Close();
 }
 
+// An onPush that raises leaves the command's real reply unread. That reply
+// must not become the next command's answer: the connection is dropped and
+// the next command reconnects.
+fn test_fake_abandoned() {
+    Console.WriteLine("== fake server: an exchange left mid-reply ==");
+    _cmds = [];
+    let p = fakeRedis([{ send: ">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n$5\r\nfirst\r\n" },
+                       "next",
+                       "$6\r\nsecond\r\n"]);
+    let r = Resp.Connect("127.0.0.1", p, { timeoutMs: 400, onPush: fn(_m) { throw(7, "handler failed"); } });
+    check(raised(fn() { r.Get("a"); }) != nil, "a raising onPush reaches the caller");
+    checkEq(r.Get("b"), "second", "the next command gets its own reply, not the one left behind");
+    r.Close();
+
+    // SELECT is remembered across a reconnect.
+    _cmds = [];
+    let p2 = fakeRedis(["+OK\r\n", "close"]);
+    let r2 = Resp.Connect("127.0.0.1", p2, { timeoutMs: 400 });
+    r2.Select(3);
+    checkEq(r2._db, 3, "Select is remembered for the next handshake");
+    r2.Close();
+}
+
 fn test_fake_blocking() {
     Console.WriteLine("== fake server: waits park one fiber ==");
     _cmds = [];
@@ -774,6 +797,7 @@ fn async Main() {
     test_fake_failures();
     test_fake_handshake();
     test_fake_blocking();
+    test_fake_abandoned();
     test_fake_sharing();
     test_fake_pubsub();
     test_fake_pool();

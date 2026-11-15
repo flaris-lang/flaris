@@ -191,6 +191,20 @@ static const char *ffi_to_pg_param(const FfiObject *v, char *buf, size_t bufsz) 
     }
 }
 
+// A value libpq cannot take as text: a block, an array or an object. Binding
+// it as SQL NULL would store NULL where the caller passed data, so the call
+// fails instead.
+static int ffi_pg_param_ok(const FfiObject *v) {
+    if (!v) return 1;
+    switch (v->type) {
+        case FFIVAL_NIL: case FFIVAL_INT: case FFIVAL_FLOAT:
+        case FFIVAL_BOOL: case FFIVAL_STRING:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 // ── Exported functions ───────────────────────────────────────────────────────
 
 // pg_connect(connstr: string) - int
@@ -271,6 +285,11 @@ PG_EXPORT FfiObject pg_query_params(FfiObject *args, int argc) {
 
     for (uint32_t i = 0; i < nparams; i++) {
         FfiObject *el = args[2].array.elements ? &args[2].array.elements[i] : NULL;
+        if (!ffi_pg_param_ok(el)) {
+            free(param_values);
+            free(num_bufs);
+            return make_error("a parameter is a block, array or object; pass a string, number, bool or nil");
+        }
         param_values[i] = ffi_to_pg_param(el, num_bufs + i * 64, 64);
     }
 
@@ -354,6 +373,11 @@ PG_EXPORT FfiObject pg_exec_params(FfiObject *args, int argc) {
 
     for (uint32_t i = 0; i < nparams; i++) {
         FfiObject *el = args[2].array.elements ? &args[2].array.elements[i] : NULL;
+        if (!ffi_pg_param_ok(el)) {
+            free(param_values);
+            free(num_bufs);
+            return make_int(-1);
+        }
         param_values[i] = ffi_to_pg_param(el, num_bufs + i * 64, 64);
     }
 

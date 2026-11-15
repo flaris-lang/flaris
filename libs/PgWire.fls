@@ -633,7 +633,7 @@ class PgScram {
 
 class PgWire {
     let _opts = nil;
-    let _sock = nil;
+    let _sock: stream|nil = nil;
     let _timeoutMs: int = _DEFAULT_TIMEOUT_MS;
     let _closed: bool = false;
     let _busy: bool = false;
@@ -643,6 +643,8 @@ class PgWire {
     let _secret: int = 0;
     let _tx: int = 73;               // the ReadyForQuery status byte: I, T or E
     let _depth: int = 0;             // Transaction() nesting
+    let _owed: bool = false;         // sent, and ReadyForQuery not read yet
+    let _txOwner = nil;              // fiber id whose transaction holds the connection
     let _notes = [];
     let _onNotice = nil;
     let _encrypted: bool = false;
@@ -751,31 +753,58 @@ class PgWire {
 
     // ---- transactions ----
 
-    fn Begin() { this._run("BEGIN", nil); return nil; }
-    fn Commit() { this._run("COMMIT", nil); return nil; }
-    fn Rollback() { this._run("ROLLBACK", nil); return nil; }
+    fn Begin() {
+        this._run("BEGIN", nil);
+        _txOwner = Fiber.Id();
+        return nil;
+    }
+    fn Commit() {
+        try { this._run("COMMIT", nil); } finally { this._endTx(); }
+        return nil;
+    }
+    fn Rollback() {
+        try { this._run("ROLLBACK", nil); } finally { this._endTx(); }
+        return nil;
+    }
+
+    // The connection is free for other fibers again; wake every one waiting,
+    // since each was waiting on the transaction, not on one exchange.
+    fn _endTx() {
+        _txOwner = nil;
+        foreach (w in _waiters) {
+            let f = Fiber.FromId(w);
+            if (f != nil) { Fiber.Unpark(f); }
+        }
+        _waiters = [];
+    }
 
     fn Transaction(f) {
         let nested = _tx != 73;
         let sp = "flaris_sp_" + str(_depth + 1);
         this._run(nested ? "SAVEPOINT " + sp : "BEGIN", nil);
+        let outer = !nested && _txOwner == nil;
+        if (outer) { _txOwner = Fiber.Id(); }
         _depth += 1;
         var r = nil;
         try {
-            let info = VM.GetFunctionInfo(f);
-            r = (info != nil && info.Arity >= 1) ? f(this) : f();
-        } catch (e) {
+            try {
+                let info = VM.GetFunctionInfo(f);
+                r = (info != nil && info.Arity >= 1) ? f(this) : f();
+            } catch (e) {
+                _depth -= 1;
+                this._tryRun(nested ? "ROLLBACK TO SAVEPOINT " + sp + "; RELEASE SAVEPOINT " + sp : "ROLLBACK");
+                throw e;
+            }
             _depth -= 1;
-            this._tryRun(nested ? "ROLLBACK TO SAVEPOINT " + sp + "; RELEASE SAVEPOINT " + sp : "ROLLBACK");
-            throw e;
+            if (r == false) {
+                this._run(nested ? "ROLLBACK TO SAVEPOINT " + sp + "; RELEASE SAVEPOINT " + sp : "ROLLBACK", nil);
+                return false;
+            }
+            this._run(nested ? "RELEASE SAVEPOINT " + sp : "COMMIT", nil);
+            return true;
+        } finally {
+            if (outer) { this._endTx(); }
         }
-        _depth -= 1;
-        if (r == false) {
-            this._run(nested ? "ROLLBACK TO SAVEPOINT " + sp + "; RELEASE SAVEPOINT " + sp : "ROLLBACK", nil);
-            return false;
-        }
-        this._run(nested ? "RELEASE SAVEPOINT " + sp : "COMMIT", nil);
-        return true;
     }
 
     // A rollback while an exception is already on its way: its own failure
@@ -857,7 +886,7 @@ class PgWire {
                 }
                 if (t == 67) { count = _tagCount(_cstrAt(_mb, 0)); continue; }
                 if (t == 69) { err = _serverError(_mb); continue; }
-                if (t == 90) { _tx = _mb[0]; break; }
+                if (t == 90) { _tx = _mb[0]; _owed = false; break; }
                 if (!this._async(t)) { this._protocol("unexpected message " + str(t) + " during COPY"); }
             }
             if (err != nil) { throw err; }
@@ -912,7 +941,7 @@ class PgWire {
                 if (t == 72) { started = true; continue; }
                 if (t == 99 || t == 67 || t == 84 || t == 68) { continue; }
                 if (t == 69) { err = _serverError(_mb); continue; }
-                if (t == 90) { _tx = _mb[0]; break; }
+                if (t == 90) { _tx = _mb[0]; _owed = false; break; }
                 if (!this._async(t)) { this._protocol("unexpected message " + str(t) + " during COPY"); }
             }
             if (err != nil) { throw err; }
@@ -1005,7 +1034,7 @@ class PgWire {
                 cur = nil;
                 continue;
             }
-            if (t == 90) { _tx = _mb[0]; break; }             // ReadyForQuery
+            if (t == 90) { _tx = _mb[0]; _owed = false; break; }             // ReadyForQuery
             if (t == 69) { err = _serverError(_mb); cur = nil; continue; }
             if (t == 49 || t == 50 || t == 110 || t == 116 || t == 51) { continue; }
             if (t == 73) {                                   // EmptyQueryResponse
@@ -1069,7 +1098,7 @@ class PgWire {
     // One whole message into _mt and _mb; returns its type.
     fn _readMsg(): int {
         let t = Stream.ReadU8(_sock);
-        if (t == nil) { this._lost(); }
+        if (t == nil) { this._lost(); return 0; }   // _lost raises; the return is for the checker
         this._readBody(t);
         return t;
     }
@@ -1095,14 +1124,18 @@ class PgWire {
     }
 
     fn _send(b: block) {
+        _owed = true;
         if (!Stream.WriteAll(_sock, b)) { this._lost(); }
     }
 
+    // A transaction holds the connection for the fiber that opened it: a query
+    // from another fiber in between would run inside it, and be committed or
+    // rolled back with work it knows nothing about.
     fn _enter() {
-        if (_busy) {
+        let me = Fiber.Id();
+        if (_busy || (_txOwner != nil && _txOwner != me)) {
             let deadline = Time.Millis() + _timeoutMs;
-            let me = Fiber.Id();
-            while (_busy) {
+            while (_busy || (_txOwner != nil && _txOwner != me)) {
                 let left = deadline - Time.Millis();
                 if (left <= 0) { throw _pgErr("timeout", "PgWire: another fiber held the connection for " + str(_timeoutMs) + " ms"); }
                 Array.Append(_waiters, me);
@@ -1113,7 +1146,12 @@ class PgWire {
         _busy = true;
     }
 
+    // An exchange left before ReadyForQuery - a fiber cancelled while it read
+    // the rows - leaves the rest on the socket, where the next query would
+    // read it as its own result. The connection is closed instead.
     fn _leave() {
+        if (_owed && _sock != nil) { Stream.Close(_sock); _sock = nil; }
+        _owed = false;
         _busy = false;
         while (len(_waiters) > 0) {
             let f = Fiber.FromId(_waiters[0]);
@@ -1262,7 +1300,7 @@ class PgWire {
                 throw _pgErr("auth", "PgWire: unsupported authentication method " + str(code) + " (only password, MD5 and SCRAM-SHA-256)");
             }
             if (t == 75) { _pid = Buffer.ReadU32At(mb, 0, true); _secret = Buffer.ReadI32At(mb, 4, true); continue; }
-            if (t == 90) { _tx = mb[0]; return; }
+            if (t == 90) { _tx = mb[0]; _owed = false; return; }
             if (t == 69) {
                 let e = _serverError(mb);
                 if (e.SqlState == "28P01" || e.SqlState == "28000") { e.Kind = "auth"; }
