@@ -35,7 +35,7 @@ if [ -z "${FLARISVM:-}" ]; then
 fi
 FLARISVM=${FLARISVM:-flarisvm}
 
-declare_langs() { echo "flaris lua luau qjs python"; }
+declare_langs() { echo "flaris lua luau qjs python rhai"; }
 cmd_for() { # $1=lang $2=bench $3=dir -> command, empty if unavailable
     local d=${3:-.}
     case "$1" in
@@ -45,6 +45,7 @@ cmd_for() { # $1=lang $2=bench $3=dir -> command, empty if unavailable
         luau)   command -v luau >/dev/null && [ -f "$d/bench_$2.luau" ] && echo "luau -O2 $d/bench_$2.luau" ;;
         qjs)    command -v qjs  >/dev/null && echo "qjs $d/bench_$2.js" ;;
         python) [ -n "$PYTHON" ] && echo "$PYTHON $d/bench_$2.py" ;;
+        rhai)   command -v rhai-run >/dev/null && [ -f "$d/bench_$2.rhai" ] && echo "rhai-run $d/bench_$2.rhai" ;;
     esac
 }
 
@@ -86,6 +87,7 @@ command -v lua     >/dev/null && printf '  %-8s %s (%s)\n' lua    "$(command -v 
 command -v luau    >/dev/null && printf '  %-8s %s\n'      luau   "$(command -v luau)"
 command -v qjs     >/dev/null && printf '  %-8s %s (%s)\n' qjs    "$(command -v qjs)"     "$(qjs -h 2>&1 | head -1)"
 [ -n "$PYTHON" ]           && printf '  %-8s %s (%s)\n' python "$(command -v "$PYTHON")" "$("$PYTHON" --version 2>&1)"
+command -v rhai-run >/dev/null && printf '  %-8s %s\n'      rhai   "$(command -v rhai-run)"
 echo
 
 printf '%-13s' "scenario"; for l in $(declare_langs); do printf '%9s' "$l"; done; printf '   %s\n' "result"

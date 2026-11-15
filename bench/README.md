@@ -60,6 +60,9 @@ Runtimes are discovered on `PATH` and can each be overridden:
 | `GO` | `go` |
 | `NIM` | `nim` |
 | `DOTNET` | `dotnet` (SDK 10+) |
+| `ZIG` | `zig` |
+| `SWIFTC` | `swiftc` |
+| `JAVAC`, `JAVA` | brew openjdk, then `javac`, `java` |
 | `PYTHON` | the newest `python3.N`, then `python3`, `python` |
 | `LUA` | `lua`, `lua5.4`, `lua5.3` |
 | `LUAJIT` | `luajit` |
@@ -69,10 +72,12 @@ Runtimes are discovered on `PATH` and can each be overridden:
 | `SQUIRREL` | `sq` |
 | `DUK` | `duk` |
 | `MICROPYTHON` | `micropython` |
+| `RHAI` | `rhai-run` |
 | `RUBY` | brew ruby, then `ruby` |
 | `PHP` | `php` |
 | `NODE` | `node`, `nodejs` |
 | `QJS` | `qjs`, `quickjs` |
+| `BUN` | `bun` |
 | `RUNS` | `3` (runs per benchmark; the median is reported) |
 
 For example, to benchmark a local VM build against a Lua you compiled yourself:
@@ -169,104 +174,105 @@ If no external `time(1)` is available the memory columns are simply omitted.
 ## Where Flaris lands
 
 Numbers below are from
-[results/2026-10-13-apple-m5-arm64.md](results/2026-10-13-apple-m5-arm64.md)
-(VM 1.0.5.0, Apple M5, CPython 3.14). The shape has been stable across
-releases; the exact figures move.
+[results/2026-11-15-apple-m5-arm64.md](results/2026-11-15-apple-m5-arm64.md)
+(VM 1.1.0.0, Apple M5, CPython 3.14). The exact figures move between runs; the
+shape does not.
 
 **On integer kernels there are two very different answers.** With the JIT
-enabled Flaris averages 1.9× C across the three kernels, which puts it in the
-native-compiled tier: just ahead of Nim (2.1×), well ahead of LuaJIT (4.1×).
-The plain bytecode VM averages 13.6× C, level with Lua (14.1×) and ahead of PHP
-(16.3×), Luau (17.9×), QuickJS (25.3×) and CPython (36.0×). The honest summary
-is that Flaris's interpreter is a competent bytecode VM in the Lua tier, its JIT
+enabled Flaris averages 1.7× C across the three kernels, which puts it in the
+native-compiled tier: behind Go (1.4×), ahead of Swift and Nim (1.9×), Bun
+(2.2×) and LuaJIT (3.7×). The plain bytecode VM averages 8.2× C, ahead of Lua
+(13.1×), PHP (14.9×), Luau (16.1×), QuickJS (22.9×) and CPython (34.5×). The
+honest summary is that Flaris's interpreter leads the interpreters, its JIT
 reaches the compiled tier on code shaped like this, and you should know which
 one you are running.
 
-Two rows deserve care. **C# is the closest architectural comparison in the
-table** - a statically typed managed runtime whose method JIT is expected to
-reach native speed, which is exactly what Flaris is attempting - and at 1.4× it
-beats both Go (1.5×) and Nim (2.1×). That is the bar for this design, and
-Flaris's JIT is not at it yet. **Node/V8's 5.6× average is misleading on its
+Three rows deserve care. **C# and Java are the closest architectural comparison
+in the table** - statically typed managed runtimes whose method JITs are
+expected to reach native speed, which is exactly what Flaris is attempting -
+and at 1.3× and 1.2× they beat Go (1.4×). That is the bar for this design, and
+Flaris's JIT is not at it yet. **Node/V8's 5.4× average is misleading on its
 own**: it is dominated by collatz, where JavaScript's doubles cost it 12×,
-while on fib and sieve V8 lands close to Flaris JIT (176 / 22 ms against
-122 / 22 ms). The two JavaScript engines differ by about 4.5× on average,
-which is why both are listed.
+while on fib and sieve V8 lands close to Flaris JIT (179 / 21 ms against
+124 / 22 ms). Bun runs the same sources on JavaScriptCore at 2.2×.
 
 Read those ×C ratios loosely. They divide by a C baseline measured in the same
 run, and C's own numbers move a few percent between runs, which moves every
 ratio with them. The absolute millisecond columns are the stable figures.
 
 **On builtin-heavy work Flaris moves up a tier**, because that work happens in
-C rather than in the dispatch loop. Parsing 18 MB of JSON it is 1.3× behind
-Node/V8 and ahead of Go's `encoding/json`, CPython, QuickJS and Nim's
-`std/json`. The naive `s += piece` loop runs linearly rather than
-quadratically, so it lands level with Node and behind only the two languages
-that use a dedicated builder. Scanning 9.8 MB for dates it is second only to
-V8, ahead of CPython, QuickJS, Nim and Go - though still 2.6× behind V8, whose
-patterns are JIT-compiled to native code.
+C rather than in the dispatch loop. Parsing 18 MB of JSON (212 ms) it is behind
+Bun, Node/V8 and Zig and ahead of Go's `encoding/json`, CPython, QuickJS, Nim's
+`std/json` and Swift's `Codable`. The naive `s += piece` loop runs linearly
+rather than quadratically, so it lands ahead of Node, Swift and Bun and behind
+only the four languages that use a dedicated builder (Zig, Java, Go and Nim).
+Scanning 9.8 MB for dates it is third (180 ms), behind the two JavaScript
+engines, whose patterns are JIT-compiled to native code, and ahead of Java,
+CPython, QuickJS, Nim, Go and Swift.
 
 **File I/O puts it in the middle of the field.** Reading 2 million lines takes
-88 ms: behind the compiled languages, Node and PHP, ahead of Ruby, CPython and
-both Luas. Reading a whole 53 MB file is a tie across the field at about 5 ms.
-Writing a million formatted lines it is behind the five compiled languages and
-ahead of QuickJS, CPython, Node and Lua.
+72-74 ms: behind Go, Rust, C#, Node, C and PHP's JIT, ahead of Ruby, Nim,
+CPython and both Luas. Reading a whole 53 MB file is a tie across the field at
+about 5 ms. Writing a million formatted lines (74 ms) it is behind Rust and C#
+and level with Go and C.
 
-**The scenarios are where Flaris is weakest, and its JIT barely helps there.**
-Across the six program-shaped scenarios the JIT beats the interpreter on one,
-method calls (149 against 193 ms); on the other five the two lanes are within
-noise of each other. The JIT that reaches 1.9× C on the kernels covers very
-little of code shaped like this today, and that is the gap that matters most.
-Three results stand out:
+**The scenarios are where Flaris is weakest, and its JIT does not help there.**
+Across the six program-shaped scenarios the JIT and interpreter lanes are within
+noise of each other: the JIT that reaches 1.7× C on the kernels covers very
+little of code shaped like this today. Against the other scripting runtimes it
+holds up; against the two JavaScript JITs it does not:
 
 - **Allocation churn is the weakest point.** Building and discarding 14.6 M
-  tree nodes takes Flaris 1.2 s, slower than every runtime here except PUC
-  Lua: CPython needs 0.69 s, Luau 0.62 s, LuaJIT 0.31 s and V8 0.09 s. The time
-  goes on creating and reclaiming each small object, which the JIT does not
-  touch.
-- **Chained indexing** (`b[k][j]` in a matrix multiply) takes 143 ms, 2×
-  behind Lua and Luau and 16× behind LuaJIT.
-- **String routines are a tie with CPython**, 34 against 36 ms, both behind V8.
+  tree nodes takes Flaris 826 ms, level with QuickJS and ahead only of Lua
+  (1.3 s) and Rhai: CPython needs 0.69 s, Luau 0.62 s, LuaJIT 0.32 s and V8
+  0.09 s. The time goes on creating and reclaiming each small object, which the
+  JIT does not touch.
+- **String routines and a sort through a comparator lead the scripting
+  field**: 25 ms and 109 ms, against Luau's 81 and 230 and Lua's 113 and 280.
+  Only V8 and Bun are faster at the string routines, and only Bun at the sort.
+- **Chained indexing** (`b[k][j]` in a matrix multiply) takes 47 ms, ahead of
+  Lua (71) and Luau (70), behind Luau's code generator (34), the JavaScript
+  engines (15) and LuaJIT (9).
 
-Elsewhere Flaris is mid-field: close to Lua and Luau on map lookups and on the
-sort through a comparator, and ahead of CPython and QuickJS on method calls.
+Elsewhere Flaris is level with Lua and Luau on map lookups (16 ms against 14
+and 16) and ahead of both on method calls (103 ms against 201 and 202), behind
+LuaJIT and the JavaScript engines.
 
 **The standard benchmarks give the least flattering picture, which is why
-they are there.** nbody is Flaris's worst result in the whole suite: 765 ms,
-last of nine, behind CPython (456 ms) and 76× behind V8. The interpreter boxes
-most float results on the heap - about 33 million boxes in this run - and the
-step function takes an array of objects, which the JIT does not compile, so the
-JIT lane is no faster. Where the JIT does compile the hot loop it reaches the
-top tier: fannkuch-redux is the fastest run in its table (141 ms, level with
-V8's 144) and spectral-norm is third (33 ms) behind LuaJIT and V8. richards,
-the object-and-method-call benchmark, lands mid-field at 547 ms - ahead of Lua,
-Luau's interpreter, QuickJS and CPython, behind Luau's code generator, LuaJIT
-and V8 - with 3 of its 21 functions JIT-compiled. k-nucleotide, where most
-runtimes spend their time in map code written in C, puts Flaris level with Lua
-(622 against 612 ms) and ahead of Node, CPython and QuickJS.
+they are there.** nbody is Flaris's worst result against the field: 334 ms,
+behind Lua (211 ms), QuickJS (290) and Luau (127), and 30× behind LuaJIT and
+Bun (11). Its step function works on the float fields of an array of objects,
+which the JIT does not compile, so the JIT lane is no faster. Where the JIT does
+compile the hot loop it reaches the top tier: fannkuch-redux takes 192 ms, ahead
+of LuaJIT (202) and behind only Bun and V8, and spectral-norm 24 ms, level with
+V8 and Bun and behind only LuaJIT (16). richards, the object-and-method-call
+benchmark, lands at 443 ms - level with Luau's code generator, ahead of Lua,
+Luau's interpreter, QuickJS and CPython, behind LuaJIT and the JavaScript
+engines. k-nucleotide, where most runtimes spend their time in map code written
+in C, puts Flaris at 558 ms, ahead of Lua (599), Node (635), CPython and
+QuickJS, behind Luau and LuaJIT.
 
 **Against CPython specifically**, since it is the most common point of
-comparison: Flaris's interpreter is 2.2-3.0× ahead on the kernels, 1.5-2.6×
-on the builtins, 1.3-2.1× on reading and writing lines, 1.6-4.5× on four of
-the six scenarios and 1.4-2.1× on four of the five standard benchmarks. It
-ties on string routines and reading a whole file, and CPython is 1.7× ahead on
-allocation churn and on nbody.
+comparison: Flaris's interpreter is 3.7-4.7× ahead on the kernels, 1.7-2.5×
+on the builtins, 2.0-2.6× on reading and writing lines, 1.6-16× on five of the
+six scenarios and 1.3-4.5× on all five standard benchmarks. It ties on reading
+a whole file, and CPython is 1.2× ahead on allocation churn.
 
 **Memory splits the same way, but along a different seam.** Where the workload
 is buffers or strings, Flaris sits far below the other managed runtimes: 16 MB
-for the 10 M-element sieve against Lua's 239 MB and LuaJIT's 130 MB, and 20 MB
-for the string build against Node's 149 MB and Lua's 99 MB. The AOT-compiled
-lanes and QuickJS are lower still on the sieve, at 11-15 MB. On the JSON
-benchmark, which materialises 300k records as live objects, it peaks at 123 MB
-- second of the seven runtimes, behind Go (103 MB) and ahead of QuickJS
-(165 MB), Node (215 MB), CPython (235 MB) and Nim (337 MB).
+for the 10 M-element sieve against Lua's 239 MB, and 20 MB for the string build
+against Node's 144 MB and Lua's 99 MB. The AOT-compiled lanes are lower still
+on the sieve, at 11-15 MB. On the JSON benchmark, which materialises 300k
+records as live objects, it peaks at 116 MB - behind Zig (38 MB), Go (105 MB)
+and Swift (107 MB), ahead of QuickJS (165 MB), Node (181 MB), Bun (200 MB),
+CPython (222 MB) and Nim (337 MB).
 
-Baseline footprint is about 6.7 MB, above Lua (1.9 MB) and QuickJS (2.3 MB)
-and below CPython (14.2 MB). That figure is mostly the pre-allocated SLAB
-pools, so it is a fixed floor rather than something that grows with the
-program. The two JIT-backed managed runtimes start an order of magnitude
-higher - C# at 40.1 MB and Node at 46.5 MB on the same kernel - which is the
-trade that buys their compile speed, and the reason Flaris's JIT tier is
-interesting at 6.8 MB.
+Baseline footprint is about 6.5 MB, above Lua (1.9 MB), QuickJS (2.3 MB) and
+Luau (3.3 MB) and below CPython (13.0 MB). That figure is mostly the
+pre-allocated SLAB pools, so it is a fixed floor rather than something that
+grows with the program. The JIT-backed managed runtimes start several times
+higher - Bun at 23.6 MB, Java at 39.4 MB, C# at 40.1 MB and Node at 42.0 MB on
+the same kernel - while Flaris's JIT tier runs in 6.7 MB.
 
 ## Reading these honestly
 
@@ -277,9 +283,12 @@ A few things worth stating plainly, because benchmark pages usually do not:
 - Single-machine, single-run-median numbers. Treat differences under roughly
   15% as noise, and differences between machines as meaningless.
 - The comparison languages are used idiomatically but not tuned by an expert in
-  each. Where an idiomatic choice differs - Go and Nim use their string
-  builders in `strbuild` because naive concatenation is quadratic for them -
-  it is documented in the snapshot rather than hidden.
+  each. Where an idiomatic choice differs - Go, Nim, Zig and Java use their
+  string builders in `strbuild` because naive concatenation is quadratic for
+  them - it is documented in the source rather than hidden. Swift's regex lane
+  uses `NSRegularExpression`: the native `Regex` type gives the same answer
+  about four times slower, and showing that would compare an engine, not the
+  language.
 - Every language must materialise the *same* data, which matters most in the
   JSON benchmark. Go decodes into a struct carrying all four fields; a struct
   with only the summed field would let `encoding/json` skip the rest of each
@@ -303,11 +312,16 @@ A few things worth stating plainly, because benchmark pages usually do not:
 - The C# lane runs on RyuJIT rather than native AOT. .NET 10 file-based apps
   publish AOT by default and the runner turns that off, because the point of
   the lane is the managed-runtime-with-a-JIT tier - the one Flaris itself is
-  aiming at. Published as AOT it would just be a third entry in the compiled
+  aiming at. Published as AOT it would just be another entry in the compiled
   tier next to Go and Nim.
-- JavaScript appears as two engines with very different answers, and the
-  kernels are where they diverge most. QuickJS is a compact interpreter;
-  V8 is a full optimising JIT. Reporting only one of them would misrepresent
+- Zig's standard library has no regex and Java's no JSON parser, so those lanes
+  are absent there. Rhai's command-line runner cannot read the input files, so
+  Rhai takes part in the kernels, the string build and the scenarios only; it
+  is here as the engine Rust programs usually embed.
+- JavaScript appears as three engines with very different answers, and the
+  kernels are where they diverge most. QuickJS is a compact interpreter; V8
+  (Node) and JavaScriptCore (Bun) are full optimising JITs, and Bun runs the
+  Node sources unchanged. Reporting only one of them would misrepresent
   "JavaScript" by a wide margin.
 
 ## Adding a benchmark or a language

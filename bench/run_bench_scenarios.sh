@@ -33,7 +33,7 @@ cd "$BENCH_ROOT/interp"
 SCENARIOS=(binarytrees matmul dict method strops sortcb)
 STANDARD=(nbody spectralnorm fannkuch richards knucleotide)
 ALL=("${SCENARIOS[@]}" "${STANDARD[@]}")
-SC_LANGS=(py lua luajit luau luauc js node fls flsj)
+SC_LANGS=(py lua luajit luau luauc rhai js node bun fls flsj)
 
 # ── run ──────────────────────────────────────────────────────────────────────
 run_lang() {  # run_lang <bench> <lang>
@@ -46,6 +46,8 @@ run_lang() {  # run_lang <bench> <lang>
       luauc)  run_one "$b" luauc  "$LUAU" -O2 --codegen "bench_${b}.luau" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
       node)   run_one "$b" node   "$NODE"   "bench_${b}.js" ;;
+      bun)    run_one "$b" bun    "$BUN"    "bench_${b}.js" ;;
+      rhai)   [[ -f "bench_${b}.rhai" ]] && run_one "$b" rhai "$RHAI" "bench_${b}.rhai" ;;
       # The JIT is on by default, so the plain-VM lane has to switch it OFF.
       fls)    run_one "$b" fls    "$FLARISVM" --strip --jit-disable "bench_${b}.fls" ;;
       flsj)   run_one "$b" flsj   "$FLARISVM" --strip "bench_${b}.fls" ;;

@@ -51,7 +51,7 @@ table. Check it: `flarisvm` on `PATH` is easily an older install than the build
 you meant to measure.
 
 Runtimes used, if you want the full set: `lua`, `luau`, `qjs` (QuickJS),
-CPython, and `flarisvm`. CPython is the newest `python3.N` on `PATH`, not a
+CPython, `rhai-run` (Rhai) and `flarisvm`. CPython is the newest `python3.N` on `PATH`, not a
 bare `python3`, which is often an older system copy; `PYTHON=...` picks one.
 
 ## Reading the output

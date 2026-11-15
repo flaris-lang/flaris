@@ -25,10 +25,12 @@ REPORT="${BENCH_REPORT:-$BENCH_ROOT/results/$(date +%Y-%m-%d)-$(machine_slug)-re
 cd "$BENCH_ROOT/realworld"
 
 # The Lua family ships no stdlib JSON and only Lua patterns rather than full
-# regex, so Lua, LuaJIT and Luau take part in the string benchmark only.
-JSON_LANGS=(py node js go nim fls flsj)
-STR_LANGS=(py node js lua luajit luau luauc go nim fls flsj)
-REGEX_LANGS=(py node js go nim fls flsj)
+# regex, so Lua, LuaJIT and Luau take part in the string benchmark only. Zig's
+# standard library has no regex, Java's no JSON parser; Rhai has no regex and
+# its CLI cannot read the input file.
+JSON_LANGS=(py node bun js go nim zig swift fls flsj)
+STR_LANGS=(py node bun js lua luajit luau luauc rhai go nim zig swift java fls flsj)
+REGEX_LANGS=(py node bun js go nim swift java fls flsj)
 
 # ── input data ───────────────────────────────────────────────────────────────
 if [[ ! -f bench_data.json || ! -f bench_corpus.txt ]]; then
@@ -53,12 +55,33 @@ if [[ -n "$NIM" ]]; then
     done
 fi
 
+if [[ -n "$ZIG" ]]; then
+    log "Compiling Zig (-O ReleaseFast)..."
+    for b in json strbuild; do
+        "$ZIG" build-exe -O ReleaseFast -femit-bin="bench_${b}_zig" "bench_${b}.zig" \
+            || warn "Zig: $b failed to build"
+    done
+fi
+if [[ -n "$SWIFTC" ]]; then
+    log "Compiling Swift (swiftc -O)..."
+    for b in json strbuild regex; do
+        "$SWIFTC" -O -o "bench_${b}_swift" "bench_${b}.swift" || warn "Swift: $b failed to build"
+    done
+fi
+if [[ -n "$JAVAC" && -n "$JAVA" ]]; then
+    log "Compiling Java (javac)..."
+    for b in strbuild regex; do
+        "$JAVAC" -d javaout "bench_${b}.java" || warn "Java: $b failed to build"
+    done
+fi
+
 # ── run ──────────────────────────────────────────────────────────────────────
 run_lang() {  # run_lang <bench> <lang>
     local b="$1" l="$2" f
     case "$l" in
       py)     run_one "$b" py     "$PYTHON" "bench_${b}.py" ;;
       node)   run_one "$b" node   "$NODE"   "bench_${b}_node.js" ;;
+      bun)    run_one "$b" bun    "$BUN"    "bench_${b}_node.js" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
       lua)    run_one "$b" lua    "$LUA"    "bench_${b}.lua" ;;
       luajit) run_one "$b" luajit "$LUAJIT" "bench_${b}.lua" ;;
@@ -66,6 +89,10 @@ run_lang() {  # run_lang <bench> <lang>
       luauc)  run_one "$b" luauc  "$LUAU" -O2 --codegen "bench_${b}.luau" ;;
       go)     f=$(bin_path "bench_${b}_go");  [[ -n "$f" ]] && run_one "$b" go  "$f" ;;
       nim)    f=$(bin_path "bench_${b}_nim"); [[ -n "$f" ]] && run_one "$b" nim "$f" ;;
+      zig)    f=$(bin_path "bench_${b}_zig"); [[ -n "$f" ]] && run_one "$b" zig "$f" ;;
+      swift)  f=$(bin_path "bench_${b}_swift"); [[ -n "$f" ]] && run_one "$b" swift "$f" ;;
+      java)   [[ -f "javaout/bench_${b}.class" ]] && run_one "$b" java "$JAVA" -cp javaout "bench_${b}" ;;
+      rhai)   [[ -f "bench_${b}.rhai" ]] && run_one "$b" rhai "$RHAI" "bench_${b}.rhai" ;;
       # The JIT is on by default, so the plain-VM lane has to switch it OFF.
       fls)    run_one "$b" fls    "$FLARISVM" --strip --jit-disable "bench_${b}.fls" ;;
       flsj)   run_one "$b" flsj   "$FLARISVM" --strip "bench_${b}.fls" ;;

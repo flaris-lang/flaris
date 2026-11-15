@@ -66,15 +66,35 @@ if [[ -n "$DOTNET" ]]; then
     done
 fi
 
+if [[ -n "$ZIG" ]]; then
+    log "Compiling Zig (-O ReleaseFast)..."
+    for b in fib sieve collatz tailcall; do
+        "$ZIG" build-exe -O ReleaseFast -femit-bin="bench_${b}_zig" "bench_${b}.zig" \
+            || warn "Zig: $b failed to build"
+    done
+fi
+if [[ -n "$SWIFTC" ]]; then
+    log "Compiling Swift (swiftc -O)..."
+    for b in fib sieve collatz tailcall; do
+        "$SWIFTC" -O -o "bench_${b}_swift" "bench_${b}.swift" || warn "Swift: $b failed to build"
+    done
+fi
+if [[ -n "$JAVAC" && -n "$JAVA" ]]; then
+    log "Compiling Java (javac)..."
+    for b in fib sieve collatz tailcall; do
+        "$JAVAC" -d javaout "bench_${b}.java" || warn "Java: $b failed to build"
+    done
+fi
+
 # ── run ──────────────────────────────────────────────────────────────────────
-LANGS=(c rs go nim cs py rb rbj php phpj lua luajit luau luauc wren janet nut duk mpy js node fls flsj)
+LANGS=(c rs go zig swift nim cs java py rb rbj php phpj lua luajit luau luauc wren janet nut duk mpy rhai js node bun fls flsj)
 
 # Tail-call elimination is a language/compiler property, not something every
 # lane here has - a smaller, deliberately curated set rather than LANGS, so a
 # language we didn't implement this for is simply never attempted (no bogus
 # "failed" warning) instead of being conflated with one that crashed for the
 # reason this benchmark exists to show.
-TAILCALL_LANGS=(c rs go nim cs py lua luajit js node fls flsj)
+TAILCALL_LANGS=(c rs go zig swift nim cs java py lua luajit js node bun fls flsj)
 
 run_lang() {  # run_lang <bench> <lang>
     local b="$1" l="$2" f
@@ -83,6 +103,9 @@ run_lang() {  # run_lang <bench> <lang>
       rs)     f=$(bin_path "bench_${b}_rs");  [[ -n "$f" ]] && run_one "$b" rs  "$f" ;;
       go)     f=$(bin_path "bench_${b}_go");  [[ -n "$f" ]] && run_one "$b" go  "$f" ;;
       nim)    f=$(bin_path "bench_${b}_nim"); [[ -n "$f" ]] && run_one "$b" nim "$f" ;;
+      zig)    f=$(bin_path "bench_${b}_zig"); [[ -n "$f" ]] && run_one "$b" zig "$f" ;;
+      swift)  f=$(bin_path "bench_${b}_swift"); [[ -n "$f" ]] && run_one "$b" swift "$f" ;;
+      java)   [[ -f "javaout/bench_${b}.class" ]] && run_one "$b" java "$JAVA" -cp javaout "bench_${b}" ;;
       # A framework-dependent apphost needs its .dll and runtimeconfig beside
       # it, so this lane runs out of the publish directory rather than copying
       # the launcher up next to the other binaries.
@@ -106,6 +129,8 @@ run_lang() {  # run_lang <bench> <lang>
       # MicroPython's default heap is sized for a microcontroller; the sieve
       # needs 10 MB of bytearray, so the unix port has to be told.
       mpy)    run_one "$b" mpy    "$MICROPYTHON" -X heapsize=64M "bench_${b}_mpy.py" ;;
+      # Rhai is the engine Rust programs usually embed; no tail-call port.
+      rhai)   [[ -f "bench_${b}.rhai" ]] && run_one "$b" rhai "$RHAI" "bench_${b}.rhai" ;;
       rb)     run_one "$b" rb     "$RUBY" --yjit-disable "bench_${b}.rb" ;;
       rbj)    run_one "$b" rbj    "$RUBY" --yjit          "bench_${b}.rb" ;;
       php)    run_one "$b" php    "$PHP" -d opcache.enable_cli=0 "bench_${b}.php" ;;
@@ -113,6 +138,7 @@ run_lang() {  # run_lang <bench> <lang>
                                         -d opcache.jit=tracing "bench_${b}.php" ;;
       js)     run_one "$b" js     "$QJS"    "bench_${b}.js" ;;
       node)   run_one "$b" node   "$NODE"   "bench_${b}_node.js" ;;
+      bun)    run_one "$b" bun    "$BUN"    "bench_${b}_node.js" ;;
       # The JIT is on by default, so the plain-VM lane has to switch it OFF.
       fls)    run_one "$b" fls    "$FLARISVM" --strip --jit-disable "bench_${b}.fls" ;;
       flsj)   run_one "$b" flsj   "$FLARISVM" --strip "bench_${b}.fls" ;;
@@ -174,7 +200,10 @@ Interpretation of these numbers lives in [../README.md](../README.md).
 | Rust | $(tool_version "$RUSTC" --version) | rustc -O |
 | Go | $(tool_version "$GO" version) | go build |
 | Nim | $(tool_version "$NIM" --version) | -d:release --opt:speed -O3 |
+| Zig | $(tool_version "$ZIG" version) | -O ReleaseFast |
+| Swift | $(tool_version "$SWIFTC" --version) | swiftc -O |
 | C# | .NET SDK $(tool_version "$DOTNET" --version) | -c Release, RyuJIT (not AOT) |
+| Java | $(tool_version "$JAVA" -version) | javac, HotSpot JIT |
 | Python | $(tool_version "$PYTHON" --version) | CPython interpreted |
 | Lua | $(tool_version "$LUA" -v) | interpreted |
 | LuaJIT | $(tool_version "$LUAJIT" -v) | tracing JIT |
@@ -185,9 +214,11 @@ Interpretation of these numbers lives in [../README.md](../README.md).
 | Squirrel | $(tool_version "$SQUIRREL" -v) | embeddable VM |
 | Duktape | $(duk_version) | embeddable VM, ES5.1 |
 | MicroPython | $(tool_version "$MICROPYTHON" --version) | embedded-target VM, \`-X heapsize=64M\` |
+| Rhai | $(rhai_version) | AST interpreter, the Rust embedding engine |
 | Ruby | $(tool_version "$RUBY" --version) | CRuby; separate YJIT lane |
 | PHP | $(tool_version "$PHP" --version) | Zend VM; separate tracing-JIT lane |
 | Node | $(tool_version "$NODE" --version) | V8 |
+| Bun | $(tool_version "$BUN" --version) | JavaScriptCore, same sources as Node |
 | QuickJS | $(tool_version "$QJS" --help) | interpreted |
 | Flaris | $(flaris_version) | bytecode VM (\`--strip\`) |
 
@@ -210,8 +241,9 @@ cat <<'SIEVE'
 
 Byte-array write-heavy inner loop. Tests memory bandwidth and array indexing
 overhead. Each language uses its typed byte buffer (C `uint8_t*`, Nim
-`seq[uint8]`, Rust `Vec<u8>`, C# `byte[]`, Python `bytearray`, JS
-`Uint8Array`, Lua table, Flaris `Buffer`).
+`seq[uint8]`, Rust `Vec<u8>`, Zig `[]u8`, Swift `[UInt8]`, C# and Java
+`byte[]`, Python `bytearray`, JS `Uint8Array`, Rhai `blob`, Lua table,
+Flaris `Buffer`).
 
 SIEVE
 
@@ -245,8 +277,11 @@ sibling-call optimization at this optimization level) and Lua/LuaJIT (which
 specify proper tail calls in the language itself) are expected to complete
 in well under a second; Go survives by growing its goroutine stack rather
 than via tail-call elimination, which is a different mechanism reaching the
-same result; C#, Python and Node/V8 are expected to be absent, since RyuJIT,
-CPython and V8 do not eliminate this call. Flaris appears twice and is
+same result; C#, Java, Python and Node/V8 are expected to be absent, since
+RyuJIT, HotSpot, CPython and V8 do not eliminate this call. Zig and Swift
+complete through LLVM's sibling-call optimization, like C and Rust. Bun runs
+the very file Node fails on and completes it: JavaScriptCore implements the
+ES2015 proper tail calls that V8 never shipped. Flaris appears twice and is
 expected to complete both ways: the JIT compiles a self-recursive tail call
 to a native loop-back branch with no call instruction and no stack growth,
 and the interpreter reuses the call frame for a tail call independently of

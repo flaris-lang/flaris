@@ -86,6 +86,11 @@ resolve_all_tools() {
     resolve_tool GO       go                    || true
     resolve_tool NIM      nim                   || true
     resolve_tool DOTNET   dotnet                || true
+    resolve_tool ZIG      zig                   || true
+    resolve_tool SWIFTC   swiftc                || true
+    # macOS ships /usr/bin/java and javac stubs that only print an install hint.
+    resolve_tool JAVAC    /opt/homebrew/opt/openjdk/bin/javac /usr/local/opt/openjdk/bin/javac javac || true
+    resolve_tool JAVA     /opt/homebrew/opt/openjdk/bin/java /usr/local/opt/openjdk/bin/java java || true
     resolve_tool PYTHON   $(newest_python) python3 python || true
     resolve_tool LUA      lua lua5.4 lua5.3     || true
     resolve_tool LUAJIT   luajit                || true
@@ -97,11 +102,13 @@ resolve_all_tools() {
     resolve_tool SQUIRREL sq                    || true
     resolve_tool DUK      duk                   || true
     resolve_tool MICROPYTHON micropython        || true
+    resolve_tool RHAI     rhai-run              || true
     # macOS ships an ancient system Ruby with no YJIT; prefer a real one.
     resolve_tool RUBY     /opt/homebrew/opt/ruby/bin/ruby /usr/local/opt/ruby/bin/ruby ruby || true
     resolve_tool PHP      php                   || true
     resolve_tool NODE     node nodejs           || true
     resolve_tool QJS      qjs quickjs           || true
+    resolve_tool BUN      bun                   || true
     require_dotnet_filebased
     detect_time_tool
 
@@ -119,6 +126,9 @@ report_missing_tools() {
     [[ -z "$GO"     ]] && missing+=("Go")
     [[ -z "$NIM"    ]] && missing+=("Nim")
     [[ -z "$DOTNET" ]] && missing+=("C# (.NET SDK 10+)")
+    [[ -z "$ZIG"    ]] && missing+=("Zig")
+    [[ -z "$SWIFTC" ]] && missing+=("Swift")
+    [[ -z "$JAVAC" || -z "$JAVA" ]] && missing+=("Java (JDK)")
     [[ -z "$PYTHON" ]] && missing+=("Python 3")
     [[ -z "$LUA"    ]] && missing+=("Lua")
     [[ -z "$LUAJIT" ]] && missing+=("LuaJIT")
@@ -128,10 +138,12 @@ report_missing_tools() {
     [[ -z "$SQUIRREL" ]] && missing+=("Squirrel")
     [[ -z "$DUK"    ]] && missing+=("Duktape")
     [[ -z "$MICROPYTHON" ]] && missing+=("MicroPython")
+    [[ -z "$RHAI"   ]] && missing+=("Rhai")
     [[ -z "$RUBY"   ]] && missing+=("Ruby")
     [[ -z "$PHP"    ]] && missing+=("PHP")
     [[ -z "$NODE"   ]] && missing+=("Node")
     [[ -z "$QJS"    ]] && missing+=("QuickJS")
+    [[ -z "$BUN"    ]] && missing+=("Bun")
     if (( ${#missing[@]} )); then
         warn "not installed, skipping: ${missing[*]}"
     fi
@@ -296,6 +308,9 @@ lang_name() { case "$1" in
                 rbj)  echo "Ruby YJIT" ;;  php)    echo "PHP" ;;
                 phpj) echo "PHP JIT" ;;
                 js)   echo "QuickJS" ;;    node)   echo "Node/V8" ;;
+                zig)  echo "Zig" ;;        swift)  echo "Swift" ;;
+                java) echo "Java" ;;       rhai)   echo "Rhai" ;;
+                bun)  echo "Bun" ;;
                 fls)  echo "Flaris" ;;     flsj)   echo "Flaris JIT" ;;
                 *)    echo "$1" ;;
               esac; }
@@ -312,6 +327,9 @@ lang_detail() { case "$1" in
                   rbj)  echo "CRuby + YJIT" ;;      php)    echo "Zend VM" ;;
                   phpj) echo "Zend + tracing JIT" ;;
                   js)   echo "interpreted" ;;       node)   echo "V8" ;;
+                  zig)  echo "ReleaseFast" ;;       swift)  echo "swiftc -O" ;;
+                  java) echo "HotSpot JIT" ;;       rhai)   echo "AST interpreter" ;;
+                  bun)  echo "JavaScriptCore" ;;
                   fls)  echo "bytecode VM, JIT off" ;; flsj)   echo "bytecode VM + JIT" ;;
                   *)    echo "" ;;
                 esac; }
@@ -357,6 +375,14 @@ luau_version() {
     [[ -n "$LUAU" ]] || { echo "not installed"; return; }
     local v=""
     have brew && v=$(brew list --versions luau 2>/dev/null | awk '{print $2}')
+    echo "${v:-version not reported by the CLI}"
+}
+
+# rhai-run takes its first argument as a script path, so it has no version flag.
+rhai_version() {
+    [[ -n "$RHAI" ]] || { echo "not installed"; return; }
+    local v=""
+    have brew && v=$(brew list --versions rhai 2>/dev/null | awk '{print $2}')
     echo "${v:-version not reported by the CLI}"
 }
 

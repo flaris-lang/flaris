@@ -161,31 +161,37 @@ it is not installed.
 
 The JIT is on by default on ARM64 and x86-64; `--jit-disable` runs the plain
 bytecode interpreter. On integer kernels (fib, sieve, collatz) the two land in
-different tiers. Averaged against C on an Apple M5, VM 1.0.6.0
-([2026-10-24 snapshot](bench/results/2026-10-24-apple-m5-arm64.md)):
+different tiers. Averaged against C on an Apple M5, VM 1.1.0.0
+([2026-11-15 snapshot](bench/results/2026-11-15-apple-m5-arm64.md)):
 
 | Runtime | avg ×C |
 | ------- | -----: |
 | C (clang -O2) | 1.0x |
 | Rust (rustc -O) | 1.0x |
-| C# (.NET, RyuJIT) | 1.4x |
+| Zig (ReleaseFast) | 1.0x |
+| Java (HotSpot) | 1.2x |
+| C# (.NET, RyuJIT) | 1.3x |
 | Go | 1.4x |
-| **Flaris** (default, JIT on) | **1.8x** |
-| Nim | 2.0x |
-| LuaJIT | 4.1x |
-| Node/V8 | 5.6x |
-| **Flaris `--jit-disable`** (bytecode VM) | **10.8x** |
-| Lua | 14.2x |
-| QuickJS | 24.3x |
-| Python 3 | 35.7x |
+| **Flaris** (default, JIT on) | **1.7x** |
+| Swift (swiftc -O) | 1.9x |
+| Nim | 1.9x |
+| Bun (JavaScriptCore) | 2.2x |
+| LuaJIT | 3.7x |
+| Node/V8 | 5.4x |
+| **Flaris `--jit-disable`** (bytecode VM) | **8.2x** |
+| Lua | 13.1x |
+| Luau | 16.1x |
+| QuickJS | 22.9x |
+| Python 3 | 34.5x |
+| Rhai | 279.3x |
 
-Two rows in that table need a caveat. C# is the closest architectural
-comparison here: a statically typed managed runtime whose method JIT is meant
-to reach native speed, which is what Flaris's JIT is attempting. At 1.4× it is
-level with Go and ahead of Flaris and Nim. And Node/V8's average is dragged
-down almost entirely by collatz, where JavaScript's doubles cost it 12×; on fib
-and sieve V8 is close to Flaris's JIT (177 / 22 ms against 122 / 22 ms). Rust
-and C# take part in the integer kernels only.
+Three rows in that table need a caveat. C# and Java are the closest architectural
+comparison here: statically typed managed runtimes whose method JITs are meant
+to reach native speed, which is what Flaris's JIT is attempting. At 1.2× and
+1.3× they are ahead of Go and of Flaris. And Node/V8's average is dragged down
+almost entirely by collatz, where JavaScript's doubles cost it 12×; on fib and
+sieve V8 is close to Flaris's JIT (179 / 21 ms against 124 / 22 ms). Rust, C and
+C# take part in the integer kernels and the file I/O tests only.
 
 The JIT covers tight numeric code like this. Ordinary object-heavy code
 (allocation churn, arrays of objects, method calls) still runs mostly in the
@@ -193,12 +199,13 @@ interpreter, and that is where Flaris is weakest. The scenarios and standard
 benchmarks in [bench/README.md](bench/README.md) show that half.
 
 On workloads that spend their time in the C builtins the picture shifts up a
-tier: parsing an 18 MB JSON document, Flaris is 1.2× behind Node/V8 and ahead of
-Go, CPython, QuickJS and Nim; scanning 9.8 MB for dates with a regex it is
-second only to V8, ahead of CPython, QuickJS, Nim and Go. Peak memory is
-measured too: 20 MB for the string build against Node's 149 MB, 16 MB for the
-10 M-element sieve against Lua's 239 MB, and 115 MB parsing that JSON document,
-second only to Go's 103 MB and against Node's 214 MB.
+tier: parsing an 18 MB JSON document, Flaris is behind Bun, Node/V8 and Zig and
+ahead of Go, CPython, QuickJS, Nim and Swift; scanning 9.8 MB for dates with a
+regex it is third, behind the two JavaScript engines and ahead of Java, CPython,
+QuickJS, Nim, Go and Swift. Peak memory is measured too: 20 MB for the string
+build against Node's 144 MB, 16 MB for the 10 M-element sieve against Lua's
+239 MB, and 116 MB parsing that JSON document, against Go's 105 MB and Node's
+181 MB.
 
 Full numbers, methodology and the caveats that matter are in
 [bench/README.md](bench/README.md), with dated snapshots in
