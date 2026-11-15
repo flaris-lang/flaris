@@ -55,7 +55,9 @@ flarisvm --libs=. ./tests/test_csv.fls
 
 `.flx` files are build artifacts and are not committed. Official releases are
 Ed25519-signed; a locally compiled library is unsigned, which the VM accepts
-unless it is run with `--require-signed`.
+unless it is run with `--require-signed`. An unsigned library runs in the
+interpreter without its JIT code, so sign your build (`--sign`) and trust that
+key if you are measuring its speed.
 
 ## Running the tests
 
@@ -79,9 +81,9 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 64 libraries, all pure Flaris unless noted:
 
 **Data & formats** — `CSV`, `XML`, `BinaryIO`, `BitConverter`, `Config`,
-`Template`, `Lexer`
+`Template`, `Lexer`, `Protobuf` (proto3 wire codec and `.proto` reader)
 
-**Compression & archives** — `Deflate`, `Zip`
+**Compression & archives** — `Deflate`, `Zip`, `Tar` (ustar/pax, plain or gzip)
 
 **Numbers** — `BigInt`, `Decimal`, `Complex`, `Numerics`
 
@@ -89,12 +91,15 @@ flarisvm ./tests/test_sqlite.fls --unsafe
 `StringBuilder`
 
 **Web & network** — `Http`, `Https`, `HttpServer`, `HttpUtil`, `Router`,
-`OpenApi`, `WebSocket`, `Jwt`, `Ssh`
+`OpenApi`, `WebSocket`, `Jwt`, `Ssh`, `Connect` (Connect RPC over HTTP/1.1),
+`Mqtt` (MQTT 3.1.1 and 5.0 client), `Smtp` (send mail, STARTTLS, DKIM)
 
 **Security** — `CryptoKit` (HKDF, PBKDF2, TOTP/HOTP, Argon2id password hashing,
 sealed blobs, streaming MD5/SHA-1/SHA-256/SHA-384/SHA-512/SHA-3/Keccak-256/SHAKE)
 
-**Data stores** — `SQLite`, `Postgres`, `Redis`
+**Data stores** — `SQLite`, `Postgres`, `Redis` (through FFI), and `PgWire`
+and `Resp`, pure-Flaris PostgreSQL and Redis clients that speak the wire
+protocol directly and need no plugin
 
 **System & tooling** — `Argparse`, `Process`, `Logger`, `Profiler`, `Datetime`,
 `Promise`, `Signals`, `Sync` (Mutex/Semaphore/RWLock/Channel for fibers),
@@ -110,15 +115,16 @@ tracking over `Stream.OpenSerial`)
 **Hardware** — `I2c`, `Spi` (chips on Linux I2C and SPI buses, through i2c-tools
 and spi-tools), `Gpio` (GPIO lines on Linux: read, drive and watch for edges, through
 libgpiod's tools), `RaspberryPi` (the board: model, temperature, throttling,
-fan, the 40-pin header and a setup check, Pi 3 to Pi 5)
+fan, the 40-pin header and a setup check, Pi 3 to Pi 5), `Modbus` (client and
+server, TCP and RTU over serial)
 
 **Media** — `Graphics`, `Audio`, `QRCode`, `Png`, `Tiff`, `Pdf`
 
 **AI** — `AI` (Ollama client)
 
 Only `SQLite`, `Postgres` and `Redis` require `--unsafe`, because they bind
-their C client libraries through FFI. Every other library, `BinaryIO` and
-`WebSocket` included, runs in the default sandbox.
+their C client libraries through FFI. Every other library, `BinaryIO`,
+`WebSocket`, `PgWire` and `Resp` included, runs in the default sandbox.
 
 ## Native plugins (FFI)
 
@@ -153,40 +159,46 @@ SQLite project (GitHub mirror or sqlite.org amalgamation release) in
 there; every language other than Flaris itself is optional and simply omitted if
 it is not installed.
 
-On integer kernels (fib, sieve, collatz) Flaris lands in two different tiers
-depending on whether the JIT is on — averaged against C on an Apple M5,
-VM 1.0.2.0:
+The JIT is on by default on ARM64 and x86-64; `--jit-disable` runs the plain
+bytecode interpreter. On integer kernels (fib, sieve, collatz) the two land in
+different tiers. Averaged against C on an Apple M5, VM 1.0.6.0
+([2026-10-24 snapshot](bench/results/2026-10-24-apple-m5-arm64.md)):
 
 | Runtime | avg ×C |
 | ------- | -----: |
 | C (clang -O2) | 1.0x |
 | Rust (rustc -O) | 1.0x |
 | C# (.NET, RyuJIT) | 1.4x |
-| Go | 1.5x |
-| Nim | 2.1x |
-| **Flaris `--jit`** | **2.5x** |
-| LuaJIT | 4.3x |
-| Node/V8 | 5.7x |
-| Lua | 14.7x |
-| **Flaris** (bytecode VM) | **20.2x** |
-| QuickJS | 25.8x |
-| Python 3 | 65.7x |
+| Go | 1.4x |
+| **Flaris** (default, JIT on) | **1.8x** |
+| Nim | 2.0x |
+| LuaJIT | 4.1x |
+| Node/V8 | 5.6x |
+| **Flaris `--jit-disable`** (bytecode VM) | **10.8x** |
+| Lua | 14.2x |
+| QuickJS | 24.3x |
+| Python 3 | 35.7x |
 
 Two rows in that table need a caveat. C# is the closest architectural
-comparison here — a statically typed managed runtime whose method JIT is meant
-to reach native speed, which is what Flaris `--jit` is attempting — and at 1.4×
-it is ahead of Flaris and of both Go and Nim. And Node/V8's average is dragged
+comparison here: a statically typed managed runtime whose method JIT is meant
+to reach native speed, which is what Flaris's JIT is attempting. At 1.4× it is
+level with Go and ahead of Flaris and Nim. And Node/V8's average is dragged
 down almost entirely by collatz, where JavaScript's doubles cost it 12×; on fib
-and sieve V8 runs level with Flaris `--jit`. Rust and C# take part in the
-integer kernels only.
+and sieve V8 is close to Flaris's JIT (177 / 22 ms against 122 / 22 ms). Rust
+and C# take part in the integer kernels only.
+
+The JIT covers tight numeric code like this. Ordinary object-heavy code
+(allocation churn, arrays of objects, method calls) still runs mostly in the
+interpreter, and that is where Flaris is weakest. The scenarios and standard
+benchmarks in [bench/README.md](bench/README.md) show that half.
 
 On workloads that spend their time in the C builtins the picture shifts up a
-tier: parsing an 18 MB JSON document, Flaris is 1.5× behind Node/V8 and ahead of
-Go, CPython and Nim; scanning 9.8 MB for dates with a regex it is second only to
-V8, ahead of QuickJS, Nim, CPython and Go. Peak memory is measured too: 20 MB
-for the string build against Node's 149 MB, 17 MB for the 10 M-element sieve
-against Lua's 238 MB, and mid-field on large object graphs — 208 MB parsing that
-JSON document, against Node's 216 MB and Go's 103 MB.
+tier: parsing an 18 MB JSON document, Flaris is 1.2× behind Node/V8 and ahead of
+Go, CPython, QuickJS and Nim; scanning 9.8 MB for dates with a regex it is
+second only to V8, ahead of CPython, QuickJS, Nim and Go. Peak memory is
+measured too: 20 MB for the string build against Node's 149 MB, 16 MB for the
+10 M-element sieve against Lua's 239 MB, and 115 MB parsing that JSON document,
+second only to Go's 103 MB and against Node's 214 MB.
 
 Full numbers, methodology and the caveats that matter are in
 [bench/README.md](bench/README.md), with dated snapshots in
